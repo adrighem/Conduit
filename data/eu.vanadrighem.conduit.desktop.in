@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Conduit
+Exec=conduit
+Icon=eu.vanadrighem.conduit
+Terminal=false
+Type=Application
+Categories=Utility;
+Keywords=GTK;
+StartupNotify=true
+DBusActivatable=true

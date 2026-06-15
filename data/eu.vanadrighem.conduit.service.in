@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=eu.vanadrighem.conduit
+Exec=@bindir@/conduit --gapplication-service
