@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::auth::{OAuthConfig, SlackOAuthClient, TokenStore};
 use crate::models::{AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage};
+use crate::realtime::SocketModeClient;
 use crate::slack::SlackApi;
 
 #[derive(Debug)]
@@ -16,6 +17,11 @@ pub enum RuntimeCommand {
         client_id: String,
     },
     SignOut,
+    LoadStoredRealtimeToken,
+    StartRealtime {
+        app_token: String,
+    },
+    StopRealtime,
     RefreshConversations,
     LoadHistory {
         channel_id: String,
@@ -56,6 +62,13 @@ pub enum RuntimeEvent {
     Error(String),
     SignedOut,
     Authenticated(AuthInfo),
+    RealtimeTokenLoaded(Option<String>),
+    RealtimeStarted,
+    RealtimeStopped,
+    RealtimeStatus(String),
+    RealtimeMessage {
+        channel_id: String,
+    },
     ConversationsLoaded(Vec<SlackConversation>),
     HistoryLoaded {
         channel_id: String,
@@ -114,6 +127,7 @@ impl AppRuntime {
             let oauth = SlackOAuthClient::new();
             let mut slack: Option<SlackApi> = None;
             let mut user_cache = HashMap::new();
+            let mut realtime_task: Option<tokio::task::JoinHandle<()>> = None;
 
             while let Ok(command) = receiver.recv() {
                 let result = runtime.block_on(handle_command(
@@ -123,6 +137,7 @@ impl AppRuntime {
                     &oauth,
                     &mut slack,
                     &mut user_cache,
+                    &mut realtime_task,
                 ));
                 if let Err(error) = result {
                     let _ = events.send(RuntimeEvent::Error(error.to_string()));
@@ -145,6 +160,7 @@ async fn handle_command(
     oauth: &SlackOAuthClient,
     slack: &mut Option<SlackApi>,
     user_cache: &mut HashMap<String, String>,
+    realtime_task: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     match command {
         RuntimeCommand::LoadStoredToken => {
@@ -176,7 +192,44 @@ async fn handle_command(
             token_store.clear()?;
             *slack = None;
             user_cache.clear();
+            if let Some(task) = realtime_task.take() {
+                task.abort();
+            }
             events.send_event(RuntimeEvent::SignedOut);
+        }
+        RuntimeCommand::LoadStoredRealtimeToken => {
+            events.send_event(RuntimeEvent::RealtimeTokenLoaded(
+                token_store.load_app_token()?,
+            ));
+        }
+        RuntimeCommand::StartRealtime { app_token } => {
+            if !app_token.starts_with("xapp-") {
+                events.send_event(RuntimeEvent::RealtimeStatus(
+                    "Realtime token must start with xapp-".to_string(),
+                ));
+                return Ok(());
+            }
+
+            token_store.save_app_token(&app_token)?;
+            if let Some(task) = realtime_task.take() {
+                task.abort();
+            }
+
+            let client = SocketModeClient::new(app_token);
+            let realtime_events = events.clone();
+            *realtime_task = Some(tokio::spawn(async move {
+                client.run(realtime_events).await;
+            }));
+            events.send_event(RuntimeEvent::RealtimeStatus(
+                "Starting realtime".to_string(),
+            ));
+        }
+        RuntimeCommand::StopRealtime => {
+            if let Some(task) = realtime_task.take() {
+                task.abort();
+            }
+            token_store.clear_app_token()?;
+            events.send_event(RuntimeEvent::RealtimeStopped);
         }
         RuntimeCommand::RefreshConversations => {
             load_conversations(events, slack).await?;

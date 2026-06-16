@@ -22,6 +22,7 @@ mod application;
 mod auth;
 mod config;
 mod models;
+mod realtime;
 mod rendering;
 mod runtime;
 mod slack;

@@ -15,6 +15,7 @@ use crate::models::StoredToken;
 
 const KEYRING_SERVICE: &str = "eu.vanadrighem.conduit";
 const KEYRING_USER: &str = "slack-user-token";
+const KEYRING_APP_TOKEN_USER: &str = "slack-app-token";
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8934;
 pub const DEFAULT_USER_SCOPES: &[&str] = &[
@@ -91,6 +92,30 @@ impl TokenStore {
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(error).context("failed to delete Slack token from keyring"),
+        }
+    }
+
+    pub fn load_app_token(&self) -> Result<Option<String>> {
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_APP_TOKEN_USER)?;
+        match entry.get_password() {
+            Ok(token) => Ok(Some(token)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error).context("failed to read Slack app token from keyring"),
+        }
+    }
+
+    pub fn save_app_token(&self, app_token: &str) -> Result<()> {
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_APP_TOKEN_USER)?;
+        entry
+            .set_password(app_token)
+            .context("failed to save Slack app token to keyring")
+    }
+
+    pub fn clear_app_token(&self) -> Result<()> {
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_APP_TOKEN_USER)?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("failed to delete Slack app token from keyring"),
         }
     }
 }
