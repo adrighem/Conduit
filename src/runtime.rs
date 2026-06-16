@@ -32,6 +32,13 @@ pub enum RuntimeCommand {
         text: String,
         thread_ts: Option<String>,
     },
+    SetReaction {
+        channel_id: String,
+        ts: String,
+        name: String,
+        add: bool,
+        thread_ts: Option<String>,
+    },
     UploadFile {
         channel_id: String,
         path: PathBuf,
@@ -59,6 +66,10 @@ pub enum RuntimeEvent {
     MessagePosted {
         channel_id: String,
         message: SlackMessage,
+    },
+    ReactionUpdated {
+        channel_id: String,
+        thread_ts: Option<String>,
     },
     FileUploaded(String),
 }
@@ -194,6 +205,20 @@ async fn handle_command(
             events.send_event(RuntimeEvent::MessagePosted {
                 channel_id,
                 message,
+            });
+        }
+        RuntimeCommand::SetReaction {
+            channel_id,
+            ts,
+            name,
+            add,
+            thread_ts,
+        } => {
+            let api = require_slack(slack)?;
+            api.set_reaction(&channel_id, &ts, &name, add).await?;
+            events.send_event(RuntimeEvent::ReactionUpdated {
+                channel_id,
+                thread_ts,
             });
         }
         RuntimeCommand::UploadFile { channel_id, path } => {

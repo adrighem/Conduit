@@ -73,6 +73,7 @@ pub struct SlackMessage {
     pub ts: String,
     pub thread_ts: Option<String>,
     pub reply_count: Option<u64>,
+    pub reactions: Option<Vec<SlackReaction>>,
     pub files: Option<Vec<SlackFile>>,
     pub blocks: Option<Value>,
 }
@@ -92,6 +93,38 @@ impl SlackMessage {
     pub fn has_thread(&self) -> bool {
         self.reply_count.unwrap_or_default() > 0
     }
+
+    pub fn latest_ts<'a>(messages: impl Iterator<Item = &'a SlackMessage>) -> Option<String> {
+        messages
+            .filter(|message| !message.ts.is_empty())
+            .map(|message| message.ts.clone())
+            .max()
+    }
+
+    pub fn user_reacted(&self, reaction_name: &str, user_id: Option<&str>) -> bool {
+        let Some(user_id) = user_id else {
+            return false;
+        };
+
+        self.reactions
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .any(|reaction| {
+                reaction.name.as_deref() == Some(reaction_name)
+                    && reaction
+                        .users
+                        .as_ref()
+                        .is_some_and(|users| users.iter().any(|user| user == user_id))
+            })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SlackReaction {
+    pub name: Option<String>,
+    pub count: Option<u64>,
+    pub users: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

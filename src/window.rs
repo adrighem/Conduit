@@ -19,6 +19,7 @@
  */
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -83,6 +84,8 @@ mod imp {
         pub runtime: RefCell<Option<AppRuntime>>,
         pub events: RefCell<Option<Receiver<RuntimeEvent>>>,
         pub conversations: RefCell<Vec<SlackConversation>>,
+        pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
+        pub current_user_id: RefCell<Option<String>>,
         pub selected_channel: RefCell<Option<String>>,
         pub selected_thread_ts: RefCell<Option<String>>,
     }
@@ -248,6 +251,7 @@ impl ConduitWindow {
                 channel_id,
                 messages,
             } => {
+                self.notify_if_new_messages(&channel_id, &messages);
                 self.populate_history(&channel_id, messages);
             }
             RuntimeEvent::ThreadLoaded {
@@ -264,7 +268,17 @@ impl ConduitWindow {
                 message,
             } => {
                 self.imp().message_entry.set_text("");
+                self.imp().send_button.set_sensitive(true);
+                self.imp().thread_send_button.set_sensitive(true);
+                self.set_status("Message sent");
                 self.reload_after_message(&channel_id, message.thread_ts.as_deref());
+            }
+            RuntimeEvent::ReactionUpdated {
+                channel_id,
+                thread_ts,
+            } => {
+                self.set_status("Reaction updated");
+                self.reload_after_message(&channel_id, thread_ts.as_deref());
             }
             RuntimeEvent::FileUploaded(name) => {
                 self.set_status(&format!("Uploaded {name}"));
@@ -314,6 +328,8 @@ impl ConduitWindow {
             text,
             thread_ts: None,
         });
+        imp.send_button.set_sensitive(false);
+        self.set_status("Sending message");
     }
 
     fn post_thread_reply(&self) {
@@ -336,6 +352,8 @@ impl ConduitWindow {
             text,
             thread_ts: Some(thread_ts),
         });
+        imp.thread_send_button.set_sensitive(false);
+        self.set_status("Sending reply");
     }
 
     fn choose_file_for_upload(&self) {
@@ -399,12 +417,15 @@ impl ConduitWindow {
         *imp.selected_thread_ts.borrow_mut() = None;
         imp.connection_label.set_label(status);
         imp.content_stack.set_visible_child_name("login");
+        *imp.current_user_id.borrow_mut() = None;
+        imp.latest_message_ts_by_channel.borrow_mut().clear();
         self.clear_list(&imp.conversation_list);
         self.clear_list(&imp.message_list);
         self.clear_list(&imp.thread_list);
     }
 
     fn show_workspace(&self, auth: AuthInfo) {
+        *self.imp().current_user_id.borrow_mut() = auth.user_id.clone();
         let label = auth
             .team
             .or(auth.team_id)
@@ -421,6 +442,8 @@ impl ConduitWindow {
     }
 
     fn show_error(&self, error: &str) {
+        self.imp().send_button.set_sensitive(true);
+        self.imp().thread_send_button.set_sensitive(true);
         self.set_status(error);
         if self.imp().content_stack.visible_child_name().as_deref() == Some("loading") {
             self.imp().content_stack.set_visible_child_name("login");
@@ -607,6 +630,37 @@ impl ConduitWindow {
             }
         }
 
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let current_user_id = self.imp().current_user_id.borrow().clone();
+        let reacted = message.user_reacted("thumbsup", current_user_id.as_deref());
+        let reaction_button = gtk::Button::with_label(if reacted { "Remove +1" } else { "+1" });
+        reaction_button.set_halign(gtk::Align::Start);
+        let reaction_channel_id = channel_id.to_string();
+        let reaction_ts = message.ts.clone();
+        let reaction_thread_ts = if in_thread {
+            self.imp().selected_thread_ts.borrow().clone()
+        } else {
+            message.thread_ts.clone()
+        };
+        let weak_window = self.downgrade();
+        reaction_button.connect_clicked(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.send_command(RuntimeCommand::SetReaction {
+                    channel_id: reaction_channel_id.clone(),
+                    ts: reaction_ts.clone(),
+                    name: "thumbsup".to_string(),
+                    add: !reacted,
+                    thread_ts: reaction_thread_ts.clone(),
+                });
+                window.set_status(if reacted {
+                    "Removing reaction"
+                } else {
+                    "Adding reaction"
+                });
+            }
+        });
+        actions.append(&reaction_button);
+
         if message.has_thread() && !in_thread {
             let button = gtk::Button::with_label("View thread");
             button.set_halign(gtk::Align::Start);
@@ -621,11 +675,81 @@ impl ConduitWindow {
                     });
                 }
             });
-            container.append(&button);
+            actions.append(&button);
         }
+
+        container.append(&actions);
 
         row.set_child(Some(&container));
         row
+    }
+
+    fn notify_if_new_messages(&self, channel_id: &str, messages: &[SlackMessage]) {
+        let Some(latest_ts) = SlackMessage::latest_ts(messages.iter()) else {
+            return;
+        };
+
+        let latest_message = messages
+            .iter()
+            .filter(|message| message.ts == latest_ts)
+            .next();
+        let current_user_id = self.imp().current_user_id.borrow().clone();
+
+        if latest_message
+            .and_then(|message| message.user.as_deref())
+            .is_some_and(|user| Some(user) == current_user_id.as_deref())
+        {
+            self.imp()
+                .latest_message_ts_by_channel
+                .borrow_mut()
+                .insert(channel_id.to_string(), latest_ts);
+            return;
+        }
+
+        let previous_ts = self
+            .imp()
+            .latest_message_ts_by_channel
+            .borrow()
+            .get(channel_id)
+            .cloned();
+
+        self.imp()
+            .latest_message_ts_by_channel
+            .borrow_mut()
+            .insert(channel_id.to_string(), latest_ts.clone());
+
+        if previous_ts
+            .as_deref()
+            .is_some_and(|previous_ts| latest_ts.as_str() > previous_ts)
+        {
+            self.send_notification(
+                &self.conversation_title(channel_id),
+                latest_message
+                    .map(SlackMessage::body_text)
+                    .as_deref()
+                    .unwrap_or("New message"),
+            );
+        }
+    }
+
+    fn send_notification(&self, title: &str, body: &str) {
+        let Some(application) = self.application() else {
+            return;
+        };
+
+        let notification = gio::Notification::new(title);
+        notification.set_body(Some(body));
+        application.send_notification(None, &notification);
+    }
+
+    fn conversation_title(&self, channel_id: &str) -> String {
+        self.imp()
+            .conversations
+            .borrow()
+            .iter()
+            .find(|conversation| conversation.id == channel_id)
+            .map(SlackConversation::display_name)
+            .unwrap_or_else(|| "Slack".to_string())
     }
 
     fn clear_list(&self, list: &gtk::ListBox) {

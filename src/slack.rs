@@ -133,6 +133,31 @@ impl SlackApi {
         Ok(response.message)
     }
 
+    pub async fn set_reaction(
+        &self,
+        channel_id: &str,
+        ts: &str,
+        name: &str,
+        add: bool,
+    ) -> Result<()> {
+        let method = if add {
+            "reactions.add"
+        } else {
+            "reactions.remove"
+        };
+        let _: BasicResponse = self
+            .post_form(
+                method,
+                &[
+                    ("channel", channel_id.to_string()),
+                    ("timestamp", ts.to_string()),
+                    ("name", name.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn upload_file(&self, channel_id: &str, path: &Path) -> Result<SlackFile> {
         let filename = path
             .file_name()
@@ -292,6 +317,13 @@ struct PostMessageResponse {
     message: SlackMessage,
 }
 impl_slack_response!(PostMessageResponse);
+
+#[derive(Debug, Deserialize)]
+struct BasicResponse {
+    ok: bool,
+    error: Option<String>,
+}
+impl_slack_response!(BasicResponse);
 
 #[derive(Debug, Deserialize)]
 struct UploadUrlResponse {
