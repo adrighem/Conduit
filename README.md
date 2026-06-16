@@ -14,7 +14,7 @@ meson compile -C _build
 meson test -C _build
 ```
 
-`cargo check` is also supported for Rust validation, but running the app expects the compiled GResource from the Meson build or an installed build.
+`cargo check` and `cargo test` are also supported for Rust validation, but running the app expects the compiled GResource from the Meson build or an installed build.
 
 ## Slack App Setup
 
@@ -26,6 +26,8 @@ http://127.0.0.1:8934/callback
 
 The client currently uses Slack's user-token PKCE flow (`oauth.v2.user.access`) and requests user scopes. Slack desktop PKCE redirects cannot request bot scopes. Socket Mode requires a separate app-level token and is intentionally left for a later opt-in slice.
 
+For realtime updates, enable Socket Mode in the Slack app, create an app-level token with `connections:write`, and paste the `xapp-` token into the realtime field in Conduit. The token is stored in the system keyring.
+
 ## Status
 
 Implemented:
@@ -34,12 +36,10 @@ Implemented:
 - PKCE OAuth callback flow on localhost.
 - Keyring-backed token storage.
 - Background Tokio runtime for Slack network work.
-- Conversation list, history, thread replies, search, saved item, message post, and file upload service methods.
+- Conversation list, history, thread replies, search, saved items, message posting, emoji reactions, file upload, and Socket Mode refreshes.
 
 Next:
 
-- Rich Slack mrkdwn and Block Kit rendering.
-- User display-name and presence cache.
 - Rate-limit-aware pagination.
-- Optional Socket Mode realtime updates.
+- Presence cache.
 - Flatpak dependency vendoring and Flathub-grade screenshots.

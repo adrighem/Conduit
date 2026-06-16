@@ -47,3 +47,15 @@ cargo_build = custom_target(
     '@OUTPUT@',
   ]
 )
+
+test('Cargo tests',
+  cargo_bin,
+  args: [
+    'test',
+    '--manifest-path', meson.project_source_root() / 'Cargo.toml',
+    '--target-dir', meson.project_build_root() / 'src',
+  ],
+  env: cargo_env,
+  timeout: 300,
+  depends: cargo_build,
+)
