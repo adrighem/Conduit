@@ -9,6 +9,8 @@ use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, StoredToken,
 };
 
+const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct SlackApi {
     http: Client,
@@ -158,16 +160,34 @@ impl SlackApi {
         Ok(())
     }
 
-    pub async fn upload_file(&self, channel_id: &str, path: &Path) -> Result<SlackFile> {
+    pub async fn upload_file<F>(
+        &self,
+        channel_id: &str,
+        path: &Path,
+        initial_comment: Option<&str>,
+        progress: F,
+    ) -> Result<SlackFile>
+    where
+        F: Fn(UploadProgressUpdate),
+    {
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("file path has no valid filename"))?
             .to_string();
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if metadata.len() > MAX_UPLOAD_BYTES {
+            return Err(anyhow!("{} is larger than 1 GiB", path.display()));
+        }
+
+        progress(UploadProgressUpdate::new(0.15, "Reading file"));
         let bytes = tokio::fs::read(path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
 
+        progress(UploadProgressUpdate::new(0.35, "Requesting upload URL"));
         let upload: UploadUrlResponse = self
             .post_form(
                 "files.getUploadURLExternal",
@@ -178,6 +198,7 @@ impl SlackApi {
             )
             .await?;
 
+        progress(UploadProgressUpdate::new(0.60, "Uploading file"));
         self.http
             .post(&upload.upload_url)
             .body(bytes)
@@ -187,14 +208,18 @@ impl SlackApi {
             .error_for_status()
             .context("Slack upload URL returned an HTTP error")?;
 
+        progress(UploadProgressUpdate::new(0.90, "Completing upload"));
         let files = json!([{ "id": upload.file_id, "title": filename }]).to_string();
+        let mut params = vec![("files", files), ("channel_id", channel_id.to_string())];
+        if let Some(initial_comment) = initial_comment.filter(|comment| !comment.trim().is_empty())
+        {
+            params.push(("initial_comment", initial_comment.to_string()));
+        }
         let complete: CompleteUploadResponse = self
-            .post_form(
-                "files.completeUploadExternal",
-                &[("files", files), ("channel_id", channel_id.to_string())],
-            )
+            .post_form("files.completeUploadExternal", &params)
             .await?;
 
+        progress(UploadProgressUpdate::new(1.0, "Upload complete"));
         complete
             .files
             .into_iter()
@@ -222,6 +247,21 @@ impl SlackApi {
             .with_context(|| format!("failed to parse Slack method {method} response"))?;
 
         response.into_result(method)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UploadProgressUpdate {
+    pub fraction: f64,
+    pub label: String,
+}
+
+impl UploadProgressUpdate {
+    fn new(fraction: f64, label: &str) -> Self {
+        Self {
+            fraction,
+            label: label.to_string(),
+        }
     }
 }
 

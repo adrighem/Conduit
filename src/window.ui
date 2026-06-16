@@ -221,6 +221,12 @@
                                 </child>
                               </object>
                             </child>
+                            <child>
+                              <object class="GtkProgressBar" id="upload_progress">
+                                <property name="visible">False</property>
+                                <property name="show-text">True</property>
+                              </object>
+                            </child>
                           </object>
                         </property>
                         <property name="end-child">

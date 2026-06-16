@@ -59,6 +59,8 @@ mod imp {
         #[template_child]
         pub upload_button: TemplateChild<gtk::Button>,
         #[template_child]
+        pub upload_progress: TemplateChild<gtk::ProgressBar>,
+        #[template_child]
         pub search_entry: TemplateChild<gtk::SearchEntry>,
         #[template_child]
         pub search_button: TemplateChild<gtk::Button>,
@@ -280,7 +282,19 @@ impl ConduitWindow {
                 self.set_status("Reaction updated");
                 self.reload_after_message(&channel_id, thread_ts.as_deref());
             }
+            RuntimeEvent::FileUploadProgress { fraction, label } => {
+                let imp = self.imp();
+                imp.upload_progress.set_visible(true);
+                imp.upload_progress.set_fraction(fraction);
+                imp.upload_progress.set_text(Some(&label));
+                self.set_status(&label);
+            }
             RuntimeEvent::FileUploaded(name) => {
+                let imp = self.imp();
+                imp.upload_button.set_sensitive(true);
+                imp.upload_progress.set_fraction(1.0);
+                imp.upload_progress.set_text(Some("Upload complete"));
+                imp.message_entry.set_text("");
                 self.set_status(&format!("Uploaded {name}"));
                 if let Some(channel_id) = self.imp().selected_channel.borrow().clone() {
                     self.send_command(RuntimeCommand::LoadHistory { channel_id });
@@ -361,6 +375,7 @@ impl ConduitWindow {
             self.set_status("Select a conversation");
             return;
         };
+        let initial_comment = self.imp().message_entry.text().trim().to_string();
 
         let dialog = gtk::FileDialog::builder()
             .title("Upload File")
@@ -373,9 +388,16 @@ impl ConduitWindow {
             if let Ok(file) = result {
                 if let Some(path) = file.path() {
                     if let Some(window) = weak_window.upgrade() {
+                        let imp = window.imp();
+                        imp.upload_button.set_sensitive(false);
+                        imp.upload_progress.set_visible(true);
+                        imp.upload_progress.set_fraction(0.0);
+                        imp.upload_progress.set_text(Some("Starting upload"));
                         window.send_command(RuntimeCommand::UploadFile {
                             channel_id: channel_id.clone(),
                             path,
+                            initial_comment: (!initial_comment.is_empty())
+                                .then(|| initial_comment.clone()),
                         });
                     }
                 }
@@ -444,6 +466,8 @@ impl ConduitWindow {
     fn show_error(&self, error: &str) {
         self.imp().send_button.set_sensitive(true);
         self.imp().thread_send_button.set_sensitive(true);
+        self.imp().upload_button.set_sensitive(true);
+        self.imp().upload_progress.set_visible(false);
         self.set_status(error);
         if self.imp().content_stack.visible_child_name().as_deref() == Some("loading") {
             self.imp().content_stack.set_visible_child_name("login");

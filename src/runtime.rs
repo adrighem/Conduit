@@ -42,6 +42,7 @@ pub enum RuntimeCommand {
     UploadFile {
         channel_id: String,
         path: PathBuf,
+        initial_comment: Option<String>,
     },
 }
 
@@ -70,6 +71,10 @@ pub enum RuntimeEvent {
     ReactionUpdated {
         channel_id: String,
         thread_ts: Option<String>,
+    },
+    FileUploadProgress {
+        fraction: f64,
+        label: String,
     },
     FileUploaded(String),
 }
@@ -221,9 +226,30 @@ async fn handle_command(
                 thread_ts,
             });
         }
-        RuntimeCommand::UploadFile { channel_id, path } => {
+        RuntimeCommand::UploadFile {
+            channel_id,
+            path,
+            initial_comment,
+        } => {
             let api = require_slack(slack)?;
-            let file = api.upload_file(&channel_id, &path).await?;
+            events.send_event(RuntimeEvent::FileUploadProgress {
+                fraction: 0.05,
+                label: "Preparing upload".to_string(),
+            });
+            let progress_events = events.clone();
+            let file = api
+                .upload_file(
+                    &channel_id,
+                    &path,
+                    initial_comment.as_deref(),
+                    move |update| {
+                        progress_events.send_event(RuntimeEvent::FileUploadProgress {
+                            fraction: update.fraction,
+                            label: update.label,
+                        });
+                    },
+                )
+                .await?;
             let label = file
                 .title
                 .or(file.name)
