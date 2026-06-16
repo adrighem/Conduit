@@ -19,7 +19,11 @@
  */
 
 mod application;
+mod auth;
 mod config;
+mod models;
+mod runtime;
+mod slack;
 mod window;
 
 use self::application::ConduitApplication;
@@ -27,8 +31,9 @@ use self::window::ConduitWindow;
 
 use config::{GETTEXT_PACKAGE, LOCALEDIR, PKGDATADIR};
 use gettextrs::{bind_textdomain_codeset, bindtextdomain, textdomain};
-use gtk::{gio, glib};
 use gtk::prelude::*;
+use gtk::{gio, glib};
+use std::path::PathBuf;
 
 fn main() -> glib::ExitCode {
     // Set up gettext translations
@@ -38,8 +43,7 @@ fn main() -> glib::ExitCode {
     textdomain(GETTEXT_PACKAGE).expect("Unable to switch to the text domain");
 
     // Load resources
-    let resources = gio::Resource::load(PKGDATADIR.to_owned() + "/conduit.gresource")
-        .expect("Could not load resources");
+    let resources = gio::Resource::load(resource_path()).expect("Could not load resources");
     gio::resources_register(&resources);
 
     // Create a new GtkApplication. The application manages our main loop,
@@ -52,4 +56,25 @@ fn main() -> glib::ExitCode {
     // is the code you see when you do `echo $?` after running a command in a
     // terminal.
     app.run()
+}
+
+fn resource_path() -> PathBuf {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = std::env::var_os("CONDUIT_RESOURCE_PATH") {
+        candidates.push(PathBuf::from(path));
+    }
+
+    candidates.push(PathBuf::from(PKGDATADIR).join("conduit.gresource"));
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("conduit.gresource"));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from(PKGDATADIR).join("conduit.gresource"))
 }

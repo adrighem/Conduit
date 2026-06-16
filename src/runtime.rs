@@ -1,0 +1,244 @@
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+
+use anyhow::{Context, Result};
+
+use crate::auth::{OAuthConfig, SlackOAuthClient, TokenStore};
+use crate::models::{AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage};
+use crate::slack::SlackApi;
+
+#[derive(Debug)]
+pub enum RuntimeCommand {
+    LoadStoredToken,
+    StartOAuth {
+        client_id: String,
+    },
+    SignOut,
+    RefreshConversations,
+    LoadHistory {
+        channel_id: String,
+    },
+    LoadThread {
+        channel_id: String,
+        ts: String,
+    },
+    SearchMessages {
+        query: String,
+    },
+    LoadSavedItems,
+    PostMessage {
+        channel_id: String,
+        text: String,
+        thread_ts: Option<String>,
+    },
+    UploadFile {
+        channel_id: String,
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug)]
+pub enum RuntimeEvent {
+    Status(String),
+    Error(String),
+    SignedOut,
+    Authenticated(AuthInfo),
+    ConversationsLoaded(Vec<SlackConversation>),
+    HistoryLoaded {
+        channel_id: String,
+        messages: Vec<SlackMessage>,
+    },
+    ThreadLoaded {
+        channel_id: String,
+        ts: String,
+        messages: Vec<SlackMessage>,
+    },
+    SearchLoaded(Vec<SearchMatch>),
+    SavedItemsLoaded(Vec<SavedItem>),
+    MessagePosted {
+        channel_id: String,
+        message: SlackMessage,
+    },
+    FileUploaded(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct AppRuntime {
+    commands: Sender<RuntimeCommand>,
+}
+
+impl AppRuntime {
+    pub fn start(events: Sender<RuntimeEvent>) -> Self {
+        let (commands, receiver) = mpsc::channel::<RuntimeCommand>();
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = events.send(RuntimeEvent::Error(format!(
+                        "Failed to start background runtime: {error}"
+                    )));
+                    return;
+                }
+            };
+
+            let token_store = TokenStore;
+            let oauth = SlackOAuthClient::new();
+            let mut slack: Option<SlackApi> = None;
+
+            while let Ok(command) = receiver.recv() {
+                let result = runtime.block_on(handle_command(
+                    command,
+                    &events,
+                    &token_store,
+                    &oauth,
+                    &mut slack,
+                ));
+                if let Err(error) = result {
+                    let _ = events.send(RuntimeEvent::Error(error.to_string()));
+                }
+            }
+        });
+
+        Self { commands }
+    }
+
+    pub fn send(&self, command: RuntimeCommand) {
+        let _ = self.commands.send(command);
+    }
+}
+
+async fn handle_command(
+    command: RuntimeCommand,
+    events: &Sender<RuntimeEvent>,
+    token_store: &TokenStore,
+    oauth: &SlackOAuthClient,
+    slack: &mut Option<SlackApi>,
+) -> Result<()> {
+    match command {
+        RuntimeCommand::LoadStoredToken => {
+            events.send_status("Checking secure storage");
+            if let Some(token) = token_store.load()? {
+                let api = SlackApi::new(token);
+                let auth = api
+                    .auth_test()
+                    .await
+                    .context("stored Slack token is not valid")?;
+                *slack = Some(api);
+                events.send_event(RuntimeEvent::Authenticated(auth));
+                load_conversations(events, slack).await?;
+            } else {
+                events.send_status("Not connected");
+            }
+        }
+        RuntimeCommand::StartOAuth { client_id } => {
+            events.send_status("Opening Slack authorization");
+            let token = oauth.authenticate(OAuthConfig::new(client_id)).await?;
+            token_store.save(&token)?;
+            let api = SlackApi::new(token);
+            let auth = api.auth_test().await?;
+            *slack = Some(api);
+            events.send_event(RuntimeEvent::Authenticated(auth));
+            load_conversations(events, slack).await?;
+        }
+        RuntimeCommand::SignOut => {
+            token_store.clear()?;
+            *slack = None;
+            events.send_event(RuntimeEvent::SignedOut);
+        }
+        RuntimeCommand::RefreshConversations => {
+            load_conversations(events, slack).await?;
+        }
+        RuntimeCommand::LoadHistory { channel_id } => {
+            let api = require_slack(slack)?;
+            events.send_status("Loading conversation");
+            let messages = api.history(&channel_id).await?;
+            events.send_event(RuntimeEvent::HistoryLoaded {
+                channel_id,
+                messages,
+            });
+        }
+        RuntimeCommand::LoadThread { channel_id, ts } => {
+            let api = require_slack(slack)?;
+            events.send_status("Loading thread");
+            let messages = api.thread_replies(&channel_id, &ts).await?;
+            events.send_event(RuntimeEvent::ThreadLoaded {
+                channel_id,
+                ts,
+                messages,
+            });
+        }
+        RuntimeCommand::SearchMessages { query } => {
+            let api = require_slack(slack)?;
+            let results = api.search_messages(&query).await?;
+            events.send_event(RuntimeEvent::SearchLoaded(results));
+        }
+        RuntimeCommand::LoadSavedItems => {
+            let api = require_slack(slack)?;
+            let items = api.saved_items().await?;
+            events.send_event(RuntimeEvent::SavedItemsLoaded(items));
+        }
+        RuntimeCommand::PostMessage {
+            channel_id,
+            text,
+            thread_ts,
+        } => {
+            let api = require_slack(slack)?;
+            let message = api
+                .post_message(&channel_id, &text, thread_ts.as_deref())
+                .await?;
+            events.send_event(RuntimeEvent::MessagePosted {
+                channel_id,
+                message,
+            });
+        }
+        RuntimeCommand::UploadFile { channel_id, path } => {
+            let api = require_slack(slack)?;
+            let file = api.upload_file(&channel_id, &path).await?;
+            let label = file
+                .title
+                .or(file.name)
+                .or(file.id)
+                .unwrap_or_else(|| "file".to_string());
+            events.send_event(RuntimeEvent::FileUploaded(label));
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_conversations(
+    events: &Sender<RuntimeEvent>,
+    slack: &mut Option<SlackApi>,
+) -> Result<()> {
+    let api = require_slack(slack)?;
+    events.send_status("Loading conversations");
+    let conversations = api.conversations().await?;
+    events.send_event(RuntimeEvent::ConversationsLoaded(conversations));
+    Ok(())
+}
+
+fn require_slack(slack: &Option<SlackApi>) -> Result<&SlackApi> {
+    slack
+        .as_ref()
+        .context("Connect to Slack before using this action")
+}
+
+trait EventSenderExt {
+    fn send_status(&self, status: &str);
+    fn send_event(&self, event: RuntimeEvent);
+}
+
+impl EventSenderExt for Sender<RuntimeEvent> {
+    fn send_status(&self, status: &str) {
+        self.send_event(RuntimeEvent::Status(status.to_string()));
+    }
+
+    fn send_event(&self, event: RuntimeEvent) {
+        let _ = self.send(event);
+    }
+}

@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
-  <object class="AdwShortcutsDialog" id="shortcuts_dialog">
+  <object class="GtkShortcutsWindow" id="shortcuts_dialog">
     <child>
-      <object class="AdwShortcutsSection">
+      <object class="GtkShortcutsSection">
         <property name="title" translatable="yes">Shortcuts</property>
         <child>
-          <object class="AdwShortcutsItem">
+          <object class="GtkShortcutsShortcut">
             <property name="title" translatable="yes" context="shortcut window">Show Shortcuts</property>
-            <property name="action-name">app.shortcuts</property>
+            <property name="accelerator">&lt;Control&gt;question</property>
           </object>
         </child>
         <child>
-          <object class="AdwShortcutsItem">
+          <object class="GtkShortcutsShortcut">
             <property name="title" translatable="yes" context="shortcut window">Quit</property>
-            <property name="action-name">app.quit</property>
+            <property name="accelerator">&lt;Control&gt;q</property>
           </object>
         </child>
       </object>

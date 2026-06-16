@@ -18,9 +18,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use gettextrs::gettext;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
+use gettextrs::gettext;
 use gtk::{gio, glib};
 
 use crate::config::VERSION;
@@ -89,10 +89,46 @@ impl ConduitApplication {
         let quit_action = gio::ActionEntry::builder("quit")
             .activate(move |app: &Self, _, _| app.quit())
             .build();
+        let preferences_action = gio::ActionEntry::builder("preferences")
+            .activate(move |app: &Self, _, _| app.show_preferences())
+            .build();
+        let shortcuts_action = gio::ActionEntry::builder("shortcuts")
+            .activate(move |app: &Self, _, _| app.show_shortcuts())
+            .build();
         let about_action = gio::ActionEntry::builder("about")
             .activate(move |app: &Self, _, _| app.show_about())
             .build();
-        self.add_action_entries([quit_action, about_action]);
+        self.add_action_entries([
+            quit_action,
+            preferences_action,
+            shortcuts_action,
+            about_action,
+        ]);
+        self.set_accels_for_action("app.shortcuts", &["<control>question"]);
+    }
+
+    fn show_preferences(&self) {
+        let Some(window) = self.active_window() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::new(
+            Some("Preferences"),
+            Some("Conduit stores Slack tokens in the system keyring. More preferences will be added as Slack features land."),
+        );
+        dialog.add_response("close", "Close");
+        dialog.set_default_response(Some("close"));
+        dialog.present(Some(&window));
+    }
+
+    fn show_shortcuts(&self) {
+        let Some(window) = self.active_window() else {
+            return;
+        };
+        let builder = gtk::Builder::from_resource("/eu/vanadrighem/conduit/shortcuts-dialog.ui");
+        if let Some(dialog) = builder.object::<gtk::ShortcutsWindow>("shortcuts_dialog") {
+            dialog.set_transient_for(Some(&window));
+            dialog.present();
+        }
     }
 
     fn show_about(&self) {

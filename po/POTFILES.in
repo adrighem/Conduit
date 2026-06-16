@@ -3,4 +3,6 @@
 data/eu.vanadrighem.conduit.desktop.in
 data/eu.vanadrighem.conduit.metainfo.xml.in
 data/eu.vanadrighem.conduit.gschema.xml
+src/application.rs
+src/shortcuts-dialog.ui
 src/window.ui

@@ -8,33 +8,16 @@ gnome.compile_resources('conduit',
   install_dir: pkgdatadir,
 )
 
-conf = configuration_data()
-conf.set_quoted('VERSION', meson.project_version())
-conf.set_quoted('GETTEXT_PACKAGE', 'conduit')
-conf.set_quoted('LOCALEDIR', get_option('prefix') / get_option('localedir'))
-conf.set_quoted('PKGDATADIR', pkgdatadir)
-
-configure_file(
-    input: 'config.rs.in',
-    output: 'config.rs',
-    configuration: conf
-)
-
-# Copy the config.rs output to the source directory.
-run_command(
-  'cp',
-  meson.project_build_root() / 'src' / 'config.rs',
-  meson.project_source_root() / 'src' / 'config.rs',
-  check: true
-)
-
 cargo_bin  = find_program('cargo')
-cargo_opt  = [ '--manifest-path', meson.project_source_root() / 'Cargo.toml' ]
-cargo_opt += [ '--target-dir', meson.project_build_root()  / 'src' ]
-cargo_env  = [ 'CARGO_HOME=' + meson.project_build_root()  / 'cargo-home' ]
+cargo_release_arg = ''
+cargo_env  = [
+  'CARGO_HOME=' + meson.project_build_root()  / 'cargo-home',
+  'CONDUIT_LOCALEDIR=' + get_option('prefix') / get_option('localedir'),
+  'CONDUIT_PKGDATADIR=' + pkgdatadir,
+]
 
 if get_option('buildtype') == 'release'
-  cargo_opt += [ '--release' ]
+  cargo_release_arg = '--release'
   rust_target = 'release'
 else
   rust_target = 'debug'
@@ -49,8 +32,18 @@ cargo_build = custom_target(
   install: true,
   install_dir: get_option('bindir'),
   command: [
-    'env', cargo_env,
-    cargo_bin, 'build',
-    cargo_opt, '&&', 'cp', 'src' / rust_target / meson.project_name(), '@OUTPUT@',
+    'bash', '-c',
+    'release_arg="$6"; if [[ -n "$release_arg" ]]; then env "$1" "$2" "$3" "$4" build --manifest-path "$5" --target-dir "$7" "$release_arg"; else env "$1" "$2" "$3" "$4" build --manifest-path "$5" --target-dir "$7"; fi && cp "$7/$8/$9" "${10}"',
+    'cargo-build',
+    cargo_env[0],
+    cargo_env[1],
+    cargo_env[2],
+    cargo_bin.full_path(),
+    meson.project_source_root() / 'Cargo.toml',
+    cargo_release_arg,
+    meson.project_build_root() / 'src',
+    rust_target,
+    meson.project_name(),
+    '@OUTPUT@',
   ]
 )

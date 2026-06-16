@@ -1,0 +1,328 @@
+Lightweight Slack Client for GNOME Desktop in Rust: A Research and Implementation Plan
+
+This document outlines the research and a step-by-step implementation plan for creating a lightweight, native Slack client for the GNOME desktop environment using the Rust programming language. The focus is on delivering the most used and appreciated Slack features while maintaining a minimal resource footprint and a seamless GNOME user experience.
+1. Core and Appreciated Slack Features
+
+A successful lightweight Slack client should prioritize the features that users interact with most frequently. Based on user feedback and feature analysis, the following functionalities are considered essential for a minimum viable product (MVP) and subsequent updates.
+
+Core Messaging and Organization (MVP):
+
+    Channels: The fundamental building blocks of Slack, allowing for topic-based conversations
+    . The client must support joining, viewing, and participating in public and private channels.
+
+    Direct Messages (DMs) and Group DMs: For private one-on-one or small group conversations.
+
+    Threads: Essential for organizing conversations within a channel and preventing clutter
+    . The client should allow users to start, view, and reply to threads. A detailed implementation for this core feature is outlined in Phase 3.
+
+    Message History and Search: Users expect to be able to scroll back through conversations and search for specific messages. Advanced search with modifiers (e.g., from:@user, in:#channel, has:star) is a highly valued feature
+    .
+
+    File Sharing: The ability to upload and download files is a critical component of team collaboration in Slack. A detailed implementation plan is covered in Phase 5.
+
+    Emoji Reactions: A quick and common way to acknowledge messages and convey sentiment.
+
+Productivity and Workflow Features (MVP):
+
+    Notifications: Native desktop notifications for new messages, mentions, and keywords are crucial for a responsive experience.
+
+    Saved Items (Starred Messages): Allowing users to mark important messages for later reference
+    . The underlying API still uses the "stars" terminology
+    .
+
+    User Presence: Indicating whether a user is active, away, or in "do not disturb" mode.
+
+Advanced (Post-MVP) Features:
+
+    Reminders: The ability to set reminders for oneself or for a channel is a frequently used productivity feature.
+
+    Huddles: Quick, informal audio (and potentially video) calls.
+
+    Slack Connect: Interacting with channels shared with external organizations.
+
+    Slack Canvas: A collaborative space for notes and documents within Slack.
+
+    Integrations: While a fully-featured integration system is complex, displaying messages from popular integrations (like GitHub or Jira) would be beneficial.
+
+    AI-Powered Summaries: A more recent and highly appreciated feature that can summarize long threads or channel activity.
+
+2. The Case for a Lightweight, Native Client
+
+The official Slack client for Linux is built using the Electron framework, which essentially bundles a full web browser. This leads to high memory consumption, often exceeding 400MB at startup and growing significantly with use. A native client built with Rust and GTK can offer a much more lightweight alternative, with some existing native clients starting at as little as 60MB of RAM. This is particularly beneficial for users with limited hardware resources or those who prefer applications that are well-integrated with the GNOME desktop environment.
+3. Technology Stack
+
+    Programming Language: Rust
+
+        Why Rust? Rust provides memory safety without a garbage collector, leading to high performance and a lower resource footprint. Its strong type system and modern tooling make it an excellent choice for building reliable and maintainable applications.
+
+    GUI Toolkit: GTK4 and libadwaita via gtk-rs
+
+        Why GTK? GTK is the native toolkit for the GNOME desktop
+        . Using it ensures that the application will look and feel like a first-class citizen of the GNOME ecosystem, respecting user themes and settings.
+
+        libadwaita: This library provides GNOME's standard user interface patterns and widgets, ensuring a consistent and modern look
+        .
+
+        gtk-rs: These are the official Rust bindings for the GTK library, allowing for idiomatic Rust code to be used for building the user interface.
+
+        Key Widgets: The implementation will rely on specific widgets like AdwNavigationSplitView for master-detail layouts (e.g., threads)
+        , GtkFileChooserNative for platform-integrated file dialogs
+        , GtkProgressBar for visual feedback
+        , GtkSearchEntry for search input, and GtkSourceView for rendering code blocks with syntax highlighting.
+
+    Asynchronous Runtime: tokio
+
+        Why tokio? tokio is a powerful runtime for writing asynchronous applications in Rust
+        . It is essential for handling network operations like Slack API calls and real-time event listening without blocking the main UI thread
+        .
+
+    Slack API Interaction: slack-morphism-rust
+
+        Why slack-morphism-rust? This is a modern, async-first Rust library for interacting with the Slack Web API, Events API, and Socket Mode
+        . It is well-documented, provides type-safe access to Slack's features, and includes helpers for complex tasks like pagination and Block Kit parsing
+        .
+
+    Authentication and Web Interaction:
+
+        tiny-http: A lightweight crate for creating a temporary local web server to handle the OAuth 2.0 redirect callback
+        .
+
+        webbrowser or open: Crates to open the user's default web browser to the Slack authorization page
+        .
+
+        sha2: A crate for generating the SHA-256 hash required for the PKCE code_challenge
+        .
+
+        reqwest: A robust HTTP client needed for the modern file upload flow, which involves posting data to an external URL provided by Slack
+        .
+
+    Secure Storage: keyring
+
+        Why keyring? This crate provides a cross-platform API to securely store the user's access token in the native OS secret store, such as the Secret Service API on Linux (used by GNOME Keyring)
+        .
+
+    Message Content Parsing:
+
+        pulldown-cmark: An efficient, streaming Markdown parser for Rust, useful for converting Slack's mrkdwn into an event stream that can be translated to Pango markup
+        .
+
+        regex: Can be used for simpler find-and-replace operations on mrkdwn text.
+
+        slack_blocks: A helpful crate providing models for all of Slack's Block Kit components, simplifying the parsing and rendering of complex message layouts
+        .
+
+    Development Environment: GNOME Builder and Flatpak
+
+        GNOME Builder: This IDE is tailored for developing GNOME applications. It comes with pre-configured templates for Rust and GTK, and it simplifies the process of building and running the application in a sandboxed environment.
+
+        Flatpak: For packaging and distribution, Flatpak is the recommended format for GNOME applications. It allows for bundling all necessary dependencies and ensures the application runs consistently across different Linux distributions
+        .
+
+4. Step-by-Step Implementation Plan for an Agent
+
+This plan breaks down the development process into manageable phases, suitable for an automated or human agent.
+
+Phase 1: Project Setup and "Hello, World!"
+
+    Environment Setup: Install GNOME Builder and use its "GNOME Application" template with Rust to generate the project skeleton.
+
+    Initial Build and Run: Compile and run the template to confirm the environment is working.
+
+    Add Dependencies: In Cargo.toml, add the necessary crates: slack-morphism, gtk, libadwaita, tokio, futures, tiny-http, webbrowser, sha2, keyring, reqwest, pulldown-cmark, and slack_blocks.
+
+Phase 2: Secure Authentication with OAuth 2.0 and PKCE
+
+This phase implements Slack's recommended OAuth 2.0 flow for native desktop applications, which is more secure as it avoids storing a client_secret
+.
+
+    Configure Slack App: Create an app in the Slack API console, define the necessary permission scopes (e.g., channels:read, chat:write, files:write, search:read, stars:read, stars:write), set a local redirect URL (e.g., http://127.0.0.1:8080/callback), and enable PKCE
+    . Copy the Client ID.
+
+    Implement Authorization Flow:
+
+        Generate a code_verifier and its SHA-256 code_challenge
+        .
+
+        Start a tiny-http server in a background thread to listen on the redirect URL
+        .
+
+        Open the user's browser to the Slack authorization URL, including the code_challenge
+        .
+
+        Handle the callback to extract the temporary authorization_code
+        .
+
+    Exchange Code for Token: Use the authorization_code and code_verifier to call slack-morphism's client.oauth_v2_access() method to get the permanent access token
+    .
+
+    Securely Store Token: Use the keyring crate to save the token in the OS's native secret store
+    . On startup, the app will attempt to retrieve this token to bypass the login flow.
+
+Phase 3: Core UI, Data Fetch, and Threaded Conversations
+
+    Fetch Initial Data: Using the stored token, fetch the user's conversation list via the conversations.list endpoint, using slack-morphism's pagination helpers to get all channels, DMs, etc.
+    .
+
+    Build Main UI: Create a two-pane layout. Populate a sidebar with the fetched conversations. When a channel is selected, fetch its message history (conversations.history) and display it in the main view using a GtkListBox or GtkListView
+    .
+
+    Implement Threaded Conversations:
+
+        Identify Threads: In the message list, check each message object. A message with a reply_count greater than zero is a thread parent. A message with a thread_ts property is a reply
+        . Visually indicate this in the UI.
+
+        UI Pattern for Threads: Use an AdwNavigationSplitView or AdwFlap
+        . When a user clicks to view a thread, the main channel view remains in the "content" pane, and the thread's messages appear in the "sidebar" or "flap" pane
+        .
+
+        Fetch Thread Replies: When a thread is opened, use the conversations.replies API method, providing the channel ID and the parent message's timestamp (ts)
+        . Handle pagination using the next_cursor if there are many replies
+        .
+
+        Post Replies: In the thread view's input box, send new messages using chat.postMessage, but crucially include the thread_ts parameter pointing to the parent message's timestamp
+        .
+
+Phase 4: Real-time Updates with Socket Mode
+
+To provide a responsive experience, the app must receive real-time events from Slack. Socket Mode is ideal for a desktop client as it uses a WebSocket and doesn't require a public HTTP endpoint
+.
+
+    Enable Socket Mode: In your Slack app's configuration, enable Socket Mode and generate an app-level token (prefixed with xapp-)
+    .
+
+    Architect for Asynchronous UI Updates:
+
+        Main Thread (GTK): Runs the GTK event loop and must remain unblocked
+        .
+
+        Background Thread (Tokio): A separate std::thread hosts the tokio runtime, managing the Socket Mode connection and all other async API calls
+        .
+
+        Communication Channel: Use a tokio::sync::mpsc channel to pass events from the background thread to the main UI thread.
+
+    Implement the Real-time Listener:
+
+        Spawn the background thread and connect the SlackSocketModeListener, which will send any SlackPushEvent it receives into the MPSC channel
+        .
+
+        On the main GTK thread, use glib::MainContext::default().spawn_local to listen on the receiver half of the channel
+        .
+
+        When an event is received, update the UI accordingly. This is safe because spawn_local ensures the code runs on the main UI thread.
+
+Phase 5: Implementing Key Features
+
+This phase details the implementation of several core user-facing features.
+
+    File Uploads:
+
+        Step 1: File Selection: Use a GtkFileChooserNative to present a platform-native file selection dialog
+        .
+
+        Step 2: Asynchronous File Reading: Spawn a blocking-safe thread (tokio::task::spawn_blocking) to read the file's contents without blocking the UI
+        .
+
+        Step 3: Modern Slack API Upload Flow: The files.upload method is deprecated
+        . The correct process is:
+
+            Call files.getUploadURLExternal, providing the filename and size, to get a temporary upload_url and file_id
+            .
+
+            Perform an HTTP POST request using reqwest with the file's byte data to the upload_url.
+
+            Call files.completeUploadExternal, providing the file_id and channel_id to finalize the upload
+            .
+
+        Step 4: Progress Indication: Use a GtkProgressBar to provide feedback, updating it from the main thread via a channel
+        .
+
+    Comprehensive Message Search:
+
+        UI Design: Create a dedicated search view. Use an adw::HeaderBar containing a gtk::SearchEntry for user input. The results will be displayed in a gtk::ListView
+        . Add filter controls like GtkDropDown for modifiers.
+
+        API Request Construction: Build a query string for the search.messages API call based on user input
+        . Programmatically add modifiers like from:@user, in:#channel, has:star, and date filters (before:, after:)
+        .
+
+        Pagination: The search.messages endpoint uses page-based pagination. In your UI state, track the current_page and total_pages from the API response. Implement a "Load More" button or an infinite scroll mechanism to request subsequent pages as needed
+        .
+
+    Saved Items (Stars) Feature:
+
+        UI Design: In the message view, add a star or bookmark icon to each message widget. Clicking it will toggle the saved state. Add a "Saved Items" entry to the main navigation sidebar to show all saved messages
+        .
+
+        Toggling Saved State: Use the stars.add and stars.remove methods from slack-morphism-rust. These calls require the channel_id and the message timestamp
+        .
+
+        Listing Saved Items: To populate the "Saved Items" view, use the stars.list method. This endpoint supports cursor-based pagination, so you can use the convenient scroller from slack-morphism-rust to fetch all items in a stream
+        .
+
+Phase 6: Rich Message Rendering
+
+Displaying message content correctly is critical. This involves parsing Slack's mrkdwn and Block Kit formats and rendering them as rich text in GTK.
+
+    Parse mrkdwn to Pango Markup:
+
+        Slack's mrkdwn is a variant of Markdown
+        . The most robust way to render it in a GtkLabel is to convert it to Pango markup
+        .
+
+        Use a crate like pulldown-cmark to parse the mrkdwn into a stream of events (e.g., Start(Tag::Bold), Text(...), End(Tag::Bold))
+        .
+
+        Iterate through this event stream and construct a Pango markup string (e.g., <b>...</b>). Set this string on a GtkLabel with its use_markup property set to true.
+
+    Handle Special Elements:
+
+        User Mentions (<@U12345678>): Parse these IDs, look up the user's display name (caching results from users.info), and render them distinctly (e.g., bold with a background color).
+
+        Code Blocks: For inline code (`code`), use Pango attributes to set a monospace font. For multiline code blocks (```...```), use a GtkSourceView widget to provide proper formatting and syntax highlighting.
+
+        Emoji: GTK labels support emoji rendering natively.
+
+    Render Block Kit Layouts:
+
+        slack-morphism-rust provides strongly-typed models for Block Kit elements
+        .
+
+        Write a recursive function that traverses the blocks array in a message object. For each block type, create a corresponding GTK widget
+        :
+
+            Section: Render with a GtkLabel (using the Pango parsing logic above).
+
+            Image: Render with a gtk::Image.
+
+            Actions: Render as a gtk::Box containing gtk::Button widgets.
+
+            Divider: Render as a gtk::Separator.
+
+        Using GTK's composite templates for each block type can make this code more manageable and maintainable
+        . The slack_blocks crate can also provide the necessary models for all components
+        .
+
+Phase 7: Packaging and Distribution
+
+    Finalize Flatpak Manifest: Create or finalize the flatpak-manifest.json file.
+
+    Set Permissions: Ensure the manifest requests the correct permissions (portals) for network access (--share=network) and file access (--filesystem=xdg-download:ro).
+
+    Prepare for Distribution: Build the Flatpak bundle and prepare for submission to a repository like Flathub, which is the standard for GNOME applications.
+
+Executive Summary
+
+The development of a lightweight Slack client for the GNOME desktop using Rust presents a valuable opportunity to provide a more resource-efficient and better-integrated alternative to the official Electron-based application. By focusing on a core set of the most used and appreciated Slack features—such as channels, threads, search, and file sharing—it is possible to create a highly functional client that appeals to a wide range of Linux users.
+
+The recommended technology stack of Rust, GTK4/libadwaita, and the slack-morphism-rust library provides a solid foundation for this project. The step-by-step implementation plan offers a clear roadmap, beginning with project setup and a secure, modern authentication flow using OAuth 2.0 with PKCE
+. This secure foundation is critical and involves using a local web server for the authentication callback and the system's native keychain for secure token storage
+.
+
+Subsequent phases detail the implementation of the core UI and a robust architecture for handling real-time events from Slack's Socket Mode
+. This architecture involves a dedicated tokio background thread for all network I/O and a communication channel to safely pass events to the main GTK thread, preventing the application from becoming unresponsive
+. The plan provides in-depth guidance for critical features like threaded conversations
+, file uploads using the modern two-step API
+, comprehensive message search with support for advanced modifiers
+, and the "Saved Items" feature
+. A crucial phase is dedicated to rich message rendering, detailing the process of parsing mrkdwn and Block Kit into native GTK widgets using Pango markup, ensuring messages are displayed accurately and beautifully
+. The end result will be a fast, memory-efficient, and visually consistent Slack client that feels at home on the GNOME desktop.
