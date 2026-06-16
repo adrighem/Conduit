@@ -28,6 +28,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 use crate::models::{AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage};
+use crate::rendering;
 use crate::runtime::{AppRuntime, RuntimeCommand, RuntimeEvent};
 
 mod imp {
@@ -87,6 +88,9 @@ mod imp {
         pub events: RefCell<Option<Receiver<RuntimeEvent>>>,
         pub conversations: RefCell<Vec<SlackConversation>>,
         pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
+        pub user_names: RefCell<HashMap<String, String>>,
+        pub current_channel_messages: RefCell<Vec<SlackMessage>>,
+        pub current_thread_messages: RefCell<Vec<SlackMessage>>,
         pub current_user_id: RefCell<Option<String>>,
         pub selected_channel: RefCell<Option<String>>,
         pub selected_thread_ts: RefCell<Option<String>>,
@@ -254,6 +258,8 @@ impl ConduitWindow {
                 messages,
             } => {
                 self.notify_if_new_messages(&channel_id, &messages);
+                self.request_user_names(&messages);
+                *self.imp().current_channel_messages.borrow_mut() = messages.clone();
                 self.populate_history(&channel_id, messages);
             }
             RuntimeEvent::ThreadLoaded {
@@ -261,10 +267,22 @@ impl ConduitWindow {
                 ts,
                 messages,
             } => {
+                self.request_user_names(&messages);
+                *self.imp().current_thread_messages.borrow_mut() = messages.clone();
                 self.populate_thread(&channel_id, &ts, messages);
             }
             RuntimeEvent::SearchLoaded(results) => self.populate_search_results(results),
             RuntimeEvent::SavedItemsLoaded(items) => self.populate_saved_items(items),
+            RuntimeEvent::UserLoaded {
+                user_id,
+                display_name,
+            } => {
+                self.imp()
+                    .user_names
+                    .borrow_mut()
+                    .insert(user_id, display_name);
+                self.rerender_current_messages();
+            }
             RuntimeEvent::MessagePosted {
                 channel_id,
                 message,
@@ -441,6 +459,9 @@ impl ConduitWindow {
         imp.content_stack.set_visible_child_name("login");
         *imp.current_user_id.borrow_mut() = None;
         imp.latest_message_ts_by_channel.borrow_mut().clear();
+        imp.user_names.borrow_mut().clear();
+        imp.current_channel_messages.borrow_mut().clear();
+        imp.current_thread_messages.borrow_mut().clear();
         self.clear_list(&imp.conversation_list);
         self.clear_list(&imp.message_list);
         self.clear_list(&imp.thread_list);
@@ -585,10 +606,10 @@ impl ConduitWindow {
             heading.add_css_class("caption");
             container.append(&heading);
 
-            let body = gtk::Label::new(Some(result.text.as_deref().unwrap_or_default()));
-            body.set_xalign(0.0);
-            body.set_wrap(true);
-            body.set_selectable(true);
+            let body = rendering::rich_label(
+                result.text.as_deref().unwrap_or_default(),
+                &self.imp().user_names.borrow(),
+            );
             container.append(&body);
 
             row.set_child(Some(&container));
@@ -627,16 +648,12 @@ impl ConduitWindow {
         container.set_margin_start(10);
         container.set_margin_end(10);
 
-        let heading = gtk::Label::new(Some(&message.author_label()));
+        let heading = gtk::Label::new(Some(&self.message_author_label(message)));
         heading.set_xalign(0.0);
         heading.add_css_class("caption");
         container.append(&heading);
 
-        let body = gtk::Label::new(Some(&message.body_text()));
-        body.set_xalign(0.0);
-        body.set_wrap(true);
-        body.set_selectable(true);
-        container.append(&body);
+        rendering::append_message_content(&container, message, &self.imp().user_names.borrow());
 
         if let Some(files) = message.files.as_ref() {
             for file in files {
@@ -797,6 +814,48 @@ impl ConduitWindow {
     fn send_command(&self, command: RuntimeCommand) {
         if let Some(runtime) = self.imp().runtime.borrow().as_ref() {
             runtime.send(command);
+        }
+    }
+
+    fn request_user_names(&self, messages: &[SlackMessage]) {
+        let mut ids = messages
+            .iter()
+            .flat_map(rendering::extract_user_ids)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+
+        for user_id in ids {
+            if !self.imp().user_names.borrow().contains_key(&user_id) {
+                self.send_command(RuntimeCommand::LoadUser { user_id });
+            }
+        }
+    }
+
+    fn message_author_label(&self, message: &SlackMessage) -> String {
+        if let Some(user_id) = message.user.as_ref() {
+            if let Some(name) = self.imp().user_names.borrow().get(user_id) {
+                return name.clone();
+            }
+        }
+
+        message.author_label()
+    }
+
+    fn rerender_current_messages(&self) {
+        let imp = self.imp();
+        if let Some(channel_id) = imp.selected_channel.borrow().clone() {
+            let messages = imp.current_channel_messages.borrow().clone();
+            if !messages.is_empty() {
+                self.populate_history(&channel_id, messages);
+            }
+
+            if let Some(thread_ts) = imp.selected_thread_ts.borrow().clone() {
+                let thread_messages = imp.current_thread_messages.borrow().clone();
+                if !thread_messages.is_empty() {
+                    self.populate_thread(&channel_id, &thread_ts, thread_messages);
+                }
+            }
         }
     }
 }

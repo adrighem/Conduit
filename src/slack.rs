@@ -6,7 +6,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUser,
+    StoredToken,
 };
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -115,6 +116,16 @@ impl SlackApi {
             .post_form("stars.list", &[("limit", "100".to_string())])
             .await?;
         Ok(response.items)
+    }
+
+    pub async fn user_display_name(&self, user_id: &str) -> Result<String> {
+        let response: UserInfoResponse = self
+            .post_form("users.info", &[("user", user_id.to_string())])
+            .await?;
+        Ok(response
+            .user
+            .display_name()
+            .unwrap_or_else(|| user_id.to_string()))
     }
 
     pub async fn post_message(
@@ -349,6 +360,14 @@ struct StarsListResponse {
     items: Vec<SavedItem>,
 }
 impl_slack_response!(StarsListResponse);
+
+#[derive(Debug, Deserialize)]
+struct UserInfoResponse {
+    ok: bool,
+    error: Option<String>,
+    user: SlackUser,
+}
+impl_slack_response!(UserInfoResponse);
 
 #[derive(Debug, Deserialize)]
 struct PostMessageResponse {

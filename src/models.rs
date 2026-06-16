@@ -150,3 +150,37 @@ pub struct SavedItem {
     pub channel: Option<String>,
     pub message: Option<SlackMessage>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SlackUser {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub real_name: Option<String>,
+    pub profile: Option<SlackUserProfile>,
+}
+
+impl SlackUser {
+    pub fn display_name(&self) -> Option<String> {
+        self.profile
+            .as_ref()
+            .and_then(SlackUserProfile::display_name)
+            .or_else(|| self.real_name.clone())
+            .or_else(|| self.name.clone())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SlackUserProfile {
+    pub display_name: Option<String>,
+    pub real_name: Option<String>,
+}
+
+impl SlackUserProfile {
+    pub fn display_name(&self) -> Option<String> {
+        self.display_name
+            .as_ref()
+            .filter(|name| !name.trim().is_empty())
+            .cloned()
+            .or_else(|| self.real_name.clone())
+    }
+}

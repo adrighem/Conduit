@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -27,6 +28,9 @@ pub enum RuntimeCommand {
         query: String,
     },
     LoadSavedItems,
+    LoadUser {
+        user_id: String,
+    },
     PostMessage {
         channel_id: String,
         text: String,
@@ -64,6 +68,10 @@ pub enum RuntimeEvent {
     },
     SearchLoaded(Vec<SearchMatch>),
     SavedItemsLoaded(Vec<SavedItem>),
+    UserLoaded {
+        user_id: String,
+        display_name: String,
+    },
     MessagePosted {
         channel_id: String,
         message: SlackMessage,
@@ -105,6 +113,7 @@ impl AppRuntime {
             let token_store = TokenStore;
             let oauth = SlackOAuthClient::new();
             let mut slack: Option<SlackApi> = None;
+            let mut user_cache = HashMap::new();
 
             while let Ok(command) = receiver.recv() {
                 let result = runtime.block_on(handle_command(
@@ -113,6 +122,7 @@ impl AppRuntime {
                     &token_store,
                     &oauth,
                     &mut slack,
+                    &mut user_cache,
                 ));
                 if let Err(error) = result {
                     let _ = events.send(RuntimeEvent::Error(error.to_string()));
@@ -134,6 +144,7 @@ async fn handle_command(
     token_store: &TokenStore,
     oauth: &SlackOAuthClient,
     slack: &mut Option<SlackApi>,
+    user_cache: &mut HashMap<String, String>,
 ) -> Result<()> {
     match command {
         RuntimeCommand::LoadStoredToken => {
@@ -164,6 +175,7 @@ async fn handle_command(
         RuntimeCommand::SignOut => {
             token_store.clear()?;
             *slack = None;
+            user_cache.clear();
             events.send_event(RuntimeEvent::SignedOut);
         }
         RuntimeCommand::RefreshConversations => {
@@ -197,6 +209,22 @@ async fn handle_command(
             let api = require_slack(slack)?;
             let items = api.saved_items().await?;
             events.send_event(RuntimeEvent::SavedItemsLoaded(items));
+        }
+        RuntimeCommand::LoadUser { user_id } => {
+            if let Some(display_name) = user_cache.get(&user_id).cloned() {
+                events.send_event(RuntimeEvent::UserLoaded {
+                    user_id,
+                    display_name,
+                });
+            } else {
+                let api = require_slack(slack)?;
+                let display_name = api.user_display_name(&user_id).await?;
+                user_cache.insert(user_id.clone(), display_name.clone());
+                events.send_event(RuntimeEvent::UserLoaded {
+                    user_id,
+                    display_name,
+                });
+            }
         }
         RuntimeCommand::PostMessage {
             channel_id,
