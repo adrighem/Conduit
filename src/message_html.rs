@@ -366,6 +366,14 @@ pre code {{
   line-height: 1;
 }}
 
+.action-button.is-text {{
+  width: auto;
+  min-width: 56px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+}}
+
 .action-button:hover,
 .more-summary:hover {{
   background: var(--soft);
@@ -985,9 +993,9 @@ fn message_actions_html(
             .filter(|count| *count > 0)
             .map(|count| format!("View thread ({count})"))
             .unwrap_or_else(|| "Reply in thread".to_string());
-        actions.push_str(&action_button_html(
+        actions.push_str(&text_action_button_html(
             &thread_action_url(channel_id, &message.ts),
-            "💬",
+            "Thread",
             &title,
             false,
         ));
@@ -1104,10 +1112,25 @@ fn quick_reactions() -> [(&'static str, &'static str, &'static str); 3] {
 }
 
 fn action_button_html(href: &str, label: &str, title: &str, active: bool) -> String {
+    action_button_html_with_class(href, label, title, active, "")
+}
+
+fn text_action_button_html(href: &str, label: &str, title: &str, active: bool) -> String {
+    action_button_html_with_class(href, label, title, active, " is-text")
+}
+
+fn action_button_html_with_class(
+    href: &str,
+    label: &str,
+    title: &str,
+    active: bool,
+    extra_class: &str,
+) -> String {
     let active_class = if active { " is-active" } else { "" };
     format!(
-        "<a class=\"action-button{}\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
+        "<a class=\"action-button{}{}\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
         active_class,
+        extra_class,
         escape_html(href),
         escape_html(title),
         escape_html(title),
@@ -1576,11 +1599,15 @@ mod tests {
         let html = conversation_document("C123", &[message], &context);
 
         assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains(">Thread</a>"));
         assert!(html.contains(
             "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=smile&amp;add=true"
         ));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=white_check_mark&amp;add=true"));
+        let check_action = html.find("name=white_check_mark").unwrap();
+        let thread_action = html.find(">Thread</a>").unwrap();
+        assert!(check_action < thread_action);
         assert!(html.contains("conduit://save?channel=C123&amp;ts=1710000000.000100&amp;add=false"));
         assert!(html.contains("conduit://copy-link?channel=C123&amp;ts=1710000000.000100"));
         assert!(html.contains("conduit://copy-message?channel=C123&amp;ts=1710000000.000100"));
