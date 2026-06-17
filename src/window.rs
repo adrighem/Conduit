@@ -18,16 +18,18 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::models::{AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage};
+use crate::auth;
+use crate::config;
+use crate::models::{SavedItem, SearchMatch, SlackConversation, SlackMessage};
 use crate::rendering;
 use crate::runtime::{AppRuntime, RuntimeCommand, RuntimeEvent};
 
@@ -43,6 +45,8 @@ mod imp {
         pub status_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub client_id_entry: TemplateChild<gtk::Entry>,
+        #[template_child]
+        pub setup_hint_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub connect_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -72,14 +76,6 @@ mod imp {
         #[template_child]
         pub sign_out_button: TemplateChild<gtk::Button>,
         #[template_child]
-        pub realtime_token_entry: TemplateChild<gtk::Entry>,
-        #[template_child]
-        pub start_realtime_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub stop_realtime_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub realtime_status_label: TemplateChild<gtk::Label>,
-        #[template_child]
         pub thread_pane: TemplateChild<gtk::Box>,
         #[template_child]
         pub thread_title: TemplateChild<gtk::Label>,
@@ -94,6 +90,7 @@ mod imp {
 
         pub runtime: RefCell<Option<AppRuntime>>,
         pub events: RefCell<Option<Receiver<RuntimeEvent>>>,
+        pub connect_requested: Cell<bool>,
         pub conversations: RefCell<Vec<SlackConversation>>,
         pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<HashMap<String, String>>,
@@ -124,8 +121,10 @@ mod imp {
             self.parent_constructed();
             let obj = self.obj();
             obj.setup_runtime();
+            obj.configure_auth_ui();
             obj.setup_callbacks();
             obj.show_loading("Checking secure storage");
+            obj.send_command(RuntimeCommand::LoadStoredToken);
         }
     }
 
@@ -164,14 +163,10 @@ impl ConduitWindow {
             window.drain_runtime_events();
             glib::ControlFlow::Continue
         });
-
-        runtime.send(RuntimeCommand::LoadStoredToken);
-        runtime.send(RuntimeCommand::LoadStoredRealtimeToken);
     }
 
     fn setup_callbacks(&self) {
         let imp = self.imp();
-        imp.stop_realtime_button.set_sensitive(false);
 
         self.connect_widget(&imp.connect_button.get(), |window| window.start_oauth());
         self.connect_widget(&imp.refresh_button.get(), |window| {
@@ -182,12 +177,6 @@ impl ConduitWindow {
         });
         self.connect_widget(&imp.sign_out_button.get(), |window| {
             window.send_command(RuntimeCommand::SignOut)
-        });
-        self.connect_widget(&imp.start_realtime_button.get(), |window| {
-            window.start_realtime()
-        });
-        self.connect_widget(&imp.stop_realtime_button.get(), |window| {
-            window.send_command(RuntimeCommand::StopRealtime)
         });
         self.connect_widget(&imp.search_button.get(), |window| window.search_messages());
         self.connect_widget(&imp.send_button.get(), |window| {
@@ -262,34 +251,25 @@ impl ConduitWindow {
 
     fn handle_runtime_event(&self, event: RuntimeEvent) {
         match event {
-            RuntimeEvent::Status(status) => self.set_status(&status),
-            RuntimeEvent::Error(error) => self.show_error(&error),
-            RuntimeEvent::SignedOut => self.show_login("Signed out"),
-            RuntimeEvent::Authenticated(auth) => self.show_workspace(auth),
-            RuntimeEvent::RealtimeTokenLoaded(app_token) => {
-                if let Some(app_token) = app_token {
-                    self.imp().realtime_token_entry.set_text(&app_token);
+            RuntimeEvent::Status(status) => {
+                if !self.imp().connect_requested.get() {
+                    self.set_status(&status);
                 }
             }
-            RuntimeEvent::RealtimeStarted => {
-                self.imp().realtime_status_label.set_label("Realtime on");
-                self.imp().start_realtime_button.set_sensitive(false);
-                self.imp().stop_realtime_button.set_sensitive(true);
+            RuntimeEvent::Error(error) => self.show_error(&error),
+            RuntimeEvent::SignedOut => {
+                self.imp().connect_requested.set(false);
+                self.show_login("Choose a workspace to continue");
             }
-            RuntimeEvent::RealtimeStopped => {
-                self.imp().realtime_status_label.set_label("Realtime off");
-                self.imp().start_realtime_button.set_sensitive(true);
-                self.imp().stop_realtime_button.set_sensitive(false);
-            }
-            RuntimeEvent::RealtimeStatus(status) => {
-                self.imp().realtime_status_label.set_label(&status);
-                self.set_status(&status);
-            }
-            RuntimeEvent::RealtimeMessage { channel_id } => {
-                self.handle_realtime_message(&channel_id);
+            RuntimeEvent::Authenticated(auth) => {
+                if !self.imp().connect_requested.get() {
+                    self.show_workspace(auth);
+                }
             }
             RuntimeEvent::ConversationsLoaded(conversations) => {
-                self.populate_conversations(conversations);
+                if !self.imp().connect_requested.get() {
+                    self.populate_conversations(conversations);
+                }
             }
             RuntimeEvent::HistoryLoaded {
                 channel_id,
@@ -359,28 +339,31 @@ impl ConduitWindow {
         }
     }
 
+    fn configure_auth_ui(&self) {
+        let imp = self.imp();
+        if let Some(client_id) = config::slack_client_id() {
+            imp.client_id_entry.set_text(&client_id);
+            imp.client_id_entry.set_visible(false);
+            imp.setup_hint_label.set_visible(false);
+        } else {
+            imp.setup_hint_label.set_label(&format!(
+                "Use redirect URL {} in the Slack app settings.",
+                auth::OAuthConfig::new("").redirect_uri()
+            ));
+        }
+    }
+
     fn start_oauth(&self) {
         let client_id = self.imp().client_id_entry.text().trim().to_string();
         if client_id.is_empty() {
-            self.show_login("Enter a Slack client ID");
+            self.show_login("Enter a Slack app client ID");
             return;
         }
 
+        self.imp().connect_requested.set(false);
+        self.imp().connect_button.set_sensitive(false);
         self.show_loading("Opening Slack authorization");
         self.send_command(RuntimeCommand::StartOAuth { client_id });
-    }
-
-    fn start_realtime(&self) {
-        let app_token = self.imp().realtime_token_entry.text().trim().to_string();
-        if app_token.is_empty() {
-            self.imp()
-                .realtime_status_label
-                .set_label("Enter an xapp token");
-            return;
-        }
-
-        self.imp().start_realtime_button.set_sensitive(false);
-        self.send_command(RuntimeCommand::StartRealtime { app_token });
     }
 
     fn search_messages(&self) {
@@ -499,30 +482,40 @@ impl ConduitWindow {
     fn show_loading(&self, status: &str) {
         let imp = self.imp();
         imp.status_label.set_label(status);
+        imp.connection_label.set_label(status);
         imp.content_stack.set_visible_child_name("loading");
     }
 
     fn show_login(&self, status: &str) {
         let imp = self.imp();
+        self.reset_workspace_state();
+        imp.connect_button.set_sensitive(true);
+        imp.connection_label.set_label(status);
+        imp.content_stack.set_visible_child_name("connect");
+    }
+
+    pub(crate) fn show_connect_requested(&self) {
+        self.imp().connect_requested.set(true);
+        self.show_login("Choose a workspace to continue");
+    }
+
+    fn reset_workspace_state(&self) {
+        let imp = self.imp();
         *imp.selected_channel.borrow_mut() = None;
         *imp.selected_thread_ts.borrow_mut() = None;
-        imp.connection_label.set_label(status);
-        imp.content_stack.set_visible_child_name("login");
         *imp.current_user_id.borrow_mut() = None;
         imp.latest_message_ts_by_channel.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
         imp.current_channel_messages.borrow_mut().clear();
         imp.current_thread_messages.borrow_mut().clear();
-        imp.realtime_status_label.set_label("Realtime off");
-        imp.start_realtime_button.set_sensitive(true);
-        imp.stop_realtime_button.set_sensitive(false);
         self.clear_list(&imp.conversation_list);
         self.clear_list(&imp.message_list);
         self.clear_list(&imp.thread_list);
     }
 
-    fn show_workspace(&self, auth: AuthInfo) {
+    fn show_workspace(&self, auth: crate::models::AuthInfo) {
         *self.imp().current_user_id.borrow_mut() = auth.user_id.clone();
+        self.imp().connect_button.set_sensitive(true);
         let label = auth
             .team
             .or(auth.team_id)
@@ -543,9 +536,10 @@ impl ConduitWindow {
         self.imp().thread_send_button.set_sensitive(true);
         self.imp().upload_button.set_sensitive(true);
         self.imp().upload_progress.set_visible(false);
-        self.set_status(error);
         if self.imp().content_stack.visible_child_name().as_deref() == Some("loading") {
-            self.imp().content_stack.set_visible_child_name("login");
+            self.show_login(error);
+        } else {
+            self.set_status(error);
         }
     }
 
@@ -868,21 +862,6 @@ impl ConduitWindow {
     fn send_command(&self, command: RuntimeCommand) {
         if let Some(runtime) = self.imp().runtime.borrow().as_ref() {
             runtime.send(command);
-        }
-    }
-
-    fn handle_realtime_message(&self, channel_id: &str) {
-        self.send_notification(&self.conversation_title(channel_id), "New Slack activity");
-
-        if self.imp().selected_channel.borrow().as_deref() == Some(channel_id) {
-            self.send_command(RuntimeCommand::LoadHistory {
-                channel_id: channel_id.to_string(),
-            });
-        } else {
-            self.set_status(&format!(
-                "New activity in {}",
-                self.conversation_title(channel_id)
-            ));
         }
     }
 

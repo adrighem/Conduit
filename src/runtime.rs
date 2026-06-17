@@ -6,8 +6,9 @@ use std::thread;
 use anyhow::{Context, Result};
 
 use crate::auth::{OAuthConfig, SlackOAuthClient, TokenStore};
-use crate::models::{AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage};
-use crate::realtime::SocketModeClient;
+use crate::models::{
+    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage, StoredToken,
+};
 use crate::slack::SlackApi;
 
 #[derive(Debug)]
@@ -17,11 +18,6 @@ pub enum RuntimeCommand {
         client_id: String,
     },
     SignOut,
-    LoadStoredRealtimeToken,
-    StartRealtime {
-        app_token: String,
-    },
-    StopRealtime,
     RefreshConversations,
     LoadHistory {
         channel_id: String,
@@ -62,13 +58,6 @@ pub enum RuntimeEvent {
     Error(String),
     SignedOut,
     Authenticated(AuthInfo),
-    RealtimeTokenLoaded(Option<String>),
-    RealtimeStarted,
-    RealtimeStopped,
-    RealtimeStatus(String),
-    RealtimeMessage {
-        channel_id: String,
-    },
     ConversationsLoaded(Vec<SlackConversation>),
     HistoryLoaded {
         channel_id: String,
@@ -127,7 +116,6 @@ impl AppRuntime {
             let oauth = SlackOAuthClient::new();
             let mut slack: Option<SlackApi> = None;
             let mut user_cache = HashMap::new();
-            let mut realtime_task: Option<tokio::task::JoinHandle<()>> = None;
 
             while let Ok(command) = receiver.recv() {
                 let result = runtime.block_on(handle_command(
@@ -137,7 +125,6 @@ impl AppRuntime {
                     &oauth,
                     &mut slack,
                     &mut user_cache,
-                    &mut realtime_task,
                 ));
                 if let Err(error) = result {
                     let _ = events.send(RuntimeEvent::Error(error.to_string()));
@@ -160,76 +147,36 @@ async fn handle_command(
     oauth: &SlackOAuthClient,
     slack: &mut Option<SlackApi>,
     user_cache: &mut HashMap<String, String>,
-    realtime_task: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     match command {
         RuntimeCommand::LoadStoredToken => {
             events.send_status("Checking secure storage");
-            if let Some(token) = token_store.load()? {
-                let api = SlackApi::new(token);
-                let auth = api
-                    .auth_test()
-                    .await
-                    .context("stored Slack token is not valid")?;
-                *slack = Some(api);
-                events.send_event(RuntimeEvent::Authenticated(auth));
+            if let Some(mut token) = token_store.load()? {
+                if token.should_refresh() {
+                    events.send_status("Refreshing Slack session");
+                    token = oauth.refresh(&token).await?;
+                    token_store.save(&token)?;
+                }
+                connect_with_token(events, slack, token).await?;
+                user_cache.clear();
                 load_conversations(events, slack).await?;
             } else {
-                events.send_status("Not connected");
+                events.send_event(RuntimeEvent::SignedOut);
             }
         }
         RuntimeCommand::StartOAuth { client_id } => {
             events.send_status("Opening Slack authorization");
             let token = oauth.authenticate(OAuthConfig::new(client_id)).await?;
             token_store.save(&token)?;
-            let api = SlackApi::new(token);
-            let auth = api.auth_test().await?;
-            *slack = Some(api);
-            events.send_event(RuntimeEvent::Authenticated(auth));
+            connect_with_token(events, slack, token).await?;
+            user_cache.clear();
             load_conversations(events, slack).await?;
         }
         RuntimeCommand::SignOut => {
             token_store.clear()?;
             *slack = None;
             user_cache.clear();
-            if let Some(task) = realtime_task.take() {
-                task.abort();
-            }
             events.send_event(RuntimeEvent::SignedOut);
-        }
-        RuntimeCommand::LoadStoredRealtimeToken => {
-            events.send_event(RuntimeEvent::RealtimeTokenLoaded(
-                token_store.load_app_token()?,
-            ));
-        }
-        RuntimeCommand::StartRealtime { app_token } => {
-            if !app_token.starts_with("xapp-") {
-                events.send_event(RuntimeEvent::RealtimeStatus(
-                    "Realtime token must start with xapp-".to_string(),
-                ));
-                return Ok(());
-            }
-
-            token_store.save_app_token(&app_token)?;
-            if let Some(task) = realtime_task.take() {
-                task.abort();
-            }
-
-            let client = SocketModeClient::new(app_token);
-            let realtime_events = events.clone();
-            *realtime_task = Some(tokio::spawn(async move {
-                client.run(realtime_events).await;
-            }));
-            events.send_event(RuntimeEvent::RealtimeStatus(
-                "Starting realtime".to_string(),
-            ));
-        }
-        RuntimeCommand::StopRealtime => {
-            if let Some(task) = realtime_task.take() {
-                task.abort();
-            }
-            token_store.clear_app_token()?;
-            events.send_event(RuntimeEvent::RealtimeStopped);
         }
         RuntimeCommand::RefreshConversations => {
             load_conversations(events, slack).await?;
@@ -343,6 +290,22 @@ async fn handle_command(
     Ok(())
 }
 
+async fn connect_with_token(
+    events: &Sender<RuntimeEvent>,
+    slack: &mut Option<SlackApi>,
+    token: StoredToken,
+) -> Result<()> {
+    let token_team = token.team_name.clone().or(token.team_id.clone());
+    let token_user = token.user_id.clone();
+    let api = SlackApi::new(token);
+    let mut auth = api.auth_test().await?;
+    auth.team = auth.team.or(token_team);
+    auth.user_id = auth.user_id.or(token_user);
+    *slack = Some(api);
+    events.send_event(RuntimeEvent::Authenticated(auth));
+    Ok(())
+}
+
 async fn load_conversations(
     events: &Sender<RuntimeEvent>,
     slack: &mut Option<SlackApi>,
@@ -355,9 +318,7 @@ async fn load_conversations(
 }
 
 fn require_slack(slack: &Option<SlackApi>) -> Result<&SlackApi> {
-    slack
-        .as_ref()
-        .context("Connect to Slack before using this action")
+    slack.as_ref().context("No Slack workspace is available")
 }
 
 trait EventSenderExt {

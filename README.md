@@ -16,17 +16,33 @@ meson test -C _build
 
 `cargo check` and `cargo test` are also supported for Rust validation, but running the app expects the compiled GResource from the Meson build or an installed build.
 
+Packaged builds can provide a default Slack app client ID so users only need to choose **Connect Workspace**:
+
+```sh
+meson setup _build -Dslack_client_id=1234567890.1234567890123
+```
+
+For local development, you can also set `CONDUIT_SLACK_CLIENT_ID` before running `cargo` or paste the client ID into the first-run screen.
+
+To open the workspace connection flow explicitly, start Conduit with `--connect` or `-c`. This does not remove the current stored token; the token is replaced only after a new Slack authorization succeeds.
+
 ## Slack App Setup
 
-Create a Slack app and enable PKCE for desktop OAuth. Use this redirect URL:
+Create a Slack app, enable PKCE for OAuth, and add this redirect URL:
 
 ```text
 http://127.0.0.1:8934/callback
 ```
 
-The client currently uses Slack's user-token PKCE flow (`oauth.v2.user.access`) and requests user scopes. Slack desktop PKCE redirects cannot request bot scopes. Socket Mode requires a separate app-level token and is intentionally left for a later opt-in slice.
+The client uses Slack's user-token PKCE flow (`oauth.v2.user.access`) and requests user scopes. Desktop PKCE redirects cannot request bot scopes, so Conduit avoids bot-token setup for the core workspace connection.
 
-For realtime updates, enable Socket Mode in the Slack app, create an app-level token with `connections:write`, and paste the `xapp-` token into the realtime field in Conduit. The token is stored in the system keyring.
+Required user scopes:
+
+```text
+channels:read,channels:history,groups:read,groups:history,im:read,im:history,mpim:read,mpim:history,users:read,chat:write,search:read,stars:read,stars:write,reactions:read,reactions:write,files:read,files:write
+```
+
+After approval, Conduit validates the session with `auth.test` and stores the token in the system keyring. Use the sign-out button in the workspace toolbar to remove the stored token.
 
 ## Status
 

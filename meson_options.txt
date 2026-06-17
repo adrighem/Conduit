@@ -1,0 +1,6 @@
+option(
+  'slack_client_id',
+  type: 'string',
+  value: '',
+  description: 'Slack OAuth client ID for packaged builds',
+)

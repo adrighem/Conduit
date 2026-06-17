@@ -14,6 +14,7 @@ cargo_env  = [
   'CARGO_HOME=' + meson.project_build_root()  / 'cargo-home',
   'CONDUIT_LOCALEDIR=' + get_option('prefix') / get_option('localedir'),
   'CONDUIT_PKGDATADIR=' + pkgdatadir,
+  'CONDUIT_SLACK_CLIENT_ID=' + get_option('slack_client_id'),
 ]
 
 if get_option('buildtype') == 'release'
@@ -33,11 +34,12 @@ cargo_build = custom_target(
   install_dir: get_option('bindir'),
   command: [
     'bash', '-c',
-    'release_arg="$6"; if [[ -n "$release_arg" ]]; then env "$1" "$2" "$3" "$4" build --manifest-path "$5" --target-dir "$7" "$release_arg"; else env "$1" "$2" "$3" "$4" build --manifest-path "$5" --target-dir "$7"; fi && cp "$7/$8/$9" "${10}"',
+    'release_arg="$7"; if [[ -n "$release_arg" ]]; then env "$1" "$2" "$3" "$4" "$5" build --manifest-path "$6" --target-dir "$8" "$release_arg"; else env "$1" "$2" "$3" "$4" "$5" build --manifest-path "$6" --target-dir "$8"; fi && cp "$8/$9/${10}" "${11}"',
     'cargo-build',
     cargo_env[0],
     cargo_env[1],
     cargo_env[2],
+    cargo_env[3],
     cargo_bin.full_path(),
     meson.project_source_root() / 'Cargo.toml',
     cargo_release_arg,

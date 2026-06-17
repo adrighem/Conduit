@@ -22,7 +22,6 @@ mod application;
 mod auth;
 mod config;
 mod models;
-mod realtime;
 mod rendering;
 mod runtime;
 mod slack;
@@ -51,7 +50,10 @@ fn main() -> glib::ExitCode {
     // Create a new GtkApplication. The application manages our main loop,
     // application windows, integration with the window manager/compositor, and
     // desktop features such as file opening and single-instance applications.
-    let app = ConduitApplication::new("eu.vanadrighem.conduit", &gio::ApplicationFlags::empty());
+    let app = ConduitApplication::new(
+        "eu.vanadrighem.conduit",
+        &gio::ApplicationFlags::HANDLES_COMMAND_LINE,
+    );
 
     // Run the application. This function will block until the application
     // exits. Upon return, we have our exit code to return to the shell. (This

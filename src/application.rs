@@ -43,6 +43,7 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
+            obj.setup_options();
             obj.setup_gactions();
             obj.set_accels_for_action("app.quit", &["<control>q"]);
         }
@@ -55,14 +56,14 @@ mod imp {
         // to do that, we'll just present any existing window.
         fn activate(&self) {
             let application = self.obj();
-            // Get the current window or create one if necessary
-            let window = application.active_window().unwrap_or_else(|| {
-                let window = ConduitWindow::new(&*application);
-                window.upcast()
-            });
+            application.present_window(false);
+        }
 
-            // Ask the window manager/compositor to present the window
-            window.present();
+        fn command_line(&self, command_line: &gio::ApplicationCommandLine) -> glib::ExitCode {
+            let application = self.obj();
+            let connect = command_line.options_dict().contains("connect");
+            application.present_window(connect);
+            0.into()
         }
     }
 
@@ -89,35 +90,40 @@ impl ConduitApplication {
         let quit_action = gio::ActionEntry::builder("quit")
             .activate(move |app: &Self, _, _| app.quit())
             .build();
-        let preferences_action = gio::ActionEntry::builder("preferences")
-            .activate(move |app: &Self, _, _| app.show_preferences())
-            .build();
         let shortcuts_action = gio::ActionEntry::builder("shortcuts")
             .activate(move |app: &Self, _, _| app.show_shortcuts())
             .build();
         let about_action = gio::ActionEntry::builder("about")
             .activate(move |app: &Self, _, _| app.show_about())
             .build();
-        self.add_action_entries([
-            quit_action,
-            preferences_action,
-            shortcuts_action,
-            about_action,
-        ]);
+        self.add_action_entries([quit_action, shortcuts_action, about_action]);
         self.set_accels_for_action("app.shortcuts", &["<control>question"]);
     }
 
-    fn show_preferences(&self) {
-        let Some(window) = self.active_window() else {
-            return;
-        };
-        let dialog = adw::AlertDialog::new(
-            Some("Preferences"),
-            Some("Conduit stores Slack tokens in the system keyring. More preferences will be added as Slack features land."),
+    fn setup_options(&self) {
+        self.add_main_option(
+            "connect",
+            glib::Char::from(b'c'),
+            glib::OptionFlags::NONE,
+            glib::OptionArg::None,
+            "Open the Slack workspace connection flow",
+            None,
         );
-        dialog.add_response("close", "Close");
-        dialog.set_default_response(Some("close"));
-        dialog.present(Some(&window));
+    }
+
+    fn present_window(&self, connect: bool) {
+        let window = self.active_window().unwrap_or_else(|| {
+            let window = ConduitWindow::new(self);
+            window.upcast()
+        });
+
+        if connect {
+            if let Ok(window) = window.clone().downcast::<ConduitWindow>() {
+                window.show_connect_requested();
+            }
+        }
+
+        window.present();
     }
 
     fn show_shortcuts(&self) {

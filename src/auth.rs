@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -8,14 +9,13 @@ use rand::random;
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tiny_http::{Response, Server};
+use tiny_http::{Header, Response, Server, StatusCode};
 use url::Url;
 
 use crate::models::StoredToken;
 
 const KEYRING_SERVICE: &str = "eu.vanadrighem.conduit";
 const KEYRING_USER: &str = "slack-user-token";
-const KEYRING_APP_TOKEN_USER: &str = "slack-app-token";
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8934;
 pub const DEFAULT_USER_SCOPES: &[&str] = &[
@@ -94,30 +94,6 @@ impl TokenStore {
             Err(error) => Err(error).context("failed to delete Slack token from keyring"),
         }
     }
-
-    pub fn load_app_token(&self) -> Result<Option<String>> {
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_APP_TOKEN_USER)?;
-        match entry.get_password() {
-            Ok(token) => Ok(Some(token)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error).context("failed to read Slack app token from keyring"),
-        }
-    }
-
-    pub fn save_app_token(&self, app_token: &str) -> Result<()> {
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_APP_TOKEN_USER)?;
-        entry
-            .set_password(app_token)
-            .context("failed to save Slack app token to keyring")
-    }
-
-    pub fn clear_app_token(&self) -> Result<()> {
-        let entry = Entry::new(KEYRING_SERVICE, KEYRING_APP_TOKEN_USER)?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error).context("failed to delete Slack app token from keyring"),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -133,7 +109,8 @@ impl SlackOAuthClient {
     }
 
     pub async fn authenticate(&self, config: OAuthConfig) -> Result<StoredToken> {
-        if config.client_id.trim().is_empty() {
+        let client_id = config.client_id.trim().to_string();
+        if client_id.is_empty() {
             return Err(anyhow!("Slack client ID is required"));
         }
 
@@ -145,7 +122,7 @@ impl SlackOAuthClient {
             wait_for_oauth_callback(config.redirect_port, authorize_url, state.clone()).await?;
 
         if callback.state.as_deref() != Some(state.as_str()) {
-            return Err(anyhow!("OAuth state mismatch"));
+            return Err(anyhow!("Slack authorization state did not match"));
         }
 
         if let Some(error) = callback.error {
@@ -156,14 +133,21 @@ impl SlackOAuthClient {
             .code
             .ok_or_else(|| anyhow!("Slack authorization did not return a code"))?;
 
-        exchange_user_code(
-            &self.http,
-            &config.client_id,
-            &redirect_uri,
-            &pkce.verifier,
-            &code,
-        )
-        .await
+        exchange_user_code(&self.http, &client_id, &redirect_uri, &pkce.verifier, &code).await
+    }
+
+    pub async fn refresh(&self, token: &StoredToken) -> Result<StoredToken> {
+        let client_id = token
+            .client_id
+            .as_deref()
+            .filter(|client_id| !client_id.trim().is_empty())
+            .ok_or_else(|| anyhow!("stored Slack token cannot be refreshed without a client ID"))?;
+        let refresh_token = token
+            .refresh_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("stored Slack token does not include a refresh token"))?;
+
+        refresh_user_token(&self.http, client_id, refresh_token, token).await
     }
 }
 
@@ -248,18 +232,26 @@ async fn wait_for_oauth_callback(
 
         open::that_detached(&authorize_url).context("failed to open Slack authorization URL")?;
 
-        let request = server.recv().context("failed to receive OAuth callback")?;
+        let request = server
+            .recv_timeout(Duration::from_secs(300))
+            .context("failed to receive OAuth callback")?
+            .ok_or_else(|| anyhow!("Slack authorization timed out"))?;
         let callback_url = Url::parse(&format!("http://127.0.0.1{}", request.url()))
             .context("failed to parse OAuth callback URL")?;
         let params: HashMap<String, String> = callback_url.query_pairs().into_owned().collect();
 
         let state_ok = params.get("state").map(String::as_str) == Some(expected_state.as_str());
-        let body = if state_ok && params.contains_key("code") {
-            "Conduit is connected. You can close this window."
+        let success = state_ok && params.contains_key("code");
+        let page = callback_page(success);
+        let mut response = Response::from_string(page).with_status_code(if success {
+            StatusCode(200)
         } else {
-            "Conduit could not complete Slack authorization. Return to the app for details."
-        };
-        let _ = request.respond(Response::from_string(body));
+            StatusCode(400)
+        });
+        if let Ok(header) = Header::from_bytes("Content-Type", "text/html; charset=utf-8") {
+            response = response.with_header(header);
+        }
+        let _ = request.respond(response);
 
         Ok(OAuthCallback {
             code: params.get("code").cloned(),
@@ -270,6 +262,14 @@ async fn wait_for_oauth_callback(
     .await?
 }
 
+fn callback_page(success: bool) -> &'static str {
+    if success {
+        r#"<!doctype html><meta charset="utf-8"><title>Conduit connected</title><body style="font:16px system-ui,sans-serif;max-width:40rem;margin:4rem auto;line-height:1.5"><h1>Conduit is connected</h1><p>You can close this browser tab and return to Conduit.</p></body>"#
+    } else {
+        r#"<!doctype html><meta charset="utf-8"><title>Conduit authorization failed</title><body style="font:16px system-ui,sans-serif;max-width:40rem;margin:4rem auto;line-height:1.5"><h1>Conduit could not connect</h1><p>Return to Conduit for details.</p></body>"#
+    }
+}
+
 async fn exchange_user_code(
     http: &Client,
     client_id: &str,
@@ -277,15 +277,44 @@ async fn exchange_user_code(
     code_verifier: &str,
     code: &str,
 ) -> Result<StoredToken> {
-    let response = http
-        .post("https://slack.com/api/oauth.v2.user.access")
-        .form(&[
+    let response = oauth_user_access(
+        http,
+        &[
             ("client_id", client_id),
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("code_verifier", code_verifier),
             ("grant_type", "authorization_code"),
-        ])
+        ],
+    )
+    .await?;
+
+    token_from_response(response, Some(client_id), None)
+}
+
+async fn refresh_user_token(
+    http: &Client,
+    client_id: &str,
+    refresh_token: &str,
+    previous: &StoredToken,
+) -> Result<StoredToken> {
+    let response = oauth_user_access(
+        http,
+        &[
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ],
+    )
+    .await?;
+
+    token_from_response(response, Some(client_id), Some(previous))
+}
+
+async fn oauth_user_access(http: &Client, params: &[(&str, &str)]) -> Result<OAuthTokenResponse> {
+    let response = http
+        .post("https://slack.com/api/oauth.v2.user.access")
+        .form(params)
         .send()
         .await
         .context("failed to exchange Slack OAuth code")?
@@ -304,18 +333,53 @@ async fn exchange_user_code(
         ));
     }
 
+    Ok(response)
+}
+
+fn token_from_response(
+    response: OAuthTokenResponse,
+    client_id: Option<&str>,
+    previous: Option<&StoredToken>,
+) -> Result<StoredToken> {
     let access_token = response
         .access_token
         .ok_or_else(|| anyhow!("Slack OAuth response did not include an access token"))?;
+    let expires_at = response
+        .expires_in
+        .map(|expires_in| StoredToken::expires_at_from_now(expires_in));
 
     Ok(StoredToken {
         access_token,
-        token_type: response.token_type,
-        scope: response.scope,
-        refresh_token: response.refresh_token,
-        expires_in: response.expires_in,
-        team_id: response.team.as_ref().and_then(|team| team.id.clone()),
-        team_name: response.team.and_then(|team| team.name),
-        user_id: response.authed_user.and_then(|user| user.id),
+        token_type: response.token_type.or_else(|| {
+            previous
+                .and_then(|token| token.token_type.clone())
+                .or_else(|| Some("user".to_string()))
+        }),
+        scope: response
+            .scope
+            .or_else(|| previous.and_then(|token| token.scope.clone())),
+        refresh_token: response
+            .refresh_token
+            .or_else(|| previous.and_then(|token| token.refresh_token.clone())),
+        expires_in: response
+            .expires_in
+            .or_else(|| previous.and_then(|token| token.expires_in)),
+        expires_at: expires_at.or_else(|| previous.and_then(|token| token.expires_at)),
+        team_id: response
+            .team
+            .as_ref()
+            .and_then(|team| team.id.clone())
+            .or_else(|| previous.and_then(|token| token.team_id.clone())),
+        team_name: response
+            .team
+            .and_then(|team| team.name)
+            .or_else(|| previous.and_then(|token| token.team_name.clone())),
+        user_id: response
+            .authed_user
+            .and_then(|user| user.id)
+            .or_else(|| previous.and_then(|token| token.user_id.clone())),
+        client_id: client_id
+            .map(ToString::to_string)
+            .or_else(|| previous.and_then(|token| token.client_id.clone())),
     })
 }

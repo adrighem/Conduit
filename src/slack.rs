@@ -15,14 +15,14 @@ const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 #[derive(Clone)]
 pub struct SlackApi {
     http: Client,
-    token: StoredToken,
+    access_token: String,
 }
 
 impl SlackApi {
     pub fn new(token: StoredToken) -> Self {
         Self {
             http: Client::new(),
-            token,
+            access_token: token.access_token,
         }
     }
 
@@ -30,9 +30,9 @@ impl SlackApi {
         let response: AuthTestResponse = self.post_form("auth.test", &[]).await?;
         Ok(AuthInfo {
             team: response.team,
-            team_id: response.team_id.or_else(|| self.token.team_id.clone()),
+            team_id: response.team_id,
             user: response.user,
-            user_id: response.user_id.or_else(|| self.token.user_id.clone()),
+            user_id: response.user_id,
             url: response.url,
         })
     }
@@ -246,7 +246,7 @@ impl SlackApi {
         let response = self
             .http
             .post(url)
-            .bearer_auth(&self.token.access_token)
+            .bearer_auth(&self.access_token)
             .form(params)
             .send()
             .await

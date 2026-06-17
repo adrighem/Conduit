@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredToken {
@@ -8,9 +9,24 @@ pub struct StoredToken {
     pub scope: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_in: Option<u64>,
+    pub expires_at: Option<u64>,
     pub team_id: Option<String>,
     pub team_name: Option<String>,
     pub user_id: Option<String>,
+    pub client_id: Option<String>,
+}
+
+impl StoredToken {
+    pub fn expires_at_from_now(expires_in: u64) -> u64 {
+        now_unix().saturating_add(expires_in)
+    }
+
+    pub fn should_refresh(&self) -> bool {
+        let Some(expires_at) = self.expires_at else {
+            return false;
+        };
+        expires_at <= now_unix().saturating_add(300)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -20,6 +36,13 @@ pub struct AuthInfo {
     pub user: Option<String>,
     pub user_id: Option<String>,
     pub url: Option<String>,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
