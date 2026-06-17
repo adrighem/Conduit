@@ -317,6 +317,16 @@ pre code {{
   font-size: 12px;
 }}
 
+.reaction.thread-reaction {{
+  color: var(--accent);
+  font-weight: 600;
+}}
+
+.reaction.thread-reaction:hover {{
+  background: var(--accent-soft);
+  text-decoration: none;
+}}
+
 .reaction.is-active {{
   background: var(--success-soft);
   color: var(--text);
@@ -364,14 +374,6 @@ pre code {{
   color: var(--text);
   font: inherit;
   line-height: 1;
-}}
-
-.action-button.is-text {{
-  width: auto;
-  min-width: 56px;
-  padding: 0 10px;
-  font-size: 12px;
-  font-weight: 600;
 }}
 
 .action-button:hover,
@@ -495,7 +497,7 @@ fn message_article(
     );
 
     article.push_str(&attachments_html(message, context));
-    article.push_str(&reactions_html(message, context));
+    article.push_str(&message_responses_html(channel_id, message, context));
     article.push_str(&message_actions_html(channel_id, message, context));
     article.push_str("</article>");
     article
@@ -536,7 +538,7 @@ fn message_part_html(
     );
 
     part.push_str(&attachments_html(message, context));
-    part.push_str(&reactions_html(message, context));
+    part.push_str(&message_responses_html(channel_id, message, context));
     part.push_str(&message_actions_html(channel_id, message, context));
     part.push_str("</section>");
     part
@@ -926,17 +928,27 @@ fn image_figure_html(
     }
 }
 
+fn message_responses_html(
+    channel_id: Option<&str>,
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+) -> String {
+    let mut responses = reactions_html(message, context);
+    responses.push_str(&thread_response_html(channel_id, message, context));
+
+    if responses.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"reactions\">{responses}</div>")
+    }
+}
+
 fn reactions_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
-    let Some(reactions) = message
+    message
         .reactions
         .as_ref()
-        .filter(|reactions| !reactions.is_empty())
-    else {
-        return String::new();
-    };
-
-    let reactions = reactions
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|reaction| {
             let name = reaction.name.as_deref()?;
             let count = reaction.count.unwrap_or_default();
@@ -954,13 +966,34 @@ fn reactions_html(message: &SlackMessage, context: &MessageHtmlContext) -> Strin
                 count
             ))
         })
-        .collect::<String>();
+        .collect::<String>()
+}
 
-    if reactions.is_empty() {
-        String::new()
-    } else {
-        format!("<div class=\"reactions\">{reactions}</div>")
+fn thread_response_html(
+    channel_id: Option<&str>,
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+) -> String {
+    if context.thread_ts.is_some() || !message.has_thread() || message.ts.is_empty() {
+        return String::new();
     }
+
+    let Some(channel_id) = channel_id else {
+        return String::new();
+    };
+
+    let title = message
+        .reply_count
+        .filter(|count| *count > 0)
+        .map(|count| format!("View thread ({count})"))
+        .unwrap_or_else(|| "View thread".to_string());
+
+    format!(
+        "<a class=\"reaction thread-reaction\" href=\"{}\" title=\"{}\" aria-label=\"{}\">Thread</a>",
+        escape_html(&thread_action_url(channel_id, &message.ts)),
+        escape_html(&title),
+        escape_html(&title)
+    )
 }
 
 fn message_actions_html(
@@ -993,9 +1026,9 @@ fn message_actions_html(
             .filter(|count| *count > 0)
             .map(|count| format!("View thread ({count})"))
             .unwrap_or_else(|| "Reply in thread".to_string());
-        actions.push_str(&text_action_button_html(
+        actions.push_str(&action_button_html(
             &thread_action_url(channel_id, &message.ts),
-            "Thread",
+            "💬",
             &title,
             false,
         ));
@@ -1112,25 +1145,10 @@ fn quick_reactions() -> [(&'static str, &'static str, &'static str); 3] {
 }
 
 fn action_button_html(href: &str, label: &str, title: &str, active: bool) -> String {
-    action_button_html_with_class(href, label, title, active, "")
-}
-
-fn text_action_button_html(href: &str, label: &str, title: &str, active: bool) -> String {
-    action_button_html_with_class(href, label, title, active, " is-text")
-}
-
-fn action_button_html_with_class(
-    href: &str,
-    label: &str,
-    title: &str,
-    active: bool,
-    extra_class: &str,
-) -> String {
     let active_class = if active { " is-active" } else { "" };
     format!(
-        "<a class=\"action-button{}{}\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
+        "<a class=\"action-button{}\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
         active_class,
-        extra_class,
         escape_html(href),
         escape_html(title),
         escape_html(title),
@@ -1599,15 +1617,18 @@ mod tests {
         let html = conversation_document("C123", &[message], &context);
 
         assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains(">💬</a>"));
         assert!(html.contains(">Thread</a>"));
         assert!(html.contains(
             "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=smile&amp;add=true"
         ));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=white_check_mark&amp;add=true"));
-        let check_action = html.find("name=white_check_mark").unwrap();
-        let thread_action = html.find(">Thread</a>").unwrap();
-        assert!(check_action < thread_action);
+        let reaction_chip = html
+            .find("<span class=\"reaction is-active\">👍 1</span>")
+            .unwrap();
+        let thread_chip = html.find("<a class=\"reaction thread-reaction\"").unwrap();
+        assert!(reaction_chip < thread_chip);
         assert!(html.contains("conduit://save?channel=C123&amp;ts=1710000000.000100&amp;add=false"));
         assert!(html.contains("conduit://copy-link?channel=C123&amp;ts=1710000000.000100"));
         assert!(html.contains("conduit://copy-message?channel=C123&amp;ts=1710000000.000100"));
