@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +62,19 @@ pub struct SlackConversation {
 
 impl SlackConversation {
     pub fn display_name(&self) -> String {
+        self.display_name_with_users(&HashMap::new())
+    }
+
+    pub fn display_name_with_users(&self, user_names: &HashMap<String, String>) -> String {
+        if self.is_im.unwrap_or(false) {
+            if let Some(user) = &self.user {
+                if let Some(name) = user_names.get(user) {
+                    return name.clone();
+                }
+                return format!("DM {user}");
+            }
+        }
+
         if let Some(name) = &self.name {
             if self.is_channel.unwrap_or(false) || self.is_group.unwrap_or(false) {
                 return format!("#{name}");
@@ -83,6 +97,54 @@ pub struct SlackFile {
     pub title: Option<String>,
     pub mimetype: Option<String>,
     pub url_private: Option<String>,
+    pub url_private_download: Option<String>,
+    pub thumb_64: Option<String>,
+    pub thumb_80: Option<String>,
+    pub thumb_160: Option<String>,
+    pub thumb_360: Option<String>,
+    pub thumb_480: Option<String>,
+    pub thumb_720: Option<String>,
+    pub thumb_1024: Option<String>,
+    pub permalink: Option<String>,
+}
+
+impl SlackFile {
+    pub fn display_title(&self) -> &str {
+        self.title
+            .as_deref()
+            .or(self.name.as_deref())
+            .or(self.id.as_deref())
+            .unwrap_or("File")
+    }
+
+    pub fn is_image(&self) -> bool {
+        self.mimetype
+            .as_deref()
+            .is_some_and(|mimetype| mimetype.starts_with("image/"))
+            || self.preview_url().is_some()
+    }
+
+    pub fn preview_url(&self) -> Option<&str> {
+        self.thumb_480
+            .as_deref()
+            .or(self.thumb_360.as_deref())
+            .or(self.thumb_720.as_deref())
+            .or(self.thumb_1024.as_deref())
+            .or(self.thumb_160.as_deref())
+            .or(self.thumb_80.as_deref())
+            .or(self.thumb_64.as_deref())
+            .or_else(|| {
+                self.is_declared_image()
+                    .then_some(self.url_private.as_deref())
+                    .flatten()
+            })
+    }
+
+    fn is_declared_image(&self) -> bool {
+        self.mimetype
+            .as_deref()
+            .is_some_and(|mimetype| mimetype.starts_with("image/"))
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -205,5 +267,36 @@ impl SlackUserProfile {
             .filter(|name| !name.trim().is_empty())
             .cloned()
             .or_else(|| self.real_name.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dm_display_name_uses_loaded_user_name() {
+        let conversation = SlackConversation {
+            id: "D123".to_string(),
+            user: Some("U123".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        let names = HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]);
+
+        assert_eq!(conversation.display_name_with_users(&names), "Ada Lovelace");
+    }
+
+    #[test]
+    fn image_file_prefers_medium_thumbnail() {
+        let file = SlackFile {
+            mimetype: Some("image/png".to_string()),
+            url_private: Some("https://files.example/original.png".to_string()),
+            thumb_160: Some("https://files.example/160.png".to_string()),
+            thumb_480: Some("https://files.example/480.png".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(file.preview_url(), Some("https://files.example/480.png"));
     }
 }

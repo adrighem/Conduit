@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -11,6 +12,7 @@ use crate::models::{
 };
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct SlackApi {
@@ -126,6 +128,48 @@ impl SlackApi {
             .user
             .display_name()
             .unwrap_or_else(|| user_id.to_string()))
+    }
+
+    pub async fn download_image(&self, url: &str) -> Result<DownloadedImage> {
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .context("failed to download Slack image preview")?
+            .error_for_status()
+            .context("Slack image preview returned an HTTP error")?;
+
+        let mime_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| value.starts_with("image/"))
+            .ok_or_else(|| anyhow!("Slack image preview did not return an image content type"))?
+            .to_string();
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_PREVIEW_IMAGE_BYTES as u64)
+        {
+            return Err(anyhow!("Slack image preview is larger than 8 MiB"));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read Slack image preview bytes")?;
+        if bytes.len() > MAX_PREVIEW_IMAGE_BYTES {
+            return Err(anyhow!("Slack image preview is larger than 8 MiB"));
+        }
+
+        Ok(DownloadedImage {
+            mime_type,
+            bytes: bytes.to_vec(),
+        })
     }
 
     pub async fn post_message(
@@ -259,6 +303,12 @@ impl SlackApi {
 
         response.into_result(method)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadedImage {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]

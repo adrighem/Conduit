@@ -108,7 +108,7 @@ impl SlackOAuthClient {
         }
     }
 
-    pub async fn authenticate(&self, config: OAuthConfig) -> Result<StoredToken> {
+    pub async fn authenticate(&self, config: OAuthConfig, debug: bool) -> Result<StoredToken> {
         let client_id = config.client_id.trim().to_string();
         if client_id.is_empty() {
             return Err(anyhow!("Slack client ID is required"));
@@ -118,14 +118,21 @@ impl SlackOAuthClient {
         let state = random_urlsafe(32);
         let authorize_url = build_authorize_url(&config, &pkce.challenge, &state)?;
         let redirect_uri = config.redirect_uri();
+        auth_debug(debug, &format!("client_id={client_id}"));
+        auth_debug(debug, &format!("redirect_uri={redirect_uri}"));
+        auth_debug(debug, &format!("scopes={}", config.user_scopes.join(",")));
+        auth_debug(debug, &format!("authorize_url={authorize_url}"));
         let callback =
-            wait_for_oauth_callback(config.redirect_port, authorize_url, state.clone()).await?;
+            wait_for_oauth_callback(config.redirect_port, authorize_url, state.clone(), debug)
+                .await?;
 
         if callback.state.as_deref() != Some(state.as_str()) {
+            auth_debug(debug, "callback state mismatch");
             return Err(anyhow!("Slack authorization state did not match"));
         }
 
         if let Some(error) = callback.error {
+            auth_debug(debug, &format!("Slack returned authorize error={error}"));
             return Err(anyhow!("Slack authorization failed: {error}"));
         }
 
@@ -133,7 +140,15 @@ impl SlackOAuthClient {
             .code
             .ok_or_else(|| anyhow!("Slack authorization did not return a code"))?;
 
-        exchange_user_code(&self.http, &client_id, &redirect_uri, &pkce.verifier, &code).await
+        exchange_user_code(
+            &self.http,
+            &client_id,
+            &redirect_uri,
+            &pkce.verifier,
+            &code,
+            debug,
+        )
+        .await
     }
 
     pub async fn refresh(&self, token: &StoredToken) -> Result<StoredToken> {
@@ -209,10 +224,10 @@ fn random_urlsafe(size: usize) -> String {
 }
 
 fn build_authorize_url(config: &OAuthConfig, challenge: &str, state: &str) -> Result<String> {
-    let mut url = Url::parse("https://slack.com/oauth/v2/authorize")?;
+    let mut url = Url::parse("https://slack.com/oauth/v2_user/authorize")?;
     url.query_pairs_mut()
         .append_pair("client_id", config.client_id.trim())
-        .append_pair("user_scope", &config.user_scopes.join(","))
+        .append_pair("scope", &config.user_scopes.join(","))
         .append_pair("redirect_uri", &config.redirect_uri())
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256")
@@ -224,14 +239,18 @@ async fn wait_for_oauth_callback(
     redirect_port: u16,
     authorize_url: String,
     expected_state: String,
+    debug: bool,
 ) -> Result<OAuthCallback> {
     tokio::task::spawn_blocking(move || {
         let addr = SocketAddr::from(([127, 0, 0, 1], redirect_port));
+        auth_debug(debug, &format!("binding local callback server on {addr}"));
         let server = Server::http(addr)
             .map_err(|error| anyhow!("failed to start local OAuth callback server: {error}"))?;
 
+        auth_debug(debug, "opening authorization URL in default browser");
         open::that_detached(&authorize_url).context("failed to open Slack authorization URL")?;
 
+        auth_debug(debug, "waiting up to 300 seconds for Slack callback");
         let request = server
             .recv_timeout(Duration::from_secs(300))
             .context("failed to receive OAuth callback")?
@@ -241,6 +260,16 @@ async fn wait_for_oauth_callback(
         let params: HashMap<String, String> = callback_url.query_pairs().into_owned().collect();
 
         let state_ok = params.get("state").map(String::as_str) == Some(expected_state.as_str());
+        auth_debug(
+            debug,
+            &format!(
+                "callback path={} state_ok={} error={} code_present={}",
+                callback_url.path(),
+                state_ok,
+                params.get("error").map(String::as_str).unwrap_or("<none>"),
+                params.contains_key("code")
+            ),
+        );
         let success = state_ok && params.contains_key("code");
         let page = callback_page(success);
         let mut response = Response::from_string(page).with_status_code(if success {
@@ -276,7 +305,12 @@ async fn exchange_user_code(
     redirect_uri: &str,
     code_verifier: &str,
     code: &str,
+    debug: bool,
 ) -> Result<StoredToken> {
+    auth_debug(
+        debug,
+        "exchanging authorization code with oauth.v2.user.access",
+    );
     let response = oauth_user_access(
         http,
         &[
@@ -289,7 +323,17 @@ async fn exchange_user_code(
     )
     .await?;
 
-    token_from_response(response, Some(client_id), None)
+    let token = token_from_response(response, Some(client_id), None)?;
+    auth_debug(
+        debug,
+        &format!(
+            "token exchange succeeded team_id={} user_id={} scope={}",
+            token.team_id.as_deref().unwrap_or("<unknown>"),
+            token.user_id.as_deref().unwrap_or("<unknown>"),
+            token.scope.as_deref().unwrap_or("<unknown>")
+        ),
+    );
+    Ok(token)
 }
 
 async fn refresh_user_token(
@@ -382,4 +426,51 @@ fn token_from_response(
             .map(ToString::to_string)
             .or_else(|| previous.and_then(|token| token.client_id.clone())),
     })
+}
+
+fn auth_debug(enabled: bool, message: &str) {
+    if enabled {
+        eprintln!("[conduit::auth] {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_user_token_authorize_url() {
+        let config = OAuthConfig {
+            client_id: "123.456".to_string(),
+            redirect_port: 8934,
+            user_scopes: vec!["channels:read".to_string(), "chat:write".to_string()],
+        };
+
+        let url = build_authorize_url(&config, "challenge", "state").unwrap();
+        let url = Url::parse(&url).unwrap();
+        let params = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("slack.com"));
+        assert_eq!(url.path(), "/oauth/v2_user/authorize");
+        assert_eq!(params.get("client_id").map(String::as_str), Some("123.456"));
+        assert_eq!(
+            params.get("scope").map(String::as_str),
+            Some("channels:read,chat:write")
+        );
+        assert!(!params.contains_key("user_scope"));
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some("http://127.0.0.1:8934/callback")
+        );
+        assert_eq!(
+            params.get("code_challenge").map(String::as_str),
+            Some("challenge")
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(params.get("state").map(String::as_str), Some("state"));
+    }
 }

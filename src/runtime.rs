@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use crate::auth::{OAuthConfig, SlackOAuthClient, TokenStore};
 use crate::models::{
@@ -16,6 +17,7 @@ pub enum RuntimeCommand {
     LoadStoredToken,
     StartOAuth {
         client_id: String,
+        debug_auth: bool,
     },
     SignOut,
     RefreshConversations,
@@ -32,6 +34,10 @@ pub enum RuntimeCommand {
     LoadSavedItems,
     LoadUser {
         user_id: String,
+    },
+    LoadImageAsset {
+        key: String,
+        url: String,
     },
     PostMessage {
         channel_id: String,
@@ -73,6 +79,13 @@ pub enum RuntimeEvent {
     UserLoaded {
         user_id: String,
         display_name: String,
+    },
+    ImageAssetLoaded {
+        key: String,
+        data_uri: String,
+    },
+    ImageAssetFailed {
+        key: String,
     },
     MessagePosted {
         channel_id: String,
@@ -164,9 +177,14 @@ async fn handle_command(
                 events.send_event(RuntimeEvent::SignedOut);
             }
         }
-        RuntimeCommand::StartOAuth { client_id } => {
+        RuntimeCommand::StartOAuth {
+            client_id,
+            debug_auth,
+        } => {
             events.send_status("Opening Slack authorization");
-            let token = oauth.authenticate(OAuthConfig::new(client_id)).await?;
+            let token = oauth
+                .authenticate(OAuthConfig::new(client_id), debug_auth)
+                .await?;
             token_store.save(&token)?;
             connect_with_token(events, slack, token).await?;
             user_cache.clear();
@@ -224,6 +242,22 @@ async fn handle_command(
                     user_id,
                     display_name,
                 });
+            }
+        }
+        RuntimeCommand::LoadImageAsset { key, url } => {
+            let api = require_slack(slack)?;
+            match api.download_image(&url).await {
+                Ok(image) => {
+                    let data_uri = format!(
+                        "data:{};base64,{}",
+                        image.mime_type,
+                        BASE64.encode(image.bytes)
+                    );
+                    events.send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
+                }
+                Err(_) => {
+                    events.send_event(RuntimeEvent::ImageAssetFailed { key });
+                }
             }
         }
         RuntimeCommand::PostMessage {
