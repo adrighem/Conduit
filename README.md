@@ -10,7 +10,7 @@ The current implementation is an early development slice. It includes a native U
 
 ## Building
 
-Install the GNOME development stack, WebKitGTK 6.0 development headers, Rust, Meson, and Ninja, then build with Meson:
+Install the GNOME development stack, WebKitGTK 6.0 and D-Bus development headers, Rust, Meson, and Ninja, then build with Meson:
 
 ```sh
 meson setup _build

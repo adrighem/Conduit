@@ -23,10 +23,12 @@ jobs:
             desktop-file-utils \
             gettext \
             libadwaita-1-dev \
+            libdbus-1-dev \
             libgtk-4-dev \
             libwebkitgtk-6.0-dev \
             meson \
-            ninja-build
+            ninja-build \
+            pkg-config
 
       - name: Format
         run: cargo fmt --check
