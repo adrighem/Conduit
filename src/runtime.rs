@@ -163,6 +163,7 @@ async fn handle_command(
 ) -> Result<()> {
     match command {
         RuntimeCommand::LoadStoredToken => {
+            crate::debug::log("runtime", "LoadStoredToken");
             events.send_status("Checking secure storage");
             if let Some(mut token) = token_store.load()? {
                 if token.should_refresh() {
@@ -197,12 +198,21 @@ async fn handle_command(
             events.send_event(RuntimeEvent::SignedOut);
         }
         RuntimeCommand::RefreshConversations => {
+            crate::debug::log("runtime", "RefreshConversations");
             load_conversations(events, slack).await?;
         }
         RuntimeCommand::LoadHistory { channel_id } => {
             let api = require_slack(slack)?;
+            crate::debug::log("runtime", &format!("LoadHistory channel_id={channel_id}"));
             events.send_status("Loading conversation");
             let messages = api.history(&channel_id).await?;
+            crate::debug::log(
+                "runtime",
+                &format!(
+                    "HistoryLoaded channel_id={channel_id} messages={}",
+                    messages.len()
+                ),
+            );
             events.send_event(RuntimeEvent::HistoryLoaded {
                 channel_id,
                 messages,
@@ -246,8 +256,21 @@ async fn handle_command(
         }
         RuntimeCommand::LoadImageAsset { key, url } => {
             let api = require_slack(slack)?;
+            crate::debug::log(
+                "runtime",
+                &format!("LoadImageAsset key={}", crate::debug::url_for_log(&key)),
+            );
             match api.download_image(&url).await {
                 Ok(image) => {
+                    crate::debug::log(
+                        "runtime",
+                        &format!(
+                            "ImageAssetLoaded key={} mime_type={} bytes={}",
+                            crate::debug::url_for_log(&key),
+                            image.mime_type,
+                            image.bytes.len()
+                        ),
+                    );
                     let data_uri = format!(
                         "data:{};base64,{}",
                         image.mime_type,
@@ -255,7 +278,14 @@ async fn handle_command(
                     );
                     events.send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
                 }
-                Err(_) => {
+                Err(error) => {
+                    crate::debug::log(
+                        "runtime",
+                        &format!(
+                            "ImageAssetFailed key={} error={error:#}",
+                            crate::debug::url_for_log(&key)
+                        ),
+                    );
                     events.send_event(RuntimeEvent::ImageAssetFailed { key });
                 }
             }
@@ -335,6 +365,14 @@ async fn connect_with_token(
     let mut auth = api.auth_test().await?;
     auth.team = auth.team.or(token_team);
     auth.user_id = auth.user_id.or(token_user);
+    crate::debug::log(
+        "runtime",
+        &format!(
+            "Authenticated team={} user_id={}",
+            auth.team.as_deref().unwrap_or("<unknown>"),
+            auth.user_id.as_deref().unwrap_or("<unknown>")
+        ),
+    );
     *slack = Some(api);
     events.send_event(RuntimeEvent::Authenticated(auth));
     Ok(())
@@ -347,6 +385,10 @@ async fn load_conversations(
     let api = require_slack(slack)?;
     events.send_status("Loading conversations");
     let conversations = api.conversations().await?;
+    crate::debug::log(
+        "runtime",
+        &format!("ConversationsLoaded count={}", conversations.len()),
+    );
     events.send_event(RuntimeEvent::ConversationsLoaded(conversations));
     Ok(())
 }

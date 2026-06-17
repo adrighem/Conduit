@@ -21,6 +21,7 @@
 mod application;
 mod auth;
 mod config;
+mod debug;
 mod message_html;
 mod models;
 mod rendering;

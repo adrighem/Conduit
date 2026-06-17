@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Local};
+
+use crate::debug;
 use crate::models::{SavedItem, SearchMatch, SlackMessage};
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
@@ -35,8 +38,20 @@ pub fn conversation_document(
         return placeholder_document("Messages", "No messages");
     }
 
+    let groups = message_groups(messages);
+    debug::log(
+        "render",
+        &format!(
+            "conversation channel_id={channel_id} messages={} groups={} image_assets={} failed_images={}",
+            messages.len(),
+            groups.len(),
+            context.image_assets.len(),
+            context.failed_image_urls.len()
+        ),
+    );
+
     let mut body = String::from("<main class=\"timeline\" aria-label=\"Messages\">");
-    for group in message_groups(messages) {
+    for group in groups {
         body.push_str(&message_group_article(Some(channel_id), &group, context));
     }
     body.push_str("</main>");
@@ -491,15 +506,59 @@ fn search_result_article(result: &SearchMatch, context: &MessageHtmlContext) -> 
 }
 
 fn metadata_html(message: &SlackMessage) -> String {
+    let mut metadata = timestamp_html(&message.ts);
+
     match message.subtype.as_deref() {
         Some(subtype) if !subtype.is_empty() => {
-            format!(
+            metadata.push_str(&format!(
                 "<span class=\"metadata\">{}</span>",
                 escape_html(&subtype.replace('_', " "))
-            )
+            ));
         }
-        _ => String::new(),
+        _ => {}
     }
+
+    metadata
+}
+
+fn timestamp_html(ts: &str) -> String {
+    let Some(datetime) = slack_ts_datetime(ts) else {
+        return String::new();
+    };
+
+    let short = datetime.format("%H:%M").to_string();
+    let full = datetime.format("%Y-%m-%d %H:%M:%S %Z").to_string();
+    format!(
+        "<time class=\"metadata\" datetime=\"{}\" title=\"{}\">{}</time>",
+        escape_html(&datetime.to_rfc3339()),
+        escape_html(&full),
+        escape_html(&short)
+    )
+}
+
+fn slack_ts_datetime(ts: &str) -> Option<DateTime<Local>> {
+    let (seconds, nanos) = parse_slack_ts(ts)?;
+    DateTime::from_timestamp(seconds, nanos).map(|datetime| datetime.with_timezone(&Local))
+}
+
+fn parse_slack_ts(ts: &str) -> Option<(i64, u32)> {
+    let (seconds, fraction) = ts.split_once('.').unwrap_or((ts, ""));
+    let seconds = seconds.parse::<i64>().ok()?;
+    let mut fraction = fraction
+        .chars()
+        .take(9)
+        .filter(|character| character.is_ascii_digit())
+        .collect::<String>();
+    while fraction.len() < 9 {
+        fraction.push('0');
+    }
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u32>().ok()?
+    };
+
+    Some((seconds, nanos))
 }
 
 fn author_label(message: &SlackMessage, context: &MessageHtmlContext) -> String {
@@ -683,20 +742,47 @@ fn image_figure_html(
     context: &MessageHtmlContext,
 ) -> String {
     let image = if let Some(src) = context.image_assets.get(asset_key) {
+        if debug::enabled() {
+            debug::log(
+                "render",
+                &format!("image state=loaded key={}", debug::url_for_log(asset_key)),
+            );
+        }
         format!(
             "<img loading=\"lazy\" decoding=\"async\" src=\"{}\" alt=\"{}\">",
             escape_html(src),
             escape_html(alt)
         )
     } else if context.failed_image_urls.contains(asset_key) {
+        if debug::enabled() {
+            debug::log(
+                "render",
+                &format!("image state=failed key={}", debug::url_for_log(asset_key)),
+            );
+        }
         "<div class=\"image-placeholder\">Image preview unavailable</div>".to_string()
     } else if is_http_url(asset_key) && !requires_authenticated_image(asset_key) {
+        if debug::enabled() {
+            debug::log(
+                "render",
+                &format!(
+                    "image state=direct-webkit key={}",
+                    debug::url_for_log(asset_key)
+                ),
+            );
+        }
         format!(
             "<img loading=\"lazy\" decoding=\"async\" src=\"{}\" alt=\"{}\">",
             escape_html(asset_key),
             escape_html(alt)
         )
     } else {
+        if debug::enabled() {
+            debug::log(
+                "render",
+                &format!("image state=pending key={}", debug::url_for_log(asset_key)),
+            );
+        }
         "<div class=\"image-placeholder\">Loading image preview</div>".to_string()
     };
 
@@ -983,7 +1069,15 @@ fn render_emoji_shortcode(text: &str) -> Option<(String, usize)> {
     }
 
     let shortcode = &text[..end + 1];
-    let rendered = emoji_for_code(code)
+    let emoji = emoji_for_code(code);
+    if debug::enabled() {
+        debug::log(
+            "render",
+            &format!("emoji shortcode=:{code}: mapped={}", emoji.is_some()),
+        );
+    }
+
+    let rendered = emoji
         .map(|emoji| {
             format!(
                 "<span class=\"emoji\" title=\":{}:\">{}</span>",
@@ -1014,9 +1108,14 @@ fn emoji_for_code(code: &str) -> Option<&'static str> {
         "sad" => Some("😢"),
         "slightly_smiling_face" | "simple_smile" | "smile" => Some("🙂"),
         "smiley" => Some("😃"),
+        "stuck_out_tongue" | "face_with_tongue" => Some("😛"),
+        "stuck_out_tongue_closed_eyes" => Some("😝"),
+        "stuck_out_tongue_winking_eye" => Some("😜"),
         "sweat_smile" => Some("😅"),
         "thinking_face" => Some("🤔"),
         "white_check_mark" => Some("✅"),
+        "yum" => Some("😋"),
+        "zany_face" => Some("🤪"),
         "x" => Some("❌"),
         _ => None,
     }
@@ -1141,12 +1240,26 @@ mod tests {
     fn renders_common_slack_emoji_shortcodes() {
         let html = conversation_document(
             "C123",
-            &[message("ship it :rocket: :unknown_custom_emoji:")],
+            &[message(
+                "ship it :rocket: :stuck_out_tongue: :unknown_custom_emoji:",
+            )],
             &MessageHtmlContext::default(),
         );
 
         assert!(html.contains("<span class=\"emoji\" title=\":rocket:\">🚀</span>"));
+        assert!(html.contains("<span class=\"emoji\" title=\":stuck_out_tongue:\">😛</span>"));
         assert!(html.contains(":unknown_custom_emoji:"));
+    }
+
+    #[test]
+    fn renders_message_timestamp_with_full_datetime_tooltip() {
+        let html =
+            conversation_document("C123", &[message("timed")], &MessageHtmlContext::default());
+
+        assert!(html.contains("<time class=\"metadata\""));
+        assert!(html.contains("datetime=\""));
+        assert!(html.contains("title=\""));
+        assert!(html.contains("</time>"));
     }
 
     #[test]

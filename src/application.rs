@@ -56,6 +56,7 @@ mod imp {
         // to do that, we'll just present any existing window.
         fn activate(&self) {
             let application = self.obj();
+            crate::debug::set_enabled(false);
             application.present_window(false, false);
         }
 
@@ -63,7 +64,10 @@ mod imp {
             let application = self.obj();
             let options = command_line.options_dict();
             let connect = options.contains("connect");
-            let debug_auth = options.contains("debug-auth");
+            let debug = options.contains("debug");
+            let debug_auth = debug || options.contains("debug-auth");
+            crate::debug::set_enabled(debug);
+            crate::debug::log("app", "debug logging enabled");
             application.present_window(connect, debug_auth);
             0.into()
         }
@@ -112,8 +116,16 @@ impl ConduitApplication {
             None,
         );
         self.add_main_option(
-            "debug-auth",
+            "debug",
             glib::Char::from(b'd'),
+            glib::OptionFlags::NONE,
+            glib::OptionArg::None,
+            "Print renderer and Slack loading diagnostics to stderr",
+            None,
+        );
+        self.add_main_option(
+            "debug-auth",
+            glib::Char::from(b'\0'),
             glib::OptionFlags::NONE,
             glib::OptionArg::None,
             "Print Slack OAuth diagnostics to stderr",

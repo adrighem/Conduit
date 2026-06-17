@@ -408,6 +408,10 @@ impl ConduitWindow {
                 self.rerender_current_messages();
             }
             RuntimeEvent::ImageAssetLoaded { key, data_uri } => {
+                crate::debug::log(
+                    "ui",
+                    &format!("ImageAssetLoaded key={}", crate::debug::url_for_log(&key)),
+                );
                 let imp = self.imp();
                 imp.pending_image_assets.borrow_mut().remove(&key);
                 imp.failed_image_assets.borrow_mut().remove(&key);
@@ -415,6 +419,10 @@ impl ConduitWindow {
                 self.rerender_current_messages();
             }
             RuntimeEvent::ImageAssetFailed { key } => {
+                crate::debug::log(
+                    "ui",
+                    &format!("ImageAssetFailed key={}", crate::debug::url_for_log(&key)),
+                );
                 let imp = self.imp();
                 imp.pending_image_assets.borrow_mut().remove(&key);
                 imp.failed_image_assets.borrow_mut().insert(key);
@@ -799,6 +807,10 @@ impl ConduitWindow {
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
+        crate::debug::log(
+            "ui",
+            &format!("select_conversation channel_id={channel_id} title={title}"),
+        );
         let imp = self.imp();
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
         *imp.selected_thread_ts.borrow_mut() = None;
@@ -817,6 +829,16 @@ impl ConduitWindow {
         imp.current_main_view.set(MainMessageView::Conversation);
         self.request_image_assets(messages.iter());
         let context = self.message_html_context();
+        crate::debug::log(
+            "ui",
+            &format!(
+                "populate_history channel_id={channel_id} messages={} image_assets={} pending_images={} failed_images={}",
+                messages.len(),
+                context.image_assets.len(),
+                imp.pending_image_assets.borrow().len(),
+                context.failed_image_urls.len()
+            ),
+        );
         self.load_message_html(&message_html::conversation_document(
             channel_id, &messages, &context,
         ));
@@ -1056,6 +1078,7 @@ impl ConduitWindow {
 
     fn load_message_html(&self, html: &str) {
         if let Some(web_view) = self.imp().message_view.borrow().as_ref() {
+            crate::debug::log("ui", &format!("load_message_html bytes={}", html.len()));
             web_view.load_html(html, Some(message_html::base_uri()));
         }
     }
@@ -1131,7 +1154,19 @@ impl ConduitWindow {
             .collect::<Vec<_>>();
         drop(pending_assets);
 
+        crate::debug::log(
+            "ui",
+            &format!("request_image_assets missing={}", missing_requests.len()),
+        );
         for (key, url) in missing_requests {
+            crate::debug::log(
+                "ui",
+                &format!(
+                    "request_image_asset key={} url={}",
+                    crate::debug::url_for_log(&key),
+                    crate::debug::url_for_log(&url)
+                ),
+            );
             self.send_command(RuntimeCommand::LoadImageAsset { key, url });
         }
     }
