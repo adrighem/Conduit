@@ -1,5 +1,13 @@
+desktop_conf = configuration_data()
+desktop_conf.set('bindir', get_option('prefix') / get_option('bindir'))
+desktop_in = configure_file(
+  input: 'eu.vanadrighem.conduit.desktop.in',
+  output: 'eu.vanadrighem.conduit.desktop.in.configured',
+  configuration: desktop_conf
+)
+
 desktop_file = i18n.merge_file(
-        input: 'eu.vanadrighem.conduit.desktop.in',
+        input: desktop_in,
        output: 'eu.vanadrighem.conduit.desktop',
          type: 'desktop',
        po_dir: '../po',
