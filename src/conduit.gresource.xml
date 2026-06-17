@@ -3,5 +3,16 @@
   <gresource prefix="/eu/vanadrighem/conduit">
     <file preprocess="xml-stripblanks">window.ui</file>
     <file preprocess="xml-stripblanks">shortcuts-dialog.ui</file>
+    <file alias="icons/hicolor/16x16/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/16x16/apps/eu.vanadrighem.conduit.png</file>
+    <file alias="icons/hicolor/24x24/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/24x24/apps/eu.vanadrighem.conduit.png</file>
+    <file alias="icons/hicolor/32x32/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/32x32/apps/eu.vanadrighem.conduit.png</file>
+    <file alias="icons/hicolor/48x48/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/48x48/apps/eu.vanadrighem.conduit.png</file>
+    <file alias="icons/hicolor/64x64/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/64x64/apps/eu.vanadrighem.conduit.png</file>
+    <file alias="icons/hicolor/128x128/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/128x128/apps/eu.vanadrighem.conduit.png</file>
+    <file alias="icons/hicolor/256x256/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/256x256/apps/eu.vanadrighem.conduit.png</file>
+    <file alias="icons/hicolor/512x512/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/512x512/apps/eu.vanadrighem.conduit.png</file>
+    <file alias="icons/hicolor/128x128/apps/eu.vanadrighem.conduit-about.png">../data/icons/hicolor/128x128/apps/eu.vanadrighem.conduit-about.png</file>
+    <file alias="icons/hicolor/256x256/apps/eu.vanadrighem.conduit-about.png">../data/icons/hicolor/256x256/apps/eu.vanadrighem.conduit-about.png</file>
+    <file alias="icons/hicolor/512x512/apps/eu.vanadrighem.conduit-about.png">../data/icons/hicolor/512x512/apps/eu.vanadrighem.conduit-about.png</file>
   </gresource>
 </gresources>

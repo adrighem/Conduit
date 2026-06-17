@@ -56,13 +56,15 @@ mod imp {
         // to do that, we'll just present any existing window.
         fn activate(&self) {
             let application = self.obj();
-            application.present_window(false);
+            application.present_window(false, false);
         }
 
         fn command_line(&self, command_line: &gio::ApplicationCommandLine) -> glib::ExitCode {
             let application = self.obj();
-            let connect = command_line.options_dict().contains("connect");
-            application.present_window(connect);
+            let options = command_line.options_dict();
+            let connect = options.contains("connect");
+            let debug_auth = options.contains("debug-auth");
+            application.present_window(connect, debug_auth);
             0.into()
         }
     }
@@ -109,21 +111,40 @@ impl ConduitApplication {
             "Open the Slack workspace connection flow",
             None,
         );
+        self.add_main_option(
+            "debug-auth",
+            glib::Char::from(b'd'),
+            glib::OptionFlags::NONE,
+            glib::OptionArg::None,
+            "Print Slack OAuth diagnostics to stderr",
+            None,
+        );
     }
 
-    fn present_window(&self, connect: bool) {
+    fn present_window(&self, connect: bool, debug_auth: bool) {
+        self.configure_icon_theme();
+
         let window = self.active_window().unwrap_or_else(|| {
             let window = ConduitWindow::new(self);
             window.upcast()
         });
 
-        if connect {
-            if let Ok(window) = window.clone().downcast::<ConduitWindow>() {
-                window.show_connect_requested();
+        if let Ok(conduit_window) = window.clone().downcast::<ConduitWindow>() {
+            conduit_window.set_auth_debug(debug_auth);
+            if connect {
+                conduit_window.show_connect_requested();
             }
         }
 
         window.present();
+    }
+
+    fn configure_icon_theme(&self) {
+        let Some(display) = gtk::gdk::Display::default() else {
+            return;
+        };
+
+        gtk::IconTheme::for_display(&display).add_resource_path("/eu/vanadrighem/conduit/icons");
     }
 
     fn show_shortcuts(&self) {
@@ -138,10 +159,12 @@ impl ConduitApplication {
     }
 
     fn show_about(&self) {
-        let window = self.active_window().unwrap();
+        let Some(window) = self.active_window() else {
+            return;
+        };
         let about = adw::AboutDialog::builder()
             .application_name("Conduit")
-            .application_icon("eu.vanadrighem.conduit")
+            .application_icon("eu.vanadrighem.conduit-about")
             .developer_name("Vincent van Adrighem")
             .version(VERSION)
             .developers(vec!["Vincent van Adrighem"])
