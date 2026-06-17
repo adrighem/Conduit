@@ -82,7 +82,7 @@ mod imp {
         #[template_child]
         pub thread_title: TemplateChild<gtk::Label>,
         #[template_child]
-        pub thread_list: TemplateChild<gtk::ListBox>,
+        pub thread_view_box: TemplateChild<gtk::Box>,
         #[template_child]
         pub thread_entry: TemplateChild<gtk::Entry>,
         #[template_child]
@@ -98,6 +98,7 @@ mod imp {
         pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<HashMap<String, String>>,
         pub pending_user_ids: RefCell<HashSet<String>>,
+        pub workspace_url: RefCell<Option<String>>,
         pub current_channel_messages: RefCell<Vec<SlackMessage>>,
         pub current_thread_messages: RefCell<Vec<SlackMessage>>,
         pub current_search_results: RefCell<Vec<SearchMatch>>,
@@ -107,6 +108,7 @@ mod imp {
         pub selected_channel: RefCell<Option<String>>,
         pub selected_thread_ts: RefCell<Option<String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
+        pub thread_view: RefCell<Option<webkit6::WebView>>,
         pub image_assets: RefCell<HashMap<String, String>>,
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
@@ -153,13 +155,6 @@ glib::wrapper! {
 }
 
 #[derive(Debug, Clone, Default)]
-struct MessageRenderContext {
-    user_names: HashMap<String, String>,
-    current_user_id: Option<String>,
-    selected_thread_ts: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
 struct CurrentMessageSnapshot {
     channel_id: Option<String>,
     thread_ts: Option<String>,
@@ -197,6 +192,34 @@ fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
     Some((url.to_string(), url.to_string()))
 }
 
+fn message_permalink(workspace_url: &str, channel_id: &str, ts: &str) -> Option<String> {
+    let ts = slack_permalink_ts(ts)?;
+    Some(format!(
+        "{}/archives/{}/p{}",
+        workspace_url.trim_end_matches('/'),
+        channel_id,
+        ts
+    ))
+}
+
+fn slack_permalink_ts(ts: &str) -> Option<String> {
+    let (seconds, fraction) = ts.split_once('.')?;
+    if seconds.is_empty() || !seconds.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+
+    let mut fraction = fraction
+        .chars()
+        .take(6)
+        .filter(|character| character.is_ascii_digit())
+        .collect::<String>();
+    while fraction.len() < 6 {
+        fraction.push('0');
+    }
+
+    Some(format!("{seconds}{fraction}"))
+}
+
 impl ConduitWindow {
     pub fn new<P: IsA<gtk::Application>>(application: &P) -> Self {
         glib::Object::builder()
@@ -223,6 +246,22 @@ impl ConduitWindow {
     }
 
     fn setup_message_view(&self) {
+        let message_view = self.create_message_web_view();
+        self.imp().message_view_box.append(&message_view);
+        *self.imp().message_view.borrow_mut() = Some(message_view);
+
+        let thread_view = self.create_message_web_view();
+        self.imp().thread_view_box.append(&thread_view);
+        *self.imp().thread_view.borrow_mut() = Some(thread_view);
+
+        self.show_message_placeholder("Select a conversation");
+        self.load_thread_html(&message_html::placeholder_document(
+            "Thread",
+            "No thread open",
+        ));
+    }
+
+    fn create_message_web_view(&self) -> webkit6::WebView {
         let settings = webkit6::Settings::new();
         settings.set_allow_file_access_from_file_urls(false);
         settings.set_allow_universal_access_from_file_urls(false);
@@ -264,9 +303,7 @@ impl ConduitWindow {
             handled
         });
 
-        self.imp().message_view_box.append(&web_view);
-        *self.imp().message_view.borrow_mut() = Some(web_view);
-        self.show_message_placeholder("Select a conversation");
+        web_view
     }
 
     fn setup_callbacks(&self) {
@@ -445,6 +482,22 @@ impl ConduitWindow {
                 self.set_status("Reaction updated");
                 self.reload_after_message(&channel_id, thread_ts.as_deref());
             }
+            RuntimeEvent::SavedUpdated {
+                channel_id,
+                saved,
+                thread_ts,
+            } => {
+                self.set_status(if saved {
+                    "Saved for later"
+                } else {
+                    "Removed from saved items"
+                });
+                if self.imp().current_main_view.get() == MainMessageView::Saved {
+                    self.send_command(RuntimeCommand::LoadSavedItems);
+                } else {
+                    self.reload_after_message(&channel_id, thread_ts.as_deref());
+                }
+            }
             RuntimeEvent::FileUploadProgress { fraction, label } => {
                 let imp = self.imp();
                 imp.upload_progress.set_visible(true);
@@ -592,9 +645,13 @@ impl ConduitWindow {
     fn close_thread(&self) {
         let imp = self.imp();
         *imp.selected_thread_ts.borrow_mut() = None;
+        imp.current_thread_messages.borrow_mut().clear();
         imp.thread_entry.set_text("");
         imp.thread_pane.set_visible(false);
-        self.clear_list(&imp.thread_list);
+        self.load_thread_html(&message_html::placeholder_document(
+            "Thread",
+            "No thread open",
+        ));
     }
 
     fn handle_message_view_uri(&self, uri: &str) -> bool {
@@ -653,6 +710,48 @@ impl ConduitWindow {
                 });
                 true
             }
+            Some("save") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let Some(ts) = query_param(url, "ts") else {
+                    return true;
+                };
+                let add = query_param(url, "add").is_none_or(|value| value == "true");
+                let thread_ts = query_param(url, "thread_ts");
+                self.send_command(RuntimeCommand::SetSaved {
+                    channel_id,
+                    ts,
+                    add,
+                    thread_ts,
+                });
+                self.set_status(if add {
+                    "Saving message"
+                } else {
+                    "Removing saved message"
+                });
+                true
+            }
+            Some("copy-message") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let Some(ts) = query_param(url, "ts") else {
+                    return true;
+                };
+                self.copy_message_text(&channel_id, &ts);
+                true
+            }
+            Some("copy-link") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let Some(ts) = query_param(url, "ts") else {
+                    return true;
+                };
+                self.copy_message_link(&channel_id, &ts);
+                true
+            }
             _ => true,
         }
     }
@@ -661,6 +760,77 @@ impl ConduitWindow {
         if let Err(error) = open::that(uri) {
             self.set_status(&format!("Failed to open link: {error}"));
         }
+    }
+
+    fn copy_message_text(&self, channel_id: &str, ts: &str) {
+        let Some(message) = self.find_message(channel_id, ts) else {
+            self.set_status("Message is no longer loaded");
+            return;
+        };
+
+        let text = message.body_text();
+        if text.trim().is_empty() {
+            self.set_status("Message has no text to copy");
+            return;
+        }
+
+        self.copy_to_clipboard(&text, "Copied message");
+    }
+
+    fn copy_message_link(&self, channel_id: &str, ts: &str) {
+        let Some(workspace_url) = self.imp().workspace_url.borrow().clone() else {
+            self.set_status("Workspace URL is not available");
+            return;
+        };
+        let Some(permalink) = message_permalink(&workspace_url, channel_id, ts) else {
+            self.set_status("Could not build message link");
+            return;
+        };
+
+        self.copy_to_clipboard(&permalink, "Copied message link");
+    }
+
+    fn copy_to_clipboard(&self, text: &str, status: &str) {
+        let Some(display) = gtk::gdk::Display::default() else {
+            self.set_status("Clipboard is not available");
+            return;
+        };
+
+        display.clipboard().set_text(text);
+        self.set_status(status);
+    }
+
+    fn find_message(&self, channel_id: &str, ts: &str) -> Option<SlackMessage> {
+        let imp = self.imp();
+        if imp.selected_channel.borrow().as_deref() == Some(channel_id) {
+            if let Some(message) = imp
+                .current_channel_messages
+                .borrow()
+                .iter()
+                .find(|message| message.ts == ts)
+                .cloned()
+            {
+                return Some(message);
+            }
+
+            if let Some(message) = imp
+                .current_thread_messages
+                .borrow()
+                .iter()
+                .find(|message| message.ts == ts)
+                .cloned()
+            {
+                return Some(message);
+            }
+        }
+
+        imp.current_saved_items
+            .borrow()
+            .iter()
+            .filter(|item| item.channel.as_deref() == Some(channel_id))
+            .filter_map(|item| item.message.as_ref())
+            .find(|message| message.ts == ts)
+            .cloned()
     }
 
     fn reload_after_message(&self, channel_id: &str, thread_ts: Option<&str>) {
@@ -712,6 +882,7 @@ impl ConduitWindow {
         imp.latest_message_ts_by_channel.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
         imp.pending_user_ids.borrow_mut().clear();
+        *imp.workspace_url.borrow_mut() = None;
         imp.image_assets.borrow_mut().clear();
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
@@ -721,12 +892,16 @@ impl ConduitWindow {
         imp.current_saved_items.borrow_mut().clear();
         imp.current_main_view.set(MainMessageView::Placeholder);
         self.clear_list(&imp.conversation_list);
-        self.clear_list(&imp.thread_list);
         self.show_message_placeholder("Select a conversation");
+        self.load_thread_html(&message_html::placeholder_document(
+            "Thread",
+            "No thread open",
+        ));
     }
 
     fn show_workspace(&self, auth: crate::models::AuthInfo) {
         *self.imp().current_user_id.borrow_mut() = auth.user_id.clone();
+        *self.imp().workspace_url.borrow_mut() = auth.url.clone();
         self.imp().connect_button.set_sensitive(true);
         let label = auth
             .team
@@ -828,7 +1003,7 @@ impl ConduitWindow {
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
         imp.current_main_view.set(MainMessageView::Conversation);
         self.request_image_assets(messages.iter());
-        let context = self.message_html_context();
+        let context = self.message_html_context(None);
         crate::debug::log(
             "ui",
             &format!(
@@ -850,18 +1025,17 @@ impl ConduitWindow {
         *imp.selected_thread_ts.borrow_mut() = Some(ts.to_string());
         imp.thread_title.set_label("Thread");
         imp.thread_pane.set_visible(true);
-        self.clear_list(&imp.thread_list);
 
         if messages.is_empty() {
-            self.append_placeholder(&imp.thread_list, "No replies");
+            self.load_thread_html(&message_html::placeholder_document("Thread", "No replies"));
             return;
         }
 
-        let context = self.message_render_context();
-        for message in messages {
-            let row = self.message_row(channel_id, &message, true, &context);
-            imp.thread_list.append(&row);
-        }
+        self.request_image_assets(messages.iter());
+        let context = self.message_html_context(Some(ts));
+        self.load_thread_html(&message_html::conversation_document(
+            channel_id, &messages, &context,
+        ));
     }
 
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
@@ -869,7 +1043,7 @@ impl ConduitWindow {
         imp.message_title.set_label("Search results");
         imp.current_main_view.set(MainMessageView::Search);
         *imp.current_search_results.borrow_mut() = results.clone();
-        let context = self.message_html_context();
+        let context = self.message_html_context(None);
         self.load_message_html(&message_html::search_results_document(&results, &context));
     }
 
@@ -888,98 +1062,8 @@ impl ConduitWindow {
             .collect::<Vec<_>>();
         self.request_user_names(&messages_for_names);
         self.request_image_assets(saved_messages);
-        let context = self.message_html_context();
+        let context = self.message_html_context(None);
         self.load_message_html(&message_html::saved_items_document(&items, &context));
-    }
-
-    fn message_row(
-        &self,
-        channel_id: &str,
-        message: &SlackMessage,
-        in_thread: bool,
-        context: &MessageRenderContext,
-    ) -> gtk::ListBoxRow {
-        let row = gtk::ListBoxRow::new();
-        let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        container.set_margin_top(10);
-        container.set_margin_bottom(10);
-        container.set_margin_start(10);
-        container.set_margin_end(10);
-
-        let heading = gtk::Label::new(Some(&self.message_author_label(message, context)));
-        heading.set_xalign(0.0);
-        heading.add_css_class("caption");
-        container.append(&heading);
-
-        rendering::append_message_content(&container, message, &context.user_names);
-
-        if let Some(files) = message.files.as_ref() {
-            for file in files {
-                let label = file
-                    .title
-                    .as_ref()
-                    .or(file.name.as_ref())
-                    .or(file.id.as_ref())
-                    .map(String::as_str)
-                    .unwrap_or("File");
-                let file_label = gtk::Label::new(Some(&format!("Attachment: {label}")));
-                file_label.set_xalign(0.0);
-                file_label.add_css_class("caption");
-                container.append(&file_label);
-            }
-        }
-
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let reacted = message.user_reacted("thumbsup", context.current_user_id.as_deref());
-        let reaction_button = gtk::Button::with_label(if reacted { "Remove +1" } else { "+1" });
-        reaction_button.set_halign(gtk::Align::Start);
-        let reaction_channel_id = channel_id.to_string();
-        let reaction_ts = message.ts.clone();
-        let reaction_thread_ts = if in_thread {
-            context.selected_thread_ts.clone()
-        } else {
-            message.thread_ts.clone()
-        };
-        let weak_window = self.downgrade();
-        reaction_button.connect_clicked(move |_| {
-            if let Some(window) = weak_window.upgrade() {
-                window.send_command(RuntimeCommand::SetReaction {
-                    channel_id: reaction_channel_id.clone(),
-                    ts: reaction_ts.clone(),
-                    name: "thumbsup".to_string(),
-                    add: !reacted,
-                    thread_ts: reaction_thread_ts.clone(),
-                });
-                window.set_status(if reacted {
-                    "Removing reaction"
-                } else {
-                    "Adding reaction"
-                });
-            }
-        });
-        actions.append(&reaction_button);
-
-        if message.has_thread() && !in_thread {
-            let button = gtk::Button::with_label("View thread");
-            button.set_halign(gtk::Align::Start);
-            let channel_id = channel_id.to_string();
-            let ts = message.ts.clone();
-            let weak_window = self.downgrade();
-            button.connect_clicked(move |_| {
-                if let Some(window) = weak_window.upgrade() {
-                    window.send_command(RuntimeCommand::LoadThread {
-                        channel_id: channel_id.clone(),
-                        ts: ts.clone(),
-                    });
-                }
-            });
-            actions.append(&button);
-        }
-
-        container.append(&actions);
-
-        row.set_child(Some(&container));
-        row
     }
 
     fn notify_if_new_messages(&self, channel_id: &str, messages: &[SlackMessage]) {
@@ -1083,6 +1167,13 @@ impl ConduitWindow {
         }
     }
 
+    fn load_thread_html(&self, html: &str) {
+        if let Some(web_view) = self.imp().thread_view.borrow().as_ref() {
+            crate::debug::log("ui", &format!("load_thread_html bytes={}", html.len()));
+            web_view.load_html(html, Some(message_html::base_uri()));
+        }
+    }
+
     fn send_command(&self, command: RuntimeCommand) {
         let runtime = self.imp().runtime.borrow().clone();
         if let Some(runtime) = runtime {
@@ -1171,20 +1262,6 @@ impl ConduitWindow {
         }
     }
 
-    fn message_author_label(
-        &self,
-        message: &SlackMessage,
-        context: &MessageRenderContext,
-    ) -> String {
-        if let Some(user_id) = message.user.as_ref() {
-            if let Some(name) = context.user_names.get(user_id) {
-                return name.clone();
-            }
-        }
-
-        message.author_label()
-    }
-
     fn rerender_current_messages(&self) {
         let snapshot = self.current_message_snapshot();
 
@@ -1210,20 +1287,12 @@ impl ConduitWindow {
         }
     }
 
-    fn message_render_context(&self) -> MessageRenderContext {
-        let imp = self.imp();
-        MessageRenderContext {
-            user_names: imp.user_names.borrow().clone(),
-            current_user_id: imp.current_user_id.borrow().clone(),
-            selected_thread_ts: imp.selected_thread_ts.borrow().clone(),
-        }
-    }
-
-    fn message_html_context(&self) -> MessageHtmlContext {
+    fn message_html_context(&self, thread_ts: Option<&str>) -> MessageHtmlContext {
         let imp = self.imp();
         MessageHtmlContext {
             user_names: imp.user_names.borrow().clone(),
             current_user_id: imp.current_user_id.borrow().clone(),
+            thread_ts: thread_ts.map(ToString::to_string),
             image_assets: imp.image_assets.borrow().clone(),
             failed_image_urls: imp.failed_image_assets.borrow().clone(),
         }

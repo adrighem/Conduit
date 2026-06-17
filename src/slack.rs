@@ -215,6 +215,20 @@ impl SlackApi {
         Ok(())
     }
 
+    pub async fn set_saved(&self, channel_id: &str, ts: &str, add: bool) -> Result<()> {
+        let method = if add { "stars.add" } else { "stars.remove" };
+        let _: BasicResponse = self
+            .post_form(
+                method,
+                &[
+                    ("channel", channel_id.to_string()),
+                    ("timestamp", ts.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn upload_file<F>(
         &self,
         channel_id: &str,

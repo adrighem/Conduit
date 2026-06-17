@@ -278,13 +278,10 @@
                               </object>
                             </child>
                             <child>
-                              <object class="GtkScrolledWindow">
+                              <object class="GtkBox" id="thread_view_box">
+                                <property name="orientation">vertical</property>
+                                <property name="hexpand">True</property>
                                 <property name="vexpand">True</property>
-                                <property name="child">
-                                  <object class="GtkListBox" id="thread_list">
-                                    <property name="selection-mode">none</property>
-                                  </object>
-                                </property>
                               </object>
                             </child>
                             <child>

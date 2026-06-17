@@ -158,6 +158,7 @@ pub struct SlackMessage {
     pub ts: String,
     pub thread_ts: Option<String>,
     pub reply_count: Option<u64>,
+    pub is_starred: Option<bool>,
     pub reactions: Option<Vec<SlackReaction>>,
     pub files: Option<Vec<SlackFile>>,
     pub blocks: Option<Value>,

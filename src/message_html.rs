@@ -11,6 +11,7 @@ const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
 pub struct MessageHtmlContext {
     pub user_names: HashMap<String, String>,
     pub current_user_id: Option<String>,
+    pub thread_ts: Option<String>,
     pub image_assets: HashMap<String, String>,
     pub failed_image_urls: HashSet<String>,
 }
@@ -159,9 +160,10 @@ a:hover {{
 }}
 
 .message {{
+  position: relative;
   display: grid;
   gap: 6px;
-  padding: 10px 0;
+  padding: 10px 144px 10px 0;
   border-bottom: 1px solid var(--line);
 }}
 
@@ -170,9 +172,15 @@ a:hover {{
   gap: 8px;
 }}
 
+.message-group {{
+  padding-right: 0;
+}}
+
 .message-part {{
+  position: relative;
   display: grid;
   gap: 6px;
+  padding-right: 144px;
 }}
 
 .message-part + .message-part {{
@@ -256,7 +264,6 @@ pre code {{
 
 .attachments,
 .reactions,
-.message-actions,
 .block-actions {{
   display: flex;
   flex-wrap: wrap;
@@ -316,26 +323,130 @@ pre code {{
   font-weight: 700;
 }}
 
-.action {{
+.quick-actions {{
+  position: absolute;
+  top: 6px;
+  right: 0;
+  z-index: 2;
   display: inline-flex;
   align-items: center;
-  min-height: 26px;
-  padding: 0 10px;
+  gap: 0;
+  min-height: 34px;
+  overflow: visible;
   border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--soft);
-  color: var(--text);
-  font-weight: 600;
-  font-size: 12px;
+  border-radius: 8px;
+  background: var(--page);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
 }}
 
-.action:hover {{
-  border-color: var(--accent);
+.message:hover > .quick-actions,
+.message:focus-within > .quick-actions,
+.message-part:hover > .quick-actions,
+.message-part:focus-within > .quick-actions,
+.quick-actions:focus-within {{
+  opacity: 1;
+  pointer-events: auto;
+}}
+
+.action-button,
+.more-summary {{
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  line-height: 1;
+}}
+
+.action-button:hover,
+.more-summary:hover {{
+  background: var(--soft);
   text-decoration: none;
 }}
 
-.action.is-active {{
+.action-button.is-active {{
   background: var(--success-soft);
+}}
+
+.more-actions {{
+  position: relative;
+}}
+
+.more-summary {{
+  list-style: none;
+  cursor: default;
+}}
+
+.more-summary::-webkit-details-marker {{
+  display: none;
+}}
+
+.action-menu {{
+  position: absolute;
+  top: 38px;
+  right: 0;
+  z-index: 3;
+  display: grid;
+  min-width: 248px;
+  padding: 6px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--page);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+}}
+
+.menu-item,
+.menu-section {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 30px;
+  padding: 0 12px;
+  color: var(--text);
+  white-space: nowrap;
+}}
+
+.menu-item:hover {{
+  background: var(--soft);
+  text-decoration: none;
+}}
+
+.menu-item.is-disabled {{
+  color: var(--muted);
+}}
+
+.menu-item.is-danger {{
+  color: #d81951;
+}}
+
+.shortcut {{
+  color: var(--muted);
+  font-size: 12px;
+}}
+
+.menu-divider {{
+  height: 1px;
+  margin: 6px 0;
+  background: var(--line);
+}}
+
+.external-actions {{
+  display: flex;
+  gap: 8px;
+}}
+
+.external-action {{
+  color: var(--accent);
+  font-size: 13px;
 }}
 
 .image-link {{
@@ -496,7 +607,7 @@ fn search_result_article(result: &SearchMatch, context: &MessageHtmlContext) -> 
 
     if let Some(permalink) = result.permalink.as_deref().filter(|url| is_http_url(url)) {
         article.push_str(&format!(
-            "<nav class=\"message-actions\"><a class=\"action\" href=\"{}\" rel=\"noreferrer noopener\">Open in Slack</a></nav>",
+            "<nav class=\"external-actions\"><a class=\"external-action\" href=\"{}\" rel=\"noreferrer noopener\">Open in Slack</a></nav>",
             escape_html(permalink)
         ));
     }
@@ -856,31 +967,52 @@ fn message_actions_html(
         return String::new();
     }
 
+    let thread_ts = action_thread_ts(message, context);
     let mut actions = String::new();
-    let reacted = message.user_reacted("thumbsup", context.current_user_id.as_deref());
-    let reaction_label = if reacted { "Remove +1" } else { "+1" };
-    let active_class = if reacted { " is-active" } else { "" };
-    actions.push_str(&format!(
-        "<a class=\"action{}\" href=\"{}\">{}</a>",
-        active_class,
-        escape_html(&reaction_action_url(channel_id, message, !reacted)),
-        reaction_label
-    ));
-
-    if message.has_thread() {
-        let label = message
-            .reply_count
-            .filter(|count| *count > 0)
-            .map(|count| format!("View thread ({count})"))
-            .unwrap_or_else(|| "View thread".to_string());
-        actions.push_str(&format!(
-            "<a class=\"action\" href=\"{}\">{}</a>",
-            escape_html(&thread_action_url(channel_id, &message.ts)),
-            escape_html(&label)
+    for (name, emoji, title) in quick_reactions() {
+        let reacted = message.user_reacted(name, context.current_user_id.as_deref());
+        actions.push_str(&action_button_html(
+            &reaction_action_url(channel_id, message, name, !reacted, thread_ts),
+            emoji,
+            title,
+            reacted,
         ));
     }
 
-    format!("<nav class=\"message-actions\">{actions}</nav>")
+    if context.thread_ts.is_none() {
+        let title = message
+            .reply_count
+            .filter(|count| *count > 0)
+            .map(|count| format!("View thread ({count})"))
+            .unwrap_or_else(|| "Reply in thread".to_string());
+        actions.push_str(&action_button_html(
+            &thread_action_url(channel_id, &message.ts),
+            "💬",
+            &title,
+            false,
+        ));
+    }
+
+    let starred = message.is_starred.unwrap_or(false);
+    actions.push_str(&action_button_html(
+        &save_action_url(channel_id, message, !starred, thread_ts),
+        if starred { "★" } else { "☆" },
+        if starred {
+            "Remove from saved items"
+        } else {
+            "Save for later"
+        },
+        starred,
+    ));
+    actions.push_str(&action_button_html(
+        &copy_link_action_url(channel_id, message),
+        "🔗",
+        "Copy link",
+        false,
+    ));
+    actions.push_str(&more_actions_html(channel_id, message, thread_ts));
+
+    format!("<nav class=\"quick-actions\" aria-label=\"Message actions\">{actions}</nav>")
 }
 
 pub fn thread_action_url(channel_id: &str, ts: &str) -> String {
@@ -891,20 +1023,137 @@ pub fn thread_action_url(channel_id: &str, ts: &str) -> String {
     )
 }
 
-pub fn reaction_action_url(channel_id: &str, message: &SlackMessage, add: bool) -> String {
+pub fn reaction_action_url(
+    channel_id: &str,
+    message: &SlackMessage,
+    name: &str,
+    add: bool,
+    thread_ts: Option<&str>,
+) -> String {
     let mut url = format!(
-        "conduit://reaction?channel={}&ts={}&name=thumbsup&add={}",
+        "conduit://reaction?channel={}&ts={}&name={}&add={}",
+        encode_query(channel_id),
+        encode_query(&message.ts),
+        encode_query(name),
+        add
+    );
+
+    append_thread_ts_query(&mut url, thread_ts);
+
+    url
+}
+
+pub fn save_action_url(
+    channel_id: &str,
+    message: &SlackMessage,
+    add: bool,
+    thread_ts: Option<&str>,
+) -> String {
+    let mut url = format!(
+        "conduit://save?channel={}&ts={}&add={}",
         encode_query(channel_id),
         encode_query(&message.ts),
         add
     );
 
-    if let Some(thread_ts) = message.thread_ts.as_deref().filter(|ts| !ts.is_empty()) {
+    append_thread_ts_query(&mut url, thread_ts);
+    url
+}
+
+pub fn copy_message_action_url(channel_id: &str, message: &SlackMessage) -> String {
+    format!(
+        "conduit://copy-message?channel={}&ts={}",
+        encode_query(channel_id),
+        encode_query(&message.ts)
+    )
+}
+
+pub fn copy_link_action_url(channel_id: &str, message: &SlackMessage) -> String {
+    format!(
+        "conduit://copy-link?channel={}&ts={}",
+        encode_query(channel_id),
+        encode_query(&message.ts)
+    )
+}
+
+fn append_thread_ts_query(url: &mut String, thread_ts: Option<&str>) {
+    if let Some(thread_ts) = thread_ts.filter(|ts| !ts.is_empty()) {
         url.push_str("&thread_ts=");
         url.push_str(&encode_query(thread_ts));
     }
+}
 
-    url
+fn action_thread_ts<'a>(
+    message: &'a SlackMessage,
+    context: &'a MessageHtmlContext,
+) -> Option<&'a str> {
+    context.thread_ts.as_deref().or_else(|| {
+        message
+            .thread_ts
+            .as_deref()
+            .filter(|thread_ts| !thread_ts.is_empty() && *thread_ts != message.ts.as_str())
+    })
+}
+
+fn quick_reactions() -> [(&'static str, &'static str, &'static str); 3] {
+    [
+        ("smile", "🙂", "React with smile"),
+        ("thumbsup", "👍", "React with thumbs up"),
+        ("white_check_mark", "✅", "React with check"),
+    ]
+}
+
+fn action_button_html(href: &str, label: &str, title: &str, active: bool) -> String {
+    let active_class = if active { " is-active" } else { "" };
+    format!(
+        "<a class=\"action-button{}\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
+        active_class,
+        escape_html(href),
+        escape_html(title),
+        escape_html(title),
+        escape_html(label)
+    )
+}
+
+fn more_actions_html(channel_id: &str, message: &SlackMessage, thread_ts: Option<&str>) -> String {
+    let mut save_url = save_action_url(
+        channel_id,
+        message,
+        !message.is_starred.unwrap_or(false),
+        thread_ts,
+    );
+    save_url = escape_html(&save_url);
+
+    format!(
+        concat!(
+            "<details class=\"more-actions\">",
+            "<summary class=\"more-summary\" title=\"More actions\" aria-label=\"More actions\">⋮</summary>",
+            "<div class=\"action-menu\">",
+            "<span class=\"menu-item is-disabled\"><span>Edit message</span><span class=\"shortcut\">E</span></span>",
+            "<span class=\"menu-item is-disabled\"><span>Mark unread</span><span class=\"shortcut\">U</span></span>",
+            "<span class=\"menu-item is-disabled\"><span>Remind me</span><span class=\"shortcut\">›</span></span>",
+            "<span class=\"menu-item is-disabled\">Turn off notifications for replies</span>",
+            "<div class=\"menu-divider\"></div>",
+            "<a class=\"menu-item\" href=\"{}\"><span>Copy link</span><span class=\"shortcut\">L</span></a>",
+            "<a class=\"menu-item\" href=\"{}\"><span>Copy message</span><span class=\"shortcut\">Ctrl+C</span></a>",
+            "<a class=\"menu-item\" href=\"{}\">{}</a>",
+            "<div class=\"menu-divider\"></div>",
+            "<span class=\"menu-item is-disabled\"><span>Organise</span><span class=\"shortcut\">›</span></span>",
+            "<span class=\"menu-item is-disabled\"><span>Connect to apps</span><span class=\"shortcut\">›</span></span>",
+            "<div class=\"menu-divider\"></div>",
+            "<span class=\"menu-item is-disabled is-danger\"><span>Delete message...</span><span class=\"shortcut\">Delete</span></span>",
+            "</div>",
+            "</details>"
+        ),
+        escape_html(&copy_link_action_url(channel_id, message)),
+        escape_html(&copy_message_action_url(channel_id, message)),
+        save_url,
+        if message.is_starred.unwrap_or(false) {
+            "Remove from saved items"
+        } else {
+            "Save for later"
+        }
+    )
 }
 
 fn encode_query(value: &str) -> String {
@@ -1272,7 +1521,11 @@ mod tests {
 
         let html = conversation_document("C123", &messages, &MessageHtmlContext::default());
 
-        assert_eq!(html.matches("message-group").count(), 2);
+        assert_eq!(
+            html.matches("<article class=\"message message-group\"")
+                .count(),
+            2
+        );
         assert!(html.contains("first"));
         assert!(html.contains("second"));
     }
@@ -1286,7 +1539,11 @@ mod tests {
 
         let html = conversation_document("C123", &messages, &MessageHtmlContext::default());
 
-        assert_eq!(html.matches("message-group").count(), 2);
+        assert_eq!(
+            html.matches("<article class=\"message message-group\"")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1302,9 +1559,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_interactive_thread_and_reaction_actions() {
+    fn renders_message_quick_actions() {
         let mut message = message("threaded");
         message.reply_count = Some(3);
+        message.is_starred = Some(true);
         message.reactions = Some(vec![SlackReaction {
             name: Some("thumbsup".to_string()),
             count: Some(1),
@@ -1318,9 +1576,47 @@ mod tests {
         let html = conversation_document("C123", &[message], &context);
 
         assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains(
+            "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=smile&amp;add=true"
+        ));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
-        assert!(html.contains("Remove +1"));
-        assert!(html.contains("View thread (3)"));
+        assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=white_check_mark&amp;add=true"));
+        assert!(html.contains("conduit://save?channel=C123&amp;ts=1710000000.000100&amp;add=false"));
+        assert!(html.contains("conduit://copy-link?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains("conduit://copy-message?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains("More actions"));
+        assert!(!html.contains("Remove +1"));
+    }
+
+    #[test]
+    fn thread_context_actions_reload_thread_without_thread_button() {
+        let image_url = "https://files.slack.com/files-pri/T123-F123/thread.png";
+        let mut message = message("reply");
+        message.text = Some("reply :stuck_out_tongue:".to_string());
+        message.files = Some(vec![SlackFile {
+            title: Some("Thread image".to_string()),
+            mimetype: Some("image/png".to_string()),
+            thumb_480: Some(image_url.to_string()),
+            ..Default::default()
+        }]);
+        message.thread_ts = Some("1710000000.000100".to_string());
+        message.ts = "1710000010.000200".to_string();
+        let context = MessageHtmlContext {
+            thread_ts: Some("1710000000.000100".to_string()),
+            image_assets: HashMap::from([(
+                image_url.to_string(),
+                "data:image/png;base64,thread".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message], &context);
+
+        assert!(html.contains("thread_ts=1710000000.000100"));
+        assert!(!html.contains("conduit://thread?"));
+        assert!(html.contains("<span class=\"emoji\" title=\":stuck_out_tongue:\">😛</span>"));
+        assert!(html.contains("src=\"data:image/png;base64,thread\""));
+        assert!(html.contains("Thread image"));
     }
 
     #[test]
