@@ -988,11 +988,18 @@ fn thread_response_html(
         .map(|count| format!("View thread ({count})"))
         .unwrap_or_else(|| "View thread".to_string());
 
+    let label = message
+        .reply_count
+        .filter(|count| *count > 0)
+        .map(|count| format!("thread ({count})"))
+        .unwrap_or_else(|| "thread".to_string());
+
     format!(
-        "<a class=\"reaction thread-reaction\" href=\"{}\" title=\"{}\" aria-label=\"{}\">Thread</a>",
+        "<a class=\"reaction thread-reaction\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
         escape_html(&thread_action_url(channel_id, &message.ts)),
         escape_html(&title),
-        escape_html(&title)
+        escape_html(&title),
+        escape_html(&label)
     )
 }
 
@@ -1403,6 +1410,7 @@ fn emoji_for_code(code: &str) -> Option<&'static str> {
         "stuck_out_tongue_winking_eye" => Some("😜"),
         "sweat_smile" => Some("😅"),
         "thinking_face" => Some("🤔"),
+        "troll" => Some("🧌"),
         "white_check_mark" => Some("✅"),
         "yum" => Some("😋"),
         "zany_face" => Some("🤪"),
@@ -1542,6 +1550,21 @@ mod tests {
     }
 
     #[test]
+    fn renders_thread_emoji_shortcodes_embedded_in_text() {
+        let context = MessageHtmlContext {
+            thread_ts: Some("1710000000.000100".to_string()),
+            ..Default::default()
+        };
+        let html = conversation_document(
+            "C123",
+            &[message("Something in a thread :troll:")],
+            &context,
+        );
+
+        assert!(html.contains("<span class=\"emoji\" title=\":troll:\">🧌</span>"));
+    }
+
+    #[test]
     fn renders_message_timestamp_with_full_datetime_tooltip() {
         let html =
             conversation_document("C123", &[message("timed")], &MessageHtmlContext::default());
@@ -1618,7 +1641,7 @@ mod tests {
 
         assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
         assert!(html.contains(">💬</a>"));
-        assert!(html.contains(">Thread</a>"));
+        assert!(html.contains(">thread (3)</a>"));
         assert!(html.contains(
             "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=smile&amp;add=true"
         ));

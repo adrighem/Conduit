@@ -96,7 +96,7 @@ impl SlackApi {
                 ],
             )
             .await?;
-        Ok(response.messages)
+        Ok(thread_replies_in_history_order(response.messages))
     }
 
     pub async fn search_messages(&self, query: &str) -> Result<Vec<SearchMatch>> {
@@ -464,3 +464,44 @@ struct CompleteUploadResponse {
     files: Vec<SlackFile>,
 }
 impl_slack_response!(CompleteUploadResponse);
+
+fn thread_replies_in_history_order(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+    // Slack conversations.replies returns the parent first, while conversations.history
+    // returns newest-first. Keep these API methods consistent for the message renderer.
+    messages.reverse();
+    messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(ts: &str) -> SlackMessage {
+        SlackMessage {
+            ts: ts.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn thread_replies_are_normalized_to_history_order() {
+        let messages = thread_replies_in_history_order(vec![
+            message("1710000000.000100"),
+            message("1710000100.000100"),
+            message("1710000200.000100"),
+        ]);
+        let timestamps = messages
+            .iter()
+            .map(|message| message.ts.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            timestamps,
+            vec![
+                "1710000200.000100",
+                "1710000100.000100",
+                "1710000000.000100"
+            ]
+        );
+    }
+}
