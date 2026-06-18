@@ -1,19 +1,21 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-06-17",
+  "last_manual_run": "2026-06-18",
   "last_known_open_issues": 0,
   "last_known_open_pull_requests": 0,
   "last_known_total_issues": 0,
   "last_known_total_pull_requests": 0,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass",
+    "cargo_test": "pass: 19 tests",
     "meson_compile": "pass",
     "meson_test": "pass",
+    "github_actions": "latest CI and CodeQL runs passing",
     "cargo_clippy": "unavailable"
   },
   "notes": {
     "skill_package": "references and triage script missing; manual fallback used",
-    "clippy": "cargo clippy is unavailable because the local toolchain lacks clippy and rustup is not installed"
+    "clippy": "cargo clippy is unavailable because the local toolchain lacks clippy and rustup is not installed",
+    "worktree": "docs/sidebar-improvement-plan.md is uncommitted documentation work"
   }
 }
