@@ -11,11 +11,11 @@
     "meson_compile": "pass",
     "meson_test": "pass",
     "github_actions": "latest CI and CodeQL runs passing",
-    "cargo_clippy": "blocked: cargo-clippy/clippy-driver 0.1.87 behaves as Rust 1.87 while dependencies require Rust 1.88+"
+    "cargo_clippy": "pass: cargo clippy --all-targets -- -D warnings"
   },
   "notes": {
     "skill_package": "references and triage script missing; manual fallback used",
-    "clippy": "normal cargo/rustc are 1.95, but /usr/bin/cargo-clippy and /usr/bin/clippy-driver are 0.1.87; install a matching Clippy before adding a lint CI gate",
-    "worktree": "sidebar and contributor intake recommendation commits completed; maintainer memory remains to commit"
+    "clippy": "cargo-clippy and clippy-driver are 0.1.95; CI and contributor docs now use cargo clippy --all-targets -- -D warnings",
+    "worktree": "clippy gate implemented locally with CI, docs, and warning cleanup"
   }
 }

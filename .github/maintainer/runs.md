@@ -47,3 +47,20 @@
   - Sidebar implementation committed as `b97419f`.
   - Contributor intake files committed as `0230dc5`.
 - Notes: the installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback again.
+
+## 2026-06-19 Clippy Gate
+
+- Scope: enable Clippy after local upgrade to matching Rust 1.95 tooling.
+- Local checks:
+  - `cargo clippy --version`: `clippy 0.1.95`
+  - `clippy-driver --version`: `clippy 0.1.95`
+  - `cargo clippy --all-targets -- -D warnings`: pass after mechanical cleanup
+- Code cleanup:
+  - Removed needless generic borrow in About dialog translator credits.
+  - Replaced redundant OAuth expiry closure with function item.
+  - Replaced lazy reaction fallback with eager `Option::or`.
+  - Replaced `filter(...).next()` with `find(...)`.
+  - Elided needless test helper lifetimes.
+- Policy update:
+  - CI now installs the `clippy` component and runs the warning-deny lint gate.
+  - Contributor guide and PR template include the lint command.

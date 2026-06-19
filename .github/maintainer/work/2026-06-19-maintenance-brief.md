@@ -16,7 +16,7 @@
 
 ## Why This Matters
 
-- A mismatched Clippy binary fails before checking project code and would create a noisy local/CI story if treated as a ready gate.
+- The Clippy binary now matches the active Rust toolchain, and the warning-deny lint gate is enabled in CI.
 - A security policy reduces the chance that Slack tokens, OAuth codes, or private workspace data get posted publicly.
 - Release-readiness docs are now the highest-leverage preventive maintenance item after intake templates.
 
@@ -24,7 +24,7 @@
 
 - Confidence is high for the empty-backlog and green-Actions assessment because it came from live `gh` queries.
 - Confidence is high that the sidebar and intake recommendations are implemented locally because both are committed.
-- Clippy remains unknown for project lints because the installed `cargo-clippy`/`clippy-driver` is older than the active Rust toolchain and dependency MSRV.
+- Clippy confidence is high after `cargo clippy --all-targets -- -D warnings` passed locally with version 0.1.95.
 
 ## Needs Approval
 

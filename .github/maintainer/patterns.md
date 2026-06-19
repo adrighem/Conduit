@@ -20,3 +20,8 @@
 
 - Contributor intake should bias toward reproducibility and secret hygiene: Slack tokens, OAuth codes, workspace secrets, and private messages are the support data most likely to leak accidentally.
 - CI Clippy should wait until the available Clippy driver matches the active Rust toolchain; a mismatched `cargo-clippy` binary can fail before linting project code.
+
+## 2026-06-19 Clippy Gate
+
+- Clippy is now part of the standard maintenance gate. Keep local docs, PR templates, and CI aligned on the exact command: `cargo clippy --all-targets -- -D warnings`.
+- Treat new Clippy warnings as code review signals before changing lint policy; suppressions should be local and justified.

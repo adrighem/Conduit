@@ -29,3 +29,9 @@
 - Committed the native GTK sidebar slice first as `b97419f`.
 - Added preventive intake and contributor guidance in `0230dc5`: GitHub issue forms, PR template, and `CONTRIBUTING.md`.
 - Did not add Clippy to CI yet. `cargo-clippy` is installed locally, but the installed `clippy-driver` is version `0.1.87` and behaves as Rust 1.87, while current resolved dependencies require Rust 1.88 or newer. The normal `cargo` and `rustc` are 1.95.
+
+## 2026-06-19 Clippy Gate
+
+- After `cargo-clippy` was upgraded to match Rust 1.95, enabled `cargo clippy --all-targets -- -D warnings` in CI.
+- Fixed the current warning set before adding the gate, so the lint check is immediately actionable rather than aspirational.
+- Updated contributor and pull request checklists to include the same Clippy command.
