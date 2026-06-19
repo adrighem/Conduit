@@ -1210,7 +1210,7 @@ fn encode_query(value: &str) -> String {
 
 fn reaction_label(name: &str) -> String {
     emoji_for_code(name)
-        .or_else(|| match name {
+        .or(match name {
             "+1" => Some("👍"),
             "-1" => Some("👎"),
             _ => None,

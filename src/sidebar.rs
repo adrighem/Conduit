@@ -217,10 +217,7 @@ mod tests {
         }
     }
 
-    fn section<'a>(
-        sections: &'a [SidebarSectionModel],
-        kind: SidebarSectionKind,
-    ) -> &'a SidebarSectionModel {
+    fn section(sections: &[SidebarSectionModel], kind: SidebarSectionKind) -> &SidebarSectionModel {
         sections
             .iter()
             .find(|section| section.kind == kind)

@@ -388,9 +388,7 @@ fn token_from_response(
     let access_token = response
         .access_token
         .ok_or_else(|| anyhow!("Slack OAuth response did not include an access token"))?;
-    let expires_at = response
-        .expires_in
-        .map(|expires_in| StoredToken::expires_at_from_now(expires_in));
+    let expires_at = response.expires_in.map(StoredToken::expires_at_from_now);
 
     Ok(StoredToken {
         access_token,

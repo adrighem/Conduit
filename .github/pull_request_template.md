@@ -5,6 +5,7 @@ Describe the change and the user-facing problem it solves.
 ## Testing
 
 - [ ] `cargo fmt --check`
+- [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test`
 - [ ] `meson compile -C _build`
 - [ ] `meson test -C _build`

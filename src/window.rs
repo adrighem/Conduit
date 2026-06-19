@@ -1246,10 +1246,7 @@ impl ConduitWindow {
             return;
         };
 
-        let latest_message = messages
-            .iter()
-            .filter(|message| message.ts == latest_ts)
-            .next();
+        let latest_message = messages.iter().find(|message| message.ts == latest_ts);
         let current_user_id = self.imp().current_user_id.borrow().clone();
 
         if latest_message

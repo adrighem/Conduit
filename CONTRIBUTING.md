@@ -25,6 +25,7 @@ Rust-only checks are also useful while iterating:
 
 ```sh
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
@@ -49,6 +50,7 @@ Before opening a pull request, run:
 
 ```sh
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 meson compile -C _build
 meson test -C _build
