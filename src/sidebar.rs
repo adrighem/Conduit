@@ -65,11 +65,43 @@ pub struct SidebarRowModel {
     pub private: bool,
 }
 
+impl SidebarRowModel {
+    pub fn unread_badge_label(&self) -> Option<String> {
+        match self.unread_count {
+            0 => None,
+            1..=99 => Some(self.unread_count.to_string()),
+            _ => Some("99+".to_string()),
+        }
+    }
+
+    pub fn accessible_label(&self) -> String {
+        let mut label = format!("{}: {}", self.kind.accessible_name(), self.title);
+        if self.unread_count == 1 {
+            label.push_str(", 1 unread");
+        } else if self.unread_count > 1 {
+            label.push_str(&format!(", {} unread", self.unread_count));
+        }
+        if self.selected {
+            label.push_str(", selected");
+        }
+        label
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarSectionModel {
     pub kind: SidebarSectionKind,
     pub title: &'static str,
     pub rows: Vec<SidebarRowModel>,
+}
+
+impl SidebarSectionModel {
+    pub fn display_title(&self) -> String {
+        match self.kind {
+            SidebarSectionKind::Unreads => format!("{} ({})", self.title, self.rows.len()),
+            _ => self.title.to_string(),
+        }
+    }
 }
 
 pub fn build_sidebar_sections(
@@ -228,6 +260,17 @@ mod tests {
         section.rows.iter().map(|row| row.title.as_str()).collect()
     }
 
+    fn row(title: &str, unread_count: u64, selected: bool) -> SidebarRowModel {
+        SidebarRowModel {
+            id: title.to_string(),
+            title: title.to_string(),
+            kind: ConversationKind::PublicChannel,
+            unread_count,
+            selected,
+            private: false,
+        }
+    }
+
     #[test]
     fn classifies_conversation_types() {
         assert_eq!(
@@ -348,5 +391,37 @@ mod tests {
             section(&sections, SidebarSectionKind::Channels).rows[0].selected,
             "regular row should be selected"
         );
+    }
+
+    #[test]
+    fn unread_badge_is_capped_for_large_counts() {
+        assert_eq!(row("#general", 0, false).unread_badge_label(), None);
+        assert_eq!(
+            row("#general", 12, false).unread_badge_label().as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            row("#general", 120, false).unread_badge_label().as_deref(),
+            Some("99+")
+        );
+    }
+
+    #[test]
+    fn accessible_label_includes_type_unreads_and_selected_state() {
+        assert_eq!(
+            row("#general", 3, true).accessible_label(),
+            "Public channel: #general, 3 unread, selected"
+        );
+    }
+
+    #[test]
+    fn unread_section_display_title_includes_row_count() {
+        let section = SidebarSectionModel {
+            kind: SidebarSectionKind::Unreads,
+            title: "Unreads",
+            rows: vec![row("#general", 1, false), row("#random", 1, false)],
+        };
+
+        assert_eq!(section.display_title(), "Unreads (2)");
     }
 }

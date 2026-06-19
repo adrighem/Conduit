@@ -6,7 +6,7 @@
 
 Conduit is a lightweight GNOME desktop client for Slack written in Rust with GTK4, libadwaita, and WebKitGTK.
 
-The current implementation is an early development slice. It includes a native UI shell, Slack OAuth with PKCE for desktop user-token authentication, secure token storage through the system keyring, and read/write Slack Web API plumbing for conversations, history, threads, search, saved items, messages, and file uploads.
+The current implementation is an early development slice. It includes a native UI shell with a GTK sidebar for workspace navigation, Slack OAuth with PKCE for desktop user-token authentication, secure token storage through the system keyring, and read/write Slack Web API plumbing for conversations, history, threads, search, saved items, messages, and file uploads.
 
 ## Building
 
@@ -48,7 +48,7 @@ Required user scopes:
 channels:read,channels:history,groups:read,groups:history,im:read,im:history,mpim:read,mpim:history,users:read,chat:write,search:read,stars:read,stars:write,reactions:read,reactions:write,files:read,files:write
 ```
 
-After approval, Conduit validates the session with `auth.test` and stores the token in the system keyring. Use the sign-out button in the workspace toolbar to remove the stored token.
+After approval, Conduit validates the session with `auth.test` and stores the token in the system keyring. Use **Sign Out** in the workspace menu to remove the stored token.
 
 ## Status
 
@@ -58,7 +58,7 @@ Implemented:
 - PKCE OAuth callback flow on localhost.
 - Keyring-backed token storage.
 - Background Tokio runtime for Slack network work.
-- Conversation list, history, thread replies, search, saved items, message posting, emoji reactions, file upload, and Socket Mode refreshes.
+- Native sidebar conversation navigation, history, thread replies, search, saved items, message posting, emoji reactions, file upload, and Socket Mode refreshes.
 
 Next:
 

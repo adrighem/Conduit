@@ -136,10 +136,11 @@
                             <property name="orientation">horizontal</property>
                             <property name="spacing">6</property>
                             <child>
-                              <object class="GtkLabel">
+                              <object class="GtkLabel" id="workspace_title_label">
                                 <property name="xalign">0</property>
                                 <property name="hexpand">True</property>
-                                <property name="label" translatable="yes">Home</property>
+                                <property name="ellipsize">end</property>
+                                <property name="label" translatable="yes">Workspace</property>
                                 <style>
                                   <class name="heading"/>
                                 </style>
@@ -152,9 +153,10 @@
                               </object>
                             </child>
                             <child>
-                              <object class="GtkButton" id="sign_out_button">
-                                <property name="icon-name">system-log-out-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Sign Out</property>
+                              <object class="GtkMenuButton">
+                                <property name="icon-name">open-menu-symbolic</property>
+                                <property name="tooltip-text" translatable="yes">Workspace Menu</property>
+                                <property name="menu-model">workspace_menu</property>
                               </object>
                             </child>
                           </object>
@@ -219,7 +221,8 @@
                             <property name="vexpand">True</property>
                             <property name="child">
                               <object class="GtkListBox" id="conversation_list">
-                                <property name="selection-mode">none</property>
+                                <property name="selection-mode">single</property>
+                                <property name="activate-on-single-click">True</property>
                                 <style>
                                   <class name="navigation-sidebar"/>
                                 </style>
@@ -402,6 +405,14 @@
       <item>
         <attribute name="label" translatable="yes">_About Conduit</attribute>
         <attribute name="action">app.about</attribute>
+      </item>
+    </section>
+  </menu>
+  <menu id="workspace_menu">
+    <section>
+      <item>
+        <attribute name="label" translatable="yes">_Sign Out</attribute>
+        <attribute name="action">win.sign-out</attribute>
       </item>
     </section>
   </menu>

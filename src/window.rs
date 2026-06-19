@@ -55,13 +55,13 @@ mod imp {
         #[template_child]
         pub connection_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub workspace_title_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub home_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub saved_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub refresh_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub sign_out_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub sidebar_filter_entry: TemplateChild<gtk::SearchEntry>,
         #[template_child]
@@ -104,10 +104,14 @@ mod imp {
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
         pub conversations: RefCell<Vec<SlackConversation>>,
+        pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
         pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<HashMap<String, String>>,
         pub pending_user_ids: RefCell<HashSet<String>>,
+        pub workspace_name: RefCell<Option<String>>,
         pub workspace_url: RefCell<Option<String>>,
+        pub sidebar_loading: Cell<bool>,
+        pub sidebar_error: RefCell<Option<String>>,
         pub current_channel_messages: RefCell<Vec<SlackMessage>>,
         pub current_thread_messages: RefCell<Vec<SlackMessage>>,
         pub current_search_results: RefCell<Vec<SearchMatch>>,
@@ -174,6 +178,28 @@ struct CurrentMessageSnapshot {
     main_view: MainMessageView,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarRowAction {
+    channel_id: String,
+    title: String,
+}
+
+impl SidebarRowAction {
+    fn from_model(model: &SidebarRowModel) -> Self {
+        Self {
+            channel_id: model.id.clone(),
+            title: model.title.clone(),
+        }
+    }
+}
+
+fn sidebar_row_action_for_index(
+    actions: &HashMap<i32, SidebarRowAction>,
+    row_index: i32,
+) -> Option<SidebarRowAction> {
+    actions.get(&row_index).cloned()
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MainMessageView {
     #[default]
@@ -181,6 +207,15 @@ pub enum MainMessageView {
     Conversation,
     Search,
     Saved,
+}
+
+fn sidebar_selected_channel(
+    main_view: MainMessageView,
+    selected_channel: Option<String>,
+) -> Option<String> {
+    (main_view == MainMessageView::Conversation)
+        .then_some(selected_channel)
+        .flatten()
 }
 
 fn message_navigation_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
@@ -318,15 +353,13 @@ impl ConduitWindow {
     fn setup_callbacks(&self) {
         let imp = self.imp();
 
+        self.setup_window_actions();
         self.connect_widget(&imp.connect_button.get(), |window| window.start_oauth());
         self.connect_widget(&imp.home_button.get(), |window| window.show_home());
         self.connect_widget(&imp.refresh_button.get(), |window| {
-            window.send_command(RuntimeCommand::RefreshConversations)
+            window.refresh_conversations()
         });
         self.connect_widget(&imp.saved_button.get(), |window| window.show_later());
-        self.connect_widget(&imp.sign_out_button.get(), |window| {
-            window.send_command(RuntimeCommand::SignOut)
-        });
         self.connect_widget(&imp.message_search_button.get(), |window| {
             window.search_messages()
         });
@@ -351,6 +384,13 @@ impl ConduitWindow {
         });
 
         let weak_window = self.downgrade();
+        imp.conversation_list.connect_row_activated(move |_, row| {
+            if let Some(window) = weak_window.upgrade() {
+                window.activate_sidebar_row(row.index());
+            }
+        });
+
+        let weak_window = self.downgrade();
         imp.message_entry.connect_activate(move |_| {
             if let Some(window) = weak_window.upgrade() {
                 window.post_current_message();
@@ -370,6 +410,17 @@ impl ConduitWindow {
                 window.search_messages();
             }
         });
+    }
+
+    fn setup_window_actions(&self) {
+        let sign_out_action = gio::SimpleAction::new("sign-out", None);
+        let weak_window = self.downgrade();
+        sign_out_action.connect_activate(move |_, _| {
+            if let Some(window) = weak_window.upgrade() {
+                window.send_command(RuntimeCommand::SignOut);
+            }
+        });
+        self.add_action(&sign_out_action);
     }
 
     fn connect_widget<W, F>(&self, widget: &W, callback: F)
@@ -411,6 +462,9 @@ impl ConduitWindow {
         match event {
             RuntimeEvent::Status(status) => {
                 if !self.imp().connect_requested.get() {
+                    if status == "Loading conversations" {
+                        self.set_sidebar_loading(true);
+                    }
                     self.set_status(&status);
                 }
             }
@@ -567,11 +621,19 @@ impl ConduitWindow {
         });
     }
 
+    fn refresh_conversations(&self) {
+        self.set_sidebar_loading(true);
+        self.send_command(RuntimeCommand::RefreshConversations);
+    }
+
     fn show_home(&self) {
         if let Some(channel_id) = self.selected_channel_id() {
             let title = self.conversation_title(&channel_id);
             self.select_conversation(&channel_id, &title);
         } else {
+            self.imp()
+                .current_main_view
+                .set(MainMessageView::Placeholder);
             self.imp().message_title.set_label("Select a conversation");
             self.show_message_placeholder("Select a conversation");
             self.close_thread();
@@ -580,8 +642,10 @@ impl ConduitWindow {
     }
 
     fn show_later(&self) {
+        self.imp().current_main_view.set(MainMessageView::Saved);
         self.imp().message_title.set_label("Later");
         self.close_thread();
+        self.render_conversations();
         self.load_message_html(&message_html::placeholder_document(
             "Later",
             "Loading saved items",
@@ -596,6 +660,8 @@ impl ConduitWindow {
             return;
         }
         self.close_thread();
+        self.imp().current_main_view.set(MainMessageView::Search);
+        self.render_conversations();
         self.imp().message_title.set_label("Search results");
         self.load_message_html(&message_html::placeholder_document(
             "Search results",
@@ -922,9 +988,13 @@ impl ConduitWindow {
         *imp.current_user_id.borrow_mut() = None;
         imp.latest_message_ts_by_channel.borrow_mut().clear();
         imp.conversations.borrow_mut().clear();
+        imp.sidebar_row_actions.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
         imp.pending_user_ids.borrow_mut().clear();
+        *imp.workspace_name.borrow_mut() = None;
         *imp.workspace_url.borrow_mut() = None;
+        imp.sidebar_loading.set(false);
+        *imp.sidebar_error.borrow_mut() = None;
         imp.image_assets.borrow_mut().clear();
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
@@ -934,6 +1004,8 @@ impl ConduitWindow {
         imp.current_saved_items.borrow_mut().clear();
         imp.current_main_view.set(MainMessageView::Placeholder);
         imp.sidebar_filter_entry.set_text("");
+        imp.workspace_title_label.set_label("Workspace");
+        imp.workspace_status_label.set_label("");
         self.clear_list(&imp.conversation_list);
         self.show_message_placeholder("Select a conversation");
         self.load_thread_html(&message_html::placeholder_document(
@@ -946,13 +1018,16 @@ impl ConduitWindow {
         *self.imp().current_user_id.borrow_mut() = auth.user_id.clone();
         *self.imp().workspace_url.borrow_mut() = auth.url.clone();
         self.imp().connect_button.set_sensitive(true);
-        let label = auth
+        let workspace_name = auth
             .team
             .or(auth.team_id)
-            .map(|team| format!("Connected to {team}"))
-            .unwrap_or_else(|| "Connected to Slack".to_string());
+            .unwrap_or_else(|| "Slack".to_string());
+        *self.imp().workspace_name.borrow_mut() = Some(workspace_name.clone());
+        self.imp().workspace_title_label.set_label(&workspace_name);
+        let label = format!("Connected to {workspace_name}");
         self.set_status(&label);
         self.imp().content_stack.set_visible_child_name("workspace");
+        self.set_sidebar_loading(true);
     }
 
     fn set_status(&self, status: &str) {
@@ -960,6 +1035,15 @@ impl ConduitWindow {
         imp.status_label.set_label(status);
         imp.connection_label.set_label(status);
         imp.workspace_status_label.set_label(status);
+    }
+
+    fn set_sidebar_loading(&self, loading: bool) {
+        let imp = self.imp();
+        imp.sidebar_loading.set(loading);
+        if loading {
+            *imp.sidebar_error.borrow_mut() = None;
+        }
+        self.render_conversations();
     }
 
     fn show_error(&self, error: &str) {
@@ -970,11 +1054,18 @@ impl ConduitWindow {
         if self.imp().content_stack.visible_child_name().as_deref() == Some("loading") {
             self.show_login(error);
         } else {
+            if self.imp().content_stack.visible_child_name().as_deref() == Some("workspace") {
+                self.imp().sidebar_loading.set(false);
+                *self.imp().sidebar_error.borrow_mut() = Some(error.to_string());
+                self.render_conversations();
+            }
             self.set_status(error);
         }
     }
 
     fn populate_conversations(&self, conversations: Vec<SlackConversation>) {
+        self.imp().sidebar_loading.set(false);
+        *self.imp().sidebar_error.borrow_mut() = None;
         *self.imp().conversations.borrow_mut() = conversations;
         self.request_conversation_user_names();
         self.render_conversations();
@@ -985,12 +1076,24 @@ impl ConduitWindow {
         let imp = self.imp();
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
-        let selected_channel = self.selected_channel_id();
+        let selected_channel =
+            sidebar_selected_channel(imp.current_main_view.get(), self.selected_channel_id());
         let filtered = self.filtered_sidebar_conversations(&conversations, &user_names);
         let sections =
             sidebar::build_sidebar_sections(&filtered, &user_names, selected_channel.as_deref());
 
+        imp.sidebar_row_actions.borrow_mut().clear();
         self.clear_list(&imp.conversation_list);
+
+        if imp.sidebar_loading.get() && conversations.is_empty() {
+            self.append_placeholder(&imp.conversation_list, "Loading conversations");
+            return;
+        }
+
+        if imp.sidebar_error.borrow().is_some() && conversations.is_empty() {
+            self.append_placeholder(&imp.conversation_list, "Could not load conversations");
+            return;
+        }
 
         if conversations.is_empty() {
             self.append_placeholder(&imp.conversation_list, "No conversations");
@@ -1035,8 +1138,10 @@ impl ConduitWindow {
         let header_row = gtk::ListBoxRow::new();
         header_row.set_selectable(false);
         header_row.set_activatable(false);
+        header_row.set_focusable(false);
 
-        let header = gtk::Label::new(Some(section.title));
+        let header_title = section.display_title();
+        let header = gtk::Label::new(Some(&header_title));
         header.set_xalign(0.0);
         header.set_margin_top(12);
         header.set_margin_bottom(3);
@@ -1055,21 +1160,11 @@ impl ConduitWindow {
 
     fn append_sidebar_conversation(&self, list: &gtk::ListBox, model: &SidebarRowModel) {
         let row = gtk::ListBoxRow::new();
-        row.set_selectable(false);
-        row.set_activatable(false);
-
-        let button = gtk::Button::new();
-        button.set_halign(gtk::Align::Fill);
-        button.set_hexpand(true);
-        button.add_css_class("flat");
-        if model.selected {
-            button.add_css_class("suggested-action");
-        }
-        button.set_tooltip_text(Some(&format!(
-            "{}: {}",
-            model.kind.accessible_name(),
-            model.title
-        )));
+        row.set_selectable(true);
+        row.set_activatable(true);
+        let accessible_label = model.accessible_label();
+        row.set_tooltip_text(Some(&accessible_label));
+        row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         content.set_margin_top(3);
@@ -1090,25 +1185,35 @@ impl ConduitWindow {
         }
         content.append(&title);
 
-        if model.unread_count > 0 {
-            let unread = gtk::Label::new(Some(&model.unread_count.to_string()));
+        if let Some(unread_label) = model.unread_badge_label() {
+            let unread = gtk::Label::new(Some(&unread_label));
             unread.add_css_class("caption");
             unread.add_css_class("heading");
             content.append(&unread);
         }
 
-        let channel_id = model.id.clone();
-        let title = model.title.clone();
-        let weak_window = self.downgrade();
-        button.connect_clicked(move |_| {
-            if let Some(window) = weak_window.upgrade() {
-                window.select_conversation(&channel_id, &title);
-            }
-        });
-
-        button.set_child(Some(&content));
-        row.set_child(Some(&button));
+        row.set_child(Some(&content));
         list.append(&row);
+        self.register_sidebar_row_action(row.index(), model);
+        if model.selected && list.selected_row().is_none() {
+            list.select_row(Some(&row));
+        }
+    }
+
+    fn register_sidebar_row_action(&self, row_index: i32, model: &SidebarRowModel) {
+        self.imp()
+            .sidebar_row_actions
+            .borrow_mut()
+            .insert(row_index, SidebarRowAction::from_model(model));
+    }
+
+    fn activate_sidebar_row(&self, row_index: i32) {
+        let action =
+            sidebar_row_action_for_index(&self.imp().sidebar_row_actions.borrow(), row_index);
+
+        if let Some(action) = action {
+            self.select_conversation(&action.channel_id, &action.title);
+        }
     }
 
     fn refresh_current_conversation_title(&self) {
@@ -1139,7 +1244,10 @@ impl ConduitWindow {
             "No thread open",
         ));
         self.render_conversations();
-        self.show_message_placeholder("Loading messages");
+        self.load_message_html(&message_html::placeholder_document(
+            "Messages",
+            "Loading messages",
+        ));
         self.send_command(RuntimeCommand::LoadHistory {
             channel_id: channel_id.to_string(),
         });
@@ -1332,9 +1440,6 @@ impl ConduitWindow {
     }
 
     fn show_message_placeholder(&self, text: &str) {
-        self.imp()
-            .current_main_view
-            .set(MainMessageView::Placeholder);
         self.load_message_html(&message_html::placeholder_document("Messages", text));
     }
 
@@ -1495,5 +1600,70 @@ impl ConduitWindow {
 
     fn selected_thread_ts(&self) -> Option<String> {
         self.imp().selected_thread_ts.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sidebar::ConversationKind;
+
+    fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {
+        SidebarRowModel {
+            id: id.to_string(),
+            title: title.to_string(),
+            kind: ConversationKind::DirectMessage,
+            unread_count: 0,
+            selected: false,
+            private: true,
+        }
+    }
+
+    #[test]
+    fn sidebar_row_action_uses_conversation_id_and_resolved_title() {
+        let model = sidebar_row("D123", "Mohamed Moulay");
+
+        assert_eq!(
+            SidebarRowAction::from_model(&model),
+            SidebarRowAction {
+                channel_id: "D123".to_string(),
+                title: "Mohamed Moulay".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sidebar_row_action_lookup_ignores_unregistered_rows() {
+        let action = SidebarRowAction {
+            channel_id: "C123".to_string(),
+            title: "#general".to_string(),
+        };
+        let mut actions = HashMap::new();
+        actions.insert(4, action.clone());
+
+        assert_eq!(sidebar_row_action_for_index(&actions, 3), None);
+        assert_eq!(sidebar_row_action_for_index(&actions, 4), Some(action));
+    }
+
+    #[test]
+    fn sidebar_selection_is_visible_only_for_conversation_view() {
+        let selected = Some("C123".to_string());
+
+        assert_eq!(
+            sidebar_selected_channel(MainMessageView::Conversation, selected.clone()),
+            selected
+        );
+        assert_eq!(
+            sidebar_selected_channel(MainMessageView::Search, Some("C123".to_string())),
+            None
+        );
+        assert_eq!(
+            sidebar_selected_channel(MainMessageView::Saved, Some("C123".to_string())),
+            None
+        );
+        assert_eq!(
+            sidebar_selected_channel(MainMessageView::Placeholder, Some("C123".to_string())),
+            None
+        );
     }
 }
