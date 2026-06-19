@@ -27,3 +27,23 @@
 - Worktree notes:
   - `docs/sidebar-improvement-plan.md` is uncommitted documentation work.
 - Notes: the installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback again.
+
+## 2026-06-19
+
+- Scope: manual maintainer pass for `adrighem/Conduit` after implementing the native GTK sidebar slice.
+- GitHub backlog: 0 open issues, 0 open pull requests, 0 historical issues, and 0 historical pull requests returned by `gh`.
+- Recent GitHub Actions: latest CI and CodeQL runs on `main` are passing.
+- Local checks:
+  - `cargo fmt --check`: pass
+  - `cargo test`: pass, 24 tests
+  - `xmllint --noout src/window.ui`: pass
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, 4 Meson tests
+  - runtime smoke launch under `xvfb-run`: pass, no template binding failure observed before timeout
+- Extra checks:
+  - `gtk4-builder-tool validate src/window.ui`: not applicable directly, fails because the tool does not load `AdwApplicationWindow` as a template parent.
+  - `cargo clippy --all-targets -- -D warnings`: failed before linting project code because installed `clippy-driver` is 0.1.87/Rust 1.87 while dependencies require Rust 1.88 or newer.
+- Worktree notes:
+  - Sidebar implementation committed as `b97419f`.
+  - Contributor intake files committed as `0230dc5`.
+- Notes: the installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback again.

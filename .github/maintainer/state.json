@@ -1,21 +1,21 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-06-18",
+  "last_manual_run": "2026-06-19",
   "last_known_open_issues": 0,
   "last_known_open_pull_requests": 0,
   "last_known_total_issues": 0,
   "last_known_total_pull_requests": 0,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 19 tests",
+    "cargo_test": "pass: 24 tests",
     "meson_compile": "pass",
     "meson_test": "pass",
     "github_actions": "latest CI and CodeQL runs passing",
-    "cargo_clippy": "unavailable"
+    "cargo_clippy": "blocked: cargo-clippy/clippy-driver 0.1.87 behaves as Rust 1.87 while dependencies require Rust 1.88+"
   },
   "notes": {
     "skill_package": "references and triage script missing; manual fallback used",
-    "clippy": "cargo clippy is unavailable because the local toolchain lacks clippy and rustup is not installed",
-    "worktree": "docs/sidebar-improvement-plan.md is uncommitted documentation work"
+    "clippy": "normal cargo/rustc are 1.95, but /usr/bin/cargo-clippy and /usr/bin/clippy-driver are 0.1.87; install a matching Clippy before adding a lint CI gate",
+    "worktree": "sidebar and contributor intake recommendation commits completed; maintainer memory remains to commit"
   }
 }
