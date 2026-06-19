@@ -1,0 +1,93 @@
+name: Bug report
+description: Report a reproducible problem in Conduit.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Conduit. Do not include Slack access tokens, OAuth authorization codes, cookies, private message contents, or workspace secrets.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+      placeholder: Conduit crashes when...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the exact actions needed to trigger the problem.
+      placeholder: |
+        1. Start Conduit with...
+        2. Connect to...
+        3. Click...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should Conduit have done?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What did Conduit do instead?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Release version, package version, or Git commit.
+      placeholder: e.g. 0.1.0 or git commit abc1234
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Install method
+      options:
+        - Meson build from source
+        - Cargo from source
+        - Flatpak or local package
+        - Other
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and desktop
+      placeholder: e.g. Fedora 41, GNOME 47, Wayland
+  - type: input
+    id: libraries
+    attributes:
+      label: GTK/libadwaita/WebKitGTK versions
+      description: Include versions if you know them.
+      placeholder: e.g. GTK 4.16, libadwaita 1.6, WebKitGTK 6.0
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Slack OAuth / login
+        - Conversation list / sidebar
+        - Messages / rendering
+        - Threads
+        - Search
+        - Saved items / Later
+        - File upload
+        - Packaging / installation
+        - Other
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Include relevant terminal output. Redact tokens, authorization codes, workspace secrets, and private messages.
+      render: text
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or screencast
+      description: Optional, but useful for UI and rendering bugs. Redact private workspace data.

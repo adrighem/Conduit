@@ -1,0 +1,53 @@
+name: Feature request
+description: Suggest a focused improvement for Conduit.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please keep requests focused. Conduit is an early GNOME desktop Slack client, so maintainability and native desktop behavior matter as much as feature breadth.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should Conduit do?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Slack OAuth / login
+        - Conversation list / sidebar
+        - Messages / rendering
+        - Threads
+        - Search
+        - Saved items / Later
+        - File upload
+        - Packaging / installation
+        - Documentation
+        - Other
+  - type: textarea
+    id: slack_reference
+    attributes:
+      label: Slack client reference
+      description: If this mirrors Slack desktop behavior, describe where it appears there.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Include simpler approaches if they would solve the same problem.
+  - type: textarea
+    id: maintenance
+    attributes:
+      label: Maintenance notes
+      description: Optional. Call out API scopes, packaging impact, UI complexity, or compatibility concerns.
