@@ -7,6 +7,7 @@ body:
     attributes:
       value: |
         Thanks for helping improve Conduit. Do not include Slack access tokens, OAuth authorization codes, cookies, private message contents, or workspace secrets.
+        For security-sensitive reports, use the repository security policy instead of a public issue.
   - type: textarea
     id: summary
     attributes:
