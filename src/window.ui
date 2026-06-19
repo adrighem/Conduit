@@ -121,7 +121,7 @@
                 <property name="child">
                   <object class="GtkPaned">
                     <property name="orientation">horizontal</property>
-                    <property name="position">280</property>
+                    <property name="position">300</property>
                     <property name="start-child">
                       <object class="GtkBox">
                         <property name="orientation">vertical</property>
@@ -130,37 +130,25 @@
                         <property name="margin-bottom">12</property>
                         <property name="margin-start">12</property>
                         <property name="margin-end">6</property>
+                        <property name="width-request">280</property>
                         <child>
                           <object class="GtkBox">
                             <property name="orientation">horizontal</property>
                             <property name="spacing">6</property>
                             <child>
-                              <object class="GtkSearchEntry" id="search_entry">
+                              <object class="GtkLabel">
+                                <property name="xalign">0</property>
                                 <property name="hexpand">True</property>
+                                <property name="label" translatable="yes">Home</property>
+                                <style>
+                                  <class name="heading"/>
+                                </style>
                               </object>
                             </child>
-                            <child>
-                              <object class="GtkButton" id="search_button">
-                                <property name="icon-name">system-search-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Search</property>
-                              </object>
-                            </child>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkBox">
-                            <property name="orientation">horizontal</property>
-                            <property name="spacing">6</property>
                             <child>
                               <object class="GtkButton" id="refresh_button">
                                 <property name="icon-name">view-refresh-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Refresh</property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkButton" id="saved_button">
-                                <property name="icon-name">starred-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Saved Items</property>
+                                <property name="tooltip-text" translatable="yes">Refresh Conversations</property>
                               </object>
                             </child>
                             <child>
@@ -172,21 +160,89 @@
                           </object>
                         </child>
                         <child>
+                          <object class="GtkBox">
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">6</property>
+                            <child>
+                              <object class="GtkButton" id="home_button">
+                                <property name="hexpand">True</property>
+                                <property name="tooltip-text" translatable="yes">Home</property>
+                                <property name="child">
+                                  <object class="GtkBox">
+                                    <property name="halign">center</property>
+                                    <property name="spacing">6</property>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon-name">go-home-symbolic</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkLabel">
+                                        <property name="label" translatable="yes">Home</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="saved_button">
+                                <property name="hexpand">True</property>
+                                <property name="tooltip-text" translatable="yes">Later</property>
+                                <property name="child">
+                                  <object class="GtkBox">
+                                    <property name="halign">center</property>
+                                    <property name="spacing">6</property>
+                                    <child>
+                                      <object class="GtkImage">
+                                        <property name="icon-name">starred-symbolic</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkLabel">
+                                        <property name="label" translatable="yes">Later</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSearchEntry" id="sidebar_filter_entry">
+                            <property name="placeholder-text" translatable="yes">Filter conversations</property>
+                          </object>
+                        </child>
+                        <child>
                           <object class="GtkScrolledWindow">
                             <property name="vexpand">True</property>
                             <property name="child">
                               <object class="GtkListBox" id="conversation_list">
                                 <property name="selection-mode">none</property>
+                                <style>
+                                  <class name="navigation-sidebar"/>
+                                </style>
                               </object>
                             </property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkLabel" id="workspace_status_label">
+                            <property name="xalign">0</property>
+                            <property name="ellipsize">end</property>
+                            <style>
+                              <class name="caption"/>
+                              <class name="dim-label"/>
+                            </style>
                           </object>
                         </child>
                       </object>
                     </property>
                     <property name="end-child">
-                      <object class="GtkPaned">
+                      <object class="GtkPaned" id="message_thread_paned">
                         <property name="orientation">horizontal</property>
-                        <property name="position">560</property>
+                        <property name="position">640</property>
                         <property name="start-child">
                           <object class="GtkBox">
                             <property name="orientation">vertical</property>
@@ -196,12 +252,31 @@
                             <property name="margin-start">6</property>
                             <property name="margin-end">6</property>
                             <child>
-                              <object class="GtkLabel" id="message_title">
-                                <property name="xalign">0</property>
-                                <property name="label" translatable="yes">Select a conversation</property>
-                                <style>
-                                  <class name="heading"/>
-                                </style>
+                              <object class="GtkBox">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">6</property>
+                                <child>
+                                  <object class="GtkLabel" id="message_title">
+                                    <property name="xalign">0</property>
+                                    <property name="hexpand">True</property>
+                                    <property name="label" translatable="yes">Select a conversation</property>
+                                    <style>
+                                      <class name="heading"/>
+                                    </style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkSearchEntry" id="message_search_entry">
+                                    <property name="width-request">220</property>
+                                    <property name="placeholder-text" translatable="yes">Search messages</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="message_search_button">
+                                    <property name="icon-name">system-search-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Search Messages</property>
+                                  </object>
+                                </child>
                               </object>
                             </child>
                             <child>

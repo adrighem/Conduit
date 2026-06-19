@@ -26,6 +26,7 @@ mod message_html;
 mod models;
 mod rendering;
 mod runtime;
+mod sidebar;
 mod slack;
 mod window;
 

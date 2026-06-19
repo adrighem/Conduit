@@ -34,6 +34,7 @@ use crate::message_html::{self, MessageHtmlContext};
 use crate::models::{SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage};
 use crate::rendering;
 use crate::runtime::{AppRuntime, RuntimeCommand, RuntimeEvent};
+use crate::sidebar::{self, SidebarRowModel, SidebarSectionModel};
 
 mod imp {
     use super::*;
@@ -54,11 +55,25 @@ mod imp {
         #[template_child]
         pub connection_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub home_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub saved_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub refresh_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub sign_out_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub sidebar_filter_entry: TemplateChild<gtk::SearchEntry>,
+        #[template_child]
         pub conversation_list: TemplateChild<gtk::ListBox>,
+        #[template_child]
+        pub workspace_status_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub message_title: TemplateChild<gtk::Label>,
         #[template_child]
         pub message_view_box: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub message_thread_paned: TemplateChild<gtk::Paned>,
         #[template_child]
         pub message_entry: TemplateChild<gtk::Entry>,
         #[template_child]
@@ -68,15 +83,9 @@ mod imp {
         #[template_child]
         pub upload_progress: TemplateChild<gtk::ProgressBar>,
         #[template_child]
-        pub search_entry: TemplateChild<gtk::SearchEntry>,
+        pub message_search_entry: TemplateChild<gtk::SearchEntry>,
         #[template_child]
-        pub search_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub saved_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub refresh_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub sign_out_button: TemplateChild<gtk::Button>,
+        pub message_search_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub thread_pane: TemplateChild<gtk::Box>,
         #[template_child]
@@ -310,16 +319,17 @@ impl ConduitWindow {
         let imp = self.imp();
 
         self.connect_widget(&imp.connect_button.get(), |window| window.start_oauth());
+        self.connect_widget(&imp.home_button.get(), |window| window.show_home());
         self.connect_widget(&imp.refresh_button.get(), |window| {
             window.send_command(RuntimeCommand::RefreshConversations)
         });
-        self.connect_widget(&imp.saved_button.get(), |window| {
-            window.send_command(RuntimeCommand::LoadSavedItems)
-        });
+        self.connect_widget(&imp.saved_button.get(), |window| window.show_later());
         self.connect_widget(&imp.sign_out_button.get(), |window| {
             window.send_command(RuntimeCommand::SignOut)
         });
-        self.connect_widget(&imp.search_button.get(), |window| window.search_messages());
+        self.connect_widget(&imp.message_search_button.get(), |window| {
+            window.search_messages()
+        });
         self.connect_widget(&imp.send_button.get(), |window| {
             window.post_current_message()
         });
@@ -331,6 +341,13 @@ impl ConduitWindow {
         });
         self.connect_widget(&imp.close_thread_button.get(), |window| {
             window.close_thread()
+        });
+
+        let weak_window = self.downgrade();
+        imp.sidebar_filter_entry.connect_search_changed(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.render_conversations();
+            }
         });
 
         let weak_window = self.downgrade();
@@ -348,7 +365,7 @@ impl ConduitWindow {
         });
 
         let weak_window = self.downgrade();
-        imp.search_entry.connect_activate(move |_| {
+        imp.message_search_entry.connect_activate(move |_| {
             if let Some(window) = weak_window.upgrade() {
                 window.search_messages();
             }
@@ -442,6 +459,7 @@ impl ConduitWindow {
                     .insert(user_id.clone(), display_name);
                 self.imp().pending_user_ids.borrow_mut().remove(&user_id);
                 self.render_conversations();
+                self.refresh_current_conversation_title();
                 self.rerender_current_messages();
             }
             RuntimeEvent::ImageAssetLoaded { key, data_uri } => {
@@ -549,12 +567,35 @@ impl ConduitWindow {
         });
     }
 
+    fn show_home(&self) {
+        if let Some(channel_id) = self.selected_channel_id() {
+            let title = self.conversation_title(&channel_id);
+            self.select_conversation(&channel_id, &title);
+        } else {
+            self.imp().message_title.set_label("Select a conversation");
+            self.show_message_placeholder("Select a conversation");
+            self.close_thread();
+            self.render_conversations();
+        }
+    }
+
+    fn show_later(&self) {
+        self.imp().message_title.set_label("Later");
+        self.close_thread();
+        self.load_message_html(&message_html::placeholder_document(
+            "Later",
+            "Loading saved items",
+        ));
+        self.send_command(RuntimeCommand::LoadSavedItems);
+    }
+
     fn search_messages(&self) {
-        let query = self.imp().search_entry.text().trim().to_string();
+        let query = self.imp().message_search_entry.text().trim().to_string();
         if query.is_empty() {
-            self.set_status("Enter a search query");
+            self.set_status("Enter a message search query");
             return;
         }
+        self.close_thread();
         self.imp().message_title.set_label("Search results");
         self.load_message_html(&message_html::placeholder_document(
             "Search results",
@@ -880,6 +921,7 @@ impl ConduitWindow {
         *imp.selected_thread_ts.borrow_mut() = None;
         *imp.current_user_id.borrow_mut() = None;
         imp.latest_message_ts_by_channel.borrow_mut().clear();
+        imp.conversations.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
         imp.pending_user_ids.borrow_mut().clear();
         *imp.workspace_url.borrow_mut() = None;
@@ -891,6 +933,7 @@ impl ConduitWindow {
         imp.current_search_results.borrow_mut().clear();
         imp.current_saved_items.borrow_mut().clear();
         imp.current_main_view.set(MainMessageView::Placeholder);
+        imp.sidebar_filter_entry.set_text("");
         self.clear_list(&imp.conversation_list);
         self.show_message_placeholder("Select a conversation");
         self.load_thread_html(&message_html::placeholder_document(
@@ -916,6 +959,7 @@ impl ConduitWindow {
         let imp = self.imp();
         imp.status_label.set_label(status);
         imp.connection_label.set_label(status);
+        imp.workspace_status_label.set_label(status);
     }
 
     fn show_error(&self, error: &str) {
@@ -934,17 +978,17 @@ impl ConduitWindow {
         *self.imp().conversations.borrow_mut() = conversations;
         self.request_conversation_user_names();
         self.render_conversations();
+        self.refresh_current_conversation_title();
     }
 
     fn render_conversations(&self) {
         let imp = self.imp();
-        let mut conversations = imp.conversations.borrow().clone();
+        let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
-        conversations.sort_by_key(|conversation| {
-            conversation
-                .display_name_with_users(&user_names)
-                .to_lowercase()
-        });
+        let selected_channel = self.selected_channel_id();
+        let filtered = self.filtered_sidebar_conversations(&conversations, &user_names);
+        let sections =
+            sidebar::build_sidebar_sections(&filtered, &user_names, selected_channel.as_deref());
 
         self.clear_list(&imp.conversation_list);
 
@@ -953,26 +997,122 @@ impl ConduitWindow {
             return;
         }
 
-        for conversation in conversations {
-            let row = gtk::ListBoxRow::new();
-            let title = conversation.display_name_with_users(&user_names);
-            let button = gtk::Button::with_label(&title);
-            button.set_halign(gtk::Align::Fill);
-            button.set_hexpand(true);
-            button.add_css_class("flat");
-
-            let channel_id = conversation.id.clone();
-            let weak_window = self.downgrade();
-            button.connect_clicked(move |_| {
-                if let Some(window) = weak_window.upgrade() {
-                    window.select_conversation(&channel_id, &title);
-                }
-            });
-
-            row.set_child(Some(&button));
-            imp.conversation_list.append(&row);
+        if sections.is_empty() {
+            self.append_placeholder(&imp.conversation_list, "No matching conversations");
+            return;
         }
 
+        for section in sections {
+            self.append_sidebar_section(&imp.conversation_list, &section);
+        }
+    }
+
+    fn filtered_sidebar_conversations(
+        &self,
+        conversations: &[SlackConversation],
+        user_names: &HashMap<String, String>,
+    ) -> Vec<SlackConversation> {
+        let query = self.imp().sidebar_filter_entry.text().trim().to_lowercase();
+
+        if query.is_empty() {
+            return conversations.to_vec();
+        }
+
+        conversations
+            .iter()
+            .filter(|conversation| {
+                conversation
+                    .display_name_with_users(user_names)
+                    .to_lowercase()
+                    .contains(&query)
+                    || conversation.id.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn append_sidebar_section(&self, list: &gtk::ListBox, section: &SidebarSectionModel) {
+        let header_row = gtk::ListBoxRow::new();
+        header_row.set_selectable(false);
+        header_row.set_activatable(false);
+
+        let header = gtk::Label::new(Some(section.title));
+        header.set_xalign(0.0);
+        header.set_margin_top(12);
+        header.set_margin_bottom(3);
+        header.set_margin_start(9);
+        header.set_margin_end(9);
+        header.add_css_class("caption");
+        header.add_css_class("heading");
+
+        header_row.set_child(Some(&header));
+        list.append(&header_row);
+
+        for row in &section.rows {
+            self.append_sidebar_conversation(list, row);
+        }
+    }
+
+    fn append_sidebar_conversation(&self, list: &gtk::ListBox, model: &SidebarRowModel) {
+        let row = gtk::ListBoxRow::new();
+        row.set_selectable(false);
+        row.set_activatable(false);
+
+        let button = gtk::Button::new();
+        button.set_halign(gtk::Align::Fill);
+        button.set_hexpand(true);
+        button.add_css_class("flat");
+        if model.selected {
+            button.add_css_class("suggested-action");
+        }
+        button.set_tooltip_text(Some(&format!(
+            "{}: {}",
+            model.kind.accessible_name(),
+            model.title
+        )));
+
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        content.set_margin_top(3);
+        content.set_margin_bottom(3);
+        content.set_margin_start(6);
+        content.set_margin_end(6);
+
+        let icon = gtk::Image::from_icon_name(model.kind.icon_name());
+        icon.set_tooltip_text(Some(model.kind.accessible_name()));
+        content.append(&icon);
+
+        let title = gtk::Label::new(Some(&model.title));
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        if model.unread_count > 0 {
+            title.add_css_class("heading");
+        }
+        content.append(&title);
+
+        if model.unread_count > 0 {
+            let unread = gtk::Label::new(Some(&model.unread_count.to_string()));
+            unread.add_css_class("caption");
+            unread.add_css_class("heading");
+            content.append(&unread);
+        }
+
+        let channel_id = model.id.clone();
+        let title = model.title.clone();
+        let weak_window = self.downgrade();
+        button.connect_clicked(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.select_conversation(&channel_id, &title);
+            }
+        });
+
+        button.set_child(Some(&content));
+        row.set_child(Some(&button));
+        list.append(&row);
+    }
+
+    fn refresh_current_conversation_title(&self) {
+        let imp = self.imp();
         if imp.current_main_view.get() == MainMessageView::Conversation {
             if let Some(channel_id) = self.selected_channel_id() {
                 imp.message_title
@@ -991,7 +1131,14 @@ impl ConduitWindow {
         *imp.selected_thread_ts.borrow_mut() = None;
         imp.current_main_view.set(MainMessageView::Conversation);
         imp.message_title.set_label(title);
+        imp.current_thread_messages.borrow_mut().clear();
+        imp.thread_entry.set_text("");
         imp.thread_pane.set_visible(false);
+        self.load_thread_html(&message_html::placeholder_document(
+            "Thread",
+            "No thread open",
+        ));
+        self.render_conversations();
         self.show_message_placeholder("Loading messages");
         self.send_command(RuntimeCommand::LoadHistory {
             channel_id: channel_id.to_string(),
@@ -1002,6 +1149,9 @@ impl ConduitWindow {
         let imp = self.imp();
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
         imp.current_main_view.set(MainMessageView::Conversation);
+        imp.message_title
+            .set_label(&self.conversation_title(channel_id));
+        self.render_conversations();
         self.request_image_assets(messages.iter());
         let context = self.message_html_context(None);
         crate::debug::log(
@@ -1024,7 +1174,11 @@ impl ConduitWindow {
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
         *imp.selected_thread_ts.borrow_mut() = Some(ts.to_string());
         imp.thread_title.set_label("Thread");
+        let opening_thread_pane = !imp.thread_pane.is_visible();
         imp.thread_pane.set_visible(true);
+        if opening_thread_pane {
+            self.queue_default_thread_pane_position();
+        }
 
         if messages.is_empty() {
             self.load_thread_html(&message_html::placeholder_document("Thread", "No replies"));
@@ -1038,6 +1192,27 @@ impl ConduitWindow {
         ));
     }
 
+    fn queue_default_thread_pane_position(&self) {
+        let weak_window = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(window) = weak_window.upgrade() {
+                window.set_default_thread_pane_position();
+            }
+        });
+    }
+
+    fn set_default_thread_pane_position(&self) {
+        let paned = self.imp().message_thread_paned.get();
+        let width = paned.width();
+        if width <= 0 {
+            return;
+        }
+
+        // Keep the thread pane half as wide as the main message pane:
+        // message width is 2/3 of the paned area, thread width is 1/3.
+        paned.set_position(width * 2 / 3);
+    }
+
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
         let imp = self.imp();
         imp.message_title.set_label("Search results");
@@ -1049,7 +1224,7 @@ impl ConduitWindow {
 
     fn populate_saved_items(&self, items: Vec<SavedItem>) {
         let imp = self.imp();
-        imp.message_title.set_label("Saved items");
+        imp.message_title.set_label("Later");
         imp.current_main_view.set(MainMessageView::Saved);
         *imp.current_saved_items.borrow_mut() = items.clone();
         let saved_messages = items
@@ -1100,10 +1275,11 @@ impl ConduitWindow {
             .borrow_mut()
             .insert(channel_id.to_string(), latest_ts.clone());
 
-        if previous_ts
+        let has_new_message = previous_ts
             .as_deref()
-            .is_some_and(|previous_ts| latest_ts.as_str() > previous_ts)
-        {
+            .is_some_and(|previous_ts| latest_ts.as_str() > previous_ts);
+
+        if has_new_message {
             self.send_notification(
                 &self.conversation_title(channel_id),
                 latest_message
@@ -1143,12 +1319,17 @@ impl ConduitWindow {
 
     fn append_placeholder(&self, list: &gtk::ListBox, text: &str) {
         let row = gtk::ListBoxRow::new();
+        row.set_selectable(false);
+        row.set_activatable(false);
+
         let label = gtk::Label::new(Some(text));
         label.set_margin_top(12);
         label.set_margin_bottom(12);
         label.set_margin_start(12);
         label.set_margin_end(12);
         label.set_xalign(0.0);
+        label.add_css_class("dim-label");
+
         row.set_child(Some(&label));
         list.append(&row);
     }
