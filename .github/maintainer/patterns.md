@@ -25,3 +25,14 @@
 
 - Clippy is now part of the standard maintenance gate. Keep local docs, PR templates, and CI aligned on the exact command: `cargo clippy --all-targets -- -D warnings`.
 - Treat new Clippy warnings as code review signals before changing lint policy; suppressions should be local and justified.
+
+## 2026-06-19 Maintainer Activation
+
+- Empty public backlog means release readiness remains the highest-leverage maintenance track: land coherent local slices, keep CI green, and reduce future support load before outside reports arrive.
+- Local commits ahead of `origin/main` should be pushed only after the dirty worktree is intentionally resolved, because current remote CI results do not cover the local six-commit stack plus sidebar follow-up edits.
+- Sidebar UX changes are easiest to maintain when behavior, tests, and docs move together; avoid splitting row activation semantics from the design contract unless there is a clear review reason.
+
+## 2026-06-19 Recommendation Implementation
+
+- Keep security-sensitive intake guidance close to issue templates, not only in contributor docs, because issue forms are where accidental disclosure is most likely.
+- For early projects with empty public backlogs, small preventive policy files can be higher leverage than opening internal tracking issues.

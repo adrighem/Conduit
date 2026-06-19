@@ -64,3 +64,38 @@
 - Policy update:
   - CI now installs the `clippy` component and runs the warning-deny lint gate.
   - Contributor guide and PR template include the lint command.
+
+## 2026-06-19 Maintainer Activation
+
+- Scope: manual maintainer check after invoking the open-source maintainer workflow.
+- GitHub backlog: 0 open issues and 0 open pull requests returned by `gh`.
+- Recent GitHub Actions: latest visible CI and CodeQL runs on `origin/main` are passing, but they predate the local six-commit stack.
+- Branch state:
+  - `main` is ahead of `origin/main` by 6 commits.
+  - Worktree has uncommitted sidebar follow-up changes in `README.md`, `src/sidebar.rs`, `src/window.rs`, and `src/window.ui`.
+  - Worktree has untracked sidebar docs: `docs/sidebar-1.0-update-plan.md` and `docs/sidebar-design.md`.
+- Local checks on the current dirty worktree:
+  - `cargo fmt --check`: pass
+  - `cargo test`: pass, 30 tests
+  - `cargo clippy --all-targets -- -D warnings`: pass
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, 4 Meson tests
+  - `xmllint --noout src/window.ui`: pass
+- Notes: the installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback again.
+
+## 2026-06-19 Recommendation Implementation
+
+- Scope: implement maintainer recommendations from the activation pass.
+- Commits created:
+  - `3cebef2` `Polish sidebar row activation`: resolved the sidebar follow-up as one reviewable code/docs change set.
+  - `0ab0606` `Add security reporting policy`: added `SECURITY.md` and routed security-sensitive issue-template users to the policy.
+- Local checks before committing:
+  - `cargo fmt --check`: pass
+  - `cargo test`: pass, 30 tests
+  - `cargo clippy --all-targets -- -D warnings`: pass
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, 4 Meson tests
+  - `xmllint --noout src/window.ui`: pass
+  - `git diff --check`: pass
+  - YAML parse for `.github/ISSUE_TEMPLATE/config.yml` and `.github/ISSUE_TEMPLATE/bug_report.yml`: pass
+- Notes: maintainer memory is recorded in this follow-up commit before pushing the local stack.

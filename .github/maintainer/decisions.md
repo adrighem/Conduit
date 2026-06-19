@@ -35,3 +35,17 @@
 - After `cargo-clippy` was upgraded to match Rust 1.95, enabled `cargo clippy --all-targets -- -D warnings` in CI.
 - Fixed the current warning set before adding the gate, so the lint check is immediately actionable rather than aspirational.
 - Updated contributor and pull request checklists to include the same Clippy command.
+
+## 2026-06-19 Maintainer Activation
+
+- Continued maintainer workflow with manual fallback because the installed skill package still lacks its referenced triage script and reference files.
+- No public GitHub action is needed: the open issue and pull request backlog is empty.
+- Treat the current local branch state as the immediate maintenance priority. The repo is six commits ahead of `origin/main` and has uncommitted sidebar follow-up work; remote CI has not validated that combined state yet.
+- Keep the sidebar follow-up grouped as one reviewable local change set because the code, row behavior tests, README wording, and sidebar design docs describe the same UX contract.
+
+## 2026-06-19 Recommendation Implementation
+
+- Implemented the activation recommendations locally instead of opening public backlog items, because the requested work was directly actionable in the repository.
+- Kept sidebar row activation polish, tests, README updates, and sidebar design docs in a single commit to preserve review context.
+- Added a lightweight security reporting policy and issue-template redirect to reduce the chance of Slack tokens, OAuth codes, or private workspace data being posted publicly.
+- Prepared the local stack for push after validation; no issue, pull request, label, release, or public comment action was taken.
