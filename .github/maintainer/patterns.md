@@ -36,3 +36,9 @@
 
 - Keep security-sensitive intake guidance close to issue templates, not only in contributor docs, because issue forms are where accidental disclosure is most likely.
 - For early projects with empty public backlogs, small preventive policy files can be higher leverage than opening internal tracking issues.
+
+## 2026-06-20 Maintainer Pass
+
+- Theme-dependent icon names are brittle for core navigation. Prefer app-owned symbolic icons when the desired metaphor is not available in stock Adwaita.
+- Diagnostic logging that prints Slack conversation objects should preserve unknown API fields, because unread state often depends on fields the UI does not yet model.
+- Keep cache files under the XDG cache root. WebKit persistent storage and app-managed image preview caches should not write to data directories unless the data is user-owned state.

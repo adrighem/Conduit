@@ -99,3 +99,24 @@
   - `git diff --check`: pass
   - YAML parse for `.github/ISSUE_TEMPLATE/config.yml` and `.github/ISSUE_TEMPLATE/bug_report.yml`: pass
 - Notes: maintainer memory is recorded in this follow-up commit before pushing the local stack.
+
+## 2026-06-20 Maintainer Pass
+
+- Scope: manual maintainer pass after image caching, sidebar icon, and conversation unread diagnostics work.
+- GitHub backlog: 0 open issues and 0 open pull requests returned by `gh`.
+- Recent GitHub Actions: latest visible CI and CodeQL runs on `main` are passing.
+- Commits created locally:
+  - `af53fa2` `Persist message image caches`: uses persistent WebKit cache/data directories under the app cache root and caches authenticated Slack image preview data URIs.
+  - `fec82d8` `Log conversation properties in debug mode`: preserves unknown Slack conversation fields and prints full conversation JSON under `--debug`.
+  - `4b7fe94` `Bundle public channel sidebar icon`: adds an app-owned symbolic public-channel icon and updates sidebar docs.
+- Local checks:
+  - `xmllint --noout src/conduit.gresource.xml src/icons/hicolor/scalable/status/channel-public-symbolic.svg`: pass
+  - `cargo fmt --check`: pass
+  - `cargo test`: pass, 34 tests
+  - `cargo clippy --all-targets -- -D warnings`: pass
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, 4 Meson tests
+  - `gresource list _build/src/conduit.gresource`: includes `channel-public-symbolic.svg`
+- Notes:
+  - The installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback.
+  - No public GitHub action was taken. Pushing the local commits requires explicit approval.

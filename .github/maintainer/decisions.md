@@ -49,3 +49,11 @@
 - Kept sidebar row activation polish, tests, README updates, and sidebar design docs in a single commit to preserve review context.
 - Added a lightweight security reporting policy and issue-template redirect to reduce the chance of Slack tokens, OAuth codes, or private workspace data being posted publicly.
 - Prepared the local stack for push after validation; no issue, pull request, label, release, or public comment action was taken.
+
+## 2026-06-20 Maintainer Pass
+
+- Continued maintainer workflow with manual fallback because the installed skill package still lacks its referenced triage script and reference files.
+- No issue or PR triage action is needed: the open GitHub backlog is empty.
+- Kept the session work split into focused local commits: cache behavior, debug diagnostics, and sidebar icon resources.
+- Treated `--debug` conversation dumps as sensitive diagnostics and documented that they may include private workspace metadata while still avoiding access tokens and authorization codes.
+- Did not push the local commits because pushing is a public repository action and needs explicit approval.

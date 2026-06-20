@@ -1,21 +1,21 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-06-19-recommendation-implementation",
+  "last_manual_run": "2026-06-20-maintainer-pass",
   "last_known_open_issues": 0,
   "last_known_open_pull_requests": 0,
   "last_known_total_issues": 0,
   "last_known_total_pull_requests": 0,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 30 tests",
+    "cargo_test": "pass: 34 tests",
     "meson_compile": "pass",
     "meson_test": "pass",
-    "github_actions": "latest visible CI and CodeQL runs passing on origin/main; local main is ahead by 6 commits",
+    "github_actions": "latest visible CI and CodeQL runs passing on main; local main has unpushed maintainer-pass commits",
     "cargo_clippy": "pass: cargo clippy --all-targets -- -D warnings"
   },
   "notes": {
     "skill_package": "references and triage script missing; manual fallback used",
     "clippy": "cargo-clippy and clippy-driver are 0.1.95; CI and contributor docs now use cargo clippy --all-targets -- -D warnings",
-    "worktree": "sidebar follow-up committed as 3cebef2; security policy committed as 0ab0606; maintainer record pending commit before push"
+    "worktree": "local commits af53fa2, fec82d8, and 4b7fe94 created; maintainer record pending commit; push requires explicit approval"
   }
 }
