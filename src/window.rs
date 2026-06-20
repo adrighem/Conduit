@@ -1409,6 +1409,18 @@ impl ConduitWindow {
             content.append(&unread);
         }
 
+        if model.muted {
+            let muted = gtk::Image::from_icon_name("notifications-disabled-symbolic");
+            muted.set_tooltip_text(Some("Muted"));
+            content.append(&muted);
+        }
+
+        if model.external {
+            let external = gtk::Image::from_icon_name("network-workgroup-symbolic");
+            external.set_tooltip_text(Some("Shared externally"));
+            content.append(&external);
+        }
+
         row.set_child(Some(&content));
         list.append(&row);
         self.register_sidebar_row_action(row.index(), model);
@@ -1850,6 +1862,8 @@ mod tests {
             unread_count: 0,
             selected: false,
             private: true,
+            muted: false,
+            external: false,
         }
     }
 

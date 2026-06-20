@@ -95,6 +95,17 @@ impl SlackConversation {
         }
     }
 
+    pub fn is_muted_conversation(&self) -> bool {
+        self.extra_bool("is_muted") || self.extra_bool("muted")
+    }
+
+    pub fn is_external_conversation(&self) -> bool {
+        self.extra_bool("is_ext_shared")
+            || self.extra_bool("is_org_shared")
+            || self.extra_bool("is_pending_ext_shared")
+            || self.extra_bool("is_shared")
+    }
+
     pub fn display_name_with_users(&self, user_names: &HashMap<String, String>) -> String {
         if self.is_im.unwrap_or(false) {
             if let Some(user) = &self.user {
@@ -117,6 +128,13 @@ impl SlackConversation {
         }
 
         self.id.clone()
+    }
+
+    fn extra_bool(&self, key: &str) -> bool {
+        self.extra
+            .get(key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -438,6 +456,23 @@ mod tests {
             conversation.extra.get("last_read"),
             Some(&serde_json::json!("1710000000.000000"))
         );
+    }
+
+    #[test]
+    fn conversation_state_helpers_use_extra_slack_properties() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            ..Default::default()
+        };
+        conversation
+            .extra
+            .insert("is_muted".to_string(), serde_json::json!(true));
+        conversation
+            .extra
+            .insert("is_ext_shared".to_string(), serde_json::json!(true));
+
+        assert!(conversation.is_muted_conversation());
+        assert!(conversation.is_external_conversation());
     }
 
     #[test]

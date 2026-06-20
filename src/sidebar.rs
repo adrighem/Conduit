@@ -63,6 +63,8 @@ pub struct SidebarRowModel {
     pub unread_count: u64,
     pub selected: bool,
     pub private: bool,
+    pub muted: bool,
+    pub external: bool,
 }
 
 impl SidebarRowModel {
@@ -83,6 +85,12 @@ impl SidebarRowModel {
         }
         if self.selected {
             label.push_str(", selected");
+        }
+        if self.muted {
+            label.push_str(", muted");
+        }
+        if self.external {
+            label.push_str(", external");
         }
         label
     }
@@ -131,6 +139,8 @@ pub fn build_sidebar_sections(
                     conversation_kind(conversation),
                     ConversationKind::PrivateChannel
                 ),
+            muted: conversation.is_muted_conversation(),
+            external: conversation.is_external_conversation(),
         };
 
         if row.unread_count > 0 {
@@ -268,6 +278,8 @@ mod tests {
             unread_count,
             selected,
             private: false,
+            muted: false,
+            external: false,
         }
     }
 
@@ -391,6 +403,23 @@ mod tests {
     }
 
     #[test]
+    fn row_state_includes_muted_and_external_flags() {
+        let mut alpha = channel("C1", "alpha");
+        alpha
+            .extra
+            .insert("is_muted".to_string(), serde_json::json!(true));
+        alpha
+            .extra
+            .insert("is_ext_shared".to_string(), serde_json::json!(true));
+
+        let sections = build_sidebar_sections(&[alpha], &HashMap::new(), None);
+        let row = &section(&sections, SidebarSectionKind::Channels).rows[0];
+
+        assert!(row.muted);
+        assert!(row.external);
+    }
+
+    #[test]
     fn selected_channel_is_marked_in_all_matching_rows() {
         let mut general = channel("C1", "general");
         general.unread_count = Some(1);
@@ -422,9 +451,13 @@ mod tests {
 
     #[test]
     fn accessible_label_includes_type_unreads_and_selected_state() {
+        let mut row = row("#general", 3, true);
+        row.muted = true;
+        row.external = true;
+
         assert_eq!(
-            row("#general", 3, true).accessible_label(),
-            "Public channel: #general, 3 unread, selected"
+            row.accessible_label(),
+            "Public channel: #general, 3 unread, selected, muted, external"
         );
     }
 
