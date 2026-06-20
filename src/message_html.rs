@@ -955,13 +955,7 @@ fn blocks_html(blocks: &serde_json::Value, context: &MessageHtmlContext) -> Stri
                     .and_then(|elements| elements.as_array())
                     .into_iter()
                     .flatten()
-                    .filter_map(block_text)
-                    .map(|label| {
-                        format!(
-                            "<span class=\"block-action\">{}</span>",
-                            mrkdwn_to_html(&label, context)
-                        )
-                    })
+                    .filter_map(|element| block_action_html(element, context))
                     .collect::<String>();
                 if !labels.is_empty() {
                     rendered.push_str(&format!("<div class=\"block-actions\">{labels}</div>"));
@@ -972,6 +966,24 @@ fn blocks_html(blocks: &serde_json::Value, context: &MessageHtmlContext) -> Stri
     }
 
     rendered
+}
+
+fn block_action_html(element: &serde_json::Value, context: &MessageHtmlContext) -> Option<String> {
+    let label = block_text(element)?;
+    let label = mrkdwn_to_html(&label, context);
+
+    if let Some(url) = element
+        .get("url")
+        .and_then(|url| url.as_str())
+        .filter(|url| is_http_url(url))
+    {
+        Some(format!(
+            "<a class=\"block-action\" href=\"{}\" rel=\"noreferrer noopener\">{label}</a>",
+            escape_html(url)
+        ))
+    } else {
+        Some(format!("<span class=\"block-action\">{label}</span>"))
+    }
 }
 
 fn block_text(value: &serde_json::Value) -> Option<String> {
@@ -1851,6 +1863,42 @@ mod tests {
 
         assert!(html.contains("<pre><code>&lt;b&gt;not bold&lt;/b&gt;</code></pre>"));
         assert!(!html.contains("<p><pre>"));
+    }
+
+    #[test]
+    fn renders_block_action_urls_as_external_links() {
+        let mut message = message("actions");
+        message.blocks = Some(serde_json::json!([
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Open canvas" },
+                        "url": "https://example.slack.com/canvas/C123"
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Callback only" },
+                        "action_id": "callback"
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Unsafe" },
+                        "url": "javascript:alert(1)"
+                    }
+                ]
+            }
+        ]));
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html
+            .contains("<a class=\"block-action\" href=\"https://example.slack.com/canvas/C123\""));
+        assert!(html.contains(">Open canvas</a>"));
+        assert!(html.contains("<span class=\"block-action\">Callback only</span>"));
+        assert!(html.contains("<span class=\"block-action\">Unsafe</span>"));
+        assert!(!html.contains("javascript:alert"));
     }
 
     #[test]
