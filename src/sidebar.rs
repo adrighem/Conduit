@@ -15,7 +15,7 @@ pub enum ConversationKind {
 impl ConversationKind {
     pub fn icon_name(self) -> &'static str {
         match self {
-            Self::PublicChannel => "channel-insecure-symbolic",
+            Self::PublicChannel => "channel-public-symbolic",
             Self::PrivateChannel => "channel-secure-symbolic",
             Self::DirectMessage => "avatar-default-symbolic",
             Self::GroupDirectMessage => "system-users-symbolic",

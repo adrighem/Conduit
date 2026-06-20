@@ -169,7 +169,7 @@ Each conversation row is a selectable and activatable `GtkListBoxRow`. The row c
 
 Icons:
 
-- Public channel: `channel-insecure-symbolic`
+- Public channel: `channel-public-symbolic`
 - Private channel: `channel-secure-symbolic`
 - Direct message: `avatar-default-symbolic`
 - Group direct message: `system-users-symbolic`
