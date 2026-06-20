@@ -35,7 +35,7 @@ use crate::message_html::{self, MessageHtmlContext};
 use crate::models::{SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage};
 use crate::rendering;
 use crate::runtime::{AppRuntime, RuntimeCommand, RuntimeEvent};
-use crate::sidebar::{self, SidebarRowModel, SidebarSectionModel};
+use crate::sidebar::{self, SidebarRowModel, SidebarSectionKind, SidebarSectionModel};
 
 mod imp {
     use super::*;
@@ -65,6 +65,8 @@ mod imp {
         pub refresh_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub sidebar_filter_entry: TemplateChild<gtk::SearchEntry>,
+        #[template_child]
+        pub sidebar_unread_filter_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub conversation_list: TemplateChild<gtk::ListBox>,
         #[template_child]
@@ -217,6 +219,23 @@ fn sidebar_selected_channel(
     (main_view == MainMessageView::Conversation)
         .then_some(selected_channel)
         .flatten()
+}
+
+fn sidebar_conversation_matches_filters(
+    conversation: &SlackConversation,
+    user_names: &HashMap<String, String>,
+    query: &str,
+    unread_only: bool,
+) -> bool {
+    let matches_query = query.is_empty()
+        || conversation
+            .display_name_with_users(user_names)
+            .to_lowercase()
+            .contains(query)
+        || conversation.id.to_lowercase().contains(query);
+    let matches_unread = !unread_only || conversation.has_unread_activity();
+
+    matches_query && matches_unread
 }
 
 fn message_navigation_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
@@ -406,6 +425,13 @@ impl ConduitWindow {
 
         let weak_window = self.downgrade();
         imp.sidebar_filter_entry.connect_search_changed(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.render_conversations();
+            }
+        });
+
+        let weak_window = self.downgrade();
+        imp.sidebar_unread_filter_button.connect_toggled(move |_| {
             if let Some(window) = weak_window.upgrade() {
                 window.render_conversations();
             }
@@ -1032,6 +1058,7 @@ impl ConduitWindow {
         imp.current_saved_items.borrow_mut().clear();
         imp.current_main_view.set(MainMessageView::Placeholder);
         imp.sidebar_filter_entry.set_text("");
+        imp.sidebar_unread_filter_button.set_active(false);
         imp.workspace_title_label.set_label("Workspace");
         imp.workspace_status_label.set_label("");
         self.clear_list(&imp.conversation_list);
@@ -1107,8 +1134,12 @@ impl ConduitWindow {
         let selected_channel =
             sidebar_selected_channel(imp.current_main_view.get(), self.selected_channel_id());
         let filtered = self.filtered_sidebar_conversations(&conversations, &user_names);
-        let sections =
+        let unread_only = imp.sidebar_unread_filter_button.is_active();
+        let mut sections =
             sidebar::build_sidebar_sections(&filtered, &user_names, selected_channel.as_deref());
+        if unread_only {
+            sections.retain(|section| section.kind != SidebarSectionKind::Unreads);
+        }
 
         imp.sidebar_row_actions.borrow_mut().clear();
         self.clear_list(&imp.conversation_list);
@@ -1144,19 +1175,16 @@ impl ConduitWindow {
         user_names: &HashMap<String, String>,
     ) -> Vec<SlackConversation> {
         let query = self.imp().sidebar_filter_entry.text().trim().to_lowercase();
+        let unread_only = self.imp().sidebar_unread_filter_button.is_active();
 
-        if query.is_empty() {
+        if query.is_empty() && !unread_only {
             return conversations.to_vec();
         }
 
         conversations
             .iter()
             .filter(|conversation| {
-                conversation
-                    .display_name_with_users(user_names)
-                    .to_lowercase()
-                    .contains(&query)
-                    || conversation.id.to_lowercase().contains(&query)
+                sidebar_conversation_matches_filters(conversation, user_names, &query, unread_only)
             })
             .cloned()
             .collect()
@@ -1693,5 +1721,57 @@ mod tests {
             sidebar_selected_channel(MainMessageView::Placeholder, Some("C123".to_string())),
             None
         );
+    }
+
+    #[test]
+    fn sidebar_filter_predicate_combines_query_and_unread_toggle() {
+        let unread = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            unread_count: Some(2),
+            ..Default::default()
+        };
+        let read = SlackConversation {
+            id: "C456".to_string(),
+            name: Some("random".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let mut extra_unread = SlackConversation {
+            id: "D123".to_string(),
+            user: Some("U123".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        extra_unread
+            .extra
+            .insert("has_unreads".to_string(), serde_json::json!(true));
+        let user_names = HashMap::from([("U123".to_string(), "Ada".to_string())]);
+
+        assert!(sidebar_conversation_matches_filters(
+            &unread,
+            &user_names,
+            "",
+            true
+        ));
+        assert!(!sidebar_conversation_matches_filters(
+            &read,
+            &user_names,
+            "",
+            true
+        ));
+        assert!(sidebar_conversation_matches_filters(
+            &extra_unread,
+            &user_names,
+            "ada",
+            true
+        ));
+        assert!(!sidebar_conversation_matches_filters(
+            &unread,
+            &user_names,
+            "random",
+            true
+        ));
     }
 }

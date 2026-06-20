@@ -123,7 +123,7 @@ pub fn build_sidebar_sections(
             id: conversation.id.clone(),
             title: conversation.display_name_with_users(user_names),
             kind: conversation_kind(conversation),
-            unread_count: conversation.unread_count.unwrap_or_default(),
+            unread_count: conversation.unread_activity_count(),
             selected: selected_channel == Some(conversation.id.as_str()),
             private: conversation.is_private.unwrap_or(false)
                 || conversation.is_group.unwrap_or(false)
@@ -374,6 +374,20 @@ mod tests {
             titles(section(&sections, SidebarSectionKind::DirectMessages)),
             vec!["Beta"]
         );
+    }
+
+    #[test]
+    fn unread_section_uses_extra_unread_properties() {
+        let mut alpha = channel("C1", "alpha");
+        alpha
+            .extra
+            .insert("unread_count_display".to_string(), serde_json::json!(5));
+
+        let sections = build_sidebar_sections(&[alpha], &HashMap::new(), None);
+        let unread_row = &section(&sections, SidebarSectionKind::Unreads).rows[0];
+
+        assert_eq!(unread_row.title, "#alpha");
+        assert_eq!(unread_row.unread_count, 5);
     }
 
     #[test]

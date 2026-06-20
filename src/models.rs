@@ -67,6 +67,24 @@ impl SlackConversation {
         self.display_name_with_users(&HashMap::new())
     }
 
+    pub fn unread_activity_count(&self) -> u64 {
+        let extra_unread_count = self
+            .extra
+            .iter()
+            .filter(|(key, _)| key.to_lowercase().contains("unread"))
+            .filter_map(|(_, value)| unread_value_count(value))
+            .max()
+            .unwrap_or_default();
+
+        self.unread_count
+            .unwrap_or_default()
+            .max(extra_unread_count)
+    }
+
+    pub fn has_unread_activity(&self) -> bool {
+        self.unread_activity_count() > 0
+    }
+
     pub fn display_name_with_users(&self, user_names: &HashMap<String, String>) -> String {
         if self.is_im.unwrap_or(false) {
             if let Some(user) = &self.user {
@@ -89,6 +107,21 @@ impl SlackConversation {
         }
 
         self.id.clone()
+    }
+}
+
+fn unread_value_count(value: &Value) -> Option<u64> {
+    match value {
+        Value::Bool(true) => Some(1),
+        Value::Bool(false) => Some(0),
+        Value::Number(number) => number.as_u64().or_else(|| {
+            number
+                .as_i64()
+                .filter(|value| *value > 0)
+                .map(|value| value as u64)
+        }),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
     }
 }
 
@@ -319,6 +352,32 @@ mod tests {
             serialized["last_read"],
             serde_json::json!("1700000000.000000")
         );
+    }
+
+    #[test]
+    fn conversation_unread_activity_uses_known_and_extra_unread_fields() {
+        let unread_count: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "unread_count": 3,
+            "unread_count_display": 0
+        }))
+        .expect("failed to parse conversation");
+        let unread_display: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C2",
+            "unread_count": 0,
+            "unread_count_display": 4
+        }))
+        .expect("failed to parse conversation");
+        let unread_flag: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C3",
+            "has_unreads": true
+        }))
+        .expect("failed to parse conversation");
+
+        assert_eq!(unread_count.unread_activity_count(), 3);
+        assert_eq!(unread_display.unread_activity_count(), 4);
+        assert_eq!(unread_flag.unread_activity_count(), 1);
+        assert!(unread_display.has_unread_activity());
     }
 
     #[test]

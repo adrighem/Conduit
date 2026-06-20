@@ -212,8 +212,21 @@
                           </object>
                         </child>
                         <child>
-                          <object class="GtkSearchEntry" id="sidebar_filter_entry">
-                            <property name="placeholder-text" translatable="yes">Filter conversations</property>
+                          <object class="GtkBox">
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">6</property>
+                            <child>
+                              <object class="GtkSearchEntry" id="sidebar_filter_entry">
+                                <property name="hexpand">True</property>
+                                <property name="placeholder-text" translatable="yes">Filter conversations</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkToggleButton" id="sidebar_unread_filter_button">
+                                <property name="icon-name">mail-unread-symbolic</property>
+                                <property name="tooltip-text" translatable="yes">Show Unread Conversations</property>
+                              </object>
+                            </child>
                           </object>
                         </child>
                         <child>

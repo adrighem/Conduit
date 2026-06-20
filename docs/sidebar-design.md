@@ -21,6 +21,7 @@ Included for 1.0:
 - Conversation refresh.
 - Workspace/account menu with sign out.
 - Conversation filtering by display title and Slack conversation ID.
+- Unread-only conversation filtering.
 - Sections for unreads, channels, direct messages, group direct messages, and unknown conversations.
 - Native selectable and activatable conversation rows.
 - Unread counts, selected state, type icons, and accessible row labels.
@@ -35,7 +36,7 @@ Excluded from 1.0 unless explicitly revisited:
 - Muted state.
 - Slack Connect or external organization indicators.
 - Avatars and presence badges.
-- Full unread synchronization beyond `unread_count`.
+- Full unread synchronization beyond conversation-level unread fields returned by `conversations.list`.
 
 ## Sidebar Shell
 
@@ -52,6 +53,7 @@ The sidebar is the start child of the workspace `GtkPaned`. It is a vertical `Gt
   - `Home`, using `go-home-symbolic`.
   - `Later`, using `starred-symbolic`.
 - Conversation filter entry with placeholder text `Filter conversations`.
+- Unread-only toggle button using `mail-unread-symbolic`.
 - Scrollable `GtkListBox` named `conversation_list`, styled with `navigation-sidebar`.
 - Status footer label named `workspace_status_label`.
 
@@ -148,14 +150,16 @@ The ID tie-breaker keeps ordering deterministic when titles match.
 
 ## Filtering
 
-The sidebar filter entry rerenders the list on search changes.
+The sidebar filter entry rerenders the list on search changes. The unread-only toggle rerenders the list on state changes.
 
-Filtering matches:
+Text filtering matches:
 
 - Resolved display title, case-insensitive.
 - Slack conversation ID, case-insensitive.
 
-Filtered results preserve normal section grouping and hide empty sections. Fuzzy search and matched-text highlighting are not part of the 1.0 sidebar.
+Unread-only filtering keeps conversations that have unread activity according to the modeled `unread_count` field or extra Slack conversation fields whose names contain `unread`, such as `unread_count_display` or `has_unreads`. This catches unread state variants while the app is still validating Slack's conversation payloads.
+
+Filtered results preserve normal section grouping and hide empty sections. When unread-only filtering is active, the `Unreads` shortcut section is omitted so the same unread conversations do not appear twice in an already-filtered list. Fuzzy search and matched-text highlighting are not part of the 1.0 sidebar.
 
 If no conversations exist, the list shows `No conversations`. If the filter removes every conversation, it shows `No matching conversations`.
 
@@ -218,12 +222,13 @@ Icon-only controls have tooltips:
 
 - Refresh: `Refresh Conversations`
 - Workspace menu: `Workspace Menu`
+- Unread-only filter: `Show Unread Conversations`
 
 Expected keyboard order:
 
 1. Sidebar header/menu controls.
 2. Home and Later primary navigation.
-3. Conversation filter.
+3. Conversation filter and unread-only toggle.
 4. Conversation list.
 5. Main message area.
 
@@ -252,4 +257,4 @@ Known limits:
 - No Slack Connect or external organization indicators.
 - No avatars or presence badges.
 - No multiple workspace switching.
-- No full unread synchronization beyond `unread_count`.
+- No full unread synchronization beyond conversation-level unread fields returned by `conversations.list`.
