@@ -213,6 +213,7 @@ pub struct SlackMessage {
     pub thread_ts: Option<String>,
     pub reply_count: Option<u64>,
     pub is_starred: Option<bool>,
+    pub edited: Option<SlackMessageEdit>,
     pub reactions: Option<Vec<SlackReaction>>,
     pub files: Option<Vec<SlackFile>>,
     pub blocks: Option<Value>,
@@ -258,6 +259,12 @@ impl SlackMessage {
                         .is_some_and(|users| users.iter().any(|user| user == user_id))
             })
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SlackMessageEdit {
+    pub user: Option<String>,
+    pub ts: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

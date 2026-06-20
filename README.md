@@ -58,11 +58,12 @@ Implemented:
 - PKCE OAuth callback flow on localhost.
 - Keyring-backed token storage.
 - Background Tokio runtime for Slack network work.
-- Native sidebar conversation navigation, Activity, cached conversations and recent histories, paged channel and thread history, read-marker updates, search, saved items, message posting, emoji reactions, and file upload.
+- Native sidebar conversation navigation, Activity, cached conversations and recent histories, paged channel and thread history, read-marker updates, search, saved items, multiline message posting, emoji reactions, edited/deleted message rendering, and file upload.
 
 Next:
 
 - Newer-message timestamp refresh and explicit read/unread actions.
+- Composer formatting controls, autocomplete, emoji picker, and draft persistence.
 - Slack-wide mention, reply, and reaction aggregation for Activity.
 - Optional Socket Mode realtime sync.
 - Presence cache.

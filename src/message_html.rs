@@ -745,6 +745,10 @@ fn search_result_article(result: &SearchMatch, context: &MessageHtmlContext) -> 
 fn metadata_html(message: &SlackMessage) -> String {
     let mut metadata = timestamp_html(&message.ts);
 
+    if message.edited.is_some() {
+        metadata.push_str("<span class=\"metadata\">edited</span>");
+    }
+
     match message.subtype.as_deref() {
         Some(subtype) if !subtype.is_empty() => {
             metadata.push_str(&format!(
@@ -808,6 +812,10 @@ fn author_label(message: &SlackMessage, context: &MessageHtmlContext) -> String 
 }
 
 fn message_body_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
+    if message.subtype.as_deref() == Some("message_deleted") {
+        return "<p class=\"empty-message\">Message deleted</p>".to_string();
+    }
+
     if let Some(blocks) = message.blocks.as_ref() {
         let rendered = blocks_html(blocks, context);
         if !rendered.is_empty() {
@@ -1708,6 +1716,31 @@ mod tests {
         assert!(html.contains("datetime=\""));
         assert!(html.contains("title=\""));
         assert!(html.contains("</time>"));
+    }
+
+    #[test]
+    fn renders_edited_message_metadata() {
+        let mut message = message("edited text");
+        message.edited = Some(crate::models::SlackMessageEdit {
+            user: Some("U123".to_string()),
+            ts: Some("1710000010.000100".to_string()),
+        });
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains("<span class=\"metadata\">edited</span>"));
+        assert!(html.contains("edited text"));
+    }
+
+    #[test]
+    fn renders_deleted_messages_as_deleted() {
+        let mut message = message("");
+        message.subtype = Some("message_deleted".to_string());
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains("Message deleted"));
+        assert!(!html.contains("No message text"));
     }
 
     #[test]

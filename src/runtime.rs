@@ -115,7 +115,7 @@ pub enum RuntimeEvent {
     },
     MessagePosted {
         channel_id: String,
-        message: SlackMessage,
+        message: Box<SlackMessage>,
     },
     ReactionUpdated {
         channel_id: String,
@@ -477,7 +477,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .await?;
             context.events.send_event(RuntimeEvent::MessagePosted {
                 channel_id,
-                message,
+                message: Box::new(message),
             });
         }
         RuntimeCommand::SetReaction {

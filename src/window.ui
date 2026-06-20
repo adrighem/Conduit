@@ -329,9 +329,20 @@
                                 <property name="orientation">horizontal</property>
                                 <property name="spacing">6</property>
                                 <child>
-                                  <object class="GtkEntry" id="message_entry">
+                                  <object class="GtkScrolledWindow">
                                     <property name="hexpand">True</property>
-                                    <property name="placeholder-text" translatable="yes">Message</property>
+                                    <property name="min-content-height">42</property>
+                                    <property name="max-content-height">132</property>
+                                    <property name="child">
+                                      <object class="GtkTextView" id="message_entry">
+                                        <property name="wrap-mode">word-char</property>
+                                        <property name="accepts-tab">False</property>
+                                        <property name="top-margin">7</property>
+                                        <property name="bottom-margin">7</property>
+                                        <property name="left-margin">8</property>
+                                        <property name="right-margin">8</property>
+                                      </object>
+                                    </property>
                                   </object>
                                 </child>
                                 <child>
@@ -402,9 +413,20 @@
                                 <property name="orientation">horizontal</property>
                                 <property name="spacing">6</property>
                                 <child>
-                                  <object class="GtkEntry" id="thread_entry">
+                                  <object class="GtkScrolledWindow">
                                     <property name="hexpand">True</property>
-                                    <property name="placeholder-text" translatable="yes">Reply</property>
+                                    <property name="min-content-height">42</property>
+                                    <property name="max-content-height">132</property>
+                                    <property name="child">
+                                      <object class="GtkTextView" id="thread_entry">
+                                        <property name="wrap-mode">word-char</property>
+                                        <property name="accepts-tab">False</property>
+                                        <property name="top-margin">7</property>
+                                        <property name="bottom-margin">7</property>
+                                        <property name="left-margin">8</property>
+                                        <property name="right-margin">8</property>
+                                      </object>
+                                    </property>
                                   </object>
                                 </child>
                                 <child>

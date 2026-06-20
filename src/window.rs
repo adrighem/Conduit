@@ -81,7 +81,7 @@ mod imp {
         #[template_child]
         pub message_thread_paned: TemplateChild<gtk::Paned>,
         #[template_child]
-        pub message_entry: TemplateChild<gtk::Entry>,
+        pub message_entry: TemplateChild<gtk::TextView>,
         #[template_child]
         pub send_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -99,7 +99,7 @@ mod imp {
         #[template_child]
         pub thread_view_box: TemplateChild<gtk::Box>,
         #[template_child]
-        pub thread_entry: TemplateChild<gtk::Entry>,
+        pub thread_entry: TemplateChild<gtk::TextView>,
         #[template_child]
         pub thread_send_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -314,6 +314,16 @@ fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<
     messages
 }
 
+fn text_view_text(text_view: &gtk::TextView) -> String {
+    let buffer = text_view.buffer();
+    let (start, end) = buffer.bounds();
+    buffer.text(&start, &end, false).to_string()
+}
+
+fn set_text_view_text(text_view: &gtk::TextView, text: &str) {
+    text_view.buffer().set_text(text);
+}
+
 impl ConduitWindow {
     pub fn new<P: IsA<gtk::Application>>(application: &P) -> Self {
         glib::Object::builder()
@@ -463,18 +473,11 @@ impl ConduitWindow {
             }
         });
 
-        let weak_window = self.downgrade();
-        imp.message_entry.connect_activate(move |_| {
-            if let Some(window) = weak_window.upgrade() {
-                window.post_current_message();
-            }
+        self.connect_text_view_send_shortcut(&imp.message_entry.get(), |window| {
+            window.post_current_message()
         });
-
-        let weak_window = self.downgrade();
-        imp.thread_entry.connect_activate(move |_| {
-            if let Some(window) = weak_window.upgrade() {
-                window.post_thread_reply();
-            }
+        self.connect_text_view_send_shortcut(&imp.thread_entry.get(), |window| {
+            window.post_thread_reply()
         });
 
         let weak_window = self.downgrade();
@@ -507,6 +510,26 @@ impl ConduitWindow {
                 callback(&window);
             }
         });
+    }
+
+    fn connect_text_view_send_shortcut<F>(&self, text_view: &gtk::TextView, callback: F)
+    where
+        F: Fn(&Self) + 'static,
+    {
+        let controller = gtk::EventControllerKey::new();
+        let weak_window = self.downgrade();
+        controller.connect_key_pressed(move |_, key, _, state| {
+            if key == gtk::gdk::Key::Return && state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            {
+                if let Some(window) = weak_window.upgrade() {
+                    callback(&window);
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        text_view.add_controller(controller);
     }
 
     fn drain_runtime_events(&self) {
@@ -635,7 +658,7 @@ impl ConduitWindow {
                 channel_id,
                 message,
             } => {
-                self.imp().message_entry.set_text("");
+                set_text_view_text(&self.imp().message_entry, "");
                 self.imp().send_button.set_sensitive(true);
                 self.imp().thread_send_button.set_sensitive(true);
                 self.set_status("Message sent");
@@ -676,7 +699,7 @@ impl ConduitWindow {
                 imp.upload_button.set_sensitive(true);
                 imp.upload_progress.set_fraction(1.0);
                 imp.upload_progress.set_text(Some("Upload complete"));
-                imp.message_entry.set_text("");
+                set_text_view_text(&imp.message_entry, "");
                 self.set_status(&format!("Uploaded {name}"));
                 if let Some(channel_id) = self.selected_channel_id() {
                     self.send_command(RuntimeCommand::LoadHistory { channel_id });
@@ -776,7 +799,7 @@ impl ConduitWindow {
             self.set_status("Select a conversation");
             return;
         };
-        let text = imp.message_entry.text().trim().to_string();
+        let text = text_view_text(&imp.message_entry).trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -800,7 +823,7 @@ impl ConduitWindow {
             self.set_status("Open a thread");
             return;
         };
-        let text = imp.thread_entry.text().trim().to_string();
+        let text = text_view_text(&imp.thread_entry).trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -819,7 +842,7 @@ impl ConduitWindow {
             self.set_status("Select a conversation");
             return;
         };
-        let initial_comment = self.imp().message_entry.text().trim().to_string();
+        let initial_comment = text_view_text(&self.imp().message_entry).trim().to_string();
 
         let dialog = gtk::FileDialog::builder()
             .title("Upload File")
@@ -853,7 +876,7 @@ impl ConduitWindow {
         let imp = self.imp();
         *imp.selected_thread_ts.borrow_mut() = None;
         imp.current_thread_messages.borrow_mut().clear();
-        imp.thread_entry.set_text("");
+        set_text_view_text(&imp.thread_entry, "");
         imp.thread_pane.set_visible(false);
         self.load_thread_html(&message_html::placeholder_document(
             "Thread",
@@ -1070,7 +1093,7 @@ impl ConduitWindow {
 
     fn reload_after_message(&self, channel_id: &str, thread_ts: Option<&str>) {
         if let Some(thread_ts) = thread_ts {
-            self.imp().thread_entry.set_text("");
+            set_text_view_text(&self.imp().thread_entry, "");
             self.send_command(RuntimeCommand::LoadThread {
                 channel_id: channel_id.to_string(),
                 ts: thread_ts.to_string(),
@@ -1133,6 +1156,8 @@ impl ConduitWindow {
         imp.current_search_results.borrow_mut().clear();
         imp.current_saved_items.borrow_mut().clear();
         imp.current_main_view.set(MainMessageView::Placeholder);
+        set_text_view_text(&imp.message_entry, "");
+        set_text_view_text(&imp.thread_entry, "");
         imp.sidebar_filter_entry.set_text("");
         imp.sidebar_unread_filter_button.set_active(false);
         imp.workspace_title_label.set_label("Workspace");
@@ -1429,7 +1454,7 @@ impl ConduitWindow {
         imp.current_main_view.set(MainMessageView::Conversation);
         imp.message_title.set_label(title);
         imp.current_thread_messages.borrow_mut().clear();
-        imp.thread_entry.set_text("");
+        set_text_view_text(&imp.thread_entry, "");
         imp.thread_pane.set_visible(false);
         self.load_thread_html(&message_html::placeholder_document(
             "Thread",
