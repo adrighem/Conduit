@@ -28,6 +28,7 @@ mod rendering;
 mod runtime;
 mod sidebar;
 mod slack;
+mod store;
 mod window;
 
 use self::application::ConduitApplication;

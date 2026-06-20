@@ -15,6 +15,7 @@ use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage, StoredToken,
 };
 use crate::slack::{DownloadedImage, SlackApi};
+use crate::store::WorkspaceStore;
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
@@ -204,18 +205,20 @@ impl AppRuntime {
             let oauth = SlackOAuthClient::new();
             let image_cache = ImageAssetCache::new(config::image_asset_cache_dir());
             let mut slack: Option<SlackApi> = None;
+            let mut workspace_store: Option<WorkspaceStore> = None;
             let mut user_cache = HashMap::new();
 
             while let Ok(command) = receiver.recv() {
-                let result = runtime.block_on(handle_command(
-                    command,
-                    &events,
-                    &token_store,
-                    &oauth,
-                    &image_cache,
-                    &mut slack,
-                    &mut user_cache,
-                ));
+                let mut context = RuntimeContext {
+                    events: &events,
+                    token_store: &token_store,
+                    oauth: &oauth,
+                    image_cache: &image_cache,
+                    slack: &mut slack,
+                    workspace_store: &mut workspace_store,
+                    user_cache: &mut user_cache,
+                };
+                let result = runtime.block_on(handle_command(command, &mut context));
                 if let Err(error) = result {
                     let _ = events.send(RuntimeEvent::Error(error.to_string()));
                 }
@@ -230,60 +233,76 @@ impl AppRuntime {
     }
 }
 
-async fn handle_command(
-    command: RuntimeCommand,
-    events: &Sender<RuntimeEvent>,
-    token_store: &TokenStore,
-    oauth: &SlackOAuthClient,
-    image_cache: &ImageAssetCache,
-    slack: &mut Option<SlackApi>,
-    user_cache: &mut HashMap<String, String>,
-) -> Result<()> {
+struct RuntimeContext<'a> {
+    events: &'a Sender<RuntimeEvent>,
+    token_store: &'a TokenStore,
+    oauth: &'a SlackOAuthClient,
+    image_cache: &'a ImageAssetCache,
+    slack: &'a mut Option<SlackApi>,
+    workspace_store: &'a mut Option<WorkspaceStore>,
+    user_cache: &'a mut HashMap<String, String>,
+}
+
+async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_>) -> Result<()> {
     match command {
         RuntimeCommand::LoadStoredToken => {
             crate::debug::log("runtime", "LoadStoredToken");
-            events.send_status("Checking secure storage");
-            if let Some(mut token) = token_store.load()? {
+            context.events.send_status("Checking secure storage");
+            if let Some(mut token) = context.token_store.load()? {
                 if token.should_refresh() {
-                    events.send_status("Refreshing Slack session");
-                    token = oauth.refresh(&token).await?;
-                    token_store.save(&token)?;
+                    context.events.send_status("Refreshing Slack session");
+                    token = context.oauth.refresh(&token).await?;
+                    context.token_store.save(&token)?;
                 }
-                connect_with_token(events, slack, token).await?;
-                user_cache.clear();
-                load_conversations(events, slack).await?;
+                let auth = connect_with_token(context.events, context.slack, token).await?;
+                *context.workspace_store = Some(WorkspaceStore::new(
+                    config::state_cache_dir(),
+                    &workspace_store_id(&auth),
+                ));
+                context.user_cache.clear();
+                load_cached_conversations(context.events, context.workspace_store).await;
+                load_conversations(context.events, context.slack, context.workspace_store).await?;
             } else {
-                events.send_event(RuntimeEvent::SignedOut);
+                context.events.send_event(RuntimeEvent::SignedOut);
             }
         }
         RuntimeCommand::StartOAuth {
             client_id,
             debug_auth,
         } => {
-            events.send_status("Opening Slack authorization");
-            let token = oauth
+            context.events.send_status("Opening Slack authorization");
+            let token = context
+                .oauth
                 .authenticate(OAuthConfig::new(client_id), debug_auth)
                 .await?;
-            token_store.save(&token)?;
-            connect_with_token(events, slack, token).await?;
-            user_cache.clear();
-            load_conversations(events, slack).await?;
+            context.token_store.save(&token)?;
+            let auth = connect_with_token(context.events, context.slack, token).await?;
+            *context.workspace_store = Some(WorkspaceStore::new(
+                config::state_cache_dir(),
+                &workspace_store_id(&auth),
+            ));
+            context.user_cache.clear();
+            load_cached_conversations(context.events, context.workspace_store).await;
+            load_conversations(context.events, context.slack, context.workspace_store).await?;
         }
         RuntimeCommand::SignOut => {
-            token_store.clear()?;
-            *slack = None;
-            user_cache.clear();
-            events.send_event(RuntimeEvent::SignedOut);
+            context.token_store.clear()?;
+            *context.slack = None;
+            *context.workspace_store = None;
+            context.user_cache.clear();
+            context.events.send_event(RuntimeEvent::SignedOut);
         }
         RuntimeCommand::RefreshConversations => {
             crate::debug::log("runtime", "RefreshConversations");
-            load_conversations(events, slack).await?;
+            load_conversations(context.events, context.slack, context.workspace_store).await?;
         }
         RuntimeCommand::LoadHistory { channel_id } => {
-            let api = require_slack(slack)?;
+            let api = require_slack(context.slack)?;
             crate::debug::log("runtime", &format!("LoadHistory channel_id={channel_id}"));
-            events.send_status("Loading conversation");
+            load_cached_history(context.events, context.workspace_store, &channel_id).await;
+            context.events.send_status("Loading conversation");
             let messages = api.history(&channel_id).await?;
+            store_history(context.workspace_store, &channel_id, &messages).await;
             crate::debug::log(
                 "runtime",
                 &format!(
@@ -291,60 +310,70 @@ async fn handle_command(
                     messages.len()
                 ),
             );
-            events.send_event(RuntimeEvent::HistoryLoaded {
+            context.events.send_event(RuntimeEvent::HistoryLoaded {
                 channel_id,
                 messages,
             });
         }
         RuntimeCommand::LoadThread { channel_id, ts } => {
-            let api = require_slack(slack)?;
-            events.send_status("Loading thread");
+            let api = require_slack(context.slack)?;
+            load_cached_thread(context.events, context.workspace_store, &channel_id, &ts).await;
+            context.events.send_status("Loading thread");
             let messages = api.thread_replies(&channel_id, &ts).await?;
-            events.send_event(RuntimeEvent::ThreadLoaded {
+            store_thread(context.workspace_store, &channel_id, &ts, &messages).await;
+            context.events.send_event(RuntimeEvent::ThreadLoaded {
                 channel_id,
                 ts,
                 messages,
             });
         }
         RuntimeCommand::SearchMessages { query } => {
-            let api = require_slack(slack)?;
+            let api = require_slack(context.slack)?;
             let results = api.search_messages(&query).await?;
-            events.send_event(RuntimeEvent::SearchLoaded(results));
+            context
+                .events
+                .send_event(RuntimeEvent::SearchLoaded(results));
         }
         RuntimeCommand::LoadSavedItems => {
-            let api = require_slack(slack)?;
+            let api = require_slack(context.slack)?;
             let items = api.saved_items().await?;
-            events.send_event(RuntimeEvent::SavedItemsLoaded(items));
+            context
+                .events
+                .send_event(RuntimeEvent::SavedItemsLoaded(items));
         }
         RuntimeCommand::LoadUser { user_id } => {
-            if let Some(display_name) = user_cache.get(&user_id).cloned() {
-                events.send_event(RuntimeEvent::UserLoaded {
+            if let Some(display_name) = context.user_cache.get(&user_id).cloned() {
+                context.events.send_event(RuntimeEvent::UserLoaded {
                     user_id,
                     display_name,
                 });
             } else {
-                let api = require_slack(slack)?;
+                let api = require_slack(context.slack)?;
                 let display_name = api.user_display_name(&user_id).await?;
-                user_cache.insert(user_id.clone(), display_name.clone());
-                events.send_event(RuntimeEvent::UserLoaded {
+                context
+                    .user_cache
+                    .insert(user_id.clone(), display_name.clone());
+                context.events.send_event(RuntimeEvent::UserLoaded {
                     user_id,
                     display_name,
                 });
             }
         }
         RuntimeCommand::LoadImageAsset { key, url } => {
-            let api = require_slack(slack)?;
+            let api = require_slack(context.slack)?;
             crate::debug::log(
                 "runtime",
                 &format!("LoadImageAsset key={}", crate::debug::url_for_log(&key)),
             );
-            match image_cache.load(&key).await {
+            match context.image_cache.load(&key).await {
                 Ok(Some(data_uri)) => {
                     crate::debug::log(
                         "runtime",
                         &format!("ImageAssetCacheHit key={}", crate::debug::url_for_log(&key)),
                     );
-                    events.send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
+                    context
+                        .events
+                        .send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -369,7 +398,7 @@ async fn handle_command(
                         ),
                     );
                     let data_uri = image_data_uri(image);
-                    if let Err(error) = image_cache.store(&key, &data_uri).await {
+                    if let Err(error) = context.image_cache.store(&key, &data_uri).await {
                         crate::debug::log(
                             "runtime",
                             &format!(
@@ -378,7 +407,9 @@ async fn handle_command(
                             ),
                         );
                     }
-                    events.send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
+                    context
+                        .events
+                        .send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
                 }
                 Err(error) => {
                     crate::debug::log(
@@ -388,7 +419,9 @@ async fn handle_command(
                             crate::debug::url_for_log(&key)
                         ),
                     );
-                    events.send_event(RuntimeEvent::ImageAssetFailed { key });
+                    context
+                        .events
+                        .send_event(RuntimeEvent::ImageAssetFailed { key });
                 }
             }
         }
@@ -397,11 +430,11 @@ async fn handle_command(
             text,
             thread_ts,
         } => {
-            let api = require_slack(slack)?;
+            let api = require_slack(context.slack)?;
             let message = api
                 .post_message(&channel_id, &text, thread_ts.as_deref())
                 .await?;
-            events.send_event(RuntimeEvent::MessagePosted {
+            context.events.send_event(RuntimeEvent::MessagePosted {
                 channel_id,
                 message,
             });
@@ -413,9 +446,9 @@ async fn handle_command(
             add,
             thread_ts,
         } => {
-            let api = require_slack(slack)?;
+            let api = require_slack(context.slack)?;
             api.set_reaction(&channel_id, &ts, &name, add).await?;
-            events.send_event(RuntimeEvent::ReactionUpdated {
+            context.events.send_event(RuntimeEvent::ReactionUpdated {
                 channel_id,
                 thread_ts,
             });
@@ -426,9 +459,9 @@ async fn handle_command(
             add,
             thread_ts,
         } => {
-            let api = require_slack(slack)?;
+            let api = require_slack(context.slack)?;
             api.set_saved(&channel_id, &ts, add).await?;
-            events.send_event(RuntimeEvent::SavedUpdated {
+            context.events.send_event(RuntimeEvent::SavedUpdated {
                 channel_id,
                 saved: add,
                 thread_ts,
@@ -439,12 +472,12 @@ async fn handle_command(
             path,
             initial_comment,
         } => {
-            let api = require_slack(slack)?;
-            events.send_event(RuntimeEvent::FileUploadProgress {
+            let api = require_slack(context.slack)?;
+            context.events.send_event(RuntimeEvent::FileUploadProgress {
                 fraction: 0.05,
                 label: "Preparing upload".to_string(),
             });
-            let progress_events = events.clone();
+            let progress_events = context.events.clone();
             let file = api
                 .upload_file(
                     &channel_id,
@@ -463,7 +496,7 @@ async fn handle_command(
                 .or(file.name)
                 .or(file.id)
                 .unwrap_or_else(|| "file".to_string());
-            events.send_event(RuntimeEvent::FileUploaded(label));
+            context.events.send_event(RuntimeEvent::FileUploaded(label));
         }
     }
 
@@ -474,12 +507,14 @@ async fn connect_with_token(
     events: &Sender<RuntimeEvent>,
     slack: &mut Option<SlackApi>,
     token: StoredToken,
-) -> Result<()> {
+) -> Result<AuthInfo> {
     let token_team = token.team_name.clone().or(token.team_id.clone());
+    let token_team_id = token.team_id.clone();
     let token_user = token.user_id.clone();
     let api = SlackApi::new(token);
     let mut auth = api.auth_test().await?;
     auth.team = auth.team.or(token_team);
+    auth.team_id = auth.team_id.or(token_team_id);
     auth.user_id = auth.user_id.or(token_user);
     crate::debug::log(
         "runtime",
@@ -490,23 +525,179 @@ async fn connect_with_token(
         ),
     );
     *slack = Some(api);
-    events.send_event(RuntimeEvent::Authenticated(auth));
-    Ok(())
+    events.send_event(RuntimeEvent::Authenticated(auth.clone()));
+    Ok(auth)
 }
 
 async fn load_conversations(
     events: &Sender<RuntimeEvent>,
     slack: &mut Option<SlackApi>,
+    workspace_store: &Option<WorkspaceStore>,
 ) -> Result<()> {
     let api = require_slack(slack)?;
     events.send_status("Loading conversations");
     let conversations = api.conversations().await?;
+    store_conversations(workspace_store, &conversations).await;
     crate::debug::log(
         "runtime",
         &format!("ConversationsLoaded count={}", conversations.len()),
     );
     events.send_event(RuntimeEvent::ConversationsLoaded(conversations));
     Ok(())
+}
+
+fn workspace_store_id(auth: &AuthInfo) -> String {
+    let team = auth
+        .team_id
+        .as_deref()
+        .or(auth.team.as_deref())
+        .or(auth.url.as_deref())
+        .unwrap_or("unknown-team");
+    let user = auth.user_id.as_deref().unwrap_or("unknown-user");
+    format!("{team}:{user}")
+}
+
+async fn load_cached_conversations(
+    events: &Sender<RuntimeEvent>,
+    workspace_store: &Option<WorkspaceStore>,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    match store.load_conversations().await {
+        Ok(Some(conversations)) => {
+            crate::debug::log(
+                "runtime",
+                &format!("CachedConversationsLoaded count={}", conversations.len()),
+            );
+            events.send_event(RuntimeEvent::ConversationsLoaded(conversations));
+        }
+        Ok(None) => {}
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("CachedConversationsLoadFailed error={error:#}"),
+        ),
+    }
+}
+
+async fn store_conversations(
+    workspace_store: &Option<WorkspaceStore>,
+    conversations: &[SlackConversation],
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    if let Err(error) = store.store_conversations(conversations).await {
+        crate::debug::log(
+            "runtime",
+            &format!("CachedConversationsStoreFailed error={error:#}"),
+        );
+    }
+}
+
+async fn load_cached_history(
+    events: &Sender<RuntimeEvent>,
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    match store.load_history(channel_id).await {
+        Ok(Some(messages)) => {
+            crate::debug::log(
+                "runtime",
+                &format!(
+                    "CachedHistoryLoaded channel_id={channel_id} messages={}",
+                    messages.len()
+                ),
+            );
+            events.send_event(RuntimeEvent::HistoryLoaded {
+                channel_id: channel_id.to_string(),
+                messages,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("CachedHistoryLoadFailed channel_id={channel_id} error={error:#}"),
+        ),
+    }
+}
+
+async fn store_history(
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+    messages: &[SlackMessage],
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    if let Err(error) = store.store_history(channel_id, messages).await {
+        crate::debug::log(
+            "runtime",
+            &format!("CachedHistoryStoreFailed channel_id={channel_id} error={error:#}"),
+        );
+    }
+}
+
+async fn load_cached_thread(
+    events: &Sender<RuntimeEvent>,
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+    thread_ts: &str,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    match store.load_thread(channel_id, thread_ts).await {
+        Ok(Some(messages)) => {
+            crate::debug::log(
+                "runtime",
+                &format!(
+                    "CachedThreadLoaded channel_id={channel_id} ts={thread_ts} messages={}",
+                    messages.len()
+                ),
+            );
+            events.send_event(RuntimeEvent::ThreadLoaded {
+                channel_id: channel_id.to_string(),
+                ts: thread_ts.to_string(),
+                messages,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!(
+                "CachedThreadLoadFailed channel_id={channel_id} ts={thread_ts} error={error:#}"
+            ),
+        ),
+    }
+}
+
+async fn store_thread(
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+    thread_ts: &str,
+    messages: &[SlackMessage],
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    if let Err(error) = store.store_thread(channel_id, thread_ts, messages).await {
+        crate::debug::log(
+            "runtime",
+            &format!(
+                "CachedThreadStoreFailed channel_id={channel_id} ts={thread_ts} error={error:#}"
+            ),
+        );
+    }
 }
 
 fn require_slack(slack: &Option<SlackApi>) -> Result<&SlackApi> {
@@ -540,6 +731,18 @@ mod tests {
             image_asset_cache_key("https://files.example/image.png"),
             "7db09e79cb28f1be72da3c1449cd42619e048f148310325cc2c8f55cd713aa0e"
         );
+    }
+
+    #[test]
+    fn workspace_store_id_uses_team_and_user_identity() {
+        let auth = AuthInfo {
+            team: Some("Example".to_string()),
+            team_id: Some("T123".to_string()),
+            user_id: Some("U123".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(workspace_store_id(&auth), "T123:U123");
     }
 
     #[test]

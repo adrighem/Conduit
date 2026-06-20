@@ -1,8 +1,9 @@
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::header::CONTENT_TYPE;
-use reqwest::Client;
+use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -13,6 +14,9 @@ use crate::models::{
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RATE_LIMIT_RETRIES: usize = 2;
+const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
+const MAX_RETRY_AFTER_SECONDS: u64 = 30;
 
 #[derive(Clone)]
 pub struct SlackApi {
@@ -302,22 +306,65 @@ impl SlackApi {
         T: for<'de> Deserialize<'de> + SlackResponse,
     {
         let url = format!("https://slack.com/api/{method}");
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.access_token)
-            .form(params)
-            .send()
-            .await
-            .with_context(|| format!("failed to call Slack method {method}"))?
-            .error_for_status()
-            .with_context(|| format!("Slack method {method} returned an HTTP error"))?
-            .json::<T>()
-            .await
-            .with_context(|| format!("failed to parse Slack method {method} response"))?;
+        let mut retries = 0;
 
-        response.into_result(method)
+        loop {
+            let response = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.access_token)
+                .form(params)
+                .send()
+                .await
+                .with_context(|| format!("failed to call Slack method {method}"))?;
+
+            if response.status() == StatusCode::TOO_MANY_REQUESTS
+                && retries < MAX_RATE_LIMIT_RETRIES
+            {
+                let retry_after = retry_after_delay(&response);
+                retries += 1;
+                crate::debug::log(
+                    "slack",
+                    &format!(
+                        "Slack method {method} rate limited; retrying in {}s",
+                        retry_after.as_secs()
+                    ),
+                );
+                tokio::time::sleep(retry_after).await;
+                continue;
+            }
+
+            let response = response
+                .error_for_status()
+                .with_context(|| format!("Slack method {method} returned an HTTP error"))?
+                .json::<T>()
+                .await
+                .with_context(|| format!("failed to parse Slack method {method} response"))?;
+
+            return response.into_result(method);
+        }
     }
+}
+
+fn retry_after_delay(response: &reqwest::Response) -> Duration {
+    let seconds = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(retry_after_seconds)
+        .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS);
+
+    Duration::from_secs(seconds)
+}
+
+fn retry_after_seconds(value: &str) -> u64 {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS)
+        .min(MAX_RETRY_AFTER_SECONDS)
 }
 
 #[derive(Debug, Clone)]
@@ -547,5 +594,16 @@ mod tests {
                 "1710000000.000100"
             ]
         );
+    }
+
+    #[test]
+    fn retry_after_seconds_uses_bounded_positive_integer_values() {
+        assert_eq!(retry_after_seconds("4"), 4);
+        assert_eq!(retry_after_seconds("0"), DEFAULT_RETRY_AFTER_SECONDS);
+        assert_eq!(
+            retry_after_seconds("not-a-number"),
+            DEFAULT_RETRY_AFTER_SECONDS
+        );
+        assert_eq!(retry_after_seconds("120"), MAX_RETRY_AFTER_SECONDS);
     }
 }

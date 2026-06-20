@@ -24,6 +24,10 @@ pub fn image_asset_cache_dir() -> PathBuf {
     app_cache_dir().join("image-assets")
 }
 
+pub fn state_cache_dir() -> PathBuf {
+    app_cache_dir().join("state")
+}
+
 pub fn slack_client_id() -> Option<String> {
     let packaged_client_id = option_env!("CONDUIT_SLACK_CLIENT_ID")
         .map(ToString::to_string)
@@ -68,5 +72,6 @@ mod tests {
         assert!(webkit_data_dir().starts_with(&app_cache));
         assert!(webkit_cache_dir().starts_with(&app_cache));
         assert!(image_asset_cache_dir().starts_with(&app_cache));
+        assert!(state_cache_dir().starts_with(&app_cache));
     }
 }
