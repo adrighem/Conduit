@@ -4,7 +4,7 @@ use chrono::{DateTime, Local};
 
 use crate::activity::ActivityItem;
 use crate::debug;
-use crate::models::{SavedItem, SearchMatch, SlackMessage};
+use crate::models::{SavedItem, SearchMatch, SlackFile, SlackMessage};
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
 
@@ -105,6 +105,21 @@ pub fn activity_document(items: &[ActivityItem]) -> String {
     body.push_str("</section></main>");
 
     html_document("Activity", &body)
+}
+
+pub fn files_document(files: &[SlackFile]) -> String {
+    if files.is_empty() {
+        return placeholder_document("Files", "No files");
+    }
+
+    let mut body = String::from("<main class=\"timeline\" aria-label=\"Files\">");
+    body.push_str("<section class=\"file-list\">");
+    for file in files {
+        body.push_str(&file_item_html(file));
+    }
+    body.push_str("</section></main>");
+
+    html_document("Files", &body)
 }
 
 pub fn search_results_document(results: &[SearchMatch], context: &MessageHtmlContext) -> String {
@@ -378,6 +393,34 @@ pre code {{
   text-align: center;
 }}
 
+.file-list {{
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--line);
+}}
+
+.file-row {{
+  display: grid;
+  gap: 4px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+}}
+
+.file-row:hover {{
+  text-decoration: none;
+}}
+
+.file-title {{
+  min-width: 0;
+  font-weight: 700;
+}}
+
+.file-meta {{
+  color: var(--muted);
+  font-size: 12px;
+}}
+
 .reaction {{
   padding: 2px 7px;
   border-radius: 999px;
@@ -617,6 +660,26 @@ fn activity_item_html(item: &ActivityItem) -> String {
         escape_html(&item.unread_label()),
         escape_html(item.kind.label())
     )
+}
+
+fn file_item_html(file: &SlackFile) -> String {
+    let title = escape_html(file.display_title());
+    let detail = file.detail_label();
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!("<span class=\"file-meta\">{}</span>", escape_html(&detail))
+    };
+    let content = format!("<span class=\"file-title\">{title}</span>{detail}");
+
+    if let Some(url) = file.link_url().filter(|url| is_http_url(url)) {
+        format!(
+            "<a class=\"file-row\" href=\"{}\" rel=\"noreferrer noopener\">{content}</a>",
+            escape_html(url)
+        )
+    } else {
+        format!("<section class=\"file-row\">{content}</section>")
+    }
 }
 
 fn message_group_article(
@@ -1977,6 +2040,33 @@ mod tests {
 
         assert!(html.contains("No unread activity"));
         assert!(!html.contains("<a class=\"activity-row\""));
+    }
+
+    #[test]
+    fn files_document_renders_file_rows() {
+        let files = vec![SlackFile {
+            title: Some("Quarterly <plan>.pdf".to_string()),
+            pretty_type: Some("PDF".to_string()),
+            size: Some(1_048_576),
+            permalink: Some("https://slack.example/files/F123".to_string()),
+            ..Default::default()
+        }];
+
+        let html = files_document(&files);
+
+        assert!(html.contains("aria-label=\"Files\""));
+        assert!(html.contains("Quarterly &lt;plan&gt;.pdf"));
+        assert!(html.contains("PDF - 1.0 MB"));
+        assert!(html.contains("href=\"https://slack.example/files/F123\""));
+    }
+
+    #[test]
+    fn files_document_uses_empty_state_without_rows() {
+        let html = files_document(&[]);
+
+        assert!(html.contains("No files"));
+        assert!(!html.contains("<a class=\"file-row\""));
+        assert!(!html.contains("<section class=\"file-row\""));
     }
 
     #[test]

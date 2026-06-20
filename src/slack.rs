@@ -160,6 +160,16 @@ impl SlackApi {
         Ok(response.items)
     }
 
+    pub async fn files(&self) -> Result<Vec<SlackFile>> {
+        let response: FilesListResponse = self
+            .post_form(
+                "files.list",
+                &[("count", "50".to_string()), ("page", "1".to_string())],
+            )
+            .await?;
+        Ok(response.files)
+    }
+
     pub async fn user_display_name(&self, user_id: &str) -> Result<String> {
         let response: UserInfoResponse = self
             .post_form("users.info", &[("user", user_id.to_string())])
@@ -601,6 +611,14 @@ struct StarsListResponse {
     items: Vec<SavedItem>,
 }
 impl_slack_response!(StarsListResponse);
+
+#[derive(Debug, Deserialize)]
+struct FilesListResponse {
+    ok: bool,
+    error: Option<String>,
+    files: Vec<SlackFile>,
+}
+impl_slack_response!(FilesListResponse);
 
 #[derive(Debug, Deserialize)]
 struct UserInfoResponse {

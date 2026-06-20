@@ -63,6 +63,8 @@ mod imp {
         #[template_child]
         pub activity_button: TemplateChild<gtk::Button>,
         #[template_child]
+        pub files_button: TemplateChild<gtk::Button>,
+        #[template_child]
         pub saved_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub refresh_button: TemplateChild<gtk::Button>,
@@ -121,6 +123,7 @@ mod imp {
         pub current_channel_messages: RefCell<Vec<SlackMessage>>,
         pub current_thread_messages: RefCell<Vec<SlackMessage>>,
         pub current_search_results: RefCell<Vec<SearchMatch>>,
+        pub current_files: RefCell<Vec<SlackFile>>,
         pub current_saved_items: RefCell<Vec<SavedItem>>,
         pub current_main_view: Cell<MainMessageView>,
         pub current_user_id: RefCell<Option<String>>,
@@ -182,6 +185,7 @@ struct CurrentMessageSnapshot {
     channel_messages: Vec<SlackMessage>,
     thread_messages: Vec<SlackMessage>,
     search_results: Vec<SearchMatch>,
+    files: Vec<SlackFile>,
     saved_items: Vec<SavedItem>,
     main_view: MainMessageView,
 }
@@ -215,6 +219,7 @@ pub enum MainMessageView {
     Conversation,
     Activity,
     Search,
+    Files,
     Saved,
 }
 
@@ -432,6 +437,7 @@ impl ConduitWindow {
         self.connect_widget(&imp.connect_button.get(), |window| window.start_oauth());
         self.connect_widget(&imp.home_button.get(), |window| window.show_home());
         self.connect_widget(&imp.activity_button.get(), |window| window.show_activity());
+        self.connect_widget(&imp.files_button.get(), |window| window.show_files());
         self.connect_widget(&imp.refresh_button.get(), |window| {
             window.refresh_conversations()
         });
@@ -619,6 +625,7 @@ impl ConduitWindow {
                 self.populate_thread(&channel_id, &ts, rendered_messages);
             }
             RuntimeEvent::SearchLoaded(results) => self.populate_search_results(results),
+            RuntimeEvent::FilesLoaded(files) => self.populate_files(files),
             RuntimeEvent::SavedItemsLoaded(items) => self.populate_saved_items(items),
             RuntimeEvent::UserLoaded {
                 user_id,
@@ -762,6 +769,18 @@ impl ConduitWindow {
         self.close_thread();
         let items = self.activity_items();
         self.populate_activity(items);
+    }
+
+    fn show_files(&self) {
+        self.close_thread();
+        self.imp().current_main_view.set(MainMessageView::Files);
+        self.imp().message_title.set_label("Files");
+        self.render_conversations();
+        self.load_message_html(&message_html::placeholder_document(
+            "Files",
+            "Loading files",
+        ));
+        self.send_command(RuntimeCommand::LoadFiles);
     }
 
     fn show_later(&self) {
@@ -1154,6 +1173,7 @@ impl ConduitWindow {
         imp.current_channel_messages.borrow_mut().clear();
         imp.current_thread_messages.borrow_mut().clear();
         imp.current_search_results.borrow_mut().clear();
+        imp.current_files.borrow_mut().clear();
         imp.current_saved_items.borrow_mut().clear();
         imp.current_main_view.set(MainMessageView::Placeholder);
         set_text_view_text(&imp.message_entry, "");
@@ -1569,6 +1589,15 @@ impl ConduitWindow {
         self.load_message_html(&message_html::search_results_document(&results, &context));
     }
 
+    fn populate_files(&self, files: Vec<SlackFile>) {
+        let imp = self.imp();
+        imp.message_title.set_label("Files");
+        imp.current_main_view.set(MainMessageView::Files);
+        *imp.current_files.borrow_mut() = files.clone();
+        self.render_conversations();
+        self.load_message_html(&message_html::files_document(&files));
+    }
+
     fn populate_saved_items(&self, items: Vec<SavedItem>) {
         let imp = self.imp();
         imp.message_title.set_label("Later");
@@ -1802,6 +1831,7 @@ impl ConduitWindow {
             }
             MainMessageView::Activity => self.populate_activity(self.activity_items()),
             MainMessageView::Search => self.populate_search_results(snapshot.search_results),
+            MainMessageView::Files => self.populate_files(snapshot.files),
             MainMessageView::Saved => self.populate_saved_items(snapshot.saved_items),
             MainMessageView::Placeholder => {}
         }
@@ -1835,6 +1865,7 @@ impl ConduitWindow {
             channel_messages: imp.current_channel_messages.borrow().clone(),
             thread_messages: imp.current_thread_messages.borrow().clone(),
             search_results: imp.current_search_results.borrow().clone(),
+            files: imp.current_files.borrow().clone(),
             saved_items: imp.current_saved_items.borrow().clone(),
             main_view: imp.current_main_view.get(),
         }
@@ -1911,6 +1942,10 @@ mod tests {
         );
         assert_eq!(
             sidebar_selected_channel(MainMessageView::Search, Some("C123".to_string())),
+            None
+        );
+        assert_eq!(
+            sidebar_selected_channel(MainMessageView::Files, Some("C123".to_string())),
             None
         );
         assert_eq!(

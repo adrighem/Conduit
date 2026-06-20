@@ -167,7 +167,13 @@ pub struct SlackFile {
     pub id: Option<String>,
     pub name: Option<String>,
     pub title: Option<String>,
+    pub user: Option<String>,
+    pub created: Option<u64>,
+    pub timestamp: Option<u64>,
     pub mimetype: Option<String>,
+    pub filetype: Option<String>,
+    pub pretty_type: Option<String>,
+    pub size: Option<u64>,
     pub url_private: Option<String>,
     pub url_private_download: Option<String>,
     pub thumb_64: Option<String>,
@@ -178,6 +184,9 @@ pub struct SlackFile {
     pub thumb_720: Option<String>,
     pub thumb_1024: Option<String>,
     pub permalink: Option<String>,
+    pub channels: Option<Vec<String>>,
+    pub groups: Option<Vec<String>>,
+    pub ims: Option<Vec<String>>,
 }
 
 impl SlackFile {
@@ -216,6 +225,49 @@ impl SlackFile {
         self.mimetype
             .as_deref()
             .is_some_and(|mimetype| mimetype.starts_with("image/"))
+    }
+
+    pub fn detail_label(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(kind) = self
+            .pretty_type
+            .as_deref()
+            .or(self.filetype.as_deref())
+            .filter(|kind| !kind.trim().is_empty())
+        {
+            parts.push(kind.to_string());
+        }
+
+        if let Some(size) = self.size {
+            parts.push(file_size_label(size));
+        }
+
+        parts.join(" - ")
+    }
+
+    pub fn link_url(&self) -> Option<&str> {
+        self.permalink
+            .as_deref()
+            .or(self.url_private.as_deref())
+            .or(self.url_private_download.as_deref())
+    }
+}
+
+fn file_size_label(size: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let size = size as f64;
+    if size >= GIB {
+        format!("{:.1} GB", size / GIB)
+    } else if size >= MIB {
+        format!("{:.1} MB", size / MIB)
+    } else if size >= KIB {
+        format!("{:.1} KB", size / KIB)
+    } else {
+        format!("{} B", size as u64)
     }
 }
 
@@ -486,5 +538,16 @@ mod tests {
         };
 
         assert_eq!(file.preview_url(), Some("https://files.example/480.png"));
+    }
+
+    #[test]
+    fn file_detail_label_uses_type_and_size() {
+        let file = SlackFile {
+            pretty_type: Some("PDF".to_string()),
+            size: Some(1_572_864),
+            ..Default::default()
+        };
+
+        assert_eq!(file.detail_label(), "PDF - 1.5 MB");
     }
 }

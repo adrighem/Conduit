@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::auth::{OAuthConfig, SlackOAuthClient, TokenStore};
 use crate::config;
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage, StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, StoredToken,
 };
 use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage};
 use crate::store::WorkspaceStore;
@@ -45,6 +45,7 @@ pub enum RuntimeCommand {
     SearchMessages {
         query: String,
     },
+    LoadFiles,
     LoadSavedItems,
     LoadUser {
         user_id: String,
@@ -101,6 +102,7 @@ pub enum RuntimeEvent {
         append_older: bool,
     },
     SearchLoaded(Vec<SearchMatch>),
+    FilesLoaded(Vec<SlackFile>),
     SavedItemsLoaded(Vec<SavedItem>),
     UserLoaded {
         user_id: String,
@@ -374,6 +376,11 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context
                 .events
                 .send_event(RuntimeEvent::SearchLoaded(results));
+        }
+        RuntimeCommand::LoadFiles => {
+            let api = require_slack(context.slack)?;
+            let files = api.files().await?;
+            context.events.send_event(RuntimeEvent::FilesLoaded(files));
         }
         RuntimeCommand::LoadSavedItems => {
             let api = require_slack(context.slack)?;
