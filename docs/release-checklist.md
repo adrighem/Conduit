@@ -9,7 +9,7 @@
 - Run `meson test -C _build`.
 - Launch `_build/src/conduit` and confirm the login screen renders.
 - Test OAuth with a real Slack app client ID and `http://127.0.0.1:8934/callback`.
-- Test Socket Mode with an `xapp-` token that has `connections:write`.
+- If Socket Mode has been implemented for the release, test it with an `xapp-` token that has `connections:write`.
 - Capture real screenshots before adding AppStream screenshot entries.
 
 ## Flatpak
@@ -23,4 +23,4 @@
 
 - Desktop PKCE OAuth uses user scopes through `oauth.v2.user.access`.
 - Bot scopes are not requested by the desktop redirect flow.
-- Socket Mode requires a separate app-level token and explicit Slack app configuration.
+- Socket Mode is planned as an optional advanced feature because it requires a separate app-level token and explicit Slack app configuration.

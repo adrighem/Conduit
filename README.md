@@ -58,10 +58,11 @@ Implemented:
 - PKCE OAuth callback flow on localhost.
 - Keyring-backed token storage.
 - Background Tokio runtime for Slack network work.
-- Native sidebar conversation navigation, history, thread replies, search, saved items, message posting, emoji reactions, file upload, and Socket Mode refreshes.
+- Native sidebar conversation navigation, cached conversations and recent histories, thread replies, search, saved items, message posting, emoji reactions, and file upload.
 
 Next:
 
-- Rate-limit-aware pagination.
+- History pagination and read-state synchronization.
+- Optional Socket Mode realtime sync.
 - Presence cache.
 - Flatpak dependency vendoring and Flathub-grade screenshots.
