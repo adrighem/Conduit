@@ -29,6 +29,7 @@ use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 use webkit6::prelude::*;
 
+use crate::activity::{self, ActivityItem};
 use crate::auth;
 use crate::config;
 use crate::message_html::{self, MessageHtmlContext};
@@ -59,6 +60,8 @@ mod imp {
         pub workspace_title_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub home_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub activity_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub saved_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -210,6 +213,7 @@ pub enum MainMessageView {
     #[default]
     Placeholder,
     Conversation,
+    Activity,
     Search,
     Saved,
 }
@@ -417,6 +421,7 @@ impl ConduitWindow {
         self.setup_window_actions();
         self.connect_widget(&imp.connect_button.get(), |window| window.start_oauth());
         self.connect_widget(&imp.home_button.get(), |window| window.show_home());
+        self.connect_widget(&imp.activity_button.get(), |window| window.show_activity());
         self.connect_widget(&imp.refresh_button.get(), |window| {
             window.refresh_conversations()
         });
@@ -730,6 +735,12 @@ impl ConduitWindow {
         }
     }
 
+    fn show_activity(&self) {
+        self.close_thread();
+        let items = self.activity_items();
+        self.populate_activity(items);
+    }
+
     fn show_later(&self) {
         self.imp().current_main_view.set(MainMessageView::Saved);
         self.imp().message_title.set_label("Later");
@@ -900,6 +911,14 @@ impl ConduitWindow {
                     self.set_status("Loading older messages");
                     self.send_command(RuntimeCommand::LoadOlderHistory { channel_id, cursor });
                 }
+                true
+            }
+            Some("activity-open") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let title = self.conversation_title(&channel_id);
+                self.select_conversation(&channel_id, &title);
                 true
             }
             Some("reaction") => {
@@ -1181,7 +1200,11 @@ impl ConduitWindow {
         *self.imp().conversations.borrow_mut() = conversations;
         self.request_conversation_user_names();
         self.render_conversations();
-        self.refresh_current_conversation_title();
+        if self.imp().current_main_view.get() == MainMessageView::Activity {
+            self.populate_activity(self.activity_items());
+        } else {
+            self.refresh_current_conversation_title();
+        }
     }
 
     fn mark_conversation_locally_read(&self, channel_id: &str) {
@@ -1492,6 +1515,14 @@ impl ConduitWindow {
         paned.set_position(width * 2 / 3);
     }
 
+    fn populate_activity(&self, items: Vec<ActivityItem>) {
+        let imp = self.imp();
+        imp.message_title.set_label("Activity");
+        imp.current_main_view.set(MainMessageView::Activity);
+        self.render_conversations();
+        self.load_message_html(&message_html::activity_document(&items));
+    }
+
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
         let imp = self.imp();
         imp.message_title.set_label("Search results");
@@ -1585,6 +1616,11 @@ impl ConduitWindow {
             .find(|conversation| conversation.id == channel_id)
             .map(|conversation| conversation.display_name_with_users(&user_names))
             .unwrap_or_else(|| "Slack".to_string())
+    }
+
+    fn activity_items(&self) -> Vec<ActivityItem> {
+        let imp = self.imp();
+        activity::build_activity_items(&imp.conversations.borrow(), &imp.user_names.borrow())
     }
 
     fn clear_list(&self, list: &gtk::ListBox) {
@@ -1727,6 +1763,7 @@ impl ConduitWindow {
                     }
                 }
             }
+            MainMessageView::Activity => self.populate_activity(self.activity_items()),
             MainMessageView::Search => self.populate_search_results(snapshot.search_results),
             MainMessageView::Saved => self.populate_saved_items(snapshot.saved_items),
             MainMessageView::Placeholder => {}
@@ -1835,6 +1872,10 @@ mod tests {
         );
         assert_eq!(
             sidebar_selected_channel(MainMessageView::Search, Some("C123".to_string())),
+            None
+        );
+        assert_eq!(
+            sidebar_selected_channel(MainMessageView::Activity, Some("C123".to_string())),
             None
         );
         assert_eq!(

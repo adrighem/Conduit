@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Local};
 
+use crate::activity::ActivityItem;
 use crate::debug;
 use crate::models::{SavedItem, SearchMatch, SlackMessage};
 
@@ -89,6 +90,21 @@ pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -
     body.push_str("</main>");
 
     html_document("Saved items", &body)
+}
+
+pub fn activity_document(items: &[ActivityItem]) -> String {
+    if items.is_empty() {
+        return placeholder_document("Activity", "No unread activity");
+    }
+
+    let mut body = String::from("<main class=\"timeline\" aria-label=\"Activity\">");
+    body.push_str("<section class=\"activity-list\">");
+    for item in items {
+        body.push_str(&activity_item_html(item));
+    }
+    body.push_str("</section></main>");
+
+    html_document("Activity", &body)
 }
 
 pub fn search_results_document(results: &[SearchMatch], context: &MessageHtmlContext) -> String {
@@ -320,6 +336,48 @@ pre code {{
   color: var(--muted);
 }}
 
+.activity-list {{
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--line);
+}}
+
+.activity-row {{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+}}
+
+.activity-row:hover {{
+  text-decoration: none;
+}}
+
+.activity-title {{
+  min-width: 0;
+  font-weight: 700;
+}}
+
+.activity-meta {{
+  color: var(--muted);
+  font-size: 12px;
+}}
+
+.activity-badge {{
+  align-self: center;
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  min-width: 24px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 12px;
+  text-align: center;
+}}
+
 .reaction {{
   padding: 2px 7px;
   border-radius: 999px;
@@ -542,6 +600,22 @@ fn load_more_action_html(url: &str, label: &str) -> String {
         "<nav class=\"timeline-action\"><a href=\"{}\">{}</a></nav>",
         escape_html(url),
         escape_html(label)
+    )
+}
+
+fn activity_item_html(item: &ActivityItem) -> String {
+    format!(
+        concat!(
+            "<a class=\"activity-row\" href=\"{}\">",
+            "<span class=\"activity-title\">{}</span>",
+            "<span class=\"activity-badge\">{}</span>",
+            "<span class=\"activity-meta\">{}</span>",
+            "</a>"
+        ),
+        escape_html(&activity_open_action_url(&item.channel_id)),
+        escape_html(&item.title),
+        escape_html(&item.unread_label()),
+        escape_html(item.kind.label())
     )
 }
 
@@ -1177,6 +1251,13 @@ pub fn load_more_action_url(channel_id: &str, cursor: &str, thread_ts: Option<&s
     url
 }
 
+pub fn activity_open_action_url(channel_id: &str) -> String {
+    format!(
+        "conduit://activity-open?channel={}",
+        encode_query(channel_id)
+    )
+}
+
 fn append_thread_ts_query(url: &mut String, thread_ts: Option<&str>) {
     if let Some(thread_ts) = thread_ts.filter(|ts| !ts.is_empty()) {
         url.push_str("&thread_ts=");
@@ -1534,6 +1615,7 @@ fn escape_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::{ActivityItem, ActivityKind};
     use crate::models::{SavedItem, SlackFile, SlackReaction};
 
     fn message(text: &str) -> SlackMessage {
@@ -1836,6 +1918,32 @@ mod tests {
 
         assert!(html.contains("saved"));
         assert!(!html.contains("No saved items"));
+    }
+
+    #[test]
+    fn activity_document_renders_unread_rows() {
+        let items = vec![ActivityItem {
+            channel_id: "C123".to_string(),
+            title: "#general & friends".to_string(),
+            kind: ActivityKind::PublicChannel,
+            unread_count: 3,
+        }];
+
+        let html = activity_document(&items);
+
+        assert!(html.contains("aria-label=\"Activity\""));
+        assert!(html.contains("#general &amp; friends"));
+        assert!(html.contains("3 unread"));
+        assert!(html.contains("Channel"));
+        assert!(html.contains("conduit://activity-open?channel=C123"));
+    }
+
+    #[test]
+    fn activity_document_uses_empty_state_without_rows() {
+        let html = activity_document(&[]);
+
+        assert!(html.contains("No unread activity"));
+        assert!(!html.contains("<a class=\"activity-row\""));
     }
 
     #[test]
