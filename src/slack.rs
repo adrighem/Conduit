@@ -69,6 +69,7 @@ impl SlackApi {
         }
 
         conversations.sort_by_key(|conversation| conversation.display_name().to_lowercase());
+        log_conversation_properties(&conversations);
         Ok(conversations)
     }
 
@@ -386,6 +387,49 @@ struct AuthTestResponse {
     user_id: Option<String>,
 }
 impl_slack_response!(AuthTestResponse);
+
+fn log_conversation_properties(conversations: &[SlackConversation]) {
+    if !crate::debug::enabled() {
+        return;
+    }
+
+    crate::debug::log(
+        "slack",
+        &format!(
+            "conversations.list returned {} conversations",
+            conversations.len()
+        ),
+    );
+
+    for conversation in conversations {
+        let properties = serde_json::to_string_pretty(conversation)
+            .unwrap_or_else(|_| format!("{conversation:#?}"));
+        crate::debug::log(
+            "slack",
+            &format!(
+                "conversation id={} type={} title={} properties=\n{}",
+                conversation.id,
+                conversation_debug_kind(conversation),
+                conversation.display_name(),
+                properties
+            ),
+        );
+    }
+}
+
+fn conversation_debug_kind(conversation: &SlackConversation) -> &'static str {
+    if conversation.is_im.unwrap_or(false) {
+        "direct_message"
+    } else if conversation.is_mpim.unwrap_or(false) {
+        "group_direct_message"
+    } else if conversation.is_private.unwrap_or(false) || conversation.is_group.unwrap_or(false) {
+        "private_channel"
+    } else if conversation.is_channel.unwrap_or(false) {
+        "public_channel"
+    } else {
+        "unknown"
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ConversationListResponse {

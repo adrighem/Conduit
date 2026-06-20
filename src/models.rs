@@ -58,6 +58,8 @@ pub struct SlackConversation {
     pub is_private: Option<bool>,
     pub is_archived: Option<bool>,
     pub unread_count: Option<u64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 impl SlackConversation {
@@ -286,6 +288,37 @@ mod tests {
         let names = HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]);
 
         assert_eq!(conversation.display_name_with_users(&names), "Ada Lovelace");
+    }
+
+    #[test]
+    fn conversation_preserves_unknown_slack_properties() {
+        let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C123",
+            "name": "general",
+            "is_channel": true,
+            "unread_count": 3,
+            "unread_count_display": 2,
+            "is_ext_shared": true,
+            "last_read": "1700000000.000000"
+        }))
+        .expect("failed to parse conversation");
+
+        assert_eq!(conversation.unread_count, Some(3));
+        assert_eq!(
+            conversation.extra.get("unread_count_display"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            conversation.extra.get("last_read"),
+            Some(&serde_json::json!("1700000000.000000"))
+        );
+
+        let serialized = serde_json::to_value(&conversation).expect("failed to serialize");
+        assert_eq!(serialized["unread_count_display"], serde_json::json!(2));
+        assert_eq!(
+            serialized["last_read"],
+            serde_json::json!("1700000000.000000")
+        );
     }
 
     #[test]

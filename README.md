@@ -30,7 +30,7 @@ For local development, you can also set `CONDUIT_SLACK_CLIENT_ID` before running
 
 To open the workspace connection flow explicitly, start Conduit with `--connect` or `-c`. This does not remove the current stored token; the token is replaced only after a new Slack authorization succeeds.
 
-To debug rendering and Slack loading, add `--debug` or `-d`. This prints message rendering, emoji, and image preview diagnostics to stderr. To debug only OAuth setup, add `--debug-auth`; `--debug` includes those OAuth diagnostics too. The logs do not include access tokens or authorization codes.
+To debug rendering and Slack loading, add `--debug` or `-d`. This prints message rendering, emoji, image preview, and full Slack conversation property diagnostics to stderr. Conversation diagnostics can include private workspace metadata such as channel names, user IDs, read timestamps, and unread counts. To debug only OAuth setup, add `--debug-auth`; `--debug` includes those OAuth diagnostics too. The logs do not include access tokens or authorization codes.
 
 ## Slack App Setup
 
