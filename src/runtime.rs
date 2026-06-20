@@ -1,16 +1,20 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use sha2::{Digest, Sha256};
 
 use crate::auth::{OAuthConfig, SlackOAuthClient, TokenStore};
+use crate::config;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage, StoredToken,
 };
-use crate::slack::SlackApi;
+use crate::slack::{DownloadedImage, SlackApi};
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
@@ -118,6 +122,66 @@ pub struct AppRuntime {
     commands: Sender<RuntimeCommand>,
 }
 
+#[derive(Clone, Debug)]
+struct ImageAssetCache {
+    directory: PathBuf,
+}
+
+impl ImageAssetCache {
+    fn new(directory: PathBuf) -> Self {
+        Self { directory }
+    }
+
+    async fn load(&self, key: &str) -> Result<Option<String>> {
+        let path = self.path_for_key(key);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(data_uri) if data_uri.starts_with("data:image/") => Ok(Some(data_uri)),
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to read cached image {}", path.display())),
+        }
+    }
+
+    async fn store(&self, key: &str, data_uri: &str) -> Result<()> {
+        tokio::fs::create_dir_all(&self.directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create image cache directory {}",
+                    self.directory.display()
+                )
+            })?;
+
+        let path = self.path_for_key(key);
+        tokio::fs::write(&path, data_uri)
+            .await
+            .with_context(|| format!("failed to write cached image {}", path.display()))
+    }
+
+    fn path_for_key(&self, key: &str) -> PathBuf {
+        self.directory
+            .join(format!("{}.data-uri", image_asset_cache_key(key)))
+    }
+}
+
+fn image_asset_cache_key(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn image_data_uri(image: DownloadedImage) -> String {
+    format!(
+        "data:{};base64,{}",
+        image.mime_type,
+        BASE64.encode(image.bytes)
+    )
+}
+
 impl AppRuntime {
     pub fn start(events: Sender<RuntimeEvent>) -> Self {
         let (commands, receiver) = mpsc::channel::<RuntimeCommand>();
@@ -138,6 +202,7 @@ impl AppRuntime {
 
             let token_store = TokenStore;
             let oauth = SlackOAuthClient::new();
+            let image_cache = ImageAssetCache::new(config::image_asset_cache_dir());
             let mut slack: Option<SlackApi> = None;
             let mut user_cache = HashMap::new();
 
@@ -147,6 +212,7 @@ impl AppRuntime {
                     &events,
                     &token_store,
                     &oauth,
+                    &image_cache,
                     &mut slack,
                     &mut user_cache,
                 ));
@@ -169,6 +235,7 @@ async fn handle_command(
     events: &Sender<RuntimeEvent>,
     token_store: &TokenStore,
     oauth: &SlackOAuthClient,
+    image_cache: &ImageAssetCache,
     slack: &mut Option<SlackApi>,
     user_cache: &mut HashMap<String, String>,
 ) -> Result<()> {
@@ -271,6 +338,25 @@ async fn handle_command(
                 "runtime",
                 &format!("LoadImageAsset key={}", crate::debug::url_for_log(&key)),
             );
+            match image_cache.load(&key).await {
+                Ok(Some(data_uri)) => {
+                    crate::debug::log(
+                        "runtime",
+                        &format!("ImageAssetCacheHit key={}", crate::debug::url_for_log(&key)),
+                    );
+                    events.send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) => crate::debug::log(
+                    "runtime",
+                    &format!(
+                        "ImageAssetCacheReadFailed key={} error={error:#}",
+                        crate::debug::url_for_log(&key)
+                    ),
+                ),
+            }
+
             match api.download_image(&url).await {
                 Ok(image) => {
                     crate::debug::log(
@@ -282,11 +368,16 @@ async fn handle_command(
                             image.bytes.len()
                         ),
                     );
-                    let data_uri = format!(
-                        "data:{};base64,{}",
-                        image.mime_type,
-                        BASE64.encode(image.bytes)
-                    );
+                    let data_uri = image_data_uri(image);
+                    if let Err(error) = image_cache.store(&key, &data_uri).await {
+                        crate::debug::log(
+                            "runtime",
+                            &format!(
+                                "ImageAssetCacheWriteFailed key={} error={error:#}",
+                                crate::debug::url_for_log(&key)
+                            ),
+                        );
+                    }
                     events.send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
                 }
                 Err(error) => {
@@ -434,5 +525,66 @@ impl EventSenderExt for Sender<RuntimeEvent> {
 
     fn send_event(&self, event: RuntimeEvent) {
         let _ = self.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn image_asset_cache_key_is_stable_hex_digest() {
+        assert_eq!(
+            image_asset_cache_key("https://files.example/image.png"),
+            "7db09e79cb28f1be72da3c1449cd42619e048f148310325cc2c8f55cd713aa0e"
+        );
+    }
+
+    #[test]
+    fn image_asset_cache_round_trips_data_uri() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-image-cache-test-{}-{unique}",
+            std::process::id()
+        ));
+        let cache = ImageAssetCache::new(directory.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            assert_eq!(
+                cache
+                    .load("https://files.example/image.png")
+                    .await
+                    .expect("cache load failed"),
+                None
+            );
+
+            cache
+                .store(
+                    "https://files.example/image.png",
+                    "data:image/png;base64,abc",
+                )
+                .await
+                .expect("cache store failed");
+
+            assert_eq!(
+                cache
+                    .load("https://files.example/image.png")
+                    .await
+                    .expect("cache load failed")
+                    .as_deref(),
+                Some("data:image/png;base64,abc")
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

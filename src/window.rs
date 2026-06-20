@@ -20,6 +20,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -236,6 +237,18 @@ fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
     Some((url.to_string(), url.to_string()))
 }
 
+fn create_cache_directory(path: &Path) {
+    if let Err(error) = std::fs::create_dir_all(path) {
+        crate::debug::log(
+            "ui",
+            &format!(
+                "failed to create cache directory {}: {error}",
+                path.display()
+            ),
+        );
+    }
+}
+
 fn message_permalink(workspace_url: &str, channel_id: &str, ts: &str) -> Option<String> {
     let ts = slack_permalink_ts(ts)?;
     Some(format!(
@@ -290,11 +303,13 @@ impl ConduitWindow {
     }
 
     fn setup_message_view(&self) {
-        let message_view = self.create_message_web_view();
+        let network_session = self.create_message_network_session();
+
+        let message_view = self.create_message_web_view(&network_session);
         self.imp().message_view_box.append(&message_view);
         *self.imp().message_view.borrow_mut() = Some(message_view);
 
-        let thread_view = self.create_message_web_view();
+        let thread_view = self.create_message_web_view(&network_session);
         self.imp().thread_view_box.append(&thread_view);
         *self.imp().thread_view.borrow_mut() = Some(thread_view);
 
@@ -305,7 +320,21 @@ impl ConduitWindow {
         ));
     }
 
-    fn create_message_web_view(&self) -> webkit6::WebView {
+    fn create_message_network_session(&self) -> webkit6::NetworkSession {
+        let data_dir = config::webkit_data_dir();
+        let cache_dir = config::webkit_cache_dir();
+        create_cache_directory(&data_dir);
+        create_cache_directory(&cache_dir);
+
+        let data_dir = data_dir.to_string_lossy().into_owned();
+        let cache_dir = cache_dir.to_string_lossy().into_owned();
+        webkit6::NetworkSession::new(Some(&data_dir), Some(&cache_dir))
+    }
+
+    fn create_message_web_view(
+        &self,
+        network_session: &webkit6::NetworkSession,
+    ) -> webkit6::WebView {
         let settings = webkit6::Settings::new();
         settings.set_allow_file_access_from_file_urls(false);
         settings.set_allow_universal_access_from_file_urls(false);
@@ -316,9 +345,8 @@ impl ConduitWindow {
         settings.set_enable_webgl(false);
         settings.set_enable_webaudio(false);
 
-        let network_session = webkit6::NetworkSession::new_ephemeral();
         let web_view = webkit6::WebView::builder()
-            .network_session(&network_session)
+            .network_session(network_session)
             .settings(&settings)
             .build();
         web_view.set_hexpand(true);

@@ -33,7 +33,7 @@ mod window;
 use self::application::ConduitApplication;
 use self::window::ConduitWindow;
 
-use config::{GETTEXT_PACKAGE, LOCALEDIR, PKGDATADIR};
+use config::{APPLICATION_ID, GETTEXT_PACKAGE, LOCALEDIR, PKGDATADIR};
 use gettextrs::{bind_textdomain_codeset, bindtextdomain, textdomain};
 use gtk::prelude::*;
 use gtk::{gio, glib};
@@ -53,10 +53,7 @@ fn main() -> glib::ExitCode {
     // Create a new GtkApplication. The application manages our main loop,
     // application windows, integration with the window manager/compositor, and
     // desktop features such as file opening and single-instance applications.
-    let app = ConduitApplication::new(
-        "eu.vanadrighem.conduit",
-        &gio::ApplicationFlags::HANDLES_COMMAND_LINE,
-    );
+    let app = ConduitApplication::new(APPLICATION_ID, &gio::ApplicationFlags::HANDLES_COMMAND_LINE);
 
     // Run the application. This function will block until the application
     // exits. Upon return, we have our exit code to return to the shell. (This
