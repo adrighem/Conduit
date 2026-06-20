@@ -14,7 +14,7 @@ use crate::config;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackMessage, StoredToken,
 };
-use crate::slack::{DownloadedImage, SlackApi};
+use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage};
 use crate::store::WorkspaceStore;
 
 #[derive(Debug)]
@@ -29,9 +29,18 @@ pub enum RuntimeCommand {
     LoadHistory {
         channel_id: String,
     },
+    LoadOlderHistory {
+        channel_id: String,
+        cursor: String,
+    },
     LoadThread {
         channel_id: String,
         ts: String,
+    },
+    LoadOlderThread {
+        channel_id: String,
+        ts: String,
+        cursor: String,
     },
     SearchMessages {
         query: String,
@@ -79,11 +88,17 @@ pub enum RuntimeEvent {
     HistoryLoaded {
         channel_id: String,
         messages: Vec<SlackMessage>,
+        has_more: bool,
+        next_cursor: Option<String>,
+        append_older: bool,
     },
     ThreadLoaded {
         channel_id: String,
         ts: String,
         messages: Vec<SlackMessage>,
+        has_more: bool,
+        next_cursor: Option<String>,
+        append_older: bool,
     },
     SearchLoaded(Vec<SearchMatch>),
     SavedItemsLoaded(Vec<SavedItem>),
@@ -207,6 +222,7 @@ impl AppRuntime {
             let mut slack: Option<SlackApi> = None;
             let mut workspace_store: Option<WorkspaceStore> = None;
             let mut user_cache = HashMap::new();
+            let mut read_marks = HashMap::new();
 
             while let Ok(command) = receiver.recv() {
                 let mut context = RuntimeContext {
@@ -217,6 +233,7 @@ impl AppRuntime {
                     slack: &mut slack,
                     workspace_store: &mut workspace_store,
                     user_cache: &mut user_cache,
+                    read_marks: &mut read_marks,
                 };
                 let result = runtime.block_on(handle_command(command, &mut context));
                 if let Err(error) = result {
@@ -241,6 +258,7 @@ struct RuntimeContext<'a> {
     slack: &'a mut Option<SlackApi>,
     workspace_store: &'a mut Option<WorkspaceStore>,
     user_cache: &'a mut HashMap<String, String>,
+    read_marks: &'a mut HashMap<String, String>,
 }
 
 async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_>) -> Result<()> {
@@ -301,31 +319,54 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             crate::debug::log("runtime", &format!("LoadHistory channel_id={channel_id}"));
             load_cached_history(context.events, context.workspace_store, &channel_id).await;
             context.events.send_status("Loading conversation");
-            let messages = api.history(&channel_id).await?;
-            store_history(context.workspace_store, &channel_id, &messages).await;
+            let page = api.history(&channel_id).await?;
+            store_history(context.workspace_store, &channel_id, &page.messages).await;
+            mark_history_read_best_effort(api, context.read_marks, &channel_id, &page.messages)
+                .await;
             crate::debug::log(
                 "runtime",
                 &format!(
-                    "HistoryLoaded channel_id={channel_id} messages={}",
-                    messages.len()
+                    "HistoryLoaded channel_id={channel_id} messages={} has_more={} next_cursor={}",
+                    page.messages.len(),
+                    page.has_more,
+                    page.next_cursor.is_some()
                 ),
             );
-            context.events.send_event(RuntimeEvent::HistoryLoaded {
-                channel_id,
-                messages,
-            });
+            send_history_loaded(context.events, channel_id, page, false);
+        }
+        RuntimeCommand::LoadOlderHistory { channel_id, cursor } => {
+            let api = require_slack(context.slack)?;
+            crate::debug::log(
+                "runtime",
+                &format!("LoadOlderHistory channel_id={channel_id}"),
+            );
+            context.events.send_status("Loading older messages");
+            let page = api.history_page(&channel_id, Some(&cursor)).await?;
+            send_history_loaded(context.events, channel_id, page, true);
         }
         RuntimeCommand::LoadThread { channel_id, ts } => {
             let api = require_slack(context.slack)?;
             load_cached_thread(context.events, context.workspace_store, &channel_id, &ts).await;
             context.events.send_status("Loading thread");
-            let messages = api.thread_replies(&channel_id, &ts).await?;
-            store_thread(context.workspace_store, &channel_id, &ts, &messages).await;
-            context.events.send_event(RuntimeEvent::ThreadLoaded {
-                channel_id,
-                ts,
-                messages,
-            });
+            let page = api.thread_replies(&channel_id, &ts).await?;
+            store_thread(context.workspace_store, &channel_id, &ts, &page.messages).await;
+            send_thread_loaded(context.events, channel_id, ts, page, false);
+        }
+        RuntimeCommand::LoadOlderThread {
+            channel_id,
+            ts,
+            cursor,
+        } => {
+            let api = require_slack(context.slack)?;
+            crate::debug::log(
+                "runtime",
+                &format!("LoadOlderThread channel_id={channel_id} ts={ts}"),
+            );
+            context.events.send_status("Loading more replies");
+            let page = api
+                .thread_replies_page(&channel_id, &ts, Some(&cursor))
+                .await?;
+            send_thread_loaded(context.events, channel_id, ts, page, true);
         }
         RuntimeCommand::SearchMessages { query } => {
             let api = require_slack(context.slack)?;
@@ -546,6 +587,77 @@ async fn load_conversations(
     Ok(())
 }
 
+fn send_history_loaded(
+    events: &Sender<RuntimeEvent>,
+    channel_id: String,
+    page: SlackMessagePage,
+    append_older: bool,
+) {
+    events.send_event(RuntimeEvent::HistoryLoaded {
+        channel_id,
+        messages: page.messages,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        append_older,
+    });
+}
+
+fn send_thread_loaded(
+    events: &Sender<RuntimeEvent>,
+    channel_id: String,
+    ts: String,
+    page: SlackMessagePage,
+    append_older: bool,
+) {
+    events.send_event(RuntimeEvent::ThreadLoaded {
+        channel_id,
+        ts,
+        messages: page.messages,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        append_older,
+    });
+}
+
+async fn mark_history_read_best_effort(
+    api: &SlackApi,
+    read_marks: &mut HashMap<String, String>,
+    channel_id: &str,
+    messages: &[SlackMessage],
+) {
+    let Some(latest_ts) = SlackMessage::latest_ts(messages.iter()) else {
+        return;
+    };
+
+    if read_marks
+        .get(channel_id)
+        .is_some_and(|marked_ts| marked_ts >= &latest_ts)
+    {
+        return;
+    }
+
+    if !api.can_mark_read() {
+        crate::debug::log(
+            "runtime",
+            &format!("MarkReadSkipped channel_id={channel_id} reason=missing_token_scope"),
+        );
+        return;
+    }
+
+    match api.mark_read(channel_id, &latest_ts).await {
+        Ok(()) => crate::debug::log(
+            "runtime",
+            &format!("MarkRead channel_id={channel_id} ts={latest_ts}"),
+        ),
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("MarkReadFailed channel_id={channel_id} ts={latest_ts} error={error:#}"),
+        ),
+    }
+
+    read_marks.insert(channel_id.to_string(), latest_ts);
+}
+
 fn workspace_store_id(auth: &AuthInfo) -> String {
     let team = auth
         .team_id
@@ -618,6 +730,9 @@ async fn load_cached_history(
             events.send_event(RuntimeEvent::HistoryLoaded {
                 channel_id: channel_id.to_string(),
                 messages,
+                has_more: false,
+                next_cursor: None,
+                append_older: false,
             });
         }
         Ok(None) => {}
@@ -668,6 +783,9 @@ async fn load_cached_thread(
                 channel_id: channel_id.to_string(),
                 ts: thread_ts.to_string(),
                 messages,
+                has_more: false,
+                next_cursor: None,
+                append_older: false,
             });
         }
         Ok(None) => {}

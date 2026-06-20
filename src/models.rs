@@ -85,6 +85,16 @@ impl SlackConversation {
         self.unread_activity_count() > 0
     }
 
+    pub fn clear_unread_activity(&mut self) {
+        self.unread_count = Some(0);
+
+        for (key, value) in &mut self.extra {
+            if key.to_lowercase().contains("unread") {
+                *value = cleared_unread_value(value);
+            }
+        }
+    }
+
     pub fn display_name_with_users(&self, user_names: &HashMap<String, String>) -> String {
         if self.is_im.unwrap_or(false) {
             if let Some(user) = &self.user {
@@ -122,6 +132,15 @@ fn unread_value_count(value: &Value) -> Option<u64> {
         }),
         Value::String(value) => value.parse::<u64>().ok(),
         _ => None,
+    }
+}
+
+fn cleared_unread_value(value: &Value) -> Value {
+    match value {
+        Value::Bool(_) => Value::Bool(false),
+        Value::Number(_) => serde_json::json!(0),
+        Value::String(_) => Value::String("0".to_string()),
+        _ => value.clone(),
     }
 }
 
@@ -378,6 +397,40 @@ mod tests {
         assert_eq!(unread_display.unread_activity_count(), 4);
         assert_eq!(unread_flag.unread_activity_count(), 1);
         assert!(unread_display.has_unread_activity());
+    }
+
+    #[test]
+    fn conversation_clear_unread_activity_resets_known_and_extra_fields() {
+        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "unread_count": 4,
+            "unread_count_display": 2,
+            "has_unreads": true,
+            "unread_count_string": "5",
+            "last_read": "1710000000.000000"
+        }))
+        .expect("failed to parse conversation");
+
+        conversation.clear_unread_activity();
+
+        assert_eq!(conversation.unread_activity_count(), 0);
+        assert_eq!(conversation.unread_count, Some(0));
+        assert_eq!(
+            conversation.extra.get("unread_count_display"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            conversation.extra.get("has_unreads"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            conversation.extra.get("unread_count_string"),
+            Some(&serde_json::json!("0"))
+        );
+        assert_eq!(
+            conversation.extra.get("last_read"),
+            Some(&serde_json::json!("1710000000.000000"))
+        );
     }
 
     #[test]

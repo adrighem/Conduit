@@ -12,6 +12,7 @@ pub struct MessageHtmlContext {
     pub user_names: HashMap<String, String>,
     pub current_user_id: Option<String>,
     pub thread_ts: Option<String>,
+    pub load_more_url: Option<String>,
     pub image_assets: HashMap<String, String>,
     pub failed_image_urls: HashSet<String>,
 }
@@ -52,8 +53,18 @@ pub fn conversation_document(
     );
 
     let mut body = String::from("<main class=\"timeline\" aria-label=\"Messages\">");
+    if context.thread_ts.is_none() {
+        if let Some(url) = context.load_more_url.as_deref() {
+            body.push_str(&load_more_action_html(url, "Load older messages"));
+        }
+    }
     for group in groups {
         body.push_str(&message_group_article(Some(channel_id), &group, context));
+    }
+    if context.thread_ts.is_some() {
+        if let Some(url) = context.load_more_url.as_deref() {
+            body.push_str(&load_more_action_html(url, "Load more replies"));
+        }
     }
     body.push_str("</main>");
 
@@ -459,6 +470,29 @@ pre code {{
   font-size: 13px;
 }}
 
+.timeline-action {{
+  display: flex;
+  justify-content: center;
+  padding: 10px 0;
+}}
+
+.timeline-action a {{
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--soft);
+  color: var(--text);
+  font-size: 13px;
+}}
+
+.timeline-action a:hover {{
+  text-decoration: none;
+  background: var(--accent-soft);
+}}
+
 .image-link {{
   color: inherit;
   text-decoration: none;
@@ -501,6 +535,14 @@ fn message_article(
     article.push_str(&message_actions_html(channel_id, message, context));
     article.push_str("</article>");
     article
+}
+
+fn load_more_action_html(url: &str, label: &str) -> String {
+    format!(
+        "<nav class=\"timeline-action\"><a href=\"{}\">{}</a></nav>",
+        escape_html(url),
+        escape_html(label)
+    )
 }
 
 fn message_group_article(
@@ -1124,6 +1166,17 @@ pub fn copy_link_action_url(channel_id: &str, message: &SlackMessage) -> String 
     )
 }
 
+pub fn load_more_action_url(channel_id: &str, cursor: &str, thread_ts: Option<&str>) -> String {
+    let mut url = format!(
+        "conduit://load-older?channel={}&cursor={}",
+        encode_query(channel_id),
+        encode_query(cursor)
+    );
+
+    append_thread_ts_query(&mut url, thread_ts);
+    url
+}
+
 fn append_thread_ts_query(url: &mut String, thread_ts: Option<&str>) {
     if let Some(thread_ts) = thread_ts.filter(|ts| !ts.is_empty()) {
         url.push_str("&thread_ts=");
@@ -1657,6 +1710,41 @@ mod tests {
         assert!(html.contains("conduit://copy-message?channel=C123&amp;ts=1710000000.000100"));
         assert!(html.contains("More actions"));
         assert!(!html.contains("Remove +1"));
+    }
+
+    #[test]
+    fn renders_channel_load_more_action_before_messages() {
+        let context = MessageHtmlContext {
+            load_more_url: Some(load_more_action_url("C123", "next cursor", None)),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("paged")], &context);
+        let load_more = html.find("Load older messages").unwrap();
+        let message = html.find("paged").unwrap();
+
+        assert!(load_more < message);
+        assert!(html.contains("conduit://load-older?channel=C123&amp;cursor=next%20cursor"));
+    }
+
+    #[test]
+    fn renders_thread_load_more_action_after_replies() {
+        let context = MessageHtmlContext {
+            thread_ts: Some("1710000000.000100".to_string()),
+            load_more_url: Some(load_more_action_url(
+                "C123",
+                "next cursor",
+                Some("1710000000.000100"),
+            )),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("reply")], &context);
+        let reply = html.find("reply").unwrap();
+        let load_more = html.find("Load more replies").unwrap();
+
+        assert!(reply < load_more);
+        assert!(html.contains("thread_ts=1710000000.000100"));
     }
 
     #[test]

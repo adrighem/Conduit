@@ -45,7 +45,7 @@ The client uses Slack's user-token PKCE flow (`oauth.v2.user.access`) and reques
 Required user scopes:
 
 ```text
-channels:read,channels:history,groups:read,groups:history,im:read,im:history,mpim:read,mpim:history,users:read,chat:write,search:read,stars:read,stars:write,reactions:read,reactions:write,files:read,files:write
+channels:read,channels:history,channels:write,groups:read,groups:history,groups:write,im:read,im:history,im:write,mpim:read,mpim:history,mpim:write,users:read,chat:write,search:read,stars:read,stars:write,reactions:read,reactions:write,files:read,files:write
 ```
 
 After approval, Conduit validates the session with `auth.test` and stores the token in the system keyring. Use **Sign Out** in the workspace menu to remove the stored token.
@@ -58,11 +58,11 @@ Implemented:
 - PKCE OAuth callback flow on localhost.
 - Keyring-backed token storage.
 - Background Tokio runtime for Slack network work.
-- Native sidebar conversation navigation, cached conversations and recent histories, thread replies, search, saved items, message posting, emoji reactions, and file upload.
+- Native sidebar conversation navigation, cached conversations and recent histories, paged channel and thread history, read-marker updates, search, saved items, message posting, emoji reactions, and file upload.
 
 Next:
 
-- History pagination and read-state synchronization.
+- Newer-message timestamp refresh and explicit read/unread actions.
 - Optional Socket Mode realtime sync.
 - Presence cache.
 - Flatpak dependency vendoring and Flathub-grade screenshots.

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,18 +18,23 @@ const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
 const MAX_RETRY_AFTER_SECONDS: u64 = 30;
+const HISTORY_PAGE_LIMIT: &str = "50";
+const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
 
 #[derive(Clone)]
 pub struct SlackApi {
     http: Client,
     access_token: String,
+    scopes: HashSet<String>,
 }
 
 impl SlackApi {
     pub fn new(token: StoredToken) -> Self {
+        let scopes = token_scope_set(token.scope.as_deref());
         Self {
             http: Client::new(),
             access_token: token.access_token,
+            scopes,
         }
     }
 
@@ -77,31 +83,60 @@ impl SlackApi {
         Ok(conversations)
     }
 
-    pub async fn history(&self, channel_id: &str) -> Result<Vec<SlackMessage>> {
-        let response: HistoryResponse = self
-            .post_form(
-                "conversations.history",
-                &[
-                    ("channel", channel_id.to_string()),
-                    ("limit", "15".to_string()),
-                ],
-            )
-            .await?;
-        Ok(response.messages)
+    pub fn can_mark_read(&self) -> bool {
+        READ_MARKER_SCOPES
+            .iter()
+            .any(|scope| self.scopes.contains(*scope))
     }
 
-    pub async fn thread_replies(&self, channel_id: &str, ts: &str) -> Result<Vec<SlackMessage>> {
-        let response: HistoryResponse = self
-            .post_form(
-                "conversations.replies",
-                &[
-                    ("channel", channel_id.to_string()),
-                    ("ts", ts.to_string()),
-                    ("limit", "15".to_string()),
-                ],
-            )
-            .await?;
-        Ok(thread_replies_in_history_order(response.messages))
+    pub async fn history(&self, channel_id: &str) -> Result<SlackMessagePage> {
+        self.history_page(channel_id, None).await
+    }
+
+    pub async fn history_page(
+        &self,
+        channel_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<SlackMessagePage> {
+        let mut params = vec![
+            ("channel", channel_id.to_string()),
+            ("limit", HISTORY_PAGE_LIMIT.to_string()),
+        ];
+        if let Some(cursor) = cursor.filter(|cursor| !cursor.trim().is_empty()) {
+            params.push(("cursor", cursor.to_string()));
+        }
+
+        let response: HistoryResponse = self.post_form("conversations.history", &params).await?;
+        Ok(SlackMessagePage::from_response(
+            response,
+            std::convert::identity,
+        ))
+    }
+
+    pub async fn thread_replies(&self, channel_id: &str, ts: &str) -> Result<SlackMessagePage> {
+        self.thread_replies_page(channel_id, ts, None).await
+    }
+
+    pub async fn thread_replies_page(
+        &self,
+        channel_id: &str,
+        ts: &str,
+        cursor: Option<&str>,
+    ) -> Result<SlackMessagePage> {
+        let mut params = vec![
+            ("channel", channel_id.to_string()),
+            ("ts", ts.to_string()),
+            ("limit", HISTORY_PAGE_LIMIT.to_string()),
+        ];
+        if let Some(cursor) = cursor.filter(|cursor| !cursor.trim().is_empty()) {
+            params.push(("cursor", cursor.to_string()));
+        }
+
+        let response: HistoryResponse = self.post_form("conversations.replies", &params).await?;
+        Ok(SlackMessagePage::from_response(
+            response,
+            thread_replies_in_history_order,
+        ))
     }
 
     pub async fn search_messages(&self, query: &str) -> Result<Vec<SearchMatch>> {
@@ -229,6 +264,16 @@ impl SlackApi {
                     ("channel", channel_id.to_string()),
                     ("timestamp", ts.to_string()),
                 ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_read(&self, channel_id: &str, ts: &str) -> Result<()> {
+        let _: BasicResponse = self
+            .post_form(
+                "conversations.mark",
+                &[("channel", channel_id.to_string()), ("ts", ts.to_string())],
             )
             .await?;
         Ok(())
@@ -367,6 +412,45 @@ fn retry_after_seconds(value: &str) -> u64 {
         .min(MAX_RETRY_AFTER_SECONDS)
 }
 
+fn token_scope_set(scope: Option<&str>) -> HashSet<String> {
+    scope
+        .unwrap_or_default()
+        .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct SlackMessagePage {
+    pub messages: Vec<SlackMessage>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+impl SlackMessagePage {
+    fn from_response(
+        response: HistoryResponse,
+        normalize_messages: impl FnOnce(Vec<SlackMessage>) -> Vec<SlackMessage>,
+    ) -> Self {
+        let next_cursor = response
+            .response_metadata
+            .and_then(|metadata| metadata.next_cursor)
+            .and_then(|cursor| {
+                let cursor = cursor.trim().to_string();
+                (!cursor.is_empty()).then_some(cursor)
+            });
+        let has_more = response.has_more.unwrap_or(false) || next_cursor.is_some();
+
+        Self {
+            messages: normalize_messages(response.messages),
+            has_more,
+            next_cursor,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadedImage {
     pub mime_type: String,
@@ -492,6 +576,8 @@ struct HistoryResponse {
     ok: bool,
     error: Option<String>,
     messages: Vec<SlackMessage>,
+    has_more: Option<bool>,
+    response_metadata: Option<ResponseMetadata>,
 }
 impl_slack_response!(HistoryResponse);
 
@@ -605,5 +691,33 @@ mod tests {
             DEFAULT_RETRY_AFTER_SECONDS
         );
         assert_eq!(retry_after_seconds("120"), MAX_RETRY_AFTER_SECONDS);
+    }
+
+    #[test]
+    fn message_page_has_more_uses_response_metadata_cursor() {
+        let page = SlackMessagePage::from_response(
+            HistoryResponse {
+                ok: true,
+                error: None,
+                messages: vec![message("1710000000.000100")],
+                has_more: Some(false),
+                response_metadata: Some(ResponseMetadata {
+                    next_cursor: Some(" next-page ".to_string()),
+                }),
+            },
+            std::convert::identity,
+        );
+
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
+    }
+
+    #[test]
+    fn token_scope_set_accepts_commas_and_whitespace() {
+        let scopes = token_scope_set(Some("channels:read,channels:write im:write"));
+
+        assert!(scopes.contains("channels:read"));
+        assert!(scopes.contains("channels:write"));
+        assert!(scopes.contains("im:write"));
     }
 }

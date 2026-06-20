@@ -123,6 +123,8 @@ mod imp {
         pub current_user_id: RefCell<Option<String>>,
         pub selected_channel: RefCell<Option<String>>,
         pub selected_thread_ts: RefCell<Option<String>>,
+        pub channel_history_cursors: RefCell<HashMap<String, String>>,
+        pub thread_history_cursors: RefCell<HashMap<String, String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
         pub thread_view: RefCell<Option<webkit6::WebView>>,
         pub image_assets: RefCell<HashMap<String, String>>,
@@ -294,6 +296,18 @@ fn slack_permalink_ts(ts: &str) -> Option<String> {
     }
 
     Some(format!("{seconds}{fraction}"))
+}
+
+fn thread_history_key(channel_id: &str, ts: &str) -> String {
+    format!("{channel_id}:{ts}")
+}
+
+fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
+    let mut messages = existing.to_vec();
+    messages.extend(page.iter().cloned());
+    messages.sort_by(|left, right| right.ts.cmp(&left.ts));
+    messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
+    messages
 }
 
 impl ConduitWindow {
@@ -540,20 +554,41 @@ impl ConduitWindow {
             RuntimeEvent::HistoryLoaded {
                 channel_id,
                 messages,
+                has_more,
+                next_cursor,
+                append_older,
             } => {
-                self.notify_if_new_messages(&channel_id, &messages);
-                self.request_user_names(&messages);
-                *self.imp().current_channel_messages.borrow_mut() = messages.clone();
-                self.populate_history(&channel_id, messages);
+                self.set_channel_history_cursor(&channel_id, has_more, next_cursor);
+                if !append_older {
+                    self.notify_if_new_messages(&channel_id, &messages);
+                    self.mark_conversation_locally_read(&channel_id);
+                }
+                let rendered_messages = if append_older {
+                    merge_message_pages(&self.imp().current_channel_messages.borrow(), &messages)
+                } else {
+                    messages
+                };
+                self.request_user_names(&rendered_messages);
+                *self.imp().current_channel_messages.borrow_mut() = rendered_messages.clone();
+                self.populate_history(&channel_id, rendered_messages);
             }
             RuntimeEvent::ThreadLoaded {
                 channel_id,
                 ts,
                 messages,
+                has_more,
+                next_cursor,
+                append_older,
             } => {
-                self.request_user_names(&messages);
-                *self.imp().current_thread_messages.borrow_mut() = messages.clone();
-                self.populate_thread(&channel_id, &ts, messages);
+                self.set_thread_history_cursor(&channel_id, &ts, has_more, next_cursor);
+                let rendered_messages = if append_older {
+                    merge_message_pages(&self.imp().current_thread_messages.borrow(), &messages)
+                } else {
+                    messages
+                };
+                self.request_user_names(&rendered_messages);
+                *self.imp().current_thread_messages.borrow_mut() = rendered_messages.clone();
+                self.populate_thread(&channel_id, &ts, rendered_messages);
             }
             RuntimeEvent::SearchLoaded(results) => self.populate_search_results(results),
             RuntimeEvent::SavedItemsLoaded(items) => self.populate_saved_items(items),
@@ -847,6 +882,26 @@ impl ConduitWindow {
                 self.send_command(RuntimeCommand::LoadThread { channel_id, ts });
                 true
             }
+            Some("load-older") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let Some(cursor) = query_param(url, "cursor") else {
+                    return true;
+                };
+                if let Some(ts) = query_param(url, "thread_ts") {
+                    self.set_status("Loading more replies");
+                    self.send_command(RuntimeCommand::LoadOlderThread {
+                        channel_id,
+                        ts,
+                        cursor,
+                    });
+                } else {
+                    self.set_status("Loading older messages");
+                    self.send_command(RuntimeCommand::LoadOlderHistory { channel_id, cursor });
+                }
+                true
+            }
             Some("reaction") => {
                 let Some(channel_id) = query_param(url, "channel") else {
                     return true;
@@ -1039,6 +1094,8 @@ impl ConduitWindow {
         let imp = self.imp();
         *imp.selected_channel.borrow_mut() = None;
         *imp.selected_thread_ts.borrow_mut() = None;
+        imp.channel_history_cursors.borrow_mut().clear();
+        imp.thread_history_cursors.borrow_mut().clear();
         *imp.current_user_id.borrow_mut() = None;
         imp.latest_message_ts_by_channel.borrow_mut().clear();
         imp.conversations.borrow_mut().clear();
@@ -1125,6 +1182,62 @@ impl ConduitWindow {
         self.request_conversation_user_names();
         self.render_conversations();
         self.refresh_current_conversation_title();
+    }
+
+    fn mark_conversation_locally_read(&self, channel_id: &str) {
+        let mut conversations = self.imp().conversations.borrow_mut();
+        if let Some(conversation) = conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == channel_id)
+        {
+            conversation.clear_unread_activity();
+        }
+    }
+
+    fn set_channel_history_cursor(
+        &self,
+        channel_id: &str,
+        has_more: bool,
+        next_cursor: Option<String>,
+    ) {
+        let mut cursors = self.imp().channel_history_cursors.borrow_mut();
+        if let Some(cursor) = next_cursor.filter(|cursor| has_more && !cursor.trim().is_empty()) {
+            cursors.insert(channel_id.to_string(), cursor);
+        } else {
+            cursors.remove(channel_id);
+        }
+    }
+
+    fn set_thread_history_cursor(
+        &self,
+        channel_id: &str,
+        ts: &str,
+        has_more: bool,
+        next_cursor: Option<String>,
+    ) {
+        let key = thread_history_key(channel_id, ts);
+        let mut cursors = self.imp().thread_history_cursors.borrow_mut();
+        if let Some(cursor) = next_cursor.filter(|cursor| has_more && !cursor.trim().is_empty()) {
+            cursors.insert(key, cursor);
+        } else {
+            cursors.remove(&key);
+        }
+    }
+
+    fn channel_load_more_url(&self, channel_id: &str) -> Option<String> {
+        self.imp()
+            .channel_history_cursors
+            .borrow()
+            .get(channel_id)
+            .map(|cursor| message_html::load_more_action_url(channel_id, cursor, None))
+    }
+
+    fn thread_load_more_url(&self, channel_id: &str, ts: &str) -> Option<String> {
+        self.imp()
+            .thread_history_cursors
+            .borrow()
+            .get(&thread_history_key(channel_id, ts))
+            .map(|cursor| message_html::load_more_action_url(channel_id, cursor, Some(ts)))
     }
 
     fn render_conversations(&self) {
@@ -1317,7 +1430,8 @@ impl ConduitWindow {
             .set_label(&self.conversation_title(channel_id));
         self.render_conversations();
         self.request_image_assets(messages.iter());
-        let context = self.message_html_context(None);
+        let mut context = self.message_html_context(None);
+        context.load_more_url = self.channel_load_more_url(channel_id);
         crate::debug::log(
             "ui",
             &format!(
@@ -1350,7 +1464,8 @@ impl ConduitWindow {
         }
 
         self.request_image_assets(messages.iter());
-        let context = self.message_html_context(Some(ts));
+        let mut context = self.message_html_context(Some(ts));
+        context.load_more_url = self.thread_load_more_url(channel_id, ts);
         self.load_thread_html(&message_html::conversation_document(
             channel_id, &messages, &context,
         ));
@@ -1632,6 +1747,7 @@ impl ConduitWindow {
             user_names: imp.user_names.borrow().clone(),
             current_user_id: imp.current_user_id.borrow().clone(),
             thread_ts: thread_ts.map(ToString::to_string),
+            load_more_url: None,
             image_assets: imp.image_assets.borrow().clone(),
             failed_image_urls: imp.failed_image_assets.borrow().clone(),
         }
@@ -1672,6 +1788,14 @@ mod tests {
             unread_count: 0,
             selected: false,
             private: true,
+        }
+    }
+
+    fn message(ts: &str, text: &str) -> SlackMessage {
+        SlackMessage {
+            ts: ts.to_string(),
+            text: Some(text.to_string()),
+            ..Default::default()
         }
     }
 
@@ -1773,5 +1897,32 @@ mod tests {
             "random",
             true
         ));
+    }
+
+    #[test]
+    fn merge_message_pages_deduplicates_and_sorts_newest_first() {
+        let existing = vec![
+            message("1710000300.000000", "new"),
+            message("1710000200.000000", "middle"),
+        ];
+        let page = vec![
+            message("1710000200.000000", "duplicate"),
+            message("1710000100.000000", "old"),
+        ];
+
+        let merged = merge_message_pages(&existing, &page);
+        let timestamps = merged
+            .iter()
+            .map(|message| message.ts.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            timestamps,
+            vec![
+                "1710000300.000000",
+                "1710000200.000000",
+                "1710000100.000000"
+            ]
+        );
     }
 }
