@@ -1,0 +1,20 @@
+Task: Add browser-session token import and authenticated Slack requests
+
+Summary:
+- Added XOXC/XOXD browser-session token import from Conduit env vars and Slack MCP-compatible aliases.
+- Reused the existing Slack auth validation/keyring/runtime flow after auth.test succeeds.
+- Added browser-session cookie and optional User-Agent handling to authenticated Slack requests.
+- Added unit coverage for token parsing and request headers.
+- Documented the advanced environment-variable flow and initialized Conductor artifacts.
+
+Modified files:
+- README.md
+- src/auth.rs
+- src/config.rs
+- src/models.rs
+- src/runtime.rs
+- src/slack.rs
+- conductor/**
+
+Why:
+Support Slack browser-session credentials for users following the referenced Slack MCP XOXC/XOXD setup while preserving OAuth as the normal connection path and keeping secrets out of logs.
