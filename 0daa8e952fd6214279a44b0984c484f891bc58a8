@@ -1,0 +1,23 @@
+Task: Use member-scoped conversations and resilient sidebar refresh
+
+Summary:
+- Added the slack_parity_20260630 Conductor track.
+- Switched sidebar loading from conversations.list to users.conversations.
+- Kept conversation refresh failures scoped to sidebar status instead of blocking startup.
+- Made conversation rate-limit failures fail fast and made large debug payload dumps opt-in.
+
+Modified files:
+- conductor/tracks.md
+- conductor/tracks/slack_parity_20260630/metadata.json
+- conductor/tracks/slack_parity_20260630/plan.md
+- conductor/tracks/slack_parity_20260630/spec.md
+- docs/activity-notifications-design.md
+- docs/sidebar-1.0-update-plan.md
+- docs/sidebar-design.md
+- docs/sidebar-improvement-plan.md
+- src/runtime.rs
+- src/slack.rs
+- src/window.rs
+
+Rationale:
+Use the API shape closer to Slack browser/app sidebar behavior, avoid broad workspace enumeration rate limits, and keep startup responsive with cached sidebar data.
