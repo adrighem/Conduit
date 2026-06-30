@@ -1,0 +1,19 @@
+Task: Add XOXC/XOXD authentication option to the connect UI
+
+Summary:
+- Added a login-screen toggle for XOXC/XOXD browser-session authentication.
+- Added hidden token fields plus optional User-Agent input.
+- Routed UI credentials through runtime validation, auth.test, and keyring storage.
+- Made browser-session validation errors generic enough for both env and UI use.
+- Added pure helper tests for UI token input validation.
+
+Modified files:
+- README.md
+- src/auth.rs
+- src/runtime.rs
+- src/window.rs
+- src/window.ui
+- conductor/tracks/xoxc_xoxd_auth_20260630/*
+
+Why:
+Users should be able to use browser-session authentication without environment variables while keeping OAuth as the default path.
