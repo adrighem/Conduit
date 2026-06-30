@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
-use reqwest::{Client, StatusCode};
+use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
+use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -26,6 +26,8 @@ pub struct SlackApi {
     http: Client,
     access_token: String,
     scopes: HashSet<String>,
+    browser_cookie_d: Option<String>,
+    user_agent: Option<String>,
 }
 
 impl SlackApi {
@@ -35,6 +37,8 @@ impl SlackApi {
             http: Client::new(),
             access_token: token.access_token,
             scopes,
+            browser_cookie_d: token.browser_cookie_d,
+            user_agent: token.user_agent,
         }
     }
 
@@ -182,9 +186,7 @@ impl SlackApi {
 
     pub async fn download_image(&self, url: &str) -> Result<DownloadedImage> {
         let response = self
-            .http
-            .get(url)
-            .bearer_auth(&self.access_token)
+            .authenticated_request(Method::GET, url)
             .send()
             .await
             .context("failed to download Slack image preview")?
@@ -365,9 +367,7 @@ impl SlackApi {
 
         loop {
             let response = self
-                .http
-                .post(&url)
-                .bearer_auth(&self.access_token)
+                .authenticated_request(Method::POST, &url)
                 .form(params)
                 .send()
                 .await
@@ -398,6 +398,33 @@ impl SlackApi {
 
             return response.into_result(method);
         }
+    }
+
+    fn authenticated_request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
+        let mut request = self
+            .http
+            .request(method, url)
+            .bearer_auth(&self.access_token);
+
+        if let Some(cookie) = self
+            .browser_cookie_d
+            .as_deref()
+            .map(str::trim)
+            .filter(|cookie| !cookie.is_empty())
+        {
+            request = request.header(COOKIE, format!("d={cookie}"));
+        }
+
+        if let Some(user_agent) = self
+            .user_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|user_agent| !user_agent.is_empty())
+        {
+            request = request.header(USER_AGENT, user_agent);
+        }
+
+        request
     }
 }
 
@@ -670,6 +697,7 @@ fn thread_replies_in_history_order(mut messages: Vec<SlackMessage>) -> Vec<Slack
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::{AUTHORIZATION, COOKIE, USER_AGENT};
 
     fn message(ts: &str) -> SlackMessage {
         SlackMessage {
@@ -737,5 +765,51 @@ mod tests {
         assert!(scopes.contains("channels:read"));
         assert!(scopes.contains("channels:write"));
         assert!(scopes.contains("im:write"));
+    }
+
+    #[test]
+    fn browser_session_requests_include_cookie_and_user_agent() {
+        let token = StoredToken {
+            access_token: "xoxc-browser-token".to_string(),
+            token_type: Some("browser_session".to_string()),
+            scope: None,
+            refresh_token: None,
+            expires_in: None,
+            expires_at: None,
+            team_id: None,
+            team_name: None,
+            user_id: None,
+            client_id: None,
+            browser_cookie_d: Some("xoxd-cookie-value".to_string()),
+            user_agent: Some("Browser User Agent".to_string()),
+        };
+        let api = SlackApi::new(token);
+
+        let request = api
+            .authenticated_request(reqwest::Method::POST, "https://slack.com/api/auth.test")
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer xoxc-browser-token")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(COOKIE)
+                .and_then(|value| value.to_str().ok()),
+            Some("d=xoxd-cookie-value")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("Browser User Agent")
+        );
     }
 }

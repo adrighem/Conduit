@@ -33,12 +33,26 @@ pub fn slack_client_id() -> Option<String> {
         .map(ToString::to_string)
         .map(|client_id| client_id.trim().to_string())
         .filter(|client_id| !client_id.is_empty());
-    packaged_client_id.or_else(|| {
-        std::env::var("CONDUIT_SLACK_CLIENT_ID")
-            .ok()
-            .map(|client_id| client_id.trim().to_string())
-            .filter(|client_id| !client_id.is_empty())
-    })
+    packaged_client_id.or_else(|| env_value("CONDUIT_SLACK_CLIENT_ID"))
+}
+
+pub fn slack_xoxc_token() -> Option<String> {
+    env_value("CONDUIT_SLACK_XOXC_TOKEN").or_else(|| env_value("SLACK_MCP_XOXC_TOKEN"))
+}
+
+pub fn slack_xoxd_token() -> Option<String> {
+    env_value("CONDUIT_SLACK_XOXD_TOKEN").or_else(|| env_value("SLACK_MCP_XOXD_TOKEN"))
+}
+
+pub fn slack_user_agent() -> Option<String> {
+    env_value("CONDUIT_SLACK_USER_AGENT").or_else(|| env_value("SLACK_MCP_USER_AGENT"))
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn user_cache_dir() -> PathBuf {

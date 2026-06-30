@@ -28,6 +28,17 @@ meson setup _build -Dslack_client_id=1234567890.1234567890123
 
 For local development, you can also set `CONDUIT_SLACK_CLIENT_ID` before running `cargo` or paste the client ID into the first-run screen.
 
+Advanced users can also import a Slack browser session with an `xoxc-*` token and `xoxd-*` cookie, following the [Slack MCP XOXC/XOXD setup documentation](https://github.com/korotovsky/slack-mcp-server/blob/master/docs/03-configuration-and-usage.md). Conduit only imports these when no token is already stored in the keyring, validates them with `auth.test`, then stores them in the keyring:
+
+```sh
+export CONDUIT_SLACK_XOXC_TOKEN=xoxc-...
+export CONDUIT_SLACK_XOXD_TOKEN=xoxd-...
+# Optional, for enterprise workspaces that require a browser-like user agent:
+export CONDUIT_SLACK_USER_AGENT="Mozilla/5.0 ..."
+```
+
+The Slack MCP variable names `SLACK_MCP_XOXC_TOKEN`, `SLACK_MCP_XOXD_TOKEN`, and `SLACK_MCP_USER_AGENT` are accepted as aliases. These values are browser-session credentials; keep them secret and unset them after import if you do not want Conduit to re-import them after signing out.
+
 To open the workspace connection flow explicitly, start Conduit with `--connect` or `-c`. This does not remove the current stored token; the token is replaced only after a new Slack authorization succeeds.
 
 To debug rendering and Slack loading, add `--debug` or `-d`. This prints message rendering, emoji, image preview, and full Slack conversation property diagnostics to stderr. Conversation diagnostics can include private workspace metadata such as channel names, user IDs, read timestamps, and unread counts. To debug only OAuth setup, add `--debug-auth`; `--debug` includes those OAuth diagnostics too. The logs do not include access tokens or authorization codes.
@@ -48,7 +59,7 @@ Required user scopes:
 channels:read,channels:history,channels:write,groups:read,groups:history,groups:write,im:read,im:history,im:write,mpim:read,mpim:history,mpim:write,users:read,chat:write,search:read,stars:read,stars:write,reactions:read,reactions:write,files:read,files:write
 ```
 
-After approval, Conduit validates the session with `auth.test` and stores the token in the system keyring. Use **Sign Out** in the workspace menu to remove the stored token.
+After approval, Conduit validates the session with `auth.test` and stores the token in the system keyring. Browser-session token imports use the same validation and storage path. Use **Sign Out** in the workspace menu to remove the stored token.
 
 ## Status
 

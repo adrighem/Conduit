@@ -15,6 +15,8 @@ pub struct StoredToken {
     pub team_name: Option<String>,
     pub user_id: Option<String>,
     pub client_id: Option<String>,
+    pub browser_cookie_d: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 impl StoredToken {

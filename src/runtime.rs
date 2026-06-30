@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
 
-use crate::auth::{OAuthConfig, SlackOAuthClient, TokenStore};
+use crate::auth::{browser_session_token_from_env, OAuthConfig, SlackOAuthClient, TokenStore};
 use crate::config;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, StoredToken,
@@ -274,14 +274,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     token = context.oauth.refresh(&token).await?;
                     context.token_store.save(&token)?;
                 }
-                let auth = connect_with_token(context.events, context.slack, token).await?;
-                *context.workspace_store = Some(WorkspaceStore::new(
-                    config::state_cache_dir(),
-                    &workspace_store_id(&auth),
-                ));
-                context.user_cache.clear();
-                load_cached_conversations(context.events, context.workspace_store).await;
-                load_conversations(context.events, context.slack, context.workspace_store).await?;
+                connect_and_load_workspace(context, token).await?;
+            } else if let Some(token) = browser_session_token_from_env()? {
+                context
+                    .events
+                    .send_status("Importing Slack browser session");
+                let auth = connect_with_token(context.events, context.slack, token.clone()).await?;
+                context.token_store.save(&token)?;
+                load_workspace_after_auth(context, &auth).await?;
             } else {
                 context.events.send_event(RuntimeEvent::SignedOut);
             }
@@ -296,14 +296,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .authenticate(OAuthConfig::new(client_id), debug_auth)
                 .await?;
             context.token_store.save(&token)?;
-            let auth = connect_with_token(context.events, context.slack, token).await?;
-            *context.workspace_store = Some(WorkspaceStore::new(
-                config::state_cache_dir(),
-                &workspace_store_id(&auth),
-            ));
-            context.user_cache.clear();
-            load_cached_conversations(context.events, context.workspace_store).await;
-            load_conversations(context.events, context.slack, context.workspace_store).await?;
+            connect_and_load_workspace(context, token).await?;
         }
         RuntimeCommand::SignOut => {
             context.token_store.clear()?;
@@ -549,6 +542,27 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
     }
 
     Ok(())
+}
+
+async fn connect_and_load_workspace(
+    context: &mut RuntimeContext<'_>,
+    token: StoredToken,
+) -> Result<()> {
+    let auth = connect_with_token(context.events, context.slack, token).await?;
+    load_workspace_after_auth(context, &auth).await
+}
+
+async fn load_workspace_after_auth(
+    context: &mut RuntimeContext<'_>,
+    auth: &AuthInfo,
+) -> Result<()> {
+    *context.workspace_store = Some(WorkspaceStore::new(
+        config::state_cache_dir(),
+        &workspace_store_id(auth),
+    ));
+    context.user_cache.clear();
+    load_cached_conversations(context.events, context.workspace_store).await;
+    load_conversations(context.events, context.slack, context.workspace_store).await
 }
 
 async fn connect_with_token(

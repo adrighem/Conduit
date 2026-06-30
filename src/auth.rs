@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 use url::Url;
 
-use crate::models::StoredToken;
+use crate::{config, models::StoredToken};
 
 const KEYRING_SERVICE: &str = "eu.vanadrighem.conduit";
 const KEYRING_USER: &str = "slack-user-token";
@@ -41,6 +41,8 @@ pub const DEFAULT_USER_SCOPES: &[&str] = &[
     "files:read",
     "files:write",
 ];
+const DEFAULT_BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
@@ -170,6 +172,14 @@ impl SlackOAuthClient {
     }
 }
 
+pub fn browser_session_token_from_env() -> Result<Option<StoredToken>> {
+    browser_session_token_from_values(
+        config::slack_xoxc_token(),
+        config::slack_xoxd_token(),
+        config::slack_user_agent(),
+    )
+}
+
 #[derive(Debug, Clone)]
 struct PkcePair {
     verifier: String,
@@ -225,6 +235,53 @@ fn random_urlsafe(size: usize) -> String {
         *byte = random::<u8>();
     }
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn browser_session_token_from_values(
+    xoxc_token: Option<String>,
+    xoxd_token: Option<String>,
+    user_agent: Option<String>,
+) -> Result<Option<StoredToken>> {
+    let xoxc_token = trimmed_value(xoxc_token);
+    let xoxd_token = trimmed_value(xoxd_token);
+    let user_agent =
+        trimmed_value(user_agent).or_else(|| Some(DEFAULT_BROWSER_USER_AGENT.to_string()));
+
+    match (xoxc_token, xoxd_token) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(anyhow!(
+            "both CONDUIT_SLACK_XOXC_TOKEN and CONDUIT_SLACK_XOXD_TOKEN are required for Slack browser-session authentication"
+        )),
+        (Some(access_token), Some(browser_cookie_d)) => {
+            if !access_token.starts_with("xoxc-") {
+                return Err(anyhow!("CONDUIT_SLACK_XOXC_TOKEN must start with xoxc-"));
+            }
+            if !browser_cookie_d.starts_with("xoxd-") {
+                return Err(anyhow!("CONDUIT_SLACK_XOXD_TOKEN must start with xoxd-"));
+            }
+
+            Ok(Some(StoredToken {
+                access_token,
+                token_type: Some("browser_session".to_string()),
+                scope: None,
+                refresh_token: None,
+                expires_in: None,
+                expires_at: None,
+                team_id: None,
+                team_name: None,
+                user_id: None,
+                client_id: None,
+                browser_cookie_d: Some(browser_cookie_d),
+                user_agent,
+            }))
+        }
+    }
+}
+
+fn trimmed_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn build_authorize_url(config: &OAuthConfig, challenge: &str, state: &str) -> Result<String> {
@@ -427,6 +484,8 @@ fn token_from_response(
         client_id: client_id
             .map(ToString::to_string)
             .or_else(|| previous.and_then(|token| token.client_id.clone())),
+        browser_cookie_d: previous.and_then(|token| token.browser_cookie_d.clone()),
+        user_agent: previous.and_then(|token| token.user_agent.clone()),
     })
 }
 
@@ -474,5 +533,49 @@ mod tests {
             Some("S256")
         );
         assert_eq!(params.get("state").map(String::as_str), Some("state"));
+    }
+
+    #[test]
+    fn builds_browser_session_token_from_xoxc_xoxd_values() {
+        let token = browser_session_token_from_values(
+            Some(" xoxc-browser-token ".to_string()),
+            Some(" xoxd-cookie-value ".to_string()),
+            None,
+        )
+        .unwrap()
+        .expect("token should be created");
+
+        assert_eq!(token.access_token, "xoxc-browser-token");
+        assert_eq!(token.token_type.as_deref(), Some("browser_session"));
+        assert_eq!(token.browser_cookie_d.as_deref(), Some("xoxd-cookie-value"));
+        assert_eq!(
+            token.user_agent.as_deref(),
+            Some(DEFAULT_BROWSER_USER_AGENT)
+        );
+        assert!(!token.should_refresh());
+    }
+
+    #[test]
+    fn uses_custom_browser_session_user_agent() {
+        let token = browser_session_token_from_values(
+            Some("xoxc-browser-token".to_string()),
+            Some("xoxd-cookie-value".to_string()),
+            Some(" Browser User Agent ".to_string()),
+        )
+        .unwrap()
+        .expect("token should be created");
+
+        assert_eq!(token.user_agent.as_deref(), Some("Browser User Agent"));
+    }
+
+    #[test]
+    fn rejects_partial_browser_session_values() {
+        let error =
+            browser_session_token_from_values(Some("xoxc-browser-token".to_string()), None, None)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("CONDUIT_SLACK_XOXC_TOKEN"));
+        assert!(error.contains("CONDUIT_SLACK_XOXD_TOKEN"));
     }
 }
