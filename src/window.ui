@@ -71,7 +71,7 @@
                       </object>
                     </child>
                     <child>
-                      <object class="GtkLabel">
+                      <object class="GtkLabel" id="auth_intro_label">
                         <property name="label" translatable="yes">Approve Conduit in your browser. Your Slack token will be stored in the system keyring.</property>
                         <property name="wrap">True</property>
                         <property name="justify">center</property>
@@ -81,6 +81,35 @@
                       <object class="GtkEntry" id="client_id_entry">
                         <property name="placeholder-text" translatable="yes">Slack app client ID</property>
                         <property name="hexpand">True</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkCheckButton" id="browser_session_check">
+                        <property name="label" translatable="yes">Use XOXC/XOXD tokens</property>
+                        <property name="halign">center</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkEntry" id="xoxc_token_entry">
+                        <property name="placeholder-text" translatable="yes">XOXC token</property>
+                        <property name="visibility">False</property>
+                        <property name="hexpand">True</property>
+                        <property name="visible">False</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkEntry" id="xoxd_token_entry">
+                        <property name="placeholder-text" translatable="yes">XOXD cookie</property>
+                        <property name="visibility">False</property>
+                        <property name="hexpand">True</property>
+                        <property name="visible">False</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkEntry" id="user_agent_entry">
+                        <property name="placeholder-text" translatable="yes">User-Agent (optional)</property>
+                        <property name="hexpand">True</property>
+                        <property name="visible">False</property>
                       </object>
                     </child>
                     <child>

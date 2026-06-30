@@ -18,6 +18,8 @@ Conduit currently supports Slack OAuth PKCE and stores the resulting user token 
 - Validate imported credentials with Slack `auth.test` before saving them to the keyring.
 - Send the `xoxc` value as the Slack API bearer token and the `xoxd` value as cookie `d`.
 - Preserve the existing OAuth PKCE flow as the primary UI connection path.
+- Offer XOXC/XOXD browser-session authentication as an option in the connect UI.
+- Let users switch between OAuth and XOXC/XOXD entry without restarting the app.
 - Do not log imported token or cookie values.
 - Document the environment variables and security expectations.
 
@@ -27,12 +29,13 @@ Conduit currently supports Slack OAuth PKCE and stores the resulting user token 
 - If only one browser-session variable is set, startup reports a clear authentication configuration error.
 - Slack API requests built from imported credentials include `Authorization: Bearer <xoxc>` and `Cookie: d=<xoxd>`.
 - Optional user-agent configuration is applied to Slack requests for browser-session credentials.
+- The connect screen can toggle to XOXC/XOXD mode, enter both token values, and connect without browser OAuth.
+- Incomplete XOXC/XOXD UI input shows a local validation message before any runtime command is sent.
 - Unit tests cover token import parsing and authenticated request header construction.
 - README documents the token import flow and links to the upstream Slack MCP documentation.
 
 ## Out of Scope
 
-- Interactive UI fields for pasting XOXC/XOXD values.
 - Support for bot-token-only authentication.
 - Custom TLS fingerprinting.
 - Slack Edge API replacement for existing Web API calls.

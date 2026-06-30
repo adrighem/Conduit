@@ -49,7 +49,17 @@ mod imp {
         #[template_child]
         pub status_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub auth_intro_label: TemplateChild<gtk::Label>,
+        #[template_child]
         pub client_id_entry: TemplateChild<gtk::Entry>,
+        #[template_child]
+        pub browser_session_check: TemplateChild<gtk::CheckButton>,
+        #[template_child]
+        pub xoxc_token_entry: TemplateChild<gtk::Entry>,
+        #[template_child]
+        pub xoxd_token_entry: TemplateChild<gtk::Entry>,
+        #[template_child]
+        pub user_agent_entry: TemplateChild<gtk::Entry>,
         #[template_child]
         pub setup_hint_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -329,6 +339,20 @@ fn set_text_view_text(text_view: &gtk::TextView, text: &str) {
     text_view.buffer().set_text(text);
 }
 
+fn browser_session_input(
+    xoxc_token: &str,
+    xoxd_token: &str,
+) -> std::result::Result<(String, String), &'static str> {
+    let xoxc_token = xoxc_token.trim();
+    let xoxd_token = xoxd_token.trim();
+
+    if xoxc_token.is_empty() || xoxd_token.is_empty() {
+        return Err("Enter XOXC and XOXD tokens");
+    }
+
+    Ok((xoxc_token.to_string(), xoxd_token.to_string()))
+}
+
 impl ConduitWindow {
     pub fn new<P: IsA<gtk::Application>>(application: &P) -> Self {
         glib::Object::builder()
@@ -434,7 +458,7 @@ impl ConduitWindow {
         let imp = self.imp();
 
         self.setup_window_actions();
-        self.connect_widget(&imp.connect_button.get(), |window| window.start_oauth());
+        self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
         self.connect_widget(&imp.home_button.get(), |window| window.show_home());
         self.connect_widget(&imp.activity_button.get(), |window| window.show_activity());
         self.connect_widget(&imp.files_button.get(), |window| window.show_files());
@@ -456,6 +480,13 @@ impl ConduitWindow {
         });
         self.connect_widget(&imp.close_thread_button.get(), |window| {
             window.close_thread()
+        });
+
+        let weak_window = self.downgrade();
+        imp.browser_session_check.connect_toggled(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.update_auth_mode_ui();
+            }
         });
 
         let weak_window = self.downgrade();
@@ -719,13 +750,52 @@ impl ConduitWindow {
         let imp = self.imp();
         if let Some(client_id) = config::slack_client_id() {
             imp.client_id_entry.set_text(&client_id);
-            imp.client_id_entry.set_visible(false);
-            imp.setup_hint_label.set_visible(false);
         } else {
             imp.setup_hint_label.set_label(&format!(
                 "Use redirect URL {} in the Slack app settings.",
                 auth::OAuthConfig::new("").redirect_uri()
             ));
+        }
+        self.update_auth_mode_ui();
+    }
+
+    fn update_auth_mode_ui(&self) {
+        let imp = self.imp();
+        let browser_session = imp.browser_session_check.is_active();
+        let has_packaged_client_id = config::slack_client_id().is_some();
+
+        imp.client_id_entry
+            .set_visible(!browser_session && !has_packaged_client_id);
+        imp.xoxc_token_entry.set_visible(browser_session);
+        imp.xoxd_token_entry.set_visible(browser_session);
+        imp.user_agent_entry.set_visible(browser_session);
+
+        if browser_session {
+            imp.auth_intro_label.set_label(
+                "Paste browser-session credentials. They will be stored in the system keyring.",
+            );
+            imp.setup_hint_label.set_visible(true);
+            imp.setup_hint_label
+                .set_label("Paste your Slack browser xoxc token and xoxd cookie.");
+            imp.connect_button.set_label("Import Browser Session");
+        } else {
+            imp.auth_intro_label.set_label(
+                "Approve Conduit in your browser. Your Slack token will be stored in the system keyring.",
+            );
+            imp.setup_hint_label.set_visible(!has_packaged_client_id);
+            imp.setup_hint_label.set_label(&format!(
+                "Use redirect URL {} in the Slack app settings.",
+                auth::OAuthConfig::new("").redirect_uri()
+            ));
+            imp.connect_button.set_label("Connect Workspace");
+        }
+    }
+
+    fn start_auth(&self) {
+        if self.imp().browser_session_check.is_active() {
+            self.start_browser_session();
+        } else {
+            self.start_oauth();
         }
     }
 
@@ -742,6 +812,30 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::StartOAuth {
             client_id,
             debug_auth: self.imp().auth_debug.get(),
+        });
+    }
+
+    fn start_browser_session(&self) {
+        let imp = self.imp();
+        let (xoxc_token, xoxd_token) =
+            match browser_session_input(&imp.xoxc_token_entry.text(), &imp.xoxd_token_entry.text())
+            {
+                Ok(tokens) => tokens,
+                Err(status) => {
+                    self.show_login(status);
+                    return;
+                }
+            };
+        let user_agent = imp.user_agent_entry.text().trim().to_string();
+        let user_agent = (!user_agent.is_empty()).then_some(user_agent);
+
+        self.imp().connect_requested.set(false);
+        imp.connect_button.set_sensitive(false);
+        self.show_loading("Validating Slack browser session");
+        self.send_command(RuntimeCommand::StartBrowserSession {
+            xoxc_token,
+            xoxd_token,
+            user_agent,
         });
     }
 
@@ -2012,6 +2106,26 @@ mod tests {
             "random",
             true
         ));
+    }
+
+    #[test]
+    fn browser_session_input_requires_both_tokens() {
+        assert_eq!(
+            browser_session_input("xoxc-token", "").unwrap_err(),
+            "Enter XOXC and XOXD tokens"
+        );
+        assert_eq!(
+            browser_session_input("", "xoxd-token").unwrap_err(),
+            "Enter XOXC and XOXD tokens"
+        );
+    }
+
+    #[test]
+    fn browser_session_input_trims_token_values() {
+        assert_eq!(
+            browser_session_input(" xoxc-token ", " xoxd-token ").unwrap(),
+            ("xoxc-token".to_string(), "xoxd-token".to_string())
+        );
     }
 
     #[test]

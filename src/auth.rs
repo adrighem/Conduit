@@ -237,7 +237,7 @@ fn random_urlsafe(size: usize) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn browser_session_token_from_values(
+pub fn browser_session_token_from_values(
     xoxc_token: Option<String>,
     xoxd_token: Option<String>,
     user_agent: Option<String>,
@@ -250,14 +250,14 @@ fn browser_session_token_from_values(
     match (xoxc_token, xoxd_token) {
         (None, None) => Ok(None),
         (Some(_), None) | (None, Some(_)) => Err(anyhow!(
-            "both CONDUIT_SLACK_XOXC_TOKEN and CONDUIT_SLACK_XOXD_TOKEN are required for Slack browser-session authentication"
+            "both XOXC and XOXD tokens are required for Slack browser-session authentication"
         )),
         (Some(access_token), Some(browser_cookie_d)) => {
             if !access_token.starts_with("xoxc-") {
-                return Err(anyhow!("CONDUIT_SLACK_XOXC_TOKEN must start with xoxc-"));
+                return Err(anyhow!("XOXC token must start with xoxc-"));
             }
             if !browser_cookie_d.starts_with("xoxd-") {
-                return Err(anyhow!("CONDUIT_SLACK_XOXD_TOKEN must start with xoxd-"));
+                return Err(anyhow!("XOXD token must start with xoxd-"));
             }
 
             Ok(Some(StoredToken {
@@ -575,7 +575,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
 
-        assert!(error.contains("CONDUIT_SLACK_XOXC_TOKEN"));
-        assert!(error.contains("CONDUIT_SLACK_XOXD_TOKEN"));
+        assert!(error.contains("XOXC"));
+        assert!(error.contains("XOXD"));
     }
 }

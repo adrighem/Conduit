@@ -5,11 +5,14 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
 
-use crate::auth::{browser_session_token_from_env, OAuthConfig, SlackOAuthClient, TokenStore};
+use crate::auth::{
+    browser_session_token_from_env, browser_session_token_from_values, OAuthConfig,
+    SlackOAuthClient, TokenStore,
+};
 use crate::config;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, StoredToken,
@@ -23,6 +26,11 @@ pub enum RuntimeCommand {
     StartOAuth {
         client_id: String,
         debug_auth: bool,
+    },
+    StartBrowserSession {
+        xoxc_token: String,
+        xoxd_token: String,
+        user_agent: Option<String>,
     },
     SignOut,
     RefreshConversations,
@@ -297,6 +305,21 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .await?;
             context.token_store.save(&token)?;
             connect_and_load_workspace(context, token).await?;
+        }
+        RuntimeCommand::StartBrowserSession {
+            xoxc_token,
+            xoxd_token,
+            user_agent,
+        } => {
+            context
+                .events
+                .send_status("Validating Slack browser session");
+            let token =
+                browser_session_token_from_values(Some(xoxc_token), Some(xoxd_token), user_agent)?
+                    .ok_or_else(|| anyhow!("Enter XOXC and XOXD tokens"))?;
+            let auth = connect_with_token(context.events, context.slack, token.clone()).await?;
+            context.token_store.save(&token)?;
+            load_workspace_after_auth(context, &auth).await?;
         }
         RuntimeCommand::SignOut => {
             context.token_store.clear()?;

@@ -28,7 +28,9 @@ meson setup _build -Dslack_client_id=1234567890.1234567890123
 
 For local development, you can also set `CONDUIT_SLACK_CLIENT_ID` before running `cargo` or paste the client ID into the first-run screen.
 
-Advanced users can also import a Slack browser session with an `xoxc-*` token and `xoxd-*` cookie, following the [Slack MCP XOXC/XOXD setup documentation](https://github.com/korotovsky/slack-mcp-server/blob/master/docs/03-configuration-and-usage.md). Conduit only imports these when no token is already stored in the keyring, validates them with `auth.test`, then stores them in the keyring:
+Advanced users can also import a Slack browser session with an `xoxc-*` token and `xoxd-*` cookie, following the [Slack MCP XOXC/XOXD setup documentation](https://github.com/korotovsky/slack-mcp-server/blob/master/docs/03-configuration-and-usage.md). On the connection screen, enable **Use XOXC/XOXD tokens**, paste both values, and connect. Conduit validates them with `auth.test`, then stores them in the keyring.
+
+For scripted setup, Conduit also imports these values from the environment when no token is already stored:
 
 ```sh
 export CONDUIT_SLACK_XOXC_TOKEN=xoxc-...
