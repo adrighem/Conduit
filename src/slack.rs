@@ -19,6 +19,10 @@ const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
 const MAX_RETRY_AFTER_SECONDS: u64 = 30;
 const HISTORY_PAGE_LIMIT: &str = "50";
+const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
+const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROPERTIES";
+const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
+const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
 const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
 
 #[derive(Clone)]
@@ -71,7 +75,7 @@ impl SlackApi {
             }
 
             let response: ConversationListResponse =
-                self.post_form("conversations.list", &params).await?;
+                self.post_form(USERS_CONVERSATIONS_METHOD, &params).await?;
             conversations.extend(response.channels);
 
             cursor = response
@@ -83,7 +87,7 @@ impl SlackApi {
         }
 
         conversations.sort_by_key(|conversation| conversation.display_name().to_lowercase());
-        log_conversation_properties(&conversations);
+        log_conversation_properties(USERS_CONVERSATIONS_METHOD, &conversations);
         Ok(conversations)
     }
 
@@ -373,10 +377,18 @@ impl SlackApi {
                 .await
                 .with_context(|| format!("failed to call Slack method {method}"))?;
 
-            if response.status() == StatusCode::TOO_MANY_REQUESTS
-                && retries < MAX_RATE_LIMIT_RETRIES
-            {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = retry_after_delay(&response);
+                let max_retries = rate_limit_retries_for_method(method);
+                if retries >= max_retries {
+                    crate::debug::log(
+                        "slack",
+                        &format!("Slack method {method} rate limited; not retrying automatically"),
+                    );
+                    return Err(anyhow!(
+                        "Slack method {method} was rate limited; try again shortly"
+                    ));
+                }
                 retries += 1;
                 crate::debug::log(
                     "slack",
@@ -447,6 +459,17 @@ fn retry_after_seconds(value: &str) -> u64 {
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS)
         .min(MAX_RETRY_AFTER_SECONDS)
+}
+
+fn rate_limit_retries_for_method(method: &str) -> usize {
+    if matches!(
+        method,
+        CONVERSATIONS_LIST_METHOD | USERS_CONVERSATIONS_METHOD
+    ) {
+        0
+    } else {
+        MAX_RATE_LIMIT_RETRIES
+    }
 }
 
 fn token_scope_set(scope: Option<&str>) -> HashSet<String> {
@@ -556,20 +579,33 @@ struct AuthTestResponse {
 }
 impl_slack_response!(AuthTestResponse);
 
-fn log_conversation_properties(conversations: &[SlackConversation]) {
+fn log_conversation_properties(method: &str, conversations: &[SlackConversation]) {
     if !crate::debug::enabled() {
         return;
     }
 
     crate::debug::log(
         "slack",
-        &format!(
-            "conversations.list returned {} conversations",
-            conversations.len()
-        ),
+        &format!("{method} returned {} conversations", conversations.len()),
     );
 
-    for conversation in conversations {
+    let log_limit = conversation_property_log_limit(
+        std::env::var(DEBUG_CONVERSATION_PROPERTIES_ENV)
+            .ok()
+            .as_deref(),
+        conversations.len(),
+    );
+    if log_limit == 0 {
+        crate::debug::log(
+            "slack",
+            &format!(
+                "conversation property logging disabled; set {DEBUG_CONVERSATION_PROPERTIES_ENV}=20 or all to enable"
+            ),
+        );
+        return;
+    }
+
+    for conversation in conversations.iter().take(log_limit) {
         let properties = serde_json::to_string_pretty(conversation)
             .unwrap_or_else(|_| format!("{conversation:#?}"));
         crate::debug::log(
@@ -583,6 +619,32 @@ fn log_conversation_properties(conversations: &[SlackConversation]) {
             ),
         );
     }
+
+    if conversations.len() > log_limit {
+        crate::debug::log(
+            "slack",
+            &format!(
+                "conversation property logging truncated at {log_limit}/{}; set {DEBUG_CONVERSATION_PROPERTIES_ENV}=all to log every conversation",
+                conversations.len()
+            ),
+        );
+    }
+}
+
+fn conversation_property_log_limit(setting: Option<&str>, total: usize) -> usize {
+    let Some(setting) = setting.map(str::trim).filter(|setting| !setting.is_empty()) else {
+        return 0;
+    };
+
+    if setting.eq_ignore_ascii_case("all") {
+        return total;
+    }
+
+    if setting.eq_ignore_ascii_case("true") || setting == "1" {
+        return DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT.min(total);
+    }
+
+    setting.parse::<usize>().unwrap_or_default().min(total)
 }
 
 fn conversation_debug_kind(conversation: &SlackConversation) -> &'static str {
@@ -737,6 +799,29 @@ mod tests {
             DEFAULT_RETRY_AFTER_SECONDS
         );
         assert_eq!(retry_after_seconds("120"), MAX_RETRY_AFTER_SECONDS);
+    }
+
+    #[test]
+    fn conversations_list_rate_limits_fail_fast() {
+        assert_eq!(rate_limit_retries_for_method(CONVERSATIONS_LIST_METHOD), 0);
+        assert_eq!(rate_limit_retries_for_method(USERS_CONVERSATIONS_METHOD), 0);
+        assert_eq!(
+            rate_limit_retries_for_method("conversations.history"),
+            MAX_RATE_LIMIT_RETRIES
+        );
+    }
+
+    #[test]
+    fn conversation_property_logging_is_opt_in_and_bounded() {
+        assert_eq!(conversation_property_log_limit(None, 100), 0);
+        assert_eq!(
+            conversation_property_log_limit(Some("true"), 100),
+            DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT
+        );
+        assert_eq!(conversation_property_log_limit(Some("1"), 5), 5);
+        assert_eq!(conversation_property_log_limit(Some("7"), 100), 7);
+        assert_eq!(conversation_property_log_limit(Some("all"), 100), 100);
+        assert_eq!(conversation_property_log_limit(Some("invalid"), 100), 0);
     }
 
     #[test]

@@ -94,6 +94,7 @@ pub enum RuntimeEvent {
     SignedOut,
     Authenticated(AuthInfo),
     ConversationsLoaded(Vec<SlackConversation>),
+    ConversationsLoadFailed(String),
     HistoryLoaded {
         channel_id: String,
         messages: Vec<SlackMessage>,
@@ -330,7 +331,8 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         }
         RuntimeCommand::RefreshConversations => {
             crate::debug::log("runtime", "RefreshConversations");
-            load_conversations(context.events, context.slack, context.workspace_store).await?;
+            load_conversations_best_effort(context.events, context.slack, context.workspace_store)
+                .await?;
         }
         RuntimeCommand::LoadHistory { channel_id } => {
             let api = require_slack(context.slack)?;
@@ -585,7 +587,7 @@ async fn load_workspace_after_auth(
     ));
     context.user_cache.clear();
     load_cached_conversations(context.events, context.workspace_store).await;
-    load_conversations(context.events, context.slack, context.workspace_store).await
+    load_conversations_best_effort(context.events, context.slack, context.workspace_store).await
 }
 
 async fn connect_with_token(
@@ -628,6 +630,21 @@ async fn load_conversations(
         &format!("ConversationsLoaded count={}", conversations.len()),
     );
     events.send_event(RuntimeEvent::ConversationsLoaded(conversations));
+    Ok(())
+}
+
+async fn load_conversations_best_effort(
+    events: &Sender<RuntimeEvent>,
+    slack: &mut Option<SlackApi>,
+    workspace_store: &Option<WorkspaceStore>,
+) -> Result<()> {
+    if let Err(error) = load_conversations(events, slack, workspace_store).await {
+        crate::debug::log(
+            "runtime",
+            &format!("ConversationsLoadFailed error={error:#}"),
+        );
+        events.send_event(RuntimeEvent::ConversationsLoadFailed(error.to_string()));
+    }
     Ok(())
 }
 

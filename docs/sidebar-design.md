@@ -36,7 +36,7 @@ Excluded from 1.0 unless explicitly revisited:
 - Muted state.
 - Slack Connect or external organization indicators.
 - Avatars and presence badges.
-- Full unread synchronization beyond conversation-level unread fields returned by `conversations.list`.
+- Full unread synchronization beyond conversation-level unread fields returned by `users.conversations`.
 
 ## Sidebar Shell
 
@@ -246,7 +246,7 @@ The sidebar is fully GTK4/libadwaita-native. WebKit is still used for message an
 
 ## Current Limits
 
-The sidebar currently uses only data already available from `conversations.list` and the user-name cache. Future features should be added only when the data model and Slack API usage support them cleanly.
+The sidebar currently uses member-scoped conversation data from `users.conversations` and the user-name cache. Future features should be added only when the data model and Slack API usage support them cleanly.
 
 Known limits:
 
@@ -257,4 +257,4 @@ Known limits:
 - No Slack Connect or external organization indicators.
 - No avatars or presence badges.
 - No multiple workspace switching.
-- No full unread synchronization beyond conversation-level unread fields returned by `conversations.list`.
+- No full unread synchronization beyond conversation-level unread fields returned by `users.conversations`.

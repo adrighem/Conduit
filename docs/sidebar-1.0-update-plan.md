@@ -209,7 +209,7 @@ Validation:
 
 Problem:
 
-- The sidebar depends on `conversations.list`, cached user names, and `unread_count`.
+- The sidebar depends on `users.conversations`, cached user names, and `unread_count`.
 - 1.0 should clearly communicate which Slack-like features are intentionally not present.
 
 Changes:

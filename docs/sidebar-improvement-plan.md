@@ -50,7 +50,7 @@ Data already available:
 
 Important constraint:
 
-- Conduit currently obtains conversation data from `conversations.list`. The first implementation should use only data already available there unless a step explicitly calls for new API work.
+- Conduit currently obtains sidebar conversation data from `users.conversations`. The first implementation should use only data already available there unless a step explicitly calls for new API work.
 
 ## Product Goals
 
@@ -451,7 +451,7 @@ Risk: Slack API fields are incomplete for exact web-client parity.
 
 Risk: unread semantics differ from Slack web.
 
-- Mitigation: label the first pass as best-effort unread rendering from `conversations.list`; verify against a real workspace before expanding behavior.
+- Mitigation: label the first pass as best-effort unread rendering from `users.conversations`; verify against a real workspace before expanding behavior.
 
 Risk: GTK row rendering becomes hard to unit test.
 

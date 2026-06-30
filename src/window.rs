@@ -616,6 +616,11 @@ impl ConduitWindow {
                     self.populate_conversations(conversations);
                 }
             }
+            RuntimeEvent::ConversationsLoadFailed(error) => {
+                if !self.imp().connect_requested.get() {
+                    self.show_conversation_load_error(&error);
+                }
+            }
             RuntimeEvent::HistoryLoaded {
                 channel_id,
                 messages,
@@ -1325,12 +1330,21 @@ impl ConduitWindow {
             self.show_login(error);
         } else {
             if self.imp().content_stack.visible_child_name().as_deref() == Some("workspace") {
-                self.imp().sidebar_loading.set(false);
-                *self.imp().sidebar_error.borrow_mut() = Some(error.to_string());
-                self.render_conversations();
+                self.set_sidebar_error(error);
             }
             self.set_status(error);
         }
+    }
+
+    fn show_conversation_load_error(&self, error: &str) {
+        self.set_sidebar_error(error);
+        self.set_status(error);
+    }
+
+    fn set_sidebar_error(&self, error: &str) {
+        self.imp().sidebar_loading.set(false);
+        *self.imp().sidebar_error.borrow_mut() = Some(error.to_string());
+        self.render_conversations();
     }
 
     fn populate_conversations(&self, conversations: Vec<SlackConversation>) {

@@ -12,7 +12,7 @@ This slice adds a native sidebar entry named **Activity** and a main-pane attent
 
 The Activity list:
 
-- Includes conversations with unread activity from `conversations.list`.
+- Includes conversations with unread activity from `users.conversations`.
 - Uses the same unread-field interpretation as the sidebar, including Slack extra fields whose names contain `unread`.
 - Resolves DM titles through the existing user-name cache.
 - Sorts direct messages before group DMs, then private channels, public channels, and unknown conversations; within each group, higher unread counts sort first.
