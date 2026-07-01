@@ -134,6 +134,7 @@ mod imp {
         pub sidebar_loading: Cell<bool>,
         pub sidebar_error: RefCell<Option<String>>,
         pub current_channel_messages: RefCell<Vec<SlackMessage>>,
+        pub channel_message_cache: RefCell<HashMap<String, Vec<SlackMessage>>>,
         pub current_thread_messages: RefCell<Vec<SlackMessage>>,
         pub current_search_results: RefCell<Vec<SearchMatch>>,
         pub current_files: RefCell<Vec<SlackFile>>,
@@ -234,6 +235,13 @@ pub enum MainMessageView {
     Search,
     Files,
     Saved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationHistorySelectionAction {
+    RenderCurrent,
+    RenderCached,
+    RequestFresh,
 }
 
 fn sidebar_selected_channel(
@@ -369,6 +377,21 @@ fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<
     messages.sort_by(|left, right| right.ts.cmp(&left.ts));
     messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
     messages
+}
+
+fn conversation_history_selection_action(
+    requested_channel: &str,
+    selected_channel: Option<&str>,
+    current_messages: &[SlackMessage],
+    cached_messages: Option<&[SlackMessage]>,
+) -> ConversationHistorySelectionAction {
+    if selected_channel == Some(requested_channel) && !current_messages.is_empty() {
+        ConversationHistorySelectionAction::RenderCurrent
+    } else if cached_messages.is_some_and(|messages| !messages.is_empty()) {
+        ConversationHistorySelectionAction::RenderCached
+    } else {
+        ConversationHistorySelectionAction::RequestFresh
+    }
 }
 
 fn text_view_text(text_view: &gtk::TextView) -> String {
@@ -701,7 +724,6 @@ impl ConduitWindow {
                     messages
                 };
                 self.request_user_names(&rendered_messages);
-                *self.imp().current_channel_messages.borrow_mut() = rendered_messages.clone();
                 self.populate_history(&channel_id, rendered_messages);
             }
             RuntimeEvent::ThreadLoaded {
@@ -1336,6 +1358,7 @@ impl ConduitWindow {
         imp.current_search_results.borrow_mut().clear();
         imp.current_files.borrow_mut().clear();
         imp.current_saved_items.borrow_mut().clear();
+        imp.channel_message_cache.borrow_mut().clear();
         imp.current_main_view.set(MainMessageView::Placeholder);
         set_text_view_text(&imp.message_entry, "");
         set_text_view_text(&imp.thread_entry, "");
@@ -1816,6 +1839,16 @@ impl ConduitWindow {
             &format!("select_conversation channel_id={channel_id} title={title}"),
         );
         let imp = self.imp();
+        let previous_channel = imp.selected_channel.borrow().clone();
+        let current_messages = imp.current_channel_messages.borrow().clone();
+        let cached_messages = imp.channel_message_cache.borrow().get(channel_id).cloned();
+        let history_action = conversation_history_selection_action(
+            channel_id,
+            previous_channel.as_deref(),
+            &current_messages,
+            cached_messages.as_deref(),
+        );
+
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
         *imp.selected_thread_ts.borrow_mut() = None;
         imp.current_main_view.set(MainMessageView::Conversation);
@@ -1828,19 +1861,36 @@ impl ConduitWindow {
             "No thread open",
         ));
         self.render_conversations();
-        self.load_message_html(&message_html::placeholder_document(
-            "Messages",
-            "Loading messages",
-        ));
-        self.send_command(RuntimeCommand::LoadHistory {
-            channel_id: channel_id.to_string(),
-        });
+
+        match history_action {
+            ConversationHistorySelectionAction::RenderCurrent => {
+                self.populate_history(channel_id, current_messages);
+            }
+            ConversationHistorySelectionAction::RenderCached => {
+                if let Some(messages) = cached_messages {
+                    self.populate_history(channel_id, messages);
+                }
+            }
+            ConversationHistorySelectionAction::RequestFresh => {
+                self.load_message_html(&message_html::placeholder_document(
+                    "Messages",
+                    "Loading messages",
+                ));
+                self.send_command(RuntimeCommand::LoadHistory {
+                    channel_id: channel_id.to_string(),
+                });
+            }
+        }
     }
 
     fn populate_history(&self, channel_id: &str, messages: Vec<SlackMessage>) {
         let imp = self.imp();
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
         imp.current_main_view.set(MainMessageView::Conversation);
+        *imp.current_channel_messages.borrow_mut() = messages.clone();
+        imp.channel_message_cache
+            .borrow_mut()
+            .insert(channel_id.to_string(), messages.clone());
         imp.message_title
             .set_label(&self.conversation_title(channel_id));
         self.render_conversations();
@@ -2442,6 +2492,25 @@ mod tests {
                 "1710000200.000000",
                 "1710000100.000000"
             ]
+        );
+    }
+
+    #[test]
+    fn conversation_history_selection_reuses_current_or_cached_messages() {
+        let current = vec![message("1710000300.000000", "current")];
+        let cached = vec![message("1710000200.000000", "cached")];
+
+        assert_eq!(
+            conversation_history_selection_action("C1", Some("C1"), &current, None),
+            ConversationHistorySelectionAction::RenderCurrent
+        );
+        assert_eq!(
+            conversation_history_selection_action("C2", Some("C1"), &current, Some(&cached)),
+            ConversationHistorySelectionAction::RenderCached
+        );
+        assert_eq!(
+            conversation_history_selection_action("C2", Some("C1"), &current, Some(&[])),
+            ConversationHistorySelectionAction::RequestFresh
         );
     }
 }
