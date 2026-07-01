@@ -223,6 +223,7 @@ Icon-only controls have tooltips:
 - Refresh: `Refresh Conversations`
 - Workspace menu: `Workspace Menu`
 - Unread-only filter: `Show Unread Conversations`
+- All-conversations filter: `Show All Conversations`
 
 Expected keyboard order:
 
@@ -246,7 +247,7 @@ The sidebar is fully GTK4/libadwaita-native. WebKit is still used for message an
 
 ## Current Limits
 
-The sidebar currently uses member-scoped conversation data from `users.conversations` and the user-name cache. Future features should be added only when the data model and Slack API usage support them cleanly.
+The sidebar currently uses member-scoped conversation data from `users.conversations` and the user-name cache. By default it hides dormant, deleted-user, and inactive direct-message style entries unless they are unread or currently selected. The `Show All Conversations` toggle exposes the full loaded set for older or low-activity conversations. Future features should be added only when the data model and Slack API usage support them cleanly.
 
 Known limits:
 

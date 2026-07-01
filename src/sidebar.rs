@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use crate::models::SlackConversation;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
@@ -192,6 +193,43 @@ pub fn conversation_kind(conversation: &SlackConversation) -> ConversationKind {
     }
 }
 
+pub fn conversation_visible_in_default_sidebar(
+    conversation: &SlackConversation,
+    selected_channel: Option<&str>,
+) -> bool {
+    if selected_channel == Some(conversation.id.as_str()) {
+        return true;
+    }
+
+    if conversation.is_archived.unwrap_or(false) {
+        return false;
+    }
+
+    if conversation.has_unread_activity() {
+        return true;
+    }
+
+    if conversation_extra_bool(conversation, "is_user_deleted")
+        || conversation_extra_bool(conversation, "is_dormant")
+    {
+        return false;
+    }
+
+    match conversation_kind(conversation) {
+        ConversationKind::PublicChannel | ConversationKind::PrivateChannel => true,
+        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
+            conversation_extra_bool(conversation, "is_open")
+                || conversation_extra_number_positive(conversation, "priority")
+                || conversation_extra_non_zero_string(conversation, "last_read")
+        }
+        ConversationKind::Unknown => {
+            conversation_extra_bool(conversation, "is_open")
+                || conversation_extra_number_positive(conversation, "priority")
+                || conversation_extra_non_zero_string(conversation, "last_read")
+        }
+    }
+}
+
 fn section(kind: SidebarSectionKind, rows: Vec<SidebarRowModel>) -> Option<SidebarSectionModel> {
     (!rows.is_empty()).then_some(SidebarSectionModel {
         kind,
@@ -216,6 +254,43 @@ fn sort_unread_rows(rows: &mut [SidebarRowModel]) {
 
 fn title_sort_key(title: &str) -> String {
     title.trim_start_matches('#').trim_start().to_lowercase()
+}
+
+fn conversation_extra_bool(conversation: &SlackConversation, key: &str) -> bool {
+    conversation_extra_value(conversation, key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn conversation_extra_number_positive(conversation: &SlackConversation, key: &str) -> bool {
+    conversation_extra_value(conversation, key).is_some_and(|value| match value {
+        Value::Number(number) => number.as_f64().unwrap_or_default() > 0.0,
+        Value::String(value) => value.parse::<f64>().is_ok_and(|number| number > 0.0),
+        _ => false,
+    })
+}
+
+fn conversation_extra_non_zero_string(conversation: &SlackConversation, key: &str) -> bool {
+    conversation_extra_value(conversation, key).is_some_and(|value| match value {
+        Value::String(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && value != "0.000000"
+        }
+        Value::Number(number) => number.as_f64().unwrap_or_default() > 0.0,
+        _ => false,
+    })
+}
+
+fn conversation_extra_value<'a>(
+    conversation: &'a SlackConversation,
+    key: &str,
+) -> Option<&'a Value> {
+    conversation.extra.get(key).or_else(|| {
+        conversation
+            .extra
+            .get("properties")
+            .and_then(|properties| properties.get(key))
+    })
 }
 
 #[cfg(test)]
@@ -400,6 +475,66 @@ mod tests {
 
         assert_eq!(unread_row.title, "#alpha");
         assert_eq!(unread_row.unread_count, 5);
+    }
+
+    #[test]
+    fn default_sidebar_visibility_keeps_active_items_and_hides_dormant_dms() {
+        let active_channel = channel("C1", "general");
+        let active_dm: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D1",
+            "user": "U1",
+            "is_im": true,
+            "priority": 0.42
+        }))
+        .expect("failed to parse active DM");
+        let dormant_dm: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D2",
+            "user": "U2",
+            "is_im": true,
+            "properties": {
+                "is_dormant": true
+            }
+        }))
+        .expect("failed to parse dormant DM");
+        let unopened_dm = dm("D3", "U3");
+
+        assert!(conversation_visible_in_default_sidebar(
+            &active_channel,
+            None
+        ));
+        assert!(conversation_visible_in_default_sidebar(&active_dm, None));
+        assert!(!conversation_visible_in_default_sidebar(&dormant_dm, None));
+        assert!(!conversation_visible_in_default_sidebar(&unopened_dm, None));
+    }
+
+    #[test]
+    fn default_sidebar_visibility_keeps_unread_and_selected_hidden_items() {
+        let mut unread_dormant = dm("D1", "U1");
+        unread_dormant.unread_count = Some(2);
+        unread_dormant.extra.insert(
+            "properties".to_string(),
+            serde_json::json!({ "is_dormant": true }),
+        );
+        let selected_deleted: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D2",
+            "user": "U2",
+            "is_im": true,
+            "is_user_deleted": true
+        }))
+        .expect("failed to parse deleted DM");
+
+        assert!(conversation_visible_in_default_sidebar(
+            &unread_dormant,
+            None
+        ));
+        assert!(conversation_visible_in_default_sidebar(
+            &selected_deleted,
+            Some("D2")
+        ));
+        assert!(!conversation_visible_in_default_sidebar(
+            &selected_deleted,
+            None
+        ));
     }
 
     #[test]

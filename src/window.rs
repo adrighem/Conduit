@@ -83,6 +83,8 @@ mod imp {
         #[template_child]
         pub sidebar_unread_filter_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
+        pub sidebar_all_filter_button: TemplateChild<gtk::ToggleButton>,
+        #[template_child]
         pub conversation_list: TemplateChild<gtk::ListBox>,
         #[template_child]
         pub workspace_status_label: TemplateChild<gtk::Label>,
@@ -498,6 +500,13 @@ impl ConduitWindow {
 
         let weak_window = self.downgrade();
         imp.sidebar_unread_filter_button.connect_toggled(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.render_conversations();
+            }
+        });
+
+        let weak_window = self.downgrade();
+        imp.sidebar_all_filter_button.connect_toggled(move |_| {
             if let Some(window) = weak_window.upgrade() {
                 window.render_conversations();
             }
@@ -1279,6 +1288,7 @@ impl ConduitWindow {
         set_text_view_text(&imp.thread_entry, "");
         imp.sidebar_filter_entry.set_text("");
         imp.sidebar_unread_filter_button.set_active(false);
+        imp.sidebar_all_filter_button.set_active(false);
         imp.workspace_title_label.set_label("Workspace");
         imp.workspace_status_label.set_label("");
         self.clear_list(&imp.conversation_list);
@@ -1465,15 +1475,27 @@ impl ConduitWindow {
     ) -> Vec<SlackConversation> {
         let query = self.imp().sidebar_filter_entry.text().trim().to_lowercase();
         let unread_only = self.imp().sidebar_unread_filter_button.is_active();
+        let show_all = self.imp().sidebar_all_filter_button.is_active();
+        let selected_channel = self.selected_channel_id();
 
-        if query.is_empty() && !unread_only {
+        if show_all && query.is_empty() && !unread_only {
             return conversations.to_vec();
         }
 
         conversations
             .iter()
             .filter(|conversation| {
-                sidebar_conversation_matches_filters(conversation, user_names, &query, unread_only)
+                (show_all
+                    || sidebar::conversation_visible_in_default_sidebar(
+                        conversation,
+                        selected_channel.as_deref(),
+                    ))
+                    && sidebar_conversation_matches_filters(
+                        conversation,
+                        user_names,
+                        &query,
+                        unread_only,
+                    )
             })
             .cloned()
             .collect()
