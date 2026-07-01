@@ -1,0 +1,12 @@
+Phase: Quick History Switching
+
+Verification:
+- cargo test: passed, 73 tests
+- cargo check: passed
+- meson compile -C _build: passed
+
+Manual verification under standing checkpoint approval:
+- Open a conversation and wait for messages to render.
+- Switch to another conversation.
+- Switch back to the first conversation and confirm messages render immediately without a new Loading messages delay.
+- Confirm conversations with no cached messages still show Loading messages and fetch history.
