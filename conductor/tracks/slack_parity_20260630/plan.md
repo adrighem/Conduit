@@ -15,15 +15,15 @@
   - [x] Sub-task: Preserve search and unread filtering behavior
 - [x] Task: Conductor - User Manual Verification 'Slack-Like Visible Conversation Set' (Protocol in workflow.md) ff4ca7e
 
-## Phase 3: Ctrl-K Conversation Switcher
+## Phase 3: Ctrl-K Conversation Switcher [checkpoint: 3013661]
 - [x] Task: Add Ctrl-K conversation switcher 9588d32
   - [x] Sub-task: Write tests for switcher filtering and activation helpers
   - [x] Sub-task: Add modal dialog UI and shortcut wiring
   - [x] Sub-task: Select conversations from all loaded conversations
-- [ ] Task: Conductor - User Manual Verification 'Ctrl-K Conversation Switcher' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Ctrl-K Conversation Switcher' (Protocol in workflow.md) 3013661
 
 ## Phase 4: Quick History Switching
-- [ ] Task: Reuse in-memory history before fresh network loading
+- [~] Task: Reuse in-memory history before fresh network loading
   - [ ] Sub-task: Write tests for history load decision helpers
   - [ ] Sub-task: Avoid duplicate `LoadHistory` commands for current cached conversation history
   - [ ] Sub-task: Keep explicit refresh behavior available
