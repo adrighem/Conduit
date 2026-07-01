@@ -16,10 +16,10 @@
 - [x] Task: Conductor - User Manual Verification 'Slack-Like Visible Conversation Set' (Protocol in workflow.md) ff4ca7e
 
 ## Phase 3: Ctrl-K Conversation Switcher
-- [~] Task: Add Ctrl-K conversation switcher
-  - [ ] Sub-task: Write tests for switcher filtering and activation helpers
-  - [ ] Sub-task: Add modal dialog UI and shortcut wiring
-  - [ ] Sub-task: Select conversations from all loaded conversations
+- [x] Task: Add Ctrl-K conversation switcher 9588d32
+  - [x] Sub-task: Write tests for switcher filtering and activation helpers
+  - [x] Sub-task: Add modal dialog UI and shortcut wiring
+  - [x] Sub-task: Select conversations from all loaded conversations
 - [ ] Task: Conductor - User Manual Verification 'Ctrl-K Conversation Switcher' (Protocol in workflow.md)
 
 ## Phase 4: Quick History Switching
