@@ -23,8 +23,8 @@
 - [x] Task: Conductor - User Manual Verification 'Ctrl-K Conversation Switcher' (Protocol in workflow.md) 3013661
 
 ## Phase 4: Quick History Switching
-- [~] Task: Reuse in-memory history before fresh network loading
-  - [ ] Sub-task: Write tests for history load decision helpers
-  - [ ] Sub-task: Avoid duplicate `LoadHistory` commands for current cached conversation history
-  - [ ] Sub-task: Keep explicit refresh behavior available
+- [x] Task: Reuse in-memory history before fresh network loading 1c42058
+  - [x] Sub-task: Write tests for history load decision helpers
+  - [x] Sub-task: Avoid duplicate `LoadHistory` commands for current cached conversation history
+  - [x] Sub-task: Keep explicit refresh behavior available
 - [ ] Task: Conductor - User Manual Verification 'Quick History Switching' (Protocol in workflow.md)
