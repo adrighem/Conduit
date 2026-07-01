@@ -1,0 +1,19 @@
+Task: Add Ctrl-K conversation switcher
+
+Summary:
+- Added a Ctrl-K window action and accelerator for conversation switching.
+- Added a modal switcher with search, Escape-to-close, and row activation.
+- Search covers all loaded conversations, including inactive conversations hidden from the default sidebar.
+- Added shortcut help entry and unit tests for switcher item filtering.
+
+Modified files:
+- src/window.rs
+- src/shortcuts-dialog.ui
+
+Validation:
+- cargo test: passed, 72 tests
+- cargo check: passed
+- meson compile -C _build: passed
+
+Rationale:
+Provide Slack-like quick conversation navigation without requiring users to expose every conversation in the sidebar.
