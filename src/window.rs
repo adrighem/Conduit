@@ -21,6 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -259,6 +260,45 @@ fn sidebar_conversation_matches_filters(
     let matches_unread = !unread_only || conversation.has_unread_activity();
 
     matches_query && matches_unread
+}
+
+fn conversation_switcher_items(
+    conversations: &[SlackConversation],
+    user_names: &HashMap<String, String>,
+    query: &str,
+) -> Vec<SidebarRowModel> {
+    let query = query.trim().to_lowercase();
+    let mut items = conversations
+        .iter()
+        .filter(|conversation| !conversation.is_archived.unwrap_or(false))
+        .map(|conversation| {
+            let kind = sidebar::conversation_kind(conversation);
+            SidebarRowModel {
+                id: conversation.id.clone(),
+                title: conversation.display_name_with_users(user_names),
+                kind,
+                unread_count: conversation.unread_activity_count(),
+                selected: false,
+                private: conversation.is_private.unwrap_or(false)
+                    || conversation.is_group.unwrap_or(false)
+                    || matches!(kind, sidebar::ConversationKind::PrivateChannel),
+                muted: conversation.is_muted_conversation(),
+                external: conversation.is_external_conversation(),
+            }
+        })
+        .filter(|item| {
+            query.is_empty()
+                || item.title.to_lowercase().contains(&query)
+                || item.id.to_lowercase().contains(&query)
+        })
+        .collect::<Vec<_>>();
+
+    items.sort_by_key(|item| (switcher_title_sort_key(&item.title), item.id.to_lowercase()));
+    items
+}
+
+fn switcher_title_sort_key(title: &str) -> String {
+    title.trim_start_matches('#').trim_start().to_lowercase()
 }
 
 fn message_navigation_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
@@ -543,6 +583,19 @@ impl ConduitWindow {
             }
         });
         self.add_action(&sign_out_action);
+
+        let switch_action = gio::SimpleAction::new("switch-conversation", None);
+        let weak_window = self.downgrade();
+        switch_action.connect_activate(move |_, _| {
+            if let Some(window) = weak_window.upgrade() {
+                window.show_conversation_switcher();
+            }
+        });
+        self.add_action(&switch_action);
+
+        if let Some(application) = self.application() {
+            application.set_accels_for_action("win.switch-conversation", &["<control>k"]);
+        }
     }
 
     fn connect_widget<W, F>(&self, widget: &W, callback: F)
@@ -1595,6 +1648,158 @@ impl ConduitWindow {
         }
     }
 
+    fn show_conversation_switcher(&self) {
+        let imp = self.imp();
+        let conversations = imp.conversations.borrow().clone();
+        let user_names = imp.user_names.borrow().clone();
+        let items = conversation_switcher_items(&conversations, &user_names, "");
+        if items.is_empty() {
+            self.set_status("No conversations loaded");
+            return;
+        }
+
+        let dialog = gtk::Window::builder()
+            .title("Switch conversation")
+            .transient_for(self)
+            .modal(true)
+            .default_width(520)
+            .default_height(560)
+            .build();
+
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        container.set_margin_top(12);
+        container.set_margin_bottom(12);
+        container.set_margin_start(12);
+        container.set_margin_end(12);
+        dialog.set_child(Some(&container));
+
+        let close_controller = gtk::EventControllerKey::new();
+        let dialog_for_close = dialog.clone();
+        close_controller.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                dialog_for_close.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        dialog.add_controller(close_controller);
+
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some("Search conversations"));
+        container.append(&search);
+
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::Single);
+        list.set_activate_on_single_click(true);
+        list.add_css_class("navigation-sidebar");
+
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_vexpand(true);
+        scroller.set_child(Some(&list));
+        container.append(&scroller);
+
+        let actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        self.populate_conversation_switcher_list(&list, &actions, &items);
+
+        let weak_window = self.downgrade();
+        let list_for_search = list.clone();
+        let actions_for_search = actions.clone();
+        let conversations_for_search = conversations.clone();
+        let user_names_for_search = user_names.clone();
+        search.connect_search_changed(move |entry| {
+            if let Some(window) = weak_window.upgrade() {
+                let items = conversation_switcher_items(
+                    &conversations_for_search,
+                    &user_names_for_search,
+                    entry.text().as_str(),
+                );
+                window.populate_conversation_switcher_list(
+                    &list_for_search,
+                    &actions_for_search,
+                    &items,
+                );
+            }
+        });
+
+        let weak_window = self.downgrade();
+        let actions_for_activate = actions.clone();
+        let dialog_for_activate = dialog.clone();
+        list.connect_row_activated(move |_, row| {
+            let action = sidebar_row_action_for_index(&actions_for_activate.borrow(), row.index());
+            if let (Some(window), Some(action)) = (weak_window.upgrade(), action) {
+                window.select_conversation(&action.channel_id, &action.title);
+                dialog_for_activate.close();
+            }
+        });
+
+        dialog.present();
+        search.grab_focus();
+    }
+
+    fn populate_conversation_switcher_list(
+        &self,
+        list: &gtk::ListBox,
+        actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
+        items: &[SidebarRowModel],
+    ) {
+        self.clear_list(list);
+        actions.borrow_mut().clear();
+
+        if items.is_empty() {
+            self.append_placeholder(list, "No matching conversations");
+            return;
+        }
+
+        for item in items {
+            self.append_conversation_switcher_row(list, actions, item);
+        }
+    }
+
+    fn append_conversation_switcher_row(
+        &self,
+        list: &gtk::ListBox,
+        actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
+        model: &SidebarRowModel,
+    ) {
+        let row = gtk::ListBoxRow::new();
+        row.set_selectable(true);
+        row.set_activatable(true);
+        let accessible_label = model.accessible_label();
+        row.set_tooltip_text(Some(&accessible_label));
+        row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
+
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        content.set_margin_top(6);
+        content.set_margin_bottom(6);
+        content.set_margin_start(8);
+        content.set_margin_end(8);
+
+        let icon = gtk::Image::from_icon_name(model.kind.icon_name());
+        icon.set_tooltip_text(Some(model.kind.accessible_name()));
+        content.append(&icon);
+
+        let title = gtk::Label::new(Some(&model.title));
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        content.append(&title);
+
+        if let Some(unread_label) = model.unread_badge_label() {
+            let unread = gtk::Label::new(Some(&unread_label));
+            unread.add_css_class("caption");
+            unread.add_css_class("heading");
+            content.append(&unread);
+        }
+
+        row.set_child(Some(&content));
+        list.append(&row);
+        actions
+            .borrow_mut()
+            .insert(row.index(), SidebarRowAction::from_model(model));
+    }
+
     fn refresh_current_conversation_title(&self) {
         let imp = self.imp();
         if imp.current_main_view.get() == MainMessageView::Conversation {
@@ -2142,6 +2347,55 @@ mod tests {
             "random",
             true
         ));
+    }
+
+    #[test]
+    fn conversation_switcher_items_search_all_loaded_conversations() {
+        let active = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let dormant_dm: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D123",
+            "user": "U123",
+            "is_im": true,
+            "properties": {
+                "is_dormant": true
+            }
+        }))
+        .expect("failed to parse dormant DM");
+        let user_names = HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]);
+
+        let items = conversation_switcher_items(&[active, dormant_dm], &user_names, "ada");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "D123");
+        assert_eq!(items[0].title, "Ada Lovelace");
+    }
+
+    #[test]
+    fn conversation_switcher_items_match_title_and_id() {
+        let general = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let random = SlackConversation {
+            id: "C456".to_string(),
+            name: Some("random".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+
+        let title_match =
+            conversation_switcher_items(&[general.clone(), random.clone()], &HashMap::new(), "gen");
+        let id_match = conversation_switcher_items(&[general, random], &HashMap::new(), "456");
+
+        assert_eq!(title_match[0].id, "C123");
+        assert_eq!(id_match[0].id, "C456");
     }
 
     #[test]

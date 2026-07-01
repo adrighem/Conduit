@@ -12,6 +12,12 @@
         </child>
         <child>
           <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Switch Conversation</property>
+            <property name="accelerator">&lt;Control&gt;k</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
             <property name="title" translatable="yes" context="shortcut window">Quit</property>
             <property name="accelerator">&lt;Control&gt;q</property>
           </object>
