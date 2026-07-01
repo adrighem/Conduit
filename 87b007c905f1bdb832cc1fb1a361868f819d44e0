@@ -1,0 +1,21 @@
+Task: Add active-only sidebar filtering with all-conversations override
+
+Summary:
+- Added default sidebar visibility classification for active/member-style conversations.
+- Hid dormant, deleted-user, and inactive DM-style entries by default while preserving unread and selected conversations.
+- Added a Show All Conversations sidebar toggle.
+- Documented the default visible set and override control.
+
+Modified files:
+- docs/sidebar-design.md
+- src/sidebar.rs
+- src/window.rs
+- src/window.ui
+
+Validation:
+- cargo test: passed, 70 tests
+- cargo check: passed
+- meson compile -C _build: passed
+
+Rationale:
+Make Conduit's sidebar closer to Slack's default visible conversation set without losing access to older loaded conversations.
