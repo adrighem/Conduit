@@ -8,15 +8,15 @@
   - [x] Sub-task: Keep debug logs compact by default
 - [x] Task: Conductor - User Manual Verification 'Member-Scoped Sidebar Loading' (Protocol in workflow.md) d797e7c
 
-## Phase 2: Slack-Like Visible Conversation Set
+## Phase 2: Slack-Like Visible Conversation Set [checkpoint: ff4ca7e]
 - [x] Task: Add active-only sidebar filtering with all-conversations override 87b007c
   - [x] Sub-task: Write tests for visible conversation classification
   - [x] Sub-task: Add the sidebar override control
   - [x] Sub-task: Preserve search and unread filtering behavior
-- [ ] Task: Conductor - User Manual Verification 'Slack-Like Visible Conversation Set' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Slack-Like Visible Conversation Set' (Protocol in workflow.md) ff4ca7e
 
 ## Phase 3: Ctrl-K Conversation Switcher
-- [ ] Task: Add Ctrl-K conversation switcher
+- [~] Task: Add Ctrl-K conversation switcher
   - [ ] Sub-task: Write tests for switcher filtering and activation helpers
   - [ ] Sub-task: Add modal dialog UI and shortcut wiring
   - [ ] Sub-task: Select conversations from all loaded conversations
