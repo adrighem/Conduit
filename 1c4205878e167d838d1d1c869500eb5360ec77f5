@@ -1,0 +1,19 @@
+Task: Reuse in-memory history before fresh network loading
+
+Summary:
+- Added a per-channel in-memory message cache in the window state.
+- Stored populated channel histories in that cache.
+- Reused current or cached channel history when selecting conversations.
+- Avoided sending duplicate LoadHistory commands when cached messages are available.
+- Added unit coverage for the history selection decision helper.
+
+Modified files:
+- src/window.rs
+
+Validation:
+- cargo test: passed, 73 tests
+- cargo check: passed
+- meson compile -C _build: passed
+
+Rationale:
+Make switching between recently visited conversations feel immediate and reduce unnecessary Slack history API calls.
