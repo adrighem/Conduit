@@ -1,0 +1,13 @@
+Phase: Ctrl-K Conversation Switcher
+
+Verification:
+- cargo test: passed, 72 tests
+- cargo check: passed
+- meson compile -C _build: passed
+
+Manual verification under standing checkpoint approval:
+- Launch _build/src/conduit.
+- Press Ctrl-K and confirm the switcher opens.
+- Type a channel, DM, or conversation ID fragment and confirm results filter.
+- Activate a row and confirm the conversation opens and the switcher closes.
+- Press Escape and confirm the switcher closes.
