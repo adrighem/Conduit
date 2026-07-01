@@ -9,5 +9,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Slack browser/app navigation parity
+## [x] Track: Slack browser/app navigation parity
 *Link: [./conductor/tracks/slack_parity_20260630/](./conductor/tracks/slack_parity_20260630/)*

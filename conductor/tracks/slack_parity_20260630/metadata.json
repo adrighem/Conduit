@@ -1,8 +1,8 @@
 {
   "track_id": "slack_parity_20260630",
   "type": "feature",
-  "status": "in_progress",
+  "status": "completed",
   "created_at": "2026-06-30T22:00:05Z",
-  "updated_at": "2026-07-01T05:44:09Z",
+  "updated_at": "2026-07-01T05:44:39Z",
   "description": "Implement practical Slack browser/app navigation parity for sidebar visibility, Ctrl-K switching, and quick history loading."
 }
