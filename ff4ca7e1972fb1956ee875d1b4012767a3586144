@@ -1,0 +1,12 @@
+Phase: Slack-Like Visible Conversation Set
+
+Verification:
+- cargo test: passed, 70 tests
+- cargo check: passed
+- meson compile -C _build: passed
+
+Manual verification under standing checkpoint approval:
+- Launch _build/src/conduit --debug.
+- Confirm the sidebar defaults to active conversations.
+- Toggle Show All Conversations and confirm older/dormant loaded conversations become available.
+- Confirm unread filter and text filtering still work with the default and all-conversation modes.
