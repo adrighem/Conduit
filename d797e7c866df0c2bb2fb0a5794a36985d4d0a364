@@ -1,0 +1,15 @@
+Phase: Member-Scoped Sidebar Loading
+
+Verification:
+- cargo test: passed, 68 tests
+- cargo check: passed
+- meson compile -C _build: passed
+
+Manual verification plan approved by user as standing checkpoint approval:
+- Run _build/src/conduit --debug
+- Expect cached conversations to load, users.conversations to return conversations, and ConversationsLoaded to be emitted.
+
+Result from prior live debug run:
+- CachedConversationsLoaded count=1227
+- users.conversations returned 1227 conversations
+- ConversationsLoaded count=1227
