@@ -1,0 +1,8 @@
+{
+  "track_id": "speed_cache_20260703",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-07-03T15:05:55Z",
+  "updated_at": "2026-07-03T15:05:55Z",
+  "description": "Improve sidebar responsiveness, channel-history caching, pagination, and bottom scroll anchoring."
+}
