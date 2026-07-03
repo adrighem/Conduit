@@ -270,6 +270,18 @@ fn sidebar_conversation_matches_filters(
     matches_query && matches_unread
 }
 
+fn sidebar_loading_change_needs_render(
+    has_conversations: bool,
+    current_loading: bool,
+    next_loading: bool,
+) -> bool {
+    current_loading != next_loading && !has_conversations
+}
+
+fn sidebar_error_change_needs_render(has_conversations: bool) -> bool {
+    !has_conversations
+}
+
 fn conversation_switcher_items(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
@@ -1400,11 +1412,19 @@ impl ConduitWindow {
 
     fn set_sidebar_loading(&self, loading: bool) {
         let imp = self.imp();
+        let has_conversations = !imp.conversations.borrow().is_empty();
+        let should_render = sidebar_loading_change_needs_render(
+            has_conversations,
+            imp.sidebar_loading.get(),
+            loading,
+        );
         imp.sidebar_loading.set(loading);
         if loading {
             *imp.sidebar_error.borrow_mut() = None;
         }
-        self.render_conversations();
+        if should_render {
+            self.render_conversations();
+        }
     }
 
     fn show_error(&self, error: &str) {
@@ -1428,9 +1448,13 @@ impl ConduitWindow {
     }
 
     fn set_sidebar_error(&self, error: &str) {
-        self.imp().sidebar_loading.set(false);
-        *self.imp().sidebar_error.borrow_mut() = Some(error.to_string());
-        self.render_conversations();
+        let imp = self.imp();
+        let has_conversations = !imp.conversations.borrow().is_empty();
+        imp.sidebar_loading.set(false);
+        *imp.sidebar_error.borrow_mut() = Some(error.to_string());
+        if sidebar_error_change_needs_render(has_conversations) {
+            self.render_conversations();
+        }
     }
 
     fn populate_conversations(&self, conversations: Vec<SlackConversation>) {
@@ -2397,6 +2421,21 @@ mod tests {
             "random",
             true
         ));
+    }
+
+    #[test]
+    fn sidebar_loading_change_rerenders_only_when_list_state_changes() {
+        assert!(sidebar_loading_change_needs_render(false, false, true));
+        assert!(sidebar_loading_change_needs_render(false, true, false));
+        assert!(!sidebar_loading_change_needs_render(true, false, true));
+        assert!(!sidebar_loading_change_needs_render(true, true, false));
+        assert!(!sidebar_loading_change_needs_render(false, true, true));
+    }
+
+    #[test]
+    fn sidebar_error_change_preserves_populated_list() {
+        assert!(sidebar_error_change_needs_render(false));
+        assert!(!sidebar_error_change_needs_render(true));
     }
 
     #[test]
