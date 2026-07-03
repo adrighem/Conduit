@@ -14,5 +14,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [ ] Track: Speed optimization and channel caching
+## [~] Track: Speed optimization and channel caching
 *Link: [./conductor/tracks/speed_cache_20260703/](./conductor/tracks/speed_cache_20260703/)*

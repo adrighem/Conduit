@@ -1,11 +1,11 @@
 # Track Plan
 
 ## Phase 1: Stable Sidebar During Conversation Refresh
-- [ ] Task: Keep populated sidebar interactive during refresh
-  - [ ] Sub-task: Write tests for sidebar render policy when loading with existing conversations
-  - [ ] Sub-task: Avoid list replacement for loading/error states when conversations are already available
-  - [ ] Sub-task: Preserve selection, filters, toggles, and list scroll during refresh
-  - [ ] Sub-task: Reduce avoidable full sidebar rebuilds from status-only updates
+- [x] Task: Keep populated sidebar interactive during refresh 6eac9a8
+  - [x] Sub-task: Write tests for sidebar render policy when loading with existing conversations
+  - [x] Sub-task: Avoid list replacement for loading/error states when conversations are already available
+  - [x] Sub-task: Preserve selection, filters, toggles, and list scroll during refresh
+  - [x] Sub-task: Reduce avoidable full sidebar rebuilds from status-only updates
 - [ ] Task: Conductor - User Manual Verification 'Stable Sidebar During Conversation Refresh' (Protocol in workflow.md)
 
 ## Phase 2: Fast Channel Opening And Bounded History Cache
