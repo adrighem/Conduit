@@ -6,6 +6,10 @@
   - [x] Sub-task: Avoid list replacement for loading/error states when conversations are already available
   - [x] Sub-task: Preserve selection, filters, toggles, and list scroll during refresh
   - [x] Sub-task: Reduce avoidable full sidebar rebuilds from status-only updates
+- [x] Task: Suppress sidebar rebuilds from user-name refresh churn db93e6b
+  - [x] Sub-task: Write tests for user-name sidebar render policy during refresh
+  - [x] Sub-task: Render sidebar only when a loaded user changes a visible DM row
+  - [x] Sub-task: Defer user-name sidebar rerenders while conversation refresh is active
 - [ ] Task: Conductor - User Manual Verification 'Stable Sidebar During Conversation Refresh' (Protocol in workflow.md)
 
 ## Phase 2: Fast Channel Opening And Bounded History Cache
