@@ -144,6 +144,7 @@ mod imp {
         pub selected_channel: RefCell<Option<String>>,
         pub selected_thread_ts: RefCell<Option<String>>,
         pub channel_history_cursors: RefCell<HashMap<String, String>>,
+        pub loading_channel_histories: RefCell<HashSet<String>>,
         pub thread_history_cursors: RefCell<HashMap<String, String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
         pub thread_view: RefCell<Option<webkit6::WebView>>,
@@ -241,7 +242,9 @@ pub enum MainMessageView {
 enum ConversationHistorySelectionAction {
     RenderCurrent,
     RenderCached,
+    RenderCachedAndRefresh,
     RequestFresh,
+    AwaitFresh,
 }
 
 fn sidebar_selected_channel(
@@ -407,14 +410,28 @@ fn conversation_history_selection_action(
     selected_channel: Option<&str>,
     current_messages: &[SlackMessage],
     cached_messages: Option<&[SlackMessage]>,
+    fresh_load_in_progress: bool,
 ) -> ConversationHistorySelectionAction {
     if selected_channel == Some(requested_channel) && !current_messages.is_empty() {
         ConversationHistorySelectionAction::RenderCurrent
-    } else if cached_messages.is_some_and(|messages| !messages.is_empty()) {
+    } else if cached_messages.is_some_and(|messages| !messages.is_empty()) && fresh_load_in_progress
+    {
         ConversationHistorySelectionAction::RenderCached
+    } else if cached_messages.is_some_and(|messages| !messages.is_empty()) {
+        ConversationHistorySelectionAction::RenderCachedAndRefresh
+    } else if fresh_load_in_progress {
+        ConversationHistorySelectionAction::AwaitFresh
     } else {
         ConversationHistorySelectionAction::RequestFresh
     }
+}
+
+fn history_event_updates_fresh_metadata(cached: bool) -> bool {
+    !cached
+}
+
+fn history_event_marks_read(cached: bool, append_older: bool) -> bool {
+    !cached && !append_older
 }
 
 fn text_view_text(text_view: &gtk::TextView) -> String {
@@ -735,9 +752,16 @@ impl ConduitWindow {
                 has_more,
                 next_cursor,
                 append_older,
+                cached,
             } => {
-                self.set_channel_history_cursor(&channel_id, has_more, next_cursor);
-                if !append_older {
+                if history_event_updates_fresh_metadata(cached) {
+                    self.set_channel_history_cursor(&channel_id, has_more, next_cursor);
+                }
+                if history_event_marks_read(cached, append_older) {
+                    self.imp()
+                        .loading_channel_histories
+                        .borrow_mut()
+                        .remove(&channel_id);
                     self.notify_if_new_messages(&channel_id, &messages);
                     self.mark_conversation_locally_read(&channel_id);
                 }
@@ -1373,6 +1397,7 @@ impl ConduitWindow {
         *imp.selected_channel.borrow_mut() = None;
         *imp.selected_thread_ts.borrow_mut() = None;
         imp.channel_history_cursors.borrow_mut().clear();
+        imp.loading_channel_histories.borrow_mut().clear();
         imp.thread_history_cursors.borrow_mut().clear();
         *imp.current_user_id.borrow_mut() = None;
         imp.latest_message_ts_by_channel.borrow_mut().clear();
@@ -1454,6 +1479,7 @@ impl ConduitWindow {
         self.imp().thread_send_button.set_sensitive(true);
         self.imp().upload_button.set_sensitive(true);
         self.imp().upload_progress.set_visible(false);
+        self.imp().loading_channel_histories.borrow_mut().clear();
         if self.imp().content_stack.visible_child_name().as_deref() == Some("loading") {
             self.show_login(error);
         } else {
@@ -1888,11 +1914,13 @@ impl ConduitWindow {
         let previous_channel = imp.selected_channel.borrow().clone();
         let current_messages = imp.current_channel_messages.borrow().clone();
         let cached_messages = imp.channel_message_cache.borrow().get(channel_id).cloned();
+        let fresh_load_in_progress = imp.loading_channel_histories.borrow().contains(channel_id);
         let history_action = conversation_history_selection_action(
             channel_id,
             previous_channel.as_deref(),
             &current_messages,
             cached_messages.as_deref(),
+            fresh_load_in_progress,
         );
 
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
@@ -1917,16 +1945,41 @@ impl ConduitWindow {
                     self.populate_history(channel_id, messages);
                 }
             }
+            ConversationHistorySelectionAction::RenderCachedAndRefresh => {
+                if let Some(messages) = cached_messages {
+                    self.populate_history(channel_id, messages);
+                }
+                self.request_channel_history(channel_id);
+            }
             ConversationHistorySelectionAction::RequestFresh => {
                 self.load_message_html(&message_html::placeholder_document(
                     "Messages",
                     "Loading messages",
                 ));
-                self.send_command(RuntimeCommand::LoadHistory {
-                    channel_id: channel_id.to_string(),
-                });
+                self.request_channel_history(channel_id);
+            }
+            ConversationHistorySelectionAction::AwaitFresh => {
+                self.load_message_html(&message_html::placeholder_document(
+                    "Messages",
+                    "Loading messages",
+                ));
             }
         }
+    }
+
+    fn request_channel_history(&self, channel_id: &str) {
+        if !self
+            .imp()
+            .loading_channel_histories
+            .borrow_mut()
+            .insert(channel_id.to_string())
+        {
+            return;
+        }
+
+        self.send_command(RuntimeCommand::LoadHistory {
+            channel_id: channel_id.to_string(),
+        });
     }
 
     fn populate_history(&self, channel_id: &str, messages: Vec<SlackMessage>) {
@@ -2596,16 +2649,42 @@ mod tests {
         let cached = vec![message("1710000200.000000", "cached")];
 
         assert_eq!(
-            conversation_history_selection_action("C1", Some("C1"), &current, None),
+            conversation_history_selection_action("C1", Some("C1"), &current, None, false),
             ConversationHistorySelectionAction::RenderCurrent
         );
         assert_eq!(
-            conversation_history_selection_action("C2", Some("C1"), &current, Some(&cached)),
+            conversation_history_selection_action("C2", Some("C1"), &current, Some(&cached), false),
+            ConversationHistorySelectionAction::RenderCachedAndRefresh
+        );
+        assert_eq!(
+            conversation_history_selection_action("C2", Some("C1"), &current, Some(&[]), false),
+            ConversationHistorySelectionAction::RequestFresh
+        );
+    }
+
+    #[test]
+    fn conversation_history_selection_avoids_duplicate_fresh_loads() {
+        let current = vec![message("1710000300.000000", "current")];
+        let cached = vec![message("1710000200.000000", "cached")];
+
+        assert_eq!(
+            conversation_history_selection_action("C2", Some("C1"), &current, Some(&cached), true),
             ConversationHistorySelectionAction::RenderCached
         );
         assert_eq!(
-            conversation_history_selection_action("C2", Some("C1"), &current, Some(&[])),
-            ConversationHistorySelectionAction::RequestFresh
+            conversation_history_selection_action("C2", Some("C1"), &current, Some(&[]), true),
+            ConversationHistorySelectionAction::AwaitFresh
         );
+    }
+
+    #[test]
+    fn cached_history_events_do_not_update_fresh_metadata_or_read_state() {
+        assert!(!history_event_updates_fresh_metadata(true));
+        assert!(!history_event_marks_read(true, false));
+        assert!(!history_event_marks_read(true, true));
+
+        assert!(history_event_updates_fresh_metadata(false));
+        assert!(history_event_marks_read(false, false));
+        assert!(!history_event_marks_read(false, true));
     }
 }

@@ -101,6 +101,7 @@ pub enum RuntimeEvent {
         has_more: bool,
         next_cursor: Option<String>,
         append_older: bool,
+        cached: bool,
     },
     ThreadLoaded {
         channel_id: String,
@@ -660,6 +661,7 @@ fn send_history_loaded(
         has_more: page.has_more,
         next_cursor: page.next_cursor,
         append_older,
+        cached: false,
     });
 }
 
@@ -794,6 +796,7 @@ async fn load_cached_history(
                 has_more: false,
                 next_cursor: None,
                 append_older: false,
+                cached: true,
             });
         }
         Ok(None) => {}
