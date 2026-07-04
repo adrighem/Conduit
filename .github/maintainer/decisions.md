@@ -57,3 +57,19 @@
 - Kept the session work split into focused local commits: cache behavior, debug diagnostics, and sidebar icon resources.
 - Treated `--debug` conversation dumps as sensitive diagnostics and documented that they may include private workspace metadata while still avoiding access tokens and authorization codes.
 - Did not push the local commits because pushing is a public repository action and needs explicit approval.
+
+## 2026-06-20 Modernization Follow-up
+
+- Continued maintainer workflow with manual fallback because the installed skill package still lacks its referenced triage script and reference files.
+- No issue or PR triage action is needed: the open and fetched historical GitHub backlog is empty.
+- Treat the post-modernization feature set as ready for release-readiness validation rather than more breadth-first feature work.
+- Prioritize real-workspace smoke testing, OAuth scope migration notes, and Flatpak/release packaging because those reduce likely user setup and support failures.
+- No issue, pull request, label, release, or public comment action was taken.
+
+## 2026-07-03 Maintainer Pass
+
+- Continued maintainer workflow with manual fallback because the installed skill package still lacks its referenced triage script and reference files.
+- No public triage action is needed: inbox notifications, issues, pull requests, Dependabot alerts, code scanning alerts, historical issues, and historical pull requests are all empty.
+- Implemented the low-risk OAuth scope migration documentation locally instead of opening a tracking issue.
+- Treat real-workspace OAuth reconnect smoke testing and Flatpak packaging validation as the next maintenance priorities.
+- No issue, pull request, label, release, or public comment action was taken.

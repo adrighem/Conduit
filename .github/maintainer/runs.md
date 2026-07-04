@@ -120,3 +120,51 @@
 - Notes:
   - The installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback.
   - No public GitHub action was taken. Pushing the local commits requires explicit approval.
+
+## 2026-06-20 Modernization Follow-up
+
+- Scope: manual maintainer pass after the modernization build-out through `50f4c05` (`Render Slack product surface action links`).
+- GitHub backlog: 0 open issues, 0 open pull requests, 0 historical issues, and 0 historical pull requests returned by `gh`.
+- Recent GitHub Actions: latest visible CI and CodeQL runs on `main` are passing for `50f4c05`.
+- Branch state:
+  - `main` is aligned with `origin/main`.
+  - Worktree was clean before recording this maintainer update.
+- Local checks:
+  - `cargo fmt --check`: pass
+  - `cargo test`: pass, 60 tests
+  - `cargo clippy --all-targets -- -D warnings`: pass
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, 4 Meson tests
+- Recommendations:
+  - Run a real-workspace release smoke pass before adding more broad Slack surface area.
+  - Document OAuth scope migration expectations for users who authenticated before read markers and file access were added.
+  - Keep Flatpak and release packaging as the next preventive support-load reducer.
+- Notes:
+  - The installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback.
+  - No issue, pull request, label, release, or public comment action was taken.
+
+## 2026-07-03 Maintainer Pass
+
+- Scope: manual maintainer pass after the Slack parity track completed through `9623c82` (`conductor(plan): Complete Slack parity track`).
+- GitHub backlog: 0 unread notifications, 0 open issues, 0 open pull requests, 0 Dependabot alerts, 0 code scanning alerts, 0 historical issues, and 0 historical pull requests returned by `gh-helper` and `gh`.
+- Recent GitHub Actions: latest visible CI and CodeQL runs on `main` are passing for `9623c82`.
+- Branch state:
+  - `main` is aligned with `origin/main` at `9623c82`.
+  - Worktree had prior uncommitted maintainer-memory updates before this pass; this run preserved them and added release-readiness docs.
+- Local changes:
+  - Added README guidance for testers who authenticated before new Slack scopes were added: sign out, confirm scopes, and reconnect.
+  - Added a release-checklist gate to verify scope documentation and reconnect instructions when requested scopes change.
+- Local checks:
+  - `cargo fmt --check`: pass
+  - `cargo test`: pass, 73 tests
+  - `cargo clippy --all-targets -- -D warnings`: pass
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, 4 Meson tests
+  - `git diff --check`: pass
+- Recommendations:
+  - Run a real-workspace release smoke pass with OAuth reconnect before adding more broad Slack surface area.
+  - Start Flatpak dependency vendoring and sandbox checks next, because packaging is now the highest support-risk area.
+  - Keep Slack scope changes paired with explicit migration notes.
+- Notes:
+  - The installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback.
+  - No issue, pull request, label, release, or public comment action was taken.

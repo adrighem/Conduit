@@ -42,3 +42,15 @@
 - Theme-dependent icon names are brittle for core navigation. Prefer app-owned symbolic icons when the desired metaphor is not available in stock Adwaita.
 - Diagnostic logging that prints Slack conversation objects should preserve unknown API fields, because unread state often depends on fields the UI does not yet model.
 - Keep cache files under the XDG cache root. WebKit persistent storage and app-managed image preview caches should not write to data directories unless the data is user-owned state.
+
+## 2026-06-20 Modernization Follow-up
+
+- After a broad modernization stack lands with green CI and an empty public backlog, maintenance risk shifts from implementation throughput to real-workspace integration, setup clarity, and release packaging.
+- New Slack API scopes should be documented as migration-sensitive changes because existing keyring tokens may not have the permissions expected by newer UI paths.
+- Keep advanced Slack product surfaces as link-and-handoff experiences unless a stable lightweight API makes native support cheap to test and maintain.
+
+## 2026-07-03 Maintainer Pass
+
+- Scope changes need user-facing reconnect guidance, not just a current scope list, because Slack may keep older OAuth grants for existing testers.
+- Release readiness checks should explicitly verify scope migration notes whenever requested Slack permissions change.
+- With GitHub backlog and security alerts empty, packaging and real-workspace smoke tests are higher leverage than more feature breadth.
