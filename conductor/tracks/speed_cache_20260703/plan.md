@@ -30,8 +30,8 @@
   - [x] Sub-task: Scroll to the bottom after initial channel render and sent-message render
   - [x] Sub-task: Keep bottom anchoring when the user was already at the bottom
   - [x] Sub-task: Avoid stealing scroll when the user is reading older messages
-- [ ] Task: Preserve reading position while loading older messages
-  - [ ] Sub-task: Write tests or a small harness for prepend scroll behavior
-  - [ ] Sub-task: Maintain visible position when older messages are prepended above the current viewport
-  - [ ] Sub-task: Keep the top **Load older messages** affordance reachable
+- [x] Task: Preserve reading position while loading older messages 66910c5
+  - [x] Sub-task: Write tests or a small harness for prepend scroll behavior
+  - [x] Sub-task: Maintain visible position when older messages are prepended above the current viewport
+  - [x] Sub-task: Keep the top **Load older messages** affordance reachable
 - [ ] Task: Conductor - User Manual Verification 'Bottom Anchoring And Auto-Scroll' (Protocol in workflow.md)
