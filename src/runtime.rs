@@ -363,6 +363,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             );
             context.events.send_status("Loading older messages");
             let page = api.history_page(&channel_id, Some(&cursor)).await?;
+            store_merged_history(context.workspace_store, &channel_id, &page.messages).await;
             send_history_loaded(context.events, channel_id, page, true);
         }
         RuntimeCommand::LoadThread { channel_id, ts } => {
@@ -820,6 +821,23 @@ async fn store_history(
         crate::debug::log(
             "runtime",
             &format!("CachedHistoryStoreFailed channel_id={channel_id} error={error:#}"),
+        );
+    }
+}
+
+async fn store_merged_history(
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+    messages: &[SlackMessage],
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    if let Err(error) = store.store_merged_history(channel_id, messages).await {
+        crate::debug::log(
+            "runtime",
+            &format!("CachedHistoryMergedStoreFailed channel_id={channel_id} error={error:#}"),
         );
     }
 }

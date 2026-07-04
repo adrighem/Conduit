@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::models::{SlackConversation, SlackMessage};
 
 const CACHE_VERSION: u32 = 1;
+const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceStore {
@@ -51,7 +52,25 @@ impl WorkspaceStore {
         let mut state = self.load_state_for_update().await;
         state
             .channel_histories
-            .insert(channel_id.to_string(), messages.to_vec());
+            .insert(channel_id.to_string(), pruned_history(messages.to_vec()));
+        self.store_state(&state).await
+    }
+
+    pub async fn store_merged_history(
+        &self,
+        channel_id: &str,
+        messages: &[SlackMessage],
+    ) -> Result<()> {
+        let mut state = self.load_state_for_update().await;
+        let existing = state
+            .channel_histories
+            .get(channel_id)
+            .cloned()
+            .unwrap_or_default();
+        state.channel_histories.insert(
+            channel_id.to_string(),
+            merge_history_pages(&existing, messages),
+        );
         self.store_state(&state).await
     }
 
@@ -175,6 +194,19 @@ fn cache_key(value: &str) -> String {
 
 fn thread_key(channel_id: &str, thread_ts: &str) -> String {
     format!("{channel_id}:{thread_ts}")
+}
+
+fn merge_history_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
+    let mut messages = existing.to_vec();
+    messages.extend(page.iter().cloned());
+    pruned_history(messages)
+}
+
+fn pruned_history(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+    messages.sort_by(|left, right| right.ts.cmp(&left.ts));
+    messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
+    messages.truncate(MAX_CACHED_CHANNEL_MESSAGES);
+    messages
 }
 
 #[cfg(test)]
@@ -303,6 +335,111 @@ mod tests {
                     .expect("missing cached conversations")[0]
                     .id,
                 "C123"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_merges_paged_history_newest_first() {
+        let directory = temp_cache_dir("workspace-store-merged-history");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_history(
+                    "C123",
+                    &[
+                        SlackMessage {
+                            ts: "1710000300.000000".to_string(),
+                            text: Some("new".to_string()),
+                            ..Default::default()
+                        },
+                        SlackMessage {
+                            ts: "1710000200.000000".to_string(),
+                            text: Some("middle".to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                )
+                .await
+                .expect("history store failed");
+
+            store
+                .store_merged_history(
+                    "C123",
+                    &[
+                        SlackMessage {
+                            ts: "1710000200.000000".to_string(),
+                            text: Some("duplicate".to_string()),
+                            ..Default::default()
+                        },
+                        SlackMessage {
+                            ts: "1710000100.000000".to_string(),
+                            text: Some("old".to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                )
+                .await
+                .expect("merged history store failed");
+
+            let messages = store
+                .load_history("C123")
+                .await
+                .expect("history load failed")
+                .expect("missing cached history");
+            let timestamps = messages
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                timestamps,
+                vec![
+                    "1710000300.000000",
+                    "1710000200.000000",
+                    "1710000100.000000"
+                ]
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_prunes_cached_history_to_recent_bound() {
+        let directory = temp_cache_dir("workspace-store-pruned-history");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let messages = (0..=MAX_CACHED_CHANNEL_MESSAGES)
+                .map(|index| SlackMessage {
+                    ts: format!("1710000{:03}.000000", MAX_CACHED_CHANNEL_MESSAGES - index),
+                    text: Some(format!("message {index}")),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+
+            store
+                .store_history("C123", &messages)
+                .await
+                .expect("history store failed");
+
+            let cached = store
+                .load_history("C123")
+                .await
+                .expect("history load failed")
+                .expect("missing cached history");
+
+            assert_eq!(cached.len(), MAX_CACHED_CHANNEL_MESSAGES);
+            assert_eq!(cached[0].ts, "1710000200.000000");
+            assert_eq!(
+                cached.last().map(|message| message.ts.as_str()),
+                Some("1710000001.000000")
             );
         });
 
