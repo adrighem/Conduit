@@ -477,6 +477,28 @@ fn set_text_view_text(text_view: &gtk::TextView, text: &str) {
     text_view.buffer().set_text(text);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextViewEnterAction {
+    Send,
+    InsertNewline,
+    Ignore,
+}
+
+fn text_view_enter_action(
+    key: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+) -> TextViewEnterAction {
+    if !matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter) {
+        return TextViewEnterAction::Ignore;
+    }
+
+    if state.intersects(gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::CONTROL_MASK) {
+        TextViewEnterAction::InsertNewline
+    } else {
+        TextViewEnterAction::Send
+    }
+}
+
 fn browser_session_input(
     xoxc_token: &str,
     xoxd_token: &str,
@@ -715,8 +737,7 @@ impl ConduitWindow {
         let controller = gtk::EventControllerKey::new();
         let weak_window = self.downgrade();
         controller.connect_key_pressed(move |_, key, _, state| {
-            if key == gtk::gdk::Key::Return && state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
-            {
+            if text_view_enter_action(key, state) == TextViewEnterAction::Send {
                 if let Some(window) = weak_window.upgrade() {
                     callback(&window);
                 }
@@ -2748,6 +2769,38 @@ mod tests {
         assert_eq!(
             browser_session_input(" xoxc-token ", " xoxd-token ").unwrap(),
             ("xoxc-token".to_string(), "xoxd-token".to_string())
+        );
+    }
+
+    #[test]
+    fn text_view_enter_action_sends_on_plain_enter() {
+        assert_eq!(
+            text_view_enter_action(gtk::gdk::Key::Return, gtk::gdk::ModifierType::empty()),
+            TextViewEnterAction::Send
+        );
+        assert_eq!(
+            text_view_enter_action(gtk::gdk::Key::KP_Enter, gtk::gdk::ModifierType::empty()),
+            TextViewEnterAction::Send
+        );
+    }
+
+    #[test]
+    fn text_view_enter_action_inserts_newline_with_shift_or_control() {
+        assert_eq!(
+            text_view_enter_action(gtk::gdk::Key::Return, gtk::gdk::ModifierType::SHIFT_MASK),
+            TextViewEnterAction::InsertNewline
+        );
+        assert_eq!(
+            text_view_enter_action(gtk::gdk::Key::Return, gtk::gdk::ModifierType::CONTROL_MASK),
+            TextViewEnterAction::InsertNewline
+        );
+    }
+
+    #[test]
+    fn text_view_enter_action_ignores_other_keys() {
+        assert_eq!(
+            text_view_enter_action(gtk::gdk::Key::space, gtk::gdk::ModifierType::empty()),
+            TextViewEnterAction::Ignore
         );
     }
 
