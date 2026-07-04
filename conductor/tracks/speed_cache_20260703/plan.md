@@ -46,4 +46,8 @@
   - [x] Sub-task: Add regression coverage for no sidebar loading repaint on refresh start
   - [x] Sub-task: Avoid sidebar loading state on workspace open, manual refresh, and loading status events
   - [x] Sub-task: Repaint sidebar only when conversations finish loading or fail
+- [x] Task: Cache DM display names for sidebar startup 3570402
+  - [x] Sub-task: Add cache round-trip tests for user display names
+  - [x] Sub-task: Load cached user names before cached conversations
+  - [x] Sub-task: Store users.info results and refresh cached DM names in the background
 - [ ] Task: Conductor - User Manual Verification 'Bottom Anchoring And Auto-Scroll' (Protocol in workflow.md)
