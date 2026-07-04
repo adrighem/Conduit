@@ -24,7 +24,7 @@
   - [x] Sub-task: Keep the cache focused on recent and explicitly loaded messages
 - [x] Task: Conductor - User Manual Verification 'Fast Channel Opening And Bounded History Cache' (Protocol in workflow.md) 06d4863
 
-## Phase 3: Bottom Anchoring And Auto-Scroll
+## Phase 3: Bottom Anchoring And Auto-Scroll [checkpoint: a2d9e0f]
 - [x] Task: Default channel timelines to the latest messages cb80c3c
   - [x] Sub-task: Write tests for scroll-intent decisions
   - [x] Sub-task: Scroll to the bottom after initial channel render and sent-message render
@@ -50,4 +50,4 @@
   - [x] Sub-task: Add cache round-trip tests for user display names
   - [x] Sub-task: Load cached user names before cached conversations
   - [x] Sub-task: Store users.info results and refresh cached DM names in the background
-- [ ] Task: Conductor - User Manual Verification 'Bottom Anchoring And Auto-Scroll' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Bottom Anchoring And Auto-Scroll' (Protocol in workflow.md) a2d9e0f
