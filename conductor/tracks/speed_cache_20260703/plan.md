@@ -12,7 +12,7 @@
   - [x] Sub-task: Defer user-name sidebar rerenders while conversation refresh is active
 - [x] Task: Conductor - User Manual Verification 'Stable Sidebar During Conversation Refresh' (Protocol in workflow.md) 956004c
 
-## Phase 2: Fast Channel Opening And Bounded History Cache
+## Phase 2: Fast Channel Opening And Bounded History Cache [checkpoint: 06d4863]
 - [x] Task: Render cached channel history immediately while refreshing latest history 033b3f6
   - [x] Sub-task: Write tests for cached-vs-fresh history event handling
   - [x] Sub-task: Keep cached loads from clearing fresh pagination/read-state metadata
@@ -22,7 +22,7 @@
   - [x] Sub-task: Write tests for merged history storage and pruning behavior
   - [x] Sub-task: Store merged history after older-page loads
   - [x] Sub-task: Keep the cache focused on recent and explicitly loaded messages
-- [ ] Task: Conductor - User Manual Verification 'Fast Channel Opening And Bounded History Cache' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Fast Channel Opening And Bounded History Cache' (Protocol in workflow.md) 06d4863
 
 ## Phase 3: Bottom Anchoring And Auto-Scroll
 - [ ] Task: Default channel timelines to the latest messages
