@@ -13,11 +13,11 @@
 - [x] Task: Conductor - User Manual Verification 'Stable Sidebar During Conversation Refresh' (Protocol in workflow.md) 956004c
 
 ## Phase 2: Fast Channel Opening And Bounded History Cache
-- [ ] Task: Render cached channel history immediately while refreshing latest history
-  - [ ] Sub-task: Write tests for cached-vs-fresh history event handling
-  - [ ] Sub-task: Keep cached loads from clearing fresh pagination/read-state metadata
-  - [ ] Sub-task: Continue fresh latest-page loading after cached history is shown
-  - [ ] Sub-task: Avoid duplicate in-flight history requests for the same channel
+- [x] Task: Render cached channel history immediately while refreshing latest history 033b3f6
+  - [x] Sub-task: Write tests for cached-vs-fresh history event handling
+  - [x] Sub-task: Keep cached loads from clearing fresh pagination/read-state metadata
+  - [x] Sub-task: Continue fresh latest-page loading after cached history is shown
+  - [x] Sub-task: Avoid duplicate in-flight history requests for the same channel
 - [ ] Task: Cache merged paged history without building an unbounded archive
   - [ ] Sub-task: Write tests for merged history storage and pruning behavior
   - [ ] Sub-task: Store merged history after older-page loads
