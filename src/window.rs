@@ -282,6 +282,17 @@ fn sidebar_error_change_needs_render(has_conversations: bool) -> bool {
     !has_conversations
 }
 
+fn sidebar_user_name_update_needs_render(
+    conversations: &[SlackConversation],
+    user_id: &str,
+    sidebar_loading: bool,
+) -> bool {
+    !sidebar_loading
+        && conversations.iter().any(|conversation| {
+            conversation.is_im.unwrap_or(false) && conversation.user.as_deref() == Some(user_id)
+        })
+}
+
 fn conversation_switcher_items(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
@@ -763,12 +774,23 @@ impl ConduitWindow {
                 user_id,
                 display_name,
             } => {
+                let should_render_sidebar = {
+                    let imp = self.imp();
+                    let conversations = imp.conversations.borrow();
+                    sidebar_user_name_update_needs_render(
+                        &conversations,
+                        &user_id,
+                        imp.sidebar_loading.get(),
+                    )
+                };
                 self.imp()
                     .user_names
                     .borrow_mut()
                     .insert(user_id.clone(), display_name);
                 self.imp().pending_user_ids.borrow_mut().remove(&user_id);
-                self.render_conversations();
+                if should_render_sidebar {
+                    self.render_conversations();
+                }
                 self.refresh_current_conversation_title();
                 self.rerender_current_messages();
             }
@@ -2436,6 +2458,40 @@ mod tests {
     fn sidebar_error_change_preserves_populated_list() {
         assert!(sidebar_error_change_needs_render(false));
         assert!(!sidebar_error_change_needs_render(true));
+    }
+
+    #[test]
+    fn sidebar_user_name_updates_render_only_for_idle_dm_rows() {
+        let dm = SlackConversation {
+            id: "D123".to_string(),
+            user: Some("U123".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        let channel = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let conversations = vec![dm, channel];
+
+        assert!(sidebar_user_name_update_needs_render(
+            &conversations,
+            "U123",
+            false
+        ));
+        assert!(!sidebar_user_name_update_needs_render(
+            &conversations,
+            "U999",
+            false
+        ));
+        assert!(!sidebar_user_name_update_needs_render(
+            &conversations,
+            "U123",
+            true
+        ));
+        assert!(!sidebar_user_name_update_needs_render(&[], "U123", false));
     }
 
     #[test]
