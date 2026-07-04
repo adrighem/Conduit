@@ -23,6 +23,7 @@ pub struct MessageHtmlContext {
 pub enum TimelineScrollBehavior {
     #[default]
     Preserve,
+    PreservePrepend,
     Bottom,
     StickToBottom,
 }
@@ -31,6 +32,7 @@ impl TimelineScrollBehavior {
     fn js_mode(self) -> &'static str {
         match self {
             Self::Preserve => "preserve",
+            Self::PreservePrepend => "preserve-prepend",
             Self::Bottom => "bottom",
             Self::StickToBottom => "stick-to-bottom",
         }
@@ -654,13 +656,16 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
         return None;
     }
 
-    let channel_id = serde_json::to_string(channel_id).unwrap_or_else(|_| "\"\"".to_string());
+    let sticky_key = serde_json::to_string(&format!("conduit:timeline-at-bottom:{channel_id}"))
+        .unwrap_or_else(|_| "\"conduit:timeline-at-bottom:\"".to_string());
+    let anchor_key = serde_json::to_string(&format!("conduit:timeline-anchor:{channel_id}"))
+        .unwrap_or_else(|_| "\"conduit:timeline-anchor:\"".to_string());
     let mode = serde_json::to_string(behavior.js_mode()).unwrap_or_else(|_| "\"preserve\"".into());
     Some(format!(
         r#"(function () {{
-  const channelId = {channel_id};
   const mode = {mode};
-  const storageKey = "conduit:timeline-at-bottom:" + channelId;
+  const stickyKey = {sticky_key};
+  const anchorKey = {anchor_key};
   const threshold = 48;
 
   function root() {{
@@ -674,7 +679,7 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
 
   function rememberPosition() {{
     try {{
-      sessionStorage.setItem(storageKey, atBottom() ? "true" : "false");
+      sessionStorage.setItem(stickyKey, atBottom() ? "true" : "false");
     }} catch (_) {{
     }}
   }}
@@ -684,10 +689,67 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
       return true;
     }}
     try {{
-      return sessionStorage.getItem(storageKey) !== "false";
+      return sessionStorage.getItem(stickyKey) !== "false";
     }} catch (_) {{
       return true;
     }}
+  }}
+
+  function messageAnchors() {{
+    return Array.from(document.querySelectorAll("[data-message-ts]"));
+  }}
+
+  function visibleAnchor() {{
+    const viewportHeight = window.innerHeight || root().clientHeight;
+    return messageAnchors().find(function (element) {{
+      const rect = element.getBoundingClientRect();
+      return rect.bottom >= 0 && rect.top <= viewportHeight;
+    }});
+  }}
+
+  function rememberAnchor() {{
+    const scrollRoot = root();
+    const anchor = visibleAnchor();
+    const payload = {{
+      scrollTop: scrollRoot.scrollTop,
+      scrollHeight: scrollRoot.scrollHeight
+    }};
+    if (anchor) {{
+      payload.ts = anchor.dataset.messageTs;
+      payload.top = anchor.getBoundingClientRect().top;
+    }}
+    try {{
+      sessionStorage.setItem(anchorKey, JSON.stringify(payload));
+    }} catch (_) {{
+    }}
+  }}
+
+  function restorePrependAnchor() {{
+    let payload = null;
+    try {{
+      payload = JSON.parse(sessionStorage.getItem(anchorKey) || "null");
+    }} catch (_) {{
+      payload = null;
+    }}
+    if (!payload) {{
+      return;
+    }}
+
+    const scrollRoot = root();
+    const anchor = payload.ts
+      ? messageAnchors().find(function (element) {{
+          return element.dataset.messageTs === payload.ts;
+        }})
+      : null;
+    if (anchor && typeof payload.top === "number") {{
+      scrollRoot.scrollTop += anchor.getBoundingClientRect().top - payload.top;
+    }} else if (
+      typeof payload.scrollTop === "number" &&
+      typeof payload.scrollHeight === "number"
+    ) {{
+      scrollRoot.scrollTop = payload.scrollTop + scrollRoot.scrollHeight - payload.scrollHeight;
+    }}
+    rememberPosition();
   }}
 
   function scrollToBottom() {{
@@ -703,6 +765,25 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
     }} else {{
       rememberPosition();
     }}
+  }}
+
+  document.addEventListener("click", function (event) {{
+    const target = event.target && event.target.closest
+      ? event.target.closest("a[href^='conduit://load-older']")
+      : null;
+    if (target) {{
+      rememberAnchor();
+    }}
+  }}, true);
+
+  if (mode === "preserve-prepend") {{
+    window.addEventListener("scroll", rememberPosition, {{ passive: true }});
+    window.addEventListener("load", restorePrependAnchor, {{ once: true }});
+    requestAnimationFrame(restorePrependAnchor);
+    requestAnimationFrame(function () {{
+      requestAnimationFrame(restorePrependAnchor);
+    }});
+    return;
   }}
 
   window.addEventListener("scroll", rememberPosition, {{ passive: true }});
@@ -721,8 +802,10 @@ fn message_article(
     context: &MessageHtmlContext,
 ) -> String {
     let author = author_label(message, context);
+    let message_ts = escape_html(&message.ts);
     let mut article = format!(
-        "<article class=\"message\"><header class=\"message-header\"><span class=\"author\">{}</span>{}</header><div class=\"body\">{}</div>",
+        "<article class=\"message\" data-message-ts=\"{}\"><header class=\"message-header\"><span class=\"author\">{}</span>{}</header><div class=\"body\">{}</div>",
+        message_ts,
         escape_html(&author),
         metadata_html(message),
         message_body_html(message, context)
@@ -808,8 +891,10 @@ fn message_part_html(
     message: &SlackMessage,
     context: &MessageHtmlContext,
 ) -> String {
+    let message_ts = escape_html(&message.ts);
     let mut part = format!(
-        "<section class=\"message-part\"><div class=\"body\">{}</div>",
+        "<section class=\"message-part\" data-message-ts=\"{}\"><div class=\"body\">{}</div>",
+        message_ts,
         message_body_html(message, context)
     );
 
@@ -1888,6 +1973,30 @@ mod tests {
         assert!(html.contains("datetime=\""));
         assert!(html.contains("title=\""));
         assert!(html.contains("</time>"));
+    }
+
+    #[test]
+    fn conversation_messages_include_stable_scroll_anchors() {
+        let html = conversation_document(
+            "C123",
+            &[message("anchored")],
+            &MessageHtmlContext::default(),
+        );
+
+        assert!(html.contains("data-message-ts=\"1710000000.000100\""));
+    }
+
+    #[test]
+    fn older_page_scroll_behavior_installs_prepend_preservation_script() {
+        let context = MessageHtmlContext {
+            timeline_scroll: TimelineScrollBehavior::PreservePrepend,
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("paged")], &context);
+
+        assert!(html.contains("mode = \"preserve-prepend\""));
+        assert!(html.contains("conduit:timeline-anchor:C123"));
     }
 
     #[test]

@@ -440,7 +440,7 @@ fn channel_history_scroll_behavior(
     force_bottom: bool,
 ) -> TimelineScrollBehavior {
     if append_older {
-        TimelineScrollBehavior::Preserve
+        TimelineScrollBehavior::PreservePrepend
     } else if force_bottom {
         TimelineScrollBehavior::Bottom
     } else {
@@ -2770,14 +2770,14 @@ mod tests {
     }
 
     #[test]
-    fn channel_history_scroll_behavior_preserves_view_for_older_pages() {
+    fn channel_history_scroll_behavior_preserves_prepended_older_pages() {
         assert_eq!(
             channel_history_scroll_behavior(true, false),
-            message_html::TimelineScrollBehavior::Preserve
+            message_html::TimelineScrollBehavior::PreservePrepend
         );
         assert_eq!(
             channel_history_scroll_behavior(true, true),
-            message_html::TimelineScrollBehavior::Preserve
+            message_html::TimelineScrollBehavior::PreservePrepend
         );
     }
 }
