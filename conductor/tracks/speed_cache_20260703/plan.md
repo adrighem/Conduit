@@ -18,10 +18,10 @@
   - [x] Sub-task: Keep cached loads from clearing fresh pagination/read-state metadata
   - [x] Sub-task: Continue fresh latest-page loading after cached history is shown
   - [x] Sub-task: Avoid duplicate in-flight history requests for the same channel
-- [ ] Task: Cache merged paged history without building an unbounded archive
-  - [ ] Sub-task: Write tests for merged history storage and pruning behavior
-  - [ ] Sub-task: Store merged history after older-page loads
-  - [ ] Sub-task: Keep the cache focused on recent and explicitly loaded messages
+- [x] Task: Cache merged paged history without building an unbounded archive c60ae35
+  - [x] Sub-task: Write tests for merged history storage and pruning behavior
+  - [x] Sub-task: Store merged history after older-page loads
+  - [x] Sub-task: Keep the cache focused on recent and explicitly loaded messages
 - [ ] Task: Conductor - User Manual Verification 'Fast Channel Opening And Bounded History Cache' (Protocol in workflow.md)
 
 ## Phase 3: Bottom Anchoring And Auto-Scroll
