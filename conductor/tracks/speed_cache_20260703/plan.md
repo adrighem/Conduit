@@ -42,4 +42,8 @@
   - [x] Sub-task: Add regression coverage for background conversation refresh policy
   - [x] Sub-task: Spawn fresh conversation refreshes after auth and manual refresh
   - [x] Sub-task: Keep cached conversation rendering synchronous
+- [x] Task: Keep sidebar refresh visually backgrounded 93eec70
+  - [x] Sub-task: Add regression coverage for no sidebar loading repaint on refresh start
+  - [x] Sub-task: Avoid sidebar loading state on workspace open, manual refresh, and loading status events
+  - [x] Sub-task: Repaint sidebar only when conversations finish loading or fail
 - [ ] Task: Conductor - User Manual Verification 'Bottom Anchoring And Auto-Scroll' (Protocol in workflow.md)
