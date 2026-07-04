@@ -40,6 +40,33 @@ impl WorkspaceStore {
         self.store_state(&state).await
     }
 
+    pub async fn load_user_names(&self) -> Result<HashMap<String, String>> {
+        Ok(self
+            .load_state()
+            .await?
+            .map(|state| state.user_names)
+            .unwrap_or_default())
+    }
+
+    pub async fn store_user_name(&self, user_id: &str, display_name: &str) -> Result<()> {
+        let mut names = HashMap::new();
+        names.insert(user_id.to_string(), display_name.to_string());
+        self.store_user_names(&names).await
+    }
+
+    pub async fn store_user_names(&self, user_names: &HashMap<String, String>) -> Result<()> {
+        let mut state = self.load_state_for_update().await;
+        state.user_names.extend(
+            user_names
+                .iter()
+                .filter(|(user_id, display_name)| {
+                    !user_id.trim().is_empty() && !display_name.trim().is_empty()
+                })
+                .map(|(user_id, display_name)| (user_id.clone(), display_name.clone())),
+        );
+        self.store_state(&state).await
+    }
+
     pub async fn load_history(&self, channel_id: &str) -> Result<Option<Vec<SlackMessage>>> {
         Ok(self
             .load_state()
@@ -167,6 +194,8 @@ struct CachedWorkspaceState {
     #[serde(default)]
     conversations: Vec<SlackConversation>,
     #[serde(default)]
+    user_names: HashMap<String, String>,
+    #[serde(default)]
     channel_histories: HashMap<String, Vec<SlackMessage>>,
     #[serde(default)]
     thread_replies: HashMap<String, Vec<SlackMessage>>,
@@ -177,6 +206,7 @@ impl CachedWorkspaceState {
         Self {
             version: CACHE_VERSION,
             conversations: Vec::new(),
+            user_names: HashMap::new(),
             channel_histories: HashMap::new(),
             thread_replies: HashMap::new(),
         }
@@ -294,6 +324,38 @@ mod tests {
                     .expect("missing cached thread")[0]
                     .ts,
                 "1710000000.000100"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_round_trips_user_names() {
+        let directory = temp_cache_dir("workspace-store-user-names");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            assert!(store
+                .load_user_names()
+                .await
+                .expect("user name load failed")
+                .is_empty());
+
+            store
+                .store_user_name("U123", "Ada Lovelace")
+                .await
+                .expect("user name store failed");
+
+            assert_eq!(
+                store
+                    .load_user_names()
+                    .await
+                    .expect("user name load failed")
+                    .get("U123")
+                    .map(String::as_str),
+                Some("Ada Lovelace")
             );
         });
 

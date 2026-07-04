@@ -835,26 +835,9 @@ impl ConduitWindow {
                 user_id,
                 display_name,
             } => {
-                let should_render_sidebar = {
-                    let imp = self.imp();
-                    let conversations = imp.conversations.borrow();
-                    sidebar_user_name_update_needs_render(
-                        &conversations,
-                        &user_id,
-                        imp.sidebar_loading.get(),
-                    )
-                };
-                self.imp()
-                    .user_names
-                    .borrow_mut()
-                    .insert(user_id.clone(), display_name);
-                self.imp().pending_user_ids.borrow_mut().remove(&user_id);
-                if should_render_sidebar {
-                    self.render_conversations();
-                }
-                self.refresh_current_conversation_title();
-                self.rerender_current_messages();
+                self.populate_user_names(HashMap::from([(user_id, display_name)]));
             }
+            RuntimeEvent::UserNamesLoaded(user_names) => self.populate_user_names(user_names),
             RuntimeEvent::ImageAssetLoaded { key, data_uri } => {
                 crate::debug::log(
                     "ui",
@@ -1556,6 +1539,53 @@ impl ConduitWindow {
         } else {
             self.refresh_current_conversation_title();
         }
+    }
+
+    fn populate_user_names(&self, user_names: HashMap<String, String>) {
+        if user_names.is_empty() {
+            return;
+        }
+
+        let changed_user_ids = {
+            let imp = self.imp();
+            let mut known_user_names = imp.user_names.borrow_mut();
+            let mut pending_user_ids = imp.pending_user_ids.borrow_mut();
+            let mut changed_user_ids = Vec::new();
+
+            for (user_id, display_name) in user_names {
+                if user_id.trim().is_empty() || display_name.trim().is_empty() {
+                    continue;
+                }
+                pending_user_ids.remove(&user_id);
+                if known_user_names.get(&user_id) != Some(&display_name) {
+                    known_user_names.insert(user_id.clone(), display_name);
+                    changed_user_ids.push(user_id);
+                }
+            }
+
+            changed_user_ids
+        };
+
+        if changed_user_ids.is_empty() {
+            return;
+        }
+
+        let should_render_sidebar = {
+            let imp = self.imp();
+            let conversations = imp.conversations.borrow();
+            changed_user_ids.iter().any(|user_id| {
+                sidebar_user_name_update_needs_render(
+                    &conversations,
+                    user_id,
+                    imp.sidebar_loading.get(),
+                )
+            })
+        };
+        if should_render_sidebar {
+            self.render_conversations();
+        }
+        self.refresh_current_conversation_title();
+        self.rerender_current_messages();
     }
 
     fn mark_conversation_locally_read(&self, channel_id: &str) {

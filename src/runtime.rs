@@ -118,6 +118,7 @@ pub enum RuntimeEvent {
         user_id: String,
         display_name: String,
     },
+    UserNamesLoaded(HashMap<String, String>),
     ImageAssetLoaded {
         key: String,
         data_uri: String,
@@ -282,6 +283,22 @@ fn conversation_refresh_mode() -> ConversationRefreshMode {
     ConversationRefreshMode::Background
 }
 
+fn cached_dm_user_ids(
+    conversations: &[SlackConversation],
+    user_cache: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut user_ids = conversations
+        .iter()
+        .filter(|conversation| conversation.is_im.unwrap_or(false))
+        .filter_map(|conversation| conversation.user.as_deref())
+        .filter(|user_id| user_cache.contains_key(*user_id))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    user_ids.sort();
+    user_ids.dedup();
+    user_ids
+}
+
 async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_>) -> Result<()> {
     match command {
         RuntimeCommand::LoadStoredToken => {
@@ -433,6 +450,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 context
                     .user_cache
                     .insert(user_id.clone(), display_name.clone());
+                store_user_name(context.workspace_store, &user_id, &display_name).await;
                 context.events.send_event(RuntimeEvent::UserLoaded {
                     user_id,
                     display_name,
@@ -600,6 +618,7 @@ async fn load_workspace_after_auth(
         &workspace_store_id(auth),
     ));
     context.user_cache.clear();
+    load_cached_user_names(context.events, context.workspace_store, context.user_cache).await;
     load_cached_conversations(context.events, context.workspace_store).await;
     debug_assert_eq!(
         conversation_refresh_mode(),
@@ -612,10 +631,16 @@ fn spawn_conversation_refresh(context: &RuntimeContext<'_>) -> Result<()> {
     let api = require_slack(context.slack)?.clone();
     let events = context.events.clone();
     let workspace_store = (*context.workspace_store).clone();
+    let cached_user_names = context.user_cache.clone();
 
     tokio::spawn(async move {
-        if let Err(error) =
-            load_conversations_best_effort_with_api(&events, &api, &workspace_store).await
+        if let Err(error) = load_conversations_best_effort_with_api(
+            &events,
+            &api,
+            &workspace_store,
+            cached_user_names,
+        )
+        .await
         {
             crate::debug::log(
                 "runtime",
@@ -657,7 +682,7 @@ async fn load_conversations_with_api(
     events: &Sender<RuntimeEvent>,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
-) -> Result<()> {
+) -> Result<Vec<SlackConversation>> {
     events.send_status("Loading conversations");
     let conversations = api.conversations().await?;
     store_conversations(workspace_store, &conversations).await;
@@ -665,19 +690,89 @@ async fn load_conversations_with_api(
         "runtime",
         &format!("ConversationsLoaded count={}", conversations.len()),
     );
-    events.send_event(RuntimeEvent::ConversationsLoaded(conversations));
-    Ok(())
+    events.send_event(RuntimeEvent::ConversationsLoaded(conversations.clone()));
+    Ok(conversations)
 }
 
 async fn load_conversations_best_effort_with_api(
     events: &Sender<RuntimeEvent>,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
+    cached_user_names: HashMap<String, String>,
 ) -> Result<()> {
-    if let Err(error) = load_conversations_with_api(events, api, workspace_store).await {
-        handle_conversations_load_error(events, error);
+    match load_conversations_with_api(events, api, workspace_store).await {
+        Ok(conversations) => {
+            refresh_cached_dm_user_names(
+                events,
+                api,
+                workspace_store,
+                &conversations,
+                &cached_user_names,
+            )
+            .await;
+        }
+        Err(error) => handle_conversations_load_error(events, error),
     }
     Ok(())
+}
+
+async fn load_cached_user_names(
+    events: &Sender<RuntimeEvent>,
+    workspace_store: &Option<WorkspaceStore>,
+    user_cache: &mut HashMap<String, String>,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    match store.load_user_names().await {
+        Ok(user_names) if !user_names.is_empty() => {
+            crate::debug::log(
+                "runtime",
+                &format!("CachedUserNamesLoaded count={}", user_names.len()),
+            );
+            user_cache.extend(user_names.clone());
+            events.send_event(RuntimeEvent::UserNamesLoaded(user_names));
+        }
+        Ok(_) => {}
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("CachedUserNamesLoadFailed error={error:#}"),
+        ),
+    }
+}
+
+async fn refresh_cached_dm_user_names(
+    events: &Sender<RuntimeEvent>,
+    api: &SlackApi,
+    workspace_store: &Option<WorkspaceStore>,
+    conversations: &[SlackConversation],
+    cached_user_names: &HashMap<String, String>,
+) {
+    let user_ids = cached_dm_user_ids(conversations, cached_user_names);
+    if user_ids.is_empty() {
+        return;
+    }
+
+    let mut refreshed = HashMap::new();
+    for user_id in user_ids {
+        match api.user_display_name(&user_id).await {
+            Ok(display_name) => {
+                refreshed.insert(user_id, display_name);
+            }
+            Err(error) => crate::debug::log(
+                "runtime",
+                &format!("UserDisplayNameRefreshFailed user_id={user_id} error={error:#}"),
+            ),
+        }
+    }
+
+    if refreshed.is_empty() {
+        return;
+    }
+
+    store_user_names(workspace_store, &refreshed).await;
+    events.send_event(RuntimeEvent::UserNamesLoaded(refreshed));
 }
 
 fn handle_conversations_load_error(events: &Sender<RuntimeEvent>, error: anyhow::Error) {
@@ -807,6 +902,42 @@ async fn store_conversations(
         crate::debug::log(
             "runtime",
             &format!("CachedConversationsStoreFailed error={error:#}"),
+        );
+    }
+}
+
+async fn store_user_name(
+    workspace_store: &Option<WorkspaceStore>,
+    user_id: &str,
+    display_name: &str,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    if let Err(error) = store.store_user_name(user_id, display_name).await {
+        crate::debug::log(
+            "runtime",
+            &format!("CachedUserNameStoreFailed user_id={user_id} error={error:#}"),
+        );
+    }
+}
+
+async fn store_user_names(
+    workspace_store: &Option<WorkspaceStore>,
+    user_names: &HashMap<String, String>,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    if let Err(error) = store.store_user_names(user_names).await {
+        crate::debug::log(
+            "runtime",
+            &format!(
+                "CachedUserNamesStoreFailed count={} error={error:#}",
+                user_names.len()
+            ),
         );
     }
 }
@@ -988,6 +1119,36 @@ mod tests {
         assert_eq!(
             conversation_refresh_mode(),
             ConversationRefreshMode::Background
+        );
+    }
+
+    #[test]
+    fn cached_dm_user_ids_selects_only_known_direct_messages() {
+        let conversations = vec![
+            SlackConversation {
+                id: "D123".to_string(),
+                user: Some("U123".to_string()),
+                is_im: Some(true),
+                ..Default::default()
+            },
+            SlackConversation {
+                id: "D999".to_string(),
+                user: Some("U999".to_string()),
+                is_im: Some(true),
+                ..Default::default()
+            },
+            SlackConversation {
+                id: "C123".to_string(),
+                user: Some("U123".to_string()),
+                is_channel: Some(true),
+                ..Default::default()
+            },
+        ];
+        let user_cache = HashMap::from([("U123".to_string(), "Ada".to_string())]);
+
+        assert_eq!(
+            cached_dm_user_ids(&conversations, &user_cache),
+            vec!["U123"]
         );
     }
 
