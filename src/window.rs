@@ -274,12 +274,8 @@ fn sidebar_conversation_matches_filters(
     matches_query && matches_unread
 }
 
-fn sidebar_loading_change_needs_render(
-    has_conversations: bool,
-    current_loading: bool,
-    next_loading: bool,
-) -> bool {
-    current_loading != next_loading && !has_conversations
+fn conversation_refresh_start_shows_sidebar_loading() -> bool {
+    false
 }
 
 fn sidebar_error_change_needs_render(has_conversations: bool) -> bool {
@@ -758,8 +754,10 @@ impl ConduitWindow {
         match event {
             RuntimeEvent::Status(status) => {
                 if !self.imp().connect_requested.get() {
-                    if status == "Loading conversations" {
-                        self.set_sidebar_loading(true);
+                    if status == "Loading conversations"
+                        && conversation_refresh_start_shows_sidebar_loading()
+                    {
+                        self.start_sidebar_loading();
                     }
                     self.set_status(&status);
                 }
@@ -1031,7 +1029,9 @@ impl ConduitWindow {
     }
 
     fn refresh_conversations(&self) {
-        self.set_sidebar_loading(true);
+        if conversation_refresh_start_shows_sidebar_loading() {
+            self.start_sidebar_loading();
+        }
         self.send_command(RuntimeCommand::RefreshConversations);
     }
 
@@ -1492,7 +1492,9 @@ impl ConduitWindow {
         let label = format!("Connected to {workspace_name}");
         self.set_status(&label);
         self.imp().content_stack.set_visible_child_name("workspace");
-        self.set_sidebar_loading(true);
+        if conversation_refresh_start_shows_sidebar_loading() {
+            self.start_sidebar_loading();
+        }
     }
 
     fn set_status(&self, status: &str) {
@@ -1502,20 +1504,13 @@ impl ConduitWindow {
         imp.workspace_status_label.set_label(status);
     }
 
-    fn set_sidebar_loading(&self, loading: bool) {
+    fn start_sidebar_loading(&self) {
         let imp = self.imp();
-        let has_conversations = !imp.conversations.borrow().is_empty();
-        let should_render = sidebar_loading_change_needs_render(
-            has_conversations,
-            imp.sidebar_loading.get(),
-            loading,
-        );
-        imp.sidebar_loading.set(loading);
-        if loading {
+        if !imp.sidebar_loading.replace(true) {
             *imp.sidebar_error.borrow_mut() = None;
-        }
-        if should_render {
-            self.render_conversations();
+            if imp.conversations.borrow().is_empty() {
+                self.render_conversations();
+            }
         }
     }
 
@@ -2600,15 +2595,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_loading_change_rerenders_only_when_list_state_changes() {
-        assert!(sidebar_loading_change_needs_render(false, false, true));
-        assert!(sidebar_loading_change_needs_render(false, true, false));
-        assert!(!sidebar_loading_change_needs_render(true, false, true));
-        assert!(!sidebar_loading_change_needs_render(true, true, false));
-        assert!(!sidebar_loading_change_needs_render(false, true, true));
-    }
-
-    #[test]
     fn sidebar_error_change_preserves_populated_list() {
         assert!(sidebar_error_change_needs_render(false));
         assert!(!sidebar_error_change_needs_render(true));
@@ -2646,6 +2632,11 @@ mod tests {
             true
         ));
         assert!(!sidebar_user_name_update_needs_render(&[], "U123", false));
+    }
+
+    #[test]
+    fn conversation_refresh_start_keeps_sidebar_visually_backgrounded() {
+        assert!(!conversation_refresh_start_shows_sidebar_loading());
     }
 
     #[test]
