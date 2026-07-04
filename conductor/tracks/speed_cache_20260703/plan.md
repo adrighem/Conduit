@@ -25,11 +25,11 @@
 - [x] Task: Conductor - User Manual Verification 'Fast Channel Opening And Bounded History Cache' (Protocol in workflow.md) 06d4863
 
 ## Phase 3: Bottom Anchoring And Auto-Scroll
-- [ ] Task: Default channel timelines to the latest messages
-  - [ ] Sub-task: Write tests for scroll-intent decisions
-  - [ ] Sub-task: Scroll to the bottom after initial channel render and sent-message render
-  - [ ] Sub-task: Keep bottom anchoring when the user was already at the bottom
-  - [ ] Sub-task: Avoid stealing scroll when the user is reading older messages
+- [x] Task: Default channel timelines to the latest messages cb80c3c
+  - [x] Sub-task: Write tests for scroll-intent decisions
+  - [x] Sub-task: Scroll to the bottom after initial channel render and sent-message render
+  - [x] Sub-task: Keep bottom anchoring when the user was already at the bottom
+  - [x] Sub-task: Avoid stealing scroll when the user is reading older messages
 - [ ] Task: Preserve reading position while loading older messages
   - [ ] Sub-task: Write tests or a small harness for prepend scroll behavior
   - [ ] Sub-task: Maintain visible position when older messages are prepended above the current viewport
