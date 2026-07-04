@@ -448,6 +448,29 @@ fn channel_history_scroll_behavior(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MessageWebViewFeaturePolicy {
+    javascript: bool,
+    html5_local_storage: bool,
+    file_url_access: bool,
+    universal_file_url_access: bool,
+    media: bool,
+    webgl: bool,
+    webaudio: bool,
+}
+
+fn message_web_view_feature_policy() -> MessageWebViewFeaturePolicy {
+    MessageWebViewFeaturePolicy {
+        javascript: true,
+        html5_local_storage: true,
+        file_url_access: false,
+        universal_file_url_access: false,
+        media: false,
+        webgl: false,
+        webaudio: false,
+    }
+}
+
 fn text_view_text(text_view: &gtk::TextView) -> String {
     let buffer = text_view.buffer();
     let (start, end) = buffer.bounds();
@@ -531,14 +554,15 @@ impl ConduitWindow {
         network_session: &webkit6::NetworkSession,
     ) -> webkit6::WebView {
         let settings = webkit6::Settings::new();
-        settings.set_allow_file_access_from_file_urls(false);
-        settings.set_allow_universal_access_from_file_urls(false);
+        let features = message_web_view_feature_policy();
+        settings.set_allow_file_access_from_file_urls(features.file_url_access);
+        settings.set_allow_universal_access_from_file_urls(features.universal_file_url_access);
         settings.set_enable_html5_database(false);
-        settings.set_enable_html5_local_storage(false);
-        settings.set_enable_javascript(false);
-        settings.set_enable_media(false);
-        settings.set_enable_webgl(false);
-        settings.set_enable_webaudio(false);
+        settings.set_enable_html5_local_storage(features.html5_local_storage);
+        settings.set_enable_javascript(features.javascript);
+        settings.set_enable_media(features.media);
+        settings.set_enable_webgl(features.webgl);
+        settings.set_enable_webaudio(features.webaudio);
 
         let web_view = webkit6::WebView::builder()
             .network_session(network_session)
@@ -786,7 +810,6 @@ impl ConduitWindow {
                 };
                 let scroll_behavior =
                     self.next_channel_history_scroll_behavior(&channel_id, append_older);
-                self.request_user_names(&rendered_messages);
                 self.populate_history_with_scroll(&channel_id, rendered_messages, scroll_behavior);
             }
             RuntimeEvent::ThreadLoaded {
@@ -2055,8 +2078,6 @@ impl ConduitWindow {
             .insert(channel_id.to_string(), messages.clone());
         imp.message_title
             .set_label(&self.conversation_title(channel_id));
-        self.render_conversations();
-        self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(None);
         context.load_more_url = self.channel_load_more_url(channel_id);
         context.timeline_scroll = scroll_behavior;
@@ -2073,6 +2094,21 @@ impl ConduitWindow {
         self.load_message_html(&message_html::conversation_document(
             channel_id, &messages, &context,
         ));
+        self.queue_history_render_followups(channel_id, messages);
+    }
+
+    fn queue_history_render_followups(&self, channel_id: &str, messages: Vec<SlackMessage>) {
+        let weak_window = self.downgrade();
+        let channel_id = channel_id.to_string();
+        glib::idle_add_local_once(move || {
+            if let Some(window) = weak_window.upgrade() {
+                window.render_conversations();
+                if window.selected_channel_id().as_deref() == Some(channel_id.as_str()) {
+                    window.request_user_names(&messages);
+                    window.request_image_assets(messages.iter());
+                }
+            }
+        });
     }
 
     fn populate_thread(&self, channel_id: &str, ts: &str, messages: Vec<SlackMessage>) {
@@ -2610,6 +2646,19 @@ mod tests {
             true
         ));
         assert!(!sidebar_user_name_update_needs_render(&[], "U123", false));
+    }
+
+    #[test]
+    fn message_web_view_features_enable_internal_scroll_runtime() {
+        let features = message_web_view_feature_policy();
+
+        assert!(features.javascript);
+        assert!(features.html5_local_storage);
+        assert!(!features.file_url_access);
+        assert!(!features.universal_file_url_access);
+        assert!(!features.media);
+        assert!(!features.webgl);
+        assert!(!features.webaudio);
     }
 
     #[test]
