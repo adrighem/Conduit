@@ -14,8 +14,27 @@ pub struct MessageHtmlContext {
     pub current_user_id: Option<String>,
     pub thread_ts: Option<String>,
     pub load_more_url: Option<String>,
+    pub timeline_scroll: TimelineScrollBehavior,
     pub image_assets: HashMap<String, String>,
     pub failed_image_urls: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimelineScrollBehavior {
+    #[default]
+    Preserve,
+    Bottom,
+    StickToBottom,
+}
+
+impl TimelineScrollBehavior {
+    fn js_mode(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Bottom => "bottom",
+            Self::StickToBottom => "stick-to-bottom",
+        }
+    }
 }
 
 pub fn base_uri() -> &'static str {
@@ -69,7 +88,8 @@ pub fn conversation_document(
     }
     body.push_str("</main>");
 
-    html_document("Messages", &body)
+    let scroll_script = timeline_scroll_script(channel_id, context.timeline_scroll);
+    html_document_with_script("Messages", &body, scroll_script.as_deref())
 }
 
 pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -> String {
@@ -137,6 +157,15 @@ pub fn search_results_document(results: &[SearchMatch], context: &MessageHtmlCon
 }
 
 fn html_document(title: &str, body: &str) -> String {
+    html_document_with_script(title, body, None)
+}
+
+fn html_document_with_script(title: &str, body: &str, script: Option<&str>) -> String {
+    let script_tag = script
+        .filter(|script| !script.trim().is_empty())
+        .map(|script| format!("\n<script>\n{script}\n</script>"))
+        .unwrap_or_default();
+
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -611,11 +640,79 @@ pre code {{
 </head>
 <body>
 {}
+{}
 </body>
 </html>"#,
         escape_html(title),
-        body
+        body,
+        script_tag
     )
+}
+
+fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) -> Option<String> {
+    if behavior == TimelineScrollBehavior::Preserve {
+        return None;
+    }
+
+    let channel_id = serde_json::to_string(channel_id).unwrap_or_else(|_| "\"\"".to_string());
+    let mode = serde_json::to_string(behavior.js_mode()).unwrap_or_else(|_| "\"preserve\"".into());
+    Some(format!(
+        r#"(function () {{
+  const channelId = {channel_id};
+  const mode = {mode};
+  const storageKey = "conduit:timeline-at-bottom:" + channelId;
+  const threshold = 48;
+
+  function root() {{
+    return document.scrollingElement || document.documentElement;
+  }}
+
+  function atBottom() {{
+    const scrollRoot = root();
+    return scrollRoot.scrollHeight - scrollRoot.scrollTop - scrollRoot.clientHeight <= threshold;
+  }}
+
+  function rememberPosition() {{
+    try {{
+      sessionStorage.setItem(storageKey, atBottom() ? "true" : "false");
+    }} catch (_) {{
+    }}
+  }}
+
+  function wasAtBottom() {{
+    if (mode === "bottom") {{
+      return true;
+    }}
+    try {{
+      return sessionStorage.getItem(storageKey) !== "false";
+    }} catch (_) {{
+      return true;
+    }}
+  }}
+
+  function scrollToBottom() {{
+    const scrollRoot = root();
+    scrollRoot.scrollTop = scrollRoot.scrollHeight;
+    rememberPosition();
+  }}
+
+  const shouldStick = wasAtBottom();
+  function applyScroll() {{
+    if (shouldStick) {{
+      scrollToBottom();
+    }} else {{
+      rememberPosition();
+    }}
+  }}
+
+  window.addEventListener("scroll", rememberPosition, {{ passive: true }});
+  window.addEventListener("load", applyScroll, {{ once: true }});
+  requestAnimationFrame(applyScroll);
+  requestAnimationFrame(function () {{
+    requestAnimationFrame(applyScroll);
+  }});
+}})();"#
+    ))
 }
 
 fn message_article(

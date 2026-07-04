@@ -33,7 +33,7 @@ use webkit6::prelude::*;
 use crate::activity::{self, ActivityItem};
 use crate::auth;
 use crate::config;
-use crate::message_html::{self, MessageHtmlContext};
+use crate::message_html::{self, MessageHtmlContext, TimelineScrollBehavior};
 use crate::models::{SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage};
 use crate::rendering;
 use crate::runtime::{AppRuntime, RuntimeCommand, RuntimeEvent};
@@ -145,6 +145,7 @@ mod imp {
         pub selected_thread_ts: RefCell<Option<String>>,
         pub channel_history_cursors: RefCell<HashMap<String, String>>,
         pub loading_channel_histories: RefCell<HashSet<String>>,
+        pub force_bottom_channel_renders: RefCell<HashSet<String>>,
         pub thread_history_cursors: RefCell<HashMap<String, String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
         pub thread_view: RefCell<Option<webkit6::WebView>>,
@@ -432,6 +433,19 @@ fn history_event_updates_fresh_metadata(cached: bool) -> bool {
 
 fn history_event_marks_read(cached: bool, append_older: bool) -> bool {
     !cached && !append_older
+}
+
+fn channel_history_scroll_behavior(
+    append_older: bool,
+    force_bottom: bool,
+) -> TimelineScrollBehavior {
+    if append_older {
+        TimelineScrollBehavior::Preserve
+    } else if force_bottom {
+        TimelineScrollBehavior::Bottom
+    } else {
+        TimelineScrollBehavior::StickToBottom
+    }
 }
 
 fn text_view_text(text_view: &gtk::TextView) -> String {
@@ -770,8 +784,10 @@ impl ConduitWindow {
                 } else {
                     messages
                 };
+                let scroll_behavior =
+                    self.next_channel_history_scroll_behavior(&channel_id, append_older);
                 self.request_user_names(&rendered_messages);
-                self.populate_history(&channel_id, rendered_messages);
+                self.populate_history_with_scroll(&channel_id, rendered_messages, scroll_behavior);
             }
             RuntimeEvent::ThreadLoaded {
                 channel_id,
@@ -847,7 +863,11 @@ impl ConduitWindow {
                 self.imp().send_button.set_sensitive(true);
                 self.imp().thread_send_button.set_sensitive(true);
                 self.set_status("Message sent");
-                self.reload_after_message(&channel_id, message.thread_ts.as_deref());
+                let thread_ts = message.thread_ts.clone();
+                if thread_ts.is_none() {
+                    self.force_next_channel_bottom_render(&channel_id);
+                }
+                self.reload_after_message(&channel_id, thread_ts.as_deref());
             }
             RuntimeEvent::ReactionUpdated {
                 channel_id,
@@ -887,6 +907,7 @@ impl ConduitWindow {
                 set_text_view_text(&imp.message_entry, "");
                 self.set_status(&format!("Uploaded {name}"));
                 if let Some(channel_id) = self.selected_channel_id() {
+                    self.force_next_channel_bottom_render(&channel_id);
                     self.send_command(RuntimeCommand::LoadHistory { channel_id });
                 }
             }
@@ -1398,6 +1419,7 @@ impl ConduitWindow {
         *imp.selected_thread_ts.borrow_mut() = None;
         imp.channel_history_cursors.borrow_mut().clear();
         imp.loading_channel_histories.borrow_mut().clear();
+        imp.force_bottom_channel_renders.borrow_mut().clear();
         imp.thread_history_cursors.borrow_mut().clear();
         *imp.current_user_id.borrow_mut() = None;
         imp.latest_message_ts_by_channel.borrow_mut().clear();
@@ -1922,6 +1944,9 @@ impl ConduitWindow {
             cached_messages.as_deref(),
             fresh_load_in_progress,
         );
+        if previous_channel.as_deref() != Some(channel_id) {
+            self.force_next_channel_bottom_render(channel_id);
+        }
 
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
         *imp.selected_thread_ts.borrow_mut() = None;
@@ -1938,16 +1963,21 @@ impl ConduitWindow {
 
         match history_action {
             ConversationHistorySelectionAction::RenderCurrent => {
-                self.populate_history(channel_id, current_messages);
+                let scroll_behavior = self.next_channel_history_scroll_behavior(channel_id, false);
+                self.populate_history_with_scroll(channel_id, current_messages, scroll_behavior);
             }
             ConversationHistorySelectionAction::RenderCached => {
                 if let Some(messages) = cached_messages {
-                    self.populate_history(channel_id, messages);
+                    let scroll_behavior =
+                        self.next_channel_history_scroll_behavior(channel_id, false);
+                    self.populate_history_with_scroll(channel_id, messages, scroll_behavior);
                 }
             }
             ConversationHistorySelectionAction::RenderCachedAndRefresh => {
                 if let Some(messages) = cached_messages {
-                    self.populate_history(channel_id, messages);
+                    let scroll_behavior =
+                        self.next_channel_history_scroll_behavior(channel_id, false);
+                    self.populate_history_with_scroll(channel_id, messages, scroll_behavior);
                 }
                 self.request_channel_history(channel_id);
             }
@@ -1982,7 +2012,40 @@ impl ConduitWindow {
         });
     }
 
+    fn force_next_channel_bottom_render(&self, channel_id: &str) {
+        self.imp()
+            .force_bottom_channel_renders
+            .borrow_mut()
+            .insert(channel_id.to_string());
+    }
+
+    fn next_channel_history_scroll_behavior(
+        &self,
+        channel_id: &str,
+        append_older: bool,
+    ) -> TimelineScrollBehavior {
+        let force_bottom = self
+            .imp()
+            .force_bottom_channel_renders
+            .borrow_mut()
+            .remove(channel_id);
+        channel_history_scroll_behavior(append_older, force_bottom)
+    }
+
     fn populate_history(&self, channel_id: &str, messages: Vec<SlackMessage>) {
+        self.populate_history_with_scroll(
+            channel_id,
+            messages,
+            TimelineScrollBehavior::StickToBottom,
+        );
+    }
+
+    fn populate_history_with_scroll(
+        &self,
+        channel_id: &str,
+        messages: Vec<SlackMessage>,
+        scroll_behavior: TimelineScrollBehavior,
+    ) {
         let imp = self.imp();
         *imp.selected_channel.borrow_mut() = Some(channel_id.to_string());
         imp.current_main_view.set(MainMessageView::Conversation);
@@ -1996,6 +2059,7 @@ impl ConduitWindow {
         self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(None);
         context.load_more_url = self.channel_load_more_url(channel_id);
+        context.timeline_scroll = scroll_behavior;
         crate::debug::log(
             "ui",
             &format!(
@@ -2336,6 +2400,7 @@ impl ConduitWindow {
             current_user_id: imp.current_user_id.borrow().clone(),
             thread_ts: thread_ts.map(ToString::to_string),
             load_more_url: None,
+            timeline_scroll: TimelineScrollBehavior::Preserve,
             image_assets: imp.image_assets.borrow().clone(),
             failed_image_urls: imp.failed_image_assets.borrow().clone(),
         }
@@ -2686,5 +2751,33 @@ mod tests {
         assert!(history_event_updates_fresh_metadata(false));
         assert!(history_event_marks_read(false, false));
         assert!(!history_event_marks_read(false, true));
+    }
+
+    #[test]
+    fn channel_history_scroll_behavior_forces_bottom_for_explicit_bottom_renders() {
+        assert_eq!(
+            channel_history_scroll_behavior(false, true),
+            message_html::TimelineScrollBehavior::Bottom
+        );
+    }
+
+    #[test]
+    fn channel_history_scroll_behavior_sticks_only_when_already_bottom_for_updates() {
+        assert_eq!(
+            channel_history_scroll_behavior(false, false),
+            message_html::TimelineScrollBehavior::StickToBottom
+        );
+    }
+
+    #[test]
+    fn channel_history_scroll_behavior_preserves_view_for_older_pages() {
+        assert_eq!(
+            channel_history_scroll_behavior(true, false),
+            message_html::TimelineScrollBehavior::Preserve
+        );
+        assert_eq!(
+            channel_history_scroll_behavior(true, true),
+            message_html::TimelineScrollBehavior::Preserve
+        );
     }
 }
