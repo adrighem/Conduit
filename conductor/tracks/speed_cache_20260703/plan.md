@@ -38,4 +38,8 @@
   - [x] Sub-task: Enable the internal WebView runtime needed by timeline scroll scripts
   - [x] Sub-task: Defer non-critical history render follow-up work until after HTML load starts
   - [x] Sub-task: Add regression tests for WebView feature policy
+- [x] Task: Prevent sidebar refresh from blocking channel loads 7d67cfc
+  - [x] Sub-task: Add regression coverage for background conversation refresh policy
+  - [x] Sub-task: Spawn fresh conversation refreshes after auth and manual refresh
+  - [x] Sub-task: Keep cached conversation rendering synchronous
 - [ ] Task: Conductor - User Manual Verification 'Bottom Anchoring And Auto-Scroll' (Protocol in workflow.md)
