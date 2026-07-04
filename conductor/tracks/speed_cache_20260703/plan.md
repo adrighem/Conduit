@@ -1,6 +1,6 @@
 # Track Plan
 
-## Phase 1: Stable Sidebar During Conversation Refresh
+## Phase 1: Stable Sidebar During Conversation Refresh [checkpoint: 956004c]
 - [x] Task: Keep populated sidebar interactive during refresh 6eac9a8
   - [x] Sub-task: Write tests for sidebar render policy when loading with existing conversations
   - [x] Sub-task: Avoid list replacement for loading/error states when conversations are already available
@@ -10,7 +10,7 @@
   - [x] Sub-task: Write tests for user-name sidebar render policy during refresh
   - [x] Sub-task: Render sidebar only when a loaded user changes a visible DM row
   - [x] Sub-task: Defer user-name sidebar rerenders while conversation refresh is active
-- [ ] Task: Conductor - User Manual Verification 'Stable Sidebar During Conversation Refresh' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Stable Sidebar During Conversation Refresh' (Protocol in workflow.md) 956004c
 
 ## Phase 2: Fast Channel Opening And Bounded History Cache
 - [ ] Task: Render cached channel history immediately while refreshing latest history
