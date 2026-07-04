@@ -61,6 +61,8 @@ Required user scopes:
 channels:read,channels:history,channels:write,groups:read,groups:history,groups:write,im:read,im:history,im:write,mpim:read,mpim:history,mpim:write,users:read,chat:write,search:read,stars:read,stars:write,reactions:read,reactions:write,files:read,files:write
 ```
 
+If you connected Conduit before new scopes were added, Slack may keep using the older grant. Use **Sign Out** in the workspace menu, confirm the app has the scopes above, and reconnect so read markers, search, saved items, reactions, and file access have the permissions they expect.
+
 After approval, Conduit validates the session with `auth.test` and stores the token in the system keyring. Browser-session token imports use the same validation and storage path. Use **Sign Out** in the workspace menu to remove the stored token.
 
 ## Status

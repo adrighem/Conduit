@@ -9,6 +9,7 @@
 - Run `meson test -C _build`.
 - Launch `_build/src/conduit` and confirm the login screen renders.
 - Test OAuth with a real Slack app client ID and `http://127.0.0.1:8934/callback`.
+- If requested Slack scopes changed since the last tester build, verify the README scope list and reconnect instructions before tagging.
 - If Socket Mode has been implemented for the release, test it with an `xapp-` token that has `connections:write`.
 - Capture real screenshots before adding AppStream screenshot entries.
 
