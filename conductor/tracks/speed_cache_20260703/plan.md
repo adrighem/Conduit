@@ -34,4 +34,8 @@
   - [x] Sub-task: Write tests or a small harness for prepend scroll behavior
   - [x] Sub-task: Maintain visible position when older messages are prepended above the current viewport
   - [x] Sub-task: Keep the top **Load older messages** affordance reachable
+- [x] Task: Fix failed bottom-anchor manual verification f33252d
+  - [x] Sub-task: Enable the internal WebView runtime needed by timeline scroll scripts
+  - [x] Sub-task: Defer non-critical history render follow-up work until after HTML load starts
+  - [x] Sub-task: Add regression tests for WebView feature policy
 - [ ] Task: Conductor - User Manual Verification 'Bottom Anchoring And Auto-Scroll' (Protocol in workflow.md)
