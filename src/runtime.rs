@@ -273,6 +273,15 @@ struct RuntimeContext<'a> {
     read_marks: &'a mut HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationRefreshMode {
+    Background,
+}
+
+fn conversation_refresh_mode() -> ConversationRefreshMode {
+    ConversationRefreshMode::Background
+}
+
 async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_>) -> Result<()> {
     match command {
         RuntimeCommand::LoadStoredToken => {
@@ -332,8 +341,11 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         }
         RuntimeCommand::RefreshConversations => {
             crate::debug::log("runtime", "RefreshConversations");
-            load_conversations_best_effort(context.events, context.slack, context.workspace_store)
-                .await?;
+            debug_assert_eq!(
+                conversation_refresh_mode(),
+                ConversationRefreshMode::Background
+            );
+            spawn_conversation_refresh(context)?;
         }
         RuntimeCommand::LoadHistory { channel_id } => {
             let api = require_slack(context.slack)?;
@@ -589,7 +601,30 @@ async fn load_workspace_after_auth(
     ));
     context.user_cache.clear();
     load_cached_conversations(context.events, context.workspace_store).await;
-    load_conversations_best_effort(context.events, context.slack, context.workspace_store).await
+    debug_assert_eq!(
+        conversation_refresh_mode(),
+        ConversationRefreshMode::Background
+    );
+    spawn_conversation_refresh(context)
+}
+
+fn spawn_conversation_refresh(context: &RuntimeContext<'_>) -> Result<()> {
+    let api = require_slack(context.slack)?.clone();
+    let events = context.events.clone();
+    let workspace_store = (*context.workspace_store).clone();
+
+    tokio::spawn(async move {
+        if let Err(error) =
+            load_conversations_best_effort_with_api(&events, &api, &workspace_store).await
+        {
+            crate::debug::log(
+                "runtime",
+                &format!("ConversationsBackgroundRefreshFailed error={error:#}"),
+            );
+        }
+    });
+
+    Ok(())
 }
 
 async fn connect_with_token(
@@ -618,12 +653,11 @@ async fn connect_with_token(
     Ok(auth)
 }
 
-async fn load_conversations(
+async fn load_conversations_with_api(
     events: &Sender<RuntimeEvent>,
-    slack: &mut Option<SlackApi>,
+    api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
 ) -> Result<()> {
-    let api = require_slack(slack)?;
     events.send_status("Loading conversations");
     let conversations = api.conversations().await?;
     store_conversations(workspace_store, &conversations).await;
@@ -635,19 +669,23 @@ async fn load_conversations(
     Ok(())
 }
 
-async fn load_conversations_best_effort(
+async fn load_conversations_best_effort_with_api(
     events: &Sender<RuntimeEvent>,
-    slack: &mut Option<SlackApi>,
+    api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
 ) -> Result<()> {
-    if let Err(error) = load_conversations(events, slack, workspace_store).await {
-        crate::debug::log(
-            "runtime",
-            &format!("ConversationsLoadFailed error={error:#}"),
-        );
-        events.send_event(RuntimeEvent::ConversationsLoadFailed(error.to_string()));
+    if let Err(error) = load_conversations_with_api(events, api, workspace_store).await {
+        handle_conversations_load_error(events, error);
     }
     Ok(())
+}
+
+fn handle_conversations_load_error(events: &Sender<RuntimeEvent>, error: anyhow::Error) {
+    crate::debug::log(
+        "runtime",
+        &format!("ConversationsLoadFailed error={error:#}"),
+    );
+    events.send_event(RuntimeEvent::ConversationsLoadFailed(error.to_string()));
 }
 
 fn send_history_loaded(
@@ -943,6 +981,14 @@ mod tests {
         };
 
         assert_eq!(workspace_store_id(&auth), "T123:U123");
+    }
+
+    #[test]
+    fn conversation_refresh_runs_in_background() {
+        assert_eq!(
+            conversation_refresh_mode(),
+            ConversationRefreshMode::Background
+        );
     }
 
     #[test]
