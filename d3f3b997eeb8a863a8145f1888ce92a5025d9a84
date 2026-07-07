@@ -1,0 +1,18 @@
+Task: Make unread sidebar titles explicitly bold
+
+Summary:
+- Added an explicit Pango font-weight helper for sidebar conversation titles.
+- Applied bold title weight when unread_count > 0 and normal title weight otherwise.
+- Applied the same unread title weight behavior to Ctrl-K conversation switcher rows.
+- Updated sidebar design docs and added regression coverage for the weight decision.
+
+Modified files:
+- src/window.rs
+- docs/sidebar-design.md
+- conductor/tracks.md
+- conductor/tracks/unread_sidebar_bold_20260707/spec.md
+- conductor/tracks/unread_sidebar_bold_20260707/plan.md
+- conductor/tracks/unread_sidebar_bold_20260707/metadata.json
+
+Rationale:
+The previous implementation relied on the libadwaita heading style class, which did not reliably make unread row titles bold in the navigation list. Explicit Pango title weights make the read/unread visual distinction deterministic.
