@@ -293,6 +293,22 @@ fn sidebar_user_name_update_needs_render(
         })
 }
 
+fn sidebar_title_weight(unread_count: u64) -> gtk::pango::Weight {
+    if unread_count > 0 {
+        gtk::pango::Weight::Bold
+    } else {
+        gtk::pango::Weight::Normal
+    }
+}
+
+fn sidebar_title_attributes(unread_count: u64) -> gtk::pango::AttrList {
+    let attributes = gtk::pango::AttrList::new();
+    attributes.insert(gtk::pango::AttrInt::new_weight(sidebar_title_weight(
+        unread_count,
+    )));
+    attributes
+}
+
 fn conversation_switcher_items(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
@@ -1786,9 +1802,7 @@ impl ConduitWindow {
         title.set_xalign(0.0);
         title.set_hexpand(true);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        if model.unread_count > 0 {
-            title.add_css_class("heading");
-        }
+        title.set_attributes(Some(&sidebar_title_attributes(model.unread_count)));
         content.append(&title);
 
         if let Some(unread_label) = model.unread_badge_label() {
@@ -1970,6 +1984,7 @@ impl ConduitWindow {
         title.set_xalign(0.0);
         title.set_hexpand(true);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title.set_attributes(Some(&sidebar_title_attributes(model.unread_count)));
         content.append(&title);
 
         if let Some(unread_label) = model.unread_badge_label() {
@@ -2561,6 +2576,13 @@ mod tests {
 
         assert_eq!(sidebar_row_action_for_index(&actions, 3), None);
         assert_eq!(sidebar_row_action_for_index(&actions, 4), Some(action));
+    }
+
+    #[test]
+    fn sidebar_title_weight_uses_bold_only_for_unread_rows() {
+        assert_eq!(sidebar_title_weight(0), gtk::pango::Weight::Normal);
+        assert_eq!(sidebar_title_weight(1), gtk::pango::Weight::Bold);
+        assert_eq!(sidebar_title_weight(12), gtk::pango::Weight::Bold);
     }
 
     #[test]

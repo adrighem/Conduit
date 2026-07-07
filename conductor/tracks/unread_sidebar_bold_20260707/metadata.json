@@ -1,0 +1,8 @@
+{
+  "track_id": "unread_sidebar_bold_20260707",
+  "type": "bugfix",
+  "status": "in_progress",
+  "created_at": "2026-07-07T10:01:11Z",
+  "updated_at": "2026-07-07T10:01:11Z",
+  "description": "Fix sidebar unread conversation titles so unread rows render bold and read rows render normal weight."
+}

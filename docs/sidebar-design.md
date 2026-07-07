@@ -179,7 +179,7 @@ Icons:
 - Group direct message: `system-users-symbolic`
 - Unknown conversation: `dialog-question-symbolic`
 
-Rows with unread messages apply the `heading` CSS class to the title and unread count. Selected conversations use the native `GtkListBox` selected row state, not `suggested-action`.
+Rows with unread messages apply explicit bold Pango weight to the title; read rows apply explicit normal title weight. Unread counts remain visually emphasized with the `heading` CSS class. Selected conversations use the native `GtkListBox` selected row state, not `suggested-action`.
 
 Unread badge labels are capped at `99+` for counts above 99. Row titles ellipsize and the sidebar width remains stable at the shell level.
 

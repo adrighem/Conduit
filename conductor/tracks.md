@@ -21,3 +21,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [~] Track: Near instant channel loading
 *Link: [./conductor/tracks/instant_channel_loading_20260707/](./conductor/tracks/instant_channel_loading_20260707/)*
+
+---
+
+## [~] Track: Unread sidebar bold text
+*Link: [./conductor/tracks/unread_sidebar_bold_20260707/](./conductor/tracks/unread_sidebar_bold_20260707/)*
