@@ -1,7 +1,7 @@
 # Track Plan
 
 ## Phase 1: Near Instant Channel First Paint
-- [~] Task: Add bounded latest-history prefetch and recent previews
+- [x] Task: Add bounded latest-history prefetch and recent previews 6f3750f
   - [x] Sub-task: Keep initial channel history pages around 30 messages
   - [x] Sub-task: Limit cached first renders to the latest preview page
   - [x] Sub-task: Rank and bound background channel-history prefetch candidates
