@@ -1,7 +1,7 @@
 # Track Plan
 
 ## Phase 1: Sidebar Unread Title Weight
-- [~] Task: Make unread sidebar titles explicitly bold
+- [x] Task: Make unread sidebar titles explicitly bold d3f3b99
   - [x] Sub-task: Add regression coverage for unread/read title weight
   - [x] Sub-task: Apply explicit normal/bold font weight to sidebar row titles
   - [x] Sub-task: Preserve existing unread badge and accessible label behavior
