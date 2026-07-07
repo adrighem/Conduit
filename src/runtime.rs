@@ -17,8 +17,10 @@ use crate::config;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, StoredToken,
 };
-use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage};
+use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
 use crate::store::WorkspaceStore;
+
+const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
@@ -297,6 +299,89 @@ fn cached_dm_user_ids(
     user_ids.sort();
     user_ids.dedup();
     user_ids
+}
+
+fn recent_history_preview(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+    messages.sort_by(|left, right| right.ts.cmp(&left.ts));
+    messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
+    messages.truncate(CHANNEL_HISTORY_PAGE_LIMIT);
+    messages
+}
+
+#[derive(Debug, Clone)]
+struct ChannelHistoryPrefetchCandidate {
+    id: String,
+    unread_count: u64,
+    activity_score: f64,
+    title: String,
+}
+
+fn channel_history_prefetch_candidates(conversations: &[SlackConversation]) -> Vec<String> {
+    let mut candidates = conversations
+        .iter()
+        .filter_map(channel_history_prefetch_candidate)
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .unread_count
+            .cmp(&left.unread_count)
+            .then_with(|| right.activity_score.total_cmp(&left.activity_score))
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
+    candidates
+        .into_iter()
+        .map(|candidate| candidate.id)
+        .collect()
+}
+
+fn channel_history_prefetch_candidate(
+    conversation: &SlackConversation,
+) -> Option<ChannelHistoryPrefetchCandidate> {
+    if conversation.is_archived.unwrap_or(false)
+        || conversation.is_im.unwrap_or(false)
+        || conversation.is_mpim.unwrap_or(false)
+    {
+        return None;
+    }
+
+    let is_channel = conversation.is_channel.unwrap_or(false)
+        || conversation.is_group.unwrap_or(false)
+        || conversation.is_private.unwrap_or(false);
+    if !is_channel {
+        return None;
+    }
+
+    Some(ChannelHistoryPrefetchCandidate {
+        id: conversation.id.clone(),
+        unread_count: conversation.unread_activity_count(),
+        activity_score: conversation_activity_score(conversation),
+        title: conversation.display_name().to_lowercase(),
+    })
+}
+
+fn conversation_activity_score(conversation: &SlackConversation) -> f64 {
+    [
+        "last_read",
+        "updated",
+        "updated_at",
+        "created",
+        "latest",
+        "latest_ts",
+    ]
+    .into_iter()
+    .filter_map(|key| conversation.extra.get(key).and_then(slack_numeric_value))
+    .fold(0.0, f64::max)
+}
+
+fn slack_numeric_value(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_>) -> Result<()> {
@@ -702,6 +787,7 @@ async fn load_conversations_best_effort_with_api(
 ) -> Result<()> {
     match load_conversations_with_api(events, api, workspace_store).await {
         Ok(conversations) => {
+            prefetch_channel_histories_best_effort(api, workspace_store, &conversations).await;
             refresh_cached_dm_user_names(
                 events,
                 api,
@@ -714,6 +800,63 @@ async fn load_conversations_best_effort_with_api(
         Err(error) => handle_conversations_load_error(events, error),
     }
     Ok(())
+}
+
+async fn prefetch_channel_histories_best_effort(
+    api: &SlackApi,
+    workspace_store: &Option<WorkspaceStore>,
+    conversations: &[SlackConversation],
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+
+    let channel_ids = channel_history_prefetch_candidates(conversations);
+    if channel_ids.is_empty() {
+        return;
+    }
+
+    crate::debug::log(
+        "runtime",
+        &format!("ChannelHistoryPrefetchStart count={}", channel_ids.len()),
+    );
+
+    for channel_id in channel_ids {
+        match store.load_history(&channel_id).await {
+            Ok(Some(_)) => {
+                crate::debug::log(
+                    "runtime",
+                    &format!("ChannelHistoryPrefetchSkipped channel_id={channel_id} reason=cached"),
+                );
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::debug::log(
+                    "runtime",
+                    &format!("ChannelHistoryPrefetchCacheCheckFailed channel_id={channel_id} error={error:#}"),
+                );
+                continue;
+            }
+        }
+
+        match api.history(&channel_id).await {
+            Ok(page) => {
+                crate::debug::log(
+                    "runtime",
+                    &format!(
+                        "ChannelHistoryPrefetched channel_id={channel_id} messages={}",
+                        page.messages.len()
+                    ),
+                );
+                store_history(workspace_store, &channel_id, &page.messages).await;
+            }
+            Err(error) => crate::debug::log(
+                "runtime",
+                &format!("ChannelHistoryPrefetchFailed channel_id={channel_id} error={error:#}"),
+            ),
+        }
+    }
 }
 
 async fn load_cached_user_names(
@@ -953,16 +1096,17 @@ async fn load_cached_history(
 
     match store.load_history(channel_id).await {
         Ok(Some(messages)) => {
+            let preview = recent_history_preview(messages);
             crate::debug::log(
                 "runtime",
                 &format!(
                     "CachedHistoryLoaded channel_id={channel_id} messages={}",
-                    messages.len()
+                    preview.len()
                 ),
             );
             events.send_event(RuntimeEvent::HistoryLoaded {
                 channel_id: channel_id.to_string(),
-                messages,
+                messages: preview,
                 has_more: false,
                 next_cursor: None,
                 append_older: false,
@@ -1150,6 +1294,108 @@ mod tests {
             cached_dm_user_ids(&conversations, &user_cache),
             vec!["U123"]
         );
+    }
+
+    fn channel(id: &str, unread_count: u64, last_read: Option<&str>) -> SlackConversation {
+        let mut conversation = SlackConversation {
+            id: id.to_string(),
+            name: Some(
+                id.trim_start_matches("C-")
+                    .trim_start_matches('C')
+                    .to_string(),
+            ),
+            is_channel: Some(true),
+            unread_count: Some(unread_count),
+            ..Default::default()
+        };
+        if let Some(last_read) = last_read {
+            conversation
+                .extra
+                .insert("last_read".to_string(), serde_json::json!(last_read));
+        }
+        conversation
+    }
+
+    fn private_channel(id: &str, unread_count: u64, last_read: Option<&str>) -> SlackConversation {
+        SlackConversation {
+            is_channel: Some(false),
+            is_group: Some(true),
+            is_private: Some(true),
+            ..channel(id, unread_count, last_read)
+        }
+    }
+
+    fn archived_channel(id: &str, unread_count: u64) -> SlackConversation {
+        SlackConversation {
+            is_archived: Some(true),
+            ..channel(id, unread_count, None)
+        }
+    }
+
+    fn dm(id: &str, unread_count: u64) -> SlackConversation {
+        SlackConversation {
+            id: id.to_string(),
+            user: Some("U123".to_string()),
+            is_im: Some(true),
+            unread_count: Some(unread_count),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn recent_history_preview_keeps_latest_page_only() {
+        let count = CHANNEL_HISTORY_PAGE_LIMIT + 5;
+        let messages = (0..count)
+            .map(|index| SlackMessage {
+                ts: format!("1710000{index:03}.000000"),
+                text: Some(format!("message {index}")),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let preview = recent_history_preview(messages);
+        let first_ts = format!("1710000{:03}.000000", count - 1);
+        let last_ts = format!("1710000{:03}.000000", count - CHANNEL_HISTORY_PAGE_LIMIT);
+
+        assert_eq!(preview.len(), CHANNEL_HISTORY_PAGE_LIMIT);
+        assert_eq!(
+            preview.first().map(|message| message.ts.as_str()),
+            Some(first_ts.as_str())
+        );
+        assert_eq!(
+            preview.last().map(|message| message.ts.as_str()),
+            Some(last_ts.as_str())
+        );
+    }
+
+    #[test]
+    fn channel_history_prefetch_candidates_prioritize_unread_and_recent_channels() {
+        let conversations = vec![
+            channel("C-old", 0, None),
+            dm("D-unread", 99),
+            archived_channel("C-archived", 99),
+            channel("C-recent", 0, Some("1710000300.000000")),
+            channel("C-unread", 4, Some("1710000000.000000")),
+            private_channel("G-private", 0, Some("1710000200.000000")),
+        ];
+
+        assert_eq!(
+            channel_history_prefetch_candidates(&conversations),
+            vec!["C-unread", "C-recent", "G-private", "C-old"]
+        );
+    }
+
+    #[test]
+    fn channel_history_prefetch_candidates_are_bounded() {
+        let conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
+            .map(|index| channel(&format!("C{index}"), index as u64, None))
+            .collect::<Vec<_>>();
+
+        let candidates = channel_history_prefetch_candidates(&conversations);
+
+        assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT);
+        assert_eq!(candidates.first().map(String::as_str), Some("C14"));
+        assert_eq!(candidates.last().map(String::as_str), Some("C3"));
     }
 
     #[test]

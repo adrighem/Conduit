@@ -18,7 +18,8 @@ const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
 const MAX_RETRY_AFTER_SECONDS: u64 = 30;
-const HISTORY_PAGE_LIMIT: &str = "50";
+pub(crate) const CHANNEL_HISTORY_PAGE_LIMIT: usize = 30;
+const THREAD_HISTORY_PAGE_LIMIT: usize = 50;
 const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
 const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROPERTIES";
 const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
@@ -108,7 +109,7 @@ impl SlackApi {
     ) -> Result<SlackMessagePage> {
         let mut params = vec![
             ("channel", channel_id.to_string()),
-            ("limit", HISTORY_PAGE_LIMIT.to_string()),
+            ("limit", CHANNEL_HISTORY_PAGE_LIMIT.to_string()),
         ];
         if let Some(cursor) = cursor.filter(|cursor| !cursor.trim().is_empty()) {
             params.push(("cursor", cursor.to_string()));
@@ -134,7 +135,7 @@ impl SlackApi {
         let mut params = vec![
             ("channel", channel_id.to_string()),
             ("ts", ts.to_string()),
-            ("limit", HISTORY_PAGE_LIMIT.to_string()),
+            ("limit", THREAD_HISTORY_PAGE_LIMIT.to_string()),
         ];
         if let Some(cursor) = cursor.filter(|cursor| !cursor.trim().is_empty()) {
             params.push(("cursor", cursor.to_string()));

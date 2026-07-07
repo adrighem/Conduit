@@ -16,3 +16,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [x] Track: Speed optimization and channel caching
 *Link: [./conductor/tracks/speed_cache_20260703/](./conductor/tracks/speed_cache_20260703/)*
+
+---
+
+## [~] Track: Near instant channel loading
+*Link: [./conductor/tracks/instant_channel_loading_20260707/](./conductor/tracks/instant_channel_loading_20260707/)*
