@@ -8,6 +8,7 @@
 4. **High Code Coverage:** Aim for >80% code coverage for all modules
 5. **User Experience First:** Every decision should prioritize user experience
 6. **Non-Interactive & CI-Aware:** Prefer non-interactive commands. Use `CI=true` for watch-mode tools (tests, linters) to ensure single execution.
+7. **Compile After Code Changes:** Always run a compile command after creating or changing application code.
 
 ## Task Workflow
 
@@ -25,10 +26,12 @@ All tasks follow a strict lifecycle:
 
 4. **Implement to Pass Tests (Green Phase):**
    - Write the minimum application code necessary to make the failing tests pass.
+   - Run the appropriate compile command after creating or changing code.
    - Run the test suite again and confirm that all tests pass.
 
 5. **Refactor:**
    - Improve clarity and remove duplication while preserving behavior.
+   - Run the appropriate compile command after changing code.
    - Rerun tests after refactoring.
 
 6. **Verify Coverage:**
