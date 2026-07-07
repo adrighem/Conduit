@@ -1,0 +1,18 @@
+Task: Add bounded latest-history prefetch and recent previews
+
+Summary:
+- Reduced initial channel history pages to a 30-message latest preview while keeping thread history at 50.
+- Limited cached first renders to the latest preview page.
+- Added bounded background prefetch for likely channel histories after conversation refresh, skipping already cached histories and avoiding read-state changes.
+- Added unit coverage for cached previews and prefetch candidate ranking/bounding.
+
+Modified files:
+- src/slack.rs
+- src/runtime.rs
+- conductor/tracks.md
+- conductor/tracks/instant_channel_loading_20260707/spec.md
+- conductor/tracks/instant_channel_loading_20260707/plan.md
+- conductor/tracks/instant_channel_loading_20260707/metadata.json
+
+Rationale:
+Opening channels should render recent messages from cache as quickly as possible. Prefetching a bounded set of likely channels warms that cache without sweeping large workspaces or marking conversations read.
