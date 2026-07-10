@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures_util::lock::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -16,6 +18,7 @@ const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 pub struct WorkspaceStore {
     directory: PathBuf,
     workspace_key: String,
+    update_lock: Arc<Mutex<()>>,
 }
 
 impl WorkspaceStore {
@@ -23,6 +26,7 @@ impl WorkspaceStore {
         Self {
             directory,
             workspace_key: cache_key(workspace_id),
+            update_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -35,9 +39,8 @@ impl WorkspaceStore {
     }
 
     pub async fn store_conversations(&self, conversations: &[SlackConversation]) -> Result<()> {
-        let mut state = self.load_state_for_update().await;
-        state.conversations = conversations.to_vec();
-        self.store_state(&state).await
+        self.update_state(|state| state.conversations = conversations.to_vec())
+            .await
     }
 
     pub async fn load_user_names(&self) -> Result<HashMap<String, String>> {
@@ -55,16 +58,17 @@ impl WorkspaceStore {
     }
 
     pub async fn store_user_names(&self, user_names: &HashMap<String, String>) -> Result<()> {
-        let mut state = self.load_state_for_update().await;
-        state.user_names.extend(
-            user_names
-                .iter()
-                .filter(|(user_id, display_name)| {
-                    !user_id.trim().is_empty() && !display_name.trim().is_empty()
-                })
-                .map(|(user_id, display_name)| (user_id.clone(), display_name.clone())),
-        );
-        self.store_state(&state).await
+        self.update_state(|state| {
+            state.user_names.extend(
+                user_names
+                    .iter()
+                    .filter(|(user_id, display_name)| {
+                        !user_id.trim().is_empty() && !display_name.trim().is_empty()
+                    })
+                    .map(|(user_id, display_name)| (user_id.clone(), display_name.clone())),
+            );
+        })
+        .await
     }
 
     pub async fn load_history(&self, channel_id: &str) -> Result<Option<Vec<SlackMessage>>> {
@@ -76,11 +80,12 @@ impl WorkspaceStore {
     }
 
     pub async fn store_history(&self, channel_id: &str, messages: &[SlackMessage]) -> Result<()> {
-        let mut state = self.load_state_for_update().await;
-        state
-            .channel_histories
-            .insert(channel_id.to_string(), pruned_history(messages.to_vec()));
-        self.store_state(&state).await
+        self.update_state(|state| {
+            state
+                .channel_histories
+                .insert(channel_id.to_string(), pruned_history(messages.to_vec()));
+        })
+        .await
     }
 
     pub async fn store_merged_history(
@@ -88,17 +93,18 @@ impl WorkspaceStore {
         channel_id: &str,
         messages: &[SlackMessage],
     ) -> Result<()> {
-        let mut state = self.load_state_for_update().await;
-        let existing = state
-            .channel_histories
-            .get(channel_id)
-            .cloned()
-            .unwrap_or_default();
-        state.channel_histories.insert(
-            channel_id.to_string(),
-            merge_history_pages(&existing, messages),
-        );
-        self.store_state(&state).await
+        self.update_state(|state| {
+            let existing = state
+                .channel_histories
+                .get(channel_id)
+                .cloned()
+                .unwrap_or_default();
+            state.channel_histories.insert(
+                channel_id.to_string(),
+                merge_history_pages(&existing, messages),
+            );
+        })
+        .await
     }
 
     pub async fn load_thread(
@@ -120,10 +126,18 @@ impl WorkspaceStore {
         thread_ts: &str,
         messages: &[SlackMessage],
     ) -> Result<()> {
+        self.update_state(|state| {
+            state
+                .thread_replies
+                .insert(thread_key(channel_id, thread_ts), messages.to_vec());
+        })
+        .await
+    }
+
+    async fn update_state(&self, update: impl FnOnce(&mut CachedWorkspaceState)) -> Result<()> {
+        let _guard = self.update_lock.lock().await;
         let mut state = self.load_state_for_update().await;
-        state
-            .thread_replies
-            .insert(thread_key(channel_id, thread_ts), messages.to_vec());
+        update(&mut state);
         self.store_state(&state).await
     }
 
@@ -356,6 +370,56 @@ mod tests {
                     .get("U123")
                     .map(String::as_str),
                 Some("Ada Lovelace")
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_serializes_concurrent_updates_from_clones() {
+        let directory = temp_cache_dir("workspace-store-concurrent-updates");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let cloned_store = store.clone();
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let conversations = vec![SlackConversation {
+                id: "C123".to_string(),
+                name: Some("general".to_string()),
+                ..Default::default()
+            }];
+            let messages = vec![SlackMessage {
+                ts: "1710000000.000100".to_string(),
+                text: Some("cached".to_string()),
+                ..Default::default()
+            }];
+
+            let (conversations_result, history_result) = futures_util::future::join(
+                store.store_conversations(&conversations),
+                cloned_store.store_history("C123", &messages),
+            )
+            .await;
+            conversations_result.expect("conversation store failed");
+            history_result.expect("history store failed");
+
+            assert_eq!(
+                store
+                    .load_conversations()
+                    .await
+                    .expect("conversation load failed")
+                    .expect("concurrent conversation update was lost")[0]
+                    .id,
+                "C123"
+            );
+            assert_eq!(
+                store
+                    .load_history("C123")
+                    .await
+                    .expect("history load failed")
+                    .expect("concurrent history update was lost")[0]
+                    .body_text(),
+                "cached"
             );
         });
 
