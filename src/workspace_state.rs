@@ -61,6 +61,12 @@ pub(crate) struct HistoryApplyOutcome {
     pub(crate) scroll: Option<WorkspaceScrollBehavior>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkspaceFailureOutcome {
+    pub(crate) active: bool,
+    pub(crate) has_content: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadOpenOutcome {
     Ignored,
@@ -349,16 +355,19 @@ impl WorkspaceViewState {
         }
     }
 
-    pub(crate) fn clear_history_loading(&mut self) {
-        for history in self.channels.values_mut() {
-            history.loading = false;
+    pub(crate) fn fail_history(&mut self, channel_id: &str) -> WorkspaceFailureOutcome {
+        let active = self.visible_channel_id() == Some(channel_id);
+        let Some(history) = self.channels.get_mut(channel_id) else {
+            return WorkspaceFailureOutcome::default();
+        };
+        history.loading = false;
+        if history.messages.is_empty() {
+            history.loaded = false;
         }
-        if let Some(thread) = &mut self.thread {
-            thread.loading = false;
+        WorkspaceFailureOutcome {
+            active,
+            has_content: !history.messages.is_empty(),
         }
-        self.search_loading = false;
-        self.files_loading = false;
-        self.saved_loading = false;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -447,8 +456,49 @@ impl WorkspaceViewState {
         }
     }
 
+    pub(crate) fn fail_thread(&mut self, channel_id: &str, ts: &str) -> WorkspaceFailureOutcome {
+        let Some(thread) = &mut self.thread else {
+            return WorkspaceFailureOutcome::default();
+        };
+        if thread.channel_id != channel_id || thread.ts != ts {
+            return WorkspaceFailureOutcome::default();
+        }
+        thread.loading = false;
+        if thread.messages.is_empty() {
+            thread.loaded = false;
+        }
+        WorkspaceFailureOutcome {
+            active: true,
+            has_content: !thread.messages.is_empty(),
+        }
+    }
+
     pub(crate) fn close_thread(&mut self) -> bool {
         self.thread.take().is_some()
+    }
+
+    pub(crate) fn fail_search(&mut self) -> WorkspaceFailureOutcome {
+        self.search_loading = false;
+        WorkspaceFailureOutcome {
+            active: self.main_view == MainMessageView::Search,
+            has_content: !self.search_results.is_empty(),
+        }
+    }
+
+    pub(crate) fn fail_files(&mut self) -> WorkspaceFailureOutcome {
+        self.files_loading = false;
+        WorkspaceFailureOutcome {
+            active: self.main_view == MainMessageView::Files,
+            has_content: !self.files.is_empty(),
+        }
+    }
+
+    pub(crate) fn fail_saved(&mut self) -> WorkspaceFailureOutcome {
+        self.saved_loading = false;
+        WorkspaceFailureOutcome {
+            active: self.main_view == MainMessageView::Saved,
+            has_content: !self.saved_items.is_empty(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -906,18 +956,178 @@ mod tests {
     #[test]
     fn explicit_history_requests_are_deduplicated_and_errors_clear_loading() {
         let mut state = WorkspaceViewState::default();
+        apply_fresh(&mut state, "C1", vec![message("1", "cached one")]);
+        apply_fresh(&mut state, "C2", vec![message("2", "cached two")]);
+        state.select_conversation("C2");
+        apply_fresh(&mut state, "C2", vec![message("2", "cached two")]);
         assert!(state.begin_history_request("C1"));
-        assert!(!state.begin_history_request("C1"));
-        state.start_files();
-        state.start_saved();
-        state.start_search();
+        assert!(state.begin_history_request("C2"));
 
-        state.clear_history_loading();
+        let hidden = state.fail_history("C1");
 
+        assert_eq!(
+            hidden,
+            WorkspaceFailureOutcome {
+                active: false,
+                has_content: true,
+            }
+        );
         assert!(state.begin_history_request("C1"));
-        assert!(!state.search_loading());
-        assert!(!state.files_loading());
-        assert!(!state.saved_loading());
+        assert!(!state.begin_history_request("C2"));
+        assert_eq!(state.visible_channel_id(), Some("C2"));
+        assert_eq!(state.channel_messages("C1")[0].body_text(), "cached one");
+
+        let visible = state.fail_history("C2");
+        assert_eq!(
+            visible,
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: true,
+            }
+        );
+        assert!(state.begin_history_request("C2"));
+    }
+
+    #[test]
+    fn thread_failure_clears_only_the_matching_load_and_preserves_messages() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("1", "parent")]);
+        state.open_thread("C1", "1");
+        state.apply_thread(
+            "C1",
+            "1",
+            vec![message("1", "parent"), message("2", "reply")],
+            false,
+            None,
+            false,
+        );
+        assert!(state.begin_thread_history_request());
+
+        assert_eq!(
+            state.fail_thread("C1", "other"),
+            WorkspaceFailureOutcome::default()
+        );
+        assert!(!state.begin_thread_history_request());
+
+        assert_eq!(
+            state.fail_thread("C1", "1"),
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: true,
+            }
+        );
+        assert!(state.begin_thread_history_request());
+        assert_eq!(state.current_thread_messages().len(), 2);
+        assert_eq!(state.selected_thread_ts(), Some("1"));
+    }
+
+    #[test]
+    fn empty_history_and_thread_failures_make_direct_retry_available() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", Vec::new());
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RenderCurrent
+        );
+        assert!(state.begin_history_request("C1"));
+
+        assert_eq!(
+            state.fail_history("C1"),
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: false,
+            }
+        );
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RequestFresh
+        );
+        apply_fresh(&mut state, "C1", vec![message("1", "parent")]);
+        state.open_thread("C1", "1");
+        state.apply_thread("C1", "1", Vec::new(), false, None, false);
+        assert_eq!(
+            state.open_thread("C1", "1"),
+            ThreadOpenOutcome::RenderCurrent
+        );
+        assert!(state.begin_thread_history_request());
+
+        assert_eq!(
+            state.fail_thread("C1", "1"),
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: false,
+            }
+        );
+        assert_eq!(
+            state.open_thread("C1", "1"),
+            ThreadOpenOutcome::RequestFresh
+        );
+    }
+
+    #[test]
+    fn surface_failures_clear_only_their_loading_state_and_report_visibility() {
+        let mut search = WorkspaceViewState::default();
+        search.start_search();
+        search.search_results.push(SearchMatch {
+            text: Some("preserved".into()),
+            ..SearchMatch::default()
+        });
+        assert_eq!(
+            search.fail_search(),
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: true,
+            }
+        );
+        assert!(!search.search_loading());
+        assert_eq!(
+            search.search_results()[0].text.as_deref(),
+            Some("preserved")
+        );
+        search.start_search();
+        search.show_activity();
+        assert_eq!(
+            search.fail_search(),
+            WorkspaceFailureOutcome {
+                active: false,
+                has_content: false,
+            }
+        );
+        assert_eq!(search.main_view(), MainMessageView::Activity);
+
+        let mut files = WorkspaceViewState::default();
+        files.start_files();
+        files.files.push(SlackFile {
+            id: Some("F1".into()),
+            ..SlackFile::default()
+        });
+        assert_eq!(
+            files.fail_files(),
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: true,
+            }
+        );
+        assert!(!files.files_loading());
+        assert_eq!(files.files()[0].id.as_deref(), Some("F1"));
+
+        let mut saved = WorkspaceViewState::default();
+        saved.start_saved();
+        saved.saved_items.push(SavedItem {
+            channel: Some("C1".into()),
+            ..SavedItem::default()
+        });
+        assert_eq!(
+            saved.fail_saved(),
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: true,
+            }
+        );
+        assert!(!saved.saved_loading());
+        assert_eq!(saved.saved_items()[0].channel.as_deref(), Some("C1"));
     }
 
     #[test]

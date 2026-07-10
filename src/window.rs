@@ -41,7 +41,7 @@ use crate::models::{
 use crate::rendering;
 use crate::runtime::{
     AppRuntime, OperationContext, RequestId, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
-    RuntimeEventMeta, RuntimeIdentity, SessionId,
+    RuntimeEventMeta, RuntimeIdentity, RuntimeOperation, RuntimeTarget, SessionId,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{self, SidebarRowModel, SidebarSectionModel};
@@ -318,6 +318,120 @@ fn sidebar_error_change_needs_render(has_conversations: bool) -> bool {
     !has_conversations
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeFailureRecovery {
+    Session,
+    Sidebar,
+    History(String),
+    Thread {
+        channel_id: String,
+        thread_ts: String,
+    },
+    Search,
+    Files,
+    SavedItems,
+    User(String),
+    Image(String),
+    PostMessage {
+        channel_id: String,
+        thread_ts: Option<String>,
+    },
+    Reaction {
+        channel_id: String,
+        thread_ts: Option<String>,
+    },
+    Saved {
+        channel_id: String,
+        thread_ts: Option<String>,
+    },
+    Upload(String),
+    NonDisruptive,
+}
+
+fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecovery {
+    match (&context.operation, &context.target) {
+        (
+            RuntimeOperation::Startup
+            | RuntimeOperation::Authenticate
+            | RuntimeOperation::SignOut
+            | RuntimeOperation::Disconnect,
+            RuntimeTarget::Workspace,
+        ) => RuntimeFailureRecovery::Session,
+        (RuntimeOperation::Conversations, RuntimeTarget::Workspace) => {
+            RuntimeFailureRecovery::Sidebar
+        }
+        (
+            RuntimeOperation::History | RuntimeOperation::OlderHistory,
+            RuntimeTarget::Channel(channel_id),
+        ) => RuntimeFailureRecovery::History(channel_id.clone()),
+        (
+            RuntimeOperation::Thread | RuntimeOperation::OlderThread,
+            RuntimeTarget::Thread {
+                channel_id,
+                thread_ts,
+            },
+        ) => RuntimeFailureRecovery::Thread {
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts.clone(),
+        },
+        (RuntimeOperation::Search, RuntimeTarget::Workspace) => RuntimeFailureRecovery::Search,
+        (RuntimeOperation::Files, RuntimeTarget::Workspace) => RuntimeFailureRecovery::Files,
+        (RuntimeOperation::SavedItems, RuntimeTarget::Workspace) => {
+            RuntimeFailureRecovery::SavedItems
+        }
+        (RuntimeOperation::User, RuntimeTarget::User(user_id)) => {
+            RuntimeFailureRecovery::User(user_id.clone())
+        }
+        (RuntimeOperation::ImageAsset, RuntimeTarget::Image(key)) => {
+            RuntimeFailureRecovery::Image(key.clone())
+        }
+        (
+            RuntimeOperation::PostMessage,
+            RuntimeTarget::Message {
+                channel_id,
+                thread_ts,
+            },
+        ) => RuntimeFailureRecovery::PostMessage {
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts.clone(),
+        },
+        (
+            RuntimeOperation::Reaction,
+            RuntimeTarget::Message {
+                channel_id,
+                thread_ts,
+            },
+        ) => RuntimeFailureRecovery::Reaction {
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts.clone(),
+        },
+        (
+            RuntimeOperation::Saved,
+            RuntimeTarget::Message {
+                channel_id,
+                thread_ts,
+            },
+        ) => RuntimeFailureRecovery::Saved {
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts.clone(),
+        },
+        (RuntimeOperation::FileUpload, RuntimeTarget::Upload(channel_id)) => {
+            RuntimeFailureRecovery::Upload(channel_id.clone())
+        }
+        _ => RuntimeFailureRecovery::NonDisruptive,
+    }
+}
+
+fn mutation_target_is_active(
+    visible_channel: Option<&str>,
+    selected_thread: Option<&str>,
+    target_channel: &str,
+    target_thread: Option<&str>,
+) -> bool {
+    visible_channel == Some(target_channel)
+        && target_thread.is_none_or(|thread_ts| selected_thread == Some(thread_ts))
+}
+
 fn connected_workspace_status(workspace_name: Option<&str>) -> String {
     format!("Connected to {}", workspace_name.unwrap_or("Slack"))
 }
@@ -508,7 +622,7 @@ impl ConduitWindow {
                 let Some(window) = weak_window.upgrade() else {
                     return;
                 };
-                window.show_error("Background runtime stopped");
+                window.show_session_error("Background runtime stopped");
             }
         });
     }
@@ -778,8 +892,10 @@ impl ConduitWindow {
                     self.set_status(&status);
                 }
             }
-            RuntimeEventKind::Error(error) => self.show_error(&error),
-            RuntimeEventKind::RuntimeStartFailed(error) => self.show_error(&error),
+            RuntimeEventKind::Error(error) => {
+                self.handle_runtime_error(&meta.context, &error);
+            }
+            RuntimeEventKind::RuntimeStartFailed(error) => self.show_session_error(&error),
             RuntimeEventKind::SignedOut => {
                 self.imp().connect_requested.set(false);
                 self.show_login("Choose a workspace to continue");
@@ -934,23 +1050,22 @@ impl ConduitWindow {
                     "ui",
                     &format!("ImageAssetFailed key={}", crate::debug::url_for_log(&key)),
                 );
-                let imp = self.imp();
-                imp.pending_image_assets.borrow_mut().remove(&key);
-                imp.failed_image_assets.borrow_mut().insert(key);
-                self.rerender_current_messages();
+                self.mark_image_asset_failed(&key);
             }
             RuntimeEventKind::MessagePosted {
                 channel_id,
                 message,
             } => {
-                set_text_view_text(&self.imp().message_entry, "");
-                self.imp().send_button.set_sensitive(true);
-                self.imp().thread_send_button.set_sensitive(true);
                 self.set_status("Message sent");
                 let thread_ts = message.thread_ts.clone();
                 if let Some(thread_ts) = thread_ts.as_deref() {
+                    self.imp().thread_send_button.set_sensitive(true);
                     self.note_thread_reply_posted(&channel_id, thread_ts);
                 } else {
+                    self.imp().send_button.set_sensitive(true);
+                    if self.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
+                        set_text_view_text(&self.imp().message_entry, "");
+                    }
                     self.force_next_channel_bottom_render(&channel_id);
                 }
                 self.reload_after_message(&channel_id, thread_ts.as_deref());
@@ -990,11 +1105,17 @@ impl ConduitWindow {
                 imp.upload_button.set_sensitive(true);
                 imp.upload_progress.set_fraction(1.0);
                 imp.upload_progress.set_text(Some("Upload complete"));
-                set_text_view_text(&imp.message_entry, "");
                 self.set_status(&format!("Uploaded {name}"));
-                if let Some(channel_id) = self.visible_channel_id() {
-                    self.force_next_channel_bottom_render(&channel_id);
-                    self.request_channel_history(&channel_id);
+                let uploaded_channel = match &meta.context.target {
+                    RuntimeTarget::Upload(channel_id) => Some(channel_id.as_str()),
+                    _ => None,
+                };
+                if let Some(channel_id) = uploaded_channel
+                    .filter(|channel_id| self.visible_channel_id().as_deref() == Some(*channel_id))
+                {
+                    set_text_view_text(&imp.message_entry, "");
+                    self.force_next_channel_bottom_render(channel_id);
+                    self.request_channel_history(channel_id);
                 }
             }
         }
@@ -1505,7 +1626,6 @@ impl ConduitWindow {
 
     fn reload_after_message(&self, channel_id: &str, thread_ts: Option<&str>) {
         if let Some(thread_ts) = thread_ts {
-            set_text_view_text(&self.imp().thread_entry, "");
             let should_load = {
                 let mut state = self.imp().workspace_view.borrow_mut();
                 state.visible_channel_id() == Some(channel_id)
@@ -1513,6 +1633,7 @@ impl ConduitWindow {
                     && state.begin_thread_history_request()
             };
             if should_load {
+                set_text_view_text(&self.imp().thread_entry, "");
                 self.send_command(RuntimeCommand::LoadThread {
                     channel_id: channel_id.to_string(),
                     ts: thread_ts.to_string(),
@@ -1574,6 +1695,12 @@ impl ConduitWindow {
         imp.failed_image_assets.borrow_mut().clear();
         set_text_view_text(&imp.message_entry, "");
         set_text_view_text(&imp.thread_entry, "");
+        imp.send_button.set_sensitive(true);
+        imp.thread_send_button.set_sensitive(true);
+        imp.upload_button.set_sensitive(true);
+        imp.upload_progress.set_visible(false);
+        imp.upload_progress.set_fraction(0.0);
+        imp.upload_progress.set_text(None);
         imp.sidebar_filter_entry.set_text("");
         imp.sidebar_unread_filter_button.set_active(false);
         imp.sidebar_all_filter_button.set_active(false);
@@ -1626,28 +1753,161 @@ impl ConduitWindow {
         }
     }
 
-    fn show_error(&self, error: &str) {
-        self.imp().send_button.set_sensitive(true);
-        self.imp().thread_send_button.set_sensitive(true);
-        self.imp().upload_button.set_sensitive(true);
-        self.imp().upload_progress.set_visible(false);
-        self.imp()
-            .workspace_view
-            .borrow_mut()
-            .clear_history_loading();
-        if self.imp().content_stack.visible_child_name().as_deref() == Some("loading") {
-            self.show_login(error);
-        } else {
-            if self.imp().content_stack.visible_child_name().as_deref() == Some("workspace") {
-                self.set_sidebar_error(error);
+    fn handle_runtime_error(&self, context: &OperationContext, error: &str) {
+        match runtime_failure_recovery(context) {
+            RuntimeFailureRecovery::Session => self.show_session_error(error),
+            RuntimeFailureRecovery::Sidebar => self.show_conversation_load_error(error),
+            RuntimeFailureRecovery::History(channel_id) => {
+                let outcome = self
+                    .imp()
+                    .workspace_view
+                    .borrow_mut()
+                    .fail_history(&channel_id);
+                if outcome.active {
+                    self.set_status(error);
+                    if !outcome.has_content {
+                        self.show_main_surface_error("Messages", "messages", error);
+                    }
+                }
             }
-            self.set_status(error);
+            RuntimeFailureRecovery::Thread {
+                channel_id,
+                thread_ts,
+            } => {
+                let outcome = self
+                    .imp()
+                    .workspace_view
+                    .borrow_mut()
+                    .fail_thread(&channel_id, &thread_ts);
+                if outcome.active {
+                    self.set_status(error);
+                    if !outcome.has_content {
+                        self.show_thread_error(error);
+                    }
+                }
+            }
+            RuntimeFailureRecovery::Search => {
+                let outcome = self.imp().workspace_view.borrow_mut().fail_search();
+                if outcome.active {
+                    self.set_status(error);
+                    if !outcome.has_content {
+                        self.show_main_surface_error("Search results", "search results", error);
+                    }
+                }
+            }
+            RuntimeFailureRecovery::Files => {
+                let outcome = self.imp().workspace_view.borrow_mut().fail_files();
+                if outcome.active {
+                    self.set_status(error);
+                    if !outcome.has_content {
+                        self.show_main_surface_error("Files", "files", error);
+                    }
+                }
+            }
+            RuntimeFailureRecovery::SavedItems => {
+                let outcome = self.imp().workspace_view.borrow_mut().fail_saved();
+                if outcome.active {
+                    self.set_status(error);
+                    if !outcome.has_content {
+                        self.show_main_surface_error("Later", "saved items", error);
+                    }
+                }
+            }
+            RuntimeFailureRecovery::User(user_id) => {
+                self.imp().pending_user_ids.borrow_mut().remove(&user_id);
+                crate::debug::log(
+                    "ui",
+                    &format!("UserLoadFailed user_id={user_id} error={error}"),
+                );
+            }
+            RuntimeFailureRecovery::Image(key) => self.mark_image_asset_failed(&key),
+            RuntimeFailureRecovery::PostMessage {
+                channel_id,
+                thread_ts,
+            } => {
+                if thread_ts.is_some() {
+                    self.imp().thread_send_button.set_sensitive(true);
+                } else {
+                    self.imp().send_button.set_sensitive(true);
+                }
+                if self.mutation_target_is_active(&channel_id, thread_ts.as_deref()) {
+                    self.set_status(error);
+                }
+            }
+            RuntimeFailureRecovery::Reaction {
+                channel_id,
+                thread_ts,
+            }
+            | RuntimeFailureRecovery::Saved {
+                channel_id,
+                thread_ts,
+            } => {
+                if self.mutation_target_is_active(&channel_id, thread_ts.as_deref()) {
+                    self.set_status(error);
+                }
+            }
+            RuntimeFailureRecovery::Upload(channel_id) => {
+                let imp = self.imp();
+                imp.upload_button.set_sensitive(true);
+                imp.upload_progress.set_visible(false);
+                imp.upload_progress.set_fraction(0.0);
+                imp.upload_progress.set_text(Some("Upload failed"));
+                if self.mutation_target_is_active(&channel_id, None) {
+                    self.set_status(error);
+                }
+            }
+            RuntimeFailureRecovery::NonDisruptive => {
+                crate::debug::log(
+                    "ui",
+                    &format!(
+                        "RuntimeOperationFailed operation={:?} target={:?} error={error}",
+                        context.operation, context.target
+                    ),
+                );
+            }
         }
+    }
+
+    fn show_session_error(&self, error: &str) {
+        self.show_login(error);
+    }
+
+    fn mutation_target_is_active(&self, channel_id: &str, thread_ts: Option<&str>) -> bool {
+        let state = self.imp().workspace_view.borrow();
+        mutation_target_is_active(
+            state.visible_channel_id(),
+            state.selected_thread_ts(),
+            channel_id,
+            thread_ts,
+        )
+    }
+
+    fn show_main_surface_error(&self, title: &str, surface: &str, error: &str) {
+        let message = format!("Could not load {surface}. Try again. {error}");
+        self.load_message_html(&message_html::placeholder_document(title, &message));
+    }
+
+    fn show_thread_error(&self, error: &str) {
+        let imp = self.imp();
+        imp.thread_title.set_label("Thread");
+        let opening_thread_pane = !imp.thread_pane.is_visible();
+        imp.thread_pane.set_visible(true);
+        if opening_thread_pane {
+            self.queue_default_thread_pane_position();
+        }
+        let message = format!("Could not load replies. Try again. {error}");
+        self.load_thread_html(&message_html::placeholder_document("Thread", &message));
+    }
+
+    fn mark_image_asset_failed(&self, key: &str) {
+        let imp = self.imp();
+        imp.pending_image_assets.borrow_mut().remove(key);
+        imp.failed_image_assets.borrow_mut().insert(key.to_string());
+        self.rerender_current_messages();
     }
 
     fn show_conversation_load_error(&self, error: &str) {
         self.set_sidebar_error(error);
-        self.set_status(error);
     }
 
     fn set_sidebar_error(&self, error: &str) {
@@ -2799,6 +3059,191 @@ mod tests {
             kind: RuntimeEventKind::Error("stored token failed".to_string()),
         };
         assert!(!runtime_event_is_start_failure(&ordinary_error));
+    }
+
+    #[test]
+    fn runtime_failure_policy_maps_operations_and_targets_to_local_recovery() {
+        let channel = RuntimeTarget::Channel("C123".to_string());
+        let thread = RuntimeTarget::Thread {
+            channel_id: "C123".to_string(),
+            thread_ts: "1.0".to_string(),
+        };
+        let main_message = RuntimeTarget::Message {
+            channel_id: "C123".to_string(),
+            thread_ts: None,
+        };
+        let thread_message = RuntimeTarget::Message {
+            channel_id: "C123".to_string(),
+            thread_ts: Some("1.0".to_string()),
+        };
+
+        let cases = [
+            (
+                RuntimeOperation::Startup,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::Session,
+            ),
+            (
+                RuntimeOperation::Authenticate,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::Session,
+            ),
+            (
+                RuntimeOperation::SignOut,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::Session,
+            ),
+            (
+                RuntimeOperation::Disconnect,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::Session,
+            ),
+            (
+                RuntimeOperation::Conversations,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::Sidebar,
+            ),
+            (
+                RuntimeOperation::History,
+                channel.clone(),
+                RuntimeFailureRecovery::History("C123".to_string()),
+            ),
+            (
+                RuntimeOperation::OlderHistory,
+                channel,
+                RuntimeFailureRecovery::History("C123".to_string()),
+            ),
+            (
+                RuntimeOperation::Thread,
+                thread.clone(),
+                RuntimeFailureRecovery::Thread {
+                    channel_id: "C123".to_string(),
+                    thread_ts: "1.0".to_string(),
+                },
+            ),
+            (
+                RuntimeOperation::OlderThread,
+                thread,
+                RuntimeFailureRecovery::Thread {
+                    channel_id: "C123".to_string(),
+                    thread_ts: "1.0".to_string(),
+                },
+            ),
+            (
+                RuntimeOperation::Search,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::Search,
+            ),
+            (
+                RuntimeOperation::Files,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::Files,
+            ),
+            (
+                RuntimeOperation::SavedItems,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::SavedItems,
+            ),
+            (
+                RuntimeOperation::User,
+                RuntimeTarget::User("U123".to_string()),
+                RuntimeFailureRecovery::User("U123".to_string()),
+            ),
+            (
+                RuntimeOperation::ImageAsset,
+                RuntimeTarget::Image("asset".to_string()),
+                RuntimeFailureRecovery::Image("asset".to_string()),
+            ),
+            (
+                RuntimeOperation::PostMessage,
+                main_message.clone(),
+                RuntimeFailureRecovery::PostMessage {
+                    channel_id: "C123".to_string(),
+                    thread_ts: None,
+                },
+            ),
+            (
+                RuntimeOperation::PostMessage,
+                thread_message.clone(),
+                RuntimeFailureRecovery::PostMessage {
+                    channel_id: "C123".to_string(),
+                    thread_ts: Some("1.0".to_string()),
+                },
+            ),
+            (
+                RuntimeOperation::Reaction,
+                main_message.clone(),
+                RuntimeFailureRecovery::Reaction {
+                    channel_id: "C123".to_string(),
+                    thread_ts: None,
+                },
+            ),
+            (
+                RuntimeOperation::Saved,
+                main_message,
+                RuntimeFailureRecovery::Saved {
+                    channel_id: "C123".to_string(),
+                    thread_ts: None,
+                },
+            ),
+            (
+                RuntimeOperation::FileUpload,
+                RuntimeTarget::Upload("C123".to_string()),
+                RuntimeFailureRecovery::Upload("C123".to_string()),
+            ),
+            (
+                RuntimeOperation::SocketMode,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::NonDisruptive,
+            ),
+        ];
+
+        for (operation, target, expected) in cases {
+            let context = OperationContext::new(operation, target);
+            assert_eq!(runtime_failure_recovery(&context), expected);
+        }
+
+        assert_eq!(
+            runtime_failure_recovery(&OperationContext::new(
+                RuntimeOperation::User,
+                RuntimeTarget::Workspace,
+            )),
+            RuntimeFailureRecovery::NonDisruptive
+        );
+    }
+
+    #[test]
+    fn mutation_target_activity_requires_the_channel_and_optional_thread() {
+        assert!(mutation_target_is_active(
+            Some("C1"),
+            Some("T1"),
+            "C1",
+            None
+        ));
+        assert!(mutation_target_is_active(
+            Some("C1"),
+            Some("T1"),
+            "C1",
+            Some("T1")
+        ));
+        assert!(!mutation_target_is_active(
+            Some("C2"),
+            Some("T1"),
+            "C1",
+            None
+        ));
+        assert!(!mutation_target_is_active(
+            Some("C1"),
+            Some("T2"),
+            "C1",
+            Some("T1")
+        ));
+        assert!(!mutation_target_is_active(
+            Some("C1"),
+            None,
+            "C1",
+            Some("T1")
+        ));
     }
 
     fn message(ts: &str, text: &str) -> SlackMessage {
