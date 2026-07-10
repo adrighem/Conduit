@@ -22,8 +22,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -134,7 +132,6 @@ mod imp {
         pub close_thread_button: TemplateChild<gtk::Button>,
 
         pub runtime: RefCell<Option<AppRuntime>>,
-        pub events: RefCell<Option<Receiver<RuntimeEvent>>>,
         pub(super) request_coordinator: RefCell<RequestCoordinator>,
         pub settings: RefCell<Option<gio::Settings>>,
         pub connect_requested: Cell<bool>,
@@ -268,7 +265,9 @@ impl RequestCoordinator {
     fn issue(&mut self, command: &RuntimeCommand) -> RuntimeIdentity {
         self.next_request = self.next_request.saturating_add(1);
         let request = RequestId::new(self.next_request);
-        self.latest.insert(command.operation_context(), request);
+        if command.supersedes_previous() {
+            self.latest.insert(command.operation_context(), request);
+        }
         RuntimeIdentity {
             session: self.session,
             request,
@@ -317,6 +316,10 @@ fn runtime_event_is_visible(event: &RuntimeEventKind, selection: RuntimeViewSele
         RuntimeEventKind::SavedItemsLoaded(_) => selection.main_view == MainMessageView::Saved,
         _ => true,
     }
+}
+
+fn runtime_event_is_start_failure(event: &RuntimeEvent) -> bool {
+    matches!(event.kind, RuntimeEventKind::RuntimeStartFailed(_))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,19 +629,26 @@ impl ConduitWindow {
 
     fn setup_runtime(&self) {
         let imp = self.imp();
-        let (sender, receiver) = mpsc::channel::<RuntimeEvent>();
-        let runtime = AppRuntime::start(sender);
+        let (runtime, mut events) = AppRuntime::start();
 
         *imp.runtime.borrow_mut() = Some(runtime.clone());
-        *imp.events.borrow_mut() = Some(receiver);
 
         let weak_window = self.downgrade();
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            let Some(window) = weak_window.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            window.drain_runtime_events();
-            glib::ControlFlow::Continue
+        glib::spawn_future_local(async move {
+            let mut startup_failed = false;
+            while let Some(event) = events.recv().await {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                startup_failed |= runtime_event_is_start_failure(&event);
+                window.handle_runtime_event(event);
+            }
+            if !startup_failed {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                window.show_error("Background runtime stopped");
+            }
         });
     }
 
@@ -883,28 +893,6 @@ impl ConduitWindow {
         text_view.add_controller(controller);
     }
 
-    fn drain_runtime_events(&self) {
-        loop {
-            let event = {
-                let imp = self.imp();
-                let events = imp.events.borrow();
-                let Some(receiver) = events.as_ref() else {
-                    return;
-                };
-                receiver.try_recv()
-            };
-
-            match event {
-                Ok(event) => self.handle_runtime_event(event),
-                Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.show_error("Background runtime stopped");
-                    return;
-                }
-            }
-        }
-    }
-
     fn handle_runtime_event(&self, event: RuntimeEvent) {
         let RuntimeEvent { meta, kind } = event;
         if !self.imp().request_coordinator.borrow().accepts(&meta) {
@@ -942,6 +930,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::Error(error) => self.show_error(&error),
+            RuntimeEventKind::RuntimeStartFailed(error) => self.show_error(&error),
             RuntimeEventKind::SignedOut => {
                 self.imp().connect_requested.set(false);
                 self.show_login("Choose a workspace to continue");
@@ -1699,10 +1688,7 @@ impl ConduitWindow {
     }
 
     pub(crate) fn show_connect_requested(&self) {
-        self.imp()
-            .request_coordinator
-            .borrow_mut()
-            .invalidate_session();
+        self.send_session_command(RuntimeCommand::Disconnect);
         self.imp().connect_requested.set(true);
         self.show_login("Choose a workspace to continue");
     }
@@ -2982,6 +2968,33 @@ mod tests {
     }
 
     #[test]
+    fn request_coordinator_accepts_all_mutation_completions() {
+        let mut coordinator = RequestCoordinator::default();
+        let first = coordinator.begin_session(&RuntimeCommand::SetSaved {
+            channel_id: "C123".to_string(),
+            ts: "1.0".to_string(),
+            add: true,
+            thread_ts: None,
+        });
+        let second = coordinator.issue(&RuntimeCommand::SetSaved {
+            channel_id: "C123".to_string(),
+            ts: "2.0".to_string(),
+            add: true,
+            thread_ts: None,
+        });
+        let context = OperationContext::new(
+            RuntimeOperation::Saved,
+            RuntimeTarget::Message {
+                channel_id: "C123".to_string(),
+                thread_ts: None,
+            },
+        );
+
+        assert!(coordinator.accepts(&RuntimeEventMeta::new(first, context.clone())));
+        assert!(coordinator.accepts(&RuntimeEventMeta::new(second, context)));
+    }
+
+    #[test]
     fn runtime_event_visibility_rejects_inactive_channel_search_and_thread_results() {
         let conversation = RuntimeViewSelection {
             main_view: MainMessageView::Conversation,
@@ -3025,6 +3038,34 @@ mod tests {
             &RuntimeEventKind::SearchLoaded(Vec::new()),
             search,
         ));
+    }
+
+    #[test]
+    fn startup_runtime_error_is_terminal_for_event_delivery() {
+        let event = RuntimeEvent {
+            meta: RuntimeEventMeta::new(
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace),
+            ),
+            kind: RuntimeEventKind::RuntimeStartFailed("runtime construction failed".to_string()),
+        };
+
+        assert!(runtime_event_is_start_failure(&event));
+
+        let ordinary_error = RuntimeEvent {
+            meta: RuntimeEventMeta::new(
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(2),
+                },
+                OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace),
+            ),
+            kind: RuntimeEventKind::Error("stored token failed".to_string()),
+        };
+        assert!(!runtime_event_is_start_failure(&ordinary_error));
     }
 
     fn message(ts: &str, text: &str) -> SlackMessage {

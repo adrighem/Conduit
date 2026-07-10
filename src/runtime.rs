@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::{
     browser_session_token_from_env, browser_session_token_from_values, OAuthConfig,
@@ -25,6 +27,11 @@ use crate::store::WorkspaceStore;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
 const UNREAD_STATE_PRIORITY_REFRESH_LIMIT: usize = 30;
+const NAVIGATION_TASK_CONCURRENCY: usize = 2;
+const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
+const BACKGROUND_TASK_CONCURRENCY: usize = 3;
+const IMAGE_TASK_CONCURRENCY: usize = 4;
+const UPLOAD_TASK_CONCURRENCY: usize = 2;
 const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
@@ -41,6 +48,7 @@ pub enum RuntimeCommand {
         user_agent: Option<String>,
     },
     SignOut,
+    Disconnect,
     RefreshConversations,
     LoadHistory {
         channel_id: String,
@@ -124,6 +132,7 @@ pub enum RuntimeOperation {
     Startup,
     Authenticate,
     SignOut,
+    Disconnect,
     Conversations,
     History,
     OlderHistory,
@@ -171,6 +180,30 @@ impl OperationContext {
 }
 
 impl RuntimeCommand {
+    pub fn supersedes_previous(&self) -> bool {
+        !matches!(
+            self,
+            Self::SignOut
+                | Self::Disconnect
+                | Self::PostMessage { .. }
+                | Self::SetReaction { .. }
+                | Self::SetSaved { .. }
+                | Self::UploadFile { .. }
+        )
+    }
+
+    fn navigation_slot(&self) -> Option<NavigationSlot> {
+        match self {
+            Self::LoadHistory { .. }
+            | Self::LoadOlderHistory { .. }
+            | Self::SearchMessages { .. }
+            | Self::LoadFiles
+            | Self::LoadSavedItems => Some(NavigationSlot::Main),
+            Self::LoadThread { .. } | Self::LoadOlderThread { .. } => Some(NavigationSlot::Thread),
+            _ => None,
+        }
+    }
+
     pub fn operation_context(&self) -> OperationContext {
         match self {
             Self::LoadStoredToken => {
@@ -181,6 +214,9 @@ impl RuntimeCommand {
             }
             Self::SignOut => {
                 OperationContext::new(RuntimeOperation::SignOut, RuntimeTarget::Workspace)
+            }
+            Self::Disconnect => {
+                OperationContext::new(RuntimeOperation::Disconnect, RuntimeTarget::Workspace)
             }
             Self::RefreshConversations => {
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
@@ -268,6 +304,7 @@ impl RuntimeCommand {
 pub enum RuntimeEventKind {
     Status(String),
     Error(String),
+    RuntimeStartFailed(String),
     SignedOut,
     Authenticated(AuthInfo),
     ConversationsLoaded(Vec<SlackConversation>),
@@ -403,6 +440,9 @@ impl RuntimeEventKind {
             Self::SocketModeEvent(_) => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
+            Self::RuntimeStartFailed(_) => {
+                OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace)
+            }
             Self::Status(_)
             | Self::Error(_)
             | Self::MessagePosted { .. }
@@ -443,9 +483,324 @@ struct RuntimeRequest {
     command: RuntimeCommand,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeTaskLane {
+    Navigation,
+    Interactive,
+    Background,
+    Image,
+    Upload,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NavigationSlot {
+    Main,
+    Thread,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeTaskLimits {
+    navigation: Arc<Semaphore>,
+    interactive: Arc<Semaphore>,
+    background: Arc<Semaphore>,
+    image: Arc<Semaphore>,
+    upload: Arc<Semaphore>,
+}
+
+impl RuntimeTaskLimits {
+    fn new(
+        navigation: usize,
+        interactive: usize,
+        background: usize,
+        image: usize,
+        upload: usize,
+    ) -> Self {
+        Self {
+            navigation: Arc::new(Semaphore::new(navigation)),
+            interactive: Arc::new(Semaphore::new(interactive)),
+            background: Arc::new(Semaphore::new(background)),
+            image: Arc::new(Semaphore::new(image)),
+            upload: Arc::new(Semaphore::new(upload)),
+        }
+    }
+
+    async fn acquire(&self, lane: RuntimeTaskLane) -> OwnedSemaphorePermit {
+        let semaphore = match lane {
+            RuntimeTaskLane::Navigation => Arc::clone(&self.navigation),
+            RuntimeTaskLane::Interactive => Arc::clone(&self.interactive),
+            RuntimeTaskLane::Background => Arc::clone(&self.background),
+            RuntimeTaskLane::Image => Arc::clone(&self.image),
+            RuntimeTaskLane::Upload => Arc::clone(&self.upload),
+        };
+        semaphore
+            .acquire_owned()
+            .await
+            .expect("runtime task semaphore unexpectedly closed")
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeConnection {
+    slack: SlackApi,
+    workspace_store: Option<WorkspaceStore>,
+    user_cache: Arc<Mutex<HashMap<String, String>>>,
+    read_marks: Arc<Mutex<HashMap<String, String>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrackedRequest {
+    identity: RuntimeIdentity,
+    context: OperationContext,
+    supersedes_previous: bool,
+    navigation_slot: Option<NavigationSlot>,
+}
+
+impl TrackedRequest {
+    fn new(identity: RuntimeIdentity, context: OperationContext) -> Self {
+        Self {
+            identity,
+            context,
+            supersedes_previous: true,
+            navigation_slot: None,
+        }
+    }
+
+    fn for_command(identity: RuntimeIdentity, command: &RuntimeCommand) -> Self {
+        Self {
+            identity,
+            context: command.operation_context(),
+            supersedes_previous: command.supersedes_previous(),
+            navigation_slot: command.navigation_slot(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveRequest {
+    task_id: u64,
+}
+
+struct RuntimeState {
+    active_session: SessionId,
+    connection: Option<RuntimeConnection>,
+    tasks: HashMap<u64, tokio::task::AbortHandle>,
+    task_requests: HashMap<u64, TrackedRequest>,
+    active_requests: HashMap<OperationContext, ActiveRequest>,
+    latest_requests: HashMap<OperationContext, RequestId>,
+    active_navigation: HashMap<NavigationSlot, ActiveRequest>,
+    latest_navigation: HashMap<NavigationSlot, RequestId>,
+    next_task_id: u64,
+}
+
+impl RuntimeState {
+    fn new(active_session: SessionId) -> Self {
+        Self {
+            active_session,
+            connection: None,
+            tasks: HashMap::new(),
+            task_requests: HashMap::new(),
+            active_requests: HashMap::new(),
+            latest_requests: HashMap::new(),
+            active_navigation: HashMap::new(),
+            latest_navigation: HashMap::new(),
+            next_task_id: 0,
+        }
+    }
+
+    fn replace_session(&mut self, session: SessionId) {
+        for (_, task) in self.tasks.drain() {
+            task.abort();
+        }
+        self.active_requests.clear();
+        self.latest_requests.clear();
+        self.task_requests.clear();
+        self.active_navigation.clear();
+        self.latest_navigation.clear();
+        self.active_session = session;
+        self.connection = None;
+    }
+
+    fn next_task_id(&mut self) -> u64 {
+        self.next_task_id = self.next_task_id.saturating_add(1);
+        self.next_task_id
+    }
+
+    fn register_task(
+        &mut self,
+        session: SessionId,
+        task_id: u64,
+        request: Option<TrackedRequest>,
+        task: tokio::task::AbortHandle,
+    ) -> bool {
+        if self.active_session != session || task.is_finished() {
+            task.abort();
+            return false;
+        }
+
+        if let Some(request) = request.as_ref() {
+            if request.identity.session != session {
+                task.abort();
+                return false;
+            }
+            if request.supersedes_previous
+                && self
+                    .latest_requests
+                    .get(&request.context)
+                    .is_some_and(|latest| *latest >= request.identity.request)
+            {
+                task.abort();
+                return false;
+            }
+            if let Some(slot) = request.navigation_slot {
+                if self
+                    .latest_navigation
+                    .get(&slot)
+                    .is_some_and(|latest| *latest >= request.identity.request)
+                {
+                    task.abort();
+                    return false;
+                }
+            }
+
+            let context_task = request
+                .supersedes_previous
+                .then(|| self.active_requests.get(&request.context).copied())
+                .flatten()
+                .map(|active| active.task_id);
+            let navigation_task = request
+                .navigation_slot
+                .and_then(|slot| self.active_navigation.get(&slot).copied())
+                .map(|active| active.task_id);
+            if let Some(previous_task_id) = context_task {
+                self.abort_task(previous_task_id);
+            }
+            if let Some(previous_task_id) = navigation_task {
+                if Some(previous_task_id) != context_task {
+                    self.abort_task(previous_task_id);
+                }
+            }
+
+            if request.supersedes_previous {
+                self.latest_requests
+                    .insert(request.context.clone(), request.identity.request);
+                self.active_requests
+                    .insert(request.context.clone(), ActiveRequest { task_id });
+            }
+            if let Some(slot) = request.navigation_slot {
+                self.latest_navigation
+                    .insert(slot, request.identity.request);
+                self.active_navigation
+                    .insert(slot, ActiveRequest { task_id });
+            }
+            self.task_requests.insert(task_id, request.clone());
+        }
+
+        self.tasks.insert(task_id, task);
+        true
+    }
+
+    fn finish_task(&mut self, task_id: u64, request: Option<&TrackedRequest>) {
+        self.tasks.remove(&task_id);
+        self.task_requests.remove(&task_id);
+        if let Some(request) = request {
+            if request.supersedes_previous {
+                let is_current = self
+                    .active_requests
+                    .get(&request.context)
+                    .is_some_and(|active| active.task_id == task_id);
+                if is_current {
+                    self.active_requests.remove(&request.context);
+                }
+            }
+            if let Some(slot) = request.navigation_slot {
+                let is_current = self
+                    .active_navigation
+                    .get(&slot)
+                    .is_some_and(|active| active.task_id == task_id);
+                if is_current {
+                    self.active_navigation.remove(&slot);
+                }
+            }
+        }
+    }
+
+    fn abort_task(&mut self, task_id: u64) {
+        if let Some(task) = self.tasks.remove(&task_id) {
+            task.abort();
+        }
+        if let Some(request) = self.task_requests.remove(&task_id) {
+            if request.supersedes_previous
+                && self
+                    .active_requests
+                    .get(&request.context)
+                    .is_some_and(|active| active.task_id == task_id)
+            {
+                self.active_requests.remove(&request.context);
+            }
+            if let Some(slot) = request.navigation_slot {
+                if self
+                    .active_navigation
+                    .get(&slot)
+                    .is_some_and(|active| active.task_id == task_id)
+                {
+                    self.active_navigation.remove(&slot);
+                }
+            }
+        }
+    }
+}
+
+fn spawn_session_task<F>(state: &Arc<Mutex<RuntimeState>>, session: SessionId, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    spawn_runtime_task(state, session, None, future);
+}
+
+fn spawn_request_task<F>(state: &Arc<Mutex<RuntimeState>>, request: TrackedRequest, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    spawn_runtime_task(state, request.identity.session, Some(request), future);
+}
+
+fn spawn_runtime_task<F>(
+    state: &Arc<Mutex<RuntimeState>>,
+    session: SessionId,
+    request: Option<TrackedRequest>,
+    future: F,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let task_id = state
+        .lock()
+        .expect("runtime state lock poisoned")
+        .next_task_id();
+    let state_after_task = Arc::clone(state);
+    let request_after_task = request.clone();
+    let (start_task, task_started) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        if task_started.await.is_err() {
+            return;
+        }
+        future.await;
+        state_after_task
+            .lock()
+            .expect("runtime state lock poisoned")
+            .finish_task(task_id, request_after_task.as_ref());
+    });
+    let registered = state
+        .lock()
+        .expect("runtime state lock poisoned")
+        .register_task(session, task_id, request, task.abort_handle());
+    if registered {
+        let _ = start_task.send(());
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AppRuntime {
-    commands: Sender<RuntimeRequest>,
+    commands: mpsc::UnboundedSender<RuntimeRequest>,
 }
 
 #[derive(Clone, Debug)]
@@ -509,8 +864,9 @@ fn image_data_uri(image: DownloadedImage) -> String {
 }
 
 impl AppRuntime {
-    pub fn start(events: Sender<RuntimeEvent>) -> Self {
-        let (commands, receiver) = mpsc::channel::<RuntimeRequest>();
+    pub fn start() -> (Self, mpsc::UnboundedReceiver<RuntimeEvent>) {
+        let (commands, receiver) = mpsc::unbounded_channel::<RuntimeRequest>();
+        let (events, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
 
         thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -519,7 +875,7 @@ impl AppRuntime {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let kind = RuntimeEventKind::Error(format!(
+                    let kind = RuntimeEventKind::RuntimeStartFailed(format!(
                         "Failed to start background runtime: {error}"
                     ));
                     let context =
@@ -538,38 +894,10 @@ impl AppRuntime {
                 }
             };
 
-            let token_store = TokenStore;
-            let oauth = SlackOAuthClient::new();
-            let image_cache = ImageAssetCache::new(config::image_asset_cache_dir());
-            let mut slack: Option<SlackApi> = None;
-            let mut workspace_store: Option<WorkspaceStore> = None;
-            let mut user_cache = HashMap::new();
-            let mut read_marks = HashMap::new();
-            let mut socket_mode: Option<tokio::task::JoinHandle<()>> = None;
-
-            while let Ok(request) = receiver.recv() {
-                let RuntimeRequest { identity, command } = request;
-                let event_sender =
-                    RuntimeEventSender::new(events.clone(), identity, command.operation_context());
-                let mut context = RuntimeContext {
-                    events: &event_sender,
-                    token_store: &token_store,
-                    oauth: &oauth,
-                    image_cache: &image_cache,
-                    slack: &mut slack,
-                    workspace_store: &mut workspace_store,
-                    user_cache: &mut user_cache,
-                    read_marks: &mut read_marks,
-                    socket_mode: &mut socket_mode,
-                };
-                let result = runtime.block_on(handle_command(command, &mut context));
-                if let Err(error) = result {
-                    event_sender.send_event(RuntimeEventKind::Error(error.to_string()));
-                }
-            }
+            runtime.block_on(run_runtime(receiver, events));
         });
 
-        Self { commands }
+        (Self { commands }, event_receiver)
     }
 
     pub fn send(&self, identity: RuntimeIdentity, command: RuntimeCommand) {
@@ -577,16 +905,421 @@ impl AppRuntime {
     }
 }
 
+async fn run_runtime(
+    mut commands: mpsc::UnboundedReceiver<RuntimeRequest>,
+    events: mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    let state = Arc::new(Mutex::new(RuntimeState::new(SessionId::default())));
+    let oauth = SlackOAuthClient::new();
+    let image_cache = ImageAssetCache::new(config::image_asset_cache_dir());
+    let limits = RuntimeTaskLimits::new(
+        NAVIGATION_TASK_CONCURRENCY,
+        INTERACTIVE_TASK_CONCURRENCY,
+        BACKGROUND_TASK_CONCURRENCY,
+        IMAGE_TASK_CONCURRENCY,
+        UPLOAD_TASK_CONCURRENCY,
+    );
+
+    while let Some(request) = commands.recv().await {
+        let RuntimeRequest { identity, command } = request;
+        {
+            let mut runtime_state = state.lock().expect("runtime state lock poisoned");
+            if identity.session < runtime_state.active_session {
+                continue;
+            }
+            if identity.session > runtime_state.active_session {
+                runtime_state.replace_session(identity.session);
+            }
+        }
+
+        let event_sender =
+            RuntimeEventSender::new(events.clone(), identity, command.operation_context());
+        dispatch_command(
+            command,
+            identity,
+            event_sender,
+            &state,
+            &oauth,
+            &image_cache,
+            &limits,
+        );
+    }
+
+    state
+        .lock()
+        .expect("runtime state lock poisoned")
+        .replace_session(SessionId::default());
+}
+
+fn dispatch_command(
+    command: RuntimeCommand,
+    identity: RuntimeIdentity,
+    events: RuntimeEventSender,
+    state: &Arc<Mutex<RuntimeState>>,
+    oauth: &SlackOAuthClient,
+    image_cache: &ImageAssetCache,
+    limits: &RuntimeTaskLimits,
+) {
+    match command {
+        RuntimeCommand::LoadStoredToken => {
+            events.send_status("Checking secure storage");
+            let token = match TokenStore.load() {
+                Ok(Some(token)) => {
+                    if token.should_refresh() {
+                        events.send_status("Refreshing Slack session");
+                    }
+                    Some(token)
+                }
+                Ok(None) => match browser_session_token_from_env() {
+                    Ok(Some(token)) => {
+                        events.send_status("Importing Slack browser session");
+                        Some(token)
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        events.send_event(RuntimeEventKind::Error(error.to_string()));
+                        return;
+                    }
+                },
+                Err(error) => {
+                    events.send_event(RuntimeEventKind::Error(error.to_string()));
+                    return;
+                }
+            };
+
+            let Some(token) = token else {
+                events.send_event(RuntimeEventKind::SignedOut);
+                return;
+            };
+            let oauth = oauth.clone();
+            spawn_authentication_task(state, identity, events, limits.clone(), async move {
+                let token = if token.should_refresh() {
+                    oauth.refresh(&token).await?
+                } else {
+                    token
+                };
+                authenticate_token(token).await
+            });
+        }
+        RuntimeCommand::StartOAuth {
+            client_id,
+            debug_auth,
+        } => {
+            events.send_status("Opening Slack authorization");
+            let oauth = oauth.clone();
+            spawn_authentication_task(state, identity, events, limits.clone(), async move {
+                let token = oauth
+                    .authenticate(OAuthConfig::new(client_id), debug_auth)
+                    .await?;
+                authenticate_token(token).await
+            });
+        }
+        RuntimeCommand::StartBrowserSession {
+            xoxc_token,
+            xoxd_token,
+            user_agent,
+        } => {
+            events.send_status("Validating Slack browser session");
+            let token = match browser_session_token_from_values(
+                Some(xoxc_token),
+                Some(xoxd_token),
+                user_agent,
+            ) {
+                Ok(Some(token)) => token,
+                Ok(None) => {
+                    events.send_event(RuntimeEventKind::Error(
+                        "Enter XOXC and XOXD tokens".to_string(),
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    events.send_event(RuntimeEventKind::Error(error.to_string()));
+                    return;
+                }
+            };
+            spawn_authentication_task(
+                state,
+                identity,
+                events,
+                limits.clone(),
+                authenticate_token(token),
+            );
+        }
+        RuntimeCommand::SignOut => {
+            finish_sign_out(&events, TokenStore.clear());
+        }
+        RuntimeCommand::Disconnect => {}
+        command => {
+            let connection = state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .connection
+                .clone();
+            let Some(connection) = connection else {
+                events.send_event(RuntimeEventKind::Error(
+                    "No Slack workspace is available".to_string(),
+                ));
+                return;
+            };
+            let lane = if command.navigation_slot().is_some() {
+                RuntimeTaskLane::Navigation
+            } else {
+                match &command {
+                    RuntimeCommand::LoadImageAsset { .. } => RuntimeTaskLane::Image,
+                    RuntimeCommand::UploadFile { .. } => RuntimeTaskLane::Upload,
+                    RuntimeCommand::RefreshConversations | RuntimeCommand::LoadUser { .. } => {
+                        RuntimeTaskLane::Background
+                    }
+                    _ => RuntimeTaskLane::Interactive,
+                }
+            };
+            let tracked_request = TrackedRequest::for_command(identity, &command);
+            let image_cache = image_cache.clone();
+            let limits = limits.clone();
+            spawn_request_task(state, tracked_request, async move {
+                let _permit = limits.acquire(lane).await;
+                if let Err(error) =
+                    handle_connected_command(command, connection, &events, &image_cache).await
+                {
+                    events.send_event(RuntimeEventKind::Error(error.to_string()));
+                }
+            });
+        }
+    }
+}
+
+fn finish_sign_out(events: &RuntimeEventSender, clear_result: Result<()>) {
+    if let Err(error) = clear_result {
+        events.send_event(RuntimeEventKind::Error(error.to_string()));
+    }
+    events.send_event(RuntimeEventKind::SignedOut);
+}
+
+async fn authenticate_token(token: StoredToken) -> Result<(StoredToken, SlackApi, AuthInfo)> {
+    let token_team = token.team_name.clone().or(token.team_id.clone());
+    let token_team_id = token.team_id.clone();
+    let token_user = token.user_id.clone();
+    let api = SlackApi::new(token.clone());
+    let mut auth = api.auth_test().await?;
+    auth.team = auth.team.or(token_team);
+    auth.team_id = auth.team_id.or(token_team_id);
+    auth.user_id = auth.user_id.or(token_user);
+    crate::debug::log(
+        "runtime",
+        &format!(
+            "Authenticated team={} user_id={}",
+            auth.team.as_deref().unwrap_or("<unknown>"),
+            auth.user_id.as_deref().unwrap_or("<unknown>")
+        ),
+    );
+    Ok((token, api, auth))
+}
+
+fn spawn_authentication_task<F>(
+    state: &Arc<Mutex<RuntimeState>>,
+    identity: RuntimeIdentity,
+    events: RuntimeEventSender,
+    limits: RuntimeTaskLimits,
+    future: F,
+) where
+    F: Future<Output = Result<(StoredToken, SlackApi, AuthInfo)>> + Send + 'static,
+{
+    let state_for_task = Arc::clone(state);
+    spawn_request_task(
+        state,
+        TrackedRequest::new(
+            identity,
+            OperationContext::new(RuntimeOperation::Authenticate, RuntimeTarget::Workspace),
+        ),
+        async move {
+            let result = future.await;
+            match result {
+                Ok((token, api, auth)) => {
+                    let connection = {
+                        let mut runtime_state =
+                            state_for_task.lock().expect("runtime state lock poisoned");
+                        if runtime_state.active_session != identity.session {
+                            return;
+                        }
+                        if let Err(error) = TokenStore.save(&token) {
+                            events.send_event(RuntimeEventKind::Error(error.to_string()));
+                            return;
+                        }
+                        let connection = RuntimeConnection {
+                            slack: api,
+                            workspace_store: Some(WorkspaceStore::new(
+                                config::state_cache_dir(),
+                                &workspace_store_id(&auth),
+                            )),
+                            user_cache: Arc::new(Mutex::new(HashMap::new())),
+                            read_marks: Arc::new(Mutex::new(HashMap::new())),
+                        };
+                        runtime_state.connection = Some(connection.clone());
+                        connection
+                    };
+
+                    events.send_event(RuntimeEventKind::Authenticated(auth));
+                    spawn_workspace_tasks(&state_for_task, identity, events, connection, limits);
+                }
+                Err(error) => events.send_event(RuntimeEventKind::Error(error.to_string())),
+            }
+        },
+    );
+}
+
+fn spawn_workspace_tasks(
+    state: &Arc<Mutex<RuntimeState>>,
+    identity: RuntimeIdentity,
+    events: RuntimeEventSender,
+    connection: RuntimeConnection,
+    limits: RuntimeTaskLimits,
+) {
+    let state_after_hydration = Arc::clone(state);
+    let hydration_events = events.clone();
+    let hydration_connection = connection.clone();
+    let hydration_limits = limits.clone();
+    spawn_session_task(state, identity.session, async move {
+        load_cached_user_names_shared(&hydration_events, &hydration_connection).await;
+        load_cached_conversations(&hydration_events, &hydration_connection.workspace_store).await;
+
+        let refresh_events = hydration_events.clone();
+        let refresh_connection = hydration_connection.clone();
+        let refresh_limits = hydration_limits.clone();
+        spawn_request_task(
+            &state_after_hydration,
+            TrackedRequest::new(
+                identity,
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
+            ),
+            async move {
+                let _permit = refresh_limits.acquire(RuntimeTaskLane::Background).await;
+                let cached_user_names = refresh_connection
+                    .user_cache
+                    .lock()
+                    .expect("runtime user cache lock poisoned")
+                    .clone();
+                if let Err(error) = load_conversations_best_effort_with_api(
+                    &refresh_events,
+                    &refresh_connection.slack,
+                    &refresh_connection.workspace_store,
+                    cached_user_names,
+                )
+                .await
+                {
+                    crate::debug::log(
+                        "runtime",
+                        &format!("ConversationsBackgroundRefreshFailed error={error:#}"),
+                    );
+                }
+            },
+        );
+
+        let group_events = hydration_events;
+        let group_connection = hydration_connection;
+        let group_limits = hydration_limits;
+        spawn_request_task(
+            &state_after_hydration,
+            TrackedRequest::new(
+                identity,
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+            ),
+            async move {
+                let _permit = group_limits.acquire(RuntimeTaskLane::Background).await;
+                let cached_user_names = group_connection
+                    .user_cache
+                    .lock()
+                    .expect("runtime user cache lock poisoned")
+                    .clone();
+                load_user_groups_best_effort_with_api(
+                    &group_events,
+                    &group_connection.slack,
+                    &group_connection.workspace_store,
+                    cached_user_names,
+                )
+                .await;
+            },
+        );
+    });
+
+    if let Some(app_token) = config::slack_app_token() {
+        let socket_events = events.unsolicited(OperationContext::new(
+            RuntimeOperation::SocketMode,
+            RuntimeTarget::Workspace,
+        ));
+        spawn_session_task(
+            state,
+            identity.session,
+            run_socket_mode(app_token, socket_events),
+        );
+    }
+}
+
+async fn load_cached_user_names_shared(
+    events: &RuntimeEventSender,
+    connection: &RuntimeConnection,
+) {
+    let mut cached_names = HashMap::new();
+    load_cached_user_names(events, &connection.workspace_store, &mut cached_names).await;
+    connection
+        .user_cache
+        .lock()
+        .expect("runtime user cache lock poisoned")
+        .extend(cached_names);
+}
+
+async fn handle_connected_command(
+    command: RuntimeCommand,
+    connection: RuntimeConnection,
+    events: &RuntimeEventSender,
+    image_cache: &ImageAssetCache,
+) -> Result<()> {
+    let mut slack = Some(connection.slack.clone());
+    let mut workspace_store = connection.workspace_store.clone();
+    let mut user_cache = connection
+        .user_cache
+        .lock()
+        .expect("runtime user cache lock poisoned")
+        .clone();
+    let mut read_marks = connection
+        .read_marks
+        .lock()
+        .expect("runtime read marks lock poisoned")
+        .clone();
+    let mut context = RuntimeContext {
+        events,
+        image_cache,
+        slack: &mut slack,
+        workspace_store: &mut workspace_store,
+        user_cache: &mut user_cache,
+        read_marks: &mut read_marks,
+    };
+
+    let result = handle_command(command, &mut context).await;
+    connection
+        .user_cache
+        .lock()
+        .expect("runtime user cache lock poisoned")
+        .extend(user_cache);
+    let mut shared_read_marks = connection
+        .read_marks
+        .lock()
+        .expect("runtime read marks lock poisoned");
+    for (channel_id, timestamp) in read_marks {
+        let marked_timestamp = shared_read_marks.entry(channel_id).or_default();
+        if timestamp > *marked_timestamp {
+            *marked_timestamp = timestamp;
+        }
+    }
+    result
+}
+
 struct RuntimeContext<'a> {
     events: &'a RuntimeEventSender,
-    token_store: &'a TokenStore,
-    oauth: &'a SlackOAuthClient,
     image_cache: &'a ImageAssetCache,
     slack: &'a mut Option<SlackApi>,
     workspace_store: &'a mut Option<WorkspaceStore>,
     user_cache: &'a mut HashMap<String, String>,
     read_marks: &'a mut HashMap<String, String>,
-    socket_mode: &'a mut Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,61 +1458,12 @@ fn slack_numeric_value(value: &serde_json::Value) -> Option<f64> {
 
 async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_>) -> Result<()> {
     match command {
-        RuntimeCommand::LoadStoredToken => {
-            crate::debug::log("runtime", "LoadStoredToken");
-            context.events.send_status("Checking secure storage");
-            if let Some(mut token) = context.token_store.load()? {
-                if token.should_refresh() {
-                    context.events.send_status("Refreshing Slack session");
-                    token = context.oauth.refresh(&token).await?;
-                    context.token_store.save(&token)?;
-                }
-                connect_and_load_workspace(context, token).await?;
-            } else if let Some(token) = browser_session_token_from_env()? {
-                context
-                    .events
-                    .send_status("Importing Slack browser session");
-                let auth = connect_with_token(context.events, context.slack, token.clone()).await?;
-                context.token_store.save(&token)?;
-                load_workspace_after_auth(context, &auth).await?;
-            } else {
-                context.events.send_event(RuntimeEventKind::SignedOut);
-            }
-        }
-        RuntimeCommand::StartOAuth {
-            client_id,
-            debug_auth,
-        } => {
-            context.events.send_status("Opening Slack authorization");
-            let token = context
-                .oauth
-                .authenticate(OAuthConfig::new(client_id), debug_auth)
-                .await?;
-            context.token_store.save(&token)?;
-            connect_and_load_workspace(context, token).await?;
-        }
-        RuntimeCommand::StartBrowserSession {
-            xoxc_token,
-            xoxd_token,
-            user_agent,
-        } => {
-            context
-                .events
-                .send_status("Validating Slack browser session");
-            let token =
-                browser_session_token_from_values(Some(xoxc_token), Some(xoxd_token), user_agent)?
-                    .ok_or_else(|| anyhow!("Enter XOXC and XOXD tokens"))?;
-            let auth = connect_with_token(context.events, context.slack, token.clone()).await?;
-            context.token_store.save(&token)?;
-            load_workspace_after_auth(context, &auth).await?;
-        }
-        RuntimeCommand::SignOut => {
-            stop_socket_mode(context);
-            context.token_store.clear()?;
-            *context.slack = None;
-            *context.workspace_store = None;
-            context.user_cache.clear();
-            context.events.send_event(RuntimeEventKind::SignedOut);
+        RuntimeCommand::LoadStoredToken
+        | RuntimeCommand::StartOAuth { .. }
+        | RuntimeCommand::StartBrowserSession { .. }
+        | RuntimeCommand::SignOut
+        | RuntimeCommand::Disconnect => {
+            return Err(anyhow!("session command reached connected task handler"));
         }
         RuntimeCommand::RefreshConversations => {
             crate::debug::log("runtime", "RefreshConversations");
@@ -787,7 +1471,16 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 conversation_refresh_mode(),
                 ConversationRefreshMode::Background
             );
-            spawn_conversation_refresh(context)?;
+            let api = require_slack(context.slack)?.clone();
+            let workspace_store = (*context.workspace_store).clone();
+            let cached_user_names = context.user_cache.clone();
+            load_conversations_best_effort_with_api(
+                context.events,
+                &api,
+                &workspace_store,
+                cached_user_names,
+            )
+            .await?;
         }
         RuntimeCommand::LoadHistory { channel_id } => {
             let api = require_slack(context.slack)?;
@@ -1034,59 +1727,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
     Ok(())
 }
 
-async fn connect_and_load_workspace(
-    context: &mut RuntimeContext<'_>,
-    token: StoredToken,
-) -> Result<()> {
-    let auth = connect_with_token(context.events, context.slack, token).await?;
-    load_workspace_after_auth(context, &auth).await
-}
-
-async fn load_workspace_after_auth(
-    context: &mut RuntimeContext<'_>,
-    auth: &AuthInfo,
-) -> Result<()> {
-    *context.workspace_store = Some(WorkspaceStore::new(
-        config::state_cache_dir(),
-        &workspace_store_id(auth),
-    ));
-    context.user_cache.clear();
-    load_cached_user_names(context.events, context.workspace_store, context.user_cache).await;
-    load_cached_conversations(context.events, context.workspace_store).await;
-    debug_assert_eq!(
-        conversation_refresh_mode(),
-        ConversationRefreshMode::Background
-    );
-    start_socket_mode(context);
-    spawn_conversation_refresh(context)?;
-    spawn_user_group_refresh(context)?;
-    Ok(())
-}
-
-fn start_socket_mode(context: &mut RuntimeContext<'_>) {
-    stop_socket_mode(context);
-
-    let Some(app_token) = config::slack_app_token() else {
-        crate::debug::log("socket", "SocketModeDisabled reason=missing_app_token");
-        return;
-    };
-
-    crate::debug::log("socket", "SocketModeStarting");
-    let events = context.events.unsolicited(OperationContext::new(
-        RuntimeOperation::SocketMode,
-        RuntimeTarget::Workspace,
-    ));
-    let handle = tokio::spawn(run_socket_mode(app_token, events));
-    *context.socket_mode = Some(handle);
-}
-
-fn stop_socket_mode(context: &mut RuntimeContext<'_>) {
-    if let Some(handle) = context.socket_mode.take() {
-        handle.abort();
-        crate::debug::log("socket", "SocketModeStopped");
-    }
-}
-
 async fn run_socket_mode(app_token: String, events: RuntimeEventSender) {
     let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
 
@@ -1149,71 +1789,6 @@ fn socket_mode_reconnect_timing(
         sleep: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
         next_backoff: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
     }
-}
-
-fn spawn_conversation_refresh(context: &RuntimeContext<'_>) -> Result<()> {
-    let api = require_slack(context.slack)?.clone();
-    let events = context.events.clone();
-    let workspace_store = (*context.workspace_store).clone();
-    let cached_user_names = context.user_cache.clone();
-
-    tokio::spawn(async move {
-        if let Err(error) = load_conversations_best_effort_with_api(
-            &events,
-            &api,
-            &workspace_store,
-            cached_user_names,
-        )
-        .await
-        {
-            crate::debug::log(
-                "runtime",
-                &format!("ConversationsBackgroundRefreshFailed error={error:#}"),
-            );
-        }
-    });
-
-    Ok(())
-}
-
-fn spawn_user_group_refresh(context: &RuntimeContext<'_>) -> Result<()> {
-    let api = require_slack(context.slack)?.clone();
-    let events = context.events.clone();
-    let workspace_store = (*context.workspace_store).clone();
-    let cached_user_names = context.user_cache.clone();
-
-    tokio::spawn(async move {
-        load_user_groups_best_effort_with_api(&events, &api, &workspace_store, cached_user_names)
-            .await;
-    });
-
-    Ok(())
-}
-
-async fn connect_with_token(
-    events: &RuntimeEventSender,
-    slack: &mut Option<SlackApi>,
-    token: StoredToken,
-) -> Result<AuthInfo> {
-    let token_team = token.team_name.clone().or(token.team_id.clone());
-    let token_team_id = token.team_id.clone();
-    let token_user = token.user_id.clone();
-    let api = SlackApi::new(token);
-    let mut auth = api.auth_test().await?;
-    auth.team = auth.team.or(token_team);
-    auth.team_id = auth.team_id.or(token_team_id);
-    auth.user_id = auth.user_id.or(token_user);
-    crate::debug::log(
-        "runtime",
-        &format!(
-            "Authenticated team={} user_id={}",
-            auth.team.as_deref().unwrap_or("<unknown>"),
-            auth.user_id.as_deref().unwrap_or("<unknown>")
-        ),
-    );
-    *slack = Some(api);
-    events.send_event(RuntimeEventKind::Authenticated(auth.clone()));
-    Ok(auth)
 }
 
 async fn load_user_groups_best_effort_with_api(
@@ -1829,7 +2404,7 @@ trait EventSenderExt {
 
 #[derive(Clone, Debug)]
 struct RuntimeEventSender {
-    sender: Sender<RuntimeEvent>,
+    sender: mpsc::UnboundedSender<RuntimeEvent>,
     session: SessionId,
     request: Option<RequestId>,
     fallback: OperationContext,
@@ -1837,7 +2412,7 @@ struct RuntimeEventSender {
 
 impl RuntimeEventSender {
     fn new(
-        sender: Sender<RuntimeEvent>,
+        sender: mpsc::UnboundedSender<RuntimeEvent>,
         identity: RuntimeIdentity,
         fallback: OperationContext,
     ) -> Self {
@@ -1879,9 +2454,433 @@ impl EventSenderExt for RuntimeEventSender {
 
 #[cfg(test)]
 mod tests {
+    use std::future;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    struct CancellationSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for CancellationSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn background_work_does_not_block_later_interactive_work() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let (background_started_tx, background_started_rx) = tokio::sync::oneshot::channel();
+            let background_gate = Arc::new(tokio::sync::Notify::new());
+            let background_task = tokio::spawn({
+                let limits = limits.clone();
+                let background_gate = Arc::clone(&background_gate);
+                async move {
+                    let _permit = limits.acquire(RuntimeTaskLane::Background).await;
+                    let _ = background_started_tx.send(());
+                    background_gate.notified().await;
+                }
+            });
+
+            background_started_rx
+                .await
+                .expect("background task did not start");
+            let interactive_permit = tokio::time::timeout(
+                Duration::from_millis(100),
+                limits.acquire(RuntimeTaskLane::Interactive),
+            )
+            .await;
+
+            assert!(
+                interactive_permit.is_ok(),
+                "interactive work was blocked by background work"
+            );
+            background_task.abort();
+        });
+    }
+
+    #[test]
+    fn image_work_does_not_block_later_upload_work() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let (image_started_tx, image_started_rx) = tokio::sync::oneshot::channel();
+            let image_gate = Arc::new(tokio::sync::Notify::new());
+            let image_task = tokio::spawn({
+                let limits = limits.clone();
+                let image_gate = Arc::clone(&image_gate);
+                async move {
+                    let _permit = limits.acquire(RuntimeTaskLane::Image).await;
+                    let _ = image_started_tx.send(());
+                    image_gate.notified().await;
+                }
+            });
+
+            image_started_rx.await.expect("image task did not start");
+            let upload_permit = tokio::time::timeout(
+                Duration::from_millis(100),
+                limits.acquire(RuntimeTaskLane::Upload),
+            )
+            .await;
+
+            assert!(
+                upload_permit.is_ok(),
+                "upload work was blocked by image work"
+            );
+            image_task.abort();
+        });
+    }
+
+    #[test]
+    fn navigation_work_does_not_block_behind_interactive_mutation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let interactive_permit = limits.acquire(RuntimeTaskLane::Interactive).await;
+            let navigation_permit = tokio::time::timeout(
+                Duration::from_millis(100),
+                limits.acquire(RuntimeTaskLane::Navigation),
+            )
+            .await;
+
+            assert!(
+                navigation_permit.is_ok(),
+                "navigation work was blocked by an interactive mutation"
+            );
+            drop(interactive_permit);
+        });
+    }
+
+    #[test]
+    fn switching_main_navigation_aborts_old_target_and_starts_new_target() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(session)));
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let first_command = RuntimeCommand::LoadHistory {
+                channel_id: "C1".to_string(),
+            };
+            let second_command = RuntimeCommand::LoadHistory {
+                channel_id: "C2".to_string(),
+            };
+            let first_identity = RuntimeIdentity {
+                session,
+                request: RequestId::new(1),
+            };
+            let second_identity = RuntimeIdentity {
+                session,
+                request: RequestId::new(2),
+            };
+            let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+            let (first_cancelled_tx, first_cancelled_rx) = tokio::sync::oneshot::channel();
+            let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+
+            let first_limits = limits.clone();
+            spawn_request_task(
+                &state,
+                TrackedRequest::for_command(first_identity, &first_command),
+                async move {
+                    let _permit = first_limits.acquire(RuntimeTaskLane::Navigation).await;
+                    let _cancelled = CancellationSignal(Some(first_cancelled_tx));
+                    let _ = first_started_tx.send(());
+                    future::pending::<()>().await;
+                },
+            );
+            first_started_rx
+                .await
+                .expect("first navigation did not start");
+
+            let second_limits = limits;
+            spawn_request_task(
+                &state,
+                TrackedRequest::for_command(second_identity, &second_command),
+                async move {
+                    let _permit = second_limits.acquire(RuntimeTaskLane::Navigation).await;
+                    let _ = second_started_tx.send(());
+                },
+            );
+
+            tokio::time::timeout(Duration::from_millis(100), first_cancelled_rx)
+                .await
+                .expect("abandoned navigation was not aborted")
+                .expect("navigation cancellation signal dropped");
+            tokio::time::timeout(Duration::from_millis(100), second_started_rx)
+                .await
+                .expect("new navigation did not get capacity")
+                .expect("new navigation start signal dropped");
+        });
+    }
+
+    #[test]
+    fn mutations_are_session_tracked_without_same_context_supersession() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let command = RuntimeCommand::PostMessage {
+                channel_id: "C1".to_string(),
+                text: "hello".to_string(),
+                thread_ts: None,
+            };
+            let first = TrackedRequest::for_command(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(1),
+                },
+                &command,
+            );
+            let second = TrackedRequest::for_command(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(2),
+                },
+                &command,
+            );
+            let first_task = tokio::spawn(future::pending::<()>());
+            let second_task = tokio::spawn(future::pending::<()>());
+            let mut state = RuntimeState::new(session);
+
+            assert!(state.register_task(
+                session,
+                1,
+                Some(first.clone()),
+                first_task.abort_handle(),
+            ));
+            assert!(state.register_task(
+                session,
+                2,
+                Some(second.clone()),
+                second_task.abort_handle(),
+            ));
+            assert!(!first_task.is_finished());
+            assert!(!second_task.is_finished());
+            assert!(state.active_requests.is_empty());
+
+            state.finish_task(1, Some(&first));
+            state.finish_task(2, Some(&second));
+            first_task.abort();
+            second_task.abort();
+        });
+    }
+
+    #[test]
+    fn only_read_commands_supersede_previous_requests() {
+        assert!(RuntimeCommand::SearchMessages {
+            query: "hello".to_string(),
+        }
+        .supersedes_previous());
+        assert!(!RuntimeCommand::SetSaved {
+            channel_id: "C1".to_string(),
+            ts: "1.0".to_string(),
+            add: true,
+            thread_ts: None,
+        }
+        .supersedes_previous());
+        assert!(!RuntimeCommand::UploadFile {
+            channel_id: "C1".to_string(),
+            path: PathBuf::from("example.txt"),
+            initial_comment: None,
+        }
+        .supersedes_previous());
+    }
+
+    #[test]
+    fn superseded_request_cleanup_does_not_remove_newer_request() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let context = OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace);
+            let first = TrackedRequest::new(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(1),
+                },
+                context.clone(),
+            );
+            let second = TrackedRequest::new(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(2),
+                },
+                context.clone(),
+            );
+            let old_task = tokio::spawn(future::pending::<()>());
+            let new_task = tokio::spawn(future::pending::<()>());
+            let mut state = RuntimeState::new(session);
+
+            state.register_task(session, 1, Some(first.clone()), old_task.abort_handle());
+            state.register_task(session, 2, Some(second.clone()), new_task.abort_handle());
+            let old_result = tokio::time::timeout(Duration::from_millis(100), old_task)
+                .await
+                .expect("superseded task was not aborted")
+                .expect_err("superseded task completed normally");
+            assert!(old_result.is_cancelled());
+
+            state.finish_task(1, Some(&first));
+            assert_eq!(
+                state
+                    .active_requests
+                    .get(&context)
+                    .map(|request| request.task_id),
+                Some(2)
+            );
+
+            state.finish_task(2, Some(&second));
+            assert!(!state.active_requests.contains_key(&context));
+            new_task.abort();
+        });
+    }
+
+    #[test]
+    fn completed_newer_request_still_rejects_older_background_request() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let context =
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace);
+            let newer = TrackedRequest::new(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(2),
+                },
+                context.clone(),
+            );
+            let older = TrackedRequest::new(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(1),
+                },
+                context.clone(),
+            );
+            let newer_task = tokio::spawn(future::pending::<()>());
+            let older_task = tokio::spawn(future::pending::<()>());
+            let mut state = RuntimeState::new(session);
+
+            assert!(state.register_task(
+                session,
+                2,
+                Some(newer.clone()),
+                newer_task.abort_handle(),
+            ));
+            state.finish_task(2, Some(&newer));
+            assert!(!state.register_task(session, 1, Some(older), older_task.abort_handle(),));
+            let older_result = tokio::time::timeout(Duration::from_millis(100), older_task)
+                .await
+                .expect("older background task was not aborted")
+                .expect_err("older background task completed normally");
+
+            assert!(older_result.is_cancelled());
+            assert_eq!(
+                state.latest_requests.get(&context),
+                Some(&RequestId::new(2))
+            );
+            newer_task.abort();
+        });
+    }
+
+    #[test]
+    fn sign_out_still_completes_when_keyring_clear_fails() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let (sender, mut events) = mpsc::unbounded_channel();
+            let event_sender = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::SignOut, RuntimeTarget::Workspace),
+            );
+
+            finish_sign_out(&event_sender, Err(anyhow!("keyring unavailable")));
+
+            assert!(matches!(
+                events.recv().await.map(|event| event.kind),
+                Some(RuntimeEventKind::Error(_))
+            ));
+            assert!(matches!(
+                events.recv().await.map(|event| event.kind),
+                Some(RuntimeEventKind::SignedOut)
+            ));
+        });
+    }
+
+    #[test]
+    fn replacing_session_aborts_registered_session_tasks() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let first_session = SessionId::default().next();
+            let second_session = first_session.next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(first_session)));
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+
+            spawn_session_task(&state, first_session, async move {
+                let _signal = CancellationSignal(Some(cancelled_tx));
+                let _ = started_tx.send(());
+                future::pending::<()>().await;
+            });
+            started_rx.await.expect("session task did not start");
+
+            state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .replace_session(second_session);
+
+            tokio::time::timeout(Duration::from_millis(100), cancelled_rx)
+                .await
+                .expect("old session task was not aborted")
+                .expect("cancellation signal was dropped");
+            assert_eq!(
+                state
+                    .lock()
+                    .expect("runtime state lock poisoned")
+                    .active_session,
+                second_session
+            );
+        });
+    }
 
     #[test]
     fn image_asset_cache_key_is_stable_hex_digest() {
