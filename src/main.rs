@@ -41,13 +41,14 @@ use self::application::ConduitApplication;
 use self::window::ConduitWindow;
 
 use config::{APPLICATION_ID, GETTEXT_PACKAGE, LOCALEDIR, PKGDATADIR};
-use gettextrs::{bind_textdomain_codeset, bindtextdomain, textdomain};
+use gettextrs::{bind_textdomain_codeset, bindtextdomain, setlocale, textdomain, LocaleCategory};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::path::PathBuf;
 
 fn main() -> glib::ExitCode {
     // Set up gettext translations
+    let _ = setlocale(LocaleCategory::LcAll, "");
     bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
     bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8")
         .expect("Unable to set the text domain encoding");

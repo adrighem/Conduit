@@ -1,8 +1,11 @@
 # List of source files containing translatable strings.
 # Please keep this file sorted alphabetically.
 data/eu.vanadrighem.conduit.desktop.in
-data/eu.vanadrighem.conduit.metainfo.xml.in
 data/eu.vanadrighem.conduit.gschema.xml
+data/eu.vanadrighem.conduit.metainfo.xml.in
+src/activity.rs
 src/application.rs
+src/message_html.rs
 src/shortcuts-dialog.ui
+src/window.rs
 src/window.ui

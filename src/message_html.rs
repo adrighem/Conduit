@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Local};
+use gettextrs::gettext;
 
 use crate::activity::ActivityItem;
 use crate::debug;
 use crate::models::{SavedItem, SearchMatch, SlackFile, SlackMessage};
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
+const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
@@ -45,11 +46,108 @@ pub fn base_uri() -> &'static str {
     MESSAGE_BASE_URI
 }
 
+fn normalize_language_tag(locale: &str) -> Option<String> {
+    let locale = locale.trim();
+    let (locale, modifier) = locale
+        .split_once('@')
+        .map_or((locale, None), |(locale, modifier)| {
+            (locale, Some(modifier.to_ascii_lowercase()))
+        });
+    let locale = locale.split('.').next().unwrap_or_default();
+    if locale.is_empty() || matches!(locale, "C" | "POSIX") {
+        return None;
+    }
+
+    let locale = locale.replace('_', "-");
+    let subtags = locale.split('-').collect::<Vec<_>>();
+    let language = subtags.first().copied()?;
+    if !(2..=8).contains(&language.len())
+        || !language
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+        || subtags.iter().any(|subtag| {
+            subtag.is_empty()
+                || subtag.len() > 8
+                || !subtag
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+    {
+        return None;
+    }
+
+    let mut normalized = subtags
+        .iter()
+        .enumerate()
+        .map(|(index, subtag)| {
+            if index == 0 {
+                subtag.to_ascii_lowercase()
+            } else if subtag.len() == 2
+                && subtag
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+            {
+                subtag.to_ascii_uppercase()
+            } else if subtag.len() == 4
+                && subtag
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+            {
+                let mut characters = subtag.chars();
+                characters
+                    .next()
+                    .map(|character| {
+                        format!(
+                            "{}{}",
+                            character.to_ascii_uppercase(),
+                            characters.as_str().to_ascii_lowercase()
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                subtag.to_ascii_lowercase()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let modifier_script = match modifier.as_deref() {
+        Some("latin") => Some("Latn"),
+        Some("cyrillic") => Some("Cyrl"),
+        _ => None,
+    };
+    let has_script = normalized.iter().skip(1).any(|subtag| {
+        subtag.len() == 4
+            && subtag
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+    });
+    if let Some(script) = modifier_script.filter(|_| !has_script) {
+        normalized.insert(1, script.to_string());
+    }
+
+    Some(normalized.join("-"))
+}
+
+fn document_language() -> String {
+    gtk::glib::language_names()
+        .iter()
+        .find_map(|language| normalize_language_tag(language.as_str()))
+        .unwrap_or_else(|| DEFAULT_DOCUMENT_LANGUAGE.to_string())
+}
+
+fn document_heading(title: &str) -> String {
+    format!(
+        "<h1 id=\"document-title\" class=\"visually-hidden\">{}</h1>",
+        escape_html(title)
+    )
+}
+
 pub fn placeholder_document(title: &str, message: &str) -> String {
     html_document(
         title,
         &format!(
-            "<main class=\"timeline\"><section class=\"placeholder\">{}</section></main>",
+            "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<p class=\"placeholder\">{}</p></main>",
+            document_heading(title),
             escape_html(message)
         ),
     )
@@ -61,7 +159,7 @@ pub fn conversation_document(
     context: &MessageHtmlContext,
 ) -> String {
     if messages.is_empty() {
-        return placeholder_document("Messages", "No messages");
+        return placeholder_document(&gettext("Messages"), &gettext("No messages"));
     }
 
     let groups = message_groups(messages);
@@ -76,88 +174,142 @@ pub fn conversation_document(
         ),
     );
 
-    let mut body = String::from("<main class=\"timeline\" aria-label=\"Messages\">");
+    let title = gettext("Messages");
+    let mut body = format!(
+        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}",
+        document_heading(&title)
+    );
     if context.thread_ts.is_none() {
         if let Some(url) = context.load_more_url.as_deref() {
-            body.push_str(&load_more_action_html(url, "Load older messages"));
+            body.push_str(&load_more_action_html(url, &gettext("Load older messages")));
         }
     }
+    body.push_str("<ol class=\"message-list\">");
     for group in groups {
+        body.push_str("<li class=\"message-list-item\">");
         body.push_str(&message_group_article(Some(channel_id), &group, context));
+        body.push_str("</li>");
     }
+    body.push_str("</ol>");
     if context.thread_ts.is_some() {
         if let Some(url) = context.load_more_url.as_deref() {
-            body.push_str(&load_more_action_html(url, "Load more replies"));
+            body.push_str(&load_more_action_html(url, &gettext("Load more replies")));
         }
     }
     body.push_str("</main>");
 
     let scroll_script = timeline_scroll_script(channel_id, context.timeline_scroll);
-    html_document_with_script("Messages", &body, scroll_script.as_deref())
+    html_document_with_script(&title, &body, scroll_script.as_deref())
 }
 
 pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -> String {
+    let title = gettext("Saved items");
     let mut rendered = 0;
-    let mut body = String::from("<main class=\"timeline\" aria-label=\"Saved items\">");
+    let mut body = format!(
+        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
+        document_heading(&title)
+    );
 
     for item in items {
         if let (Some(channel_id), Some(message)) = (item.channel.as_deref(), item.message.as_ref())
         {
+            body.push_str("<li class=\"message-list-item\">");
             body.push_str(&message_article(Some(channel_id), message, context));
+            body.push_str("</li>");
             rendered += 1;
         }
     }
 
+    body.push_str("</ol>");
     if rendered == 0 {
-        body.push_str("<section class=\"placeholder\">No saved items</section>");
+        body.push_str(&format!(
+            "<p class=\"placeholder\">{}</p>",
+            escape_html(&gettext("No saved items"))
+        ));
     }
     body.push_str("</main>");
 
-    html_document("Saved items", &body)
+    html_document(&title, &body)
 }
 
 pub fn activity_document(items: &[ActivityItem]) -> String {
     if items.is_empty() {
-        return placeholder_document("Activity", "No unread activity");
+        return placeholder_document(&gettext("Activity"), &gettext("No unread activity"));
     }
 
-    let mut body = String::from("<main class=\"timeline\" aria-label=\"Activity\">");
-    body.push_str("<section class=\"activity-list\">");
+    let title = gettext("Activity");
+    let mut body = format!(
+        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ul class=\"activity-list\">",
+        document_heading(&title)
+    );
     for item in items {
         body.push_str(&activity_item_html(item));
     }
-    body.push_str("</section></main>");
+    body.push_str("</ul></main>");
 
-    html_document("Activity", &body)
+    html_document(&title, &body)
 }
 
 pub fn files_document(files: &[SlackFile]) -> String {
     if files.is_empty() {
-        return placeholder_document("Files", "No files");
+        return placeholder_document(&gettext("Files"), &gettext("No files"));
     }
 
-    let mut body = String::from("<main class=\"timeline\" aria-label=\"Files\">");
-    body.push_str("<section class=\"file-list\">");
+    let title = gettext("Files");
+    let mut body = format!(
+        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ul class=\"file-list\">",
+        document_heading(&title)
+    );
     for file in files {
         body.push_str(&file_item_html(file));
     }
-    body.push_str("</section></main>");
+    body.push_str("</ul></main>");
 
-    html_document("Files", &body)
+    html_document(&title, &body)
 }
 
 pub fn search_results_document(results: &[SearchMatch], context: &MessageHtmlContext) -> String {
     if results.is_empty() {
-        return placeholder_document("Search results", "No results");
+        return placeholder_document(&gettext("Search results"), &gettext("No results"));
     }
 
-    let mut body = String::from("<main class=\"timeline\" aria-label=\"Search results\">");
+    let title = gettext("Search results");
+    let mut body = format!(
+        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
+        document_heading(&title)
+    );
     for result in results {
+        body.push_str("<li class=\"message-list-item\">");
         body.push_str(&search_result_article(result, context));
+        body.push_str("</li>");
     }
-    body.push_str("</main>");
+    body.push_str("</ol></main>");
 
-    html_document("Search results", &body)
+    html_document(&title, &body)
+}
+
+fn document_direction(language: &str) -> &'static str {
+    if let Some(script) = language.split('-').skip(1).find(|subtag| {
+        subtag.len() == 4
+            && subtag
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+    }) {
+        return if ["Arab", "Hebr", "Nkoo", "Rohg", "Syrc", "Thaa", "Adlm"]
+            .iter()
+            .any(|rtl_script| script.eq_ignore_ascii_case(rtl_script))
+        {
+            "rtl"
+        } else {
+            "ltr"
+        };
+    }
+
+    match language.split('-').next().unwrap_or_default() {
+        "ar" | "arc" | "ckb" | "dv" | "fa" | "he" | "iw" | "nqo" | "ps" | "sd" | "syr" | "ug"
+        | "ur" | "yi" => "rtl",
+        _ => "ltr",
+    }
 }
 
 fn html_document(title: &str, body: &str) -> String {
@@ -165,6 +317,15 @@ fn html_document(title: &str, body: &str) -> String {
 }
 
 fn html_document_with_script(title: &str, body: &str, script: Option<&str>) -> String {
+    html_document_with_language(title, body, script, &document_language())
+}
+
+fn html_document_with_language(
+    title: &str,
+    body: &str,
+    script: Option<&str>,
+    language: &str,
+) -> String {
     let script_tag = script
         .filter(|script| !script.trim().is_empty())
         .map(|script| format!("\n<script>\n{script}\n</script>"))
@@ -172,7 +333,7 @@ fn html_document_with_script(title: &str, body: &str, script: Option<&str>) -> S
 
     format!(
         r#"<!doctype html>
-<html lang="en">
+<html lang="{}" dir="{}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -186,7 +347,7 @@ fn html_document_with_script(title: &str, body: &str, script: Option<&str>) -> S
   --line: #deddda;
   --soft: #f1f3f4;
   --code: #eceff1;
-  --accent: #0a7cff;
+  --accent: #0061c9;
   --accent-soft: #e5f1ff;
   --success-soft: #e7f4e8;
 }}
@@ -206,7 +367,7 @@ fn html_document_with_script(title: &str, body: &str, script: Option<&str>) -> S
 }}
 
 html, body {{
-  min-height: 100%;
+  min-block-size: 100%;
   margin: 0;
   background: var(--page);
   color: var(--text);
@@ -215,6 +376,11 @@ html, body {{
 
 body {{
   overflow-wrap: anywhere;
+}}
+
+:where(a, summary, [tabindex]):focus-visible {{
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
 }}
 
 a {{
@@ -228,18 +394,51 @@ a:hover {{
 
 .timeline {{
   box-sizing: border-box;
-  width: 100%;
-  max-width: 880px;
-  margin: 0 auto;
-  padding: 4px 12px 20px;
+  inline-size: 100%;
+  max-inline-size: 880px;
+  margin-block: 0;
+  margin-inline: auto;
+  padding-block: 4px 20px;
+  padding-inline: 12px;
+}}
+
+.visually-hidden {{
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}}
+
+.message-list,
+.activity-list,
+.file-list {{
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}}
+
+.message-list-item {{
+  display: block;
 }}
 
 .message {{
   position: relative;
   display: grid;
   gap: 6px;
-  padding: 10px 144px 10px 0;
-  border-bottom: 1px solid var(--line);
+  padding-block: 10px;
+  padding-inline: 0;
+  border-block-end: 1px solid var(--line);
+}}
+
+.message:focus-visible,
+.message-part:focus-visible {{
+  border-radius: 6px;
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
 }}
 
 .message-stack {{
@@ -247,30 +446,25 @@ a:hover {{
   gap: 8px;
 }}
 
-.message-group {{
-  padding-right: 0;
-}}
-
 .message-part {{
   position: relative;
   display: grid;
   gap: 6px;
-  padding-right: 144px;
 }}
 
 .message-part + .message-part {{
-  padding-top: 4px;
+  padding-block-start: 4px;
 }}
 
 .message-header {{
   display: flex;
   align-items: baseline;
   gap: 8px;
-  min-width: 0;
+  min-inline-size: 0;
 }}
 
 .author {{
-  min-width: 0;
+  min-inline-size: 0;
   font-weight: 700;
 }}
 
@@ -280,11 +474,12 @@ a:hover {{
 }}
 
 .body {{
-  min-width: 0;
+  min-inline-size: 0;
 }}
 
 .body p {{
-  margin: 0;
+  margin-block: 0;
+  margin-inline: 0;
 }}
 
 .context-block,
@@ -295,14 +490,16 @@ a:hover {{
 }}
 
 .divider {{
-  height: 1px;
+  block-size: 1px;
   border: 0;
   background: var(--line);
-  margin: 4px 0;
+  margin-block: 4px;
+  margin-inline: 0;
 }}
 
 code {{
-  padding: 1px 4px;
+  padding-block: 1px;
+  padding-inline: 4px;
   border-radius: 4px;
   background: var(--code);
   font-family: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
@@ -310,15 +507,18 @@ code {{
 }}
 
 pre {{
-  margin: 2px 0;
-  padding: 10px;
+  margin-block: 2px;
+  margin-inline: 0;
+  padding-block: 10px;
+  padding-inline: 10px;
   overflow-x: auto;
   border-radius: 8px;
   background: var(--code);
 }}
 
 pre code {{
-  padding: 0;
+  padding-block: 0;
+  padding-inline: 0;
   border-radius: 0;
   background: transparent;
   font-size: 13px;
@@ -326,7 +526,8 @@ pre code {{
 
 .mention {{
   display: inline-block;
-  padding: 0 4px;
+  padding-block: 0;
+  padding-inline: 4px;
   border-radius: 4px;
   background: var(--accent-soft);
   font-weight: 700;
@@ -348,7 +549,8 @@ pre code {{
 
 .attachment,
 .block-action {{
-  padding: 3px 7px;
+  padding-block: 3px;
+  padding-inline: 7px;
   border-radius: 6px;
   background: var(--soft);
 }}
@@ -356,15 +558,16 @@ pre code {{
 .image-attachment {{
   display: grid;
   gap: 6px;
-  max-width: 520px;
-  margin: 2px 0;
+  max-inline-size: 520px;
+  margin-block: 2px;
+  margin-inline: 0;
 }}
 
 .image-attachment img {{
   display: block;
-  width: auto;
-  max-width: 100%;
-  max-height: 420px;
+  inline-size: auto;
+  max-inline-size: 100%;
+  max-block-size: 420px;
   border-radius: 8px;
   background: var(--soft);
 }}
@@ -377,8 +580,9 @@ pre code {{
 .image-placeholder {{
   display: flex;
   align-items: center;
-  min-height: 72px;
-  padding: 10px;
+  min-block-size: 72px;
+  padding-block: 10px;
+  padding-inline: 10px;
   border-radius: 8px;
   background: var(--soft);
   color: var(--muted);
@@ -387,15 +591,16 @@ pre code {{
 .activity-list {{
   display: grid;
   gap: 0;
-  border-top: 1px solid var(--line);
+  border-block-start: 1px solid var(--line);
 }}
 
 .activity-row {{
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 4px 12px;
-  padding: 11px 0;
-  border-bottom: 1px solid var(--line);
+  padding-block: 11px;
+  padding-inline: 0;
+  border-block-end: 1px solid var(--line);
   color: var(--text);
 }}
 
@@ -404,7 +609,7 @@ pre code {{
 }}
 
 .activity-title {{
-  min-width: 0;
+  min-inline-size: 0;
   font-weight: 700;
 }}
 
@@ -417,8 +622,9 @@ pre code {{
   align-self: center;
   grid-row: 1 / span 2;
   grid-column: 2;
-  min-width: 24px;
-  padding: 2px 8px;
+  min-inline-size: 24px;
+  padding-block: 2px;
+  padding-inline: 8px;
   border-radius: 999px;
   background: var(--accent-soft);
   color: var(--text);
@@ -429,14 +635,15 @@ pre code {{
 .file-list {{
   display: grid;
   gap: 0;
-  border-top: 1px solid var(--line);
+  border-block-start: 1px solid var(--line);
 }}
 
 .file-row {{
   display: grid;
   gap: 4px;
-  padding: 11px 0;
-  border-bottom: 1px solid var(--line);
+  padding-block: 11px;
+  padding-inline: 0;
+  border-block-end: 1px solid var(--line);
   color: var(--text);
 }}
 
@@ -445,7 +652,7 @@ pre code {{
 }}
 
 .file-title {{
-  min-width: 0;
+  min-inline-size: 0;
   font-weight: 700;
 }}
 
@@ -455,7 +662,8 @@ pre code {{
 }}
 
 .reaction {{
-  padding: 2px 7px;
+  padding-block: 2px;
+  padding-inline: 7px;
   border-radius: 999px;
   background: var(--soft);
   color: var(--muted);
@@ -479,119 +687,44 @@ pre code {{
 }}
 
 .quick-actions {{
-  position: absolute;
-  top: 6px;
-  right: 0;
-  z-index: 2;
-  display: inline-flex;
+  position: static;
+  display: flex;
+  flex-wrap: wrap;
+  justify-self: end;
   align-items: center;
-  gap: 0;
-  min-height: 34px;
+  gap: 2px;
+  max-inline-size: 100%;
   overflow: visible;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--page);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
-  opacity: 0;
-  pointer-events: none;
+  opacity: 1;
+  pointer-events: auto;
   transition: opacity 120ms ease;
 }}
 
-.message:hover > .quick-actions,
-.message:focus-within > .quick-actions,
-.message-part:hover > .quick-actions,
-.message-part:focus-within > .quick-actions,
-.quick-actions:focus-within {{
-  opacity: 1;
-  pointer-events: auto;
-}}
-
-.action-button,
-.more-summary {{
+.action-button {{
   display: inline-flex;
   justify-content: center;
   align-items: center;
-  width: 32px;
-  height: 32px;
+  min-inline-size: 36px;
+  min-block-size: 36px;
   border: 0;
-  border-radius: 0;
+  border-radius: 6px;
   background: transparent;
   color: var(--text);
   font: inherit;
   line-height: 1;
 }}
 
-.action-button:hover,
-.more-summary:hover {{
+.action-button:hover {{
   background: var(--soft);
   text-decoration: none;
 }}
 
 .action-button.is-active {{
   background: var(--success-soft);
-}}
-
-.more-actions {{
-  position: relative;
-}}
-
-.more-summary {{
-  list-style: none;
-  cursor: default;
-}}
-
-.more-summary::-webkit-details-marker {{
-  display: none;
-}}
-
-.action-menu {{
-  position: absolute;
-  top: 38px;
-  right: 0;
-  z-index: 3;
-  display: grid;
-  min-width: 248px;
-  padding: 6px 0;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--page);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
-}}
-
-.menu-item,
-.menu-section {{
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-height: 30px;
-  padding: 0 12px;
-  color: var(--text);
-  white-space: nowrap;
-}}
-
-.menu-item:hover {{
-  background: var(--soft);
-  text-decoration: none;
-}}
-
-.menu-item.is-disabled {{
-  color: var(--muted);
-}}
-
-.menu-item.is-danger {{
-  color: #d81951;
-}}
-
-.shortcut {{
-  color: var(--muted);
-  font-size: 12px;
-}}
-
-.menu-divider {{
-  height: 1px;
-  margin: 6px 0;
-  background: var(--line);
 }}
 
 .external-actions {{
@@ -607,14 +740,16 @@ pre code {{
 .timeline-action {{
   display: flex;
   justify-content: center;
-  padding: 10px 0;
+  padding-block: 10px;
+  padding-inline: 0;
 }}
 
 .timeline-action a {{
   display: inline-flex;
   align-items: center;
-  min-height: 30px;
-  padding: 0 12px;
+  min-block-size: 30px;
+  padding-block: 0;
+  padding-inline: 12px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--soft);
@@ -637,8 +772,49 @@ pre code {{
 }}
 
 .placeholder {{
-  padding: 14px 0;
+  padding-block: 14px;
+  padding-inline: 0;
   color: var(--muted);
+}}
+
+@media (hover: hover) and (pointer: fine) {{
+  .message,
+  .message-part {{
+    grid-template-columns: minmax(0, 1fr) auto;
+  }}
+
+  .message > :not(.quick-actions),
+  .message-part > :not(.quick-actions) {{
+    grid-column: 1;
+  }}
+
+  .quick-actions {{
+    grid-row: 1;
+    grid-column: 2;
+    align-self: start;
+    opacity: 0;
+    pointer-events: none;
+  }}
+
+  .message:hover > .quick-actions,
+  .message:focus-within > .quick-actions,
+  .message-part:hover > .quick-actions,
+  .message-part:focus-within > .quick-actions,
+  .quick-actions:focus-within {{
+    opacity: 1;
+    pointer-events: auto;
+  }}
+}}
+
+@media (prefers-reduced-motion: reduce) {{
+  *,
+  *::before,
+  *::after {{
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }}
 }}
 </style>
 </head>
@@ -647,6 +823,8 @@ pre code {{
 {}
 </body>
 </html>"#,
+        escape_html(language),
+        document_direction(language),
         escape_html(title),
         body,
         script_tag
@@ -804,10 +982,9 @@ fn message_article(
     context: &MessageHtmlContext,
 ) -> String {
     let author = author_label(message, context);
-    let message_ts = escape_html(&message.ts);
     let mut article = format!(
-        "<article class=\"message\" data-message-ts=\"{}\"><header class=\"message-header\"><span class=\"author\">{}</span>{}</header><div class=\"body\">{}</div>",
-        message_ts,
+        "<article class=\"message\"{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}</header><div class=\"body\" dir=\"auto\">{}</div>",
+        message_target_attributes(Some(&message.ts)),
         escape_html(&author),
         metadata_html(message),
         message_body_html(message, context)
@@ -831,16 +1008,16 @@ fn load_more_action_html(url: &str, label: &str) -> String {
 fn activity_item_html(item: &ActivityItem) -> String {
     format!(
         concat!(
-            "<a class=\"activity-row\" href=\"{}\">",
-            "<span class=\"activity-title\">{}</span>",
+            "<li><a class=\"activity-row\" href=\"{}\">",
+            "<span class=\"activity-title\" dir=\"auto\">{}</span>",
             "<span class=\"activity-badge\">{}</span>",
             "<span class=\"activity-meta\">{}</span>",
-            "</a>"
+            "</a></li>"
         ),
         escape_html(&activity_open_action_url(&item.channel_id)),
         escape_html(&item.title),
         escape_html(&item.unread_label()),
-        escape_html(item.kind.label())
+        escape_html(&item.kind.label())
     )
 }
 
@@ -852,15 +1029,15 @@ fn file_item_html(file: &SlackFile) -> String {
     } else {
         format!("<span class=\"file-meta\">{}</span>", escape_html(&detail))
     };
-    let content = format!("<span class=\"file-title\">{title}</span>{detail}");
+    let content = format!("<span class=\"file-title\" dir=\"auto\">{title}</span>{detail}");
 
     if let Some(url) = file.link_url().filter(|url| is_http_url(url)) {
         format!(
-            "<a class=\"file-row\" href=\"{}\" rel=\"noreferrer noopener\">{content}</a>",
+            "<li><a class=\"file-row\" href=\"{}\" rel=\"noreferrer noopener\">{content}</a></li>",
             escape_html(url)
         )
     } else {
-        format!("<section class=\"file-row\">{content}</section>")
+        format!("<li><div class=\"file-row\">{content}</div></li>")
     }
 }
 
@@ -875,7 +1052,7 @@ fn message_group_article(
 
     let author = author_label(first_message, context);
     let mut article = format!(
-        "<article class=\"message message-group\"><header class=\"message-header\"><span class=\"author\">{}</span>{}</header><div class=\"message-stack\">",
+        "<article class=\"message message-group\"><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}</header><div class=\"message-stack\">",
         escape_html(&author),
         metadata_html(first_message)
     );
@@ -893,18 +1070,38 @@ fn message_part_html(
     message: &SlackMessage,
     context: &MessageHtmlContext,
 ) -> String {
-    let message_ts = escape_html(&message.ts);
     let mut part = format!(
-        "<section class=\"message-part\" data-message-ts=\"{}\"><div class=\"body\">{}</div>",
-        message_ts,
+        "<div class=\"message-part\"{}><div class=\"body\" dir=\"auto\">{}</div>",
+        message_target_attributes(Some(&message.ts)),
         message_body_html(message, context)
     );
 
     part.push_str(&attachments_html(message, context));
     part.push_str(&message_responses_html(channel_id, message, context));
     part.push_str(&message_actions_html(channel_id, message, context));
-    part.push_str("</section>");
+    part.push_str("</div>");
     part
+}
+
+fn message_target_attributes(ts: Option<&str>) -> String {
+    let Some(ts) = ts.filter(|ts| !ts.is_empty()) else {
+        return String::new();
+    };
+
+    let mut id = String::from("message-");
+    for byte in ts.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            id.push(char::from(byte));
+        } else {
+            id.push_str(&format!("-{byte:02x}"));
+        }
+    }
+
+    format!(
+        " id=\"{}\" tabindex=\"-1\" data-message-ts=\"{}\"",
+        escape_html(&id),
+        escape_html(ts)
+    )
 }
 
 fn message_groups(messages: &[SlackMessage]) -> Vec<Vec<&SlackMessage>> {
@@ -968,20 +1165,26 @@ fn search_result_article(result: &SearchMatch, context: &MessageHtmlContext) -> 
         .username
         .as_deref()
         .or(result.user.as_deref())
-        .unwrap_or("Unknown");
+        .map(ToString::to_string)
+        .unwrap_or_else(|| gettext("Unknown"));
     let text = result.text.as_deref().unwrap_or_default();
 
+    let timestamp = result.ts.as_deref().map(timestamp_html).unwrap_or_default();
     let mut article = format!(
-        "<article class=\"message\"><header class=\"message-header\"><span class=\"author\">{}</span><span class=\"metadata\">{}</span></header><div class=\"body\"><p>{}</p></div>",
-        escape_html(author),
+        "<article class=\"message\"{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span><span class=\"metadata\">{}</span>{}</header><div class=\"body\" dir=\"auto\"><p>{}</p></div>",
+        message_target_attributes(result.ts.as_deref()),
+        escape_html(&author),
         escape_html(&channel),
+        timestamp,
         mrkdwn_to_html(text, context)
     );
 
     if let Some(permalink) = result.permalink.as_deref().filter(|url| is_http_url(url)) {
         article.push_str(&format!(
-            "<nav class=\"external-actions\"><a class=\"external-action\" href=\"{}\" rel=\"noreferrer noopener\">Open in Slack</a></nav>",
-            escape_html(permalink)
+            "<nav class=\"external-actions\" aria-label=\"{}\"><a class=\"external-action\" href=\"{}\" rel=\"noreferrer noopener\">{}</a></nav>",
+            escape_html(&gettext("Message actions")),
+            escape_html(permalink),
+            escape_html(&gettext("Open in Slack"))
         ));
     }
 
@@ -993,7 +1196,10 @@ fn metadata_html(message: &SlackMessage) -> String {
     let mut metadata = timestamp_html(&message.ts);
 
     if message.edited.is_some() {
-        metadata.push_str("<span class=\"metadata\">edited</span>");
+        metadata.push_str(&format!(
+            "<span class=\"metadata\">{}</span>",
+            escape_html(&gettext("edited"))
+        ));
     }
 
     match message.subtype.as_deref() {
@@ -1010,23 +1216,29 @@ fn metadata_html(message: &SlackMessage) -> String {
 }
 
 fn timestamp_html(ts: &str) -> String {
-    let Some(datetime) = slack_ts_datetime(ts) else {
+    let Some((machine, full, short)) = localized_timestamp_parts(ts) else {
         return String::new();
     };
 
-    let short = datetime.format("%H:%M").to_string();
-    let full = datetime.format("%Y-%m-%d %H:%M:%S %Z").to_string();
     format!(
         "<time class=\"metadata\" datetime=\"{}\" title=\"{}\">{}</time>",
-        escape_html(&datetime.to_rfc3339()),
+        escape_html(&machine),
         escape_html(&full),
         escape_html(&short)
     )
 }
 
-fn slack_ts_datetime(ts: &str) -> Option<DateTime<Local>> {
-    let (seconds, nanos) = parse_slack_ts(ts)?;
-    DateTime::from_timestamp(seconds, nanos).map(|datetime| datetime.with_timezone(&Local))
+fn localized_timestamp_parts(ts: &str) -> Option<(String, String, String)> {
+    let datetime = slack_ts_datetime(ts)?;
+    let machine = datetime.format_iso8601().ok()?.to_string();
+    let full = datetime.format("%c %Z").ok()?.to_string();
+    let short = datetime.format("%X").ok()?.to_string();
+    Some((machine, full, short))
+}
+
+fn slack_ts_datetime(ts: &str) -> Option<gtk::glib::DateTime> {
+    let (seconds, _) = parse_slack_ts(ts)?;
+    gtk::glib::DateTime::from_unix_local(seconds).ok()
 }
 
 fn parse_slack_ts(ts: &str) -> Option<(i64, u32)> {
@@ -1060,7 +1272,10 @@ fn author_label(message: &SlackMessage, context: &MessageHtmlContext) -> String 
 
 fn message_body_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
     if message.subtype.as_deref() == Some("message_deleted") {
-        return "<p class=\"empty-message\">Message deleted</p>".to_string();
+        return format!(
+            "<p class=\"empty-message\">{}</p>",
+            escape_html(&gettext("Message deleted"))
+        );
     }
 
     if let Some(blocks) = message.blocks.as_ref() {
@@ -1072,7 +1287,10 @@ fn message_body_html(message: &SlackMessage, context: &MessageHtmlContext) -> St
 
     let text = message.body_text();
     if text.trim().is_empty() {
-        "<p class=\"empty-message\">No message text</p>".to_string()
+        format!(
+            "<p class=\"empty-message\">{}</p>",
+            escape_html(&gettext("No message text"))
+        )
     } else {
         text_block_html(&text, None, context)
     }
@@ -1113,7 +1331,8 @@ fn blocks_html(blocks: &serde_json::Value, context: &MessageHtmlContext) -> Stri
                 let alt = block
                     .get("alt_text")
                     .and_then(|text| text.as_str())
-                    .unwrap_or("Image");
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| gettext("Image"));
                 if let Some(url) = block
                     .get("image_url")
                     .and_then(|url| url.as_str())
@@ -1122,14 +1341,16 @@ fn blocks_html(blocks: &serde_json::Value, context: &MessageHtmlContext) -> Stri
                     rendered.push_str(&image_figure_html(
                         url,
                         Some(url),
-                        alt,
-                        Some("Slack image"),
+                        &alt,
+                        Some(&gettext("Slack image")),
                         context,
                     ));
                 } else {
                     rendered.push_str(&format!(
-                        "<p class=\"image-alt\">Image: {}</p>",
-                        escape_html(alt)
+                        "<p class=\"image-alt\">{}</p>",
+                        escape_html(
+                            &gettext("Image: {description}").replace("{description}", &alt)
+                        )
                     ));
                 }
             }
@@ -1227,7 +1448,7 @@ fn attachments_html(message: &SlackMessage, context: &MessageHtmlContext) -> Str
 }
 
 fn attachment_chip_html(label: &str, link: Option<&str>) -> String {
-    let label = format!("Attachment: {}", escape_html(label));
+    let label = escape_html(&gettext("Attachment: {name}").replace("{name}", label));
     if let Some(link) = link.filter(|link| is_http_url(link)) {
         format!(
             "<a class=\"attachment\" href=\"{}\" rel=\"noreferrer noopener\">{label}</a>",
@@ -1264,7 +1485,10 @@ fn image_figure_html(
                 &format!("image state=failed key={}", debug::url_for_log(asset_key)),
             );
         }
-        "<div class=\"image-placeholder\">Image preview unavailable</div>".to_string()
+        format!(
+            "<div class=\"image-placeholder\">{}</div>",
+            escape_html(&gettext("Image preview unavailable"))
+        )
     } else if is_http_url(asset_key) && !requires_authenticated_image(asset_key) {
         if debug::enabled() {
             debug::log(
@@ -1287,14 +1511,17 @@ fn image_figure_html(
                 &format!("image state=pending key={}", debug::url_for_log(asset_key)),
             );
         }
-        "<div class=\"image-placeholder\">Loading image preview</div>".to_string()
+        format!(
+            "<div class=\"image-placeholder\">{}</div>",
+            escape_html(&gettext("Loading image preview"))
+        )
     };
 
     let caption = caption
         .filter(|caption| !caption.trim().is_empty())
         .map(|caption| {
             format!(
-                "<figcaption class=\"image-caption\">{}</figcaption>",
+                "<figcaption class=\"image-caption\" dir=\"auto\">{}</figcaption>",
                 escape_html(caption)
             )
         })
@@ -1368,14 +1595,14 @@ fn thread_response_html(
     let title = message
         .reply_count
         .filter(|count| *count > 0)
-        .map(|count| format!("View thread ({count})"))
-        .unwrap_or_else(|| "View thread".to_string());
+        .map(|count| gettext("View thread ({count})").replace("{count}", &count.to_string()))
+        .unwrap_or_else(|| gettext("View thread"));
 
     let label = message
         .reply_count
         .filter(|count| *count > 0)
-        .map(|count| format!("thread ({count})"))
-        .unwrap_or_else(|| "thread".to_string());
+        .map(|count| gettext("thread ({count})").replace("{count}", &count.to_string()))
+        .unwrap_or_else(|| gettext("thread"));
 
     format!(
         "<a class=\"reaction thread-reaction\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
@@ -1405,7 +1632,7 @@ fn message_actions_html(
         actions.push_str(&action_button_html(
             &reaction_action_url(channel_id, message, name, !reacted, thread_ts),
             emoji,
-            title,
+            &title,
             reacted,
         ));
     }
@@ -1414,8 +1641,8 @@ fn message_actions_html(
         let title = message
             .reply_count
             .filter(|count| *count > 0)
-            .map(|count| format!("View thread ({count})"))
-            .unwrap_or_else(|| "Reply in thread".to_string());
+            .map(|count| gettext("View thread ({count})").replace("{count}", &count.to_string()))
+            .unwrap_or_else(|| gettext("Reply in thread"));
         actions.push_str(&action_button_html(
             &thread_action_url(channel_id, &message.ts),
             "💬",
@@ -1425,25 +1652,34 @@ fn message_actions_html(
     }
 
     let starred = message.is_starred.unwrap_or(false);
+    let save_title = if starred {
+        gettext("Remove from saved items")
+    } else {
+        gettext("Save for later")
+    };
     actions.push_str(&action_button_html(
         &save_action_url(channel_id, message, !starred, thread_ts),
         if starred { "★" } else { "☆" },
-        if starred {
-            "Remove from saved items"
-        } else {
-            "Save for later"
-        },
+        &save_title,
         starred,
     ));
     actions.push_str(&action_button_html(
         &copy_link_action_url(channel_id, message),
         "🔗",
-        "Copy link",
+        &gettext("Copy link"),
         false,
     ));
-    actions.push_str(&more_actions_html(channel_id, message, thread_ts));
+    actions.push_str(&action_button_html(
+        &copy_message_action_url(channel_id, message),
+        "📋",
+        &gettext("Copy message"),
+        false,
+    ));
 
-    format!("<nav class=\"quick-actions\" aria-label=\"Message actions\">{actions}</nav>")
+    format!(
+        "<nav class=\"quick-actions\" aria-label=\"{}\">{actions}</nav>",
+        escape_html(&gettext("Message actions"))
+    )
 }
 
 pub fn thread_action_url(channel_id: &str, ts: &str) -> String {
@@ -1544,11 +1780,11 @@ fn action_thread_ts<'a>(
     })
 }
 
-fn quick_reactions() -> [(&'static str, &'static str, &'static str); 3] {
+fn quick_reactions() -> [(&'static str, &'static str, String); 3] {
     [
-        ("smile", "🙂", "React with smile"),
-        ("thumbsup", "👍", "React with thumbs up"),
-        ("white_check_mark", "✅", "React with check"),
+        ("smile", "🙂", gettext("React with smile")),
+        ("thumbsup", "👍", gettext("React with thumbs up")),
+        ("white_check_mark", "✅", gettext("React with check")),
     ]
 }
 
@@ -1561,47 +1797,6 @@ fn action_button_html(href: &str, label: &str, title: &str, active: bool) -> Str
         escape_html(title),
         escape_html(title),
         escape_html(label)
-    )
-}
-
-fn more_actions_html(channel_id: &str, message: &SlackMessage, thread_ts: Option<&str>) -> String {
-    let mut save_url = save_action_url(
-        channel_id,
-        message,
-        !message.is_starred.unwrap_or(false),
-        thread_ts,
-    );
-    save_url = escape_html(&save_url);
-
-    format!(
-        concat!(
-            "<details class=\"more-actions\">",
-            "<summary class=\"more-summary\" title=\"More actions\" aria-label=\"More actions\">⋮</summary>",
-            "<div class=\"action-menu\">",
-            "<span class=\"menu-item is-disabled\"><span>Edit message</span><span class=\"shortcut\">E</span></span>",
-            "<span class=\"menu-item is-disabled\"><span>Mark unread</span><span class=\"shortcut\">U</span></span>",
-            "<span class=\"menu-item is-disabled\"><span>Remind me</span><span class=\"shortcut\">›</span></span>",
-            "<span class=\"menu-item is-disabled\">Turn off notifications for replies</span>",
-            "<div class=\"menu-divider\"></div>",
-            "<a class=\"menu-item\" href=\"{}\"><span>Copy link</span><span class=\"shortcut\">L</span></a>",
-            "<a class=\"menu-item\" href=\"{}\"><span>Copy message</span><span class=\"shortcut\">Ctrl+C</span></a>",
-            "<a class=\"menu-item\" href=\"{}\">{}</a>",
-            "<div class=\"menu-divider\"></div>",
-            "<span class=\"menu-item is-disabled\"><span>Organise</span><span class=\"shortcut\">›</span></span>",
-            "<span class=\"menu-item is-disabled\"><span>Connect to apps</span><span class=\"shortcut\">›</span></span>",
-            "<div class=\"menu-divider\"></div>",
-            "<span class=\"menu-item is-disabled is-danger\"><span>Delete message...</span><span class=\"shortcut\">Delete</span></span>",
-            "</div>",
-            "</details>"
-        ),
-        escape_html(&copy_link_action_url(channel_id, message)),
-        escape_html(&copy_message_action_url(channel_id, message)),
-        save_url,
-        if message.is_starred.unwrap_or(false) {
-            "Remove from saved items"
-        } else {
-            "Save for later"
-        }
     )
 }
 
@@ -1776,7 +1971,7 @@ fn normalized_user_group_label(label: &str) -> String {
 }
 
 fn user_group_member_title(members: &[String]) -> String {
-    format!("Members: {}", members.join(", "))
+    gettext("Members: {members}").replace("{members}", &members.join(", "))
 }
 
 fn slack_special_entity_html(raw: &str) -> String {
@@ -1945,6 +2140,155 @@ mod tests {
         }
     }
 
+    fn contrast_ratio(foreground: &str, background: &str) -> f64 {
+        fn luminance(color: &str) -> f64 {
+            let channel = |offset| {
+                let value =
+                    u8::from_str_radix(&color[offset..offset + 2], 16).unwrap() as f64 / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5)
+        }
+
+        let foreground = luminance(foreground);
+        let background = luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
+    #[test]
+    fn normalizes_posix_locales_to_escaped_bcp_47_language_tags() {
+        assert_eq!(normalize_language_tag("nl_NL.UTF-8"), Some("nl-NL".into()));
+        assert_eq!(
+            normalize_language_tag("sr_RS@latin"),
+            Some("sr-Latn-RS".into())
+        );
+        assert_eq!(
+            normalize_language_tag("sr_RS@cyrillic"),
+            Some("sr-Cyrl-RS".into())
+        );
+        assert_eq!(
+            normalize_language_tag("sr_Latn_RS@latin"),
+            Some("sr-Latn-RS".into())
+        );
+        assert_eq!(
+            normalize_language_tag("sr_Latn_RS@cyrillic"),
+            Some("sr-Latn-RS".into())
+        );
+        assert_eq!(normalize_language_tag("C"), None);
+        assert_eq!(normalize_language_tag("POSIX"), None);
+        assert_eq!(normalize_language_tag("en\"><script>"), None);
+
+        let html = html_document_with_language(
+            "Messages",
+            "<main></main>",
+            None,
+            "en\"><script>alert(1)</script>",
+        );
+        assert!(html.contains(
+            "<html lang=\"en&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\" dir=\"ltr\">"
+        ));
+        assert!(!html.contains("<html lang=\"en\"><script>"));
+    }
+
+    #[test]
+    fn document_root_direction_follows_the_normalized_primary_language() {
+        for language in ["ar", "ar-EG", "he-IL"] {
+            let html = html_document_with_language("Title", "<main></main>", None, language);
+            assert!(
+                html.contains(&format!("<html lang=\"{language}\" dir=\"rtl\">")),
+                "{language}"
+            );
+        }
+
+        let html = html_document_with_language("Title", "<main></main>", None, "en-GB");
+        assert!(html.contains("<html lang=\"en-GB\" dir=\"ltr\">"));
+    }
+
+    #[test]
+    fn document_root_direction_prefers_explicit_script_subtags() {
+        for language in [
+            "az-Arab", "ku-Arab", "pa-Arab", "en-Hebr", "ff-Adlm", "sd-Syrc", "dv-Thaa",
+            "rhg-Rohg", "nqo-Nkoo",
+        ] {
+            assert_eq!(document_direction(language), "rtl", "{language}");
+        }
+
+        for language in ["ar-Latn", "he-Latn", "az-Latn", "ku-Cyrl"] {
+            assert_eq!(document_direction(language), "ltr", "{language}");
+        }
+    }
+
+    #[test]
+    fn placeholder_document_preserves_and_escapes_prelocalized_inputs() {
+        let html = placeholder_document("Titel & meer", "Runtime <error> & details");
+
+        assert!(html.contains("<title>Titel &amp; meer</title>"));
+        assert!(html.contains("Runtime &lt;error&gt; &amp; details"));
+    }
+
+    #[test]
+    fn document_css_supports_touch_keyboard_motion_and_logical_layout() {
+        let html = placeholder_document("Messages", "No messages");
+
+        assert!(html.contains("--accent: #0061c9"));
+        assert!(html.contains("--accent: #78aeff"));
+        assert!(html.contains("flex-wrap: wrap"));
+        assert!(html.contains("opacity: 1"));
+        assert!(html.contains("@media (hover: hover) and (pointer: fine)"));
+        assert!(html.contains(":focus-visible"));
+        assert!(html.contains("@media (prefers-reduced-motion: reduce)"));
+        assert!(html.contains("padding-inline:"));
+        assert!(html.contains(".quick-actions {\n  position: static;"));
+        let fine_pointer_css = html
+            .split("@media (hover: hover) and (pointer: fine)")
+            .nth(1)
+            .unwrap()
+            .split("@media (prefers-reduced-motion: reduce)")
+            .next()
+            .unwrap();
+        assert!(!fine_pointer_css.contains("position: absolute"));
+        assert!(!fine_pointer_css.contains("inset-"));
+        assert!(fine_pointer_css.contains("grid-template-columns: minmax(0, 1fr) auto"));
+        assert!(fine_pointer_css.contains(".message > :not(.quick-actions)"));
+        assert!(fine_pointer_css.contains("grid-column: 1"));
+        assert!(fine_pointer_css.contains("grid-row: 1"));
+        assert!(fine_pointer_css.contains("grid-column: 2"));
+        assert!(fine_pointer_css.contains("align-self: start"));
+        for physical_property in [
+            "padding-right:",
+            "padding-left:",
+            "margin-right:",
+            "margin-left:",
+            "right:",
+            "left:",
+        ] {
+            assert!(!html.contains(physical_property), "{physical_property}");
+        }
+    }
+
+    #[test]
+    fn document_color_variables_meet_wcag_aa_for_normal_text() {
+        for (foreground, background) in [
+            ("#202124", "#fafafa"),
+            ("#6a6f76", "#fafafa"),
+            ("#0061c9", "#fafafa"),
+            ("#0061c9", "#e5f1ff"),
+            ("#f2f2f2", "#1d1f20"),
+            ("#b6babf", "#1d1f20"),
+            ("#78aeff", "#1d1f20"),
+            ("#78aeff", "#183653"),
+        ] {
+            assert!(
+                contrast_ratio(foreground, background) >= 4.5,
+                "{foreground} on {background}"
+            );
+        }
+    }
+
     #[test]
     fn escapes_message_text_and_author() {
         let mut message = message("hello <script>alert(1)</script> & goodbye");
@@ -2042,6 +2386,16 @@ mod tests {
     }
 
     #[test]
+    fn formats_timestamp_text_for_the_active_locale_and_keeps_iso_machine_time() {
+        let (machine, full, short) = localized_timestamp_parts("1710000000.000100").unwrap();
+
+        assert!(machine.contains('T'));
+        assert!(!full.trim().is_empty());
+        assert!(!short.trim().is_empty());
+        assert!(localized_timestamp_parts("invalid").is_none());
+    }
+
+    #[test]
     fn conversation_messages_include_stable_scroll_anchors() {
         let html = conversation_document(
             "C123",
@@ -2049,7 +2403,10 @@ mod tests {
             &MessageHtmlContext::default(),
         );
 
-        assert!(html.contains("data-message-ts=\"1710000000.000100\""));
+        assert!(html.contains(
+            "id=\"message-1710000000.000100\" tabindex=\"-1\" data-message-ts=\"1710000000.000100\""
+        ));
+        assert!(html.contains("<div class=\"body\" dir=\"auto\">"));
     }
 
     #[test]
@@ -2206,7 +2563,19 @@ mod tests {
         assert!(html.contains("conduit://save?channel=C123&amp;ts=1710000000.000100&amp;add=false"));
         assert!(html.contains("conduit://copy-link?channel=C123&amp;ts=1710000000.000100"));
         assert!(html.contains("conduit://copy-message?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains("More actions"));
+        assert!(html.contains("aria-label=\"Copy message\""));
+        for unavailable_action in [
+            "More actions",
+            "Edit message",
+            "Mark unread",
+            "Remind me",
+            "Turn off notifications",
+            "Organise",
+            "Connect to apps",
+            "Delete message",
+        ] {
+            assert!(!html.contains(unavailable_action), "{unavailable_action}");
+        }
         assert!(!html.contains("Remove +1"));
     }
 
@@ -2348,7 +2717,9 @@ mod tests {
 
         let html = activity_document(&items);
 
-        assert!(html.contains("aria-label=\"Activity\""));
+        assert!(html.contains("<main class=\"timeline\" aria-labelledby=\"document-title\">"));
+        assert!(html.contains("<ul class=\"activity-list\"><li>"));
+        assert!(html.contains("class=\"activity-title\" dir=\"auto\""));
         assert!(html.contains("#general &amp; friends"));
         assert!(html.contains("3 unread"));
         assert!(html.contains("Channel"));
@@ -2375,7 +2746,9 @@ mod tests {
 
         let html = files_document(&files);
 
-        assert!(html.contains("aria-label=\"Files\""));
+        assert!(html.contains("<main class=\"timeline\" aria-labelledby=\"document-title\">"));
+        assert!(html.contains("<ul class=\"file-list\"><li>"));
+        assert!(html.contains("class=\"file-title\" dir=\"auto\""));
         assert!(html.contains("Quarterly &lt;plan&gt;.pdf"));
         assert!(html.contains("PDF - 1.0 MB"));
         assert!(html.contains("href=\"https://slack.example/files/F123\""));
@@ -2404,5 +2777,30 @@ mod tests {
         assert!(html.contains("result"));
         assert!(!html.contains("javascript:alert"));
         assert!(!html.contains("Open in Slack"));
+    }
+
+    #[test]
+    fn search_and_saved_documents_use_semantic_message_lists_and_time() {
+        let results = vec![SearchMatch {
+            username: Some("Ada".to_string()),
+            text: Some("A result".to_string()),
+            ts: Some("1710000000.000100".to_string()),
+            ..Default::default()
+        }];
+        let search = search_results_document(&results, &MessageHtmlContext::default());
+        assert!(search.contains("<ol class=\"message-list\"><li class=\"message-list-item\">"));
+        assert!(search.contains("<time class=\"metadata\""));
+        assert!(search.contains("id=\"message-1710000000.000100\" tabindex=\"-1\""));
+
+        let saved = saved_items_document(
+            &[SavedItem {
+                channel: Some("C123".to_string()),
+                message: Some(message("saved")),
+                ..Default::default()
+            }],
+            &MessageHtmlContext::default(),
+        );
+        assert!(saved.contains("<ol class=\"message-list\"><li class=\"message-list-item\">"));
+        assert!(saved.contains("<time class=\"metadata\""));
     }
 }

@@ -25,6 +25,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
+use gettextrs::gettext;
 use gtk::{gio, glib};
 use webkit6::prelude::*;
 
@@ -468,6 +469,39 @@ fn connected_workspace_status(workspace_name: Option<&str>) -> String {
     format!("Connected to {}", workspace_name.unwrap_or("Slack"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaceholderSurface {
+    Messages,
+    SearchResults,
+    Files,
+    SavedItems,
+}
+
+impl PlaceholderSurface {
+    fn title(self) -> String {
+        match self {
+            Self::Messages => gettext("Messages"),
+            Self::SearchResults => gettext("Search results"),
+            Self::Files => gettext("Files"),
+            Self::SavedItems => gettext("Later"),
+        }
+    }
+
+    fn error_message(self, error: &str) -> String {
+        let template = match self {
+            Self::Messages => gettext("Could not load messages. Try again. {error}"),
+            Self::SearchResults => gettext("Could not load search results. Try again. {error}"),
+            Self::Files => gettext("Could not load files. Try again. {error}"),
+            Self::SavedItems => gettext("Could not load saved items. Try again. {error}"),
+        };
+        template.replace("{error}", error)
+    }
+}
+
+fn localized_replies_error(error: &str) -> String {
+    gettext("Could not load replies. Try again. {error}").replace("{error}", error)
+}
+
 fn sidebar_user_name_update_needs_render(
     conversations: &[SlackConversation],
     user_id: &str,
@@ -713,10 +747,10 @@ impl ConduitWindow {
         self.imp().thread_view_box.append(&thread_view);
         *self.imp().thread_view.borrow_mut() = Some(thread_view);
 
-        self.show_message_placeholder("Select a conversation");
+        self.show_message_placeholder(&gettext("Select a conversation"));
         self.load_thread_html(&message_html::placeholder_document(
-            "Thread",
-            "No thread open",
+            &gettext("Thread"),
+            &gettext("No thread open"),
         ));
     }
 
@@ -1329,9 +1363,10 @@ impl ConduitWindow {
             let title = self.conversation_title(&channel_id);
             self.select_conversation(&channel_id, &title);
         } else {
+            let title = gettext("Select a conversation");
             self.imp().workspace_view.borrow_mut().show_placeholder();
-            self.imp().message_title.set_title("Select a conversation");
-            self.show_message_placeholder("Select a conversation");
+            self.imp().message_title.set_title(&title);
+            self.show_message_placeholder(&title);
             self.render_closed_thread();
             self.render_conversations();
         }
@@ -1347,26 +1382,28 @@ impl ConduitWindow {
     }
 
     fn show_files(&self) {
+        let title = gettext("Files");
         self.imp().workspace_view.borrow_mut().start_files();
         self.render_closed_thread();
-        self.imp().message_title.set_title("Files");
+        self.imp().message_title.set_title(&title);
         self.render_conversations();
         self.load_message_html(&message_html::placeholder_document(
-            "Files",
-            "Loading files",
+            &title,
+            &gettext("Loading files"),
         ));
         self.send_command(RuntimeCommand::LoadFiles);
         self.imp().workspace_split.set_show_content(true);
     }
 
     fn show_later(&self) {
+        let title = gettext("Later");
         self.imp().workspace_view.borrow_mut().start_saved();
-        self.imp().message_title.set_title("Later");
+        self.imp().message_title.set_title(&title);
         self.render_closed_thread();
         self.render_conversations();
         self.load_message_html(&message_html::placeholder_document(
-            "Later",
-            "Loading saved items",
+            &title,
+            &gettext("Loading saved items"),
         ));
         self.send_command(RuntimeCommand::LoadSavedItems);
         self.imp().workspace_split.set_show_content(true);
@@ -1379,12 +1416,13 @@ impl ConduitWindow {
             return;
         }
         self.imp().workspace_view.borrow_mut().start_search();
+        let title = gettext("Search results");
         self.render_closed_thread();
         self.render_conversations();
-        self.imp().message_title.set_title("Search results");
+        self.imp().message_title.set_title(&title);
         self.load_message_html(&message_html::placeholder_document(
-            "Search results",
-            "Searching",
+            &title,
+            &gettext("Searching"),
         ));
         self.send_command(RuntimeCommand::SearchMessages { query });
         self.imp().workspace_split.set_show_content(true);
@@ -1512,8 +1550,8 @@ impl ConduitWindow {
         set_text_view_text(&imp.thread_entry, "");
         imp.thread_split.set_show_sidebar(false);
         self.load_thread_html(&message_html::placeholder_document(
-            "Thread",
-            "No thread open",
+            &gettext("Thread"),
+            &gettext("No thread open"),
         ));
     }
 
@@ -1828,17 +1866,17 @@ impl ConduitWindow {
         imp.sidebar_filter_entry.set_text("");
         imp.sidebar_unread_filter_button.set_active(false);
         imp.sidebar_all_filter_button.set_active(false);
-        imp.workspace_title_label.set_title("Workspace");
+        imp.workspace_title_label.set_title(&gettext("Workspace"));
         imp.workspace_status_label.set_label("");
         imp.message_status_label.set_label("");
         imp.workspace_split.set_show_content(false);
         imp.thread_split.set_show_sidebar(false);
         self.sync_workspace_chrome();
         self.clear_list(&imp.conversation_list);
-        self.show_message_placeholder("Select a conversation");
+        self.show_message_placeholder(&gettext("Select a conversation"));
         self.load_thread_html(&message_html::placeholder_document(
-            "Thread",
-            "No thread open",
+            &gettext("Thread"),
+            &gettext("No thread open"),
         ));
     }
 
@@ -1897,7 +1935,7 @@ impl ConduitWindow {
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
-                        self.show_main_surface_error("Messages", "messages", error);
+                        self.show_main_surface_error(PlaceholderSurface::Messages, error);
                     }
                 }
             }
@@ -1922,7 +1960,7 @@ impl ConduitWindow {
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
-                        self.show_main_surface_error("Search results", "search results", error);
+                        self.show_main_surface_error(PlaceholderSurface::SearchResults, error);
                     }
                 }
             }
@@ -1931,7 +1969,7 @@ impl ConduitWindow {
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
-                        self.show_main_surface_error("Files", "files", error);
+                        self.show_main_surface_error(PlaceholderSurface::Files, error);
                     }
                 }
             }
@@ -1940,7 +1978,7 @@ impl ConduitWindow {
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
-                        self.show_main_surface_error("Later", "saved items", error);
+                        self.show_main_surface_error(PlaceholderSurface::SavedItems, error);
                     }
                 }
             }
@@ -2013,17 +2051,19 @@ impl ConduitWindow {
         )
     }
 
-    fn show_main_surface_error(&self, title: &str, surface: &str, error: &str) {
-        let message = format!("Could not load {surface}. Try again. {error}");
-        self.load_message_html(&message_html::placeholder_document(title, &message));
+    fn show_main_surface_error(&self, surface: PlaceholderSurface, error: &str) {
+        let title = surface.title();
+        let message = surface.error_message(error);
+        self.load_message_html(&message_html::placeholder_document(&title, &message));
     }
 
     fn show_thread_error(&self, error: &str) {
         let imp = self.imp();
-        imp.thread_title.set_title("Thread");
+        let title = gettext("Thread");
+        imp.thread_title.set_title(&title);
         imp.thread_split.set_show_sidebar(true);
-        let message = format!("Could not load replies. Try again. {error}");
-        self.load_thread_html(&message_html::placeholder_document("Thread", &message));
+        let message = localized_replies_error(error);
+        self.load_thread_html(&message_html::placeholder_document(&title, &message));
     }
 
     fn mark_image_asset_failed(&self, key: &str) {
@@ -2486,8 +2526,8 @@ impl ConduitWindow {
         imp.thread_split.set_show_sidebar(false);
         imp.workspace_split.set_show_content(true);
         self.load_thread_html(&message_html::placeholder_document(
-            "Thread",
-            "No thread open",
+            &gettext("Thread"),
+            &gettext("No thread open"),
         ));
         self.render_conversations();
 
@@ -2512,8 +2552,8 @@ impl ConduitWindow {
             }
             ConversationSelectionDecision::RequestFresh => {
                 self.load_message_html(&message_html::placeholder_document(
-                    "Messages",
-                    "Loading messages",
+                    &gettext("Messages"),
+                    &gettext("Loading messages"),
                 ));
                 self.send_command(RuntimeCommand::LoadHistory {
                     channel_id: channel_id.to_string(),
@@ -2521,8 +2561,8 @@ impl ConduitWindow {
             }
             ConversationSelectionDecision::AwaitFresh => {
                 self.load_message_html(&message_html::placeholder_document(
-                    "Messages",
-                    "Loading messages",
+                    &gettext("Messages"),
+                    &gettext("Loading messages"),
                 ));
             }
         }
@@ -2608,11 +2648,15 @@ impl ConduitWindow {
         scroll_behavior: TimelineScrollBehavior,
     ) {
         let imp = self.imp();
-        imp.thread_title.set_title("Thread");
+        let title = gettext("Thread");
+        imp.thread_title.set_title(&title);
         imp.thread_split.set_show_sidebar(true);
 
         if messages.is_empty() {
-            self.load_thread_html(&message_html::placeholder_document("Thread", "No replies"));
+            self.load_thread_html(&message_html::placeholder_document(
+                &title,
+                &gettext("No replies"),
+            ));
             return;
         }
 
@@ -2627,28 +2671,28 @@ impl ConduitWindow {
 
     fn populate_activity(&self, items: Vec<ActivityItem>) {
         let imp = self.imp();
-        imp.message_title.set_title("Activity");
+        imp.message_title.set_title(&gettext("Activity"));
         self.render_conversations();
         self.load_message_html(&message_html::activity_document(&items));
     }
 
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
         let imp = self.imp();
-        imp.message_title.set_title("Search results");
+        imp.message_title.set_title(&gettext("Search results"));
         let context = self.message_html_context(None);
         self.load_message_html(&message_html::search_results_document(&results, &context));
     }
 
     fn populate_files(&self, files: Vec<SlackFile>) {
         let imp = self.imp();
-        imp.message_title.set_title("Files");
+        imp.message_title.set_title(&gettext("Files"));
         self.render_conversations();
         self.load_message_html(&message_html::files_document(&files));
     }
 
     fn populate_saved_items(&self, items: Vec<SavedItem>) {
         let imp = self.imp();
-        imp.message_title.set_title("Later");
+        imp.message_title.set_title(&gettext("Later"));
         let saved_messages = items
             .iter()
             .filter_map(|item| item.message.as_ref())
@@ -2868,7 +2912,10 @@ impl ConduitWindow {
     }
 
     fn show_message_placeholder(&self, text: &str) {
-        self.load_message_html(&message_html::placeholder_document("Messages", text));
+        self.load_message_html(&message_html::placeholder_document(
+            &gettext("Messages"),
+            text,
+        ));
     }
 
     fn load_message_html(&self, html: &str) {
@@ -3418,6 +3465,40 @@ mod tests {
             "Connected to Signicat"
         );
         assert_eq!(connected_workspace_status(None), "Connected to Slack");
+    }
+
+    #[test]
+    fn localized_placeholder_error_templates_are_complete_per_surface() {
+        for (surface, title, expected) in [
+            (
+                PlaceholderSurface::Messages,
+                "Messages",
+                "Could not load messages. Try again. token <expired>",
+            ),
+            (
+                PlaceholderSurface::SearchResults,
+                "Search results",
+                "Could not load search results. Try again. token <expired>",
+            ),
+            (
+                PlaceholderSurface::Files,
+                "Files",
+                "Could not load files. Try again. token <expired>",
+            ),
+            (
+                PlaceholderSurface::SavedItems,
+                "Later",
+                "Could not load saved items. Try again. token <expired>",
+            ),
+        ] {
+            assert_eq!(surface.title(), title);
+            assert_eq!(surface.error_message("token <expired>"), expected);
+        }
+
+        assert_eq!(
+            localized_replies_error("request failed"),
+            "Could not load replies. Try again. request failed"
+        );
     }
 
     #[test]

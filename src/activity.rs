@@ -1,6 +1,8 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
+use gettextrs::{gettext, ngettext};
+
 use crate::models::SlackConversation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,13 +15,13 @@ pub enum ActivityKind {
 }
 
 impl ActivityKind {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::DirectMessage => "Direct message",
-            Self::GroupDirectMessage => "Group DM",
-            Self::PrivateChannel => "Private channel",
-            Self::PublicChannel => "Channel",
-            Self::Unknown => "Conversation",
+            Self::DirectMessage => gettext("Direct message"),
+            Self::GroupDirectMessage => gettext("Group DM"),
+            Self::PrivateChannel => gettext("Private channel"),
+            Self::PublicChannel => gettext("Channel"),
+            Self::Unknown => gettext("Conversation"),
         }
     }
 
@@ -46,10 +48,14 @@ pub struct ActivityItem {
 impl ActivityItem {
     pub fn unread_label(&self) -> String {
         match self.unread_count {
-            0 if self.unread => "Unread activity".to_string(),
-            0 => "No unread activity".to_string(),
-            1 => "1 unread".to_string(),
-            count => format!("{count} unread"),
+            0 if self.unread => gettext("Unread activity"),
+            0 => gettext("No unread activity"),
+            count => ngettext(
+                "1 unread",
+                "{count} unread",
+                count.min(u32::MAX.into()) as u32,
+            )
+            .replace("{count}", &count.to_string()),
         }
     }
 }
