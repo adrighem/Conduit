@@ -1,0 +1,14 @@
+# Architecture and Usability Modernization Plan
+
+## Phase 1: Architecture and UX modernization
+
+- [~] Task: Serialize workspace cache updates and add concurrent-write coverage
+- [ ] Task: Add runtime session/request identity and stale-response guards
+- [ ] Task: Make runtime work concurrent and GTK event delivery event-driven
+- [ ] Task: Extract authoritative workspace view state and pure transitions
+- [ ] Task: Add operation-scoped runtime errors and local UI recovery
+- [ ] Task: Build an adaptive, accessible shell with clear navigation state
+- [ ] Task: Modernize semantic message HTML/CSS and localization
+- [ ] Task: Complete notification, unread-surface, search-navigation, and draft UX
+- [ ] Task: Run full regression validation and synchronize architecture documentation
+- [ ] Task: Conductor - User Manual Verification 'Architecture and UX modernization' (Protocol in workflow.md)

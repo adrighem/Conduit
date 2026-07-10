@@ -31,3 +31,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [~] Track: Desktop notifications for notify-worthy messages
 *Link: [./conductor/tracks/desktop_notifications_20260707/](./conductor/tracks/desktop_notifications_20260707/)*
+
+---
+
+## [~] Track: Architecture and usability modernization
+*Link: [./conductor/tracks/architecture_ux_20260710/](./conductor/tracks/architecture_ux_20260710/)*
