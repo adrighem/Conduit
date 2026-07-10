@@ -2,8 +2,8 @@
 
 ## Phase 1: Architecture and UX modernization
 
-- [~] Task: Serialize workspace cache updates and add concurrent-write coverage
-- [ ] Task: Add runtime session/request identity and stale-response guards
+- [x] Task: Serialize workspace cache updates and add concurrent-write coverage 5cfb369
+- [~] Task: Add runtime session/request identity and stale-response guards
 - [ ] Task: Make runtime work concurrent and GTK event delivery event-driven
 - [ ] Task: Extract authoritative workspace view state and pure transitions
 - [ ] Task: Add operation-scoped runtime errors and local UI recovery
