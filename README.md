@@ -6,7 +6,7 @@
 
 Conduit is a lightweight GNOME desktop client for Slack written in Rust with GTK4, libadwaita, and WebKitGTK.
 
-The current implementation is an early development slice. It includes a native UI shell with a GTK sidebar for workspace navigation, Slack OAuth with PKCE for desktop user-token authentication, secure token storage through the system keyring, and read/write Slack Web API plumbing for conversations, history, threads, search, saved items, messages, and file uploads.
+The current implementation is an early development slice. It includes a native UI shell with a GTK sidebar for workspace navigation, Slack OAuth with PKCE for desktop user-token authentication, secure token storage through the system keyring, optional Socket Mode realtime ingestion, and read/write Slack Web API plumbing for conversations, history, threads, search, saved items, messages, and file uploads.
 
 ## Building
 
@@ -41,6 +41,15 @@ export CONDUIT_SLACK_USER_AGENT="Mozilla/5.0 ..."
 
 The Slack MCP variable names `SLACK_MCP_XOXC_TOKEN`, `SLACK_MCP_XOXD_TOKEN`, and `SLACK_MCP_USER_AGENT` are accepted as aliases. These values are browser-session credentials; keep them secret and unset them after import if you do not want Conduit to re-import them after signing out.
 
+Optional realtime sync uses Slack Socket Mode. Enable Socket Mode in the Slack app settings, create an app-level token with `connections:write`, subscribe the app to the message and reaction events you want Conduit to receive, then start Conduit with:
+
+```sh
+export CONDUIT_SLACK_APP_TOKEN=xapp-...
+# SLACK_APP_TOKEN is also accepted.
+```
+
+Socket Mode starts after the workspace is authenticated and stops on sign-out. If Slack has Socket Mode disabled or temporarily disconnects the link, Conduit keeps retrying with capped backoff and reconnects automatically once the app is enabled again. Conduit currently reduces message create/edit/delete events, reaction add/remove events, and conversation membership/name/archive events. Other Socket Mode envelopes are acknowledged and ignored.
+
 To open the workspace connection flow explicitly, start Conduit with `--connect` or `-c`. This does not remove the current stored token; the token is replaced only after a new Slack authorization succeeds.
 
 To debug rendering and Slack loading, add `--debug` or `-d`. This prints message rendering, emoji, image preview, and full Slack conversation property diagnostics to stderr. Conversation diagnostics can include private workspace metadata such as channel names, user IDs, read timestamps, and unread counts. To debug only OAuth setup, add `--debug-auth`; `--debug` includes those OAuth diagnostics too. The logs do not include access tokens or authorization codes.
@@ -73,7 +82,7 @@ Implemented:
 - PKCE OAuth callback flow on localhost.
 - Keyring-backed token storage.
 - Background Tokio runtime for Slack network work.
-- Native sidebar conversation navigation with muted/external indicators, Activity, recent files, cached conversations and recent histories, paged channel and thread history, read-marker updates, search, saved items, multiline message posting, emoji reactions, edited/deleted message rendering, Block Kit action deep links, and file upload.
+- Native sidebar conversation navigation with muted/external indicators, Activity, recent files, cached conversations and recent histories, paged channel and thread history, read-marker updates, optional Socket Mode realtime message/reaction updates, search, saved items, multiline message posting, emoji reactions, edited/deleted message rendering, Block Kit action deep links, and file upload.
 
 Next:
 
@@ -83,6 +92,6 @@ Next:
 - Search result tabs, people/channel directories, file pagination, and richer file previews.
 - Native summaries for additional Slack product references where APIs are stable.
 - Slack-wide mention, reply, and reaction aggregation for Activity.
-- Optional Socket Mode realtime sync.
+- Broader Socket Mode reducers for user/profile updates, read markers, and richer Activity aggregation.
 - Presence cache.
 - Flatpak dependency vendoring and Flathub-grade screenshots.

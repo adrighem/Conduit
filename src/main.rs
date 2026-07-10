@@ -32,6 +32,7 @@ mod shortcuts;
 mod sidebar;
 mod sidebar_widgets;
 mod slack;
+mod socket_mode;
 mod store;
 mod window;
 

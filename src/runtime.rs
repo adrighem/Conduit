@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -19,10 +20,13 @@ use crate::models::{
     SlackUserGroup, StoredToken,
 };
 use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
+use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent};
 use crate::store::WorkspaceStore;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
 const UNREAD_STATE_PRIORITY_REFRESH_LIMIT: usize = 30;
+const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
@@ -155,6 +159,7 @@ pub enum RuntimeEvent {
         saved: bool,
         thread_ts: Option<String>,
     },
+    SocketModeEvent(SocketModeEvent),
     FileUploadProgress {
         fraction: f64,
         label: String,
@@ -252,6 +257,7 @@ impl AppRuntime {
             let mut workspace_store: Option<WorkspaceStore> = None;
             let mut user_cache = HashMap::new();
             let mut read_marks = HashMap::new();
+            let mut socket_mode: Option<tokio::task::JoinHandle<()>> = None;
 
             while let Ok(command) = receiver.recv() {
                 let mut context = RuntimeContext {
@@ -263,6 +269,7 @@ impl AppRuntime {
                     workspace_store: &mut workspace_store,
                     user_cache: &mut user_cache,
                     read_marks: &mut read_marks,
+                    socket_mode: &mut socket_mode,
                 };
                 let result = runtime.block_on(handle_command(command, &mut context));
                 if let Err(error) = result {
@@ -288,6 +295,7 @@ struct RuntimeContext<'a> {
     workspace_store: &'a mut Option<WorkspaceStore>,
     user_cache: &'a mut HashMap<String, String>,
     read_marks: &'a mut HashMap<String, String>,
+    socket_mode: &'a mut Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,6 +483,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             load_workspace_after_auth(context, &auth).await?;
         }
         RuntimeCommand::SignOut => {
+            stop_socket_mode(context);
             context.token_store.clear()?;
             *context.slack = None;
             *context.workspace_store = None;
@@ -749,9 +758,95 @@ async fn load_workspace_after_auth(
         conversation_refresh_mode(),
         ConversationRefreshMode::Background
     );
+    start_socket_mode(context);
     spawn_conversation_refresh(context)?;
     spawn_user_group_refresh(context)?;
     Ok(())
+}
+
+fn start_socket_mode(context: &mut RuntimeContext<'_>) {
+    stop_socket_mode(context);
+
+    let Some(app_token) = config::slack_app_token() else {
+        crate::debug::log("socket", "SocketModeDisabled reason=missing_app_token");
+        return;
+    };
+
+    crate::debug::log("socket", "SocketModeStarting");
+    let events = context.events.clone();
+    let handle = tokio::spawn(run_socket_mode(app_token, events));
+    *context.socket_mode = Some(handle);
+}
+
+fn stop_socket_mode(context: &mut RuntimeContext<'_>) {
+    if let Some(handle) = context.socket_mode.take() {
+        handle.abort();
+        crate::debug::log("socket", "SocketModeStopped");
+    }
+}
+
+async fn run_socket_mode(app_token: String, events: Sender<RuntimeEvent>) {
+    let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
+
+    loop {
+        let events_for_run = events.clone();
+        let result = socket_mode::run_once(&app_token, move |event| {
+            events_for_run.send_event(RuntimeEvent::SocketModeEvent(event));
+        })
+        .await;
+
+        let timing = match result {
+            Ok(SocketModeDisconnect::LinkDisabled) => {
+                crate::debug::log(
+                    "socket",
+                    "SocketModeDisconnected reason=link_disabled; retrying until enabled",
+                );
+                socket_mode_reconnect_timing(
+                    reconnect_delay,
+                    Some(SocketModeDisconnect::LinkDisabled),
+                )
+            }
+            Ok(disconnect) => {
+                crate::debug::log(
+                    "socket",
+                    &format!("SocketModeDisconnected reason={disconnect:?}"),
+                );
+                socket_mode_reconnect_timing(reconnect_delay, Some(disconnect))
+            }
+            Err(error) => {
+                crate::debug::log("socket", &format!("SocketModeError error={error:#}"));
+                socket_mode_reconnect_timing(reconnect_delay, None)
+            }
+        };
+
+        reconnect_delay = timing.next_backoff;
+        tokio::time::sleep(timing.sleep).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketModeReconnectTiming {
+    sleep: Duration,
+    next_backoff: Duration,
+}
+
+fn socket_mode_reconnect_timing(
+    current: Duration,
+    disconnect: Option<SocketModeDisconnect>,
+) -> SocketModeReconnectTiming {
+    if matches!(disconnect, None | Some(SocketModeDisconnect::LinkDisabled)) {
+        return SocketModeReconnectTiming {
+            sleep: current,
+            next_backoff: current
+                .saturating_mul(2)
+                .min(SOCKET_MODE_MAX_RECONNECT_DELAY),
+        };
+    }
+
+    SocketModeReconnectTiming {
+        sleep: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
+        next_backoff: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
+    }
 }
 
 fn spawn_conversation_refresh(context: &RuntimeContext<'_>) -> Result<()> {
@@ -1471,6 +1566,54 @@ mod tests {
         assert_eq!(
             conversation_refresh_mode(),
             ConversationRefreshMode::Background
+        );
+    }
+
+    #[test]
+    fn socket_mode_reconnect_timing_backs_off_and_resets_after_socket_disconnects() {
+        assert_eq!(
+            socket_mode_reconnect_timing(SOCKET_MODE_INITIAL_RECONNECT_DELAY, None),
+            SocketModeReconnectTiming {
+                sleep: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
+                next_backoff: Duration::from_secs(2),
+            }
+        );
+        assert_eq!(
+            socket_mode_reconnect_timing(Duration::from_secs(20), None),
+            SocketModeReconnectTiming {
+                sleep: Duration::from_secs(20),
+                next_backoff: SOCKET_MODE_MAX_RECONNECT_DELAY,
+            }
+        );
+        assert_eq!(
+            socket_mode_reconnect_timing(
+                SOCKET_MODE_MAX_RECONNECT_DELAY,
+                Some(SocketModeDisconnect::LinkDisabled),
+            ),
+            SocketModeReconnectTiming {
+                sleep: SOCKET_MODE_MAX_RECONNECT_DELAY,
+                next_backoff: SOCKET_MODE_MAX_RECONNECT_DELAY,
+            }
+        );
+        assert_eq!(
+            socket_mode_reconnect_timing(
+                SOCKET_MODE_MAX_RECONNECT_DELAY,
+                Some(SocketModeDisconnect::RefreshRequested),
+            ),
+            SocketModeReconnectTiming {
+                sleep: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
+                next_backoff: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
+            }
+        );
+        assert_eq!(
+            socket_mode_reconnect_timing(
+                Duration::from_secs(20),
+                Some(SocketModeDisconnect::Warning),
+            ),
+            SocketModeReconnectTiming {
+                sleep: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
+                next_backoff: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
+            }
         );
     }
 

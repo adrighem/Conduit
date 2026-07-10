@@ -49,6 +49,10 @@ pub fn slack_user_agent() -> Option<String> {
     env_value("CONDUIT_SLACK_USER_AGENT").or_else(|| env_value("SLACK_MCP_USER_AGENT"))
 }
 
+pub fn slack_app_token() -> Option<String> {
+    env_value("CONDUIT_SLACK_APP_TOKEN").or_else(|| env_value("SLACK_APP_TOKEN"))
+}
+
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()

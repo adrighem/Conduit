@@ -334,7 +334,7 @@ fn cleared_unread_value(value: &Value) -> Value {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackFile {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -443,7 +443,7 @@ fn file_size_label(size: u64) -> String {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackMessage {
     #[serde(rename = "type")]
     pub kind: Option<String>,
@@ -503,13 +503,13 @@ impl SlackMessage {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackMessageEdit {
     pub user: Option<String>,
     pub ts: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackReaction {
     pub name: Option<String>,
     pub count: Option<u64>,

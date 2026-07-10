@@ -45,6 +45,9 @@ use crate::runtime::{AppRuntime, RuntimeCommand, RuntimeEvent};
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{self, SidebarRowModel, SidebarSectionModel};
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
+use crate::socket_mode::{
+    self, SocketModeEvent, SocketModeMessageEvent, SocketModeMessageKind, SocketModeReactionEvent,
+};
 
 mod imp {
     use super::*;
@@ -433,6 +436,40 @@ fn increment_thread_parent_reply_count(
     parent.reply_count = Some(parent.reply_count.unwrap_or_default().saturating_add(1));
 
     Some(updated_messages)
+}
+
+fn merge_realtime_message(existing: &[SlackMessage], message: &SlackMessage) -> Vec<SlackMessage> {
+    let mut messages = existing
+        .iter()
+        .filter(|existing_message| existing_message.ts != message.ts)
+        .cloned()
+        .collect::<Vec<_>>();
+    messages.push(message.clone());
+    messages.sort_by(|left, right| right.ts.cmp(&left.ts));
+    messages
+}
+
+fn realtime_message_marks_unread(
+    reading_channel: Option<&str>,
+    current_user_id: Option<&str>,
+    event: &SocketModeMessageEvent,
+) -> bool {
+    event.kind == SocketModeMessageKind::Posted
+        && reading_channel != Some(event.channel_id.as_str())
+        && event
+            .message
+            .user
+            .as_deref()
+            .is_none_or(|user| Some(user) != current_user_id)
+}
+
+fn apply_reaction_update_to_messages(
+    messages: &mut [SlackMessage],
+    event: &SocketModeReactionEvent,
+) -> bool {
+    messages
+        .iter_mut()
+        .any(|message| socket_mode::apply_reaction_update(message, event))
 }
 
 fn conversation_history_selection_action(
@@ -896,6 +933,7 @@ impl ConduitWindow {
             RuntimeEvent::SearchLoaded(results) => self.populate_search_results(results),
             RuntimeEvent::FilesLoaded(files) => self.populate_files(files),
             RuntimeEvent::SavedItemsLoaded(items) => self.populate_saved_items(items),
+            RuntimeEvent::SocketModeEvent(event) => self.handle_socket_mode_event(event),
             RuntimeEvent::UserLoaded {
                 user_id,
                 display_name,
@@ -1805,6 +1843,23 @@ impl ConduitWindow {
         }
     }
 
+    fn mark_conversation_locally_unread(&self, channel_id: &str) -> bool {
+        let mut conversations = self.imp().conversations.borrow_mut();
+        let Some(conversation) = conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == channel_id)
+        else {
+            return false;
+        };
+
+        let unread_count = conversation.unread_activity_count().saturating_add(1);
+        conversation.unread_count = Some(unread_count);
+        conversation
+            .extra
+            .insert("has_unreads".to_string(), serde_json::json!(true));
+        true
+    }
+
     fn set_channel_history_cursor(
         &self,
         channel_id: &str,
@@ -2321,6 +2376,121 @@ impl ConduitWindow {
         self.request_image_assets(saved_messages);
         let context = self.message_html_context(None);
         self.load_message_html(&message_html::saved_items_document(&items, &context));
+    }
+
+    fn handle_socket_mode_event(&self, event: SocketModeEvent) {
+        match event {
+            SocketModeEvent::Message(event) => self.apply_socket_message(*event),
+            SocketModeEvent::Reaction(event) => self.apply_socket_reaction(event),
+            SocketModeEvent::RefreshConversations => self.refresh_conversations(),
+        }
+    }
+
+    fn apply_socket_message(&self, event: SocketModeMessageEvent) {
+        let channel_id = event.channel_id.clone();
+        let message = event.message.clone();
+        let reading_channel = {
+            let imp = self.imp();
+            (imp.current_main_view.get() == MainMessageView::Conversation)
+                .then(|| imp.selected_channel.borrow().clone())
+                .flatten()
+        };
+        let current_user_id = self.imp().current_user_id.borrow().clone();
+
+        if realtime_message_marks_unread(
+            reading_channel.as_deref(),
+            current_user_id.as_deref(),
+            &event,
+        ) && !self.mark_conversation_locally_unread(&channel_id)
+        {
+            self.refresh_conversations();
+        }
+
+        {
+            let mut cache = self.imp().channel_message_cache.borrow_mut();
+            if let Some(messages) = cache.get(&channel_id).cloned() {
+                cache.insert(
+                    channel_id.clone(),
+                    merge_realtime_message(&messages, &message),
+                );
+            }
+        }
+
+        let selected_channel = self.selected_channel_id();
+        if selected_channel.as_deref() == Some(channel_id.as_str()) {
+            let current_messages = self.imp().current_channel_messages.borrow().clone();
+            if !current_messages.is_empty() {
+                let scroll_behavior = if event.kind == SocketModeMessageKind::Posted {
+                    TimelineScrollBehavior::StickToBottom
+                } else {
+                    TimelineScrollBehavior::Preserve
+                };
+                self.populate_history_with_scroll(
+                    &channel_id,
+                    merge_realtime_message(&current_messages, &message),
+                    scroll_behavior,
+                );
+            }
+        }
+
+        if let Some(thread_ts) = message
+            .thread_ts
+            .as_deref()
+            .filter(|thread_ts| *thread_ts != message.ts.as_str())
+        {
+            if self.selected_thread_ts().as_deref() == Some(thread_ts) {
+                let current_thread_messages = self.imp().current_thread_messages.borrow().clone();
+                if !current_thread_messages.is_empty() {
+                    let rendered_messages =
+                        merge_realtime_message(&current_thread_messages, &message);
+                    *self.imp().current_thread_messages.borrow_mut() = rendered_messages.clone();
+                    self.populate_thread(&channel_id, thread_ts, rendered_messages);
+                }
+            }
+        }
+
+        if event.kind == SocketModeMessageKind::Posted {
+            self.notify_if_new_messages(&channel_id, std::slice::from_ref(&message));
+        }
+        self.request_user_names(std::slice::from_ref(&message));
+        self.request_image_assets(std::iter::once(&message));
+
+        if self.imp().current_main_view.get() == MainMessageView::Activity {
+            self.populate_activity(self.activity_items());
+        } else {
+            self.render_conversations();
+        }
+    }
+
+    fn apply_socket_reaction(&self, event: SocketModeReactionEvent) {
+        let mut changed = false;
+
+        {
+            let mut cache = self.imp().channel_message_cache.borrow_mut();
+            if let Some(messages) = cache.get_mut(&event.channel_id) {
+                changed |= apply_reaction_update_to_messages(messages, &event);
+            }
+        }
+
+        let event_channel_selected =
+            self.selected_channel_id().as_deref() == Some(event.channel_id.as_str());
+        if event_channel_selected {
+            changed |= apply_reaction_update_to_messages(
+                &mut self.imp().current_channel_messages.borrow_mut(),
+                &event,
+            );
+        }
+
+        if event_channel_selected {
+            changed |= apply_reaction_update_to_messages(
+                &mut self.imp().current_thread_messages.borrow_mut(),
+                &event,
+            );
+        }
+
+        if changed {
+            self.rerender_current_messages();
+        }
     }
 
     fn notify_if_new_messages(&self, channel_id: &str, messages: &[SlackMessage]) {
@@ -2895,6 +3065,70 @@ mod tests {
         let parent = message("1710000300.000000", "parent");
 
         assert!(increment_thread_parent_reply_count(&[parent], "1710000200.000000").is_none());
+    }
+
+    #[test]
+    fn merge_realtime_message_replaces_existing_message() {
+        let existing = vec![
+            message("1710000300.000000", "new"),
+            message("1710000200.000000", "old"),
+        ];
+        let edited = message("1710000200.000000", "edited");
+
+        let merged = merge_realtime_message(&existing, &edited);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].ts, "1710000300.000000");
+        assert_eq!(merged[1].body_text(), "edited");
+    }
+
+    #[test]
+    fn realtime_messages_mark_unread_only_when_not_reading_or_self_sent() {
+        let event = SocketModeMessageEvent {
+            channel_id: "C123".to_string(),
+            kind: SocketModeMessageKind::Posted,
+            message: SlackMessage {
+                user: Some("U123".to_string()),
+                ts: "1710000300.000000".to_string(),
+                ..Default::default()
+            },
+        };
+        let changed = SocketModeMessageEvent {
+            kind: SocketModeMessageKind::Changed,
+            ..event.clone()
+        };
+
+        assert!(!realtime_message_marks_unread(
+            Some("C123"),
+            Some("U999"),
+            &event
+        ));
+        assert!(!realtime_message_marks_unread(None, Some("U123"), &event));
+        assert!(!realtime_message_marks_unread(None, Some("U999"), &changed));
+        assert!(realtime_message_marks_unread(
+            Some("C999"),
+            Some("U999"),
+            &event
+        ));
+    }
+
+    #[test]
+    fn reaction_update_helper_updates_loaded_messages() {
+        let mut messages = vec![message("1710000300.000000", "new")];
+        let event = SocketModeReactionEvent {
+            channel_id: "C123".to_string(),
+            ts: "1710000300.000000".to_string(),
+            name: "eyes".to_string(),
+            user_id: "U123".to_string(),
+            added: true,
+        };
+
+        assert!(apply_reaction_update_to_messages(&mut messages, &event));
+        assert_eq!(
+            messages[0].reactions.as_ref().unwrap()[0].name.as_deref(),
+            Some("eyes")
+        );
+        assert!(!apply_reaction_update_to_messages(&mut messages, &event));
     }
 
     #[test]
