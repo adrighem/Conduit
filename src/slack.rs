@@ -19,6 +19,7 @@ const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
 const MAX_RETRY_AFTER_SECONDS: u64 = 30;
 pub(crate) const CHANNEL_HISTORY_PAGE_LIMIT: usize = 30;
+pub(crate) const MESSAGE_CONTEXT_LIMIT: usize = 15;
 const UNREAD_STATE_HISTORY_LIMIT: usize = 1;
 const THREAD_HISTORY_PAGE_LIMIT: usize = 50;
 const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
@@ -117,6 +118,19 @@ impl SlackApi {
         ))
     }
 
+    pub async fn history_context(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> Result<SlackMessagePage> {
+        let params = message_context_request_params(channel_id, message_ts);
+        let response: HistoryResponse = self.post_form("conversations.history", &params).await?;
+        Ok(SlackMessagePage::from_response(
+            response,
+            std::convert::identity,
+        ))
+    }
+
     pub async fn unread_state(&self, channel_id: &str) -> Result<SlackUnreadState> {
         let mut last_read: Option<String> = None;
 
@@ -182,6 +196,20 @@ impl SlackApi {
             params.push(("cursor", cursor.to_string()));
         }
 
+        let response: HistoryResponse = self.post_form("conversations.replies", &params).await?;
+        Ok(SlackMessagePage::from_response(
+            response,
+            thread_replies_in_history_order,
+        ))
+    }
+
+    pub async fn thread_replies_context(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        message_ts: &str,
+    ) -> Result<SlackMessagePage> {
+        let params = thread_message_context_request_params(channel_id, thread_ts, message_ts);
         let response: HistoryResponse = self.post_form("conversations.replies", &params).await?;
         Ok(SlackMessagePage::from_response(
             response,
@@ -536,6 +564,28 @@ fn history_request_params(
     } else if include_unreads {
         params.push(("unreads", "true".to_string()));
     }
+    params
+}
+
+fn message_context_request_params(
+    channel_id: &str,
+    message_ts: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("channel", channel_id.to_string()),
+        ("latest", message_ts.to_string()),
+        ("inclusive", "true".to_string()),
+        ("limit", MESSAGE_CONTEXT_LIMIT.to_string()),
+    ]
+}
+
+fn thread_message_context_request_params(
+    channel_id: &str,
+    thread_ts: &str,
+    message_ts: &str,
+) -> Vec<(&'static str, String)> {
+    let mut params = message_context_request_params(channel_id, message_ts);
+    params.push(("ts", thread_ts.to_string()));
     params
 }
 
@@ -1019,6 +1069,31 @@ mod tests {
         )
         .iter()
         .any(|(key, _)| *key == "unreads"));
+    }
+
+    #[test]
+    fn message_context_requests_are_bounded_inclusive_and_targeted() {
+        let params = message_context_request_params("C123", "1710000000.000100");
+
+        assert_eq!(
+            params,
+            vec![
+                ("channel", "C123".to_string()),
+                ("latest", "1710000000.000100".to_string()),
+                ("inclusive", "true".to_string()),
+                ("limit", "15".to_string()),
+            ]
+        );
+
+        assert_eq!(
+            thread_message_context_request_params(
+                "C123",
+                "1709999999.000100",
+                "1710000000.000100",
+            )
+            .last(),
+            Some(&("ts", "1709999999.000100".to_string()))
+        );
     }
 
     #[test]

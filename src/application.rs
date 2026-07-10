@@ -21,11 +21,35 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gettextrs::gettext;
+use gtk::glib::variant::{StaticVariantType, ToVariant};
 use gtk::{gio, glib};
+use sha2::{Digest, Sha256};
 
 use crate::config::{self, VERSION};
 use crate::shortcuts::APP_SHORTCUTS;
 use crate::ConduitWindow;
+
+const OPEN_CONVERSATION_ACTION: &str = "app.open-conversation";
+
+fn conversation_notification_id(workspace_id: &str, channel_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(workspace_id.as_bytes());
+    digest.update([0]);
+    digest.update(channel_id.as_bytes());
+    format!("message:{:x}", digest.finalize())
+}
+
+fn conversation_target_variant(workspace_id: &str, channel_id: &str) -> glib::Variant {
+    (workspace_id, channel_id).to_variant()
+}
+
+fn conversation_target_from_variant(target: &glib::Variant) -> Option<(String, String)> {
+    let (workspace_id, channel_id) = target.get::<(String, String)>()?;
+    let workspace_id = workspace_id.trim();
+    let channel_id = channel_id.trim();
+    (!workspace_id.is_empty() && !channel_id.is_empty())
+        .then(|| (workspace_id.to_string(), channel_id.to_string()))
+}
 
 mod imp {
     use super::*;
@@ -71,6 +95,11 @@ mod imp {
             application.present_window(connect, debug_auth);
             0.into()
         }
+
+        fn shutdown(&self) {
+            self.obj().flush_active_window_drafts();
+            self.parent_shutdown();
+        }
     }
 
     impl GtkApplicationImpl for ConduitApplication {}
@@ -105,11 +134,23 @@ impl ConduitApplication {
         let about_action = gio::ActionEntry::builder("about")
             .activate(move |app: &Self, _, _| app.show_about())
             .build();
+        let open_conversation_action = gio::ActionEntry::builder("open-conversation")
+            .parameter_type(Some(<(String, String)>::static_variant_type().as_ref()))
+            .activate(move |app: &Self, _, target| {
+                let Some((workspace_id, channel_id)) =
+                    target.and_then(conversation_target_from_variant)
+                else {
+                    return;
+                };
+                app.present_conversation_target(workspace_id, channel_id);
+            })
+            .build();
         self.add_action_entries([
             quit_action,
             shortcuts_action,
             preferences_action,
             about_action,
+            open_conversation_action,
         ]);
         for shortcut in APP_SHORTCUTS {
             self.set_accels_for_action(shortcut.action, shortcut.accelerators);
@@ -159,6 +200,47 @@ impl ConduitApplication {
         }
 
         window.present();
+    }
+
+    fn flush_active_window_drafts(&self) {
+        if let Some(window) = self
+            .active_window()
+            .and_then(|window| window.downcast::<ConduitWindow>().ok())
+        {
+            window.flush_drafts();
+        }
+    }
+
+    fn present_conversation_target(&self, workspace_id: String, channel_id: String) {
+        self.present_window(false, false);
+        let Some(window) = self
+            .active_window()
+            .and_then(|window| window.downcast::<ConduitWindow>().ok())
+        else {
+            return;
+        };
+        window.open_notification_target(workspace_id, channel_id);
+    }
+
+    pub(crate) fn send_conversation_notification(
+        &self,
+        workspace_id: &str,
+        channel_id: &str,
+        title: &str,
+        body: &str,
+    ) {
+        let notification = gio::Notification::new(title);
+        notification.set_body(Some(body));
+        let target = conversation_target_variant(workspace_id, channel_id);
+        notification.set_default_action_and_target_value(OPEN_CONVERSATION_ACTION, Some(&target));
+        self.send_notification(
+            Some(&conversation_notification_id(workspace_id, channel_id)),
+            &notification,
+        );
+    }
+
+    pub(crate) fn withdraw_conversation_notification(&self, workspace_id: &str, channel_id: &str) {
+        self.withdraw_notification(&conversation_notification_id(workspace_id, channel_id));
     }
 
     fn configure_icon_theme(&self) {
@@ -231,5 +313,40 @@ impl ConduitApplication {
             .build();
 
         about.present(Some(&window));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_ids_are_stable_scoped_and_opaque() {
+        let id = conversation_notification_id("T123", "C123");
+
+        assert_eq!(id, conversation_notification_id("T123", "C123"));
+        assert_ne!(id, conversation_notification_id("T999", "C123"));
+        assert_ne!(id, conversation_notification_id("T123", "C999"));
+        assert!(id.starts_with("message:"));
+        assert!(!id.contains("T123"));
+        assert!(!id.contains("C123"));
+    }
+
+    #[test]
+    fn notification_action_targets_round_trip_and_reject_empty_parts() {
+        let target = conversation_target_variant("T123", "C123");
+        assert_eq!(
+            conversation_target_from_variant(&target),
+            Some(("T123".into(), "C123".into()))
+        );
+
+        assert_eq!(
+            conversation_target_from_variant(&conversation_target_variant("", "C123")),
+            None
+        );
+        assert_eq!(
+            conversation_target_from_variant(&conversation_target_variant("T123", "  ")),
+            None
+        );
     }
 }

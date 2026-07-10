@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist gettext-domain="conduit">
 	<schema id="eu.vanadrighem.conduit" path="/eu/vanadrighem/conduit/">
+		<key name="message-drafts" type="a{ss}">
+			<default>{}</default>
+			<summary>Saved message drafts</summary>
+			<description>Message drafts stored by workspace, conversation, and optional thread.</description>
+		</key>
 		<key name="sidebar-show-unreads-section" type="b">
 			<default>false</default>
 			<summary>Show the Unreads sidebar section</summary>

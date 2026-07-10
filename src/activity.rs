@@ -48,8 +48,8 @@ pub struct ActivityItem {
 impl ActivityItem {
     pub fn unread_label(&self) -> String {
         match self.unread_count {
-            0 if self.unread => gettext("Unread activity"),
-            0 => gettext("No unread activity"),
+            0 if self.unread => gettext("Unread conversation"),
+            0 => gettext("No unread conversation"),
             count => ngettext(
                 "1 unread",
                 "{count} unread",
@@ -108,7 +108,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activity_items_include_only_unread_conversations_and_sort_by_attention() {
+    fn unread_items_include_only_unread_conversations_and_sort_by_attention() {
         let public = SlackConversation {
             id: "C1".to_string(),
             name: Some("general".to_string()),
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_items_use_extra_unread_fields() {
+    fn unread_items_use_extra_unread_fields() {
         let mut conversation = SlackConversation {
             id: "G1".to_string(),
             name: Some("group".to_string()),
@@ -173,6 +173,6 @@ mod tests {
         assert_eq!(items[0].kind, ActivityKind::GroupDirectMessage);
         assert!(items[0].unread);
         assert_eq!(items[0].unread_count, 0);
-        assert_eq!(items[0].unread_label(), "Unread activity");
+        assert_eq!(items[0].unread_label(), "Unread conversation");
     }
 }

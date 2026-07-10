@@ -18,8 +18,8 @@ use crate::auth::{
 };
 use crate::config;
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
-    SlackUserGroup, StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
+    SlackMessage, SlackUnreadState, SlackUserGroup, StoredToken,
 };
 use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent};
@@ -66,6 +66,7 @@ pub enum RuntimeCommand {
         ts: String,
         cursor: String,
     },
+    LoadMessageContext(SearchMessageLocation),
     SearchMessages {
         query: String,
     },
@@ -200,6 +201,11 @@ impl RuntimeCommand {
             | Self::LoadFiles
             | Self::LoadSavedItems => Some(NavigationSlot::Main),
             Self::LoadThread { .. } | Self::LoadOlderThread { .. } => Some(NavigationSlot::Thread),
+            Self::LoadMessageContext(location) => Some(if location.thread_ts().is_some() {
+                NavigationSlot::Thread
+            } else {
+                NavigationSlot::Main
+            }),
             _ => None,
         }
     }
@@ -243,6 +249,7 @@ impl RuntimeCommand {
                     thread_ts: ts.clone(),
                 },
             ),
+            Self::LoadMessageContext(location) => message_context_operation_context(location),
             Self::SearchMessages { .. } => {
                 OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace)
             }
@@ -300,6 +307,26 @@ impl RuntimeCommand {
     }
 }
 
+fn message_context_operation_context(location: &SearchMessageLocation) -> OperationContext {
+    location.thread_ts().map_or_else(
+        || {
+            OperationContext::new(
+                RuntimeOperation::History,
+                RuntimeTarget::Channel(location.channel_id().to_string()),
+            )
+        },
+        |thread_ts| {
+            OperationContext::new(
+                RuntimeOperation::Thread,
+                RuntimeTarget::Thread {
+                    channel_id: location.channel_id().to_string(),
+                    thread_ts: thread_ts.to_string(),
+                },
+            )
+        },
+    )
+}
+
 #[derive(Debug)]
 pub enum RuntimeEventKind {
     Status(String),
@@ -332,6 +359,10 @@ pub enum RuntimeEventKind {
         has_more: bool,
         next_cursor: Option<String>,
         append_older: bool,
+    },
+    MessageContextLoaded {
+        location: SearchMessageLocation,
+        messages: Vec<SlackMessage>,
     },
     SearchLoaded(Vec<SearchMatch>),
     FilesLoaded(Vec<SlackFile>),
@@ -416,6 +447,9 @@ impl RuntimeEventKind {
                     thread_ts: ts.clone(),
                 },
             ),
+            Self::MessageContextLoaded { location, .. } => {
+                message_context_operation_context(location)
+            }
             Self::SearchLoaded(_) => {
                 OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace)
             }
@@ -1536,6 +1570,25 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .thread_replies_page(&channel_id, &ts, Some(&cursor))
                 .await?;
             send_thread_loaded(context.events, channel_id, ts, page, true);
+        }
+        RuntimeCommand::LoadMessageContext(location) => {
+            let api = require_slack(context.slack)?;
+            context.events.send_status("Loading message context");
+            let page = if let Some(thread_ts) = location.thread_ts() {
+                let page = api
+                    .thread_replies_context(location.channel_id(), thread_ts, location.message_ts())
+                    .await?;
+                page
+            } else {
+                api.history_context(location.channel_id(), location.message_ts())
+                    .await?
+            };
+            context
+                .events
+                .send_event(RuntimeEventKind::MessageContextLoaded {
+                    location,
+                    messages: page.messages,
+                });
         }
         RuntimeCommand::SearchMessages { query } => {
             let api = require_slack(context.slack)?;
@@ -2925,6 +2978,40 @@ mod tests {
                 },
             )
         );
+
+        let channel_context = RuntimeCommand::LoadMessageContext(
+            SearchMessageLocation::new("C123", "1710000000.000100", None).unwrap(),
+        );
+        assert_eq!(
+            channel_context.operation_context(),
+            OperationContext::new(
+                RuntimeOperation::History,
+                RuntimeTarget::Channel("C123".to_string()),
+            )
+        );
+        assert_eq!(
+            channel_context.navigation_slot(),
+            Some(NavigationSlot::Main)
+        );
+
+        let thread_context = RuntimeCommand::LoadMessageContext(
+            SearchMessageLocation::new("C123", "1710000001.000100", Some("1710000000.000100"))
+                .unwrap(),
+        );
+        assert_eq!(
+            thread_context.operation_context(),
+            OperationContext::new(
+                RuntimeOperation::Thread,
+                RuntimeTarget::Thread {
+                    channel_id: "C123".to_string(),
+                    thread_ts: "1710000000.000100".to_string(),
+                },
+            )
+        );
+        assert_eq!(
+            thread_context.navigation_slot(),
+            Some(NavigationSlot::Thread)
+        );
     }
 
     #[test]
@@ -2944,6 +3031,26 @@ mod tests {
             OperationContext::new(
                 RuntimeOperation::History,
                 RuntimeTarget::Channel("C123".to_string()),
+            )
+        );
+
+        let event = RuntimeEventKind::MessageContextLoaded {
+            location: SearchMessageLocation::new(
+                "C123",
+                "1710000001.000100",
+                Some("1710000000.000100"),
+            )
+            .unwrap(),
+            messages: Vec::new(),
+        };
+        assert_eq!(
+            event.operation_context(&fallback),
+            OperationContext::new(
+                RuntimeOperation::Thread,
+                RuntimeTarget::Thread {
+                    channel_id: "C123".into(),
+                    thread_ts: "1710000000.000100".into(),
+                },
             )
         );
     }

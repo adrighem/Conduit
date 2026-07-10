@@ -523,7 +523,57 @@ pub struct SearchMatch {
     pub username: Option<String>,
     pub text: Option<String>,
     pub ts: Option<String>,
+    pub thread_ts: Option<String>,
     pub permalink: Option<String>,
+}
+
+impl SearchMatch {
+    pub fn message_location(&self) -> Option<SearchMessageLocation> {
+        SearchMessageLocation::new(
+            self.channel.as_ref()?.id.as_deref()?,
+            self.ts.as_deref()?,
+            self.thread_ts.as_deref(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMessageLocation {
+    channel_id: String,
+    message_ts: String,
+    thread_ts: Option<String>,
+}
+
+impl SearchMessageLocation {
+    pub fn new(channel_id: &str, message_ts: &str, thread_ts: Option<&str>) -> Option<Self> {
+        let channel_id = channel_id.trim();
+        let message_ts = message_ts.trim();
+        if channel_id.is_empty() || message_ts.is_empty() {
+            return None;
+        }
+        let thread_ts = thread_ts
+            .map(str::trim)
+            .filter(|thread_ts| !thread_ts.is_empty() && *thread_ts != message_ts)
+            .map(ToString::to_string);
+
+        Some(Self {
+            channel_id: channel_id.to_string(),
+            message_ts: message_ts.to_string(),
+            thread_ts,
+        })
+    }
+
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    pub fn message_ts(&self) -> &str {
+        &self.message_ts
+    }
+
+    pub fn thread_ts(&self) -> Option<&str> {
+        self.thread_ts.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -849,5 +899,50 @@ mod tests {
         };
 
         assert_eq!(file.detail_label(), "PDF - 1.5 MB");
+    }
+
+    #[test]
+    fn search_message_location_requires_channel_and_timestamp() {
+        let result = SearchMatch {
+            channel: Some(SlackSearchChannel {
+                id: Some(" C123 ".to_string()),
+                name: Some("general".to_string()),
+            }),
+            ts: Some(" 1710000000.000100 ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            result.message_location(),
+            SearchMessageLocation::new("C123", "1710000000.000100", None)
+        );
+        assert!(SearchMatch::default().message_location().is_none());
+        assert!(SearchMatch {
+            channel: result.channel.clone(),
+            ts: Some("  ".to_string()),
+            ..Default::default()
+        }
+        .message_location()
+        .is_none());
+    }
+
+    #[test]
+    fn search_message_location_normalizes_thread_parents_and_replies() {
+        let reply: SearchMatch = serde_json::from_value(serde_json::json!({
+            "channel": { "id": "C123" },
+            "ts": "1710000001.000100",
+            "thread_ts": "1710000000.000100"
+        }))
+        .expect("search reply should parse");
+        assert_eq!(
+            reply.message_location().unwrap().thread_ts(),
+            Some("1710000000.000100")
+        );
+
+        let parent = SearchMatch {
+            thread_ts: Some("1710000001.000100".to_string()),
+            ..reply
+        };
+        assert_eq!(parent.message_location().unwrap().thread_ts(), None);
     }
 }

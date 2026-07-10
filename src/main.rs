@@ -24,6 +24,7 @@ mod auth;
 mod composer;
 mod config;
 mod debug;
+mod drafts;
 mod message_html;
 mod models;
 mod rendering;

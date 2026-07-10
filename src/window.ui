@@ -231,28 +231,28 @@
                                 <property name="homogeneous">True</property>
                                 <property name="spacing">6</property>
                                 <child>
-                                  <object class="GtkToggleButton" id="home_button">
-                                    <property name="icon-name">go-home-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Home</property>
+                                  <object class="GtkToggleButton" id="messages_button">
+                                    <property name="icon-name">view-list-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Messages</property>
                                   </object>
                                 </child>
                                 <child>
-                                  <object class="GtkToggleButton" id="activity_button">
-                                    <property name="group">home_button</property>
-                                    <property name="icon-name">emblem-important-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Activity</property>
+                                  <object class="GtkToggleButton" id="unreads_button">
+                                    <property name="group">messages_button</property>
+                                    <property name="icon-name">mail-unread-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Unreads</property>
                                   </object>
                                 </child>
                                 <child>
                                   <object class="GtkToggleButton" id="files_button">
-                                    <property name="group">home_button</property>
+                                    <property name="group">messages_button</property>
                                     <property name="icon-name">folder-documents-symbolic</property>
                                     <property name="tooltip-text" translatable="yes">Files</property>
                                   </object>
                                 </child>
                                 <child>
                                   <object class="GtkToggleButton" id="saved_button">
-                                    <property name="group">home_button</property>
+                                    <property name="group">messages_button</property>
                                     <property name="icon-name">starred-symbolic</property>
                                     <property name="tooltip-text" translatable="yes">Later</property>
                                   </object>

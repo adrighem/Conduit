@@ -29,13 +29,13 @@
         <property name="title" translatable="yes">Navigation</property>
         <child>
           <object class="GtkShortcutsShortcut">
-            <property name="title" translatable="yes" context="shortcut window">Home</property>
+            <property name="title" translatable="yes" context="shortcut window">Messages</property>
             <property name="accelerator">&lt;Control&gt;1</property>
           </object>
         </child>
         <child>
           <object class="GtkShortcutsShortcut">
-            <property name="title" translatable="yes" context="shortcut window">Activity</property>
+            <property name="title" translatable="yes" context="shortcut window">Unreads</property>
             <property name="accelerator">&lt;Control&gt;2</property>
           </object>
         </child>

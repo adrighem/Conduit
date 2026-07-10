@@ -4,7 +4,7 @@ use gettextrs::gettext;
 
 use crate::activity::ActivityItem;
 use crate::debug;
-use crate::models::{SavedItem, SearchMatch, SlackFile, SlackMessage};
+use crate::models::{SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage};
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
 const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
@@ -153,10 +153,20 @@ pub fn placeholder_document(title: &str, message: &str) -> String {
     )
 }
 
+#[cfg(test)]
 pub fn conversation_document(
     channel_id: &str,
     messages: &[SlackMessage],
     context: &MessageHtmlContext,
+) -> String {
+    conversation_document_with_focus(channel_id, messages, context, None)
+}
+
+pub fn conversation_document_with_focus(
+    channel_id: &str,
+    messages: &[SlackMessage],
+    context: &MessageHtmlContext,
+    focus_message_ts: Option<&str>,
 ) -> String {
     if messages.is_empty() {
         return placeholder_document(&gettext("Messages"), &gettext("No messages"));
@@ -175,8 +185,12 @@ pub fn conversation_document(
     );
 
     let title = gettext("Messages");
+    let focus_attribute = focus_message_ts
+        .filter(|message_ts| !message_ts.is_empty())
+        .map(|message_ts| format!(" data-focus-message-ts=\"{}\"", escape_html(message_ts)))
+        .unwrap_or_default();
     let mut body = format!(
-        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}",
+        "<main class=\"timeline\" aria-labelledby=\"document-title\"{focus_attribute}>{}",
         document_heading(&title)
     );
     if context.thread_ts.is_none() {
@@ -198,8 +212,15 @@ pub fn conversation_document(
     }
     body.push_str("</main>");
 
-    let scroll_script = timeline_scroll_script(channel_id, context.timeline_scroll);
-    html_document_with_script(&title, &body, scroll_script.as_deref())
+    let mut scripts = Vec::new();
+    if let Some(scroll_script) = timeline_scroll_script(channel_id, context.timeline_scroll) {
+        scripts.push(scroll_script);
+    }
+    if !focus_attribute.is_empty() {
+        scripts.push(message_focus_script().to_string());
+    }
+    let script = (!scripts.is_empty()).then(|| scripts.join("\n"));
+    html_document_with_script(&title, &body, script.as_deref())
 }
 
 pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -> String {
@@ -232,12 +253,12 @@ pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -
     html_document(&title, &body)
 }
 
-pub fn activity_document(items: &[ActivityItem]) -> String {
+pub fn unreads_document(items: &[ActivityItem]) -> String {
     if items.is_empty() {
-        return placeholder_document(&gettext("Activity"), &gettext("No unread activity"));
+        return placeholder_document(&gettext("Unreads"), &gettext("No unread conversations"));
     }
 
-    let title = gettext("Activity");
+    let title = gettext("Unreads");
     let mut body = format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ul class=\"activity-list\">",
         document_heading(&title)
@@ -976,6 +997,34 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
     ))
 }
 
+fn message_focus_script() -> &'static str {
+    r#"(function () {
+  function focusTarget() {
+    const timeline = document.querySelector("[data-focus-message-ts]");
+    if (!timeline) {
+      return;
+    }
+    const targetTs = timeline.dataset.focusMessageTs;
+    const target = Array.from(document.querySelectorAll("[data-message-ts]")).find(
+      function (element) { return element.dataset.messageTs === targetTs; }
+    );
+    if (!target) {
+      return;
+    }
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+    try {
+      target.focus({ preventScroll: true });
+    } catch (_) {
+      target.focus();
+    }
+  }
+
+  window.addEventListener("load", focusTarget, { once: true });
+  requestAnimationFrame(focusTarget);
+  requestAnimationFrame(function () { requestAnimationFrame(focusTarget); });
+})();"#
+}
+
 fn message_article(
     channel_id: Option<&str>,
     message: &SlackMessage,
@@ -1014,7 +1063,7 @@ fn activity_item_html(item: &ActivityItem) -> String {
             "<span class=\"activity-meta\">{}</span>",
             "</a></li>"
         ),
-        escape_html(&activity_open_action_url(&item.channel_id)),
+        escape_html(&unreads_open_action_url(&item.channel_id)),
         escape_html(&item.title),
         escape_html(&item.unread_label()),
         escape_html(&item.kind.label())
@@ -1179,12 +1228,25 @@ fn search_result_article(result: &SearchMatch, context: &MessageHtmlContext) -> 
         mrkdwn_to_html(text, context)
     );
 
+    let mut actions = String::new();
+    if let Some(location) = result.message_location() {
+        actions.push_str(&format!(
+            "<a class=\"external-action\" href=\"{}\">{}</a>",
+            escape_html(&message_context_action_url(&location)),
+            escape_html(&gettext("Open in Conduit"))
+        ));
+    }
     if let Some(permalink) = result.permalink.as_deref().filter(|url| is_http_url(url)) {
-        article.push_str(&format!(
-            "<nav class=\"external-actions\" aria-label=\"{}\"><a class=\"external-action\" href=\"{}\" rel=\"noreferrer noopener\">{}</a></nav>",
-            escape_html(&gettext("Message actions")),
+        actions.push_str(&format!(
+            "<a class=\"external-action\" href=\"{}\" rel=\"noreferrer noopener\">{}</a>",
             escape_html(permalink),
             escape_html(&gettext("Open in Slack"))
+        ));
+    }
+    if !actions.is_empty() {
+        article.push_str(&format!(
+            "<nav class=\"external-actions\" aria-label=\"{}\">{actions}</nav>",
+            escape_html(&gettext("Message actions")),
         ));
     }
 
@@ -1754,11 +1816,21 @@ pub fn load_more_action_url(channel_id: &str, cursor: &str, thread_ts: Option<&s
     url
 }
 
-pub fn activity_open_action_url(channel_id: &str) -> String {
+pub fn unreads_open_action_url(channel_id: &str) -> String {
     format!(
-        "conduit://activity-open?channel={}",
+        "conduit://unreads-open?channel={}",
         encode_query(channel_id)
     )
+}
+
+pub fn message_context_action_url(location: &SearchMessageLocation) -> String {
+    let mut url = format!(
+        "conduit://message?channel={}&ts={}",
+        encode_query(location.channel_id()),
+        encode_query(location.message_ts())
+    );
+    append_thread_ts_query(&mut url, location.thread_ts());
+    url
 }
 
 fn append_thread_ts_query(url: &mut String, thread_ts: Option<&str>) {
@@ -2706,7 +2778,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_document_renders_unread_rows() {
+    fn unreads_document_renders_rows() {
         let items = vec![ActivityItem {
             channel_id: "C123".to_string(),
             title: "#general & friends".to_string(),
@@ -2715,7 +2787,7 @@ mod tests {
             unread_count: 3,
         }];
 
-        let html = activity_document(&items);
+        let html = unreads_document(&items);
 
         assert!(html.contains("<main class=\"timeline\" aria-labelledby=\"document-title\">"));
         assert!(html.contains("<ul class=\"activity-list\"><li>"));
@@ -2723,14 +2795,14 @@ mod tests {
         assert!(html.contains("#general &amp; friends"));
         assert!(html.contains("3 unread"));
         assert!(html.contains("Channel"));
-        assert!(html.contains("conduit://activity-open?channel=C123"));
+        assert!(html.contains("conduit://unreads-open?channel=C123"));
     }
 
     #[test]
-    fn activity_document_uses_empty_state_without_rows() {
-        let html = activity_document(&[]);
+    fn unreads_document_uses_empty_state_without_rows() {
+        let html = unreads_document(&[]);
 
-        assert!(html.contains("No unread activity"));
+        assert!(html.contains("No unread conversations"));
         assert!(!html.contains("<a class=\"activity-row\""));
     }
 
@@ -2777,6 +2849,65 @@ mod tests {
         assert!(html.contains("result"));
         assert!(!html.contains("javascript:alert"));
         assert!(!html.contains("Open in Slack"));
+    }
+
+    #[test]
+    fn search_results_link_to_valid_internal_message_locations() {
+        let results = vec![SearchMatch {
+            channel: Some(crate::models::SlackSearchChannel {
+                id: Some("C 123".to_string()),
+                name: Some("general".to_string()),
+            }),
+            ts: Some("1710000001.000100".to_string()),
+            thread_ts: Some("1710000000.000100".to_string()),
+            permalink: Some("https://example.slack.com/archives/C123/p1".to_string()),
+            ..Default::default()
+        }];
+
+        let html = search_results_document(&results, &MessageHtmlContext::default());
+
+        assert!(html.contains("Open in Conduit"));
+        assert!(html.contains(
+            "conduit://message?channel=C%20123&amp;ts=1710000001.000100&amp;thread_ts=1710000000.000100"
+        ));
+        assert!(html.contains("Open in Slack"));
+    }
+
+    #[test]
+    fn search_results_omit_internal_link_without_a_complete_location() {
+        let html = search_results_document(
+            &[SearchMatch {
+                ts: Some("1710000001.000100".to_string()),
+                permalink: Some("https://example.slack.com/archives/C123/p1".to_string()),
+                ..Default::default()
+            }],
+            &MessageHtmlContext::default(),
+        );
+
+        assert!(!html.contains("Open in Conduit"));
+        assert!(html.contains("Open in Slack"));
+    }
+
+    #[test]
+    fn focused_conversation_document_escapes_target_and_uses_static_script() {
+        let target = "1710000000.000100\"</script><script>alert(1)</script>";
+        let html = conversation_document_with_focus(
+            "C123",
+            &[SlackMessage {
+                ts: target.to_string(),
+                text: Some("focused".to_string()),
+                ..Default::default()
+            }],
+            &MessageHtmlContext::default(),
+            Some(target),
+        );
+
+        assert!(html.contains("data-focus-message-ts="));
+        assert!(html.contains("&quot;&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("const targetTs = \"1710000000"));
+        assert!(html.contains("timeline.dataset.focusMessageTs"));
+        assert!(html.contains("target.scrollIntoView"));
+        assert!(html.contains("target.focus"));
     }
 
     #[test]

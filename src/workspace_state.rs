@@ -12,14 +12,16 @@
 
 use std::collections::HashMap;
 
-use crate::models::{SavedItem, SearchMatch, SlackFile, SlackMessage, SlackReaction};
+use crate::models::{
+    SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage, SlackReaction,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum MainMessageView {
     #[default]
     Placeholder,
     Conversation,
-    Activity,
+    Unreads,
     Search,
     Files,
     Saved,
@@ -93,7 +95,7 @@ pub(crate) struct RealtimeMessageOutcome {
     pub(crate) channel_changed: bool,
     pub(crate) render_channel: bool,
     pub(crate) render_thread: bool,
-    pub(crate) refresh_activity: bool,
+    pub(crate) refresh_unreads: bool,
     pub(crate) channel_scroll: Option<WorkspaceScrollBehavior>,
 }
 
@@ -128,10 +130,12 @@ pub(crate) struct WorkspaceSnapshot {
 #[derive(Debug, Clone, Default)]
 struct ChannelHistoryState {
     messages: Vec<SlackMessage>,
+    context_messages: Option<Vec<SlackMessage>>,
     next_cursor: Option<String>,
     loading: bool,
     loaded: bool,
     force_bottom: bool,
+    focus_ts: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,9 +143,11 @@ struct ThreadViewState {
     channel_id: String,
     ts: String,
     messages: Vec<SlackMessage>,
+    context_messages: Option<Vec<SlackMessage>>,
     next_cursor: Option<String>,
     loading: bool,
     loaded: bool,
+    focus_ts: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,15 +186,39 @@ impl WorkspaceViewState {
     pub(crate) fn channel_messages(&self, channel_id: &str) -> &[SlackMessage] {
         self.channels
             .get(channel_id)
-            .map(|history| history.messages.as_slice())
+            .map(|history| {
+                history
+                    .context_messages
+                    .as_deref()
+                    .unwrap_or(&history.messages)
+            })
             .unwrap_or_default()
     }
 
     pub(crate) fn current_thread_messages(&self) -> &[SlackMessage] {
         self.thread
             .as_ref()
-            .map(|thread| thread.messages.as_slice())
+            .map(|thread| {
+                thread
+                    .context_messages
+                    .as_deref()
+                    .unwrap_or(&thread.messages)
+            })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn has_channel_context(&self, channel_id: &str) -> bool {
+        self.channels
+            .get(channel_id)
+            .is_some_and(|history| history.context_messages.is_some())
+    }
+
+    pub(crate) fn has_thread_context(&self, channel_id: &str, thread_ts: &str) -> bool {
+        self.thread.as_ref().is_some_and(|thread| {
+            thread.channel_id == channel_id
+                && thread.ts == thread_ts
+                && thread.context_messages.is_some()
+        })
     }
 
     pub(crate) fn search_results(&self) -> &[SearchMatch] {
@@ -229,7 +259,6 @@ impl WorkspaceViewState {
             .as_ref()
             .map(|thread| (Some(thread.ts.clone()), thread.messages.clone()))
             .unwrap_or_default();
-
         WorkspaceSnapshot {
             channel_id,
             thread_ts,
@@ -250,8 +279,8 @@ impl WorkspaceViewState {
         self.navigate_to(MainMessageView::Placeholder);
     }
 
-    pub(crate) fn show_activity(&mut self) {
-        self.navigate_to(MainMessageView::Activity);
+    pub(crate) fn show_unreads(&mut self) {
+        self.navigate_to(MainMessageView::Unreads);
     }
 
     pub(crate) fn show_search(&mut self) {
@@ -305,6 +334,12 @@ impl WorkspaceViewState {
     pub(crate) fn select_conversation(&mut self, channel_id: &str) -> ConversationSelectionOutcome {
         let was_visible = self.visible_channel_id() == Some(channel_id);
         let changing_channel = self.last_channel_id.as_deref() != Some(channel_id);
+        if let Some(previous_channel_id) = self.last_channel_id.as_deref() {
+            if let Some(history) = self.channels.get_mut(previous_channel_id) {
+                history.focus_ts = None;
+                history.context_messages = None;
+            }
+        }
         self.thread = None;
 
         if !was_visible {
@@ -321,6 +356,8 @@ impl WorkspaceViewState {
         self.main_view = MainMessageView::Conversation;
 
         let history = self.channels.entry(channel_id.to_string()).or_default();
+        history.focus_ts = None;
+        history.context_messages = None;
         let decision = if was_visible && history.loaded {
             ConversationSelectionDecision::RenderCurrent
         } else if history.loaded && history.loading {
@@ -390,6 +427,7 @@ impl WorkspaceViewState {
         if !cached {
             history.next_cursor = usable_cursor(has_more, next_cursor);
             history.loading = false;
+            history.context_messages = None;
         }
 
         let visible = self.visible_channel_id() == Some(channel_id);
@@ -422,6 +460,8 @@ impl WorkspaceViewState {
 
         if let Some(thread) = &mut self.thread {
             if thread.channel_id == channel_id && thread.ts == ts {
+                thread.focus_ts = None;
+                thread.context_messages = None;
                 return if thread.loaded {
                     ThreadOpenOutcome::RenderCurrent
                 } else if thread.loading {
@@ -437,9 +477,11 @@ impl WorkspaceViewState {
             channel_id: channel_id.to_string(),
             ts: ts.to_string(),
             messages: Vec::new(),
+            context_messages: None,
             next_cursor: None,
             loading: true,
             loaded: false,
+            focus_ts: None,
         });
         ThreadOpenOutcome::RequestFresh
     }
@@ -475,6 +517,118 @@ impl WorkspaceViewState {
 
     pub(crate) fn close_thread(&mut self) -> bool {
         self.thread.take().is_some()
+    }
+
+    pub(crate) fn focus_message(&mut self, location: &SearchMessageLocation) -> bool {
+        if self.visible_channel_id() != Some(location.channel_id()) {
+            return false;
+        }
+
+        if let Some(thread_ts) = location.thread_ts() {
+            let Some(thread) = &mut self.thread else {
+                return false;
+            };
+            if thread.channel_id != location.channel_id() || thread.ts != thread_ts {
+                return false;
+            }
+            thread.focus_ts = Some(location.message_ts().to_string());
+        } else {
+            let Some(history) = self.channels.get_mut(location.channel_id()) else {
+                return false;
+            };
+            history.focus_ts = Some(location.message_ts().to_string());
+        }
+        true
+    }
+
+    pub(crate) fn apply_message_context(
+        &mut self,
+        location: &SearchMessageLocation,
+        messages: Vec<SlackMessage>,
+    ) -> bool {
+        if !messages
+            .iter()
+            .any(|message| message.ts == location.message_ts())
+        {
+            return false;
+        }
+
+        if let Some(thread_ts) = location.thread_ts() {
+            let Some(thread) = &mut self.thread else {
+                return false;
+            };
+            if thread.channel_id != location.channel_id()
+                || thread.ts != thread_ts
+                || thread.focus_ts.as_deref() != Some(location.message_ts())
+            {
+                return false;
+            }
+            thread.context_messages = Some(normalize_messages(messages));
+            thread.loading = false;
+            return true;
+        }
+
+        if self.visible_channel_id() != Some(location.channel_id()) {
+            return false;
+        }
+        let Some(history) = self.channels.get_mut(location.channel_id()) else {
+            return false;
+        };
+        if history.focus_ts.as_deref() != Some(location.message_ts()) {
+            return false;
+        }
+        history.context_messages = Some(normalize_messages(messages));
+        history.loading = false;
+        true
+    }
+
+    pub(crate) fn take_channel_focus_for_render(
+        &mut self,
+        channel_id: &str,
+        messages: &[SlackMessage],
+    ) -> Option<String> {
+        if self.visible_channel_id() != Some(channel_id) {
+            return None;
+        }
+        let history = self.channels.get_mut(channel_id)?;
+        let focus_ts = history.focus_ts.as_deref()?;
+        messages
+            .iter()
+            .any(|message| message.ts == focus_ts)
+            .then(|| history.focus_ts.take())
+            .flatten()
+    }
+
+    pub(crate) fn take_thread_focus_for_render(
+        &mut self,
+        channel_id: &str,
+        thread_ts: &str,
+        messages: &[SlackMessage],
+    ) -> Option<String> {
+        let thread = self.thread.as_mut()?;
+        if thread.channel_id != channel_id || thread.ts != thread_ts {
+            return None;
+        }
+        let focus_ts = thread.focus_ts.as_deref()?;
+        messages
+            .iter()
+            .any(|message| message.ts == focus_ts)
+            .then(|| thread.focus_ts.take())
+            .flatten()
+    }
+
+    #[cfg(test)]
+    fn channel_focus_ts(&self, channel_id: &str) -> Option<&str> {
+        self.channels
+            .get(channel_id)
+            .and_then(|history| history.focus_ts.as_deref())
+    }
+
+    #[cfg(test)]
+    fn thread_focus_ts(&self) -> Option<&str> {
+        self.thread
+            .as_ref()
+            .and_then(|thread| thread.focus_ts.as_deref())
     }
 
     pub(crate) fn fail_search(&mut self) -> WorkspaceFailureOutcome {
@@ -524,6 +678,7 @@ impl WorkspaceViewState {
             normalize_messages(messages)
         };
         thread.loaded = true;
+        thread.context_messages = None;
         thread.next_cursor = usable_cursor(has_more, next_cursor);
         thread.loading = false;
         ThreadApplyOutcome::Applied {
@@ -563,15 +718,23 @@ impl WorkspaceViewState {
         kind: RealtimeMessageKind,
     ) -> RealtimeMessageOutcome {
         let visible = self.visible_channel_id() == Some(channel_id);
-        let channel_changed = self
-            .channels
-            .get_mut(channel_id)
-            .filter(|history| history.loaded)
-            .map(|history| {
+        let channel_changed = self.channels.get_mut(channel_id).is_some_and(|history| {
+            let base_changed = if history.loaded {
                 history.messages = merge_realtime_message(&history.messages, &message);
                 true
-            })
-            .unwrap_or(false);
+            } else {
+                false
+            };
+            let context_changed = history
+                .context_messages
+                .as_mut()
+                .filter(|messages| messages.iter().any(|item| item.ts == message.ts))
+                .is_some_and(|messages| {
+                    *messages = merge_realtime_message(messages, &message);
+                    true
+                });
+            base_changed || context_changed
+        });
         let render_channel = visible && channel_changed;
 
         let render_thread = self
@@ -581,19 +744,30 @@ impl WorkspaceViewState {
                 thread.channel_id == channel_id
                     && message.thread_ts.as_deref() == Some(thread.ts.as_str())
                     && message.ts != thread.ts
-                    && thread.loaded
             })
-            .map(|thread| {
-                thread.messages = merge_realtime_message(&thread.messages, &message);
-                true
-            })
-            .unwrap_or(false);
+            .is_some_and(|thread| {
+                let base_changed = if thread.loaded {
+                    thread.messages = merge_realtime_message(&thread.messages, &message);
+                    true
+                } else {
+                    false
+                };
+                let context_changed = thread
+                    .context_messages
+                    .as_mut()
+                    .filter(|messages| messages.iter().any(|item| item.ts == message.ts))
+                    .is_some_and(|messages| {
+                        *messages = merge_realtime_message(messages, &message);
+                        true
+                    });
+                base_changed || context_changed
+            });
 
         RealtimeMessageOutcome {
             channel_changed,
             render_channel,
             render_thread,
-            refresh_activity: self.main_view == MainMessageView::Activity,
+            refresh_unreads: self.main_view == MainMessageView::Unreads,
             channel_scroll: render_channel.then_some(if kind == RealtimeMessageKind::Posted {
                 WorkspaceScrollBehavior::StickToBottom
             } else {
@@ -606,12 +780,26 @@ impl WorkspaceViewState {
         let channel_changed = self
             .channels
             .get_mut(&update.channel_id)
-            .is_some_and(|history| apply_reaction_to_messages(&mut history.messages, update));
+            .is_some_and(|history| {
+                let messages_changed = apply_reaction_to_messages(&mut history.messages, update);
+                let context_changed = history
+                    .context_messages
+                    .as_mut()
+                    .is_some_and(|messages| apply_reaction_to_messages(messages, update));
+                messages_changed || context_changed
+            });
         let thread_changed = self
             .thread
             .as_mut()
             .filter(|thread| thread.channel_id == update.channel_id)
-            .is_some_and(|thread| apply_reaction_to_messages(&mut thread.messages, update));
+            .is_some_and(|thread| {
+                let messages_changed = apply_reaction_to_messages(&mut thread.messages, update);
+                let context_changed = thread
+                    .context_messages
+                    .as_mut()
+                    .is_some_and(|messages| apply_reaction_to_messages(messages, update));
+                messages_changed || context_changed
+            });
         let visible = self.visible_channel_id() == Some(update.channel_id.as_str());
 
         ReactionUpdateOutcome {
@@ -624,12 +812,26 @@ impl WorkspaceViewState {
     pub(crate) fn find_message(&self, channel_id: &str, ts: &str) -> Option<SlackMessage> {
         self.channels
             .get(channel_id)
-            .and_then(|history| history.messages.iter().find(|message| message.ts == ts))
+            .and_then(|history| {
+                history
+                    .context_messages
+                    .as_deref()
+                    .unwrap_or(&history.messages)
+                    .iter()
+                    .find(|message| message.ts == ts)
+            })
             .or_else(|| {
                 self.thread
                     .as_ref()
                     .filter(|thread| thread.channel_id == channel_id)
-                    .and_then(|thread| thread.messages.iter().find(|message| message.ts == ts))
+                    .and_then(|thread| {
+                        thread
+                            .context_messages
+                            .as_deref()
+                            .unwrap_or(&thread.messages)
+                            .iter()
+                            .find(|message| message.ts == ts)
+                    })
             })
             .or_else(|| {
                 self.saved_items
@@ -643,6 +845,12 @@ impl WorkspaceViewState {
 
     fn navigate_to(&mut self, view: MainMessageView) {
         self.clear_current_view_loading();
+        if let Some(channel_id) = self.visible_channel_id().map(ToString::to_string) {
+            if let Some(history) = self.channels.get_mut(&channel_id) {
+                history.focus_ts = None;
+                history.context_messages = None;
+            }
+        }
         self.main_view = view;
         self.thread = None;
     }
@@ -659,7 +867,7 @@ impl WorkspaceViewState {
             MainMessageView::Search => self.search_loading = false,
             MainMessageView::Files => self.files_loading = false,
             MainMessageView::Saved => self.saved_loading = false,
-            MainMessageView::Placeholder | MainMessageView::Activity => {}
+            MainMessageView::Placeholder | MainMessageView::Unreads => {}
         }
     }
 
@@ -891,7 +1099,7 @@ mod tests {
         assert!(cached_refresh.decision.requests_history());
         assert_eq!(cached_refresh.scroll, Some(WorkspaceScrollBehavior::Bottom));
 
-        state.show_activity();
+        state.show_unreads();
         let cached_again = state.select_conversation("C1");
         assert_eq!(
             cached_again.decision,
@@ -923,7 +1131,7 @@ mod tests {
             state.select_conversation("C1").decision,
             ConversationSelectionDecision::RenderCurrent
         );
-        state.show_activity();
+        state.show_unreads();
         assert_eq!(
             state.select_conversation("C1").decision,
             ConversationSelectionDecision::RenderCachedAndRefresh
@@ -946,7 +1154,7 @@ mod tests {
             ConversationSelectionDecision::RequestFresh
         );
 
-        state.show_activity();
+        state.show_unreads();
         assert_eq!(
             state.select_conversation("C1").decision,
             ConversationSelectionDecision::RequestFresh
@@ -1087,7 +1295,7 @@ mod tests {
             Some("preserved")
         );
         search.start_search();
-        search.show_activity();
+        search.show_unreads();
         assert_eq!(
             search.fail_search(),
             WorkspaceFailureOutcome {
@@ -1095,7 +1303,7 @@ mod tests {
                 has_content: false,
             }
         );
-        assert_eq!(search.main_view(), MainMessageView::Activity);
+        assert_eq!(search.main_view(), MainMessageView::Unreads);
 
         let mut files = WorkspaceViewState::default();
         files.start_files();
@@ -1150,12 +1358,12 @@ mod tests {
     fn late_search_files_and_saved_results_do_not_switch_views() {
         let mut state = WorkspaceViewState::default();
         state.start_search();
-        state.show_activity();
+        state.show_unreads();
         assert!(!state.apply_search_results(vec![SearchMatch {
             text: Some("late search".into()),
             ..SearchMatch::default()
         }]));
-        assert_eq!(state.main_view(), MainMessageView::Activity);
+        assert_eq!(state.main_view(), MainMessageView::Unreads);
         assert_eq!(
             state.search_results()[0].text.as_deref(),
             Some("late search")
@@ -1171,12 +1379,12 @@ mod tests {
         assert_eq!(state.files()[0].id.as_deref(), Some("F1"));
 
         state.start_saved();
-        state.show_activity();
+        state.show_unreads();
         assert!(!state.apply_saved(vec![SavedItem {
             channel: Some("C1".into()),
             ..SavedItem::default()
         }]));
-        assert_eq!(state.main_view(), MainMessageView::Activity);
+        assert_eq!(state.main_view(), MainMessageView::Unreads);
         assert_eq!(state.saved_items()[0].channel.as_deref(), Some("C1"));
     }
 
@@ -1251,7 +1459,7 @@ mod tests {
             ThreadOpenOutcome::RequestFresh
         );
 
-        state.show_activity();
+        state.show_unreads();
 
         assert_eq!(state.last_channel_id(), Some("C1"));
         assert_eq!(state.visible_channel_id(), None);
@@ -1373,13 +1581,13 @@ mod tests {
         );
         assert_eq!(state.current_thread_messages()[0].ts, "4");
 
-        state.show_activity();
+        state.show_unreads();
         let activity = state.apply_realtime_message(
             "C1",
             message("5", "activity"),
             RealtimeMessageKind::Deleted,
         );
-        assert!(activity.refresh_activity);
+        assert!(activity.refresh_unreads);
         assert!(!activity.render_channel);
     }
 
@@ -1499,12 +1707,123 @@ mod tests {
         let mut state = WorkspaceViewState::default();
         state.select_conversation("C1");
         apply_fresh(&mut state, "C1", vec![message("1", "one")]);
-        state.show_activity();
+        state.show_unreads();
 
         let snapshot = state.snapshot();
         assert_eq!(snapshot.channel_id.as_deref(), Some("C1"));
         assert_eq!(snapshot.channel_messages[0].body_text(), "one");
-        assert_eq!(snapshot.main_view, MainMessageView::Activity);
+        assert_eq!(snapshot.main_view, MainMessageView::Unreads);
         assert_eq!(state.visible_channel_id(), None);
+    }
+
+    #[test]
+    fn message_focus_follows_active_channel_and_clears_on_navigation() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        let location = SearchMessageLocation::new("C1", "2", None).unwrap();
+
+        assert!(state.focus_message(&location));
+        assert_eq!(state.channel_focus_ts("C1"), Some("2"));
+        assert_eq!(
+            state.take_channel_focus_for_render("C1", &[message("1", "other")]),
+            None
+        );
+        assert_eq!(state.channel_focus_ts("C1"), Some("2"));
+        assert_eq!(
+            state.take_channel_focus_for_render("C1", &[message("2", "target")]),
+            Some("2".into())
+        );
+        assert_eq!(state.channel_focus_ts("C1"), None);
+
+        assert!(state.focus_message(&location));
+
+        state.show_unreads();
+        assert_eq!(state.channel_focus_ts("C1"), None);
+        assert!(!state.focus_message(&location));
+
+        state.select_conversation("C2");
+        let current = SearchMessageLocation::new("C2", "4", None).unwrap();
+        assert!(state.focus_message(&current));
+        assert!(!state.focus_message(&location));
+        assert_eq!(state.channel_focus_ts("C2"), Some("4"));
+    }
+
+    #[test]
+    fn message_focus_rejects_stale_channel_and_thread_targets() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("1", "parent")]);
+        state.open_thread("C1", "1");
+        let current = SearchMessageLocation::new("C1", "2", Some("1")).unwrap();
+        let stale = SearchMessageLocation::new("C1", "3", Some("other")).unwrap();
+
+        assert!(state.focus_message(&current));
+        assert!(!state.focus_message(&stale));
+        assert_eq!(state.thread_focus_ts(), Some("2"));
+        assert_eq!(
+            state.take_thread_focus_for_render("C1", "1", &[message("2", "reply")]),
+            Some("2".into())
+        );
+        assert_eq!(state.thread_focus_ts(), None);
+
+        assert!(state.focus_message(&current));
+        state.open_thread("C1", "1");
+        assert_eq!(state.thread_focus_ts(), None);
+    }
+
+    #[test]
+    fn message_context_is_transient_and_never_replaces_channel_history() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("10", "latest")]);
+        let location = SearchMessageLocation::new("C1", "2", None).unwrap();
+        assert!(state.focus_message(&location));
+        assert!(state.apply_message_context(
+            &location,
+            vec![message("2", "target"), message("1", "older")],
+        ));
+        assert!(state.has_channel_context("C1"));
+        assert_eq!(state.channel_messages("C1")[0].body_text(), "target");
+        assert_eq!(state.channels["C1"].messages[0].body_text(), "latest");
+
+        let outcome = state.select_conversation("C1");
+        assert_eq!(
+            outcome.decision,
+            ConversationSelectionDecision::RenderCurrent
+        );
+        assert!(!state.has_channel_context("C1"));
+        assert_eq!(state.channel_messages("C1")[0].body_text(), "latest");
+    }
+
+    #[test]
+    fn stale_message_context_cannot_change_the_active_view() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("10", "latest")]);
+        let location = SearchMessageLocation::new("C1", "2", None).unwrap();
+        assert!(state.focus_message(&location));
+        state.select_conversation("C2");
+
+        assert!(!state.apply_message_context(&location, vec![message("2", "stale")]));
+        assert_eq!(state.visible_channel_id(), Some("C2"));
+        assert_eq!(state.channels["C1"].messages[0].body_text(), "latest");
+    }
+
+    #[test]
+    fn realtime_edits_update_transient_message_context() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        let location = SearchMessageLocation::new("C1", "2", None).unwrap();
+        assert!(state.focus_message(&location));
+        assert!(state.apply_message_context(&location, vec![message("2", "original")]));
+
+        let outcome = state.apply_realtime_message(
+            "C1",
+            message("2", "edited"),
+            RealtimeMessageKind::Changed,
+        );
+        assert!(outcome.render_channel);
+        assert_eq!(state.channel_messages("C1")[0].body_text(), "edited");
+        assert!(state.channels["C1"].messages.is_empty());
     }
 }

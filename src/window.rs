@@ -22,6 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -35,9 +36,11 @@ use crate::composer::{
     set_text_view_text, text_view_enter_action, text_view_text, TextViewEnterAction,
 };
 use crate::config;
+use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::message_html::{self, MessageHtmlContext, TimelineScrollBehavior};
 use crate::models::{
-    SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
+    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
+    SlackMessage, SlackUnreadState,
 };
 use crate::rendering;
 use crate::runtime::{
@@ -89,9 +92,9 @@ mod imp {
         #[template_child]
         pub workspace_split: TemplateChild<adw::NavigationSplitView>,
         #[template_child]
-        pub home_button: TemplateChild<gtk::ToggleButton>,
+        pub messages_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
-        pub activity_button: TemplateChild<gtk::ToggleButton>,
+        pub unreads_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub files_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
@@ -155,8 +158,15 @@ mod imp {
         pub user_group_names: RefCell<HashMap<String, String>>,
         pub user_group_members: RefCell<HashMap<String, Vec<String>>>,
         pub pending_user_ids: RefCell<HashSet<String>>,
+        pub workspace_id: RefCell<Option<String>>,
         pub workspace_name: RefCell<Option<String>>,
         pub workspace_url: RefCell<Option<String>>,
+        pub workspace_ready: Cell<bool>,
+        pub(super) pending_notification_target: RefCell<Option<NotificationTarget>>,
+        pub drafts: RefCell<Drafts>,
+        pub draft_save_generation: Cell<u64>,
+        pub pending_sent_drafts: RefCell<HashMap<DraftKey, String>>,
+        pub pending_upload_drafts: RefCell<HashMap<String, Option<String>>>,
         pub sidebar_loading: Cell<bool>,
         pub sidebar_error: RefCell<Option<String>>,
         pub(super) workspace_view: RefCell<WorkspaceViewState>,
@@ -235,8 +245,8 @@ fn sidebar_row_action_for_index(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceNavigationSelection {
-    Home,
-    Activity,
+    Messages,
+    Unreads,
     Files,
     Saved,
 }
@@ -245,8 +255,8 @@ fn workspace_navigation_selection(
     main_view: MainMessageView,
 ) -> Option<WorkspaceNavigationSelection> {
     match main_view {
-        MainMessageView::Conversation => Some(WorkspaceNavigationSelection::Home),
-        MainMessageView::Activity => Some(WorkspaceNavigationSelection::Activity),
+        MainMessageView::Conversation => Some(WorkspaceNavigationSelection::Messages),
+        MainMessageView::Unreads => Some(WorkspaceNavigationSelection::Unreads),
         MainMessageView::Files => Some(WorkspaceNavigationSelection::Files),
         MainMessageView::Saved => Some(WorkspaceNavigationSelection::Saved),
         MainMessageView::Placeholder | MainMessageView::Search => None,
@@ -335,12 +345,110 @@ fn message_notification_action(state: MessageNotificationState<'_>) -> MessageNo
     }
 }
 
-fn message_notification_body(message: Option<&SlackMessage>) -> &str {
+fn message_notification_body(message: Option<&SlackMessage>) -> String {
     message
         .and_then(|message| message.text.as_deref())
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .unwrap_or("New message")
+        .map(ToString::to_string)
+        .unwrap_or_else(|| gettext("New message"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationTarget {
+    workspace_id: String,
+    channel_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationTargetResolution {
+    Wait,
+    Open,
+    RejectWorkspace,
+}
+
+fn notification_target_resolution(
+    current_workspace_id: Option<&str>,
+    workspace_ready: bool,
+    target: &NotificationTarget,
+) -> NotificationTargetResolution {
+    match current_workspace_id {
+        None => NotificationTargetResolution::Wait,
+        Some(workspace_id) if workspace_id != target.workspace_id => {
+            NotificationTargetResolution::RejectWorkspace
+        }
+        Some(_) if !workspace_ready => NotificationTargetResolution::Wait,
+        Some(_) => NotificationTargetResolution::Open,
+    }
+}
+
+fn workspace_identity(auth: &AuthInfo) -> Option<String> {
+    let workspace = [
+        auth.team_id.as_deref(),
+        auth.url.as_deref(),
+        auth.team.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())?;
+    let user = [auth.user_id.as_deref(), auth.user.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty());
+    Some(user.map_or_else(
+        || workspace.to_string(),
+        |user| format!("{workspace}:{user}"),
+    ))
+}
+
+fn submitted_draft_matches(
+    current_text: Option<&str>,
+    stored_text: Option<&str>,
+    submitted: &str,
+) -> bool {
+    current_text
+        .or(stored_text)
+        .is_some_and(|text| text.trim() == submitted)
+}
+
+fn posted_message_thread_ts(
+    context: &OperationContext,
+    channel_id: &str,
+    message: &SlackMessage,
+) -> Option<String> {
+    match &context.target {
+        RuntimeTarget::Message {
+            channel_id: target_channel_id,
+            thread_ts,
+        } if target_channel_id == channel_id => thread_ts.clone(),
+        _ => message.thread_ts.clone(),
+    }
+}
+
+fn record_draft_submission(
+    pending: &mut HashMap<DraftKey, String>,
+    key: DraftKey,
+    text: &str,
+) -> bool {
+    if pending.contains_key(&key) {
+        return false;
+    }
+    pending.insert(key, text.to_string());
+    true
+}
+
+fn record_upload_submission(
+    pending: &mut HashMap<String, Option<String>>,
+    channel_id: &str,
+    initial_comment: Option<String>,
+) -> bool {
+    if pending.contains_key(channel_id) {
+        return false;
+    }
+    pending.insert(channel_id.to_string(), initial_comment);
+    true
 }
 
 fn conversation_refresh_start_shows_sidebar_loading() -> bool {
@@ -699,15 +807,24 @@ impl ConduitWindow {
             )]);
 
         for (button, label) in [
-            (imp.home_button.get().upcast::<gtk::Widget>(), "Home"),
             (
-                imp.activity_button.get().upcast::<gtk::Widget>(),
-                "Activity",
+                imp.messages_button.get().upcast::<gtk::Widget>(),
+                gettext("Messages"),
             ),
-            (imp.files_button.get().upcast::<gtk::Widget>(), "Files"),
-            (imp.saved_button.get().upcast::<gtk::Widget>(), "Later"),
+            (
+                imp.unreads_button.get().upcast::<gtk::Widget>(),
+                gettext("Unreads"),
+            ),
+            (
+                imp.files_button.get().upcast::<gtk::Widget>(),
+                gettext("Files"),
+            ),
+            (
+                imp.saved_button.get().upcast::<gtk::Widget>(),
+                gettext("Later"),
+            ),
         ] {
-            button.update_property(&[gtk::accessible::Property::Label(label)]);
+            button.update_property(&[gtk::accessible::Property::Label(&label)]);
         }
     }
 
@@ -817,9 +934,13 @@ impl ConduitWindow {
         let imp = self.imp();
 
         self.setup_window_actions();
+        self.connect_close_request(|window| {
+            window.flush_drafts();
+            glib::Propagation::Proceed
+        });
         self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
-        self.connect_widget(&imp.home_button.get(), |window| window.show_home());
-        self.connect_widget(&imp.activity_button.get(), |window| window.show_activity());
+        self.connect_widget(&imp.messages_button.get(), |window| window.show_messages());
+        self.connect_widget(&imp.unreads_button.get(), |window| window.show_unreads());
         self.connect_widget(&imp.files_button.get(), |window| window.show_files());
         self.connect_widget(&imp.refresh_button.get(), |window| {
             window.refresh_conversations()
@@ -880,6 +1001,15 @@ impl ConduitWindow {
             window.post_thread_reply()
         });
 
+        for buffer in [imp.message_entry.buffer(), imp.thread_entry.buffer()] {
+            let weak_window = self.downgrade();
+            buffer.connect_changed(move |_| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.schedule_draft_save();
+                }
+            });
+        }
+
         let weak_window = self.downgrade();
         imp.message_search_entry.connect_activate(move |_| {
             if let Some(window) = weak_window.upgrade() {
@@ -921,6 +1051,7 @@ impl ConduitWindow {
 
     fn setup_settings(&self) {
         let settings = gio::Settings::new(config::APPLICATION_ID);
+        *self.imp().drafts.borrow_mut() = DraftSettings::new(settings.clone()).load();
         let weak_window = self.downgrade();
         settings.connect_changed(
             Some(config::SIDEBAR_SHOW_UNREADS_SECTION_KEY),
@@ -933,6 +1064,189 @@ impl ConduitWindow {
         *self.imp().settings.borrow_mut() = Some(settings);
     }
 
+    fn draft_key(&self, channel_id: &str, thread_ts: Option<&str>) -> Option<DraftKey> {
+        let workspace_id = self.imp().workspace_id.borrow().clone()?;
+        Some(DraftKey::new(&workspace_id, channel_id, thread_ts))
+    }
+
+    fn schedule_draft_save(&self) {
+        if self.visible_channel_id().is_none() {
+            return;
+        }
+        let generation = self.imp().draft_save_generation.get().saturating_add(1);
+        self.imp().draft_save_generation.set(generation);
+        let weak_window = self.downgrade();
+        glib::timeout_add_local_once(Duration::from_millis(400), move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            if window.imp().draft_save_generation.get() == generation {
+                window.save_current_drafts();
+            }
+        });
+    }
+
+    fn flush_current_drafts(&self) {
+        let generation = self.imp().draft_save_generation.get().saturating_add(1);
+        self.imp().draft_save_generation.set(generation);
+        self.save_current_drafts();
+    }
+
+    pub(crate) fn flush_drafts(&self) {
+        self.flush_current_drafts();
+    }
+
+    fn save_current_drafts(&self) {
+        let Some(channel_id) = self.visible_channel_id() else {
+            return;
+        };
+        let Some(channel_key) = self.draft_key(&channel_id, None) else {
+            return;
+        };
+        let thread_key = self
+            .selected_thread_ts()
+            .and_then(|thread_ts| self.draft_key(&channel_id, Some(&thread_ts)));
+        let message_text = text_view_text(&self.imp().message_entry);
+        let thread_text = text_view_text(&self.imp().thread_entry);
+        let changed = {
+            let mut drafts = self.imp().drafts.borrow_mut();
+            let mut changed = drafts.upsert(channel_key, &message_text);
+            if let Some(thread_key) = thread_key {
+                changed |= drafts.upsert(thread_key, &thread_text);
+            }
+            changed
+        };
+        if changed {
+            self.persist_drafts();
+        }
+    }
+
+    fn persist_drafts(&self) {
+        let Some(settings) = self.imp().settings.borrow().clone() else {
+            return;
+        };
+        if let Err(error) = DraftSettings::new(settings).save(&self.imp().drafts.borrow()) {
+            crate::debug::log("drafts", &format!("failed to persist drafts: {error}"));
+        }
+    }
+
+    fn restore_channel_draft(&self, channel_id: &str) {
+        let text = self
+            .draft_key(channel_id, None)
+            .and_then(|key| {
+                self.imp()
+                    .drafts
+                    .borrow()
+                    .get(&key)
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_default();
+        set_text_view_text(&self.imp().message_entry, &text);
+    }
+
+    fn restore_thread_draft(&self, channel_id: &str, thread_ts: &str) {
+        let text = self
+            .draft_key(channel_id, Some(thread_ts))
+            .and_then(|key| {
+                self.imp()
+                    .drafts
+                    .borrow()
+                    .get(&key)
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_default();
+        set_text_view_text(&self.imp().thread_entry, &text);
+    }
+
+    fn remember_submitted_draft(
+        &self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+    ) -> bool {
+        let Some(key) = self.draft_key(channel_id, thread_ts) else {
+            return false;
+        };
+        record_draft_submission(&mut self.imp().pending_sent_drafts.borrow_mut(), key, text)
+    }
+
+    fn discard_submitted_draft(&self, channel_id: &str, thread_ts: Option<&str>) {
+        if let Some(key) = self.draft_key(channel_id, thread_ts) {
+            self.imp().pending_sent_drafts.borrow_mut().remove(&key);
+        }
+    }
+
+    fn complete_submitted_draft(&self, channel_id: &str, thread_ts: Option<&str>) {
+        let Some(key) = self.draft_key(channel_id, thread_ts) else {
+            return;
+        };
+        let Some(submitted) = self.imp().pending_sent_drafts.borrow_mut().remove(&key) else {
+            return;
+        };
+
+        let current_key = self.visible_channel_id().and_then(|visible_channel_id| {
+            let visible_thread_ts = thread_ts.and_then(|_| self.selected_thread_ts());
+            self.draft_key(&visible_channel_id, visible_thread_ts.as_deref())
+        });
+        let current_text = (current_key.as_ref() == Some(&key)).then(|| {
+            if thread_ts.is_some() {
+                text_view_text(&self.imp().thread_entry)
+            } else {
+                text_view_text(&self.imp().message_entry)
+            }
+        });
+        let stored_text = self
+            .imp()
+            .drafts
+            .borrow()
+            .get(&key)
+            .map(ToString::to_string);
+        if !submitted_draft_matches(current_text.as_deref(), stored_text.as_deref(), &submitted) {
+            return;
+        }
+
+        let stored_matches = stored_text.is_some_and(|text| text.trim() == submitted);
+        if stored_matches && self.imp().drafts.borrow_mut().remove(&key) {
+            self.persist_drafts();
+        }
+        if current_key.as_ref() == Some(&key) {
+            if thread_ts.is_some() {
+                set_text_view_text(&self.imp().thread_entry, "");
+            } else {
+                set_text_view_text(&self.imp().message_entry, "");
+            }
+        }
+    }
+
+    fn complete_upload_draft(&self, channel_id: &str, submitted: Option<&str>) {
+        let Some(submitted) = submitted else {
+            return;
+        };
+        let Some(key) = self.draft_key(channel_id, None) else {
+            return;
+        };
+        let current_text = (self.visible_channel_id().as_deref() == Some(channel_id))
+            .then(|| text_view_text(&self.imp().message_entry));
+        let stored_text = self
+            .imp()
+            .drafts
+            .borrow()
+            .get(&key)
+            .map(ToString::to_string);
+        if !submitted_draft_matches(current_text.as_deref(), stored_text.as_deref(), submitted) {
+            return;
+        }
+
+        if stored_text.is_some_and(|text| text.trim() == submitted)
+            && self.imp().drafts.borrow_mut().remove(&key)
+        {
+            self.persist_drafts();
+        }
+        if current_text.is_some() {
+            set_text_view_text(&self.imp().message_entry, "");
+        }
+    }
+
     fn setup_window_actions(&self) {
         self.add_window_action("sign-out", |window| {
             window.send_session_command(RuntimeCommand::SignOut)
@@ -941,8 +1255,8 @@ impl ConduitWindow {
             window.show_conversation_switcher()
         });
         self.add_window_action("search-workspace", |window| window.focus_workspace_search());
-        self.add_window_action("go-home", |window| window.show_home());
-        self.add_window_action("show-activity", |window| window.show_activity());
+        self.add_window_action("show-messages", |window| window.show_messages());
+        self.add_window_action("show-unreads", |window| window.show_unreads());
         self.add_window_action("show-files", |window| window.show_files());
         self.add_window_action("show-later", |window| window.show_later());
         self.add_window_action("refresh-conversations", |window| {
@@ -1135,6 +1449,42 @@ impl ConduitWindow {
                     self.restore_workspace_status();
                 }
             }
+            RuntimeEventKind::MessageContextLoaded { location, messages } => {
+                let visible = self
+                    .imp()
+                    .workspace_view
+                    .borrow_mut()
+                    .apply_message_context(&location, messages);
+                if visible {
+                    if let Some(thread_ts) = location.thread_ts() {
+                        let messages = self
+                            .imp()
+                            .workspace_view
+                            .borrow()
+                            .current_thread_messages()
+                            .to_vec();
+                        self.populate_thread(
+                            location.channel_id(),
+                            thread_ts,
+                            messages,
+                            TimelineScrollBehavior::Preserve,
+                        );
+                    } else {
+                        let messages = self
+                            .imp()
+                            .workspace_view
+                            .borrow()
+                            .channel_messages(location.channel_id())
+                            .to_vec();
+                        self.populate_history_with_scroll(
+                            location.channel_id(),
+                            messages,
+                            TimelineScrollBehavior::Preserve,
+                        );
+                    }
+                    self.restore_workspace_status();
+                }
+            }
             RuntimeEventKind::SearchLoaded(results) => {
                 let visible = self
                     .imp()
@@ -1194,15 +1544,13 @@ impl ConduitWindow {
                 message,
             } => {
                 self.set_status("Message sent");
-                let thread_ts = message.thread_ts.clone();
+                let thread_ts = posted_message_thread_ts(&meta.context, &channel_id, &message);
+                self.complete_submitted_draft(&channel_id, thread_ts.as_deref());
                 if let Some(thread_ts) = thread_ts.as_deref() {
                     self.imp().thread_send_button.set_sensitive(true);
                     self.note_thread_reply_posted(&channel_id, thread_ts);
                 } else {
                     self.imp().send_button.set_sensitive(true);
-                    if self.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
-                        set_text_view_text(&self.imp().message_entry, "");
-                    }
                     self.force_next_channel_bottom_render(&channel_id);
                 }
                 self.reload_after_message(&channel_id, thread_ts.as_deref());
@@ -1247,12 +1595,13 @@ impl ConduitWindow {
                     RuntimeTarget::Upload(channel_id) => Some(channel_id.as_str()),
                     _ => None,
                 };
-                if let Some(channel_id) = uploaded_channel
-                    .filter(|channel_id| self.visible_channel_id().as_deref() == Some(*channel_id))
-                {
-                    set_text_view_text(&imp.message_entry, "");
-                    self.force_next_channel_bottom_render(channel_id);
-                    self.request_channel_history(channel_id);
+                if let Some(channel_id) = uploaded_channel {
+                    let submitted = imp.pending_upload_drafts.borrow_mut().remove(channel_id);
+                    self.complete_upload_draft(channel_id, submitted.flatten().as_deref());
+                    if self.visible_channel_id().as_deref() == Some(channel_id) {
+                        self.force_next_channel_bottom_render(channel_id);
+                        self.request_channel_history(channel_id);
+                    }
                 }
             }
         }
@@ -1358,7 +1707,8 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::RefreshConversations);
     }
 
-    fn show_home(&self) {
+    fn show_messages(&self) {
+        self.flush_current_drafts();
         if let Some(channel_id) = self.selected_channel_id() {
             let title = self.conversation_title(&channel_id);
             self.select_conversation(&channel_id, &title);
@@ -1373,15 +1723,17 @@ impl ConduitWindow {
         self.imp().workspace_split.set_show_content(true);
     }
 
-    fn show_activity(&self) {
-        self.imp().workspace_view.borrow_mut().show_activity();
+    fn show_unreads(&self) {
+        self.flush_current_drafts();
+        self.imp().workspace_view.borrow_mut().show_unreads();
         self.render_closed_thread();
-        let items = self.activity_items();
-        self.populate_activity(items);
+        let items = self.unread_items();
+        self.populate_unreads(items);
         self.imp().workspace_split.set_show_content(true);
     }
 
     fn show_files(&self) {
+        self.flush_current_drafts();
         let title = gettext("Files");
         self.imp().workspace_view.borrow_mut().start_files();
         self.render_closed_thread();
@@ -1396,6 +1748,7 @@ impl ConduitWindow {
     }
 
     fn show_later(&self) {
+        self.flush_current_drafts();
         let title = gettext("Later");
         self.imp().workspace_view.borrow_mut().start_saved();
         self.imp().message_title.set_title(&title);
@@ -1415,6 +1768,7 @@ impl ConduitWindow {
             self.set_status("Enter a message search query");
             return;
         }
+        self.flush_current_drafts();
         self.imp().workspace_view.borrow_mut().start_search();
         let title = gettext("Search results");
         self.render_closed_thread();
@@ -1472,6 +1826,11 @@ impl ConduitWindow {
             return;
         }
 
+        self.flush_current_drafts();
+        if !self.remember_submitted_draft(&channel_id, None, &text) {
+            self.set_status(&gettext("A message is already being sent."));
+            return;
+        }
         self.send_command(RuntimeCommand::PostMessage {
             channel_id,
             text,
@@ -1496,6 +1855,11 @@ impl ConduitWindow {
             return;
         }
 
+        self.flush_current_drafts();
+        if !self.remember_submitted_draft(&channel_id, Some(&thread_ts), &text) {
+            self.set_status(&gettext("A reply is already being sent."));
+            return;
+        }
         self.send_command(RuntimeCommand::PostMessage {
             channel_id,
             text,
@@ -1510,6 +1874,15 @@ impl ConduitWindow {
             self.set_status("Select a conversation");
             return;
         };
+        if self
+            .imp()
+            .pending_upload_drafts
+            .borrow()
+            .contains_key(&channel_id)
+        {
+            self.set_status(&gettext("A file is already being uploaded here."));
+            return;
+        }
         let initial_comment = text_view_text(&self.imp().message_entry).trim().to_string();
 
         let dialog = gtk::FileDialog::builder()
@@ -1524,6 +1897,17 @@ impl ConduitWindow {
                 if let Some(path) = file.path() {
                     if let Some(window) = weak_window.upgrade() {
                         let imp = window.imp();
+                        let initial_comment =
+                            (!initial_comment.is_empty()).then(|| initial_comment.clone());
+                        window.flush_current_drafts();
+                        if !record_upload_submission(
+                            &mut imp.pending_upload_drafts.borrow_mut(),
+                            &channel_id,
+                            initial_comment.clone(),
+                        ) {
+                            window.set_status(&gettext("A file is already being uploaded here."));
+                            return;
+                        }
                         imp.upload_button.set_sensitive(false);
                         imp.upload_progress.set_visible(true);
                         imp.upload_progress.set_fraction(0.0);
@@ -1531,8 +1915,7 @@ impl ConduitWindow {
                         window.send_command(RuntimeCommand::UploadFile {
                             channel_id: channel_id.clone(),
                             path,
-                            initial_comment: (!initial_comment.is_empty())
-                                .then(|| initial_comment.clone()),
+                            initial_comment,
                         });
                     }
                 }
@@ -1541,8 +1924,68 @@ impl ConduitWindow {
     }
 
     fn close_thread(&self) {
+        self.flush_current_drafts();
         self.imp().workspace_view.borrow_mut().close_thread();
         self.render_closed_thread();
+    }
+
+    fn open_thread(&self, channel_id: &str, ts: &str) {
+        self.flush_current_drafts();
+        if self.visible_channel_id().as_deref() != Some(channel_id) {
+            let title = self.conversation_title(channel_id);
+            self.select_conversation(channel_id, &title);
+        }
+        let outcome = self
+            .imp()
+            .workspace_view
+            .borrow_mut()
+            .open_thread(channel_id, ts);
+        self.restore_thread_draft(channel_id, ts);
+        match outcome {
+            ThreadOpenOutcome::RenderCurrent => {
+                let messages = self
+                    .imp()
+                    .workspace_view
+                    .borrow()
+                    .current_thread_messages()
+                    .to_vec();
+                self.populate_thread(
+                    channel_id,
+                    ts,
+                    messages,
+                    TimelineScrollBehavior::StickToBottom,
+                );
+            }
+            ThreadOpenOutcome::RequestFresh => {
+                self.set_status(&gettext("Loading thread"));
+                self.send_command(RuntimeCommand::LoadThread {
+                    channel_id: channel_id.to_string(),
+                    ts: ts.to_string(),
+                });
+            }
+            ThreadOpenOutcome::AwaitFresh => self.set_status(&gettext("Loading thread")),
+            ThreadOpenOutcome::Ignored => {}
+        }
+    }
+
+    fn open_message_context(&self, location: SearchMessageLocation) {
+        let channel_id = location.channel_id().to_string();
+        let thread_ts = location.thread_ts().map(ToString::to_string);
+        let title = self.conversation_title(&channel_id);
+        self.select_conversation(&channel_id, &title);
+        if let Some(thread_ts) = thread_ts.as_deref() {
+            self.open_thread(&channel_id, thread_ts);
+        }
+        if !self
+            .imp()
+            .workspace_view
+            .borrow_mut()
+            .focus_message(&location)
+        {
+            return;
+        }
+        self.set_status(&gettext("Loading message context"));
+        self.send_command(RuntimeCommand::LoadMessageContext(location));
     }
 
     fn render_closed_thread(&self) {
@@ -1583,37 +2026,24 @@ impl ConduitWindow {
                 let Some(ts) = query_param(url, "ts") else {
                     return true;
                 };
-                if self.visible_channel_id().as_deref() != Some(channel_id.as_str()) {
-                    let title = self.conversation_title(&channel_id);
-                    self.select_conversation(&channel_id, &title);
-                }
-                let outcome = self
-                    .imp()
-                    .workspace_view
-                    .borrow_mut()
-                    .open_thread(&channel_id, &ts);
-                match outcome {
-                    ThreadOpenOutcome::RenderCurrent => {
-                        let messages = self
-                            .imp()
-                            .workspace_view
-                            .borrow()
-                            .current_thread_messages()
-                            .to_vec();
-                        self.populate_thread(
-                            &channel_id,
-                            &ts,
-                            messages,
-                            TimelineScrollBehavior::StickToBottom,
-                        );
-                    }
-                    ThreadOpenOutcome::RequestFresh => {
-                        self.set_status("Loading thread");
-                        self.send_command(RuntimeCommand::LoadThread { channel_id, ts });
-                    }
-                    ThreadOpenOutcome::AwaitFresh => self.set_status("Loading thread"),
-                    ThreadOpenOutcome::Ignored => {}
-                }
+                self.open_thread(&channel_id, &ts);
+                true
+            }
+            Some("message") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let Some(message_ts) = query_param(url, "ts") else {
+                    return true;
+                };
+                let Some(location) = SearchMessageLocation::new(
+                    &channel_id,
+                    &message_ts,
+                    query_param(url, "thread_ts").as_deref(),
+                ) else {
+                    return true;
+                };
+                self.open_message_context(location);
                 true
             }
             Some("load-older") => {
@@ -1636,7 +2066,7 @@ impl ConduitWindow {
                 }
                 true
             }
-            Some("activity-open") => {
+            Some("unreads-open") => {
                 let Some(channel_id) = query_param(url, "channel") else {
                     return true;
                 };
@@ -1795,7 +2225,6 @@ impl ConduitWindow {
                     && state.begin_thread_history_request()
             };
             if should_load {
-                set_text_view_text(&self.imp().thread_entry, "");
                 self.send_command(RuntimeCommand::LoadThread {
                     channel_id: channel_id.to_string(),
                     ts: thread_ts.to_string(),
@@ -1838,10 +2267,15 @@ impl ConduitWindow {
     }
 
     fn reset_workspace_state(&self) {
+        self.flush_current_drafts();
         let imp = self.imp();
         imp.workspace_view.borrow_mut().reset();
         *imp.current_user_id.borrow_mut() = None;
+        *imp.workspace_id.borrow_mut() = None;
+        imp.workspace_ready.set(false);
         imp.latest_message_ts_by_channel.borrow_mut().clear();
+        imp.pending_sent_drafts.borrow_mut().clear();
+        imp.pending_upload_drafts.borrow_mut().clear();
         imp.conversations.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
@@ -1880,7 +2314,9 @@ impl ConduitWindow {
         ));
     }
 
-    fn show_workspace(&self, auth: crate::models::AuthInfo) {
+    fn show_workspace(&self, auth: AuthInfo) {
+        *self.imp().workspace_id.borrow_mut() = workspace_identity(&auth);
+        self.imp().workspace_ready.set(false);
         *self.imp().current_user_id.borrow_mut() = auth.user_id.clone();
         *self.imp().workspace_url.borrow_mut() = auth.url.clone();
         self.imp().connect_button.set_sensitive(true);
@@ -1897,6 +2333,7 @@ impl ConduitWindow {
         if conversation_refresh_start_shows_sidebar_loading() {
             self.start_sidebar_loading();
         }
+        self.activate_pending_notification_target();
     }
 
     fn set_status(&self, status: &str) {
@@ -1994,6 +2431,7 @@ impl ConduitWindow {
                 channel_id,
                 thread_ts,
             } => {
+                self.discard_submitted_draft(&channel_id, thread_ts.as_deref());
                 if thread_ts.is_some() {
                     self.imp().thread_send_button.set_sensitive(true);
                 } else {
@@ -2017,6 +2455,7 @@ impl ConduitWindow {
             }
             RuntimeFailureRecovery::Upload(channel_id) => {
                 let imp = self.imp();
+                imp.pending_upload_drafts.borrow_mut().remove(&channel_id);
                 imp.upload_button.set_sensitive(true);
                 imp.upload_progress.set_visible(false);
                 imp.upload_progress.set_fraction(0.0);
@@ -2093,11 +2532,13 @@ impl ConduitWindow {
         *self.imp().conversations.borrow_mut() = conversations;
         self.request_conversation_user_names();
         self.render_conversations();
-        if self.current_main_view() == MainMessageView::Activity {
-            self.populate_activity(self.activity_items());
+        if self.current_main_view() == MainMessageView::Unreads {
+            self.populate_unreads(self.unread_items());
         } else {
             self.refresh_current_conversation_title();
         }
+        self.imp().workspace_ready.set(true);
+        self.activate_pending_notification_target();
     }
 
     fn populate_user_names(&self, user_names: HashMap<String, String>) {
@@ -2230,8 +2671,8 @@ impl ConduitWindow {
 
         if changed {
             self.render_conversations();
-            if self.current_main_view() == MainMessageView::Activity {
-                self.populate_activity(self.activity_items());
+            if self.current_main_view() == MainMessageView::Unreads {
+                self.populate_unreads(self.unread_items());
             }
         }
     }
@@ -2498,10 +2939,10 @@ impl ConduitWindow {
         let imp = self.imp();
         let main_view = imp.workspace_view.borrow().main_view();
         let selection = workspace_navigation_selection(main_view);
-        imp.home_button
-            .set_active(selection == Some(WorkspaceNavigationSelection::Home));
-        imp.activity_button
-            .set_active(selection == Some(WorkspaceNavigationSelection::Activity));
+        imp.messages_button
+            .set_active(selection == Some(WorkspaceNavigationSelection::Messages));
+        imp.unreads_button
+            .set_active(selection == Some(WorkspaceNavigationSelection::Unreads));
         imp.files_button
             .set_active(selection == Some(WorkspaceNavigationSelection::Files));
         imp.saved_button
@@ -2511,17 +2952,20 @@ impl ConduitWindow {
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
+        self.flush_current_drafts();
         crate::debug::log(
             "ui",
             &format!("select_conversation channel_id={channel_id} title={title}"),
         );
         let imp = self.imp();
+        self.withdraw_conversation_notification(channel_id);
         let outcome = imp
             .workspace_view
             .borrow_mut()
             .select_conversation(channel_id);
         let current_messages = imp.workspace_view.borrow().snapshot().channel_messages;
         imp.message_title.set_title(title);
+        self.restore_channel_draft(channel_id);
         set_text_view_text(&imp.thread_entry, "");
         imp.thread_split.set_show_sidebar(false);
         imp.workspace_split.set_show_content(true);
@@ -2608,8 +3052,14 @@ impl ConduitWindow {
         imp.message_title
             .set_title(&self.conversation_title(channel_id));
         let mut context = self.message_html_context(None);
-        context.load_more_url = self.channel_load_more_url(channel_id);
+        if !imp.workspace_view.borrow().has_channel_context(channel_id) {
+            context.load_more_url = self.channel_load_more_url(channel_id);
+        }
         context.timeline_scroll = scroll_behavior;
+        let focus_message_ts = imp
+            .workspace_view
+            .borrow_mut()
+            .take_channel_focus_for_render(channel_id, &messages);
         crate::debug::log(
             "ui",
             &format!(
@@ -2620,8 +3070,11 @@ impl ConduitWindow {
                 context.failed_image_urls.len()
             ),
         );
-        self.load_message_html(&message_html::conversation_document(
-            channel_id, &messages, &context,
+        self.load_message_html(&message_html::conversation_document_with_focus(
+            channel_id,
+            &messages,
+            &context,
+            focus_message_ts.as_deref(),
         ));
         self.queue_history_render_followups(channel_id, messages);
     }
@@ -2662,18 +3115,31 @@ impl ConduitWindow {
 
         self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(Some(ts));
-        context.load_more_url = self.thread_load_more_url(channel_id, ts);
+        if !imp
+            .workspace_view
+            .borrow()
+            .has_thread_context(channel_id, ts)
+        {
+            context.load_more_url = self.thread_load_more_url(channel_id, ts);
+        }
         context.timeline_scroll = scroll_behavior;
-        self.load_thread_html(&message_html::conversation_document(
-            channel_id, &messages, &context,
+        let focus_message_ts = imp
+            .workspace_view
+            .borrow_mut()
+            .take_thread_focus_for_render(channel_id, ts, &messages);
+        self.load_thread_html(&message_html::conversation_document_with_focus(
+            channel_id,
+            &messages,
+            &context,
+            focus_message_ts.as_deref(),
         ));
     }
 
-    fn populate_activity(&self, items: Vec<ActivityItem>) {
+    fn populate_unreads(&self, items: Vec<ActivityItem>) {
         let imp = self.imp();
-        imp.message_title.set_title(&gettext("Activity"));
+        imp.message_title.set_title(&gettext("Unreads"));
         self.render_conversations();
-        self.load_message_html(&message_html::activity_document(&items));
+        self.load_message_html(&message_html::unreads_document(&items));
     }
 
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
@@ -2781,8 +3247,8 @@ impl ConduitWindow {
         self.request_user_names(std::slice::from_ref(&message));
         self.request_image_assets(std::iter::once(&message));
 
-        if outcome.refresh_activity {
-            self.populate_activity(self.activity_items());
+        if outcome.refresh_unreads {
+            self.populate_unreads(self.unread_items());
         } else {
             self.render_conversations();
         }
@@ -2841,8 +3307,9 @@ impl ConduitWindow {
 
         if action == MessageNotificationAction::Notify {
             self.send_notification(
+                channel_id,
                 &self.conversation_title(channel_id),
-                message_notification_body(latest_message),
+                &message_notification_body(latest_message),
             );
         }
     }
@@ -2862,14 +3329,66 @@ impl ConduitWindow {
             .unwrap_or((false, false))
     }
 
-    fn send_notification(&self, title: &str, body: &str) {
-        let Some(application) = self.application() else {
+    fn send_notification(&self, channel_id: &str, title: &str, body: &str) {
+        let Some(workspace_id) = self.imp().workspace_id.borrow().clone() else {
+            return;
+        };
+        let Some(application) = self
+            .application()
+            .and_then(|application| application.downcast::<crate::ConduitApplication>().ok())
+        else {
             return;
         };
 
-        let notification = gio::Notification::new(title);
-        notification.set_body(Some(body));
-        application.send_notification(None, &notification);
+        application.send_conversation_notification(&workspace_id, channel_id, title, body);
+    }
+
+    fn withdraw_conversation_notification(&self, channel_id: &str) {
+        let Some(workspace_id) = self.imp().workspace_id.borrow().clone() else {
+            return;
+        };
+        let Some(application) = self
+            .application()
+            .and_then(|application| application.downcast::<crate::ConduitApplication>().ok())
+        else {
+            return;
+        };
+
+        application.withdraw_conversation_notification(&workspace_id, channel_id);
+    }
+
+    pub(crate) fn open_notification_target(&self, workspace_id: String, channel_id: String) {
+        *self.imp().pending_notification_target.borrow_mut() = Some(NotificationTarget {
+            workspace_id,
+            channel_id,
+        });
+        self.activate_pending_notification_target();
+    }
+
+    fn activate_pending_notification_target(&self) {
+        let Some(target) = self.imp().pending_notification_target.borrow().clone() else {
+            return;
+        };
+        let current_workspace_id = self.imp().workspace_id.borrow().clone();
+        match notification_target_resolution(
+            current_workspace_id.as_deref(),
+            self.imp().workspace_ready.get(),
+            &target,
+        ) {
+            NotificationTargetResolution::Wait => {}
+            NotificationTargetResolution::RejectWorkspace => {
+                self.imp().pending_notification_target.borrow_mut().take();
+                self.set_status(&gettext(
+                    "This notification belongs to a different workspace.",
+                ));
+            }
+            NotificationTargetResolution::Open => {
+                self.imp().pending_notification_target.borrow_mut().take();
+                let title = self.conversation_title(&target.channel_id);
+                self.select_conversation(&target.channel_id, &title);
+                self.present();
+            }
+        }
     }
 
     fn conversation_title(&self, channel_id: &str) -> String {
@@ -2883,7 +3402,7 @@ impl ConduitWindow {
             .unwrap_or_else(|| "Slack".to_string())
     }
 
-    fn activity_items(&self) -> Vec<ActivityItem> {
+    fn unread_items(&self) -> Vec<ActivityItem> {
         let imp = self.imp();
         activity::build_activity_items(&imp.conversations.borrow(), &imp.user_names.borrow())
     }
@@ -3044,7 +3563,7 @@ impl ConduitWindow {
                     }
                 }
             }
-            MainMessageView::Activity => self.populate_activity(self.activity_items()),
+            MainMessageView::Unreads => self.populate_unreads(self.unread_items()),
             MainMessageView::Search => self.populate_search_results(snapshot.search_results),
             MainMessageView::Files => self.populate_files(snapshot.files),
             MainMessageView::Saved => self.populate_saved_items(snapshot.saved_items),
@@ -3385,7 +3904,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_target_activity_requires_the_channel_and_optional_thread() {
+    fn mutation_target_unreads_requires_the_channel_and_optional_thread() {
         assert!(mutation_target_is_active(
             Some("C1"),
             Some("T1"),
@@ -3669,14 +4188,114 @@ mod tests {
     }
 
     #[test]
+    fn notification_targets_wait_for_the_workspace_and_conversations() {
+        let target = NotificationTarget {
+            workspace_id: "T123".into(),
+            channel_id: "C123".into(),
+        };
+
+        assert_eq!(
+            notification_target_resolution(None, false, &target),
+            NotificationTargetResolution::Wait
+        );
+        assert_eq!(
+            notification_target_resolution(Some("T123"), false, &target),
+            NotificationTargetResolution::Wait
+        );
+        assert_eq!(
+            notification_target_resolution(Some("T123"), true, &target),
+            NotificationTargetResolution::Open
+        );
+        assert_eq!(
+            notification_target_resolution(Some("T999"), true, &target),
+            NotificationTargetResolution::RejectWorkspace
+        );
+    }
+
+    #[test]
+    fn workspace_identity_prefers_stable_team_id_with_fallbacks() {
+        assert_eq!(
+            workspace_identity(&AuthInfo {
+                team_id: Some(" T123 ".into()),
+                user_id: Some(" U123 ".into()),
+                url: Some("https://workspace.slack.com".into()),
+                team: Some("Workspace".into()),
+                ..Default::default()
+            }),
+            Some("T123:U123".into())
+        );
+        assert_eq!(
+            workspace_identity(&AuthInfo {
+                url: Some("https://workspace.slack.com".into()),
+                ..Default::default()
+            }),
+            Some("https://workspace.slack.com".into())
+        );
+        assert_eq!(workspace_identity(&AuthInfo::default()), None);
+    }
+
+    #[test]
+    fn sent_drafts_clear_only_while_the_submitted_text_is_unchanged() {
+        assert!(submitted_draft_matches(
+            Some(" hello \n"),
+            Some("hello"),
+            "hello"
+        ));
+        assert!(submitted_draft_matches(None, Some("hello"), "hello"));
+        assert!(!submitted_draft_matches(
+            Some("hello, edited"),
+            Some("hello"),
+            "hello"
+        ));
+        assert!(!submitted_draft_matches(None, None, "hello"));
+
+        let context = OperationContext::new(
+            RuntimeOperation::PostMessage,
+            RuntimeTarget::Message {
+                channel_id: "C123".into(),
+                thread_ts: Some("parent".into()),
+            },
+        );
+        assert_eq!(
+            posted_message_thread_ts(&context, "C123", &SlackMessage::default()).as_deref(),
+            Some("parent")
+        );
+    }
+
+    #[test]
+    fn only_one_submission_can_be_in_flight_for_each_draft() {
+        let key = DraftKey::new("T123:U123", "C123", None);
+        let other = DraftKey::new("T123:U123", "C999", None);
+        let mut pending = HashMap::new();
+
+        assert!(record_draft_submission(&mut pending, key.clone(), "first"));
+        assert!(!record_draft_submission(&mut pending, key, "duplicate"));
+        assert!(record_draft_submission(&mut pending, other, "parallel"));
+        assert_eq!(pending.len(), 2);
+
+        let mut uploads = HashMap::new();
+        assert!(record_upload_submission(
+            &mut uploads,
+            "C123",
+            Some("comment".into())
+        ));
+        assert!(!record_upload_submission(
+            &mut uploads,
+            "C123",
+            Some("replacement".into())
+        ));
+        assert!(record_upload_submission(&mut uploads, "C999", None));
+    }
+
+    #[test]
     fn workspace_navigation_selection_follows_authoritative_main_view() {
         assert_eq!(
             workspace_navigation_selection(MainMessageView::Conversation),
-            Some(WorkspaceNavigationSelection::Home)
+            Some(WorkspaceNavigationSelection::Messages)
         );
         assert_eq!(
-            workspace_navigation_selection(MainMessageView::Activity),
-            Some(WorkspaceNavigationSelection::Activity)
+            workspace_navigation_selection(MainMessageView::Unreads),
+            Some(WorkspaceNavigationSelection::Unreads)
         );
         assert_eq!(
             workspace_navigation_selection(MainMessageView::Files),
@@ -3701,7 +4320,7 @@ mod tests {
         assert!(workspace_composer_visible(MainMessageView::Conversation));
         for view in [
             MainMessageView::Placeholder,
-            MainMessageView::Activity,
+            MainMessageView::Unreads,
             MainMessageView::Search,
             MainMessageView::Files,
             MainMessageView::Saved,
@@ -3727,8 +4346,12 @@ mod tests {
             "AdwPasswordEntryRow\" id=\"xoxd_token_entry",
             "<property name=\"label\" translatable=\"yes\">Message</property>",
             "<property name=\"label\" translatable=\"yes\">Reply</property>",
-            "GtkToggleButton\" id=\"home_button",
-            "<property name=\"group\">home_button</property>",
+            "GtkToggleButton\" id=\"messages_button",
+            "<property name=\"group\">messages_button</property>",
+            "<property name=\"icon-name\">view-list-symbolic</property>",
+            "<property name=\"icon-name\">mail-unread-symbolic</property>",
+            "<property name=\"tooltip-text\" translatable=\"yes\">Messages</property>",
+            "<property name=\"tooltip-text\" translatable=\"yes\">Unreads</property>",
             "<property name=\"enable-show-gesture\">False</property>",
             "GtkLabel\" id=\"message_status_label",
             "<property name=\"accessible-role\">status</property>",

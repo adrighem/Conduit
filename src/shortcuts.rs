@@ -49,11 +49,11 @@ pub const WINDOW_SHORTCUTS: &[ActionShortcut] = &[
         accelerators: &["<control>f"],
     },
     ActionShortcut {
-        action: "win.go-home",
+        action: "win.show-messages",
         accelerators: &["<control>1"],
     },
     ActionShortcut {
-        action: "win.show-activity",
+        action: "win.show-unreads",
         accelerators: &["<control>2"],
     },
     ActionShortcut {
@@ -110,6 +110,14 @@ mod tests {
             accelerators_for_action("win.search-workspace").unwrap(),
             ["<control>f"]
         );
+        assert_eq!(
+            accelerators_for_action("win.show-messages").unwrap(),
+            ["<control>1"]
+        );
+        assert_eq!(
+            accelerators_for_action("win.show-unreads").unwrap(),
+            ["<control>2"]
+        );
     }
 
     #[test]
@@ -139,6 +147,8 @@ mod tests {
         for text in [
             "Jump to a Conversation",
             "Search Workspace Messages",
+            "Messages",
+            "Unreads",
             "Refresh Conversations",
             "Focus Composer",
             "&lt;Control&gt;k",
