@@ -11,6 +11,8 @@ const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
     pub user_names: HashMap<String, String>,
+    pub user_group_names: HashMap<String, String>,
+    pub user_group_members: HashMap<String, Vec<String>>,
     pub current_user_id: Option<String>,
     pub thread_ts: Option<String>,
     pub load_more_url: Option<String>,
@@ -1712,6 +1714,8 @@ fn render_slack_entity(text: &str, context: &MessageHtmlContext) -> Option<(Stri
             .cloned()
             .unwrap_or_else(|| user_id.to_string());
         format!("<span class=\"mention\">@{}</span>", escape_html(&name))
+    } else if raw.starts_with("!subteam^") {
+        user_group_mention_html(raw, context)
     } else if let Some(channel) = raw.strip_prefix('#') {
         let display = channel
             .split_once('|')
@@ -1733,6 +1737,46 @@ fn render_slack_entity(text: &str, context: &MessageHtmlContext) -> Option<(Stri
     };
 
     Some((rendered, end + 1))
+}
+
+fn user_group_mention_html(raw: &str, context: &MessageHtmlContext) -> String {
+    let Some(group) = raw.strip_prefix("!subteam^") else {
+        return escape_html(raw);
+    };
+    let (group_id, fallback_label) = group
+        .split_once('|')
+        .map(|(group_id, label)| (group_id, Some(normalized_user_group_label(label))))
+        .unwrap_or((group, None));
+
+    let label = context
+        .user_group_names
+        .get(group_id)
+        .cloned()
+        .or(fallback_label)
+        .unwrap_or_else(|| group_id.to_string());
+    let label = normalized_user_group_label(&label);
+
+    if let Some(members) = context
+        .user_group_members
+        .get(group_id)
+        .filter(|members| !members.is_empty())
+    {
+        format!(
+            "<span class=\"mention\" title=\"{}\">@{}</span>",
+            escape_html(&user_group_member_title(members)),
+            escape_html(&label)
+        )
+    } else {
+        format!("<span class=\"mention\">@{}</span>", escape_html(&label))
+    }
+}
+
+fn normalized_user_group_label(label: &str) -> String {
+    label.trim().trim_start_matches('@').to_string()
+}
+
+fn user_group_member_title(members: &[String]) -> String {
+    format!("Members: {}", members.join(", "))
 }
 
 fn slack_special_entity_html(raw: &str) -> String {
@@ -1932,6 +1976,28 @@ mod tests {
         assert!(html.contains("#general"));
         assert!(html.contains("href=\"https://example.com\""));
         assert!(html.contains(">docs</a>"));
+    }
+
+    #[test]
+    fn resolves_user_group_mentions_with_member_tooltips() {
+        let context = MessageHtmlContext {
+            user_group_names: HashMap::from([("S123".to_string(), "platform".to_string())]),
+            user_group_members: HashMap::from([(
+                "S123".to_string(),
+                vec!["Ada Lovelace".to_string(), "Grace Hopper".to_string()],
+            )]),
+            ..Default::default()
+        };
+        let html = conversation_document(
+            "C123",
+            &[message("Reminder: <!subteam^S123> please post updates")],
+            &context,
+        );
+
+        assert!(html.contains(
+            "<span class=\"mention\" title=\"Members: Ada Lovelace, Grace Hopper\">@platform</span>"
+        ));
+        assert!(!html.contains("!subteam^S123"));
     }
 
     #[test]
@@ -2276,6 +2342,7 @@ mod tests {
             channel_id: "C123".to_string(),
             title: "#general & friends".to_string(),
             kind: ActivityKind::PublicChannel,
+            unread: true,
             unread_count: 3,
         }];
 

@@ -26,3 +26,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [~] Track: Unread sidebar bold text
 *Link: [./conductor/tracks/unread_sidebar_bold_20260707/](./conductor/tracks/unread_sidebar_bold_20260707/)*
+
+---
+
+## [~] Track: Desktop notifications for notify-worthy messages
+*Link: [./conductor/tracks/desktop_notifications_20260707/](./conductor/tracks/desktop_notifications_20260707/)*

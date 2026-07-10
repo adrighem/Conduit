@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist gettext-domain="conduit">
 	<schema id="eu.vanadrighem.conduit" path="/eu/vanadrighem/conduit/">
+		<key name="sidebar-show-unreads-section" type="b">
+			<default>false</default>
+			<summary>Show the Unreads sidebar section</summary>
+			<description>Whether unread conversations are duplicated into a separate Unreads section at the top of the conversation sidebar.</description>
+		</key>
 	</schema>
 </schemalist>

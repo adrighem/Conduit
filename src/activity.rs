@@ -39,12 +39,14 @@ pub struct ActivityItem {
     pub channel_id: String,
     pub title: String,
     pub kind: ActivityKind,
+    pub unread: bool,
     pub unread_count: u64,
 }
 
 impl ActivityItem {
     pub fn unread_label(&self) -> String {
         match self.unread_count {
+            0 if self.unread => "Unread activity".to_string(),
             0 => "No unread activity".to_string(),
             1 => "1 unread".to_string(),
             count => format!("{count} unread"),
@@ -59,11 +61,13 @@ pub fn build_activity_items(
     let mut items = conversations
         .iter()
         .filter_map(|conversation| {
+            let unread = conversation.has_unread_activity();
             let unread_count = conversation.unread_activity_count();
-            (unread_count > 0).then(|| ActivityItem {
+            unread.then(|| ActivityItem {
                 channel_id: conversation.id.clone(),
                 title: conversation.display_name_with_users(user_names),
                 kind: activity_kind(conversation),
+                unread,
                 unread_count,
             })
         })
@@ -131,12 +135,14 @@ mod tests {
                     channel_id: "D1".to_string(),
                     title: "Ada".to_string(),
                     kind: ActivityKind::DirectMessage,
+                    unread: true,
                     unread_count: 1,
                 },
                 ActivityItem {
                     channel_id: "C1".to_string(),
                     title: "#general".to_string(),
                     kind: ActivityKind::PublicChannel,
+                    unread: true,
                     unread_count: 8,
                 },
             ]
@@ -159,6 +165,8 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, ActivityKind::GroupDirectMessage);
-        assert_eq!(items[0].unread_count, 1);
+        assert!(items[0].unread);
+        assert_eq!(items[0].unread_count, 0);
+        assert_eq!(items[0].unread_label(), "Unread activity");
     }
 }

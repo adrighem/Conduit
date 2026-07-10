@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const CONVERSATION_MEMBER_KEYS: [&str; 2] = ["members", "users"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredToken {
     pub access_token: String,
@@ -69,12 +71,33 @@ impl SlackConversation {
         self.display_name_with_users(&HashMap::new())
     }
 
+    pub fn display_user_ids(&self) -> Vec<String> {
+        let mut user_ids = Vec::new();
+
+        if self.is_im.unwrap_or(false) {
+            if let Some(user_id) = self
+                .user
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                user_ids.push(user_id.to_string());
+            }
+        } else if self.is_mpim.unwrap_or(false) {
+            user_ids.extend(self.group_direct_message_user_ids());
+        }
+
+        user_ids.sort();
+        user_ids.dedup();
+        user_ids
+    }
+
     pub fn unread_activity_count(&self) -> u64 {
         let extra_unread_count = self
             .extra
             .iter()
-            .filter(|(key, _)| key.to_lowercase().contains("unread"))
-            .filter_map(|(_, value)| unread_value_count(value))
+            .filter(|(key, _)| is_unread_key(key))
+            .filter_map(|(_, value)| unread_count_value(value))
             .max()
             .unwrap_or_default();
 
@@ -85,16 +108,53 @@ impl SlackConversation {
 
     pub fn has_unread_activity(&self) -> bool {
         self.unread_activity_count() > 0
+            || self
+                .extra
+                .iter()
+                .filter(|(key, _)| is_unread_key(key))
+                .any(|(_, value)| unread_flag_value(value))
+    }
+
+    pub fn unread_state(&self) -> SlackUnreadState {
+        let known = self.unread_count.is_some() || self.extra.keys().any(|key| is_unread_key(key));
+        let display_count = self
+            .extra
+            .get("unread_count_display")
+            .and_then(unread_count_value)
+            .or_else(|| {
+                self.extra
+                    .get("unread_count_string")
+                    .and_then(unread_count_value)
+            })
+            .unwrap_or_else(|| self.unread_count.unwrap_or_default());
+
+        SlackUnreadState::from_parts(known, self.has_unread_activity(), display_count)
     }
 
     pub fn clear_unread_activity(&mut self) {
         self.unread_count = Some(0);
 
         for (key, value) in &mut self.extra {
-            if key.to_lowercase().contains("unread") {
+            if is_unread_key(key) {
                 *value = cleared_unread_value(value);
             }
         }
+    }
+
+    pub fn apply_unread_state(&mut self, state: SlackUnreadState) {
+        if !state.known {
+            return;
+        }
+
+        self.unread_count = Some(state.display_count);
+        self.extra.insert(
+            "unread_count_display".to_string(),
+            serde_json::json!(state.display_count),
+        );
+        self.extra.insert(
+            "has_unreads".to_string(),
+            serde_json::json!(state.has_unread),
+        );
     }
 
     pub fn is_muted_conversation(&self) -> bool {
@@ -118,6 +178,12 @@ impl SlackConversation {
             }
         }
 
+        if self.is_mpim.unwrap_or(false) {
+            if let Some(name) = self.group_direct_message_display_name(user_names) {
+                return name;
+            }
+        }
+
         if let Some(name) = &self.name {
             if self.is_channel.unwrap_or(false) || self.is_group.unwrap_or(false) {
                 return format!("#{name}");
@@ -138,12 +204,107 @@ impl SlackConversation {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     }
+
+    fn group_direct_message_display_name(
+        &self,
+        user_names: &HashMap<String, String>,
+    ) -> Option<String> {
+        let mut names = self
+            .group_direct_message_user_ids()
+            .into_iter()
+            .map(|user_id| {
+                user_names
+                    .get(&user_id)
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(user_id.as_str())
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        if names.is_empty() {
+            return None;
+        }
+
+        names.sort_by_key(|name| name.to_lowercase());
+        Some(names.join(", "))
+    }
+
+    fn group_direct_message_user_ids(&self) -> Vec<String> {
+        let mut user_ids = Vec::new();
+
+        for key in CONVERSATION_MEMBER_KEYS {
+            if let Some(value) = self.extra_value(key) {
+                user_ids.extend(user_ids_from_value(value));
+            }
+        }
+
+        user_ids.sort();
+        user_ids.dedup();
+        user_ids
+    }
+
+    fn extra_value(&self, key: &str) -> Option<&Value> {
+        self.extra.get(key).or_else(|| {
+            self.extra
+                .get("properties")
+                .and_then(|properties| properties.get(key))
+        })
+    }
 }
 
-fn unread_value_count(value: &Value) -> Option<u64> {
+fn user_ids_from_value(value: &Value) -> Vec<String> {
     match value {
-        Value::Bool(true) => Some(1),
-        Value::Bool(false) => Some(0),
+        Value::Array(values) => values.iter().filter_map(user_id_from_value).collect(),
+        Value::String(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn user_id_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => non_empty_string(value),
+        Value::Object(object) => ["id", "user", "user_id"]
+            .into_iter()
+            .filter_map(|key| object.get(key).and_then(Value::as_str))
+            .find_map(non_empty_string),
+        _ => None,
+    }
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlackUnreadState {
+    pub known: bool,
+    pub has_unread: bool,
+    pub display_count: u64,
+}
+
+impl SlackUnreadState {
+    pub fn from_parts(known: bool, has_unread: bool, display_count: u64) -> Self {
+        Self {
+            known,
+            has_unread: known && (has_unread || display_count > 0),
+            display_count,
+        }
+    }
+}
+
+fn is_unread_key(key: &str) -> bool {
+    key.to_lowercase().contains("unread")
+}
+
+fn unread_count_value(value: &Value) -> Option<u64> {
+    match value {
         Value::Number(number) => number.as_u64().or_else(|| {
             number
                 .as_i64()
@@ -152,6 +313,15 @@ fn unread_value_count(value: &Value) -> Option<u64> {
         }),
         Value::String(value) => value.parse::<u64>().ok(),
         _ => None,
+    }
+}
+
+fn unread_flag_value(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::Number(number) => number.as_u64().is_some_and(|value| value > 0),
+        Value::String(value) => value.parse::<u64>().is_ok_and(|value| value > 0),
+        _ => false,
     }
 }
 
@@ -389,6 +559,29 @@ impl SlackUser {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SlackUserGroup {
+    pub id: String,
+    pub handle: Option<String>,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub users: Vec<String>,
+}
+
+impl SlackUserGroup {
+    pub fn mention_label(&self) -> String {
+        self.handle
+            .as_deref()
+            .filter(|label| !label.trim().is_empty())
+            .or(self.name.as_deref())
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or(&self.id)
+            .trim()
+            .trim_start_matches('@')
+            .to_string()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SlackUserProfile {
     pub display_name: Option<String>,
     pub real_name: Option<String>,
@@ -419,6 +612,72 @@ mod tests {
         let names = HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]);
 
         assert_eq!(conversation.display_name_with_users(&names), "Ada Lovelace");
+    }
+
+    #[test]
+    fn group_dm_display_name_uses_alphabetized_member_names() {
+        let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G123",
+            "name": "mpdm-old-slack-name",
+            "is_mpim": true,
+            "members": ["U2", "U1", "U3"]
+        }))
+        .expect("failed to parse group direct message");
+        let names = HashMap::from([
+            ("U1".to_string(), "Zoe".to_string()),
+            ("U2".to_string(), "Ada".to_string()),
+            ("U3".to_string(), "Grace".to_string()),
+        ]);
+
+        assert_eq!(conversation.display_user_ids(), vec!["U1", "U2", "U3"]);
+        assert_eq!(
+            conversation.display_name_with_users(&names),
+            "Ada, Grace, Zoe"
+        );
+    }
+
+    #[test]
+    fn group_dm_display_name_falls_back_to_member_ids_or_slack_name() {
+        let with_members: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G123",
+            "name": "mpdm-old-slack-name",
+            "is_mpim": true,
+            "properties": {
+                "users": [
+                    {"id": "U3"},
+                    {"user": "U1"},
+                    "U2"
+                ]
+            }
+        }))
+        .expect("failed to parse group direct message");
+        let without_members = SlackConversation {
+            id: "G456".to_string(),
+            name: Some("fallback-name".to_string()),
+            is_mpim: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            with_members.display_name_with_users(&HashMap::new()),
+            "U1, U2, U3"
+        );
+        assert_eq!(
+            without_members.display_name_with_users(&HashMap::new()),
+            "fallback-name"
+        );
+    }
+
+    #[test]
+    fn user_group_mention_label_prefers_handle_without_at_prefix() {
+        let group = SlackUserGroup {
+            id: "S123".to_string(),
+            handle: Some("@platform".to_string()),
+            name: Some("Platform team".to_string()),
+            users: Vec::new(),
+        };
+
+        assert_eq!(group.mention_label(), "platform");
     }
 
     #[test]
@@ -453,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_unread_activity_uses_known_and_extra_unread_fields() {
+    fn conversation_unread_activity_uses_known_and_extra_unread_counts() {
         let unread_count: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "C1",
             "unread_count": 3,
@@ -474,8 +733,47 @@ mod tests {
 
         assert_eq!(unread_count.unread_activity_count(), 3);
         assert_eq!(unread_display.unread_activity_count(), 4);
-        assert_eq!(unread_flag.unread_activity_count(), 1);
+        assert_eq!(unread_flag.unread_activity_count(), 0);
+        assert!(unread_flag.has_unread_activity());
         assert!(unread_display.has_unread_activity());
+    }
+
+    #[test]
+    fn conversation_applies_badgeless_unread_state() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            unread_count: Some(7),
+            ..Default::default()
+        };
+
+        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 0));
+
+        assert_eq!(conversation.unread_activity_count(), 0);
+        assert!(conversation.has_unread_activity());
+        assert_eq!(
+            conversation.extra.get("unread_count_display"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            conversation.extra.get("has_unreads"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn conversation_unread_state_prefers_display_count() {
+        let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "unread_count": 5,
+            "unread_count_display": 0
+        }))
+        .expect("failed to parse conversation");
+
+        let state = conversation.unread_state();
+
+        assert!(state.known);
+        assert!(state.has_unread);
+        assert_eq!(state.display_count, 0);
     }
 
     #[test]

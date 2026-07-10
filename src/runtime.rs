@@ -15,12 +15,14 @@ use crate::auth::{
 };
 use crate::config;
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
+    SlackUserGroup, StoredToken,
 };
 use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
 use crate::store::WorkspaceStore;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
+const UNREAD_STATE_PRIORITY_REFRESH_LIMIT: usize = 30;
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
@@ -97,6 +99,14 @@ pub enum RuntimeEvent {
     Authenticated(AuthInfo),
     ConversationsLoaded(Vec<SlackConversation>),
     ConversationsLoadFailed(String),
+    ConversationUnreadUpdated {
+        channel_id: String,
+        unread_state: SlackUnreadState,
+    },
+    ConversationNotificationCandidate {
+        channel_id: String,
+        messages: Vec<SlackMessage>,
+    },
     HistoryLoaded {
         channel_id: String,
         messages: Vec<SlackMessage>,
@@ -121,6 +131,10 @@ pub enum RuntimeEvent {
         display_name: String,
     },
     UserNamesLoaded(HashMap<String, String>),
+    UserGroupsLoaded {
+        names: HashMap<String, String>,
+        members: HashMap<String, Vec<String>>,
+    },
     ImageAssetLoaded {
         key: String,
         data_uri: String,
@@ -311,6 +325,7 @@ fn recent_history_preview(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> 
 #[derive(Debug, Clone)]
 struct ChannelHistoryPrefetchCandidate {
     id: String,
+    unread: bool,
     unread_count: u64,
     activity_score: f64,
     title: String,
@@ -324,8 +339,9 @@ fn channel_history_prefetch_candidates(conversations: &[SlackConversation]) -> V
 
     candidates.sort_by(|left, right| {
         right
-            .unread_count
-            .cmp(&left.unread_count)
+            .unread
+            .cmp(&left.unread)
+            .then_with(|| right.unread_count.cmp(&left.unread_count))
             .then_with(|| right.activity_score.total_cmp(&left.activity_score))
             .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.id.cmp(&right.id))
@@ -337,25 +353,49 @@ fn channel_history_prefetch_candidates(conversations: &[SlackConversation]) -> V
         .collect()
 }
 
+fn conversation_unread_refresh_candidates(conversations: &[SlackConversation]) -> Vec<String> {
+    let mut candidates = conversations
+        .iter()
+        .filter(|conversation| !conversation.is_archived.unwrap_or(false))
+        .filter(|conversation| !conversation.id.trim().is_empty())
+        .map(|conversation| {
+            (
+                conversation.display_name().to_lowercase(),
+                conversation.id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort();
+    candidates.dedup_by(|left, right| left.1 == right.1);
+    candidates
+        .into_iter()
+        .map(|(_, channel_id)| channel_id)
+        .collect()
+}
+
 fn channel_history_prefetch_candidate(
     conversation: &SlackConversation,
 ) -> Option<ChannelHistoryPrefetchCandidate> {
-    if conversation.is_archived.unwrap_or(false)
-        || conversation.is_im.unwrap_or(false)
-        || conversation.is_mpim.unwrap_or(false)
-    {
+    if conversation.is_archived.unwrap_or(false) {
         return None;
     }
 
     let is_channel = conversation.is_channel.unwrap_or(false)
         || conversation.is_group.unwrap_or(false)
-        || conversation.is_private.unwrap_or(false);
-    if !is_channel {
+        || conversation.is_private.unwrap_or(false)
+        || conversation.is_im.unwrap_or(false)
+        || conversation.is_mpim.unwrap_or(false);
+    if !is_channel
+        || ((conversation.is_im.unwrap_or(false) || conversation.is_mpim.unwrap_or(false))
+            && !conversation.has_unread_activity())
+    {
         return None;
     }
 
     Some(ChannelHistoryPrefetchCandidate {
         id: conversation.id.clone(),
+        unread: conversation.has_unread_activity(),
         unread_count: conversation.unread_activity_count(),
         activity_score: conversation_activity_score(conversation),
         title: conversation.display_name().to_lowercase(),
@@ -709,7 +749,9 @@ async fn load_workspace_after_auth(
         conversation_refresh_mode(),
         ConversationRefreshMode::Background
     );
-    spawn_conversation_refresh(context)
+    spawn_conversation_refresh(context)?;
+    spawn_user_group_refresh(context)?;
+    Ok(())
 }
 
 fn spawn_conversation_refresh(context: &RuntimeContext<'_>) -> Result<()> {
@@ -732,6 +774,20 @@ fn spawn_conversation_refresh(context: &RuntimeContext<'_>) -> Result<()> {
                 &format!("ConversationsBackgroundRefreshFailed error={error:#}"),
             );
         }
+    });
+
+    Ok(())
+}
+
+fn spawn_user_group_refresh(context: &RuntimeContext<'_>) -> Result<()> {
+    let api = require_slack(context.slack)?.clone();
+    let events = context.events.clone();
+    let workspace_store = (*context.workspace_store).clone();
+    let cached_user_names = context.user_cache.clone();
+
+    tokio::spawn(async move {
+        load_user_groups_best_effort_with_api(&events, &api, &workspace_store, cached_user_names)
+            .await;
     });
 
     Ok(())
@@ -763,6 +819,93 @@ async fn connect_with_token(
     Ok(auth)
 }
 
+async fn load_user_groups_best_effort_with_api(
+    events: &Sender<RuntimeEvent>,
+    api: &SlackApi,
+    workspace_store: &Option<WorkspaceStore>,
+    cached_user_names: HashMap<String, String>,
+) {
+    let groups = match api.user_groups().await {
+        Ok(groups) => groups,
+        Err(error) => {
+            crate::debug::log("runtime", &format!("UserGroupsLoadFailed error={error:#}"));
+            return;
+        }
+    };
+
+    let (names, members, loaded_user_names) =
+        resolve_user_group_display_data(api, groups, cached_user_names).await;
+
+    if !loaded_user_names.is_empty() {
+        store_user_names(workspace_store, &loaded_user_names).await;
+        events.send_event(RuntimeEvent::UserNamesLoaded(loaded_user_names));
+    }
+
+    if !names.is_empty() {
+        crate::debug::log(
+            "runtime",
+            &format!("UserGroupsLoaded count={}", names.len()),
+        );
+        events.send_event(RuntimeEvent::UserGroupsLoaded { names, members });
+    }
+}
+
+async fn resolve_user_group_display_data(
+    api: &SlackApi,
+    groups: Vec<SlackUserGroup>,
+    mut known_user_names: HashMap<String, String>,
+) -> (
+    HashMap<String, String>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, String>,
+) {
+    let mut names = HashMap::new();
+    let mut members = HashMap::new();
+    let mut loaded_user_names = HashMap::new();
+
+    for group in groups {
+        if group.id.trim().is_empty() {
+            continue;
+        }
+
+        names.insert(group.id.clone(), group.mention_label());
+        let mut member_names = Vec::new();
+        for user_id in group
+            .users
+            .iter()
+            .filter(|user_id| !user_id.trim().is_empty())
+        {
+            if let Some(display_name) = known_user_names.get(user_id).cloned() {
+                member_names.push(display_name);
+                continue;
+            }
+
+            match api.user_display_name(user_id).await {
+                Ok(display_name) => {
+                    known_user_names.insert(user_id.clone(), display_name.clone());
+                    loaded_user_names.insert(user_id.clone(), display_name.clone());
+                    member_names.push(display_name);
+                }
+                Err(error) => {
+                    crate::debug::log(
+                        "runtime",
+                        &format!("UserGroupMemberNameLoadFailed user_id={user_id} error={error:#}"),
+                    );
+                    member_names.push(user_id.clone());
+                }
+            }
+        }
+
+        if !member_names.is_empty() {
+            member_names.sort();
+            member_names.dedup();
+            members.insert(group.id, member_names);
+        }
+    }
+
+    (names, members, loaded_user_names)
+}
+
 async fn load_conversations_with_api(
     events: &Sender<RuntimeEvent>,
     api: &SlackApi,
@@ -787,7 +930,17 @@ async fn load_conversations_best_effort_with_api(
 ) -> Result<()> {
     match load_conversations_with_api(events, api, workspace_store).await {
         Ok(conversations) => {
-            prefetch_channel_histories_best_effort(api, workspace_store, &conversations).await;
+            let unread_refresh_candidates = conversation_unread_refresh_candidates(&conversations);
+            refresh_conversation_unread_states_best_effort(
+                events,
+                api,
+                unread_refresh_candidates
+                    .iter()
+                    .take(UNREAD_STATE_PRIORITY_REFRESH_LIMIT),
+            )
+            .await;
+            prefetch_channel_histories_best_effort(events, api, workspace_store, &conversations)
+                .await;
             refresh_cached_dm_user_names(
                 events,
                 api,
@@ -802,7 +955,33 @@ async fn load_conversations_best_effort_with_api(
     Ok(())
 }
 
+async fn refresh_conversation_unread_states_best_effort<'a>(
+    events: &Sender<RuntimeEvent>,
+    api: &SlackApi,
+    channel_ids: impl IntoIterator<Item = &'a String>,
+) {
+    for channel_id in channel_ids {
+        match api.unread_state(channel_id).await {
+            Ok(unread_state) => {
+                crate::debug::log(
+                    "runtime",
+                    &format!(
+                        "ConversationUnreadRefreshed channel_id={channel_id} known={} unread={} display_count={}",
+                        unread_state.known, unread_state.has_unread, unread_state.display_count
+                    ),
+                );
+                send_conversation_unread_update(events, channel_id, unread_state);
+            }
+            Err(error) => crate::debug::log(
+                "runtime",
+                &format!("ConversationUnreadRefreshFailed channel_id={channel_id} error={error:#}"),
+            ),
+        }
+    }
+}
+
 async fn prefetch_channel_histories_best_effort(
+    events: &Sender<RuntimeEvent>,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     conversations: &[SlackConversation],
@@ -826,9 +1005,10 @@ async fn prefetch_channel_histories_best_effort(
             Ok(Some(_)) => {
                 crate::debug::log(
                     "runtime",
-                    &format!("ChannelHistoryPrefetchSkipped channel_id={channel_id} reason=cached"),
+                    &format!(
+                        "ChannelHistoryPrefetchRefreshing channel_id={channel_id} reason=cached"
+                    ),
                 );
-                continue;
             }
             Ok(None) => {}
             Err(error) => {
@@ -842,6 +1022,8 @@ async fn prefetch_channel_histories_best_effort(
 
         match api.history(&channel_id).await {
             Ok(page) => {
+                send_conversation_unread_update(events, &channel_id, page.unread_state);
+                send_conversation_notification_candidate(events, &channel_id, &page.messages);
                 crate::debug::log(
                     "runtime",
                     &format!(
@@ -856,6 +1038,32 @@ async fn prefetch_channel_histories_best_effort(
                 &format!("ChannelHistoryPrefetchFailed channel_id={channel_id} error={error:#}"),
             ),
         }
+    }
+}
+
+fn send_conversation_notification_candidate(
+    events: &Sender<RuntimeEvent>,
+    channel_id: &str,
+    messages: &[SlackMessage],
+) {
+    if !messages.is_empty() {
+        events.send_event(RuntimeEvent::ConversationNotificationCandidate {
+            channel_id: channel_id.to_string(),
+            messages: messages.to_vec(),
+        });
+    }
+}
+
+fn send_conversation_unread_update(
+    events: &Sender<RuntimeEvent>,
+    channel_id: &str,
+    unread_state: SlackUnreadState,
+) {
+    if unread_state.known {
+        events.send_event(RuntimeEvent::ConversationUnreadUpdated {
+            channel_id: channel_id.to_string(),
+            unread_state,
+        });
     }
 }
 
@@ -1370,18 +1578,30 @@ mod tests {
 
     #[test]
     fn channel_history_prefetch_candidates_prioritize_unread_and_recent_channels() {
+        let mut badgeless_unread = channel("C-badgeless", 0, Some("1710000100.000000"));
+        badgeless_unread
+            .extra
+            .insert("has_unreads".to_string(), serde_json::json!(true));
         let conversations = vec![
             channel("C-old", 0, None),
             dm("D-unread", 99),
             archived_channel("C-archived", 99),
             channel("C-recent", 0, Some("1710000300.000000")),
             channel("C-unread", 4, Some("1710000000.000000")),
+            badgeless_unread,
             private_channel("G-private", 0, Some("1710000200.000000")),
         ];
 
         assert_eq!(
             channel_history_prefetch_candidates(&conversations),
-            vec!["C-unread", "C-recent", "G-private", "C-old"]
+            vec![
+                "D-unread",
+                "C-unread",
+                "C-badgeless",
+                "C-recent",
+                "G-private",
+                "C-old"
+            ]
         );
     }
 
@@ -1396,6 +1616,22 @@ mod tests {
         assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT);
         assert_eq!(candidates.first().map(String::as_str), Some("C14"));
         assert_eq!(candidates.last().map(String::as_str), Some("C3"));
+    }
+
+    #[test]
+    fn conversation_unread_refresh_candidates_cover_visible_titles_first() {
+        let conversations = vec![
+            channel("C-zebra", 0, None),
+            archived_channel("C-archived", 10),
+            dm("D-ada", 0),
+            channel("C-aggregator", 0, None),
+            channel("C-127", 0, None),
+        ];
+
+        assert_eq!(
+            conversation_unread_refresh_candidates(&conversations),
+            vec!["C-127", "C-aggregator", "C-zebra", "D-ada"]
+        );
     }
 
     #[test]

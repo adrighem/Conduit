@@ -3,7 +3,94 @@
   <object class="GtkShortcutsWindow" id="shortcuts_dialog">
     <child>
       <object class="GtkShortcutsSection">
-        <property name="title" translatable="yes">Shortcuts</property>
+        <property name="title" translatable="yes">Workspace</property>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Jump to a Conversation</property>
+            <property name="accelerator">&lt;Control&gt;k</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Search Workspace Messages</property>
+            <property name="accelerator">&lt;Control&gt;f</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Refresh Conversations</property>
+            <property name="accelerator">F5</property>
+          </object>
+        </child>
+      </object>
+    </child>
+    <child>
+      <object class="GtkShortcutsSection">
+        <property name="title" translatable="yes">Navigation</property>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Home</property>
+            <property name="accelerator">&lt;Control&gt;1</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Activity</property>
+            <property name="accelerator">&lt;Control&gt;2</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Files</property>
+            <property name="accelerator">&lt;Control&gt;3</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Later</property>
+            <property name="accelerator">&lt;Control&gt;4</property>
+          </object>
+        </child>
+      </object>
+    </child>
+    <child>
+      <object class="GtkShortcutsSection">
+        <property name="title" translatable="yes">Messages</property>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Focus Composer</property>
+            <property name="accelerator">&lt;Control&gt;m</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Send Message</property>
+            <property name="accelerator">Return</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Insert New Line</property>
+            <property name="accelerator">&lt;Shift&gt;Return</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Upload File</property>
+            <property name="accelerator">&lt;Control&gt;o</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsShortcut">
+            <property name="title" translatable="yes" context="shortcut window">Close Thread</property>
+            <property name="accelerator">&lt;Control&gt;&lt;Shift&gt;w</property>
+          </object>
+        </child>
+      </object>
+    </child>
+    <child>
+      <object class="GtkShortcutsSection">
+        <property name="title" translatable="yes">General</property>
         <child>
           <object class="GtkShortcutsShortcut">
             <property name="title" translatable="yes" context="shortcut window">Show Shortcuts</property>
@@ -12,8 +99,8 @@
         </child>
         <child>
           <object class="GtkShortcutsShortcut">
-            <property name="title" translatable="yes" context="shortcut window">Switch Conversation</property>
-            <property name="accelerator">&lt;Control&gt;k</property>
+            <property name="title" translatable="yes" context="shortcut window">Preferences</property>
+            <property name="accelerator">&lt;Control&gt;comma</property>
           </object>
         </child>
         <child>

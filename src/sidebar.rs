@@ -61,6 +61,7 @@ pub struct SidebarRowModel {
     pub id: String,
     pub title: String,
     pub kind: ConversationKind,
+    pub unread: bool,
     pub unread_count: u64,
     pub selected: bool,
     pub private: bool,
@@ -83,6 +84,8 @@ impl SidebarRowModel {
             label.push_str(", 1 unread");
         } else if self.unread_count > 1 {
             label.push_str(&format!(", {} unread", self.unread_count));
+        } else if self.unread {
+            label.push_str(", unread");
         }
         if self.selected {
             label.push_str(", selected");
@@ -113,10 +116,162 @@ impl SidebarSectionModel {
     }
 }
 
-pub fn build_sidebar_sections(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarPlaceholder {
+    LoadingConversations,
+    CouldNotLoadConversations,
+    NoConversations,
+    NoMatchingConversations,
+}
+
+impl SidebarPlaceholder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LoadingConversations => "Loading conversations",
+            Self::CouldNotLoadConversations => "Could not load conversations",
+            Self::NoConversations => "No conversations",
+            Self::NoMatchingConversations => "No matching conversations",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarListModel {
+    Placeholder(SidebarPlaceholder),
+    Sections(Vec<SidebarSectionModel>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidebarBuildOptions<'a> {
+    pub selected_channel: Option<&'a str>,
+    pub query: &'a str,
+    pub unread_only: bool,
+    pub show_unreads_section: bool,
+    pub show_all: bool,
+    pub loading: bool,
+    pub has_error: bool,
+}
+
+impl Default for SidebarBuildOptions<'_> {
+    fn default() -> Self {
+        Self {
+            selected_channel: None,
+            query: "",
+            unread_only: false,
+            show_unreads_section: false,
+            show_all: false,
+            loading: false,
+            has_error: false,
+        }
+    }
+}
+
+impl SidebarRowModel {
+    pub fn from_conversation(
+        conversation: &SlackConversation,
+        user_names: &HashMap<String, String>,
+        selected_channel: Option<&str>,
+    ) -> Self {
+        let kind = conversation_kind(conversation);
+        Self {
+            id: conversation.id.clone(),
+            title: conversation.display_name_with_users(user_names),
+            kind,
+            unread: conversation.has_unread_activity(),
+            unread_count: conversation.unread_activity_count(),
+            selected: selected_channel == Some(conversation.id.as_str()),
+            private: conversation.is_private.unwrap_or(false)
+                || conversation.is_group.unwrap_or(false)
+                || matches!(kind, ConversationKind::PrivateChannel),
+            muted: conversation.is_muted_conversation(),
+            external: conversation.is_external_conversation(),
+        }
+    }
+
+    fn matches_query(&self, query: &str) -> bool {
+        query.is_empty()
+            || self.title.to_lowercase().contains(query)
+            || self.id.to_lowercase().contains(query)
+    }
+}
+
+pub fn build_sidebar_list(
+    conversations: &[SlackConversation],
+    user_names: &HashMap<String, String>,
+    options: SidebarBuildOptions<'_>,
+) -> SidebarListModel {
+    if options.loading && conversations.is_empty() {
+        return SidebarListModel::Placeholder(SidebarPlaceholder::LoadingConversations);
+    }
+
+    if options.has_error && conversations.is_empty() {
+        return SidebarListModel::Placeholder(SidebarPlaceholder::CouldNotLoadConversations);
+    }
+
+    if conversations.is_empty() {
+        return SidebarListModel::Placeholder(SidebarPlaceholder::NoConversations);
+    }
+
+    let query = normalized_query(options.query);
+    let rows = conversations
+        .iter()
+        .filter(|conversation| !conversation.is_archived.unwrap_or(false))
+        .filter(|conversation| {
+            options.show_all
+                || conversation_visible_in_default_sidebar(conversation, options.selected_channel)
+        })
+        .map(|conversation| {
+            SidebarRowModel::from_conversation(conversation, user_names, options.selected_channel)
+        })
+        .filter(|row| row.matches_query(&query) && (!options.unread_only || row.unread));
+
+    let mut sections = build_sidebar_sections_from_rows(rows);
+    if options.unread_only || !options.show_unreads_section {
+        sections.retain(|section| section.kind != SidebarSectionKind::Unreads);
+    }
+
+    if sections.is_empty() {
+        SidebarListModel::Placeholder(SidebarPlaceholder::NoMatchingConversations)
+    } else {
+        SidebarListModel::Sections(sections)
+    }
+}
+
+#[cfg(test)]
+fn build_sidebar_sections(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
     selected_channel: Option<&str>,
+) -> Vec<SidebarSectionModel> {
+    build_sidebar_sections_from_rows(
+        conversations
+            .iter()
+            .filter(|conversation| !conversation.is_archived.unwrap_or(false))
+            .map(|conversation| {
+                SidebarRowModel::from_conversation(conversation, user_names, selected_channel)
+            }),
+    )
+}
+
+pub fn conversation_switcher_items(
+    conversations: &[SlackConversation],
+    user_names: &HashMap<String, String>,
+    query: &str,
+) -> Vec<SidebarRowModel> {
+    let query = normalized_query(query);
+    let mut items = conversations
+        .iter()
+        .filter(|conversation| !conversation.is_archived.unwrap_or(false))
+        .map(|conversation| SidebarRowModel::from_conversation(conversation, user_names, None))
+        .filter(|item| item.matches_query(&query))
+        .collect::<Vec<_>>();
+
+    sort_rows_by_title(&mut items);
+    items
+}
+
+fn build_sidebar_sections_from_rows(
+    rows: impl IntoIterator<Item = SidebarRowModel>,
 ) -> Vec<SidebarSectionModel> {
     let mut unreads = Vec::new();
     let mut channels = Vec::new();
@@ -124,27 +279,8 @@ pub fn build_sidebar_sections(
     let mut group_direct_messages = Vec::new();
     let mut other = Vec::new();
 
-    for conversation in conversations
-        .iter()
-        .filter(|conversation| !conversation.is_archived.unwrap_or(false))
-    {
-        let row = SidebarRowModel {
-            id: conversation.id.clone(),
-            title: conversation.display_name_with_users(user_names),
-            kind: conversation_kind(conversation),
-            unread_count: conversation.unread_activity_count(),
-            selected: selected_channel == Some(conversation.id.as_str()),
-            private: conversation.is_private.unwrap_or(false)
-                || conversation.is_group.unwrap_or(false)
-                || matches!(
-                    conversation_kind(conversation),
-                    ConversationKind::PrivateChannel
-                ),
-            muted: conversation.is_muted_conversation(),
-            external: conversation.is_external_conversation(),
-        };
-
-        if row.unread_count > 0 {
+    for row in rows {
+        if row.unread {
             unreads.push(row.clone());
         }
 
@@ -177,6 +313,10 @@ pub fn build_sidebar_sections(
     .into_iter()
     .flatten()
     .collect()
+}
+
+fn normalized_query(query: &str) -> String {
+    query.trim().to_lowercase()
 }
 
 pub fn conversation_kind(conversation: &SlackConversation) -> ConversationKind {
@@ -345,11 +485,28 @@ mod tests {
         section.rows.iter().map(|row| row.title.as_str()).collect()
     }
 
+    fn list_sections(model: SidebarListModel) -> Vec<SidebarSectionModel> {
+        match model {
+            SidebarListModel::Sections(sections) => sections,
+            SidebarListModel::Placeholder(placeholder) => {
+                panic!("expected sections, got {placeholder:?}")
+            }
+        }
+    }
+
+    fn list_placeholder(model: SidebarListModel) -> SidebarPlaceholder {
+        match model {
+            SidebarListModel::Placeholder(placeholder) => placeholder,
+            SidebarListModel::Sections(_) => panic!("expected placeholder"),
+        }
+    }
+
     fn row(title: &str, unread_count: u64, selected: bool) -> SidebarRowModel {
         SidebarRowModel {
             id: title.to_string(),
             title: title.to_string(),
             kind: ConversationKind::PublicChannel,
+            unread: unread_count > 0,
             unread_count,
             selected,
             private: false,
@@ -475,6 +632,23 @@ mod tests {
 
         assert_eq!(unread_row.title, "#alpha");
         assert_eq!(unread_row.unread_count, 5);
+        assert!(unread_row.unread);
+    }
+
+    #[test]
+    fn unread_section_keeps_badgeless_unread_conversations() {
+        let mut alpha = channel("C1", "alpha");
+        alpha
+            .extra
+            .insert("has_unreads".to_string(), serde_json::json!(true));
+
+        let sections = build_sidebar_sections(&[alpha], &HashMap::new(), None);
+        let unread_row = &section(&sections, SidebarSectionKind::Unreads).rows[0];
+
+        assert_eq!(unread_row.title, "#alpha");
+        assert_eq!(unread_row.unread_count, 0);
+        assert!(unread_row.unread);
+        assert_eq!(unread_row.unread_badge_label(), None);
     }
 
     #[test]
@@ -586,13 +760,20 @@ mod tests {
 
     #[test]
     fn accessible_label_includes_type_unreads_and_selected_state() {
-        let mut row = row("#general", 3, true);
-        row.muted = true;
-        row.external = true;
+        let mut unread_row = row("#general", 3, true);
+        unread_row.muted = true;
+        unread_row.external = true;
 
         assert_eq!(
-            row.accessible_label(),
+            unread_row.accessible_label(),
             "Public channel: #general, 3 unread, selected, muted, external"
+        );
+
+        let mut badgeless = row("#general", 0, false);
+        badgeless.unread = true;
+        assert_eq!(
+            badgeless.accessible_label(),
+            "Public channel: #general, unread"
         );
     }
 
@@ -605,5 +786,233 @@ mod tests {
         };
 
         assert_eq!(section.display_title(), "Unreads (2)");
+    }
+
+    #[test]
+    fn sidebar_list_uses_loading_error_and_empty_placeholders() {
+        assert_eq!(
+            list_placeholder(build_sidebar_list(
+                &[],
+                &HashMap::new(),
+                SidebarBuildOptions {
+                    loading: true,
+                    ..Default::default()
+                },
+            )),
+            SidebarPlaceholder::LoadingConversations
+        );
+        assert_eq!(
+            list_placeholder(build_sidebar_list(
+                &[],
+                &HashMap::new(),
+                SidebarBuildOptions {
+                    has_error: true,
+                    ..Default::default()
+                },
+            )),
+            SidebarPlaceholder::CouldNotLoadConversations
+        );
+        assert_eq!(
+            list_placeholder(build_sidebar_list(
+                &[],
+                &HashMap::new(),
+                SidebarBuildOptions::default(),
+            )),
+            SidebarPlaceholder::NoConversations
+        );
+        assert_eq!(
+            list_placeholder(build_sidebar_list(
+                &[channel("C1", "general")],
+                &HashMap::new(),
+                SidebarBuildOptions {
+                    query: "missing",
+                    ..Default::default()
+                },
+            )),
+            SidebarPlaceholder::NoMatchingConversations
+        );
+    }
+
+    #[test]
+    fn sidebar_list_applies_query_unread_and_default_visibility_filters() {
+        let unread = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            unread_count: Some(2),
+            ..Default::default()
+        };
+        let read = SlackConversation {
+            id: "C456".to_string(),
+            name: Some("random".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let mut badgeless_unread_dm = SlackConversation {
+            id: "D123".to_string(),
+            user: Some("U123".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        badgeless_unread_dm
+            .extra
+            .insert("has_unreads".to_string(), serde_json::json!(true));
+        let user_names = HashMap::from([("U123".to_string(), "Ada".to_string())]);
+
+        let sections = list_sections(build_sidebar_list(
+            &[unread.clone(), read.clone(), badgeless_unread_dm.clone()],
+            &user_names,
+            SidebarBuildOptions {
+                query: "ada",
+                unread_only: true,
+                ..Default::default()
+            },
+        ));
+
+        assert!(sections
+            .iter()
+            .all(|section| section.kind != SidebarSectionKind::Unreads));
+        assert_eq!(
+            titles(section(&sections, SidebarSectionKind::DirectMessages)),
+            vec!["Ada"]
+        );
+        assert_eq!(
+            list_placeholder(build_sidebar_list(
+                &[unread, read, badgeless_unread_dm],
+                &user_names,
+                SidebarBuildOptions {
+                    query: "random",
+                    unread_only: true,
+                    ..Default::default()
+                },
+            )),
+            SidebarPlaceholder::NoMatchingConversations
+        );
+    }
+
+    #[test]
+    fn sidebar_list_can_hide_unreads_section() {
+        let unread = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            unread_count: Some(2),
+            ..Default::default()
+        };
+
+        let sections = list_sections(build_sidebar_list(
+            &[unread],
+            &HashMap::new(),
+            SidebarBuildOptions {
+                show_unreads_section: false,
+                ..Default::default()
+            },
+        ));
+
+        assert!(sections
+            .iter()
+            .all(|section| section.kind != SidebarSectionKind::Unreads));
+        assert_eq!(
+            section(&sections, SidebarSectionKind::Channels).rows.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sidebar_list_can_show_unreads_section() {
+        let unread = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            unread_count: Some(2),
+            ..Default::default()
+        };
+
+        let sections = list_sections(build_sidebar_list(
+            &[unread],
+            &HashMap::new(),
+            SidebarBuildOptions {
+                show_unreads_section: true,
+                ..Default::default()
+            },
+        ));
+
+        assert_eq!(
+            section(&sections, SidebarSectionKind::Unreads).rows.len(),
+            1
+        );
+        assert_eq!(
+            section(&sections, SidebarSectionKind::Channels).rows.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn conversation_switcher_items_search_all_loaded_conversations() {
+        let active = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let dormant_dm: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D123",
+            "user": "U123",
+            "is_im": true,
+            "properties": {
+                "is_dormant": true
+            }
+        }))
+        .expect("failed to parse dormant DM");
+        let user_names = HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]);
+
+        let items = conversation_switcher_items(&[active, dormant_dm], &user_names, "ada");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "D123");
+        assert_eq!(items[0].title, "Ada Lovelace");
+    }
+
+    #[test]
+    fn conversation_switcher_items_match_title_and_id() {
+        let general = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let random = SlackConversation {
+            id: "C456".to_string(),
+            name: Some("random".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+
+        let title_match =
+            conversation_switcher_items(&[general.clone(), random.clone()], &HashMap::new(), "gen");
+        let id_match = conversation_switcher_items(&[general, random], &HashMap::new(), "456");
+
+        assert_eq!(title_match[0].id, "C123");
+        assert_eq!(id_match[0].id, "C456");
+    }
+
+    #[test]
+    fn conversation_switcher_searches_resolved_group_dm_member_names() {
+        let group_dm: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G123",
+            "name": "mpdm-old-slack-name",
+            "is_mpim": true,
+            "members": ["U2", "U1"]
+        }))
+        .expect("failed to parse group direct message");
+        let user_names = HashMap::from([
+            ("U1".to_string(), "Grace Hopper".to_string()),
+            ("U2".to_string(), "Ada Lovelace".to_string()),
+        ]);
+
+        let items = conversation_switcher_items(&[group_dm], &user_names, "grace");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Ada Lovelace, Grace Hopper");
     }
 }

@@ -32,12 +32,19 @@ use webkit6::prelude::*;
 
 use crate::activity::{self, ActivityItem};
 use crate::auth;
+use crate::composer::{
+    set_text_view_text, text_view_enter_action, text_view_text, TextViewEnterAction,
+};
 use crate::config;
 use crate::message_html::{self, MessageHtmlContext, TimelineScrollBehavior};
-use crate::models::{SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage};
+use crate::models::{
+    SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
+};
 use crate::rendering;
 use crate::runtime::{AppRuntime, RuntimeCommand, RuntimeEvent};
-use crate::sidebar::{self, SidebarRowModel, SidebarSectionKind, SidebarSectionModel};
+use crate::shortcuts::WINDOW_SHORTCUTS;
+use crate::sidebar::{self, SidebarRowModel, SidebarSectionModel};
+use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 
 mod imp {
     use super::*;
@@ -122,12 +129,15 @@ mod imp {
 
         pub runtime: RefCell<Option<AppRuntime>>,
         pub events: RefCell<Option<Receiver<RuntimeEvent>>>,
+        pub settings: RefCell<Option<gio::Settings>>,
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
         pub conversations: RefCell<Vec<SlackConversation>>,
         pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
         pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<HashMap<String, String>>,
+        pub user_group_names: RefCell<HashMap<String, String>>,
+        pub user_group_members: RefCell<HashMap<String, Vec<String>>>,
         pub pending_user_ids: RefCell<HashSet<String>>,
         pub workspace_name: RefCell<Option<String>>,
         pub workspace_url: RefCell<Option<String>>,
@@ -176,6 +186,7 @@ mod imp {
             obj.setup_runtime();
             obj.setup_message_view();
             obj.configure_auth_ui();
+            obj.setup_settings();
             obj.setup_callbacks();
             obj.show_loading("Checking secure storage");
             obj.send_command(RuntimeCommand::LoadStoredToken);
@@ -248,30 +259,46 @@ enum ConversationHistorySelectionAction {
     AwaitFresh,
 }
 
-fn sidebar_selected_channel(
-    main_view: MainMessageView,
-    selected_channel: Option<String>,
-) -> Option<String> {
-    (main_view == MainMessageView::Conversation)
-        .then_some(selected_channel)
-        .flatten()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageNotificationAction {
+    Notify,
+    RecordOnly,
 }
 
-fn sidebar_conversation_matches_filters(
-    conversation: &SlackConversation,
-    user_names: &HashMap<String, String>,
-    query: &str,
-    unread_only: bool,
-) -> bool {
-    let matches_query = query.is_empty()
-        || conversation
-            .display_name_with_users(user_names)
-            .to_lowercase()
-            .contains(query)
-        || conversation.id.to_lowercase().contains(query);
-    let matches_unread = !unread_only || conversation.has_unread_activity();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MessageNotificationState<'a> {
+    channel_id: &'a str,
+    selected_channel: Option<&'a str>,
+    previous_latest_ts: Option<&'a str>,
+    latest_ts: &'a str,
+    latest_message_user: Option<&'a str>,
+    current_user: Option<&'a str>,
+    has_unread: bool,
+    muted: bool,
+}
 
-    matches_query && matches_unread
+fn message_notification_action(state: MessageNotificationState<'_>) -> MessageNotificationAction {
+    let has_newer_message = state
+        .previous_latest_ts
+        .is_some_and(|previous_ts| state.latest_ts > previous_ts);
+    let selected = state.selected_channel == Some(state.channel_id);
+    let own_message = state
+        .latest_message_user
+        .is_some_and(|user| Some(user) == state.current_user);
+
+    if has_newer_message && state.has_unread && !state.muted && !selected && !own_message {
+        MessageNotificationAction::Notify
+    } else {
+        MessageNotificationAction::RecordOnly
+    }
+}
+
+fn message_notification_body(message: Option<&SlackMessage>) -> &str {
+    message
+        .and_then(|message| message.text.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("New message")
 }
 
 fn conversation_refresh_start_shows_sidebar_loading() -> bool {
@@ -282,6 +309,10 @@ fn sidebar_error_change_needs_render(has_conversations: bool) -> bool {
     !has_conversations
 }
 
+fn connected_workspace_status(workspace_name: Option<&str>) -> String {
+    format!("Connected to {}", workspace_name.unwrap_or("Slack"))
+}
+
 fn sidebar_user_name_update_needs_render(
     conversations: &[SlackConversation],
     user_id: &str,
@@ -289,63 +320,11 @@ fn sidebar_user_name_update_needs_render(
 ) -> bool {
     !sidebar_loading
         && conversations.iter().any(|conversation| {
-            conversation.is_im.unwrap_or(false) && conversation.user.as_deref() == Some(user_id)
+            conversation
+                .display_user_ids()
+                .iter()
+                .any(|display_user_id| display_user_id == user_id)
         })
-}
-
-fn sidebar_title_weight(unread_count: u64) -> gtk::pango::Weight {
-    if unread_count > 0 {
-        gtk::pango::Weight::Bold
-    } else {
-        gtk::pango::Weight::Normal
-    }
-}
-
-fn sidebar_title_attributes(unread_count: u64) -> gtk::pango::AttrList {
-    let attributes = gtk::pango::AttrList::new();
-    attributes.insert(gtk::pango::AttrInt::new_weight(sidebar_title_weight(
-        unread_count,
-    )));
-    attributes
-}
-
-fn conversation_switcher_items(
-    conversations: &[SlackConversation],
-    user_names: &HashMap<String, String>,
-    query: &str,
-) -> Vec<SidebarRowModel> {
-    let query = query.trim().to_lowercase();
-    let mut items = conversations
-        .iter()
-        .filter(|conversation| !conversation.is_archived.unwrap_or(false))
-        .map(|conversation| {
-            let kind = sidebar::conversation_kind(conversation);
-            SidebarRowModel {
-                id: conversation.id.clone(),
-                title: conversation.display_name_with_users(user_names),
-                kind,
-                unread_count: conversation.unread_activity_count(),
-                selected: false,
-                private: conversation.is_private.unwrap_or(false)
-                    || conversation.is_group.unwrap_or(false)
-                    || matches!(kind, sidebar::ConversationKind::PrivateChannel),
-                muted: conversation.is_muted_conversation(),
-                external: conversation.is_external_conversation(),
-            }
-        })
-        .filter(|item| {
-            query.is_empty()
-                || item.title.to_lowercase().contains(&query)
-                || item.id.to_lowercase().contains(&query)
-        })
-        .collect::<Vec<_>>();
-
-    items.sort_by_key(|item| (switcher_title_sort_key(&item.title), item.id.to_lowercase()));
-    items
-}
-
-fn switcher_title_sort_key(title: &str) -> String {
-    title.trim_start_matches('#').trim_start().to_lowercase()
 }
 
 fn message_navigation_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
@@ -410,12 +389,50 @@ fn thread_history_key(channel_id: &str, ts: &str) -> String {
     format!("{channel_id}:{ts}")
 }
 
+const THREAD_PANE_MIN_WIDTH: i32 = 380;
+const THREAD_PANE_MAX_WIDTH: i32 = 500;
+const MAIN_PANE_MIN_WITH_THREAD: i32 = 440;
+
 fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
     let mut messages = existing.to_vec();
     messages.extend(page.iter().cloned());
     messages.sort_by(|left, right| right.ts.cmp(&left.ts));
     messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
     messages
+}
+
+fn default_thread_pane_position(width: i32) -> Option<i32> {
+    if width <= 0 {
+        return None;
+    }
+
+    let thread_width = if width < MAIN_PANE_MIN_WITH_THREAD + THREAD_PANE_MIN_WIDTH {
+        width / 2
+    } else {
+        let responsive_width = width * 2 / 5;
+        let max_thread_width = THREAD_PANE_MAX_WIDTH.min(width - MAIN_PANE_MIN_WITH_THREAD);
+        responsive_width.clamp(THREAD_PANE_MIN_WIDTH, max_thread_width)
+    };
+
+    Some(width - thread_width)
+}
+
+fn increment_thread_parent_reply_count(
+    messages: &[SlackMessage],
+    thread_ts: &str,
+) -> Option<Vec<SlackMessage>> {
+    let thread_ts = thread_ts.trim();
+    if thread_ts.is_empty() {
+        return None;
+    }
+
+    let mut updated_messages = messages.to_vec();
+    let parent = updated_messages
+        .iter_mut()
+        .find(|message| message.ts == thread_ts)?;
+    parent.reply_count = Some(parent.reply_count.unwrap_or_default().saturating_add(1));
+
+    Some(updated_messages)
 }
 
 fn conversation_history_selection_action(
@@ -480,38 +497,6 @@ fn message_web_view_feature_policy() -> MessageWebViewFeaturePolicy {
         media: false,
         webgl: false,
         webaudio: false,
-    }
-}
-
-fn text_view_text(text_view: &gtk::TextView) -> String {
-    let buffer = text_view.buffer();
-    let (start, end) = buffer.bounds();
-    buffer.text(&start, &end, false).to_string()
-}
-
-fn set_text_view_text(text_view: &gtk::TextView, text: &str) {
-    text_view.buffer().set_text(text);
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextViewEnterAction {
-    Send,
-    InsertNewline,
-    Ignore,
-}
-
-fn text_view_enter_action(
-    key: gtk::gdk::Key,
-    state: gtk::gdk::ModifierType,
-) -> TextViewEnterAction {
-    if !matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter) {
-        return TextViewEnterAction::Ignore;
-    }
-
-    if state.intersects(gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::CONTROL_MASK) {
-        TextViewEnterAction::InsertNewline
-    } else {
-        TextViewEnterAction::Send
     }
 }
 
@@ -709,28 +694,58 @@ impl ConduitWindow {
         });
     }
 
-    fn setup_window_actions(&self) {
-        let sign_out_action = gio::SimpleAction::new("sign-out", None);
+    fn setup_settings(&self) {
+        let settings = gio::Settings::new(config::APPLICATION_ID);
         let weak_window = self.downgrade();
-        sign_out_action.connect_activate(move |_, _| {
-            if let Some(window) = weak_window.upgrade() {
-                window.send_command(RuntimeCommand::SignOut);
-            }
-        });
-        self.add_action(&sign_out_action);
+        settings.connect_changed(
+            Some(config::SIDEBAR_SHOW_UNREADS_SECTION_KEY),
+            move |_, _| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.render_conversations();
+                }
+            },
+        );
+        *self.imp().settings.borrow_mut() = Some(settings);
+    }
 
-        let switch_action = gio::SimpleAction::new("switch-conversation", None);
-        let weak_window = self.downgrade();
-        switch_action.connect_activate(move |_, _| {
-            if let Some(window) = weak_window.upgrade() {
-                window.show_conversation_switcher();
-            }
+    fn setup_window_actions(&self) {
+        self.add_window_action("sign-out", |window| {
+            window.send_command(RuntimeCommand::SignOut)
         });
-        self.add_action(&switch_action);
+        self.add_window_action("switch-conversation", |window| {
+            window.show_conversation_switcher()
+        });
+        self.add_window_action("search-workspace", |window| window.focus_workspace_search());
+        self.add_window_action("go-home", |window| window.show_home());
+        self.add_window_action("show-activity", |window| window.show_activity());
+        self.add_window_action("show-files", |window| window.show_files());
+        self.add_window_action("show-later", |window| window.show_later());
+        self.add_window_action("refresh-conversations", |window| {
+            window.refresh_conversations()
+        });
+        self.add_window_action("focus-composer", |window| window.focus_composer());
+        self.add_window_action("upload-file", |window| window.choose_file_for_upload());
+        self.add_window_action("close-thread", |window| window.close_thread());
 
         if let Some(application) = self.application() {
-            application.set_accels_for_action("win.switch-conversation", &["<control>k"]);
+            for shortcut in WINDOW_SHORTCUTS {
+                application.set_accels_for_action(shortcut.action, shortcut.accelerators);
+            }
         }
+    }
+
+    fn add_window_action<F>(&self, name: &str, callback: F)
+    where
+        F: Fn(&Self) + 'static,
+    {
+        let action = gio::SimpleAction::new(name, None);
+        let weak_window = self.downgrade();
+        action.connect_activate(move |_, _| {
+            if let Some(window) = weak_window.upgrade() {
+                callback(&window);
+            }
+        });
+        self.add_action(&action);
     }
 
     fn connect_widget<W, F>(&self, widget: &W, callback: F)
@@ -812,6 +827,7 @@ impl ConduitWindow {
             RuntimeEvent::ConversationsLoaded(conversations) => {
                 if !self.imp().connect_requested.get() {
                     self.populate_conversations(conversations);
+                    self.restore_workspace_status();
                 }
             }
             RuntimeEvent::ConversationsLoadFailed(error) => {
@@ -819,6 +835,14 @@ impl ConduitWindow {
                     self.show_conversation_load_error(&error);
                 }
             }
+            RuntimeEvent::ConversationUnreadUpdated {
+                channel_id,
+                unread_state,
+            } => self.apply_conversation_unread_state(&channel_id, unread_state),
+            RuntimeEvent::ConversationNotificationCandidate {
+                channel_id,
+                messages,
+            } => self.notify_if_new_messages(&channel_id, &messages),
             RuntimeEvent::HistoryLoaded {
                 channel_id,
                 messages,
@@ -846,6 +870,9 @@ impl ConduitWindow {
                 let scroll_behavior =
                     self.next_channel_history_scroll_behavior(&channel_id, append_older);
                 self.populate_history_with_scroll(&channel_id, rendered_messages, scroll_behavior);
+                if !cached {
+                    self.restore_workspace_status();
+                }
             }
             RuntimeEvent::ThreadLoaded {
                 channel_id,
@@ -864,6 +891,7 @@ impl ConduitWindow {
                 self.request_user_names(&rendered_messages);
                 *self.imp().current_thread_messages.borrow_mut() = rendered_messages.clone();
                 self.populate_thread(&channel_id, &ts, rendered_messages);
+                self.restore_workspace_status();
             }
             RuntimeEvent::SearchLoaded(results) => self.populate_search_results(results),
             RuntimeEvent::FilesLoaded(files) => self.populate_files(files),
@@ -875,6 +903,9 @@ impl ConduitWindow {
                 self.populate_user_names(HashMap::from([(user_id, display_name)]));
             }
             RuntimeEvent::UserNamesLoaded(user_names) => self.populate_user_names(user_names),
+            RuntimeEvent::UserGroupsLoaded { names, members } => {
+                self.populate_user_groups(names, members);
+            }
             RuntimeEvent::ImageAssetLoaded { key, data_uri } => {
                 crate::debug::log(
                     "ui",
@@ -905,7 +936,9 @@ impl ConduitWindow {
                 self.imp().thread_send_button.set_sensitive(true);
                 self.set_status("Message sent");
                 let thread_ts = message.thread_ts.clone();
-                if thread_ts.is_none() {
+                if let Some(thread_ts) = thread_ts.as_deref() {
+                    self.note_thread_reply_posted(&channel_id, thread_ts);
+                } else {
                     self.force_next_channel_bottom_render(&channel_id);
                 }
                 self.reload_after_message(&channel_id, thread_ts.as_deref());
@@ -1115,6 +1148,23 @@ impl ConduitWindow {
             "Searching",
         ));
         self.send_command(RuntimeCommand::SearchMessages { query });
+    }
+
+    fn focus_workspace_search(&self) {
+        let entry = self.imp().message_search_entry.get();
+        entry.grab_focus();
+        entry.select_region(0, -1);
+    }
+
+    fn focus_composer(&self) {
+        let imp = self.imp();
+        if imp.thread_pane.is_visible() {
+            imp.thread_entry.grab_focus();
+        } else if self.selected_channel_id().is_some() {
+            imp.message_entry.grab_focus();
+        } else {
+            self.set_status("Select a conversation");
+        }
     }
 
     fn post_current_message(&self) {
@@ -1415,6 +1465,41 @@ impl ConduitWindow {
             .cloned()
     }
 
+    fn note_thread_reply_posted(&self, channel_id: &str, thread_ts: &str) {
+        let imp = self.imp();
+        let selected = imp.selected_channel.borrow().as_deref() == Some(channel_id);
+        let current_update = selected.then(|| {
+            increment_thread_parent_reply_count(&imp.current_channel_messages.borrow(), thread_ts)
+        });
+
+        if let Some(Some(messages)) = current_update {
+            if imp.current_main_view.get() == MainMessageView::Conversation {
+                self.populate_history_with_scroll(
+                    channel_id,
+                    messages,
+                    TimelineScrollBehavior::Preserve,
+                );
+            } else {
+                *imp.current_channel_messages.borrow_mut() = messages.clone();
+                imp.channel_message_cache
+                    .borrow_mut()
+                    .insert(channel_id.to_string(), messages);
+            }
+            return;
+        }
+
+        let cached_update = imp
+            .channel_message_cache
+            .borrow()
+            .get(channel_id)
+            .and_then(|messages| increment_thread_parent_reply_count(messages, thread_ts));
+        if let Some(messages) = cached_update {
+            imp.channel_message_cache
+                .borrow_mut()
+                .insert(channel_id.to_string(), messages);
+        }
+    }
+
     fn reload_after_message(&self, channel_id: &str, thread_ts: Option<&str>) {
         if let Some(thread_ts) = thread_ts {
             set_text_view_text(&self.imp().thread_entry, "");
@@ -1469,6 +1554,8 @@ impl ConduitWindow {
         imp.conversations.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
+        imp.user_group_names.borrow_mut().clear();
+        imp.user_group_members.borrow_mut().clear();
         imp.pending_user_ids.borrow_mut().clear();
         *imp.workspace_name.borrow_mut() = None;
         *imp.workspace_url.borrow_mut() = None;
@@ -1509,8 +1596,7 @@ impl ConduitWindow {
             .unwrap_or_else(|| "Slack".to_string());
         *self.imp().workspace_name.borrow_mut() = Some(workspace_name.clone());
         self.imp().workspace_title_label.set_label(&workspace_name);
-        let label = format!("Connected to {workspace_name}");
-        self.set_status(&label);
+        self.set_status(&connected_workspace_status(Some(&workspace_name)));
         self.imp().content_stack.set_visible_child_name("workspace");
         if conversation_refresh_start_shows_sidebar_loading() {
             self.start_sidebar_loading();
@@ -1522,6 +1608,11 @@ impl ConduitWindow {
         imp.status_label.set_label(status);
         imp.connection_label.set_label(status);
         imp.workspace_status_label.set_label(status);
+    }
+
+    fn restore_workspace_status(&self) {
+        let workspace_name = self.imp().workspace_name.borrow().clone();
+        self.set_status(&connected_workspace_status(workspace_name.as_deref()));
     }
 
     fn start_sidebar_loading(&self) {
@@ -1625,6 +1716,49 @@ impl ConduitWindow {
         self.rerender_current_messages();
     }
 
+    fn populate_user_groups(
+        &self,
+        names: HashMap<String, String>,
+        members: HashMap<String, Vec<String>>,
+    ) {
+        if names.is_empty() && members.is_empty() {
+            return;
+        }
+
+        let changed = {
+            let imp = self.imp();
+            let mut known_names = imp.user_group_names.borrow_mut();
+            let mut known_members = imp.user_group_members.borrow_mut();
+            let mut changed = false;
+
+            for (group_id, name) in names {
+                if group_id.trim().is_empty() || name.trim().is_empty() {
+                    continue;
+                }
+                if known_names.get(&group_id) != Some(&name) {
+                    known_names.insert(group_id, name);
+                    changed = true;
+                }
+            }
+
+            for (group_id, member_names) in members {
+                if group_id.trim().is_empty() {
+                    continue;
+                }
+                if known_members.get(&group_id) != Some(&member_names) {
+                    known_members.insert(group_id, member_names);
+                    changed = true;
+                }
+            }
+
+            changed
+        };
+
+        if changed {
+            self.rerender_current_messages();
+        }
+    }
+
     fn mark_conversation_locally_read(&self, channel_id: &str) {
         let mut conversations = self.imp().conversations.borrow_mut();
         if let Some(conversation) = conversations
@@ -1632,6 +1766,42 @@ impl ConduitWindow {
             .find(|conversation| conversation.id == channel_id)
         {
             conversation.clear_unread_activity();
+        }
+    }
+
+    fn apply_conversation_unread_state(&self, channel_id: &str, unread_state: SlackUnreadState) {
+        if !unread_state.known {
+            return;
+        }
+        if self
+            .selected_channel_id()
+            .as_deref()
+            .is_some_and(|selected_channel| selected_channel == channel_id)
+        {
+            return;
+        }
+
+        let changed = {
+            let mut conversations = self.imp().conversations.borrow_mut();
+            let Some(conversation) = conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == channel_id)
+            else {
+                return;
+            };
+
+            let previous_unread = conversation.has_unread_activity();
+            let previous_count = conversation.unread_activity_count();
+            conversation.apply_unread_state(unread_state);
+            previous_unread != conversation.has_unread_activity()
+                || previous_count != conversation.unread_activity_count()
+        };
+
+        if changed {
+            self.render_conversations();
+            if self.imp().current_main_view.get() == MainMessageView::Activity {
+                self.populate_activity(self.activity_items());
+            }
         }
     }
 
@@ -1685,75 +1855,45 @@ impl ConduitWindow {
         let imp = self.imp();
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
-        let selected_channel =
-            sidebar_selected_channel(imp.current_main_view.get(), self.selected_channel_id());
-        let filtered = self.filtered_sidebar_conversations(&conversations, &user_names);
-        let unread_only = imp.sidebar_unread_filter_button.is_active();
-        let mut sections =
-            sidebar::build_sidebar_sections(&filtered, &user_names, selected_channel.as_deref());
-        if unread_only {
-            sections.retain(|section| section.kind != SidebarSectionKind::Unreads);
-        }
+        let selected_channel = (imp.current_main_view.get() == MainMessageView::Conversation)
+            .then(|| self.selected_channel_id())
+            .flatten();
+        let model = sidebar::build_sidebar_list(
+            &conversations,
+            &user_names,
+            sidebar::SidebarBuildOptions {
+                selected_channel: selected_channel.as_deref(),
+                query: imp.sidebar_filter_entry.text().as_str(),
+                unread_only: imp.sidebar_unread_filter_button.is_active(),
+                show_unreads_section: self.show_unreads_section(),
+                show_all: imp.sidebar_all_filter_button.is_active(),
+                loading: imp.sidebar_loading.get(),
+                has_error: imp.sidebar_error.borrow().is_some(),
+            },
+        );
 
         imp.sidebar_row_actions.borrow_mut().clear();
         self.clear_list(&imp.conversation_list);
 
-        if imp.sidebar_loading.get() && conversations.is_empty() {
-            self.append_placeholder(&imp.conversation_list, "Loading conversations");
-            return;
-        }
-
-        if imp.sidebar_error.borrow().is_some() && conversations.is_empty() {
-            self.append_placeholder(&imp.conversation_list, "Could not load conversations");
-            return;
-        }
-
-        if conversations.is_empty() {
-            self.append_placeholder(&imp.conversation_list, "No conversations");
-            return;
-        }
-
-        if sections.is_empty() {
-            self.append_placeholder(&imp.conversation_list, "No matching conversations");
-            return;
-        }
-
-        for section in sections {
-            self.append_sidebar_section(&imp.conversation_list, &section);
+        match model {
+            sidebar::SidebarListModel::Placeholder(placeholder) => {
+                self.append_placeholder(&imp.conversation_list, placeholder.label());
+            }
+            sidebar::SidebarListModel::Sections(sections) => {
+                for section in sections {
+                    self.append_sidebar_section(&imp.conversation_list, &section);
+                }
+            }
         }
     }
 
-    fn filtered_sidebar_conversations(
-        &self,
-        conversations: &[SlackConversation],
-        user_names: &HashMap<String, String>,
-    ) -> Vec<SlackConversation> {
-        let query = self.imp().sidebar_filter_entry.text().trim().to_lowercase();
-        let unread_only = self.imp().sidebar_unread_filter_button.is_active();
-        let show_all = self.imp().sidebar_all_filter_button.is_active();
-        let selected_channel = self.selected_channel_id();
-
-        if show_all && query.is_empty() && !unread_only {
-            return conversations.to_vec();
-        }
-
-        conversations
-            .iter()
-            .filter(|conversation| {
-                (show_all
-                    || sidebar::conversation_visible_in_default_sidebar(
-                        conversation,
-                        selected_channel.as_deref(),
-                    ))
-                    && sidebar_conversation_matches_filters(
-                        conversation,
-                        user_names,
-                        &query,
-                        unread_only,
-                    )
-            })
-            .cloned()
-            .collect()
+    fn show_unreads_section(&self) -> bool {
+        self.imp()
+            .settings
+            .borrow()
+            .as_ref()
+            .map(|settings| settings.boolean(config::SIDEBAR_SHOW_UNREADS_SECTION_KEY))
+            .unwrap_or(false)
     }
 
     fn append_sidebar_section(&self, list: &gtk::ListBox, section: &SidebarSectionModel) {
@@ -1781,50 +1921,7 @@ impl ConduitWindow {
     }
 
     fn append_sidebar_conversation(&self, list: &gtk::ListBox, model: &SidebarRowModel) {
-        let row = gtk::ListBoxRow::new();
-        row.set_selectable(true);
-        row.set_activatable(true);
-        let accessible_label = model.accessible_label();
-        row.set_tooltip_text(Some(&accessible_label));
-        row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
-
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        content.set_margin_top(3);
-        content.set_margin_bottom(3);
-        content.set_margin_start(6);
-        content.set_margin_end(6);
-
-        let icon = gtk::Image::from_icon_name(model.kind.icon_name());
-        icon.set_tooltip_text(Some(model.kind.accessible_name()));
-        content.append(&icon);
-
-        let title = gtk::Label::new(Some(&model.title));
-        title.set_xalign(0.0);
-        title.set_hexpand(true);
-        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        title.set_attributes(Some(&sidebar_title_attributes(model.unread_count)));
-        content.append(&title);
-
-        if let Some(unread_label) = model.unread_badge_label() {
-            let unread = gtk::Label::new(Some(&unread_label));
-            unread.add_css_class("caption");
-            unread.add_css_class("heading");
-            content.append(&unread);
-        }
-
-        if model.muted {
-            let muted = gtk::Image::from_icon_name("notifications-disabled-symbolic");
-            muted.set_tooltip_text(Some("Muted"));
-            content.append(&muted);
-        }
-
-        if model.external {
-            let external = gtk::Image::from_icon_name("network-workgroup-symbolic");
-            external.set_tooltip_text(Some("Shared externally"));
-            content.append(&external);
-        }
-
-        row.set_child(Some(&content));
+        let row = sidebar_row_widget(model, SidebarRowLayout::sidebar());
         list.append(&row);
         self.register_sidebar_row_action(row.index(), model);
         if model.selected && list.selected_row().is_none() {
@@ -1852,7 +1949,7 @@ impl ConduitWindow {
         let imp = self.imp();
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
-        let items = conversation_switcher_items(&conversations, &user_names, "");
+        let items = sidebar::conversation_switcher_items(&conversations, &user_names, "");
         if items.is_empty() {
             self.set_status("No conversations loaded");
             return;
@@ -1910,7 +2007,7 @@ impl ConduitWindow {
         let user_names_for_search = user_names.clone();
         search.connect_search_changed(move |entry| {
             if let Some(window) = weak_window.upgrade() {
-                let items = conversation_switcher_items(
+                let items = sidebar::conversation_switcher_items(
                     &conversations_for_search,
                     &user_names_for_search,
                     entry.text().as_str(),
@@ -1963,38 +2060,7 @@ impl ConduitWindow {
         actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
         model: &SidebarRowModel,
     ) {
-        let row = gtk::ListBoxRow::new();
-        row.set_selectable(true);
-        row.set_activatable(true);
-        let accessible_label = model.accessible_label();
-        row.set_tooltip_text(Some(&accessible_label));
-        row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
-
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        content.set_margin_top(6);
-        content.set_margin_bottom(6);
-        content.set_margin_start(8);
-        content.set_margin_end(8);
-
-        let icon = gtk::Image::from_icon_name(model.kind.icon_name());
-        icon.set_tooltip_text(Some(model.kind.accessible_name()));
-        content.append(&icon);
-
-        let title = gtk::Label::new(Some(&model.title));
-        title.set_xalign(0.0);
-        title.set_hexpand(true);
-        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        title.set_attributes(Some(&sidebar_title_attributes(model.unread_count)));
-        content.append(&title);
-
-        if let Some(unread_label) = model.unread_badge_label() {
-            let unread = gtk::Label::new(Some(&unread_label));
-            unread.add_css_class("caption");
-            unread.add_css_class("heading");
-            content.append(&unread);
-        }
-
-        row.set_child(Some(&content));
+        let row = sidebar_row_widget(model, SidebarRowLayout::switcher());
         list.append(&row);
         actions
             .borrow_mut()
@@ -2207,14 +2273,9 @@ impl ConduitWindow {
 
     fn set_default_thread_pane_position(&self) {
         let paned = self.imp().message_thread_paned.get();
-        let width = paned.width();
-        if width <= 0 {
-            return;
+        if let Some(position) = default_thread_pane_position(paned.width()) {
+            paned.set_position(position);
         }
-
-        // Keep the thread pane half as wide as the main message pane:
-        // message width is 2/3 of the paned area, thread width is 1/3.
-        paned.set_position(width * 2 / 3);
     }
 
     fn populate_activity(&self, items: Vec<ActivityItem>) {
@@ -2269,18 +2330,6 @@ impl ConduitWindow {
 
         let latest_message = messages.iter().find(|message| message.ts == latest_ts);
         let current_user_id = self.imp().current_user_id.borrow().clone();
-
-        if latest_message
-            .and_then(|message| message.user.as_deref())
-            .is_some_and(|user| Some(user) == current_user_id.as_deref())
-        {
-            self.imp()
-                .latest_message_ts_by_channel
-                .borrow_mut()
-                .insert(channel_id.to_string(), latest_ts);
-            return;
-        }
-
         let previous_ts = self
             .imp()
             .latest_message_ts_by_channel
@@ -2293,19 +2342,40 @@ impl ConduitWindow {
             .borrow_mut()
             .insert(channel_id.to_string(), latest_ts.clone());
 
-        let has_new_message = previous_ts
-            .as_deref()
-            .is_some_and(|previous_ts| latest_ts.as_str() > previous_ts);
+        let selected_channel = self.selected_channel_id();
+        let (has_unread, muted) = self.notification_conversation_state(channel_id);
+        let action = message_notification_action(MessageNotificationState {
+            channel_id,
+            selected_channel: selected_channel.as_deref(),
+            previous_latest_ts: previous_ts.as_deref(),
+            latest_ts: latest_ts.as_str(),
+            latest_message_user: latest_message.and_then(|message| message.user.as_deref()),
+            current_user: current_user_id.as_deref(),
+            has_unread,
+            muted,
+        });
 
-        if has_new_message {
+        if action == MessageNotificationAction::Notify {
             self.send_notification(
                 &self.conversation_title(channel_id),
-                latest_message
-                    .map(SlackMessage::body_text)
-                    .as_deref()
-                    .unwrap_or("New message"),
+                message_notification_body(latest_message),
             );
         }
+    }
+
+    fn notification_conversation_state(&self, channel_id: &str) -> (bool, bool) {
+        self.imp()
+            .conversations
+            .borrow()
+            .iter()
+            .find(|conversation| conversation.id == channel_id)
+            .map(|conversation| {
+                (
+                    conversation.has_unread_activity(),
+                    conversation.is_muted_conversation(),
+                )
+            })
+            .unwrap_or((false, false))
     }
 
     fn send_notification(&self, title: &str, body: &str) {
@@ -2399,8 +2469,7 @@ impl ConduitWindow {
             .conversations
             .borrow()
             .iter()
-            .filter(|conversation| conversation.is_im.unwrap_or(false))
-            .filter_map(|conversation| conversation.user.clone())
+            .flat_map(SlackConversation::display_user_ids)
             .collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
@@ -2494,6 +2563,8 @@ impl ConduitWindow {
         let imp = self.imp();
         MessageHtmlContext {
             user_names: imp.user_names.borrow().clone(),
+            user_group_names: imp.user_group_names.borrow().clone(),
+            user_group_members: imp.user_group_members.borrow().clone(),
             current_user_id: imp.current_user_id.borrow().clone(),
             thread_ts: thread_ts.map(ToString::to_string),
             load_more_url: None,
@@ -2536,6 +2607,7 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             kind: ConversationKind::DirectMessage,
+            unread: false,
             unread_count: 0,
             selected: false,
             private: true,
@@ -2579,119 +2651,50 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_title_weight_uses_bold_only_for_unread_rows() {
-        assert_eq!(sidebar_title_weight(0), gtk::pango::Weight::Normal);
-        assert_eq!(sidebar_title_weight(1), gtk::pango::Weight::Bold);
-        assert_eq!(sidebar_title_weight(12), gtk::pango::Weight::Bold);
-    }
-
-    #[test]
-    fn sidebar_selection_is_visible_only_for_conversation_view() {
-        let selected = Some("C123".to_string());
-
-        assert_eq!(
-            sidebar_selected_channel(MainMessageView::Conversation, selected.clone()),
-            selected
-        );
-        assert_eq!(
-            sidebar_selected_channel(MainMessageView::Search, Some("C123".to_string())),
-            None
-        );
-        assert_eq!(
-            sidebar_selected_channel(MainMessageView::Files, Some("C123".to_string())),
-            None
-        );
-        assert_eq!(
-            sidebar_selected_channel(MainMessageView::Activity, Some("C123".to_string())),
-            None
-        );
-        assert_eq!(
-            sidebar_selected_channel(MainMessageView::Saved, Some("C123".to_string())),
-            None
-        );
-        assert_eq!(
-            sidebar_selected_channel(MainMessageView::Placeholder, Some("C123".to_string())),
-            None
-        );
-    }
-
-    #[test]
-    fn sidebar_filter_predicate_combines_query_and_unread_toggle() {
-        let unread = SlackConversation {
-            id: "C123".to_string(),
-            name: Some("general".to_string()),
-            is_channel: Some(true),
-            unread_count: Some(2),
-            ..Default::default()
-        };
-        let read = SlackConversation {
-            id: "C456".to_string(),
-            name: Some("random".to_string()),
-            is_channel: Some(true),
-            ..Default::default()
-        };
-        let mut extra_unread = SlackConversation {
-            id: "D123".to_string(),
-            user: Some("U123".to_string()),
-            is_im: Some(true),
-            ..Default::default()
-        };
-        extra_unread
-            .extra
-            .insert("has_unreads".to_string(), serde_json::json!(true));
-        let user_names = HashMap::from([("U123".to_string(), "Ada".to_string())]);
-
-        assert!(sidebar_conversation_matches_filters(
-            &unread,
-            &user_names,
-            "",
-            true
-        ));
-        assert!(!sidebar_conversation_matches_filters(
-            &read,
-            &user_names,
-            "",
-            true
-        ));
-        assert!(sidebar_conversation_matches_filters(
-            &extra_unread,
-            &user_names,
-            "ada",
-            true
-        ));
-        assert!(!sidebar_conversation_matches_filters(
-            &unread,
-            &user_names,
-            "random",
-            true
-        ));
-    }
-
-    #[test]
     fn sidebar_error_change_preserves_populated_list() {
         assert!(sidebar_error_change_needs_render(false));
         assert!(!sidebar_error_change_needs_render(true));
     }
 
     #[test]
-    fn sidebar_user_name_updates_render_only_for_idle_dm_rows() {
+    fn connected_workspace_status_uses_workspace_name_when_available() {
+        assert_eq!(
+            connected_workspace_status(Some("Signicat")),
+            "Connected to Signicat"
+        );
+        assert_eq!(connected_workspace_status(None), "Connected to Slack");
+    }
+
+    #[test]
+    fn sidebar_user_name_updates_render_for_idle_dm_and_group_dm_rows() {
         let dm = SlackConversation {
             id: "D123".to_string(),
             user: Some("U123".to_string()),
             is_im: Some(true),
             ..Default::default()
         };
+        let group_dm: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G123",
+            "is_mpim": true,
+            "members": ["U456", "U789"]
+        }))
+        .expect("failed to parse group direct message");
         let channel = SlackConversation {
             id: "C123".to_string(),
             name: Some("general".to_string()),
             is_channel: Some(true),
             ..Default::default()
         };
-        let conversations = vec![dm, channel];
+        let conversations = vec![dm, group_dm, channel];
 
         assert!(sidebar_user_name_update_needs_render(
             &conversations,
             "U123",
+            false
+        ));
+        assert!(sidebar_user_name_update_needs_render(
+            &conversations,
+            "U456",
             false
         ));
         assert!(!sidebar_user_name_update_needs_render(
@@ -2726,55 +2729,6 @@ mod tests {
     }
 
     #[test]
-    fn conversation_switcher_items_search_all_loaded_conversations() {
-        let active = SlackConversation {
-            id: "C123".to_string(),
-            name: Some("general".to_string()),
-            is_channel: Some(true),
-            ..Default::default()
-        };
-        let dormant_dm: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "D123",
-            "user": "U123",
-            "is_im": true,
-            "properties": {
-                "is_dormant": true
-            }
-        }))
-        .expect("failed to parse dormant DM");
-        let user_names = HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]);
-
-        let items = conversation_switcher_items(&[active, dormant_dm], &user_names, "ada");
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, "D123");
-        assert_eq!(items[0].title, "Ada Lovelace");
-    }
-
-    #[test]
-    fn conversation_switcher_items_match_title_and_id() {
-        let general = SlackConversation {
-            id: "C123".to_string(),
-            name: Some("general".to_string()),
-            is_channel: Some(true),
-            ..Default::default()
-        };
-        let random = SlackConversation {
-            id: "C456".to_string(),
-            name: Some("random".to_string()),
-            is_channel: Some(true),
-            ..Default::default()
-        };
-
-        let title_match =
-            conversation_switcher_items(&[general.clone(), random.clone()], &HashMap::new(), "gen");
-        let id_match = conversation_switcher_items(&[general, random], &HashMap::new(), "456");
-
-        assert_eq!(title_match[0].id, "C123");
-        assert_eq!(id_match[0].id, "C456");
-    }
-
-    #[test]
     fn browser_session_input_requires_both_tokens() {
         assert_eq!(
             browser_session_input("xoxc-token", "").unwrap_err(),
@@ -2791,38 +2745,6 @@ mod tests {
         assert_eq!(
             browser_session_input(" xoxc-token ", " xoxd-token ").unwrap(),
             ("xoxc-token".to_string(), "xoxd-token".to_string())
-        );
-    }
-
-    #[test]
-    fn text_view_enter_action_sends_on_plain_enter() {
-        assert_eq!(
-            text_view_enter_action(gtk::gdk::Key::Return, gtk::gdk::ModifierType::empty()),
-            TextViewEnterAction::Send
-        );
-        assert_eq!(
-            text_view_enter_action(gtk::gdk::Key::KP_Enter, gtk::gdk::ModifierType::empty()),
-            TextViewEnterAction::Send
-        );
-    }
-
-    #[test]
-    fn text_view_enter_action_inserts_newline_with_shift_or_control() {
-        assert_eq!(
-            text_view_enter_action(gtk::gdk::Key::Return, gtk::gdk::ModifierType::SHIFT_MASK),
-            TextViewEnterAction::InsertNewline
-        );
-        assert_eq!(
-            text_view_enter_action(gtk::gdk::Key::Return, gtk::gdk::ModifierType::CONTROL_MASK),
-            TextViewEnterAction::InsertNewline
-        );
-    }
-
-    #[test]
-    fn text_view_enter_action_ignores_other_keys() {
-        assert_eq!(
-            text_view_enter_action(gtk::gdk::Key::space, gtk::gdk::ModifierType::empty()),
-            TextViewEnterAction::Ignore
         );
     }
 
@@ -2851,6 +2773,128 @@ mod tests {
                 "1710000100.000000"
             ]
         );
+    }
+
+    #[test]
+    fn notification_policy_notifies_only_for_new_unread_incoming_messages() {
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                channel_id: "C123",
+                selected_channel: Some("C456"),
+                previous_latest_ts: Some("1710000100.000000"),
+                latest_ts: "1710000200.000000",
+                latest_message_user: Some("U456"),
+                current_user: Some("U123"),
+                has_unread: true,
+                muted: false,
+            }),
+            MessageNotificationAction::Notify
+        );
+    }
+
+    #[test]
+    fn notification_policy_records_without_notifying_for_non_notifyable_messages() {
+        let notifyable = MessageNotificationState {
+            channel_id: "C123",
+            selected_channel: Some("C456"),
+            previous_latest_ts: Some("1710000100.000000"),
+            latest_ts: "1710000200.000000",
+            latest_message_user: Some("U456"),
+            current_user: Some("U123"),
+            has_unread: true,
+            muted: false,
+        };
+
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                previous_latest_ts: None,
+                ..notifyable
+            }),
+            MessageNotificationAction::RecordOnly
+        );
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                selected_channel: Some("C123"),
+                ..notifyable
+            }),
+            MessageNotificationAction::RecordOnly
+        );
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                has_unread: false,
+                ..notifyable
+            }),
+            MessageNotificationAction::RecordOnly
+        );
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                muted: true,
+                ..notifyable
+            }),
+            MessageNotificationAction::RecordOnly
+        );
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                latest_message_user: Some("U123"),
+                ..notifyable
+            }),
+            MessageNotificationAction::RecordOnly
+        );
+    }
+
+    #[test]
+    fn notification_body_uses_fallback_for_empty_message_text() {
+        assert_eq!(message_notification_body(None), "New message");
+        assert_eq!(
+            message_notification_body(Some(&SlackMessage {
+                ts: "1710000100.000000".to_string(),
+                text: Some("   ".to_string()),
+                ..Default::default()
+            })),
+            "New message"
+        );
+        assert_eq!(
+            message_notification_body(Some(&message("1710000200.000000", "Hello"))),
+            "Hello"
+        );
+    }
+
+    #[test]
+    fn default_thread_pane_position_uses_readable_thread_width() {
+        assert_eq!(default_thread_pane_position(0), None);
+        assert_eq!(default_thread_pane_position(600), Some(300));
+        assert_eq!(default_thread_pane_position(820), Some(440));
+        assert_eq!(default_thread_pane_position(1060), Some(636));
+        assert_eq!(default_thread_pane_position(1400), Some(900));
+    }
+
+    #[test]
+    fn thread_reply_update_adds_first_thread_count_to_parent_message() {
+        let parent = message("1710000300.000000", "parent");
+
+        let updated = increment_thread_parent_reply_count(&[parent], "1710000300.000000")
+            .expect("parent message should be updated");
+
+        assert_eq!(updated[0].reply_count, Some(1));
+        assert!(updated[0].has_thread());
+    }
+
+    #[test]
+    fn thread_reply_update_increments_existing_parent_reply_count() {
+        let mut parent = message("1710000300.000000", "parent");
+        parent.reply_count = Some(3);
+
+        let updated = increment_thread_parent_reply_count(&[parent], "1710000300.000000")
+            .expect("parent message should be updated");
+
+        assert_eq!(updated[0].reply_count, Some(4));
+    }
+
+    #[test]
+    fn thread_reply_update_ignores_missing_parent_message() {
+        let parent = message("1710000300.000000", "parent");
+
+        assert!(increment_thread_parent_reply_count(&[parent], "1710000200.000000").is_none());
     }
 
     #[test]

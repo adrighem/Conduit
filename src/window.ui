@@ -277,7 +277,7 @@
                     <property name="end-child">
                       <object class="GtkPaned" id="message_thread_paned">
                         <property name="orientation">horizontal</property>
-                        <property name="position">640</property>
+                        <property name="position">440</property>
                         <property name="start-child">
                           <object class="GtkBox">
                             <property name="orientation">vertical</property>
@@ -294,6 +294,7 @@
                                   <object class="GtkLabel" id="message_title">
                                     <property name="xalign">0</property>
                                     <property name="hexpand">True</property>
+                                    <property name="ellipsize">end</property>
                                     <property name="label" translatable="yes">Select a conversation</property>
                                     <style>
                                       <class name="heading"/>
@@ -303,13 +304,13 @@
                                 <child>
                                   <object class="GtkSearchEntry" id="message_search_entry">
                                     <property name="width-request">220</property>
-                                    <property name="placeholder-text" translatable="yes">Search messages</property>
+                                    <property name="placeholder-text" translatable="yes">Search workspace</property>
                                   </object>
                                 </child>
                                 <child>
                                   <object class="GtkButton" id="message_search_button">
                                     <property name="icon-name">system-search-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Search Messages</property>
+                                    <property name="tooltip-text" translatable="yes">Search Workspace Messages</property>
                                   </object>
                                 </child>
                               </object>
@@ -455,6 +456,10 @@
       <item>
         <attribute name="label" translatable="yes">_Keyboard Shortcuts</attribute>
         <attribute name="action">app.shortcuts</attribute>
+      </item>
+      <item>
+        <attribute name="label" translatable="yes">_Preferences</attribute>
+        <attribute name="action">app.preferences</attribute>
       </item>
       <item>
         <attribute name="label" translatable="yes">_About Conduit</attribute>

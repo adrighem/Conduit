@@ -6,11 +6,11 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUser,
-    StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
+    SlackUser, SlackUserGroup, StoredToken,
 };
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -19,6 +19,7 @@ const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
 const MAX_RETRY_AFTER_SECONDS: u64 = 30;
 pub(crate) const CHANNEL_HISTORY_PAGE_LIMIT: usize = 30;
+const UNREAD_STATE_HISTORY_LIMIT: usize = 1;
 const THREAD_HISTORY_PAGE_LIMIT: usize = 50;
 const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
 const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROPERTIES";
@@ -107,19 +108,59 @@ impl SlackApi {
         channel_id: &str,
         cursor: Option<&str>,
     ) -> Result<SlackMessagePage> {
-        let mut params = vec![
-            ("channel", channel_id.to_string()),
-            ("limit", CHANNEL_HISTORY_PAGE_LIMIT.to_string()),
-        ];
-        if let Some(cursor) = cursor.filter(|cursor| !cursor.trim().is_empty()) {
-            params.push(("cursor", cursor.to_string()));
-        }
+        let params = history_request_params(channel_id, cursor, CHANNEL_HISTORY_PAGE_LIMIT, true);
 
         let response: HistoryResponse = self.post_form("conversations.history", &params).await?;
         Ok(SlackMessagePage::from_response(
             response,
             std::convert::identity,
         ))
+    }
+
+    pub async fn unread_state(&self, channel_id: &str) -> Result<SlackUnreadState> {
+        let mut last_read: Option<String> = None;
+
+        match self.conversation_info(channel_id).await {
+            Ok(conversation) => {
+                let unread_state = conversation.unread_state();
+                if unread_state.known {
+                    return Ok(unread_state);
+                }
+
+                last_read = conversation_last_read_ts(&conversation).map(ToString::to_string);
+                if let (Some(last_read), Some(latest_ts)) =
+                    (last_read.as_deref(), conversation_latest_ts(&conversation))
+                {
+                    return Ok(unread_state_from_last_read(last_read, latest_ts));
+                }
+            }
+            Err(error) => crate::debug::log(
+                "slack",
+                &format!("ConversationInfoUnreadFallback channel_id={channel_id} error={error:#}"),
+            ),
+        }
+
+        let params = history_request_params(channel_id, None, UNREAD_STATE_HISTORY_LIMIT, true);
+        let response: HistoryResponse = self.post_form("conversations.history", &params).await?;
+        let unread_state = unread_state_from_history_response(&response);
+        if unread_state.known {
+            return Ok(unread_state);
+        }
+
+        if let (Some(last_read), Some(latest_message)) =
+            (last_read.as_deref(), response.messages.first())
+        {
+            return Ok(unread_state_from_last_read(last_read, &latest_message.ts));
+        }
+
+        Ok(unread_state)
+    }
+
+    pub async fn conversation_info(&self, channel_id: &str) -> Result<SlackConversation> {
+        let response: ConversationInfoResponse = self
+            .post_form("conversations.info", &[("channel", channel_id.to_string())])
+            .await?;
+        Ok(response.channel)
     }
 
     pub async fn thread_replies(&self, channel_id: &str, ts: &str) -> Result<SlackMessagePage> {
@@ -187,6 +228,13 @@ impl SlackApi {
             .user
             .display_name()
             .unwrap_or_else(|| user_id.to_string()))
+    }
+
+    pub async fn user_groups(&self) -> Result<Vec<SlackUserGroup>> {
+        let response: UserGroupsListResponse = self
+            .post_form("usergroups.list", &[("include_users", "true".to_string())])
+            .await?;
+        Ok(response.usergroups)
     }
 
     pub async fn download_image(&self, url: &str) -> Result<DownloadedImage> {
@@ -473,6 +521,24 @@ fn rate_limit_retries_for_method(method: &str) -> usize {
     }
 }
 
+fn history_request_params(
+    channel_id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    include_unreads: bool,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![
+        ("channel", channel_id.to_string()),
+        ("limit", limit.to_string()),
+    ];
+    if let Some(cursor) = cursor.filter(|cursor| !cursor.trim().is_empty()) {
+        params.push(("cursor", cursor.to_string()));
+    } else if include_unreads {
+        params.push(("unreads", "true".to_string()));
+    }
+    params
+}
+
 fn token_scope_set(scope: Option<&str>) -> HashSet<String> {
     scope
         .unwrap_or_default()
@@ -488,6 +554,7 @@ pub struct SlackMessagePage {
     pub messages: Vec<SlackMessage>,
     pub has_more: bool,
     pub next_cursor: Option<String>,
+    pub unread_state: SlackUnreadState,
 }
 
 impl SlackMessagePage {
@@ -495,6 +562,7 @@ impl SlackMessagePage {
         response: HistoryResponse,
         normalize_messages: impl FnOnce(Vec<SlackMessage>) -> Vec<SlackMessage>,
     ) -> Self {
+        let unread_state = unread_state_from_history_response(&response);
         let next_cursor = response
             .response_metadata
             .and_then(|metadata| metadata.next_cursor)
@@ -508,8 +576,68 @@ impl SlackMessagePage {
             messages: normalize_messages(response.messages),
             has_more,
             next_cursor,
+            unread_state,
         }
     }
+}
+
+fn unread_state_from_history_response(response: &HistoryResponse) -> SlackUnreadState {
+    let display_count = response
+        .unread_count_display
+        .or_else(|| {
+            response
+                .unread_count_string
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or_else(|| response.unread_count.unwrap_or_default());
+    let has_unread = response.has_unreads.unwrap_or(false)
+        || response.is_unread.unwrap_or(false)
+        || response.unread_count.is_some_and(|count| count > 0)
+        || display_count > 0;
+    let known = response.unread_count.is_some()
+        || response.unread_count_display.is_some()
+        || response.unread_count_string.is_some()
+        || response.has_unreads.is_some()
+        || response.is_unread.is_some();
+
+    SlackUnreadState::from_parts(known, has_unread, display_count)
+}
+
+fn unread_state_from_last_read(last_read: &str, latest_ts: &str) -> SlackUnreadState {
+    SlackUnreadState::from_parts(true, slack_ts_is_after(latest_ts, last_read), 0)
+}
+
+fn slack_ts_is_after(left: &str, right: &str) -> bool {
+    match (parse_slack_ts(left), parse_slack_ts(right)) {
+        (Some(left), Some(right)) => left > right,
+        _ => left > right,
+    }
+}
+
+fn parse_slack_ts(value: &str) -> Option<(u64, u64)> {
+    let (seconds, micros) = value.trim().split_once('.')?;
+    Some((seconds.parse().ok()?, micros.parse().ok()?))
+}
+
+fn conversation_last_read_ts(conversation: &SlackConversation) -> Option<&str> {
+    conversation
+        .extra
+        .get("last_read")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn conversation_latest_ts(conversation: &SlackConversation) -> Option<&str> {
+    let latest = conversation.extra.get("latest")?;
+    match latest {
+        Value::String(value) => Some(value.as_str()),
+        Value::Object(object) => object.get("ts").and_then(Value::as_str),
+        _ => None,
+    }
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone)]
@@ -672,11 +800,24 @@ struct ConversationListResponse {
 impl_slack_response!(ConversationListResponse);
 
 #[derive(Debug, Deserialize)]
+struct ConversationInfoResponse {
+    ok: bool,
+    error: Option<String>,
+    channel: SlackConversation,
+}
+impl_slack_response!(ConversationInfoResponse);
+
+#[derive(Debug, Deserialize)]
 struct HistoryResponse {
     ok: bool,
     error: Option<String>,
     messages: Vec<SlackMessage>,
     has_more: Option<bool>,
+    unread_count: Option<u64>,
+    unread_count_display: Option<u64>,
+    unread_count_string: Option<String>,
+    has_unreads: Option<bool>,
+    is_unread: Option<bool>,
     response_metadata: Option<ResponseMetadata>,
 }
 impl_slack_response!(HistoryResponse);
@@ -717,6 +858,14 @@ struct UserInfoResponse {
     user: SlackUser,
 }
 impl_slack_response!(UserInfoResponse);
+
+#[derive(Debug, Deserialize)]
+struct UserGroupsListResponse {
+    ok: bool,
+    error: Option<String>,
+    usergroups: Vec<SlackUserGroup>,
+}
+impl_slack_response!(UserGroupsListResponse);
 
 #[derive(Debug, Deserialize)]
 struct PostMessageResponse {
@@ -833,6 +982,11 @@ mod tests {
                 error: None,
                 messages: vec![message("1710000000.000100")],
                 has_more: Some(false),
+                unread_count: None,
+                unread_count_display: None,
+                unread_count_string: None,
+                has_unreads: None,
+                is_unread: None,
                 response_metadata: Some(ResponseMetadata {
                     next_cursor: Some(" next-page ".to_string()),
                 }),
@@ -842,6 +996,89 @@ mod tests {
 
         assert!(page.has_more);
         assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
+    }
+
+    #[test]
+    fn latest_history_request_includes_unread_state() {
+        assert!(
+            history_request_params("C123", None, CHANNEL_HISTORY_PAGE_LIMIT, true)
+                .contains(&("unreads", "true".to_string()))
+        );
+        assert_eq!(
+            history_request_params("C123", None, UNREAD_STATE_HISTORY_LIMIT, true)
+                .iter()
+                .find(|(key, _)| *key == "limit")
+                .map(|(_, value)| value.as_str()),
+            Some("1")
+        );
+        assert!(!history_request_params(
+            "C123",
+            Some("next-page"),
+            CHANNEL_HISTORY_PAGE_LIMIT,
+            true
+        )
+        .iter()
+        .any(|(key, _)| *key == "unreads"));
+    }
+
+    #[test]
+    fn message_page_preserves_badgeless_unread_state() {
+        let page = SlackMessagePage::from_response(
+            HistoryResponse {
+                ok: true,
+                error: None,
+                messages: vec![message("1710000000.000100")],
+                has_more: Some(false),
+                unread_count: Some(5),
+                unread_count_display: Some(0),
+                unread_count_string: None,
+                has_unreads: None,
+                is_unread: None,
+                response_metadata: None,
+            },
+            std::convert::identity,
+        );
+
+        assert!(page.unread_state.known);
+        assert!(page.unread_state.has_unread);
+        assert_eq!(page.unread_state.display_count, 0);
+    }
+
+    #[test]
+    fn last_read_comparison_detects_badgeless_unread_state() {
+        let unread = unread_state_from_last_read("1710000000.000000", "1710000001.000000");
+        let read = unread_state_from_last_read("1710000001.000000", "1710000001.000000");
+
+        assert!(unread.known);
+        assert!(unread.has_unread);
+        assert_eq!(unread.display_count, 0);
+        assert!(read.known);
+        assert!(!read.has_unread);
+    }
+
+    #[test]
+    fn conversation_latest_ts_accepts_latest_object_and_string() {
+        let object_latest: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "latest": {
+                "ts": "1710000001.000000"
+            }
+        }))
+        .expect("conversation should parse");
+        let string_latest: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C2",
+            "latest": "1710000002.000000"
+        }))
+        .expect("conversation should parse");
+
+        assert_eq!(
+            conversation_latest_ts(&object_latest),
+            Some("1710000001.000000")
+        );
+        assert_eq!(
+            conversation_latest_ts(&string_latest),
+            Some("1710000002.000000")
+        );
     }
 
     #[test]

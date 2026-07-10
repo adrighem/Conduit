@@ -32,6 +32,7 @@ pub const DEFAULT_USER_SCOPES: &[&str] = &[
     "mpim:history",
     "mpim:write",
     "users:read",
+    "usergroups:read",
     "chat:write",
     "search:read",
     "stars:read",
@@ -533,6 +534,11 @@ mod tests {
             Some("S256")
         );
         assert_eq!(params.get("state").map(String::as_str), Some("state"));
+    }
+
+    #[test]
+    fn default_user_scopes_include_user_group_read() {
+        assert!(DEFAULT_USER_SCOPES.contains(&"usergroups:read"));
     }
 
     #[test]

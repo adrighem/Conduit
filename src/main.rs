@@ -21,13 +21,16 @@
 mod activity;
 mod application;
 mod auth;
+mod composer;
 mod config;
 mod debug;
 mod message_html;
 mod models;
 mod rendering;
 mod runtime;
+mod shortcuts;
 mod sidebar;
+mod sidebar_widgets;
 mod slack;
 mod store;
 mod window;

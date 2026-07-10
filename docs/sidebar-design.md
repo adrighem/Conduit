@@ -7,8 +7,8 @@ This document describes the implemented Conduit workspace sidebar and its channe
 ## Source Files
 
 - `src/window.ui`: Defines the workspace sidebar shell and static controls.
-- `src/window.rs`: Renders sidebar states, sections, and rows; filters conversations; owns the GTK row-activation signal and row-action map.
-- `src/sidebar.rs`: Builds the pure sidebar view model for grouping, sorting, row state, accessibility labels, unread badges, and conversation type classification.
+- `src/window.rs`: Renders the pure sidebar model into GTK rows, owns row activation, and keeps the row-action map.
+- `src/sidebar.rs`: Builds the pure sidebar list model, including filtering, placeholder state, grouping, sorting, row state, accessibility labels, unread badges, switcher items, and conversation type classification.
 - `src/models.rs`: Defines `SlackConversation`, including the Slack fields used by the sidebar.
 
 ## 1.0 Scope
@@ -36,7 +36,7 @@ Excluded from 1.0 unless explicitly revisited:
 - Muted state.
 - Slack Connect or external organization indicators.
 - Avatars and presence badges.
-- Full unread synchronization beyond conversation-level unread fields returned by `users.conversations`.
+- Full unread synchronization beyond conversation list and lightweight history hints.
 
 ## Sidebar Shell
 
@@ -87,13 +87,13 @@ Conversation row selected state is shown only when `MainMessageView::Conversatio
 
 Sections are rendered in this order:
 
-1. `Unreads`
+1. `Unreads` when enabled in Preferences
 2. `Channels`
 3. `Direct messages`
 4. `Group direct messages`
 5. `Other`
 
-Unread conversations are duplicated: they appear in `Unreads` and also in their normal section. This keeps `Unreads` as a shortcut section rather than moving the conversation out of its normal location.
+Unread conversations can be duplicated: when the Preferences setting `Show Unreads section` is enabled, they appear in `Unreads` and also in their normal section. This keeps `Unreads` as a shortcut section rather than moving the conversation out of its normal location. The setting is disabled by default, so unread conversations stay in their normal sections unless the shortcut section is explicitly enabled.
 
 The `Unreads` section header includes its row count, for example `Unreads (3)`. Other section headers use their plain title.
 
@@ -157,9 +157,9 @@ Text filtering matches:
 - Resolved display title, case-insensitive.
 - Slack conversation ID, case-insensitive.
 
-Unread-only filtering keeps conversations that have unread activity according to the modeled `unread_count` field or extra Slack conversation fields whose names contain `unread`, such as `unread_count_display` or `has_unreads`. This catches unread state variants while the app is still validating Slack's conversation payloads.
+Unread-only filtering keeps conversations that have unread activity according to either numeric unread counts or boolean unread hints such as `has_unreads`. Numeric display counts and boolean unread state are intentionally separate so a channel can render as unread without showing a count badge. On startup, the runtime refreshes unread state for the first 30 visible-priority conversations using conversation info and lightweight latest-message checks instead of crawling the entire workspace.
 
-Filtered results preserve normal section grouping and hide empty sections. When unread-only filtering is active, the `Unreads` shortcut section is omitted so the same unread conversations do not appear twice in an already-filtered list. Fuzzy search and matched-text highlighting are not part of the 1.0 sidebar.
+Filtered results preserve normal section grouping and hide empty sections. When unread-only filtering is active or the `Show Unreads section` preference is disabled, the `Unreads` shortcut section is omitted so the same unread conversations do not appear twice in the list. Fuzzy search and matched-text highlighting are not part of the 1.0 sidebar.
 
 If no conversations exist, the list shows `No conversations`. If the filter removes every conversation, it shows `No matching conversations`.
 
@@ -169,7 +169,7 @@ Each conversation row is a selectable and activatable `GtkListBoxRow`. The row c
 
 - A conversation type icon.
 - An ellipsized title label.
-- An unread count label when `unread_count > 0`.
+- An unread count label only when Slack provides a non-zero display count.
 
 Icons:
 
@@ -179,7 +179,7 @@ Icons:
 - Group direct message: `system-users-symbolic`
 - Unknown conversation: `dialog-question-symbolic`
 
-Rows with unread messages apply explicit bold Pango weight to the title; read rows apply explicit normal title weight. Unread counts remain visually emphasized with the `heading` CSS class. Selected conversations use the native `GtkListBox` selected row state, not `suggested-action`.
+Rows with unread messages apply explicit bold Pango weight and the native `heading` CSS class to the title, including badge-less unread channels. Read rows apply explicit normal title weight. Unread counts remain visually emphasized with the `heading` CSS class when Slack provides a display count. Selected conversations use the native `GtkListBox` selected row state, not `suggested-action`.
 
 Unread badge labels are capped at `99+` for counts above 99. Row titles ellipsize and the sidebar width remains stable at the shell level.
 
@@ -237,9 +237,9 @@ Section headers are skipped because they are not focusable. Conversation rows ar
 
 ## Test Coverage
 
-Sidebar model coverage lives in `src/sidebar.rs` and verifies conversation classification, section grouping, sorting, unread duplication, unread badge labels, selected state, section display titles, and accessible labels.
+Sidebar model coverage lives in `src/sidebar.rs` and verifies conversation classification, list placeholders, filtering, section grouping, sorting, unread duplication, unread badge labels, selected state, switcher items, section display titles, and accessible labels.
 
-Window/controller coverage in `src/window.rs` verifies that rendered row actions preserve the conversation ID and resolved title, unregistered rows do not activate, and the sidebar only shows a selected conversation while the main pane is actually in `Conversation` mode.
+Window/controller coverage in `src/window.rs` verifies that rendered row actions preserve the conversation ID and resolved title, unregistered rows do not activate, and unread rows map to bold title weight.
 
 ## Native UI Boundary
 
@@ -247,7 +247,7 @@ The sidebar is fully GTK4/libadwaita-native. WebKit is still used for message an
 
 ## Current Limits
 
-The sidebar currently uses member-scoped conversation data from `users.conversations` and the user-name cache. By default it hides dormant, deleted-user, and inactive direct-message style entries unless they are unread or currently selected. The `Show All Conversations` toggle exposes the full loaded set for older or low-activity conversations. Future features should be added only when the data model and Slack API usage support them cleanly.
+The sidebar currently uses member-scoped conversation data from `users.conversations`, lightweight history unread hints, and the user-name cache. By default it hides dormant, deleted-user, and inactive direct-message style entries unless they are unread or currently selected. The `Show All Conversations` toggle exposes the full loaded set for older or low-activity conversations. Future features should be added only when the data model and Slack API usage support them cleanly.
 
 Known limits:
 
@@ -258,4 +258,4 @@ Known limits:
 - No Slack Connect or external organization indicators.
 - No avatars or presence badges.
 - No multiple workspace switching.
-- No full unread synchronization beyond conversation-level unread fields returned by `users.conversations`.
+- No full unread synchronization beyond conversation list and lightweight history hints.

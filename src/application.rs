@@ -23,7 +23,8 @@ use adw::subclass::prelude::*;
 use gettextrs::gettext;
 use gtk::{gio, glib};
 
-use crate::config::VERSION;
+use crate::config::{self, VERSION};
+use crate::shortcuts::APP_SHORTCUTS;
 use crate::ConduitWindow;
 
 mod imp {
@@ -45,7 +46,6 @@ mod imp {
             let obj = self.obj();
             obj.setup_options();
             obj.setup_gactions();
-            obj.set_accels_for_action("app.quit", &["<control>q"]);
         }
     }
 
@@ -99,11 +99,21 @@ impl ConduitApplication {
         let shortcuts_action = gio::ActionEntry::builder("shortcuts")
             .activate(move |app: &Self, _, _| app.show_shortcuts())
             .build();
+        let preferences_action = gio::ActionEntry::builder("preferences")
+            .activate(move |app: &Self, _, _| app.show_preferences())
+            .build();
         let about_action = gio::ActionEntry::builder("about")
             .activate(move |app: &Self, _, _| app.show_about())
             .build();
-        self.add_action_entries([quit_action, shortcuts_action, about_action]);
-        self.set_accels_for_action("app.shortcuts", &["<control>question"]);
+        self.add_action_entries([
+            quit_action,
+            shortcuts_action,
+            preferences_action,
+            about_action,
+        ]);
+        for shortcut in APP_SHORTCUTS {
+            self.set_accels_for_action(shortcut.action, shortcut.accelerators);
+        }
     }
 
     fn setup_options(&self) {
@@ -168,6 +178,41 @@ impl ConduitApplication {
             dialog.set_transient_for(Some(&window));
             dialog.present();
         }
+    }
+
+    fn show_preferences(&self) {
+        let Some(window) = self.active_window() else {
+            return;
+        };
+
+        let settings = gio::Settings::new(config::APPLICATION_ID);
+        let unreads_row = adw::SwitchRow::builder()
+            .title("Show Unreads section")
+            .subtitle("Duplicate unread conversations into a separate sidebar section.")
+            .active(settings.boolean(config::SIDEBAR_SHOW_UNREADS_SECTION_KEY))
+            .build();
+        settings
+            .bind(
+                config::SIDEBAR_SHOW_UNREADS_SECTION_KEY,
+                &unreads_row,
+                "active",
+            )
+            .build();
+
+        let sidebar_group = adw::PreferencesGroup::builder().title("Sidebar").build();
+        sidebar_group.add(&unreads_row);
+
+        let page = adw::PreferencesPage::builder()
+            .title("Preferences")
+            .icon_name("view-list-symbolic")
+            .build();
+        page.add(&sidebar_group);
+
+        let dialog = adw::PreferencesDialog::builder()
+            .title("Preferences")
+            .build();
+        dialog.add(&page);
+        dialog.present(Some(&window));
     }
 
     fn show_about(&self) {
