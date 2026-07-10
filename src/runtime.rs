@@ -95,8 +95,177 @@ pub enum RuntimeCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RequestId(u64);
+
+impl RequestId {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RuntimeIdentity {
+    pub session: SessionId,
+    pub request: RequestId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RuntimeOperation {
+    Startup,
+    Authenticate,
+    SignOut,
+    Conversations,
+    History,
+    OlderHistory,
+    Thread,
+    OlderThread,
+    Search,
+    Files,
+    SavedItems,
+    User,
+    ImageAsset,
+    PostMessage,
+    Reaction,
+    Saved,
+    FileUpload,
+    SocketMode,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum RuntimeTarget {
+    Workspace,
+    Channel(String),
+    Thread {
+        channel_id: String,
+        thread_ts: String,
+    },
+    User(String),
+    Image(String),
+    Message {
+        channel_id: String,
+        thread_ts: Option<String>,
+    },
+    Upload(String),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct OperationContext {
+    pub operation: RuntimeOperation,
+    pub target: RuntimeTarget,
+}
+
+impl OperationContext {
+    pub fn new(operation: RuntimeOperation, target: RuntimeTarget) -> Self {
+        Self { operation, target }
+    }
+}
+
+impl RuntimeCommand {
+    pub fn operation_context(&self) -> OperationContext {
+        match self {
+            Self::LoadStoredToken => {
+                OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace)
+            }
+            Self::StartOAuth { .. } | Self::StartBrowserSession { .. } => {
+                OperationContext::new(RuntimeOperation::Authenticate, RuntimeTarget::Workspace)
+            }
+            Self::SignOut => {
+                OperationContext::new(RuntimeOperation::SignOut, RuntimeTarget::Workspace)
+            }
+            Self::RefreshConversations => {
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
+            }
+            Self::LoadHistory { channel_id } => OperationContext::new(
+                RuntimeOperation::History,
+                RuntimeTarget::Channel(channel_id.clone()),
+            ),
+            Self::LoadOlderHistory { channel_id, .. } => OperationContext::new(
+                RuntimeOperation::OlderHistory,
+                RuntimeTarget::Channel(channel_id.clone()),
+            ),
+            Self::LoadThread { channel_id, ts } => OperationContext::new(
+                RuntimeOperation::Thread,
+                RuntimeTarget::Thread {
+                    channel_id: channel_id.clone(),
+                    thread_ts: ts.clone(),
+                },
+            ),
+            Self::LoadOlderThread { channel_id, ts, .. } => OperationContext::new(
+                RuntimeOperation::OlderThread,
+                RuntimeTarget::Thread {
+                    channel_id: channel_id.clone(),
+                    thread_ts: ts.clone(),
+                },
+            ),
+            Self::SearchMessages { .. } => {
+                OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace)
+            }
+            Self::LoadFiles => {
+                OperationContext::new(RuntimeOperation::Files, RuntimeTarget::Workspace)
+            }
+            Self::LoadSavedItems => {
+                OperationContext::new(RuntimeOperation::SavedItems, RuntimeTarget::Workspace)
+            }
+            Self::LoadUser { user_id } => {
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone()))
+            }
+            Self::LoadImageAsset { key, .. } => OperationContext::new(
+                RuntimeOperation::ImageAsset,
+                RuntimeTarget::Image(key.clone()),
+            ),
+            Self::PostMessage {
+                channel_id,
+                thread_ts,
+                ..
+            } => OperationContext::new(
+                RuntimeOperation::PostMessage,
+                RuntimeTarget::Message {
+                    channel_id: channel_id.clone(),
+                    thread_ts: thread_ts.clone(),
+                },
+            ),
+            Self::SetReaction {
+                channel_id,
+                thread_ts,
+                ..
+            } => OperationContext::new(
+                RuntimeOperation::Reaction,
+                RuntimeTarget::Message {
+                    channel_id: channel_id.clone(),
+                    thread_ts: thread_ts.clone(),
+                },
+            ),
+            Self::SetSaved {
+                channel_id,
+                thread_ts,
+                ..
+            } => OperationContext::new(
+                RuntimeOperation::Saved,
+                RuntimeTarget::Message {
+                    channel_id: channel_id.clone(),
+                    thread_ts: thread_ts.clone(),
+                },
+            ),
+            Self::UploadFile { channel_id, .. } => OperationContext::new(
+                RuntimeOperation::FileUpload,
+                RuntimeTarget::Upload(channel_id.clone()),
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
-pub enum RuntimeEvent {
+pub enum RuntimeEventKind {
     Status(String),
     Error(String),
     SignedOut,
@@ -167,9 +336,116 @@ pub enum RuntimeEvent {
     FileUploaded(String),
 }
 
+impl RuntimeEventKind {
+    pub fn operation_context(&self, fallback: &OperationContext) -> OperationContext {
+        match self {
+            Self::SignedOut => {
+                OperationContext::new(RuntimeOperation::SignOut, RuntimeTarget::Workspace)
+            }
+            Self::Authenticated(_) => {
+                OperationContext::new(RuntimeOperation::Authenticate, RuntimeTarget::Workspace)
+            }
+            Self::ConversationsLoaded(_)
+            | Self::ConversationsLoadFailed(_)
+            | Self::ConversationUnreadUpdated { .. }
+            | Self::ConversationNotificationCandidate { .. } => {
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
+            }
+            Self::HistoryLoaded {
+                channel_id,
+                append_older,
+                ..
+            } => OperationContext::new(
+                if *append_older {
+                    RuntimeOperation::OlderHistory
+                } else {
+                    RuntimeOperation::History
+                },
+                RuntimeTarget::Channel(channel_id.clone()),
+            ),
+            Self::ThreadLoaded {
+                channel_id,
+                ts,
+                append_older,
+                ..
+            } => OperationContext::new(
+                if *append_older {
+                    RuntimeOperation::OlderThread
+                } else {
+                    RuntimeOperation::Thread
+                },
+                RuntimeTarget::Thread {
+                    channel_id: channel_id.clone(),
+                    thread_ts: ts.clone(),
+                },
+            ),
+            Self::SearchLoaded(_) => {
+                OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace)
+            }
+            Self::FilesLoaded(_) => {
+                OperationContext::new(RuntimeOperation::Files, RuntimeTarget::Workspace)
+            }
+            Self::SavedItemsLoaded(_) => {
+                OperationContext::new(RuntimeOperation::SavedItems, RuntimeTarget::Workspace)
+            }
+            Self::UserLoaded { user_id, .. } => {
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone()))
+            }
+            Self::UserNamesLoaded(_) | Self::UserGroupsLoaded { .. } => {
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace)
+            }
+            Self::ImageAssetLoaded { key, .. } | Self::ImageAssetFailed { key } => {
+                OperationContext::new(
+                    RuntimeOperation::ImageAsset,
+                    RuntimeTarget::Image(key.clone()),
+                )
+            }
+            Self::SocketModeEvent(_) => {
+                OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
+            }
+            Self::Status(_)
+            | Self::Error(_)
+            | Self::MessagePosted { .. }
+            | Self::ReactionUpdated { .. }
+            | Self::SavedUpdated { .. }
+            | Self::FileUploadProgress { .. }
+            | Self::FileUploaded(_) => fallback.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RuntimeEventMeta {
+    pub session: SessionId,
+    pub request: Option<RequestId>,
+    pub context: OperationContext,
+}
+
+impl RuntimeEventMeta {
+    pub fn new(identity: RuntimeIdentity, context: OperationContext) -> Self {
+        Self {
+            session: identity.session,
+            request: Some(identity.request),
+            context,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RuntimeEvent {
+    pub meta: RuntimeEventMeta,
+    pub kind: RuntimeEventKind,
+}
+
+#[derive(Debug)]
+struct RuntimeRequest {
+    identity: RuntimeIdentity,
+    command: RuntimeCommand,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppRuntime {
-    commands: Sender<RuntimeCommand>,
+    commands: Sender<RuntimeRequest>,
 }
 
 #[derive(Clone, Debug)]
@@ -234,7 +510,7 @@ fn image_data_uri(image: DownloadedImage) -> String {
 
 impl AppRuntime {
     pub fn start(events: Sender<RuntimeEvent>) -> Self {
-        let (commands, receiver) = mpsc::channel::<RuntimeCommand>();
+        let (commands, receiver) = mpsc::channel::<RuntimeRequest>();
 
         thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -243,9 +519,21 @@ impl AppRuntime {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = events.send(RuntimeEvent::Error(format!(
+                    let kind = RuntimeEventKind::Error(format!(
                         "Failed to start background runtime: {error}"
-                    )));
+                    ));
+                    let context =
+                        OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace);
+                    let _ = events.send(RuntimeEvent {
+                        meta: RuntimeEventMeta::new(
+                            RuntimeIdentity {
+                                session: SessionId::default().next(),
+                                request: RequestId::new(1),
+                            },
+                            context,
+                        ),
+                        kind,
+                    });
                     return;
                 }
             };
@@ -259,9 +547,12 @@ impl AppRuntime {
             let mut read_marks = HashMap::new();
             let mut socket_mode: Option<tokio::task::JoinHandle<()>> = None;
 
-            while let Ok(command) = receiver.recv() {
+            while let Ok(request) = receiver.recv() {
+                let RuntimeRequest { identity, command } = request;
+                let event_sender =
+                    RuntimeEventSender::new(events.clone(), identity, command.operation_context());
                 let mut context = RuntimeContext {
-                    events: &events,
+                    events: &event_sender,
                     token_store: &token_store,
                     oauth: &oauth,
                     image_cache: &image_cache,
@@ -273,7 +564,7 @@ impl AppRuntime {
                 };
                 let result = runtime.block_on(handle_command(command, &mut context));
                 if let Err(error) = result {
-                    let _ = events.send(RuntimeEvent::Error(error.to_string()));
+                    event_sender.send_event(RuntimeEventKind::Error(error.to_string()));
                 }
             }
         });
@@ -281,13 +572,13 @@ impl AppRuntime {
         Self { commands }
     }
 
-    pub fn send(&self, command: RuntimeCommand) {
-        let _ = self.commands.send(command);
+    pub fn send(&self, identity: RuntimeIdentity, command: RuntimeCommand) {
+        let _ = self.commands.send(RuntimeRequest { identity, command });
     }
 }
 
 struct RuntimeContext<'a> {
-    events: &'a Sender<RuntimeEvent>,
+    events: &'a RuntimeEventSender,
     token_store: &'a TokenStore,
     oauth: &'a SlackOAuthClient,
     image_cache: &'a ImageAssetCache,
@@ -452,7 +743,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 context.token_store.save(&token)?;
                 load_workspace_after_auth(context, &auth).await?;
             } else {
-                context.events.send_event(RuntimeEvent::SignedOut);
+                context.events.send_event(RuntimeEventKind::SignedOut);
             }
         }
         RuntimeCommand::StartOAuth {
@@ -488,7 +779,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             *context.slack = None;
             *context.workspace_store = None;
             context.user_cache.clear();
-            context.events.send_event(RuntimeEvent::SignedOut);
+            context.events.send_event(RuntimeEventKind::SignedOut);
         }
         RuntimeCommand::RefreshConversations => {
             crate::debug::log("runtime", "RefreshConversations");
@@ -558,23 +849,25 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let results = api.search_messages(&query).await?;
             context
                 .events
-                .send_event(RuntimeEvent::SearchLoaded(results));
+                .send_event(RuntimeEventKind::SearchLoaded(results));
         }
         RuntimeCommand::LoadFiles => {
             let api = require_slack(context.slack)?;
             let files = api.files().await?;
-            context.events.send_event(RuntimeEvent::FilesLoaded(files));
+            context
+                .events
+                .send_event(RuntimeEventKind::FilesLoaded(files));
         }
         RuntimeCommand::LoadSavedItems => {
             let api = require_slack(context.slack)?;
             let items = api.saved_items().await?;
             context
                 .events
-                .send_event(RuntimeEvent::SavedItemsLoaded(items));
+                .send_event(RuntimeEventKind::SavedItemsLoaded(items));
         }
         RuntimeCommand::LoadUser { user_id } => {
             if let Some(display_name) = context.user_cache.get(&user_id).cloned() {
-                context.events.send_event(RuntimeEvent::UserLoaded {
+                context.events.send_event(RuntimeEventKind::UserLoaded {
                     user_id,
                     display_name,
                 });
@@ -585,7 +878,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     .user_cache
                     .insert(user_id.clone(), display_name.clone());
                 store_user_name(context.workspace_store, &user_id, &display_name).await;
-                context.events.send_event(RuntimeEvent::UserLoaded {
+                context.events.send_event(RuntimeEventKind::UserLoaded {
                     user_id,
                     display_name,
                 });
@@ -605,7 +898,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     );
                     context
                         .events
-                        .send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
+                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, data_uri });
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -641,7 +934,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     }
                     context
                         .events
-                        .send_event(RuntimeEvent::ImageAssetLoaded { key, data_uri });
+                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, data_uri });
                 }
                 Err(error) => {
                     crate::debug::log(
@@ -653,7 +946,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     );
                     context
                         .events
-                        .send_event(RuntimeEvent::ImageAssetFailed { key });
+                        .send_event(RuntimeEventKind::ImageAssetFailed { key });
                 }
             }
         }
@@ -666,7 +959,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let message = api
                 .post_message(&channel_id, &text, thread_ts.as_deref())
                 .await?;
-            context.events.send_event(RuntimeEvent::MessagePosted {
+            context.events.send_event(RuntimeEventKind::MessagePosted {
                 channel_id,
                 message: Box::new(message),
             });
@@ -680,10 +973,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         } => {
             let api = require_slack(context.slack)?;
             api.set_reaction(&channel_id, &ts, &name, add).await?;
-            context.events.send_event(RuntimeEvent::ReactionUpdated {
-                channel_id,
-                thread_ts,
-            });
+            context
+                .events
+                .send_event(RuntimeEventKind::ReactionUpdated {
+                    channel_id,
+                    thread_ts,
+                });
         }
         RuntimeCommand::SetSaved {
             channel_id,
@@ -693,7 +988,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         } => {
             let api = require_slack(context.slack)?;
             api.set_saved(&channel_id, &ts, add).await?;
-            context.events.send_event(RuntimeEvent::SavedUpdated {
+            context.events.send_event(RuntimeEventKind::SavedUpdated {
                 channel_id,
                 saved: add,
                 thread_ts,
@@ -705,10 +1000,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             initial_comment,
         } => {
             let api = require_slack(context.slack)?;
-            context.events.send_event(RuntimeEvent::FileUploadProgress {
-                fraction: 0.05,
-                label: "Preparing upload".to_string(),
-            });
+            context
+                .events
+                .send_event(RuntimeEventKind::FileUploadProgress {
+                    fraction: 0.05,
+                    label: "Preparing upload".to_string(),
+                });
             let progress_events = context.events.clone();
             let file = api
                 .upload_file(
@@ -716,7 +1013,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     &path,
                     initial_comment.as_deref(),
                     move |update| {
-                        progress_events.send_event(RuntimeEvent::FileUploadProgress {
+                        progress_events.send_event(RuntimeEventKind::FileUploadProgress {
                             fraction: update.fraction,
                             label: update.label,
                         });
@@ -728,7 +1025,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .or(file.name)
                 .or(file.id)
                 .unwrap_or_else(|| "file".to_string());
-            context.events.send_event(RuntimeEvent::FileUploaded(label));
+            context
+                .events
+                .send_event(RuntimeEventKind::FileUploaded(label));
         }
     }
 
@@ -773,7 +1072,10 @@ fn start_socket_mode(context: &mut RuntimeContext<'_>) {
     };
 
     crate::debug::log("socket", "SocketModeStarting");
-    let events = context.events.clone();
+    let events = context.events.unsolicited(OperationContext::new(
+        RuntimeOperation::SocketMode,
+        RuntimeTarget::Workspace,
+    ));
     let handle = tokio::spawn(run_socket_mode(app_token, events));
     *context.socket_mode = Some(handle);
 }
@@ -785,13 +1087,13 @@ fn stop_socket_mode(context: &mut RuntimeContext<'_>) {
     }
 }
 
-async fn run_socket_mode(app_token: String, events: Sender<RuntimeEvent>) {
+async fn run_socket_mode(app_token: String, events: RuntimeEventSender) {
     let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
 
     loop {
         let events_for_run = events.clone();
         let result = socket_mode::run_once(&app_token, move |event| {
-            events_for_run.send_event(RuntimeEvent::SocketModeEvent(event));
+            events_for_run.send_event(RuntimeEventKind::SocketModeEvent(event));
         })
         .await;
 
@@ -889,7 +1191,7 @@ fn spawn_user_group_refresh(context: &RuntimeContext<'_>) -> Result<()> {
 }
 
 async fn connect_with_token(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     slack: &mut Option<SlackApi>,
     token: StoredToken,
 ) -> Result<AuthInfo> {
@@ -910,12 +1212,12 @@ async fn connect_with_token(
         ),
     );
     *slack = Some(api);
-    events.send_event(RuntimeEvent::Authenticated(auth.clone()));
+    events.send_event(RuntimeEventKind::Authenticated(auth.clone()));
     Ok(auth)
 }
 
 async fn load_user_groups_best_effort_with_api(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     cached_user_names: HashMap<String, String>,
@@ -933,7 +1235,7 @@ async fn load_user_groups_best_effort_with_api(
 
     if !loaded_user_names.is_empty() {
         store_user_names(workspace_store, &loaded_user_names).await;
-        events.send_event(RuntimeEvent::UserNamesLoaded(loaded_user_names));
+        events.send_event(RuntimeEventKind::UserNamesLoaded(loaded_user_names));
     }
 
     if !names.is_empty() {
@@ -941,7 +1243,7 @@ async fn load_user_groups_best_effort_with_api(
             "runtime",
             &format!("UserGroupsLoaded count={}", names.len()),
         );
-        events.send_event(RuntimeEvent::UserGroupsLoaded { names, members });
+        events.send_event(RuntimeEventKind::UserGroupsLoaded { names, members });
     }
 }
 
@@ -1002,7 +1304,7 @@ async fn resolve_user_group_display_data(
 }
 
 async fn load_conversations_with_api(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
 ) -> Result<Vec<SlackConversation>> {
@@ -1013,12 +1315,12 @@ async fn load_conversations_with_api(
         "runtime",
         &format!("ConversationsLoaded count={}", conversations.len()),
     );
-    events.send_event(RuntimeEvent::ConversationsLoaded(conversations.clone()));
+    events.send_event(RuntimeEventKind::ConversationsLoaded(conversations.clone()));
     Ok(conversations)
 }
 
 async fn load_conversations_best_effort_with_api(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     cached_user_names: HashMap<String, String>,
@@ -1051,7 +1353,7 @@ async fn load_conversations_best_effort_with_api(
 }
 
 async fn refresh_conversation_unread_states_best_effort<'a>(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     api: &SlackApi,
     channel_ids: impl IntoIterator<Item = &'a String>,
 ) {
@@ -1076,7 +1378,7 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
 }
 
 async fn prefetch_channel_histories_best_effort(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     conversations: &[SlackConversation],
@@ -1137,12 +1439,12 @@ async fn prefetch_channel_histories_best_effort(
 }
 
 fn send_conversation_notification_candidate(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     channel_id: &str,
     messages: &[SlackMessage],
 ) {
     if !messages.is_empty() {
-        events.send_event(RuntimeEvent::ConversationNotificationCandidate {
+        events.send_event(RuntimeEventKind::ConversationNotificationCandidate {
             channel_id: channel_id.to_string(),
             messages: messages.to_vec(),
         });
@@ -1150,12 +1452,12 @@ fn send_conversation_notification_candidate(
 }
 
 fn send_conversation_unread_update(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     channel_id: &str,
     unread_state: SlackUnreadState,
 ) {
     if unread_state.known {
-        events.send_event(RuntimeEvent::ConversationUnreadUpdated {
+        events.send_event(RuntimeEventKind::ConversationUnreadUpdated {
             channel_id: channel_id.to_string(),
             unread_state,
         });
@@ -1163,7 +1465,7 @@ fn send_conversation_unread_update(
 }
 
 async fn load_cached_user_names(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
     user_cache: &mut HashMap<String, String>,
 ) {
@@ -1178,7 +1480,7 @@ async fn load_cached_user_names(
                 &format!("CachedUserNamesLoaded count={}", user_names.len()),
             );
             user_cache.extend(user_names.clone());
-            events.send_event(RuntimeEvent::UserNamesLoaded(user_names));
+            events.send_event(RuntimeEventKind::UserNamesLoaded(user_names));
         }
         Ok(_) => {}
         Err(error) => crate::debug::log(
@@ -1189,7 +1491,7 @@ async fn load_cached_user_names(
 }
 
 async fn refresh_cached_dm_user_names(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     conversations: &[SlackConversation],
@@ -1218,24 +1520,24 @@ async fn refresh_cached_dm_user_names(
     }
 
     store_user_names(workspace_store, &refreshed).await;
-    events.send_event(RuntimeEvent::UserNamesLoaded(refreshed));
+    events.send_event(RuntimeEventKind::UserNamesLoaded(refreshed));
 }
 
-fn handle_conversations_load_error(events: &Sender<RuntimeEvent>, error: anyhow::Error) {
+fn handle_conversations_load_error(events: &RuntimeEventSender, error: anyhow::Error) {
     crate::debug::log(
         "runtime",
         &format!("ConversationsLoadFailed error={error:#}"),
     );
-    events.send_event(RuntimeEvent::ConversationsLoadFailed(error.to_string()));
+    events.send_event(RuntimeEventKind::ConversationsLoadFailed(error.to_string()));
 }
 
 fn send_history_loaded(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     channel_id: String,
     page: SlackMessagePage,
     append_older: bool,
 ) {
-    events.send_event(RuntimeEvent::HistoryLoaded {
+    events.send_event(RuntimeEventKind::HistoryLoaded {
         channel_id,
         messages: page.messages,
         has_more: page.has_more,
@@ -1246,13 +1548,13 @@ fn send_history_loaded(
 }
 
 fn send_thread_loaded(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     channel_id: String,
     ts: String,
     page: SlackMessagePage,
     append_older: bool,
 ) {
-    events.send_event(RuntimeEvent::ThreadLoaded {
+    events.send_event(RuntimeEventKind::ThreadLoaded {
         channel_id,
         ts,
         messages: page.messages,
@@ -1313,7 +1615,7 @@ fn workspace_store_id(auth: &AuthInfo) -> String {
 }
 
 async fn load_cached_conversations(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
 ) {
     let Some(store) = workspace_store.as_ref() else {
@@ -1326,7 +1628,7 @@ async fn load_cached_conversations(
                 "runtime",
                 &format!("CachedConversationsLoaded count={}", conversations.len()),
             );
-            events.send_event(RuntimeEvent::ConversationsLoaded(conversations));
+            events.send_event(RuntimeEventKind::ConversationsLoaded(conversations));
         }
         Ok(None) => {}
         Err(error) => crate::debug::log(
@@ -1389,7 +1691,7 @@ async fn store_user_names(
 }
 
 async fn load_cached_history(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
     channel_id: &str,
 ) {
@@ -1407,7 +1709,7 @@ async fn load_cached_history(
                     preview.len()
                 ),
             );
-            events.send_event(RuntimeEvent::HistoryLoaded {
+            events.send_event(RuntimeEventKind::HistoryLoaded {
                 channel_id: channel_id.to_string(),
                 messages: preview,
                 has_more: false,
@@ -1459,7 +1761,7 @@ async fn store_merged_history(
 }
 
 async fn load_cached_thread(
-    events: &Sender<RuntimeEvent>,
+    events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
     channel_id: &str,
     thread_ts: &str,
@@ -1477,7 +1779,7 @@ async fn load_cached_thread(
                     messages.len()
                 ),
             );
-            events.send_event(RuntimeEvent::ThreadLoaded {
+            events.send_event(RuntimeEventKind::ThreadLoaded {
                 channel_id: channel_id.to_string(),
                 ts: thread_ts.to_string(),
                 messages,
@@ -1522,16 +1824,56 @@ fn require_slack(slack: &Option<SlackApi>) -> Result<&SlackApi> {
 
 trait EventSenderExt {
     fn send_status(&self, status: &str);
-    fn send_event(&self, event: RuntimeEvent);
+    fn send_event(&self, event: RuntimeEventKind);
 }
 
-impl EventSenderExt for Sender<RuntimeEvent> {
-    fn send_status(&self, status: &str) {
-        self.send_event(RuntimeEvent::Status(status.to_string()));
+#[derive(Clone, Debug)]
+struct RuntimeEventSender {
+    sender: Sender<RuntimeEvent>,
+    session: SessionId,
+    request: Option<RequestId>,
+    fallback: OperationContext,
+}
+
+impl RuntimeEventSender {
+    fn new(
+        sender: Sender<RuntimeEvent>,
+        identity: RuntimeIdentity,
+        fallback: OperationContext,
+    ) -> Self {
+        Self {
+            sender,
+            session: identity.session,
+            request: Some(identity.request),
+            fallback,
+        }
     }
 
-    fn send_event(&self, event: RuntimeEvent) {
-        let _ = self.send(event);
+    fn unsolicited(&self, context: OperationContext) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            session: self.session,
+            request: None,
+            fallback: context,
+        }
+    }
+}
+
+impl EventSenderExt for RuntimeEventSender {
+    fn send_status(&self, status: &str) {
+        self.send_event(RuntimeEventKind::Status(status.to_string()));
+    }
+
+    fn send_event(&self, kind: RuntimeEventKind) {
+        let context = kind.operation_context(&self.fallback);
+        let _ = self.sender.send(RuntimeEvent {
+            meta: RuntimeEventMeta {
+                session: self.session,
+                request: self.request,
+                context,
+            },
+            kind,
+        });
     }
 }
 
@@ -1559,6 +1901,52 @@ mod tests {
         };
 
         assert_eq!(workspace_store_id(&auth), "T123:U123");
+    }
+
+    #[test]
+    fn runtime_command_context_identifies_operation_and_target() {
+        assert_eq!(
+            RuntimeCommand::SearchMessages {
+                query: "from:ada".to_string(),
+            }
+            .operation_context(),
+            OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace)
+        );
+        assert_eq!(
+            RuntimeCommand::LoadThread {
+                channel_id: "C123".to_string(),
+                ts: "1710000000.000001".to_string(),
+            }
+            .operation_context(),
+            OperationContext::new(
+                RuntimeOperation::Thread,
+                RuntimeTarget::Thread {
+                    channel_id: "C123".to_string(),
+                    thread_ts: "1710000000.000001".to_string(),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_event_context_uses_loaded_resource_target() {
+        let fallback = OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace);
+        let event = RuntimeEventKind::HistoryLoaded {
+            channel_id: "C123".to_string(),
+            messages: Vec::new(),
+            has_more: false,
+            next_cursor: None,
+            append_older: false,
+            cached: false,
+        };
+
+        assert_eq!(
+            event.operation_context(&fallback),
+            OperationContext::new(
+                RuntimeOperation::History,
+                RuntimeTarget::Channel("C123".to_string()),
+            )
+        );
     }
 
     #[test]

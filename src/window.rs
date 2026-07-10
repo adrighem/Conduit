@@ -41,7 +41,10 @@ use crate::models::{
     SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
 };
 use crate::rendering;
-use crate::runtime::{AppRuntime, RuntimeCommand, RuntimeEvent};
+use crate::runtime::{
+    AppRuntime, OperationContext, RequestId, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
+    RuntimeEventMeta, RuntimeIdentity, SessionId,
+};
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{self, SidebarRowModel, SidebarSectionModel};
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
@@ -132,6 +135,7 @@ mod imp {
 
         pub runtime: RefCell<Option<AppRuntime>>,
         pub events: RefCell<Option<Receiver<RuntimeEvent>>>,
+        pub(super) request_coordinator: RefCell<RequestCoordinator>,
         pub settings: RefCell<Option<gio::Settings>>,
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
@@ -192,7 +196,7 @@ mod imp {
             obj.setup_settings();
             obj.setup_callbacks();
             obj.show_loading("Checking secure storage");
-            obj.send_command(RuntimeCommand::LoadStoredToken);
+            obj.send_session_command(RuntimeCommand::LoadStoredToken);
         }
     }
 
@@ -251,6 +255,68 @@ pub enum MainMessageView {
     Search,
     Files,
     Saved,
+}
+
+#[derive(Debug, Default)]
+struct RequestCoordinator {
+    session: SessionId,
+    next_request: u64,
+    latest: HashMap<OperationContext, RequestId>,
+}
+
+impl RequestCoordinator {
+    fn issue(&mut self, command: &RuntimeCommand) -> RuntimeIdentity {
+        self.next_request = self.next_request.saturating_add(1);
+        let request = RequestId::new(self.next_request);
+        self.latest.insert(command.operation_context(), request);
+        RuntimeIdentity {
+            session: self.session,
+            request,
+        }
+    }
+
+    fn begin_session(&mut self, command: &RuntimeCommand) -> RuntimeIdentity {
+        self.invalidate_session();
+        self.issue(command)
+    }
+
+    fn invalidate_session(&mut self) {
+        self.session = self.session.next();
+        self.latest.clear();
+    }
+
+    fn accepts(&self, meta: &RuntimeEventMeta) -> bool {
+        meta.session == self.session
+            && meta.request.is_none_or(|request| {
+                self.latest
+                    .get(&meta.context)
+                    .is_none_or(|latest| *latest == request)
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeViewSelection<'a> {
+    main_view: MainMessageView,
+    selected_channel: Option<&'a str>,
+    selected_thread_ts: Option<&'a str>,
+}
+
+fn runtime_event_is_visible(event: &RuntimeEventKind, selection: RuntimeViewSelection<'_>) -> bool {
+    match event {
+        RuntimeEventKind::HistoryLoaded { channel_id, .. } => {
+            selection.main_view == MainMessageView::Conversation
+                && selection.selected_channel == Some(channel_id)
+        }
+        RuntimeEventKind::ThreadLoaded { channel_id, ts, .. } => {
+            selection.selected_channel == Some(channel_id)
+                && selection.selected_thread_ts == Some(ts)
+        }
+        RuntimeEventKind::SearchLoaded(_) => selection.main_view == MainMessageView::Search,
+        RuntimeEventKind::FilesLoaded(_) => selection.main_view == MainMessageView::Files,
+        RuntimeEventKind::SavedItemsLoaded(_) => selection.main_view == MainMessageView::Saved,
+        _ => true,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,7 +813,7 @@ impl ConduitWindow {
 
     fn setup_window_actions(&self) {
         self.add_window_action("sign-out", |window| {
-            window.send_command(RuntimeCommand::SignOut)
+            window.send_session_command(RuntimeCommand::SignOut)
         });
         self.add_window_action("switch-conversation", |window| {
             window.show_conversation_switcher()
@@ -840,8 +906,32 @@ impl ConduitWindow {
     }
 
     fn handle_runtime_event(&self, event: RuntimeEvent) {
-        match event {
-            RuntimeEvent::Status(status) => {
+        let RuntimeEvent { meta, kind } = event;
+        if !self.imp().request_coordinator.borrow().accepts(&meta) {
+            crate::debug::log(
+                "ui",
+                &format!(
+                    "RuntimeEventIgnored reason=stale session={:?} request={:?} operation={:?}",
+                    meta.session, meta.request, meta.context.operation
+                ),
+            );
+            return;
+        }
+
+        let selected_channel = self.selected_channel_id();
+        let selected_thread_ts = self.selected_thread_ts();
+        let selection = RuntimeViewSelection {
+            main_view: self.imp().current_main_view.get(),
+            selected_channel: selected_channel.as_deref(),
+            selected_thread_ts: selected_thread_ts.as_deref(),
+        };
+        if !runtime_event_is_visible(&kind, selection) {
+            self.handle_hidden_runtime_event(kind);
+            return;
+        }
+
+        match kind {
+            RuntimeEventKind::Status(status) => {
                 if !self.imp().connect_requested.get() {
                     if status == "Loading conversations"
                         && conversation_refresh_start_shows_sidebar_loading()
@@ -851,36 +941,36 @@ impl ConduitWindow {
                     self.set_status(&status);
                 }
             }
-            RuntimeEvent::Error(error) => self.show_error(&error),
-            RuntimeEvent::SignedOut => {
+            RuntimeEventKind::Error(error) => self.show_error(&error),
+            RuntimeEventKind::SignedOut => {
                 self.imp().connect_requested.set(false);
                 self.show_login("Choose a workspace to continue");
             }
-            RuntimeEvent::Authenticated(auth) => {
+            RuntimeEventKind::Authenticated(auth) => {
                 if !self.imp().connect_requested.get() {
                     self.show_workspace(auth);
                 }
             }
-            RuntimeEvent::ConversationsLoaded(conversations) => {
+            RuntimeEventKind::ConversationsLoaded(conversations) => {
                 if !self.imp().connect_requested.get() {
                     self.populate_conversations(conversations);
                     self.restore_workspace_status();
                 }
             }
-            RuntimeEvent::ConversationsLoadFailed(error) => {
+            RuntimeEventKind::ConversationsLoadFailed(error) => {
                 if !self.imp().connect_requested.get() {
                     self.show_conversation_load_error(&error);
                 }
             }
-            RuntimeEvent::ConversationUnreadUpdated {
+            RuntimeEventKind::ConversationUnreadUpdated {
                 channel_id,
                 unread_state,
             } => self.apply_conversation_unread_state(&channel_id, unread_state),
-            RuntimeEvent::ConversationNotificationCandidate {
+            RuntimeEventKind::ConversationNotificationCandidate {
                 channel_id,
                 messages,
             } => self.notify_if_new_messages(&channel_id, &messages),
-            RuntimeEvent::HistoryLoaded {
+            RuntimeEventKind::HistoryLoaded {
                 channel_id,
                 messages,
                 has_more,
@@ -911,7 +1001,7 @@ impl ConduitWindow {
                     self.restore_workspace_status();
                 }
             }
-            RuntimeEvent::ThreadLoaded {
+            RuntimeEventKind::ThreadLoaded {
                 channel_id,
                 ts,
                 messages,
@@ -930,21 +1020,21 @@ impl ConduitWindow {
                 self.populate_thread(&channel_id, &ts, rendered_messages);
                 self.restore_workspace_status();
             }
-            RuntimeEvent::SearchLoaded(results) => self.populate_search_results(results),
-            RuntimeEvent::FilesLoaded(files) => self.populate_files(files),
-            RuntimeEvent::SavedItemsLoaded(items) => self.populate_saved_items(items),
-            RuntimeEvent::SocketModeEvent(event) => self.handle_socket_mode_event(event),
-            RuntimeEvent::UserLoaded {
+            RuntimeEventKind::SearchLoaded(results) => self.populate_search_results(results),
+            RuntimeEventKind::FilesLoaded(files) => self.populate_files(files),
+            RuntimeEventKind::SavedItemsLoaded(items) => self.populate_saved_items(items),
+            RuntimeEventKind::SocketModeEvent(event) => self.handle_socket_mode_event(event),
+            RuntimeEventKind::UserLoaded {
                 user_id,
                 display_name,
             } => {
                 self.populate_user_names(HashMap::from([(user_id, display_name)]));
             }
-            RuntimeEvent::UserNamesLoaded(user_names) => self.populate_user_names(user_names),
-            RuntimeEvent::UserGroupsLoaded { names, members } => {
+            RuntimeEventKind::UserNamesLoaded(user_names) => self.populate_user_names(user_names),
+            RuntimeEventKind::UserGroupsLoaded { names, members } => {
                 self.populate_user_groups(names, members);
             }
-            RuntimeEvent::ImageAssetLoaded { key, data_uri } => {
+            RuntimeEventKind::ImageAssetLoaded { key, data_uri } => {
                 crate::debug::log(
                     "ui",
                     &format!("ImageAssetLoaded key={}", crate::debug::url_for_log(&key)),
@@ -955,7 +1045,7 @@ impl ConduitWindow {
                 imp.image_assets.borrow_mut().insert(key, data_uri);
                 self.rerender_current_messages();
             }
-            RuntimeEvent::ImageAssetFailed { key } => {
+            RuntimeEventKind::ImageAssetFailed { key } => {
                 crate::debug::log(
                     "ui",
                     &format!("ImageAssetFailed key={}", crate::debug::url_for_log(&key)),
@@ -965,7 +1055,7 @@ impl ConduitWindow {
                 imp.failed_image_assets.borrow_mut().insert(key);
                 self.rerender_current_messages();
             }
-            RuntimeEvent::MessagePosted {
+            RuntimeEventKind::MessagePosted {
                 channel_id,
                 message,
             } => {
@@ -981,14 +1071,14 @@ impl ConduitWindow {
                 }
                 self.reload_after_message(&channel_id, thread_ts.as_deref());
             }
-            RuntimeEvent::ReactionUpdated {
+            RuntimeEventKind::ReactionUpdated {
                 channel_id,
                 thread_ts,
             } => {
                 self.set_status("Reaction updated");
                 self.reload_after_message(&channel_id, thread_ts.as_deref());
             }
-            RuntimeEvent::SavedUpdated {
+            RuntimeEventKind::SavedUpdated {
                 channel_id,
                 saved,
                 thread_ts,
@@ -1004,14 +1094,14 @@ impl ConduitWindow {
                     self.reload_after_message(&channel_id, thread_ts.as_deref());
                 }
             }
-            RuntimeEvent::FileUploadProgress { fraction, label } => {
+            RuntimeEventKind::FileUploadProgress { fraction, label } => {
                 let imp = self.imp();
                 imp.upload_progress.set_visible(true);
                 imp.upload_progress.set_fraction(fraction);
                 imp.upload_progress.set_text(Some(&label));
                 self.set_status(&label);
             }
-            RuntimeEvent::FileUploaded(name) => {
+            RuntimeEventKind::FileUploaded(name) => {
                 let imp = self.imp();
                 imp.upload_button.set_sensitive(true);
                 imp.upload_progress.set_fraction(1.0);
@@ -1023,6 +1113,45 @@ impl ConduitWindow {
                     self.send_command(RuntimeCommand::LoadHistory { channel_id });
                 }
             }
+        }
+    }
+
+    fn handle_hidden_runtime_event(&self, event: RuntimeEventKind) {
+        if let RuntimeEventKind::HistoryLoaded {
+            channel_id,
+            messages,
+            has_more,
+            next_cursor,
+            append_older,
+            cached,
+        } = event
+        {
+            if history_event_updates_fresh_metadata(cached) {
+                self.set_channel_history_cursor(&channel_id, has_more, next_cursor);
+            }
+            if !cached && !append_older {
+                self.imp()
+                    .loading_channel_histories
+                    .borrow_mut()
+                    .remove(&channel_id);
+            }
+
+            let messages = if append_older {
+                let cached_messages = self
+                    .imp()
+                    .channel_message_cache
+                    .borrow()
+                    .get(&channel_id)
+                    .cloned()
+                    .unwrap_or_default();
+                merge_message_pages(&cached_messages, &messages)
+            } else {
+                messages
+            };
+            self.imp()
+                .channel_message_cache
+                .borrow_mut()
+                .insert(channel_id, messages);
         }
     }
 
@@ -1089,7 +1218,7 @@ impl ConduitWindow {
         self.imp().connect_requested.set(false);
         self.imp().connect_button.set_sensitive(false);
         self.show_loading("Opening Slack authorization");
-        self.send_command(RuntimeCommand::StartOAuth {
+        self.send_session_command(RuntimeCommand::StartOAuth {
             client_id,
             debug_auth: self.imp().auth_debug.get(),
         });
@@ -1112,7 +1241,7 @@ impl ConduitWindow {
         self.imp().connect_requested.set(false);
         imp.connect_button.set_sensitive(false);
         self.show_loading("Validating Slack browser session");
-        self.send_command(RuntimeCommand::StartBrowserSession {
+        self.send_session_command(RuntimeCommand::StartBrowserSession {
             xoxc_token,
             xoxd_token,
             user_agent,
@@ -1324,6 +1453,8 @@ impl ConduitWindow {
                 let Some(ts) = query_param(url, "ts") else {
                     return true;
                 };
+                *self.imp().selected_channel.borrow_mut() = Some(channel_id.clone());
+                *self.imp().selected_thread_ts.borrow_mut() = Some(ts.clone());
                 self.set_status("Loading thread");
                 self.send_command(RuntimeCommand::LoadThread { channel_id, ts });
                 true
@@ -1568,6 +1699,10 @@ impl ConduitWindow {
     }
 
     pub(crate) fn show_connect_requested(&self) {
+        self.imp()
+            .request_coordinator
+            .borrow_mut()
+            .invalidate_session();
         self.imp().connect_requested.set(true);
         self.show_login("Choose a workspace to continue");
     }
@@ -2616,9 +2751,23 @@ impl ConduitWindow {
     }
 
     fn send_command(&self, command: RuntimeCommand) {
+        let identity = self.imp().request_coordinator.borrow_mut().issue(&command);
+        self.send_identified_command(identity, command);
+    }
+
+    fn send_session_command(&self, command: RuntimeCommand) {
+        let identity = self
+            .imp()
+            .request_coordinator
+            .borrow_mut()
+            .begin_session(&command);
+        self.send_identified_command(identity, command);
+    }
+
+    fn send_identified_command(&self, identity: RuntimeIdentity, command: RuntimeCommand) {
         let runtime = self.imp().runtime.borrow().clone();
         if let Some(runtime) = runtime {
-            runtime.send(command);
+            runtime.send(identity, command);
         }
     }
 
@@ -2770,6 +2919,7 @@ impl ConduitWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{RuntimeOperation, RuntimeTarget};
     use crate::sidebar::ConversationKind;
 
     fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {
@@ -2784,6 +2934,97 @@ mod tests {
             muted: false,
             external: false,
         }
+    }
+
+    #[test]
+    fn request_coordinator_rejects_superseded_and_previous_session_responses() {
+        let mut coordinator = RequestCoordinator::default();
+        let first = coordinator.begin_session(&RuntimeCommand::SearchMessages {
+            query: "first".to_string(),
+        });
+        let second = coordinator.issue(&RuntimeCommand::SearchMessages {
+            query: "second".to_string(),
+        });
+        let context = OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace);
+
+        assert!(!coordinator.accepts(&RuntimeEventMeta::new(first, context.clone())));
+        assert!(coordinator.accepts(&RuntimeEventMeta::new(second, context.clone())));
+
+        let signed_out = coordinator.begin_session(&RuntimeCommand::SignOut);
+        assert!(!coordinator.accepts(&RuntimeEventMeta::new(second, context)));
+        assert!(!coordinator.accepts(&RuntimeEventMeta {
+            session: second.session,
+            request: None,
+            context: OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace,),
+        }));
+        assert!(coordinator.accepts(&RuntimeEventMeta::new(
+            signed_out,
+            OperationContext::new(RuntimeOperation::SignOut, RuntimeTarget::Workspace),
+        )));
+    }
+
+    #[test]
+    fn request_coordinator_accepts_cached_and_fresh_events_for_current_request() {
+        let mut coordinator = RequestCoordinator::default();
+        let identity = coordinator.begin_session(&RuntimeCommand::LoadHistory {
+            channel_id: "C123".to_string(),
+        });
+        let context = OperationContext::new(
+            RuntimeOperation::History,
+            RuntimeTarget::Channel("C123".to_string()),
+        );
+
+        let cached = RuntimeEventMeta::new(identity, context.clone());
+        let fresh = RuntimeEventMeta::new(identity, context);
+
+        assert!(coordinator.accepts(&cached));
+        assert!(coordinator.accepts(&fresh));
+    }
+
+    #[test]
+    fn runtime_event_visibility_rejects_inactive_channel_search_and_thread_results() {
+        let conversation = RuntimeViewSelection {
+            main_view: MainMessageView::Conversation,
+            selected_channel: Some("C456"),
+            selected_thread_ts: Some("1710000000.000002"),
+        };
+
+        assert!(!runtime_event_is_visible(
+            &RuntimeEventKind::HistoryLoaded {
+                channel_id: "C123".to_string(),
+                messages: Vec::new(),
+                has_more: false,
+                next_cursor: None,
+                append_older: false,
+                cached: false,
+            },
+            conversation,
+        ));
+        assert!(!runtime_event_is_visible(
+            &RuntimeEventKind::ThreadLoaded {
+                channel_id: "C456".to_string(),
+                ts: "1710000000.000001".to_string(),
+                messages: Vec::new(),
+                has_more: false,
+                next_cursor: None,
+                append_older: false,
+            },
+            conversation,
+        ));
+        assert!(!runtime_event_is_visible(
+            &RuntimeEventKind::SearchLoaded(Vec::new()),
+            conversation,
+        ));
+
+        let search = RuntimeViewSelection {
+            main_view: MainMessageView::Search,
+            selected_channel: Some("C456"),
+            selected_thread_ts: None,
+        };
+        assert!(runtime_event_is_visible(
+            &RuntimeEventKind::SearchLoaded(Vec::new()),
+            search,
+        ));
     }
 
     fn message(ts: &str, text: &str) -> SlackMessage {
