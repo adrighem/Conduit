@@ -8,7 +8,7 @@
 - [x] Task: Extract authoritative workspace view state and pure transitions c0eab7e
 - [x] Task: Add operation-scoped runtime errors and local UI recovery 5c053d0
 - [x] Task: Build an adaptive, accessible shell with clear navigation state 3076778
-- [~] Task: Modernize semantic message HTML/CSS and localization
-- [ ] Task: Complete notification, unread-surface, search-navigation, and draft UX
+- [x] Task: Modernize semantic message HTML/CSS and localization 2794a90
+- [~] Task: Complete notification, unread-surface, search-navigation, and draft UX
 - [ ] Task: Run full regression validation and synchronize architecture documentation
 - [ ] Task: Conductor - User Manual Verification 'Architecture and UX modernization' (Protocol in workflow.md)
