@@ -1,21 +1,21 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-10-ci-follow-up",
+  "last_manual_run": "2026-07-10-architecture-ux-modernization",
   "last_known_open_issues": 0,
   "last_known_open_pull_requests": 0,
   "last_known_total_issues": 0,
   "last_known_total_pull_requests": 0,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 132 tests",
+    "cargo_test": "pass: 194 tests",
     "meson_compile": "pass",
     "meson_test": "pass",
-    "github_actions": "CI run 29090777347 failed Clippy on main at dee54bc; local fix passes the exact CI sequence",
-    "cargo_clippy": "pass: cargo clippy --all-targets -- -D warnings"
+    "github_actions": "latest CI run 29091467301 passed on origin/main at 227b099; failed run 29090777347 was superseded",
+    "cargo_clippy": "pass: cargo clippy --all-targets --all-features -- -D warnings"
   },
   "notes": {
-    "skill_package": "CI-focused manual investigation; full backlog triage was not needed",
+    "skill_package": "gh-helper overview plus CI-focused verification; no backlog triage actions were needed",
     "clippy": "cargo-clippy and clippy-driver are 0.1.95; CI and contributor docs now use cargo clippy --all-targets -- -D warnings",
-    "worktree": "main contains the local Socket Mode commit plus a verified CI lint fix; push pending approval"
+    "worktree": "architecture and UX modernization stack verified; user-authorized push pending final documentation commit"
   }
 }

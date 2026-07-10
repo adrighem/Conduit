@@ -82,16 +82,16 @@ Implemented:
 - PKCE OAuth callback flow on localhost.
 - Keyring-backed token storage.
 - Background Tokio runtime for Slack network work.
-- Native sidebar conversation navigation with muted/external indicators, Activity, recent files, cached conversations and recent histories, paged channel and thread history, read-marker updates, optional Socket Mode realtime message/reaction updates, search, saved items, multiline message posting, emoji reactions, edited/deleted message rendering, Block Kit action deep links, and file upload.
+- Adaptive sidebar navigation with muted/external indicators, Messages, Unreads, recent files, cached conversations and histories, paged channel and thread history, read-marker updates, optional Socket Mode realtime message/reaction updates, internal navigation from search results, saved items, multiline message posting, persistent per-conversation/thread drafts, actionable desktop notifications, emoji reactions, edited/deleted message rendering, Block Kit action deep links, and file upload.
 
 Next:
 
 - Newer-message timestamp refresh and explicit read/unread actions.
-- Composer formatting controls, autocomplete, emoji picker, and draft persistence.
+- Composer formatting controls, autocomplete, and emoji picker.
 - Multi-workspace switching, custom sections, presence, and avatars.
 - Search result tabs, people/channel directories, file pagination, and richer file previews.
 - Native summaries for additional Slack product references where APIs are stable.
-- Slack-wide mention, reply, and reaction aggregation for Activity.
-- Broader Socket Mode reducers for user/profile updates, read markers, and richer Activity aggregation.
+- Slack-wide mention, reply, and reaction aggregation.
+- Broader Socket Mode reducers for user/profile updates and read markers.
 - Presence cache.
 - Flatpak dependency vendoring and Flathub-grade screenshots.

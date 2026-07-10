@@ -79,3 +79,10 @@
 - Diagnosed failed GitHub Actions run `29090777347` on `dee54bc`: formatting passed, while strict Clippy failed on `enum_variant_names` and `derivable_impls` in `src/sidebar.rs`.
 - Fixed both lints locally by shortening internal placeholder variant names and deriving `Default` for `SidebarBuildOptions`; user-facing labels and behavior are unchanged.
 - Verified the full CI sequence locally. No public GitHub action was taken; pushing remains subject to explicit approval.
+
+## 2026-07-10 Architecture and UX Modernization
+
+- The failed CI run `29090777347` was limited to two stable-Clippy findings and was already superseded by successful run `29091467301` for `227b099`.
+- Kept exact search result context transient so opening an older result cannot replace the authoritative latest-history cache.
+- Scoped notifications and drafts by Slack team and user; draft completion clears only unchanged submitted text.
+- No issue, pull request, label, release, or public comment action is needed. The user explicitly authorized pushing the verified local stack.

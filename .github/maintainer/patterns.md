@@ -59,3 +59,9 @@
 
 - CI tracks the stable Rust toolchain with `-D warnings`, so new Clippy releases can fail an unchanged codebase. Run the exact strict Clippy command immediately before pushing.
 - Prefer small idiomatic fixes for newly enforced lints over broad lint suppression; in this case, concise enum variants and a derived `Default` preserve behavior while reducing maintenance code.
+
+## 2026-07-10 Architecture and UX Modernization
+
+- Historical search context must be modeled separately from normal history; treating a bounded context page as history silently corrupts navigation and pagination semantics.
+- Async composer/upload completion should identify one in-flight submission and compare against current text before clearing persistent drafts.
+- Desktop notification targets and persisted user content need both workspace and user identity, even before multi-workspace switching exists.
