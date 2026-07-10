@@ -10,5 +10,5 @@
 - [x] Task: Build an adaptive, accessible shell with clear navigation state 3076778
 - [x] Task: Modernize semantic message HTML/CSS and localization 2794a90
 - [x] Task: Complete notification, unread-surface, search-navigation, and draft UX f02d63b
-- [~] Task: Run full regression validation and synchronize architecture documentation
-- [ ] Task: Conductor - User Manual Verification 'Architecture and UX modernization' (Protocol in workflow.md)
+- [x] Task: Run full regression validation and synchronize architecture documentation 6c3e196
+- [~] Task: Conductor - User Manual Verification 'Architecture and UX modernization' (Protocol in workflow.md)
