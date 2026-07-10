@@ -168,3 +168,16 @@
 - Notes:
   - The installed maintainer skill is still missing its referenced scripts and reference files, so this run used the manual fallback.
   - No issue, pull request, label, release, or public comment action was taken.
+
+## 2026-07-10 CI Follow-up
+
+- Scope: investigate failed CI run `29090777347` and prepare a local fix.
+- Cause: stable Clippy rejected the sidebar placeholder enum naming and a manual `Default` implementation on `dee54bc`.
+- Local fix: renamed internal placeholder variants and derived `Default` without changing UI behavior.
+- Local checks:
+  - `cargo fmt --check`: pass
+  - `cargo clippy --all-targets -- -D warnings`: pass
+  - `cargo test`: pass, 132 tests
+  - clean Meson setup and compile: pass
+  - `meson test -C _build`: pass, 4 tests
+- No public GitHub action was taken. Pushing the local commits requires explicit approval.

@@ -118,19 +118,19 @@ impl SidebarSectionModel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarPlaceholder {
-    LoadingConversations,
-    CouldNotLoadConversations,
-    NoConversations,
-    NoMatchingConversations,
+    Loading,
+    LoadFailed,
+    Empty,
+    NoMatches,
 }
 
 impl SidebarPlaceholder {
     pub fn label(self) -> &'static str {
         match self {
-            Self::LoadingConversations => "Loading conversations",
-            Self::CouldNotLoadConversations => "Could not load conversations",
-            Self::NoConversations => "No conversations",
-            Self::NoMatchingConversations => "No matching conversations",
+            Self::Loading => "Loading conversations",
+            Self::LoadFailed => "Could not load conversations",
+            Self::Empty => "No conversations",
+            Self::NoMatches => "No matching conversations",
         }
     }
 }
@@ -141,7 +141,7 @@ pub enum SidebarListModel {
     Sections(Vec<SidebarSectionModel>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SidebarBuildOptions<'a> {
     pub selected_channel: Option<&'a str>,
     pub query: &'a str,
@@ -150,20 +150,6 @@ pub struct SidebarBuildOptions<'a> {
     pub show_all: bool,
     pub loading: bool,
     pub has_error: bool,
-}
-
-impl Default for SidebarBuildOptions<'_> {
-    fn default() -> Self {
-        Self {
-            selected_channel: None,
-            query: "",
-            unread_only: false,
-            show_unreads_section: false,
-            show_all: false,
-            loading: false,
-            has_error: false,
-        }
-    }
 }
 
 impl SidebarRowModel {
@@ -201,15 +187,15 @@ pub fn build_sidebar_list(
     options: SidebarBuildOptions<'_>,
 ) -> SidebarListModel {
     if options.loading && conversations.is_empty() {
-        return SidebarListModel::Placeholder(SidebarPlaceholder::LoadingConversations);
+        return SidebarListModel::Placeholder(SidebarPlaceholder::Loading);
     }
 
     if options.has_error && conversations.is_empty() {
-        return SidebarListModel::Placeholder(SidebarPlaceholder::CouldNotLoadConversations);
+        return SidebarListModel::Placeholder(SidebarPlaceholder::LoadFailed);
     }
 
     if conversations.is_empty() {
-        return SidebarListModel::Placeholder(SidebarPlaceholder::NoConversations);
+        return SidebarListModel::Placeholder(SidebarPlaceholder::Empty);
     }
 
     let query = normalized_query(options.query);
@@ -231,7 +217,7 @@ pub fn build_sidebar_list(
     }
 
     if sections.is_empty() {
-        SidebarListModel::Placeholder(SidebarPlaceholder::NoMatchingConversations)
+        SidebarListModel::Placeholder(SidebarPlaceholder::NoMatches)
     } else {
         SidebarListModel::Sections(sections)
     }
@@ -799,7 +785,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            SidebarPlaceholder::LoadingConversations
+            SidebarPlaceholder::Loading
         );
         assert_eq!(
             list_placeholder(build_sidebar_list(
@@ -810,7 +796,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            SidebarPlaceholder::CouldNotLoadConversations
+            SidebarPlaceholder::LoadFailed
         );
         assert_eq!(
             list_placeholder(build_sidebar_list(
@@ -818,7 +804,7 @@ mod tests {
                 &HashMap::new(),
                 SidebarBuildOptions::default(),
             )),
-            SidebarPlaceholder::NoConversations
+            SidebarPlaceholder::Empty
         );
         assert_eq!(
             list_placeholder(build_sidebar_list(
@@ -829,7 +815,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            SidebarPlaceholder::NoMatchingConversations
+            SidebarPlaceholder::NoMatches
         );
     }
 
@@ -886,7 +872,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            SidebarPlaceholder::NoMatchingConversations
+            SidebarPlaceholder::NoMatches
         );
     }
 

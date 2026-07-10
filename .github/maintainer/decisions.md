@@ -73,3 +73,9 @@
 - Implemented the low-risk OAuth scope migration documentation locally instead of opening a tracking issue.
 - Treat real-workspace OAuth reconnect smoke testing and Flatpak packaging validation as the next maintenance priorities.
 - No issue, pull request, label, release, or public comment action was taken.
+
+## 2026-07-10 CI Follow-up
+
+- Diagnosed failed GitHub Actions run `29090777347` on `dee54bc`: formatting passed, while strict Clippy failed on `enum_variant_names` and `derivable_impls` in `src/sidebar.rs`.
+- Fixed both lints locally by shortening internal placeholder variant names and deriving `Default` for `SidebarBuildOptions`; user-facing labels and behavior are unchanged.
+- Verified the full CI sequence locally. No public GitHub action was taken; pushing remains subject to explicit approval.

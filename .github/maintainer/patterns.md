@@ -54,3 +54,8 @@
 - Scope changes need user-facing reconnect guidance, not just a current scope list, because Slack may keep older OAuth grants for existing testers.
 - Release readiness checks should explicitly verify scope migration notes whenever requested Slack permissions change.
 - With GitHub backlog and security alerts empty, packaging and real-workspace smoke tests are higher leverage than more feature breadth.
+
+## 2026-07-10 CI Follow-up
+
+- CI tracks the stable Rust toolchain with `-D warnings`, so new Clippy releases can fail an unchanged codebase. Run the exact strict Clippy command immediately before pushing.
+- Prefer small idiomatic fixes for newly enforced lints over broad lint suppression; in this case, concise enum variants and a derived `Default` preserve behavior while reducing maintenance code.
