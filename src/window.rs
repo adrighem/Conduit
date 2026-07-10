@@ -68,15 +68,15 @@ mod imp {
         #[template_child]
         pub auth_intro_label: TemplateChild<gtk::Label>,
         #[template_child]
-        pub client_id_entry: TemplateChild<gtk::Entry>,
+        pub client_id_entry: TemplateChild<adw::EntryRow>,
         #[template_child]
         pub browser_session_check: TemplateChild<gtk::CheckButton>,
         #[template_child]
-        pub xoxc_token_entry: TemplateChild<gtk::Entry>,
+        pub xoxc_token_entry: TemplateChild<adw::PasswordEntryRow>,
         #[template_child]
-        pub xoxd_token_entry: TemplateChild<gtk::Entry>,
+        pub xoxd_token_entry: TemplateChild<adw::PasswordEntryRow>,
         #[template_child]
-        pub user_agent_entry: TemplateChild<gtk::Entry>,
+        pub user_agent_entry: TemplateChild<adw::EntryRow>,
         #[template_child]
         pub setup_hint_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -84,15 +84,17 @@ mod imp {
         #[template_child]
         pub connection_label: TemplateChild<gtk::Label>,
         #[template_child]
-        pub workspace_title_label: TemplateChild<gtk::Label>,
+        pub workspace_title_label: TemplateChild<adw::WindowTitle>,
         #[template_child]
-        pub home_button: TemplateChild<gtk::Button>,
+        pub workspace_split: TemplateChild<adw::NavigationSplitView>,
         #[template_child]
-        pub activity_button: TemplateChild<gtk::Button>,
+        pub home_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
-        pub files_button: TemplateChild<gtk::Button>,
+        pub activity_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
-        pub saved_button: TemplateChild<gtk::Button>,
+        pub files_button: TemplateChild<gtk::ToggleButton>,
+        #[template_child]
+        pub saved_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub refresh_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -106,11 +108,15 @@ mod imp {
         #[template_child]
         pub workspace_status_label: TemplateChild<gtk::Label>,
         #[template_child]
-        pub message_title: TemplateChild<gtk::Label>,
+        pub message_status_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub message_title: TemplateChild<adw::WindowTitle>,
         #[template_child]
         pub message_view_box: TemplateChild<gtk::Box>,
         #[template_child]
-        pub message_thread_paned: TemplateChild<gtk::Paned>,
+        pub message_composer: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub thread_split: TemplateChild<adw::OverlaySplitView>,
         #[template_child]
         pub message_entry: TemplateChild<gtk::TextView>,
         #[template_child]
@@ -120,13 +126,13 @@ mod imp {
         #[template_child]
         pub upload_progress: TemplateChild<gtk::ProgressBar>,
         #[template_child]
+        pub message_search_bar: TemplateChild<gtk::SearchBar>,
+        #[template_child]
         pub message_search_entry: TemplateChild<gtk::SearchEntry>,
         #[template_child]
-        pub message_search_button: TemplateChild<gtk::Button>,
+        pub message_search_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
-        pub thread_pane: TemplateChild<gtk::Box>,
-        #[template_child]
-        pub thread_title: TemplateChild<gtk::Label>,
+        pub thread_title: TemplateChild<adw::WindowTitle>,
         #[template_child]
         pub thread_view_box: TemplateChild<gtk::Box>,
         #[template_child]
@@ -180,8 +186,10 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
+            obj.setup_adaptive_layout();
             obj.setup_runtime();
             obj.setup_message_view();
+            obj.configure_accessibility();
             obj.configure_auth_ui();
             obj.setup_settings();
             obj.setup_callbacks();
@@ -222,6 +230,30 @@ fn sidebar_row_action_for_index(
     row_index: i32,
 ) -> Option<SidebarRowAction> {
     actions.get(&row_index).cloned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceNavigationSelection {
+    Home,
+    Activity,
+    Files,
+    Saved,
+}
+
+fn workspace_navigation_selection(
+    main_view: MainMessageView,
+) -> Option<WorkspaceNavigationSelection> {
+    match main_view {
+        MainMessageView::Conversation => Some(WorkspaceNavigationSelection::Home),
+        MainMessageView::Activity => Some(WorkspaceNavigationSelection::Activity),
+        MainMessageView::Files => Some(WorkspaceNavigationSelection::Files),
+        MainMessageView::Saved => Some(WorkspaceNavigationSelection::Saved),
+        MainMessageView::Placeholder | MainMessageView::Search => None,
+    }
+}
+
+fn workspace_composer_visible(main_view: MainMessageView) -> bool {
+    main_view == MainMessageView::Conversation
 }
 
 #[derive(Debug, Default)]
@@ -508,26 +540,6 @@ fn slack_permalink_ts(ts: &str) -> Option<String> {
     Some(format!("{seconds}{fraction}"))
 }
 
-const THREAD_PANE_MIN_WIDTH: i32 = 380;
-const THREAD_PANE_MAX_WIDTH: i32 = 500;
-const MAIN_PANE_MIN_WITH_THREAD: i32 = 440;
-
-fn default_thread_pane_position(width: i32) -> Option<i32> {
-    if width <= 0 {
-        return None;
-    }
-
-    let thread_width = if width < MAIN_PANE_MIN_WITH_THREAD + THREAD_PANE_MIN_WIDTH {
-        width / 2
-    } else {
-        let responsive_width = width * 2 / 5;
-        let max_thread_width = THREAD_PANE_MAX_WIDTH.min(width - MAIN_PANE_MIN_WITH_THREAD);
-        responsive_width.clamp(THREAD_PANE_MIN_WIDTH, max_thread_width)
-    };
-
-    Some(width - thread_width)
-}
-
 fn realtime_message_marks_unread(
     reading_channel: Option<&str>,
     current_user_id: Option<&str>,
@@ -600,6 +612,69 @@ impl ConduitWindow {
         glib::Object::builder()
             .property("application", application)
             .build()
+    }
+
+    fn setup_adaptive_layout(&self) {
+        let imp = self.imp();
+
+        let workspace_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            700.0,
+            adw::LengthUnit::Sp,
+        ));
+        workspace_breakpoint.add_setter(
+            &imp.workspace_split.get(),
+            "collapsed",
+            Some(&true.to_value()),
+        );
+        self.add_breakpoint(workspace_breakpoint);
+
+        let thread_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            900.0,
+            adw::LengthUnit::Sp,
+        ));
+        thread_breakpoint.add_setter(&imp.thread_split.get(), "collapsed", Some(&true.to_value()));
+        thread_breakpoint.add_setter(
+            &imp.thread_split.get(),
+            "pin-sidebar",
+            Some(&false.to_value()),
+        );
+        thread_breakpoint.add_setter(
+            &imp.thread_split.get(),
+            "sidebar-width-fraction",
+            Some(&1.0_f64.to_value()),
+        );
+        thread_breakpoint.add_setter(
+            &imp.thread_split.get(),
+            "max-sidebar-width",
+            Some(&1000.0_f64.to_value()),
+        );
+        self.add_breakpoint(thread_breakpoint);
+    }
+
+    fn configure_accessibility(&self) {
+        let imp = self.imp();
+        imp.message_entry
+            .update_property(&[gtk::accessible::Property::Label("Message")]);
+        imp.thread_entry
+            .update_property(&[gtk::accessible::Property::Label("Reply")]);
+        imp.message_search_entry
+            .update_property(&[gtk::accessible::Property::Label(
+                "Search workspace messages",
+            )]);
+
+        for (button, label) in [
+            (imp.home_button.get().upcast::<gtk::Widget>(), "Home"),
+            (
+                imp.activity_button.get().upcast::<gtk::Widget>(),
+                "Activity",
+            ),
+            (imp.files_button.get().upcast::<gtk::Widget>(), "Files"),
+            (imp.saved_button.get().upcast::<gtk::Widget>(), "Later"),
+        ] {
+            button.update_property(&[gtk::accessible::Property::Label(label)]);
+        }
     }
 
     fn setup_runtime(&self) {
@@ -716,9 +791,6 @@ impl ConduitWindow {
             window.refresh_conversations()
         });
         self.connect_widget(&imp.saved_button.get(), |window| window.show_later());
-        self.connect_widget(&imp.message_search_button.get(), |window| {
-            window.search_messages()
-        });
         self.connect_widget(&imp.send_button.get(), |window| {
             window.post_current_message()
         });
@@ -778,6 +850,37 @@ impl ConduitWindow {
         imp.message_search_entry.connect_activate(move |_| {
             if let Some(window) = weak_window.upgrade() {
                 window.search_messages();
+            }
+        });
+
+        imp.message_search_bar
+            .connect_entry(&imp.message_search_entry.get());
+        let weak_window = self.downgrade();
+        imp.message_search_button.connect_toggled(move |button| {
+            if let Some(window) = weak_window.upgrade() {
+                window.set_workspace_search_visible(button.is_active());
+            }
+        });
+
+        let weak_window = self.downgrade();
+        imp.message_search_bar
+            .connect_search_mode_enabled_notify(move |search_bar| {
+                if let Some(window) = weak_window.upgrade() {
+                    let button = window.imp().message_search_button.get();
+                    if button.is_active() != search_bar.is_search_mode() {
+                        button.set_active(search_bar.is_search_mode());
+                    }
+                }
+            });
+
+        let weak_window = self.downgrade();
+        imp.thread_split.connect_show_sidebar_notify(move |split| {
+            if !split.shows_sidebar() {
+                if let Some(window) = weak_window.upgrade() {
+                    if window.selected_thread_ts().is_some() {
+                        window.close_thread();
+                    }
+                }
             }
         });
     }
@@ -1227,11 +1330,12 @@ impl ConduitWindow {
             self.select_conversation(&channel_id, &title);
         } else {
             self.imp().workspace_view.borrow_mut().show_placeholder();
-            self.imp().message_title.set_label("Select a conversation");
+            self.imp().message_title.set_title("Select a conversation");
             self.show_message_placeholder("Select a conversation");
             self.render_closed_thread();
             self.render_conversations();
         }
+        self.imp().workspace_split.set_show_content(true);
     }
 
     fn show_activity(&self) {
@@ -1239,23 +1343,25 @@ impl ConduitWindow {
         self.render_closed_thread();
         let items = self.activity_items();
         self.populate_activity(items);
+        self.imp().workspace_split.set_show_content(true);
     }
 
     fn show_files(&self) {
         self.imp().workspace_view.borrow_mut().start_files();
         self.render_closed_thread();
-        self.imp().message_title.set_label("Files");
+        self.imp().message_title.set_title("Files");
         self.render_conversations();
         self.load_message_html(&message_html::placeholder_document(
             "Files",
             "Loading files",
         ));
         self.send_command(RuntimeCommand::LoadFiles);
+        self.imp().workspace_split.set_show_content(true);
     }
 
     fn show_later(&self) {
         self.imp().workspace_view.borrow_mut().start_saved();
-        self.imp().message_title.set_label("Later");
+        self.imp().message_title.set_title("Later");
         self.render_closed_thread();
         self.render_conversations();
         self.load_message_html(&message_html::placeholder_document(
@@ -1263,6 +1369,7 @@ impl ConduitWindow {
             "Loading saved items",
         ));
         self.send_command(RuntimeCommand::LoadSavedItems);
+        self.imp().workspace_split.set_show_content(true);
     }
 
     fn search_messages(&self) {
@@ -1274,23 +1381,40 @@ impl ConduitWindow {
         self.imp().workspace_view.borrow_mut().start_search();
         self.render_closed_thread();
         self.render_conversations();
-        self.imp().message_title.set_label("Search results");
+        self.imp().message_title.set_title("Search results");
         self.load_message_html(&message_html::placeholder_document(
             "Search results",
             "Searching",
         ));
         self.send_command(RuntimeCommand::SearchMessages { query });
+        self.imp().workspace_split.set_show_content(true);
     }
 
     fn focus_workspace_search(&self) {
+        self.imp().workspace_split.set_show_content(true);
+        self.set_workspace_search_visible(true);
         let entry = self.imp().message_search_entry.get();
         entry.grab_focus();
         entry.select_region(0, -1);
     }
 
-    fn focus_composer(&self) {
+    fn set_workspace_search_visible(&self, visible: bool) {
         let imp = self.imp();
-        if imp.thread_pane.is_visible() {
+        if imp.message_search_bar.is_search_mode() != visible {
+            imp.message_search_bar.set_search_mode(visible);
+        }
+        if imp.message_search_button.is_active() != visible {
+            imp.message_search_button.set_active(visible);
+        }
+        if visible {
+            imp.message_search_entry.grab_focus();
+        }
+    }
+
+    fn focus_composer(&self) {
+        self.imp().workspace_split.set_show_content(true);
+        let imp = self.imp();
+        if imp.thread_split.shows_sidebar() {
             imp.thread_entry.grab_focus();
         } else if self.visible_channel_id().is_some() {
             imp.message_entry.grab_focus();
@@ -1386,7 +1510,7 @@ impl ConduitWindow {
     fn render_closed_thread(&self) {
         let imp = self.imp();
         set_text_view_text(&imp.thread_entry, "");
-        imp.thread_pane.set_visible(false);
+        imp.thread_split.set_show_sidebar(false);
         self.load_thread_html(&message_html::placeholder_document(
             "Thread",
             "No thread open",
@@ -1704,8 +1828,12 @@ impl ConduitWindow {
         imp.sidebar_filter_entry.set_text("");
         imp.sidebar_unread_filter_button.set_active(false);
         imp.sidebar_all_filter_button.set_active(false);
-        imp.workspace_title_label.set_label("Workspace");
+        imp.workspace_title_label.set_title("Workspace");
         imp.workspace_status_label.set_label("");
+        imp.message_status_label.set_label("");
+        imp.workspace_split.set_show_content(false);
+        imp.thread_split.set_show_sidebar(false);
+        self.sync_workspace_chrome();
         self.clear_list(&imp.conversation_list);
         self.show_message_placeholder("Select a conversation");
         self.load_thread_html(&message_html::placeholder_document(
@@ -1723,9 +1851,11 @@ impl ConduitWindow {
             .or(auth.team_id)
             .unwrap_or_else(|| "Slack".to_string());
         *self.imp().workspace_name.borrow_mut() = Some(workspace_name.clone());
-        self.imp().workspace_title_label.set_label(&workspace_name);
+        self.imp().workspace_title_label.set_title(&workspace_name);
         self.set_status(&connected_workspace_status(Some(&workspace_name)));
         self.imp().content_stack.set_visible_child_name("workspace");
+        self.imp().workspace_split.set_show_content(false);
+        self.sync_workspace_chrome();
         if conversation_refresh_start_shows_sidebar_loading() {
             self.start_sidebar_loading();
         }
@@ -1736,6 +1866,7 @@ impl ConduitWindow {
         imp.status_label.set_label(status);
         imp.connection_label.set_label(status);
         imp.workspace_status_label.set_label(status);
+        imp.message_status_label.set_label(status);
     }
 
     fn restore_workspace_status(&self) {
@@ -1889,12 +2020,8 @@ impl ConduitWindow {
 
     fn show_thread_error(&self, error: &str) {
         let imp = self.imp();
-        imp.thread_title.set_label("Thread");
-        let opening_thread_pane = !imp.thread_pane.is_visible();
-        imp.thread_pane.set_visible(true);
-        if opening_thread_pane {
-            self.queue_default_thread_pane_position();
-        }
+        imp.thread_title.set_title("Thread");
+        imp.thread_split.set_show_sidebar(true);
         let message = format!("Could not load replies. Try again. {error}");
         self.load_thread_html(&message_html::placeholder_document("Thread", &message));
     }
@@ -2103,6 +2230,7 @@ impl ConduitWindow {
     }
 
     fn render_conversations(&self) {
+        self.sync_workspace_chrome();
         let imp = self.imp();
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
@@ -2321,9 +2449,25 @@ impl ConduitWindow {
         if self.current_main_view() == MainMessageView::Conversation {
             if let Some(channel_id) = self.visible_channel_id() {
                 imp.message_title
-                    .set_label(&self.conversation_title(&channel_id));
+                    .set_title(&self.conversation_title(&channel_id));
             }
         }
+    }
+
+    fn sync_workspace_chrome(&self) {
+        let imp = self.imp();
+        let main_view = imp.workspace_view.borrow().main_view();
+        let selection = workspace_navigation_selection(main_view);
+        imp.home_button
+            .set_active(selection == Some(WorkspaceNavigationSelection::Home));
+        imp.activity_button
+            .set_active(selection == Some(WorkspaceNavigationSelection::Activity));
+        imp.files_button
+            .set_active(selection == Some(WorkspaceNavigationSelection::Files));
+        imp.saved_button
+            .set_active(selection == Some(WorkspaceNavigationSelection::Saved));
+        imp.message_composer
+            .set_visible(workspace_composer_visible(main_view));
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
@@ -2337,9 +2481,10 @@ impl ConduitWindow {
             .borrow_mut()
             .select_conversation(channel_id);
         let current_messages = imp.workspace_view.borrow().snapshot().channel_messages;
-        imp.message_title.set_label(title);
+        imp.message_title.set_title(title);
         set_text_view_text(&imp.thread_entry, "");
-        imp.thread_pane.set_visible(false);
+        imp.thread_split.set_show_sidebar(false);
+        imp.workspace_split.set_show_content(true);
         self.load_thread_html(&message_html::placeholder_document(
             "Thread",
             "No thread open",
@@ -2421,7 +2566,7 @@ impl ConduitWindow {
     ) {
         let imp = self.imp();
         imp.message_title
-            .set_label(&self.conversation_title(channel_id));
+            .set_title(&self.conversation_title(channel_id));
         let mut context = self.message_html_context(None);
         context.load_more_url = self.channel_load_more_url(channel_id);
         context.timeline_scroll = scroll_behavior;
@@ -2463,12 +2608,8 @@ impl ConduitWindow {
         scroll_behavior: TimelineScrollBehavior,
     ) {
         let imp = self.imp();
-        imp.thread_title.set_label("Thread");
-        let opening_thread_pane = !imp.thread_pane.is_visible();
-        imp.thread_pane.set_visible(true);
-        if opening_thread_pane {
-            self.queue_default_thread_pane_position();
-        }
+        imp.thread_title.set_title("Thread");
+        imp.thread_split.set_show_sidebar(true);
 
         if messages.is_empty() {
             self.load_thread_html(&message_html::placeholder_document("Thread", "No replies"));
@@ -2484,46 +2625,30 @@ impl ConduitWindow {
         ));
     }
 
-    fn queue_default_thread_pane_position(&self) {
-        let weak_window = self.downgrade();
-        glib::idle_add_local_once(move || {
-            if let Some(window) = weak_window.upgrade() {
-                window.set_default_thread_pane_position();
-            }
-        });
-    }
-
-    fn set_default_thread_pane_position(&self) {
-        let paned = self.imp().message_thread_paned.get();
-        if let Some(position) = default_thread_pane_position(paned.width()) {
-            paned.set_position(position);
-        }
-    }
-
     fn populate_activity(&self, items: Vec<ActivityItem>) {
         let imp = self.imp();
-        imp.message_title.set_label("Activity");
+        imp.message_title.set_title("Activity");
         self.render_conversations();
         self.load_message_html(&message_html::activity_document(&items));
     }
 
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
         let imp = self.imp();
-        imp.message_title.set_label("Search results");
+        imp.message_title.set_title("Search results");
         let context = self.message_html_context(None);
         self.load_message_html(&message_html::search_results_document(&results, &context));
     }
 
     fn populate_files(&self, files: Vec<SlackFile>) {
         let imp = self.imp();
-        imp.message_title.set_label("Files");
+        imp.message_title.set_title("Files");
         self.render_conversations();
         self.load_message_html(&message_html::files_document(&files));
     }
 
     fn populate_saved_items(&self, items: Vec<SavedItem>) {
         let imp = self.imp();
-        imp.message_title.set_label("Later");
+        imp.message_title.set_title("Later");
         let saved_messages = items
             .iter()
             .filter_map(|item| item.message.as_ref())
@@ -3463,12 +3588,80 @@ mod tests {
     }
 
     #[test]
-    fn default_thread_pane_position_uses_readable_thread_width() {
-        assert_eq!(default_thread_pane_position(0), None);
-        assert_eq!(default_thread_pane_position(600), Some(300));
-        assert_eq!(default_thread_pane_position(820), Some(440));
-        assert_eq!(default_thread_pane_position(1060), Some(636));
-        assert_eq!(default_thread_pane_position(1400), Some(900));
+    fn workspace_navigation_selection_follows_authoritative_main_view() {
+        assert_eq!(
+            workspace_navigation_selection(MainMessageView::Conversation),
+            Some(WorkspaceNavigationSelection::Home)
+        );
+        assert_eq!(
+            workspace_navigation_selection(MainMessageView::Activity),
+            Some(WorkspaceNavigationSelection::Activity)
+        );
+        assert_eq!(
+            workspace_navigation_selection(MainMessageView::Files),
+            Some(WorkspaceNavigationSelection::Files)
+        );
+        assert_eq!(
+            workspace_navigation_selection(MainMessageView::Saved),
+            Some(WorkspaceNavigationSelection::Saved)
+        );
+        assert_eq!(
+            workspace_navigation_selection(MainMessageView::Placeholder),
+            None
+        );
+        assert_eq!(
+            workspace_navigation_selection(MainMessageView::Search),
+            None
+        );
+    }
+
+    #[test]
+    fn composer_is_only_visible_for_conversations() {
+        assert!(workspace_composer_visible(MainMessageView::Conversation));
+        for view in [
+            MainMessageView::Placeholder,
+            MainMessageView::Activity,
+            MainMessageView::Search,
+            MainMessageView::Files,
+            MainMessageView::Saved,
+        ] {
+            assert!(!workspace_composer_visible(view));
+        }
+    }
+
+    #[test]
+    fn window_template_uses_adaptive_accessible_shell() {
+        let template = include_str!("window.ui");
+
+        for required in [
+            "AdwNavigationSplitView\" id=\"workspace_split",
+            "AdwOverlaySplitView\" id=\"thread_split",
+            "AdwNavigationPage",
+            "GtkSearchBar\" id=\"message_search_bar",
+            "AdwClamp",
+            "GtkScrolledWindow\" id=\"auth_scroller",
+            "<property name=\"vscrollbar-policy\">automatic</property>",
+            "AdwEntryRow\" id=\"client_id_entry",
+            "AdwPasswordEntryRow\" id=\"xoxc_token_entry",
+            "AdwPasswordEntryRow\" id=\"xoxd_token_entry",
+            "<property name=\"label\" translatable=\"yes\">Message</property>",
+            "<property name=\"label\" translatable=\"yes\">Reply</property>",
+            "GtkToggleButton\" id=\"home_button",
+            "<property name=\"group\">home_button</property>",
+            "<property name=\"enable-show-gesture\">False</property>",
+            "GtkLabel\" id=\"message_status_label",
+            "<property name=\"accessible-role\">status</property>",
+        ] {
+            assert!(
+                template.contains(required),
+                "missing template marker {required}"
+            );
+        }
+
+        assert!(!template.contains("<object class=\"GtkPaned\""));
+        assert!(!template.contains("<property name=\"width-request\">460</property>"));
+        assert!(!template.contains("<property name=\"width-request\">280</property>"));
+        assert!(!template.contains("<property name=\"width-request\">220</property>"));
     }
 
     #[test]

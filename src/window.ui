@@ -1,38 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
   <requires lib="gtk" version="4.0"/>
-  <requires lib="Adw" version="1.0"/>
+  <requires lib="Adw" version="1.4"/>
   <template class="ConduitWindow" parent="AdwApplicationWindow">
     <property name="title" translatable="yes">Conduit</property>
     <property name="default-width">1120</property>
     <property name="default-height">720</property>
     <property name="content">
-      <object class="AdwToolbarView">
-        <child type="top">
-          <object class="AdwHeaderBar">
-            <property name="title-widget">
-              <object class="AdwWindowTitle">
-                <property name="title" translatable="yes">Conduit</property>
-                <property name="subtitle" translatable="yes">Slack</property>
-              </object>
-            </property>
-            <child type="end">
-              <object class="GtkMenuButton">
-                <property name="primary">True</property>
-                <property name="icon-name">open-menu-symbolic</property>
-                <property name="tooltip-text" translatable="yes">Main Menu</property>
-                <property name="menu-model">primary_menu</property>
-              </object>
-            </child>
-          </object>
-        </child>
-        <property name="content">
-          <object class="GtkStack" id="content_stack">
-            <property name="transition-type">crossfade</property>
-            <child>
-              <object class="GtkStackPage">
-                <property name="name">loading</property>
-                <property name="child">
+      <object class="GtkStack" id="content_stack">
+        <property name="transition-type">crossfade</property>
+        <child>
+          <object class="GtkStackPage">
+            <property name="name">loading</property>
+            <property name="child">
+              <object class="AdwToolbarView">
+                <child type="top">
+                  <object class="AdwHeaderBar">
+                    <property name="title-widget">
+                      <object class="AdwWindowTitle">
+                        <property name="title" translatable="yes">Conduit</property>
+                        <property name="subtitle" translatable="yes">Slack</property>
+                      </object>
+                    </property>
+                    <child type="end">
+                      <object class="GtkMenuButton">
+                        <property name="primary">True</property>
+                        <property name="icon-name">open-menu-symbolic</property>
+                        <property name="tooltip-text" translatable="yes">Main Menu</property>
+                        <property name="menu-model">primary_menu</property>
+                      </object>
+                    </child>
+                  </object>
+                </child>
+                <property name="content">
                   <object class="GtkBox">
                     <property name="orientation">vertical</property>
                     <property name="halign">center</property>
@@ -51,137 +51,164 @@
                   </object>
                 </property>
               </object>
-            </child>
-            <child>
-              <object class="GtkStackPage">
-                <property name="name">connect</property>
-                <property name="child">
-                  <object class="GtkBox">
-                    <property name="orientation">vertical</property>
-                    <property name="halign">center</property>
-                    <property name="valign">center</property>
-                    <property name="spacing">12</property>
-                    <property name="width-request">460</property>
-                    <child>
-                      <object class="GtkLabel">
-                        <property name="label" translatable="yes">Connect to Slack</property>
-                        <style>
-                          <class name="title-2"/>
-                        </style>
+            </property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkStackPage">
+            <property name="name">connect</property>
+            <property name="child">
+              <object class="AdwToolbarView">
+                <child type="top">
+                  <object class="AdwHeaderBar">
+                    <property name="title-widget">
+                      <object class="AdwWindowTitle">
+                        <property name="title" translatable="yes">Conduit</property>
+                        <property name="subtitle" translatable="yes">Slack</property>
                       </object>
-                    </child>
-                    <child>
-                      <object class="GtkLabel" id="auth_intro_label">
-                        <property name="label" translatable="yes">Approve Conduit in your browser. Your Slack token will be stored in the system keyring.</property>
-                        <property name="wrap">True</property>
-                        <property name="justify">center</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkEntry" id="client_id_entry">
-                        <property name="placeholder-text" translatable="yes">Slack app client ID</property>
-                        <property name="hexpand">True</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkCheckButton" id="browser_session_check">
-                        <property name="label" translatable="yes">Use XOXC/XOXD tokens</property>
-                        <property name="halign">center</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkEntry" id="xoxc_token_entry">
-                        <property name="placeholder-text" translatable="yes">XOXC token</property>
-                        <property name="visibility">False</property>
-                        <property name="hexpand">True</property>
-                        <property name="visible">False</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkEntry" id="xoxd_token_entry">
-                        <property name="placeholder-text" translatable="yes">XOXD cookie</property>
-                        <property name="visibility">False</property>
-                        <property name="hexpand">True</property>
-                        <property name="visible">False</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkEntry" id="user_agent_entry">
-                        <property name="placeholder-text" translatable="yes">User-Agent (optional)</property>
-                        <property name="hexpand">True</property>
-                        <property name="visible">False</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkLabel" id="setup_hint_label">
-                        <property name="label" translatable="yes">Use redirect URL http://127.0.0.1:8934/callback in the Slack app settings.</property>
-                        <property name="wrap">True</property>
-                        <property name="justify">center</property>
-                        <style>
-                          <class name="caption"/>
-                        </style>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkButton" id="connect_button">
-                        <property name="label" translatable="yes">Connect Workspace</property>
-                        <property name="halign">center</property>
-                        <style>
-                          <class name="suggested-action"/>
-                        </style>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkLabel" id="connection_label">
-                        <property name="wrap">True</property>
-                        <property name="justify">center</property>
-                        <style>
-                          <class name="caption"/>
-                        </style>
+                    </property>
+                    <child type="end">
+                      <object class="GtkMenuButton">
+                        <property name="primary">True</property>
+                        <property name="icon-name">open-menu-symbolic</property>
+                        <property name="tooltip-text" translatable="yes">Main Menu</property>
+                        <property name="menu-model">primary_menu</property>
                       </object>
                     </child>
                   </object>
-                </property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkStackPage">
-                <property name="name">workspace</property>
-                <property name="child">
-                  <object class="GtkPaned">
-                    <property name="orientation">horizontal</property>
-                    <property name="position">300</property>
-                    <property name="start-child">
-                      <object class="GtkBox">
-                        <property name="orientation">vertical</property>
-                        <property name="spacing">6</property>
-                        <property name="margin-top">12</property>
-                        <property name="margin-bottom">12</property>
-                        <property name="margin-start">12</property>
-                        <property name="margin-end">6</property>
-                        <property name="width-request">280</property>
-                        <child>
+                </child>
+                <property name="content">
+                  <object class="GtkScrolledWindow" id="auth_scroller">
+                    <property name="hscrollbar-policy">never</property>
+                    <property name="vscrollbar-policy">automatic</property>
+                    <property name="child">
+                      <object class="AdwClamp">
+                        <property name="maximum-size">460</property>
+                        <property name="tightening-threshold">360</property>
+                        <property name="child">
                           <object class="GtkBox">
-                            <property name="orientation">horizontal</property>
-                            <property name="spacing">6</property>
+                            <property name="orientation">vertical</property>
+                            <property name="valign">center</property>
+                            <property name="spacing">12</property>
+                            <property name="margin-top">24</property>
+                            <property name="margin-bottom">24</property>
+                            <property name="margin-start">18</property>
+                            <property name="margin-end">18</property>
                             <child>
-                              <object class="GtkLabel" id="workspace_title_label">
-                                <property name="xalign">0</property>
-                                <property name="hexpand">True</property>
-                                <property name="ellipsize">end</property>
-                                <property name="label" translatable="yes">Workspace</property>
+                              <object class="GtkLabel">
+                                <property name="label" translatable="yes">Connect to Slack</property>
                                 <style>
-                                  <class name="heading"/>
+                                  <class name="title-2"/>
                                 </style>
                               </object>
                             </child>
                             <child>
+                              <object class="GtkLabel" id="auth_intro_label">
+                                <property name="label" translatable="yes">Approve Conduit in your browser. Your Slack token will be stored in the system keyring.</property>
+                                <property name="wrap">True</property>
+                                <property name="justify">center</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwPreferencesGroup">
+                                <child>
+                                  <object class="AdwEntryRow" id="client_id_entry">
+                                    <property name="title" translatable="yes">Slack app client ID</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="AdwPasswordEntryRow" id="xoxc_token_entry">
+                                    <property name="title" translatable="yes">XOXC token</property>
+                                    <property name="visible">False</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="AdwPasswordEntryRow" id="xoxd_token_entry">
+                                    <property name="title" translatable="yes">XOXD cookie</property>
+                                    <property name="visible">False</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="AdwEntryRow" id="user_agent_entry">
+                                    <property name="title" translatable="yes">User-Agent (optional)</property>
+                                    <property name="visible">False</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkCheckButton" id="browser_session_check">
+                                <property name="label" translatable="yes">Use XOXC/XOXD tokens</property>
+                                <property name="halign">center</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel" id="setup_hint_label">
+                                <property name="label" translatable="yes">Use redirect URL http://127.0.0.1:8934/callback in the Slack app settings.</property>
+                                <property name="wrap">True</property>
+                                <property name="justify">center</property>
+                                <style>
+                                  <class name="caption"/>
+                                </style>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="connect_button">
+                                <property name="label" translatable="yes">Connect Workspace</property>
+                                <property name="halign">center</property>
+                                <style>
+                                  <class name="suggested-action"/>
+                                </style>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel" id="connection_label">
+                                <property name="wrap">True</property>
+                                <property name="justify">center</property>
+                                <style>
+                                  <class name="caption"/>
+                                </style>
+                              </object>
+                            </child>
+                          </object>
+                        </property>
+                      </object>
+                    </property>
+                  </object>
+                </property>
+              </object>
+            </property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkStackPage">
+            <property name="name">workspace</property>
+            <property name="child">
+              <object class="AdwNavigationSplitView" id="workspace_split">
+                <property name="min-sidebar-width">240</property>
+                <property name="max-sidebar-width">340</property>
+                <property name="sidebar-width-fraction">0.28</property>
+                <property name="sidebar-width-unit">sp</property>
+                <property name="sidebar">
+                  <object class="AdwNavigationPage">
+                    <property name="title" translatable="yes">Workspace</property>
+                    <property name="tag">conversations</property>
+                    <property name="child">
+                      <object class="AdwToolbarView">
+                        <child type="top">
+                          <object class="AdwHeaderBar">
+                            <property name="title-widget">
+                              <object class="AdwWindowTitle" id="workspace_title_label">
+                                <property name="title" translatable="yes">Workspace</property>
+                              </object>
+                            </property>
+                            <child type="end">
                               <object class="GtkButton" id="refresh_button">
                                 <property name="icon-name">view-refresh-symbolic</property>
                                 <property name="tooltip-text" translatable="yes">Refresh Conversations</property>
                               </object>
                             </child>
-                            <child>
+                            <child type="end">
                               <object class="GtkMenuButton">
                                 <property name="icon-name">open-menu-symbolic</property>
                                 <property name="tooltip-text" translatable="yes">Workspace Menu</property>
@@ -190,252 +217,94 @@
                             </child>
                           </object>
                         </child>
-                        <child>
-                          <object class="GtkBox">
-                            <property name="orientation">horizontal</property>
-                            <property name="spacing">6</property>
-                            <child>
-                              <object class="GtkButton" id="home_button">
-                                <property name="hexpand">True</property>
-                                <property name="icon-name">go-home-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Home</property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkButton" id="activity_button">
-                                <property name="hexpand">True</property>
-                                <property name="icon-name">emblem-important-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Activity</property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkButton" id="files_button">
-                                <property name="hexpand">True</property>
-                                <property name="icon-name">folder-documents-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Files</property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkButton" id="saved_button">
-                                <property name="hexpand">True</property>
-                                <property name="icon-name">starred-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Later</property>
-                              </object>
-                            </child>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkBox">
-                            <property name="orientation">horizontal</property>
-                            <property name="spacing">6</property>
-                            <child>
-                              <object class="GtkSearchEntry" id="sidebar_filter_entry">
-                                <property name="hexpand">True</property>
-                                <property name="placeholder-text" translatable="yes">Filter conversations</property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkToggleButton" id="sidebar_unread_filter_button">
-                                <property name="icon-name">mail-unread-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Show Unread Conversations</property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkToggleButton" id="sidebar_all_filter_button">
-                                <property name="icon-name">view-list-symbolic</property>
-                                <property name="tooltip-text" translatable="yes">Show All Conversations</property>
-                              </object>
-                            </child>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkScrolledWindow">
-                            <property name="vexpand">True</property>
-                            <property name="child">
-                              <object class="GtkListBox" id="conversation_list">
-                                <property name="selection-mode">single</property>
-                                <property name="activate-on-single-click">True</property>
-                                <style>
-                                  <class name="navigation-sidebar"/>
-                                </style>
-                              </object>
-                            </property>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkLabel" id="workspace_status_label">
-                            <property name="xalign">0</property>
-                            <property name="ellipsize">end</property>
-                            <style>
-                              <class name="caption"/>
-                              <class name="dim-label"/>
-                            </style>
-                          </object>
-                        </child>
-                      </object>
-                    </property>
-                    <property name="end-child">
-                      <object class="GtkPaned" id="message_thread_paned">
-                        <property name="orientation">horizontal</property>
-                        <property name="position">440</property>
-                        <property name="start-child">
+                        <property name="content">
                           <object class="GtkBox">
                             <property name="orientation">vertical</property>
                             <property name="spacing">6</property>
                             <property name="margin-top">12</property>
                             <property name="margin-bottom">12</property>
-                            <property name="margin-start">6</property>
-                            <property name="margin-end">6</property>
-                            <child>
-                              <object class="GtkBox">
-                                <property name="orientation">horizontal</property>
-                                <property name="spacing">6</property>
-                                <child>
-                                  <object class="GtkLabel" id="message_title">
-                                    <property name="xalign">0</property>
-                                    <property name="hexpand">True</property>
-                                    <property name="ellipsize">end</property>
-                                    <property name="label" translatable="yes">Select a conversation</property>
-                                    <style>
-                                      <class name="heading"/>
-                                    </style>
-                                  </object>
-                                </child>
-                                <child>
-                                  <object class="GtkSearchEntry" id="message_search_entry">
-                                    <property name="width-request">220</property>
-                                    <property name="placeholder-text" translatable="yes">Search workspace</property>
-                                  </object>
-                                </child>
-                                <child>
-                                  <object class="GtkButton" id="message_search_button">
-                                    <property name="icon-name">system-search-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Search Workspace Messages</property>
-                                  </object>
-                                </child>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkBox" id="message_view_box">
-                                <property name="orientation">vertical</property>
-                                <property name="hexpand">True</property>
-                                <property name="vexpand">True</property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkBox">
-                                <property name="orientation">horizontal</property>
-                                <property name="spacing">6</property>
-                                <child>
-                                  <object class="GtkScrolledWindow">
-                                    <property name="hexpand">True</property>
-                                    <property name="min-content-height">42</property>
-                                    <property name="max-content-height">132</property>
-                                    <property name="child">
-                                      <object class="GtkTextView" id="message_entry">
-                                        <property name="wrap-mode">word-char</property>
-                                        <property name="accepts-tab">False</property>
-                                        <property name="top-margin">7</property>
-                                        <property name="bottom-margin">7</property>
-                                        <property name="left-margin">8</property>
-                                        <property name="right-margin">8</property>
-                                      </object>
-                                    </property>
-                                  </object>
-                                </child>
-                                <child>
-                                  <object class="GtkButton" id="upload_button">
-                                    <property name="icon-name">mail-attachment-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Upload File</property>
-                                  </object>
-                                </child>
-                                <child>
-                                  <object class="GtkButton" id="send_button">
-                                    <property name="icon-name">mail-send-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Send</property>
-                                    <style>
-                                      <class name="suggested-action"/>
-                                    </style>
-                                  </object>
-                                </child>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkProgressBar" id="upload_progress">
-                                <property name="visible">False</property>
-                                <property name="show-text">True</property>
-                              </object>
-                            </child>
-                          </object>
-                        </property>
-                        <property name="end-child">
-                          <object class="GtkBox" id="thread_pane">
-                            <property name="orientation">vertical</property>
-                            <property name="spacing">6</property>
-                            <property name="margin-top">12</property>
-                            <property name="margin-bottom">12</property>
-                            <property name="margin-start">6</property>
+                            <property name="margin-start">12</property>
                             <property name="margin-end">12</property>
-                            <property name="visible">False</property>
                             <child>
                               <object class="GtkBox">
                                 <property name="orientation">horizontal</property>
+                                <property name="homogeneous">True</property>
                                 <property name="spacing">6</property>
                                 <child>
-                                  <object class="GtkLabel" id="thread_title">
-                                    <property name="xalign">0</property>
-                                    <property name="hexpand">True</property>
-                                    <property name="label" translatable="yes">Thread</property>
-                                    <style>
-                                      <class name="heading"/>
-                                    </style>
+                                  <object class="GtkToggleButton" id="home_button">
+                                    <property name="icon-name">go-home-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Home</property>
                                   </object>
                                 </child>
                                 <child>
-                                  <object class="GtkButton" id="close_thread_button">
-                                    <property name="icon-name">window-close-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Close Thread</property>
+                                  <object class="GtkToggleButton" id="activity_button">
+                                    <property name="group">home_button</property>
+                                    <property name="icon-name">emblem-important-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Activity</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkToggleButton" id="files_button">
+                                    <property name="group">home_button</property>
+                                    <property name="icon-name">folder-documents-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Files</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkToggleButton" id="saved_button">
+                                    <property name="group">home_button</property>
+                                    <property name="icon-name">starred-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Later</property>
                                   </object>
                                 </child>
                               </object>
                             </child>
                             <child>
-                              <object class="GtkBox" id="thread_view_box">
-                                <property name="orientation">vertical</property>
-                                <property name="hexpand">True</property>
+                              <object class="GtkBox">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">6</property>
+                                <child>
+                                  <object class="GtkSearchEntry" id="sidebar_filter_entry">
+                                    <property name="hexpand">True</property>
+                                    <property name="placeholder-text" translatable="yes">Filter conversations</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkToggleButton" id="sidebar_unread_filter_button">
+                                    <property name="icon-name">mail-unread-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Show Unread Conversations</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkToggleButton" id="sidebar_all_filter_button">
+                                    <property name="icon-name">view-list-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Show All Conversations</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkScrolledWindow">
                                 <property name="vexpand">True</property>
+                                <property name="child">
+                                  <object class="GtkListBox" id="conversation_list">
+                                    <property name="selection-mode">single</property>
+                                    <property name="activate-on-single-click">True</property>
+                                    <style>
+                                      <class name="navigation-sidebar"/>
+                                    </style>
+                                  </object>
+                                </property>
                               </object>
                             </child>
                             <child>
-                              <object class="GtkBox">
-                                <property name="orientation">horizontal</property>
-                                <property name="spacing">6</property>
-                                <child>
-                                  <object class="GtkScrolledWindow">
-                                    <property name="hexpand">True</property>
-                                    <property name="min-content-height">42</property>
-                                    <property name="max-content-height">132</property>
-                                    <property name="child">
-                                      <object class="GtkTextView" id="thread_entry">
-                                        <property name="wrap-mode">word-char</property>
-                                        <property name="accepts-tab">False</property>
-                                        <property name="top-margin">7</property>
-                                        <property name="bottom-margin">7</property>
-                                        <property name="left-margin">8</property>
-                                        <property name="right-margin">8</property>
-                                      </object>
-                                    </property>
-                                  </object>
-                                </child>
-                                <child>
-                                  <object class="GtkButton" id="thread_send_button">
-                                    <property name="icon-name">mail-send-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Send Reply</property>
-                                    <style>
-                                      <class name="suggested-action"/>
-                                    </style>
-                                  </object>
-                                </child>
+                              <object class="GtkLabel" id="workspace_status_label">
+                                <property name="xalign">0</property>
+                                <property name="ellipsize">end</property>
+                                <style>
+                                  <class name="caption"/>
+                                  <class name="dim-label"/>
+                                </style>
                               </object>
                             </child>
                           </object>
@@ -444,10 +313,243 @@
                     </property>
                   </object>
                 </property>
+                <property name="content">
+                  <object class="AdwNavigationPage">
+                    <property name="title" translatable="yes">Messages</property>
+                    <property name="tag">messages</property>
+                    <property name="child">
+                      <object class="AdwOverlaySplitView" id="thread_split">
+                        <property name="sidebar-position">end</property>
+                        <property name="pin-sidebar">True</property>
+                        <property name="show-sidebar">False</property>
+                        <property name="enable-show-gesture">False</property>
+                        <property name="enable-hide-gesture">True</property>
+                        <property name="min-sidebar-width">340</property>
+                        <property name="max-sidebar-width">500</property>
+                        <property name="sidebar-width-fraction">0.4</property>
+                        <property name="sidebar-width-unit">sp</property>
+                        <property name="content">
+                          <object class="AdwToolbarView">
+                            <child type="top">
+                              <object class="AdwHeaderBar">
+                                <property name="title-widget">
+                                  <object class="AdwWindowTitle" id="message_title">
+                                    <property name="title" translatable="yes">Select a conversation</property>
+                                  </object>
+                                </property>
+                                <child type="end">
+                                  <object class="GtkToggleButton" id="message_search_button">
+                                    <property name="icon-name">system-search-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Search Workspace Messages</property>
+                                  </object>
+                                </child>
+                                <child type="end">
+                                  <object class="GtkMenuButton">
+                                    <property name="primary">True</property>
+                                    <property name="icon-name">open-menu-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Main Menu</property>
+                                    <property name="menu-model">primary_menu</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child type="top">
+                              <object class="GtkSearchBar" id="message_search_bar">
+                                <property name="show-close-button">True</property>
+                                <property name="child">
+                                  <object class="GtkSearchEntry" id="message_search_entry">
+                                    <property name="hexpand">True</property>
+                                    <property name="max-width-chars">48</property>
+                                    <property name="placeholder-text" translatable="yes">Search workspace messages</property>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+                            <property name="content">
+                              <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">6</property>
+                                <property name="margin-top">12</property>
+                                <property name="margin-bottom">12</property>
+                                <property name="margin-start">12</property>
+                                <property name="margin-end">12</property>
+                                <child>
+                                  <object class="GtkBox" id="message_view_box">
+                                    <property name="orientation">vertical</property>
+                                    <property name="hexpand">True</property>
+                                    <property name="vexpand">True</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkLabel" id="message_status_label">
+                                    <property name="xalign">0</property>
+                                    <property name="wrap">True</property>
+                                    <property name="accessible-role">status</property>
+                                    <style>
+                                      <class name="caption"/>
+                                      <class name="dim-label"/>
+                                    </style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkBox" id="message_composer">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">4</property>
+                                    <property name="visible">False</property>
+                                    <child>
+                                      <object class="GtkLabel">
+                                        <property name="label" translatable="yes">Message</property>
+                                        <property name="xalign">0</property>
+                                        <property name="mnemonic-widget">message_entry</property>
+                                        <style>
+                                          <class name="caption"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkBox">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="spacing">6</property>
+                                        <child>
+                                          <object class="GtkScrolledWindow">
+                                            <property name="hexpand">True</property>
+                                            <property name="min-content-height">42</property>
+                                            <property name="max-content-height">132</property>
+                                            <property name="child">
+                                              <object class="GtkTextView" id="message_entry">
+                                                <property name="wrap-mode">word-char</property>
+                                                <property name="accepts-tab">False</property>
+                                                <property name="top-margin">7</property>
+                                                <property name="bottom-margin">7</property>
+                                                <property name="left-margin">8</property>
+                                                <property name="right-margin">8</property>
+                                              </object>
+                                            </property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkButton" id="upload_button">
+                                            <property name="icon-name">mail-attachment-symbolic</property>
+                                            <property name="tooltip-text" translatable="yes">Upload File</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkButton" id="send_button">
+                                            <property name="icon-name">mail-send-symbolic</property>
+                                            <property name="tooltip-text" translatable="yes">Send Message</property>
+                                            <style>
+                                              <class name="suggested-action"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkProgressBar" id="upload_progress">
+                                        <property name="visible">False</property>
+                                        <property name="show-text">True</property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                              </object>
+                            </property>
+                          </object>
+                        </property>
+                        <property name="sidebar">
+                          <object class="AdwToolbarView">
+                            <child type="top">
+                              <object class="AdwHeaderBar">
+                                <property name="show-start-title-buttons">False</property>
+                                <property name="show-end-title-buttons">False</property>
+                                <property name="title-widget">
+                                  <object class="AdwWindowTitle" id="thread_title">
+                                    <property name="title" translatable="yes">Thread</property>
+                                  </object>
+                                </property>
+                                <child type="start">
+                                  <object class="GtkButton" id="close_thread_button">
+                                    <property name="icon-name">go-previous-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Close Thread</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <property name="content">
+                              <object class="GtkBox" id="thread_pane">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">6</property>
+                                <property name="margin-top">12</property>
+                                <property name="margin-bottom">12</property>
+                                <property name="margin-start">12</property>
+                                <property name="margin-end">12</property>
+                                <child>
+                                  <object class="GtkBox" id="thread_view_box">
+                                    <property name="orientation">vertical</property>
+                                    <property name="hexpand">True</property>
+                                    <property name="vexpand">True</property>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">4</property>
+                                    <child>
+                                      <object class="GtkLabel">
+                                        <property name="label" translatable="yes">Reply</property>
+                                        <property name="xalign">0</property>
+                                        <property name="mnemonic-widget">thread_entry</property>
+                                        <style>
+                                          <class name="caption"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkBox">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="spacing">6</property>
+                                        <child>
+                                          <object class="GtkScrolledWindow">
+                                            <property name="hexpand">True</property>
+                                            <property name="min-content-height">42</property>
+                                            <property name="max-content-height">132</property>
+                                            <property name="child">
+                                              <object class="GtkTextView" id="thread_entry">
+                                                <property name="wrap-mode">word-char</property>
+                                                <property name="accepts-tab">False</property>
+                                                <property name="top-margin">7</property>
+                                                <property name="bottom-margin">7</property>
+                                                <property name="left-margin">8</property>
+                                                <property name="right-margin">8</property>
+                                              </object>
+                                            </property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkButton" id="thread_send_button">
+                                            <property name="icon-name">mail-send-symbolic</property>
+                                            <property name="tooltip-text" translatable="yes">Send Reply</property>
+                                            <style>
+                                              <class name="suggested-action"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                              </object>
+                            </property>
+                          </object>
+                        </property>
+                      </object>
+                    </property>
+                  </object>
+                </property>
               </object>
-            </child>
+            </property>
           </object>
-        </property>
+        </child>
       </object>
     </property>
   </template>
