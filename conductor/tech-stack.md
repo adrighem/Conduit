@@ -3,7 +3,7 @@
 ## Application
 - Rust 2021.
 - GTK4, libadwaita, and WebKitGTK 6 for the desktop UI.
-- Tokio for background async runtime work.
+- Tokio's multi-threaded runtime for concurrent background I/O, with asynchronous channels delivering events to GTK's main loop.
 
 ## Slack Integration
 - `reqwest` with rustls for Slack Web API requests.
