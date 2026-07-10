@@ -1,0 +1,1300 @@
+/* workspace_state.rs
+ *
+ * Copyright 2026 Vincent van Adrighem
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+//! Pure workspace navigation and message state.
+//!
+//! This module deliberately has no dependency on GTK, WebKit, or the runtime. Callers apply
+//! the returned outcomes to their views and translate request decisions into runtime commands.
+
+use std::collections::HashMap;
+
+use crate::models::{SavedItem, SearchMatch, SlackFile, SlackMessage, SlackReaction};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MainMessageView {
+    #[default]
+    Placeholder,
+    Conversation,
+    Activity,
+    Search,
+    Files,
+    Saved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceScrollBehavior {
+    Preserve,
+    PreservePrepend,
+    StickToBottom,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationSelectionDecision {
+    RenderCurrent,
+    RenderCached,
+    RenderCachedAndRefresh,
+    RequestFresh,
+    AwaitFresh,
+}
+
+impl ConversationSelectionDecision {
+    pub(crate) fn requests_history(self) -> bool {
+        matches!(self, Self::RenderCachedAndRefresh | Self::RequestFresh)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConversationSelectionOutcome {
+    pub(crate) decision: ConversationSelectionDecision,
+    pub(crate) scroll: Option<WorkspaceScrollBehavior>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryApplyOutcome {
+    pub(crate) visible: bool,
+    pub(crate) mark_read: bool,
+    pub(crate) scroll: Option<WorkspaceScrollBehavior>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadOpenOutcome {
+    Ignored,
+    RenderCurrent,
+    RequestFresh,
+    AwaitFresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadApplyOutcome {
+    Ignored,
+    Applied { scroll: WorkspaceScrollBehavior },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RealtimeMessageKind {
+    Posted,
+    Changed,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RealtimeMessageOutcome {
+    pub(crate) channel_changed: bool,
+    pub(crate) render_channel: bool,
+    pub(crate) render_thread: bool,
+    pub(crate) refresh_activity: bool,
+    pub(crate) channel_scroll: Option<WorkspaceScrollBehavior>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReactionUpdate {
+    pub(crate) channel_id: String,
+    pub(crate) ts: String,
+    pub(crate) name: String,
+    pub(crate) user_id: String,
+    pub(crate) added: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReactionUpdateOutcome {
+    pub(crate) changed: bool,
+    pub(crate) render_channel: bool,
+    pub(crate) render_thread: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceSnapshot {
+    pub(crate) channel_id: Option<String>,
+    pub(crate) thread_ts: Option<String>,
+    pub(crate) channel_messages: Vec<SlackMessage>,
+    pub(crate) thread_messages: Vec<SlackMessage>,
+    pub(crate) search_results: Vec<SearchMatch>,
+    pub(crate) files: Vec<SlackFile>,
+    pub(crate) saved_items: Vec<SavedItem>,
+    pub(crate) main_view: MainMessageView,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChannelHistoryState {
+    messages: Vec<SlackMessage>,
+    next_cursor: Option<String>,
+    loading: bool,
+    loaded: bool,
+    force_bottom: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadViewState {
+    channel_id: String,
+    ts: String,
+    messages: Vec<SlackMessage>,
+    next_cursor: Option<String>,
+    loading: bool,
+    loaded: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkspaceViewState {
+    main_view: MainMessageView,
+    last_channel_id: Option<String>,
+    channels: HashMap<String, ChannelHistoryState>,
+    thread: Option<ThreadViewState>,
+    search_results: Vec<SearchMatch>,
+    files: Vec<SlackFile>,
+    saved_items: Vec<SavedItem>,
+    search_loading: bool,
+    files_loading: bool,
+    saved_loading: bool,
+}
+
+impl WorkspaceViewState {
+    pub(crate) fn main_view(&self) -> MainMessageView {
+        self.main_view
+    }
+
+    pub(crate) fn last_channel_id(&self) -> Option<&str> {
+        self.last_channel_id.as_deref()
+    }
+
+    pub(crate) fn visible_channel_id(&self) -> Option<&str> {
+        (self.main_view == MainMessageView::Conversation)
+            .then_some(self.last_channel_id.as_deref())
+            .flatten()
+    }
+
+    pub(crate) fn selected_thread_ts(&self) -> Option<&str> {
+        self.thread.as_ref().map(|thread| thread.ts.as_str())
+    }
+
+    pub(crate) fn channel_messages(&self, channel_id: &str) -> &[SlackMessage] {
+        self.channels
+            .get(channel_id)
+            .map(|history| history.messages.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn current_thread_messages(&self) -> &[SlackMessage] {
+        self.thread
+            .as_ref()
+            .map(|thread| thread.messages.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn search_results(&self) -> &[SearchMatch] {
+        &self.search_results
+    }
+
+    pub(crate) fn files(&self) -> &[SlackFile] {
+        &self.files
+    }
+
+    pub(crate) fn saved_items(&self) -> &[SavedItem] {
+        &self.saved_items
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_loading(&self) -> bool {
+        self.search_loading
+    }
+
+    #[cfg(test)]
+    pub(crate) fn files_loading(&self) -> bool {
+        self.files_loading
+    }
+
+    #[cfg(test)]
+    pub(crate) fn saved_loading(&self) -> bool {
+        self.saved_loading
+    }
+
+    pub(crate) fn snapshot(&self) -> WorkspaceSnapshot {
+        let channel_id = self.last_channel_id.clone();
+        let channel_messages = channel_id
+            .as_deref()
+            .map(|channel_id| self.channel_messages(channel_id).to_vec())
+            .unwrap_or_default();
+        let (thread_ts, thread_messages) = self
+            .thread
+            .as_ref()
+            .map(|thread| (Some(thread.ts.clone()), thread.messages.clone()))
+            .unwrap_or_default();
+
+        WorkspaceSnapshot {
+            channel_id,
+            thread_ts,
+            channel_messages,
+            thread_messages,
+            search_results: self.search_results.clone(),
+            files: self.files.clone(),
+            saved_items: self.saved_items.clone(),
+            main_view: self.main_view,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn show_placeholder(&mut self) {
+        self.navigate_to(MainMessageView::Placeholder);
+    }
+
+    pub(crate) fn show_activity(&mut self) {
+        self.navigate_to(MainMessageView::Activity);
+    }
+
+    pub(crate) fn show_search(&mut self) {
+        self.navigate_to(MainMessageView::Search);
+    }
+
+    pub(crate) fn start_search(&mut self) {
+        self.show_search();
+        self.search_results.clear();
+        self.search_loading = true;
+    }
+
+    pub(crate) fn apply_search_results(&mut self, results: Vec<SearchMatch>) -> bool {
+        self.search_results = results;
+        self.search_loading = false;
+        self.main_view == MainMessageView::Search
+    }
+
+    pub(crate) fn show_files(&mut self) {
+        self.navigate_to(MainMessageView::Files);
+    }
+
+    pub(crate) fn start_files(&mut self) {
+        self.show_files();
+        self.files.clear();
+        self.files_loading = true;
+    }
+
+    pub(crate) fn apply_files(&mut self, files: Vec<SlackFile>) -> bool {
+        self.files = files;
+        self.files_loading = false;
+        self.main_view == MainMessageView::Files
+    }
+
+    pub(crate) fn show_saved(&mut self) {
+        self.navigate_to(MainMessageView::Saved);
+    }
+
+    pub(crate) fn start_saved(&mut self) {
+        self.show_saved();
+        self.saved_items.clear();
+        self.saved_loading = true;
+    }
+
+    pub(crate) fn apply_saved(&mut self, items: Vec<SavedItem>) -> bool {
+        self.saved_items = items;
+        self.saved_loading = false;
+        self.main_view == MainMessageView::Saved
+    }
+
+    pub(crate) fn select_conversation(&mut self, channel_id: &str) -> ConversationSelectionOutcome {
+        let was_visible = self.visible_channel_id() == Some(channel_id);
+        let changing_channel = self.last_channel_id.as_deref() != Some(channel_id);
+        self.thread = None;
+
+        if !was_visible {
+            self.clear_current_view_loading();
+        }
+
+        if changing_channel {
+            self.channels
+                .entry(channel_id.to_string())
+                .or_default()
+                .force_bottom = true;
+        }
+        self.last_channel_id = Some(channel_id.to_string());
+        self.main_view = MainMessageView::Conversation;
+
+        let history = self.channels.entry(channel_id.to_string()).or_default();
+        let decision = if was_visible && history.loaded {
+            ConversationSelectionDecision::RenderCurrent
+        } else if history.loaded && history.loading {
+            ConversationSelectionDecision::RenderCached
+        } else if history.loaded {
+            history.loading = true;
+            ConversationSelectionDecision::RenderCachedAndRefresh
+        } else if history.loading {
+            ConversationSelectionDecision::AwaitFresh
+        } else {
+            history.loading = true;
+            ConversationSelectionDecision::RequestFresh
+        };
+        let scroll = matches!(
+            decision,
+            ConversationSelectionDecision::RenderCurrent
+                | ConversationSelectionDecision::RenderCached
+                | ConversationSelectionDecision::RenderCachedAndRefresh
+        )
+        .then(|| self.take_channel_scroll(channel_id, false));
+
+        ConversationSelectionOutcome { decision, scroll }
+    }
+
+    pub(crate) fn begin_history_request(&mut self, channel_id: &str) -> bool {
+        let history = self.channels.entry(channel_id.to_string()).or_default();
+        if history.loading {
+            false
+        } else {
+            history.loading = true;
+            true
+        }
+    }
+
+    pub(crate) fn clear_history_loading(&mut self) {
+        for history in self.channels.values_mut() {
+            history.loading = false;
+        }
+        if let Some(thread) = &mut self.thread {
+            thread.loading = false;
+        }
+        self.search_loading = false;
+        self.files_loading = false;
+        self.saved_loading = false;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_history(
+        &mut self,
+        channel_id: &str,
+        messages: Vec<SlackMessage>,
+        has_more: bool,
+        next_cursor: Option<String>,
+        append_older: bool,
+        cached: bool,
+    ) -> HistoryApplyOutcome {
+        let history = self.channels.entry(channel_id.to_string()).or_default();
+        history.messages = if append_older {
+            merge_message_pages(&history.messages, &messages)
+        } else {
+            normalize_messages(messages)
+        };
+        history.loaded = true;
+        if !cached {
+            history.next_cursor = usable_cursor(has_more, next_cursor);
+            history.loading = false;
+        }
+
+        let visible = self.visible_channel_id() == Some(channel_id);
+        let mark_read = visible && !cached && !append_older;
+        let scroll = visible.then(|| self.take_channel_scroll(channel_id, append_older));
+        HistoryApplyOutcome {
+            visible,
+            mark_read,
+            scroll,
+        }
+    }
+
+    pub(crate) fn channel_cursor(&self, channel_id: &str) -> Option<&str> {
+        self.channels
+            .get(channel_id)
+            .and_then(|history| history.next_cursor.as_deref())
+    }
+
+    pub(crate) fn force_next_bottom(&mut self, channel_id: &str) {
+        self.channels
+            .entry(channel_id.to_string())
+            .or_default()
+            .force_bottom = true;
+    }
+
+    pub(crate) fn open_thread(&mut self, channel_id: &str, ts: &str) -> ThreadOpenOutcome {
+        if self.visible_channel_id() != Some(channel_id) || ts.trim().is_empty() {
+            return ThreadOpenOutcome::Ignored;
+        }
+
+        if let Some(thread) = &mut self.thread {
+            if thread.channel_id == channel_id && thread.ts == ts {
+                return if thread.loaded {
+                    ThreadOpenOutcome::RenderCurrent
+                } else if thread.loading {
+                    ThreadOpenOutcome::AwaitFresh
+                } else {
+                    thread.loading = true;
+                    ThreadOpenOutcome::RequestFresh
+                };
+            }
+        }
+
+        self.thread = Some(ThreadViewState {
+            channel_id: channel_id.to_string(),
+            ts: ts.to_string(),
+            messages: Vec::new(),
+            next_cursor: None,
+            loading: true,
+            loaded: false,
+        });
+        ThreadOpenOutcome::RequestFresh
+    }
+
+    pub(crate) fn begin_thread_history_request(&mut self) -> bool {
+        let Some(thread) = &mut self.thread else {
+            return false;
+        };
+        if thread.loading {
+            false
+        } else {
+            thread.loading = true;
+            true
+        }
+    }
+
+    pub(crate) fn close_thread(&mut self) -> bool {
+        self.thread.take().is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_thread(
+        &mut self,
+        channel_id: &str,
+        ts: &str,
+        messages: Vec<SlackMessage>,
+        has_more: bool,
+        next_cursor: Option<String>,
+        append_older: bool,
+    ) -> ThreadApplyOutcome {
+        let Some(thread) = &mut self.thread else {
+            return ThreadApplyOutcome::Ignored;
+        };
+        if thread.channel_id != channel_id || thread.ts != ts {
+            return ThreadApplyOutcome::Ignored;
+        }
+
+        thread.messages = if append_older {
+            merge_message_pages(&thread.messages, &messages)
+        } else {
+            normalize_messages(messages)
+        };
+        thread.loaded = true;
+        thread.next_cursor = usable_cursor(has_more, next_cursor);
+        thread.loading = false;
+        ThreadApplyOutcome::Applied {
+            scroll: if append_older {
+                WorkspaceScrollBehavior::PreservePrepend
+            } else {
+                WorkspaceScrollBehavior::StickToBottom
+            },
+        }
+    }
+
+    pub(crate) fn thread_cursor(&self) -> Option<&str> {
+        self.thread
+            .as_ref()
+            .and_then(|thread| thread.next_cursor.as_deref())
+    }
+
+    pub(crate) fn increment_thread_reply(&mut self, channel_id: &str, thread_ts: &str) -> bool {
+        let Some(history) = self.channels.get_mut(channel_id) else {
+            return false;
+        };
+        let Some(parent) = history
+            .messages
+            .iter_mut()
+            .find(|message| message.ts == thread_ts)
+        else {
+            return false;
+        };
+        parent.reply_count = Some(parent.reply_count.unwrap_or_default().saturating_add(1));
+        true
+    }
+
+    pub(crate) fn apply_realtime_message(
+        &mut self,
+        channel_id: &str,
+        message: SlackMessage,
+        kind: RealtimeMessageKind,
+    ) -> RealtimeMessageOutcome {
+        let visible = self.visible_channel_id() == Some(channel_id);
+        let channel_changed = self
+            .channels
+            .get_mut(channel_id)
+            .filter(|history| history.loaded)
+            .map(|history| {
+                history.messages = merge_realtime_message(&history.messages, &message);
+                true
+            })
+            .unwrap_or(false);
+        let render_channel = visible && channel_changed;
+
+        let render_thread = self
+            .thread
+            .as_mut()
+            .filter(|thread| {
+                thread.channel_id == channel_id
+                    && message.thread_ts.as_deref() == Some(thread.ts.as_str())
+                    && message.ts != thread.ts
+                    && thread.loaded
+            })
+            .map(|thread| {
+                thread.messages = merge_realtime_message(&thread.messages, &message);
+                true
+            })
+            .unwrap_or(false);
+
+        RealtimeMessageOutcome {
+            channel_changed,
+            render_channel,
+            render_thread,
+            refresh_activity: self.main_view == MainMessageView::Activity,
+            channel_scroll: render_channel.then_some(if kind == RealtimeMessageKind::Posted {
+                WorkspaceScrollBehavior::StickToBottom
+            } else {
+                WorkspaceScrollBehavior::Preserve
+            }),
+        }
+    }
+
+    pub(crate) fn apply_reaction(&mut self, update: &ReactionUpdate) -> ReactionUpdateOutcome {
+        let channel_changed = self
+            .channels
+            .get_mut(&update.channel_id)
+            .is_some_and(|history| apply_reaction_to_messages(&mut history.messages, update));
+        let thread_changed = self
+            .thread
+            .as_mut()
+            .filter(|thread| thread.channel_id == update.channel_id)
+            .is_some_and(|thread| apply_reaction_to_messages(&mut thread.messages, update));
+        let visible = self.visible_channel_id() == Some(update.channel_id.as_str());
+
+        ReactionUpdateOutcome {
+            changed: channel_changed || thread_changed,
+            render_channel: visible && channel_changed,
+            render_thread: thread_changed,
+        }
+    }
+
+    pub(crate) fn find_message(&self, channel_id: &str, ts: &str) -> Option<SlackMessage> {
+        self.channels
+            .get(channel_id)
+            .and_then(|history| history.messages.iter().find(|message| message.ts == ts))
+            .or_else(|| {
+                self.thread
+                    .as_ref()
+                    .filter(|thread| thread.channel_id == channel_id)
+                    .and_then(|thread| thread.messages.iter().find(|message| message.ts == ts))
+            })
+            .or_else(|| {
+                self.saved_items
+                    .iter()
+                    .filter(|item| item.channel.as_deref() == Some(channel_id))
+                    .filter_map(|item| item.message.as_ref())
+                    .find(|message| message.ts == ts)
+            })
+            .cloned()
+    }
+
+    fn navigate_to(&mut self, view: MainMessageView) {
+        self.clear_current_view_loading();
+        self.main_view = view;
+        self.thread = None;
+    }
+
+    fn clear_current_view_loading(&mut self) {
+        match self.main_view {
+            MainMessageView::Conversation => {
+                if let Some(channel_id) = self.last_channel_id.as_deref() {
+                    if let Some(history) = self.channels.get_mut(channel_id) {
+                        history.loading = false;
+                    }
+                }
+            }
+            MainMessageView::Search => self.search_loading = false,
+            MainMessageView::Files => self.files_loading = false,
+            MainMessageView::Saved => self.saved_loading = false,
+            MainMessageView::Placeholder | MainMessageView::Activity => {}
+        }
+    }
+
+    fn take_channel_scroll(
+        &mut self,
+        channel_id: &str,
+        append_older: bool,
+    ) -> WorkspaceScrollBehavior {
+        let force_bottom = self
+            .channels
+            .get_mut(channel_id)
+            .is_some_and(|history| std::mem::take(&mut history.force_bottom));
+        if append_older {
+            WorkspaceScrollBehavior::PreservePrepend
+        } else if force_bottom {
+            WorkspaceScrollBehavior::Bottom
+        } else {
+            WorkspaceScrollBehavior::StickToBottom
+        }
+    }
+}
+
+fn usable_cursor(has_more: bool, cursor: Option<String>) -> Option<String> {
+    cursor.filter(|cursor| has_more && !cursor.trim().is_empty())
+}
+
+fn normalize_messages(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+    messages.sort_by(|left, right| right.ts.cmp(&left.ts));
+    messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
+    messages
+}
+
+fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
+    let mut messages = existing.to_vec();
+    messages.extend(page.iter().cloned());
+    normalize_messages(messages)
+}
+
+fn merge_realtime_message(existing: &[SlackMessage], message: &SlackMessage) -> Vec<SlackMessage> {
+    let mut messages = existing
+        .iter()
+        .filter(|existing_message| existing_message.ts != message.ts)
+        .cloned()
+        .collect::<Vec<_>>();
+    messages.push(message.clone());
+    normalize_messages(messages)
+}
+
+fn apply_reaction_to_messages(messages: &mut [SlackMessage], update: &ReactionUpdate) -> bool {
+    messages
+        .iter_mut()
+        .find(|message| message.ts == update.ts)
+        .is_some_and(|message| apply_reaction_to_message(message, update))
+}
+
+fn apply_reaction_to_message(message: &mut SlackMessage, update: &ReactionUpdate) -> bool {
+    if update.added {
+        let reactions = message.reactions.get_or_insert_with(Vec::new);
+        if let Some(reaction) = reactions
+            .iter_mut()
+            .find(|reaction| reaction.name.as_deref() == Some(update.name.as_str()))
+        {
+            let users = reaction.users.get_or_insert_with(Vec::new);
+            if users.iter().any(|user| user == &update.user_id) {
+                return false;
+            }
+            users.push(update.user_id.clone());
+            reaction.count = Some(reaction.count.unwrap_or_default().saturating_add(1));
+        } else {
+            reactions.push(SlackReaction {
+                name: Some(update.name.clone()),
+                count: Some(1),
+                users: Some(vec![update.user_id.clone()]),
+            });
+        }
+        true
+    } else {
+        let Some(reactions) = message.reactions.as_mut() else {
+            return false;
+        };
+        let Some(index) = reactions
+            .iter()
+            .position(|reaction| reaction.name.as_deref() == Some(update.name.as_str()))
+        else {
+            return false;
+        };
+        let reaction = &mut reactions[index];
+        if let Some(users) = reaction.users.as_mut() {
+            let original_len = users.len();
+            users.retain(|user| user != &update.user_id);
+            if users.len() == original_len {
+                return false;
+            }
+        }
+        let count = reaction.count.unwrap_or_default().saturating_sub(1);
+        reaction.count = Some(count);
+        if count == 0 {
+            reactions.remove(index);
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(ts: &str, text: &str) -> SlackMessage {
+        SlackMessage {
+            ts: ts.to_string(),
+            text: Some(text.to_string()),
+            ..SlackMessage::default()
+        }
+    }
+
+    fn thread_message(ts: &str, thread_ts: &str, text: &str) -> SlackMessage {
+        SlackMessage {
+            thread_ts: Some(thread_ts.to_string()),
+            ..message(ts, text)
+        }
+    }
+
+    fn apply_fresh(
+        state: &mut WorkspaceViewState,
+        channel_id: &str,
+        messages: Vec<SlackMessage>,
+    ) -> HistoryApplyOutcome {
+        state.apply_history(channel_id, messages, false, None, false, false)
+    }
+
+    #[test]
+    fn reset_clears_navigation_payloads_cursors_and_loading() {
+        let mut state = WorkspaceViewState::default();
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RequestFresh
+        );
+        state.force_next_bottom("C1");
+        state.apply_history(
+            "C1",
+            vec![message("2", "new")],
+            true,
+            Some("next".into()),
+            false,
+            false,
+        );
+        assert_eq!(
+            state.open_thread("C1", "2"),
+            ThreadOpenOutcome::RequestFresh
+        );
+        state.apply_thread(
+            "C1",
+            "2",
+            vec![message("2", "parent")],
+            true,
+            Some("thread-next".into()),
+            false,
+        );
+        state.start_search();
+        state.apply_search_results(vec![SearchMatch {
+            text: Some("match".into()),
+            ..SearchMatch::default()
+        }]);
+        state.start_files();
+        state.apply_files(vec![SlackFile {
+            id: Some("F1".into()),
+            ..SlackFile::default()
+        }]);
+        state.start_saved();
+        state.apply_saved(vec![SavedItem {
+            channel: Some("C1".into()),
+            message: Some(message("2", "saved")),
+            ..SavedItem::default()
+        }]);
+        state.start_search();
+
+        state.reset();
+
+        assert_eq!(state.main_view(), MainMessageView::Placeholder);
+        assert_eq!(state.last_channel_id(), None);
+        assert_eq!(state.visible_channel_id(), None);
+        assert_eq!(state.selected_thread_ts(), None);
+        assert!(state.channels.is_empty());
+        assert!(state.search_results().is_empty());
+        assert!(state.files().is_empty());
+        assert!(state.saved_items().is_empty());
+        assert!(!state.search_loading());
+        assert!(!state.files_loading());
+        assert!(!state.saved_loading());
+    }
+
+    #[test]
+    fn conversation_selection_covers_fresh_await_and_current() {
+        let mut state = WorkspaceViewState::default();
+
+        let fresh = state.select_conversation("C1");
+        assert_eq!(fresh.decision, ConversationSelectionDecision::RequestFresh);
+        assert!(fresh.decision.requests_history());
+        assert_eq!(fresh.scroll, None);
+
+        let awaiting = state.select_conversation("C1");
+        assert_eq!(awaiting.decision, ConversationSelectionDecision::AwaitFresh);
+        assert!(!awaiting.decision.requests_history());
+
+        let applied = apply_fresh(&mut state, "C1", vec![message("1", "hello")]);
+        assert!(applied.visible);
+        assert!(applied.mark_read);
+        assert_eq!(applied.scroll, Some(WorkspaceScrollBehavior::Bottom));
+
+        let current = state.select_conversation("C1");
+        assert_eq!(
+            current.decision,
+            ConversationSelectionDecision::RenderCurrent
+        );
+        assert_eq!(current.scroll, Some(WorkspaceScrollBehavior::StickToBottom));
+    }
+
+    #[test]
+    fn conversation_selection_covers_cached_refresh_and_cached_loading() {
+        let mut state = WorkspaceViewState::default();
+        let inactive = apply_fresh(&mut state, "C1", vec![message("1", "cached")]);
+        assert!(!inactive.visible);
+
+        let cached_refresh = state.select_conversation("C1");
+        assert_eq!(
+            cached_refresh.decision,
+            ConversationSelectionDecision::RenderCachedAndRefresh
+        );
+        assert!(cached_refresh.decision.requests_history());
+        assert_eq!(cached_refresh.scroll, Some(WorkspaceScrollBehavior::Bottom));
+
+        state.show_activity();
+        let cached_again = state.select_conversation("C1");
+        assert_eq!(
+            cached_again.decision,
+            ConversationSelectionDecision::RenderCachedAndRefresh
+        );
+
+        apply_fresh(&mut state, "C2", vec![message("2", "other cached")]);
+        assert!(state.begin_history_request("C2"));
+        let cached_loading = state.select_conversation("C2");
+        assert_eq!(
+            cached_loading.decision,
+            ConversationSelectionDecision::RenderCached
+        );
+        assert!(!cached_loading.decision.requests_history());
+        assert!(!state.begin_history_request("C2"));
+    }
+
+    #[test]
+    fn loaded_empty_history_is_distinct_from_never_loaded_history() {
+        let mut state = WorkspaceViewState::default();
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RequestFresh
+        );
+        let loaded_empty = apply_fresh(&mut state, "C1", Vec::new());
+        assert!(loaded_empty.visible);
+
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RenderCurrent
+        );
+        state.show_activity();
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RenderCachedAndRefresh
+        );
+    }
+
+    #[test]
+    fn leaving_a_loading_view_allows_it_to_be_requested_again() {
+        let mut state = WorkspaceViewState::default();
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RequestFresh
+        );
+        assert_eq!(
+            state.select_conversation("C2").decision,
+            ConversationSelectionDecision::RequestFresh
+        );
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RequestFresh
+        );
+
+        state.show_activity();
+        assert_eq!(
+            state.select_conversation("C1").decision,
+            ConversationSelectionDecision::RequestFresh
+        );
+    }
+
+    #[test]
+    fn explicit_history_requests_are_deduplicated_and_errors_clear_loading() {
+        let mut state = WorkspaceViewState::default();
+        assert!(state.begin_history_request("C1"));
+        assert!(!state.begin_history_request("C1"));
+        state.start_files();
+        state.start_saved();
+        state.start_search();
+
+        state.clear_history_loading();
+
+        assert!(state.begin_history_request("C1"));
+        assert!(!state.search_loading());
+        assert!(!state.files_loading());
+        assert!(!state.saved_loading());
+    }
+
+    #[test]
+    fn late_history_updates_only_its_cache_without_navigation_or_read() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("A");
+        state.select_conversation("B");
+
+        let outcome = apply_fresh(&mut state, "A", vec![message("1", "late")]);
+
+        assert!(!outcome.visible);
+        assert!(!outcome.mark_read);
+        assert_eq!(outcome.scroll, None);
+        assert_eq!(state.main_view(), MainMessageView::Conversation);
+        assert_eq!(state.visible_channel_id(), Some("B"));
+        assert_eq!(state.channel_messages("A")[0].body_text(), "late");
+    }
+
+    #[test]
+    fn late_search_files_and_saved_results_do_not_switch_views() {
+        let mut state = WorkspaceViewState::default();
+        state.start_search();
+        state.show_activity();
+        assert!(!state.apply_search_results(vec![SearchMatch {
+            text: Some("late search".into()),
+            ..SearchMatch::default()
+        }]));
+        assert_eq!(state.main_view(), MainMessageView::Activity);
+        assert_eq!(
+            state.search_results()[0].text.as_deref(),
+            Some("late search")
+        );
+
+        state.start_files();
+        state.show_placeholder();
+        assert!(!state.apply_files(vec![SlackFile {
+            id: Some("F1".into()),
+            ..SlackFile::default()
+        }]));
+        assert_eq!(state.main_view(), MainMessageView::Placeholder);
+        assert_eq!(state.files()[0].id.as_deref(), Some("F1"));
+
+        state.start_saved();
+        state.show_activity();
+        assert!(!state.apply_saved(vec![SavedItem {
+            channel: Some("C1".into()),
+            ..SavedItem::default()
+        }]));
+        assert_eq!(state.main_view(), MainMessageView::Activity);
+        assert_eq!(state.saved_items()[0].channel.as_deref(), Some("C1"));
+    }
+
+    #[test]
+    fn pagination_merges_deduplicates_sorts_and_updates_cursor() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        state.apply_history(
+            "C1",
+            vec![message("2", "two"), message("4", "four")],
+            true,
+            Some("page-2".into()),
+            false,
+            false,
+        );
+        assert_eq!(state.channel_cursor("C1"), Some("page-2"));
+        assert!(state.begin_history_request("C1"));
+
+        let outcome = state.apply_history(
+            "C1",
+            vec![message("3", "three"), message("2", "duplicate")],
+            false,
+            Some("ignored".into()),
+            true,
+            false,
+        );
+
+        assert_eq!(
+            state
+                .channel_messages("C1")
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>(),
+            vec!["4", "3", "2"]
+        );
+        assert_eq!(state.channel_cursor("C1"), None);
+        assert!(state.begin_history_request("C1"));
+        assert_eq!(
+            outcome.scroll,
+            Some(WorkspaceScrollBehavior::PreservePrepend)
+        );
+        assert!(!outcome.mark_read);
+    }
+
+    #[test]
+    fn forced_bottom_is_one_shot_and_prepend_always_wins() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        let first = apply_fresh(&mut state, "C1", vec![message("3", "three")]);
+        assert_eq!(first.scroll, Some(WorkspaceScrollBehavior::Bottom));
+        let second = apply_fresh(&mut state, "C1", vec![message("3", "three")]);
+        assert_eq!(second.scroll, Some(WorkspaceScrollBehavior::StickToBottom));
+
+        state.force_next_bottom("C1");
+        let prepend =
+            state.apply_history("C1", vec![message("2", "two")], false, None, true, false);
+        assert_eq!(
+            prepend.scroll,
+            Some(WorkspaceScrollBehavior::PreservePrepend)
+        );
+        let after = apply_fresh(&mut state, "C1", vec![message("3", "three")]);
+        assert_eq!(after.scroll, Some(WorkspaceScrollBehavior::StickToBottom));
+    }
+
+    #[test]
+    fn navigation_closes_thread_but_preserves_last_channel() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("1", "parent")]);
+        assert_eq!(
+            state.open_thread("C1", "1"),
+            ThreadOpenOutcome::RequestFresh
+        );
+
+        state.show_activity();
+
+        assert_eq!(state.last_channel_id(), Some("C1"));
+        assert_eq!(state.visible_channel_id(), None);
+        assert_eq!(state.selected_thread_ts(), None);
+        assert_eq!(state.open_thread("C1", "1"), ThreadOpenOutcome::Ignored);
+
+        state.select_conversation("C1");
+        assert_eq!(state.visible_channel_id(), Some("C1"));
+    }
+
+    #[test]
+    fn stale_thread_result_cannot_replace_active_thread() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(
+            &mut state,
+            "C1",
+            vec![message("2", "parent two"), message("1", "parent one")],
+        );
+        state.open_thread("C1", "1");
+        state.open_thread("C1", "2");
+
+        let stale = state.apply_thread("C1", "1", vec![message("1", "stale")], false, None, false);
+        assert_eq!(stale, ThreadApplyOutcome::Ignored);
+        assert_eq!(state.selected_thread_ts(), Some("2"));
+        assert!(state.current_thread_messages().is_empty());
+
+        let current = state.apply_thread(
+            "C1",
+            "2",
+            vec![message("2.1", "reply")],
+            true,
+            Some("older".into()),
+            false,
+        );
+        assert_eq!(
+            current,
+            ThreadApplyOutcome::Applied {
+                scroll: WorkspaceScrollBehavior::StickToBottom
+            }
+        );
+        assert_eq!(state.thread_cursor(), Some("older"));
+    }
+
+    #[test]
+    fn thread_pagination_is_deduplicated_and_preserves_prepend() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("3", "parent")]);
+        state.open_thread("C1", "3");
+        state.apply_thread(
+            "C1",
+            "3",
+            vec![message("3", "parent"), message("2", "reply")],
+            true,
+            Some("older".into()),
+            false,
+        );
+        assert!(state.begin_thread_history_request());
+
+        let outcome = state.apply_thread(
+            "C1",
+            "3",
+            vec![message("2", "duplicate"), message("1", "old")],
+            false,
+            None,
+            true,
+        );
+
+        assert_eq!(
+            outcome,
+            ThreadApplyOutcome::Applied {
+                scroll: WorkspaceScrollBehavior::PreservePrepend
+            }
+        );
+        assert_eq!(
+            state
+                .current_thread_messages()
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>(),
+            vec!["3", "2", "1"]
+        );
+        assert!(state.begin_thread_history_request());
+    }
+
+    #[test]
+    fn realtime_messages_update_loaded_channel_and_matching_thread() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("3", "old")]);
+        state.open_thread("C1", "3");
+        state.apply_thread("C1", "3", vec![message("3", "parent")], false, None, false);
+
+        let changed = state.apply_realtime_message(
+            "C1",
+            message("3", "edited"),
+            RealtimeMessageKind::Changed,
+        );
+        assert!(changed.channel_changed);
+        assert!(changed.render_channel);
+        assert!(!changed.render_thread);
+        assert_eq!(
+            changed.channel_scroll,
+            Some(WorkspaceScrollBehavior::Preserve)
+        );
+        assert_eq!(state.channel_messages("C1")[0].body_text(), "edited");
+
+        let reply = state.apply_realtime_message(
+            "C1",
+            thread_message("4", "3", "reply"),
+            RealtimeMessageKind::Posted,
+        );
+        assert!(reply.render_channel);
+        assert!(reply.render_thread);
+        assert_eq!(
+            reply.channel_scroll,
+            Some(WorkspaceScrollBehavior::StickToBottom)
+        );
+        assert_eq!(state.current_thread_messages()[0].ts, "4");
+
+        state.show_activity();
+        let activity = state.apply_realtime_message(
+            "C1",
+            message("5", "activity"),
+            RealtimeMessageKind::Deleted,
+        );
+        assert!(activity.refresh_activity);
+        assert!(!activity.render_channel);
+    }
+
+    #[test]
+    fn first_realtime_messages_populate_loaded_empty_channel_and_thread() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", Vec::new());
+        state.open_thread("C1", "1");
+        state.apply_thread("C1", "1", Vec::new(), false, None, false);
+
+        let outcome = state.apply_realtime_message(
+            "C1",
+            thread_message("2", "1", "first reply"),
+            RealtimeMessageKind::Posted,
+        );
+
+        assert!(outcome.channel_changed);
+        assert!(outcome.render_channel);
+        assert!(outcome.render_thread);
+        assert_eq!(state.channel_messages("C1")[0].body_text(), "first reply");
+        assert_eq!(
+            state.current_thread_messages()[0].body_text(),
+            "first reply"
+        );
+        assert_eq!(
+            state.open_thread("C1", "1"),
+            ThreadOpenOutcome::RenderCurrent
+        );
+    }
+
+    #[test]
+    fn reactions_update_channel_and_thread_without_double_counting() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("1", "parent")]);
+        state.open_thread("C1", "1");
+        state.apply_thread("C1", "1", vec![message("1", "parent")], false, None, false);
+        let update = ReactionUpdate {
+            channel_id: "C1".into(),
+            ts: "1".into(),
+            name: "heart".into(),
+            user_id: "U1".into(),
+            added: true,
+        };
+
+        let added = state.apply_reaction(&update);
+        assert!(added.changed);
+        assert!(added.render_channel);
+        assert!(added.render_thread);
+        assert_eq!(
+            state.channel_messages("C1")[0].reactions.as_ref().unwrap()[0].count,
+            Some(1)
+        );
+        assert!(!state.apply_reaction(&update).changed);
+
+        let removed = state.apply_reaction(&ReactionUpdate {
+            added: false,
+            ..update
+        });
+        assert!(removed.changed);
+        assert!(state.channel_messages("C1")[0]
+            .reactions
+            .as_ref()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn reaction_removal_updates_counts_when_user_details_are_missing() {
+        let mut reacted = message("1", "reacted");
+        reacted.reactions = Some(vec![SlackReaction {
+            name: Some("heart".into()),
+            count: Some(1),
+            users: None,
+        }]);
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![reacted]);
+
+        let outcome = state.apply_reaction(&ReactionUpdate {
+            channel_id: "C1".into(),
+            ts: "1".into(),
+            name: "heart".into(),
+            user_id: "U1".into(),
+            added: false,
+        });
+
+        assert!(outcome.changed);
+        assert!(state.channel_messages("C1")[0]
+            .reactions
+            .as_ref()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn increment_thread_reply_and_find_message_use_authoritative_state() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("1", "parent")]);
+        assert!(state.increment_thread_reply("C1", "1"));
+        assert_eq!(state.channel_messages("C1")[0].reply_count, Some(1));
+        assert!(!state.increment_thread_reply("C1", "missing"));
+        assert_eq!(state.find_message("C1", "1").unwrap().body_text(), "parent");
+
+        state.apply_saved(vec![SavedItem {
+            channel: Some("C2".into()),
+            message: Some(message("2", "saved")),
+            ..SavedItem::default()
+        }]);
+        assert_eq!(state.find_message("C2", "2").unwrap().body_text(), "saved");
+    }
+
+    #[test]
+    fn snapshot_uses_last_channel_but_visible_channel_requires_conversation_view() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("1", "one")]);
+        state.show_activity();
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.channel_id.as_deref(), Some("C1"));
+        assert_eq!(snapshot.channel_messages[0].body_text(), "one");
+        assert_eq!(snapshot.main_view, MainMessageView::Activity);
+        assert_eq!(state.visible_channel_id(), None);
+    }
+}

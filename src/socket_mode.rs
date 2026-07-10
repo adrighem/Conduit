@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::models::{SlackMessage, SlackReaction};
+use crate::models::SlackMessage;
 
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
 
@@ -323,69 +323,6 @@ struct AppsConnectionsOpenResponse {
     url: Option<String>,
 }
 
-pub fn apply_reaction_update(message: &mut SlackMessage, event: &SocketModeReactionEvent) -> bool {
-    if message.ts != event.ts {
-        return false;
-    }
-
-    if event.added {
-        add_reaction(message, event)
-    } else {
-        remove_reaction(message, event)
-    }
-}
-
-fn add_reaction(message: &mut SlackMessage, event: &SocketModeReactionEvent) -> bool {
-    let reactions = message.reactions.get_or_insert_with(Vec::new);
-    if let Some(reaction) = reactions
-        .iter_mut()
-        .find(|reaction| reaction.name.as_deref() == Some(event.name.as_str()))
-    {
-        let users = reaction.users.get_or_insert_with(Vec::new);
-        if users.iter().any(|user| user == &event.user_id) {
-            return false;
-        }
-        users.push(event.user_id.clone());
-        reaction.count = Some(reaction.count.unwrap_or_default().saturating_add(1));
-        true
-    } else {
-        reactions.push(SlackReaction {
-            name: Some(event.name.clone()),
-            count: Some(1),
-            users: Some(vec![event.user_id.clone()]),
-        });
-        true
-    }
-}
-
-fn remove_reaction(message: &mut SlackMessage, event: &SocketModeReactionEvent) -> bool {
-    let Some(reactions) = message.reactions.as_mut() else {
-        return false;
-    };
-    let Some(index) = reactions
-        .iter()
-        .position(|reaction| reaction.name.as_deref() == Some(event.name.as_str()))
-    else {
-        return false;
-    };
-
-    let reaction = &mut reactions[index];
-    if let Some(users) = reaction.users.as_mut() {
-        let original_len = users.len();
-        users.retain(|user| user != &event.user_id);
-        if users.len() == original_len {
-            return false;
-        }
-    }
-
-    let count = reaction.count.unwrap_or_default().saturating_sub(1);
-    reaction.count = Some(count);
-    if count == 0 {
-        reactions.remove(index);
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,31 +419,6 @@ mod tests {
                 added: true,
             }))
         );
-    }
-
-    #[test]
-    fn reaction_updates_are_idempotent() {
-        let mut message = SlackMessage {
-            ts: "1710000000.000100".to_string(),
-            ..Default::default()
-        };
-        let add = SocketModeReactionEvent {
-            channel_id: "C123".to_string(),
-            ts: "1710000000.000100".to_string(),
-            name: "thumbsup".to_string(),
-            user_id: "U123".to_string(),
-            added: true,
-        };
-        let remove = SocketModeReactionEvent {
-            added: false,
-            ..add.clone()
-        };
-
-        assert!(apply_reaction_update(&mut message, &add));
-        assert!(!apply_reaction_update(&mut message, &add));
-        assert_eq!(message.reactions.as_ref().unwrap()[0].count, Some(1));
-        assert!(apply_reaction_update(&mut message, &remove));
-        assert!(message.reactions.as_ref().unwrap().is_empty());
     }
 
     #[test]

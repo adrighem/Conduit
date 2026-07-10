@@ -35,6 +35,7 @@ mod slack;
 mod socket_mode;
 mod store;
 mod window;
+mod workspace_state;
 
 use self::application::ConduitApplication;
 use self::window::ConduitWindow;
