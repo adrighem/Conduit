@@ -439,6 +439,11 @@ fn reaction_picker_script() -> &'static str {
   }
 
   document.addEventListener("click", function (event) {
+    const menuAction = event.target.closest(".more-actions-menu a");
+    if (menuAction) {
+      const menu = menuAction.closest("details");
+      if (menu) menu.open = false;
+    }
     const trigger = event.target.closest("[data-open-reaction-picker]");
     if (!trigger) return;
     event.preventDefault();
@@ -3231,6 +3236,7 @@ mod tests {
         assert!(html.contains("role=\"tablist\""));
         assert!(html.contains("class=\"emoji-grid\""));
         assert!(html.contains("role=\"menu\""));
+        assert!(html.contains("if (menu) menu.open = false"));
         let quick_actions = &html[html.find("<nav class=\"quick-actions\"").unwrap()..];
         let quick_actions = &quick_actions[..quick_actions.find("</nav>").unwrap()];
         let recent = quick_actions.find("name=heart").unwrap();
