@@ -6,6 +6,14 @@ pub fn extract_user_ids(message: &SlackMessage) -> Vec<String> {
         ids.push(user.clone());
     }
     extract_mentions(&message.body_text(), &mut ids);
+    ids.extend(
+        message
+            .reactions
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .flat_map(|reaction| reaction.users.as_ref().into_iter().flatten().cloned()),
+    );
     ids.sort();
     ids.dedup();
     ids
@@ -28,16 +36,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_author_and_mentioned_user_ids() {
+    fn extracts_author_mentions_and_reaction_user_ids() {
         let message = SlackMessage {
             user: Some("U123".to_string()),
             text: Some("hi <@U999> and <@U123>".to_string()),
+            reactions: Some(vec![crate::models::SlackReaction {
+                users: Some(vec!["U456".to_string(), "U123".to_string()]),
+                ..Default::default()
+            }]),
             ..Default::default()
         };
 
         assert_eq!(
             extract_user_ids(&message),
-            vec!["U123".to_string(), "U999".to_string()]
+            vec!["U123".to_string(), "U456".to_string(), "U999".to_string()]
         );
     }
 }

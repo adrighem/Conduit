@@ -23,6 +23,7 @@ pub struct MessageHtmlContext {
     pub failed_image_urls: HashSet<String>,
     pub recent_reactions: Vec<String>,
     pub custom_emojis: HashMap<String, String>,
+    pub read_marker_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -344,6 +345,9 @@ pub fn conversation_document_with_focus(
             body.push_str(&load_more_action_html(url, &gettext("Load more replies")));
         }
     }
+    if context.thread_ts.is_none() && context.read_marker_url.is_some() {
+        body.push_str("<div id=\"conversation-read-sentinel\" aria-hidden=\"true\"></div>");
+    }
     body.push_str("</main>");
     body.push_str(&reaction_picker_html(context));
 
@@ -353,6 +357,9 @@ pub fn conversation_document_with_focus(
     }
     if !focus_attribute.is_empty() {
         scripts.push(message_focus_script().to_string());
+    }
+    if let Some(url) = context.read_marker_url.as_deref() {
+        scripts.push(read_marker_script(url));
     }
     let script = (!scripts.is_empty()).then(|| scripts.join("\n"));
     html_document_with_script(&title, &body, script.as_deref())
@@ -1408,6 +1415,24 @@ fn message_focus_script() -> &'static str {
 })();"#
 }
 
+fn read_marker_script(url: &str) -> String {
+    let url = serde_json::to_string(url).expect("read marker URL should serialize");
+    format!(
+        r#"(function () {{
+  const sentinel = document.getElementById("conversation-read-sentinel");
+  if (!sentinel || !("IntersectionObserver" in window)) return;
+  let sent = false;
+  const observer = new IntersectionObserver(function (entries) {{
+    if (sent || !entries.some(function (entry) {{ return entry.isIntersecting; }})) return;
+    sent = true;
+    observer.disconnect();
+    window.location.href = {url};
+  }}, {{ threshold: 1.0 }});
+  observer.observe(sentinel);
+}})();"#
+    )
+}
+
 fn message_article(
     channel_id: Option<&str>,
     message: &SlackMessage,
@@ -2038,9 +2063,29 @@ fn reactions_html(message: &SlackMessage, context: &MessageHtmlContext) -> Strin
                     .is_some_and(|users| users.iter().any(|user| user == user_id))
             });
             let active_class = if active { " is-active" } else { "" };
+            let participants = reaction
+                .users
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|user_id| {
+                    context
+                        .user_names
+                        .get(user_id)
+                        .cloned()
+                        .unwrap_or_else(|| user_id.to_string())
+                })
+                .collect::<Vec<_>>();
+            let tooltip = if participants.is_empty() {
+                gettext("No participant details available")
+            } else {
+                gettext("Reacted: {names}").replace("{names}", &participants.join(", "))
+            };
             Some(format!(
-                "<span class=\"reaction{}\">{} {}</span>",
+                "<span class=\"reaction{}\" tabindex=\"0\" title=\"{}\" aria-label=\"{}\">{} {}</span>",
                 active_class,
+                escape_html(&tooltip),
+                escape_html(&tooltip),
                 reaction_label(name, context),
                 count
             ))
@@ -2245,6 +2290,14 @@ pub fn unreads_open_action_url(channel_id: &str) -> String {
     format!(
         "conduit://unreads-open?channel={}",
         encode_query(channel_id)
+    )
+}
+
+pub fn mark_read_action_url(channel_id: &str, ts: &str) -> String {
+    format!(
+        "conduit://mark-read?channel={}&ts={}",
+        encode_query(channel_id),
+        encode_query(ts)
     )
 }
 
@@ -3056,6 +3109,7 @@ mod tests {
         }]);
         let context = MessageHtmlContext {
             current_user_id: Some("U999".to_string()),
+            user_names: HashMap::from([("U999".to_string(), "Ada Lovelace".to_string())]),
             recent_reactions: vec![
                 "heart".to_string(),
                 "thumbsup".to_string(),
@@ -3076,9 +3130,9 @@ mod tests {
         assert!(html.contains(
             "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true"
         ));
-        let reaction_chip = html
-            .find("<span class=\"reaction is-active\">👍 1</span>")
-            .unwrap();
+        let reaction_chip = html.find("<span class=\"reaction is-active\"").unwrap();
+        assert!(html.contains("title=\"Reacted: Ada Lovelace\""));
+        assert!(html.contains("aria-label=\"Reacted: Ada Lovelace\""));
         let thread_chip = html.find("<a class=\"reaction thread-reaction\"").unwrap();
         assert!(reaction_chip < thread_chip);
         assert!(html.contains("conduit://save?channel=C123&amp;ts=1710000000.000100&amp;add=false"));
@@ -3112,6 +3166,22 @@ mod tests {
             assert!(!html.contains(unavailable_action), "{unavailable_action}");
         }
         assert!(!html.contains("Remove +1"));
+    }
+
+    #[test]
+    fn unread_conversation_marks_read_only_when_bottom_sentinel_is_visible() {
+        let context = MessageHtmlContext {
+            read_marker_url: Some(mark_read_action_url("C123", "1710000000.000100")),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("unread")], &context);
+
+        assert!(html.contains("id=\"conversation-read-sentinel\""));
+        assert!(html.contains("new IntersectionObserver"));
+        assert!(html.contains(
+            "window.location.href = \"conduit://mark-read?channel=C123&ts=1710000000.000100\""
+        ));
     }
 
     #[test]

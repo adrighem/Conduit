@@ -90,6 +90,10 @@ pub enum RuntimeCommand {
         url: String,
         name: String,
     },
+    MarkConversationRead {
+        channel_id: String,
+        ts: String,
+    },
     PostMessage {
         channel_id: String,
         text: String,
@@ -157,6 +161,7 @@ pub enum RuntimeOperation {
     SavedItems,
     User,
     Emoji,
+    ReadMarker,
     ImageAsset,
     Media,
     PostMessage,
@@ -297,6 +302,10 @@ impl RuntimeCommand {
             Self::LoadMedia { url, .. } => {
                 OperationContext::new(RuntimeOperation::Media, RuntimeTarget::Media(url.clone()))
             }
+            Self::MarkConversationRead { channel_id, .. } => OperationContext::new(
+                RuntimeOperation::ReadMarker,
+                RuntimeTarget::Channel(channel_id.clone()),
+            ),
             Self::PostMessage {
                 channel_id,
                 thread_ts,
@@ -375,6 +384,10 @@ pub enum RuntimeEventKind {
     ConversationUnreadUpdated {
         channel_id: String,
         unread_state: SlackUnreadState,
+    },
+    ConversationMarkedRead {
+        channel_id: String,
+        ts: String,
     },
     ConversationNotificationCandidate {
         channel_id: String,
@@ -462,6 +475,10 @@ impl RuntimeEventKind {
             | Self::ConversationNotificationCandidate { .. } => {
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
             }
+            Self::ConversationMarkedRead { channel_id, .. } => OperationContext::new(
+                RuntimeOperation::ReadMarker,
+                RuntimeTarget::Channel(channel_id.clone()),
+            ),
             Self::ConversationCandidatesLoaded { .. } => OperationContext::new(
                 RuntimeOperation::ConversationDiscovery,
                 RuntimeTarget::Workspace,
@@ -1679,8 +1696,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context.events.send_status("Loading conversation");
             let page = api.history(&channel_id).await?;
             store_history(context.workspace_store, &channel_id, &page.messages).await;
-            mark_history_read_best_effort(api, context.read_marks, &channel_id, &page.messages)
-                .await;
             crate::debug::log(
                 "runtime",
                 &format!(
@@ -1862,6 +1877,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 path: media.path,
                 mime_type: media.mime_type,
             });
+        }
+        RuntimeCommand::MarkConversationRead { channel_id, ts } => {
+            let api = require_slack(context.slack)?;
+            mark_conversation_read_best_effort(
+                api,
+                context.events,
+                context.read_marks,
+                &channel_id,
+                &ts,
+            )
+            .await;
         }
         RuntimeCommand::PostMessage {
             channel_id,
@@ -2359,20 +2385,25 @@ fn send_thread_loaded(
     });
 }
 
-async fn mark_history_read_best_effort(
+async fn mark_conversation_read_best_effort(
     api: &SlackApi,
+    events: &RuntimeEventSender,
     read_marks: &mut HashMap<String, String>,
     channel_id: &str,
-    messages: &[SlackMessage],
+    latest_ts: &str,
 ) {
-    let Some(latest_ts) = SlackMessage::latest_ts(messages.iter()) else {
+    if channel_id.trim().is_empty() || latest_ts.trim().is_empty() {
         return;
-    };
+    }
 
     if read_marks
         .get(channel_id)
-        .is_some_and(|marked_ts| marked_ts >= &latest_ts)
+        .is_some_and(|marked_ts| marked_ts.as_str() >= latest_ts)
     {
+        events.send_event(RuntimeEventKind::ConversationMarkedRead {
+            channel_id: channel_id.to_string(),
+            ts: latest_ts.to_string(),
+        });
         return;
     }
 
@@ -2381,21 +2412,24 @@ async fn mark_history_read_best_effort(
             "runtime",
             &format!("MarkReadSkipped channel_id={channel_id} reason=missing_token_scope"),
         );
-        return;
+    } else {
+        match api.mark_read(channel_id, latest_ts).await {
+            Ok(()) => crate::debug::log(
+                "runtime",
+                &format!("MarkRead channel_id={channel_id} ts={latest_ts}"),
+            ),
+            Err(error) => crate::debug::log(
+                "runtime",
+                &format!("MarkReadFailed channel_id={channel_id} ts={latest_ts} error={error:#}"),
+            ),
+        }
     }
 
-    match api.mark_read(channel_id, &latest_ts).await {
-        Ok(()) => crate::debug::log(
-            "runtime",
-            &format!("MarkRead channel_id={channel_id} ts={latest_ts}"),
-        ),
-        Err(error) => crate::debug::log(
-            "runtime",
-            &format!("MarkReadFailed channel_id={channel_id} ts={latest_ts} error={error:#}"),
-        ),
-    }
-
-    read_marks.insert(channel_id.to_string(), latest_ts);
+    read_marks.insert(channel_id.to_string(), latest_ts.to_string());
+    events.send_event(RuntimeEventKind::ConversationMarkedRead {
+        channel_id: channel_id.to_string(),
+        ts: latest_ts.to_string(),
+    });
 }
 
 fn workspace_store_id(auth: &AuthInfo) -> String {

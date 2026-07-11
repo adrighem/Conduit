@@ -866,6 +866,32 @@ fn realtime_message_marks_unread(
             .is_none_or(|user| Some(user) != current_user_id)
 }
 
+fn first_unread_message_ts(
+    messages: &[SlackMessage],
+    last_read: Option<&str>,
+    unread_count: u64,
+) -> Option<String> {
+    let mut timestamps = messages
+        .iter()
+        .map(|message| message.ts.as_str())
+        .filter(|ts| !ts.is_empty())
+        .collect::<Vec<_>>();
+    timestamps.sort_unstable();
+    if let Some(last_read) = last_read.filter(|ts| !ts.trim().is_empty()) {
+        return timestamps
+            .into_iter()
+            .find(|timestamp| *timestamp > last_read)
+            .map(ToString::to_string);
+    }
+    if unread_count == 0 {
+        return None;
+    }
+    let index = timestamps.len().saturating_sub(unread_count as usize);
+    timestamps
+        .get(index)
+        .map(|timestamp| (*timestamp).to_string())
+}
+
 fn mutation_completion_reloads_visible_channel(
     visible_channel: Option<&str>,
     completed_channel: &str,
@@ -2062,6 +2088,13 @@ impl ConduitWindow {
                 channel_id,
                 unread_state,
             } => self.apply_conversation_unread_state(&channel_id, unread_state),
+            RuntimeEventKind::ConversationMarkedRead { channel_id, ts: _ } => {
+                self.mark_conversation_locally_read(&channel_id);
+                self.render_conversations();
+                if self.current_main_view() == MainMessageView::Unreads {
+                    self.populate_unreads(self.unread_items());
+                }
+            }
             RuntimeEventKind::ConversationNotificationCandidate {
                 channel_id,
                 messages,
@@ -2089,9 +2122,8 @@ impl ConduitWindow {
                         .borrow()
                         .snapshot()
                         .channel_messages;
-                    if outcome.mark_read {
+                    if outcome.notify_new_messages {
                         self.notify_if_new_messages(&channel_id, &rendered_messages);
-                        self.mark_conversation_locally_read(&channel_id);
                     }
                     self.populate_history_with_scroll(
                         &channel_id,
@@ -2747,6 +2779,18 @@ impl ConduitWindow {
                     return true;
                 };
                 self.open_thread(&channel_id, &ts);
+                true
+            }
+            Some("mark-read") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let Some(ts) = query_param(url, "ts") else {
+                    return true;
+                };
+                if self.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
+                    self.send_command(RuntimeCommand::MarkConversationRead { channel_id, ts });
+                }
                 true
             }
             Some("message") => {
@@ -3918,11 +3962,44 @@ impl ConduitWindow {
         if !imp.workspace_view.borrow().has_channel_context(channel_id) {
             context.load_more_url = self.channel_load_more_url(channel_id);
         }
+        let has_unread = imp
+            .conversations
+            .borrow()
+            .iter()
+            .find(|conversation| conversation.id == channel_id)
+            .is_some_and(SlackConversation::has_unread_activity);
+        let (last_read, unread_count) = imp
+            .conversations
+            .borrow()
+            .iter()
+            .find(|conversation| conversation.id == channel_id)
+            .map(|conversation| {
+                (
+                    conversation
+                        .extra
+                        .get("last_read")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string),
+                    conversation.unread_activity_count(),
+                )
+            })
+            .unwrap_or_default();
+        if has_unread {
+            context.read_marker_url = SlackMessage::latest_ts(messages.iter())
+                .map(|ts| message_html::mark_read_action_url(channel_id, &ts));
+        }
         context.timeline_scroll = scroll_behavior;
-        let focus_message_ts = imp
+        let explicit_focus_ts = imp
             .workspace_view
             .borrow_mut()
             .take_channel_focus_for_render(channel_id, &messages);
+        let unread_focus_ts = has_unread
+            .then(|| first_unread_message_ts(&messages, last_read.as_deref(), unread_count))
+            .flatten();
+        let focus_message_ts = explicit_focus_ts.or(unread_focus_ts);
+        if focus_message_ts.is_some() && has_unread {
+            context.timeline_scroll = TimelineScrollBehavior::Preserve;
+        }
         crate::debug::log(
             "ui",
             &format!(
@@ -4490,6 +4567,7 @@ impl ConduitWindow {
             failed_image_urls: imp.failed_image_assets.borrow().clone(),
             recent_reactions,
             custom_emojis: imp.custom_emojis.borrow().clone(),
+            read_marker_url: None,
         }
     }
 
@@ -5317,6 +5395,34 @@ mod tests {
             Some("U999"),
             &event
         ));
+    }
+
+    #[test]
+    fn unread_focus_starts_after_last_read_or_uses_unread_count() {
+        let messages = [
+            SlackMessage {
+                ts: "3".to_string(),
+                ..Default::default()
+            },
+            SlackMessage {
+                ts: "1".to_string(),
+                ..Default::default()
+            },
+            SlackMessage {
+                ts: "2".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            first_unread_message_ts(&messages, Some("1"), 0).as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            first_unread_message_ts(&messages, None, 2).as_deref(),
+            Some("2")
+        );
+        assert_eq!(first_unread_message_ts(&messages, None, 0), None);
     }
 
     #[test]

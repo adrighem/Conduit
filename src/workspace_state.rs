@@ -60,7 +60,7 @@ pub(crate) struct ConversationSelectionOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HistoryApplyOutcome {
     pub(crate) visible: bool,
-    pub(crate) mark_read: bool,
+    pub(crate) notify_new_messages: bool,
     pub(crate) scroll: Option<WorkspaceScrollBehavior>,
 }
 
@@ -451,11 +451,11 @@ impl WorkspaceViewState {
         }
 
         let visible = self.visible_channel_id() == Some(channel_id);
-        let mark_read = visible && !cached && !append_older;
+        let notify_new_messages = visible && !cached && !append_older;
         let scroll = visible.then(|| self.take_channel_scroll(channel_id, append_older));
         HistoryApplyOutcome {
             visible,
-            mark_read,
+            notify_new_messages,
             scroll,
         }
     }
@@ -1112,7 +1112,7 @@ mod tests {
 
         let applied = apply_fresh(&mut state, "C1", vec![message("1", "hello")]);
         assert!(applied.visible);
-        assert!(applied.mark_read);
+        assert!(applied.notify_new_messages);
         assert_eq!(applied.scroll, Some(WorkspaceScrollBehavior::Bottom));
 
         let current = state.select_conversation("C1");
@@ -1385,7 +1385,7 @@ mod tests {
         let outcome = apply_fresh(&mut state, "A", vec![message("1", "late")]);
 
         assert!(!outcome.visible);
-        assert!(!outcome.mark_read);
+        assert!(!outcome.notify_new_messages);
         assert_eq!(outcome.scroll, None);
         assert_eq!(state.main_view(), MainMessageView::Conversation);
         assert_eq!(state.visible_channel_id(), Some("B"));
@@ -1464,7 +1464,7 @@ mod tests {
             outcome.scroll,
             Some(WorkspaceScrollBehavior::PreservePrepend)
         );
-        assert!(!outcome.mark_read);
+        assert!(!outcome.notify_new_messages);
     }
 
     #[test]

@@ -167,9 +167,10 @@ impl SlackApi {
     }
 
     pub fn can_mark_read(&self) -> bool {
-        READ_MARKER_SCOPES
-            .iter()
-            .any(|scope| self.scopes.contains(*scope))
+        self.scopes.is_empty()
+            || READ_MARKER_SCOPES
+                .iter()
+                .any(|scope| self.scopes.contains(*scope))
     }
 
     pub async fn history(&self, channel_id: &str) -> Result<SlackMessagePage> {
