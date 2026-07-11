@@ -650,6 +650,25 @@ fn query_param(url: &url::Url, name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+fn promoted_recent_reactions<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    name: &str,
+) -> Vec<String> {
+    let mut promoted = Vec::with_capacity(3);
+    if !name.trim().is_empty() {
+        promoted.push(name.to_string());
+    }
+    for existing in names {
+        if promoted.len() == 3 {
+            break;
+        }
+        if !existing.trim().is_empty() && !promoted.iter().any(|value| value == existing) {
+            promoted.push(existing.to_string());
+        }
+    }
+    promoted
+}
+
 fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
     let url = file.preview_url()?;
     Some((url.to_string(), url.to_string()))
@@ -2109,6 +2128,7 @@ impl ConduitWindow {
                 let name = query_param(url, "name").unwrap_or_else(|| "thumbsup".to_string());
                 let add = query_param(url, "add").is_none_or(|value| value == "true");
                 let thread_ts = query_param(url, "thread_ts");
+                self.remember_recent_reaction(&name);
                 self.send_command(RuntimeCommand::SetReaction {
                     channel_id,
                     ts,
@@ -2165,6 +2185,16 @@ impl ConduitWindow {
                 self.copy_message_link(&channel_id, &ts);
                 true
             }
+            Some("forward") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let Some(ts) = query_param(url, "ts") else {
+                    return true;
+                };
+                self.forward_message(&channel_id, &ts);
+                true
+            }
             _ => true,
         }
     }
@@ -2201,6 +2231,29 @@ impl ConduitWindow {
         };
 
         self.copy_to_clipboard(&permalink, "Copied message link");
+    }
+
+    fn forward_message(&self, channel_id: &str, ts: &str) {
+        let Some(workspace_url) = self.imp().workspace_url.borrow().clone() else {
+            self.set_status("Workspace URL is not available");
+            return;
+        };
+        let Some(permalink) = message_permalink(&workspace_url, channel_id, ts) else {
+            self.set_status("Could not build message link");
+            return;
+        };
+        self.show_conversation_picker(
+            "Forward message",
+            "Choose a conversation",
+            move |window, action| {
+                window.send_command(RuntimeCommand::PostMessage {
+                    channel_id: action.channel_id,
+                    text: permalink.clone(),
+                    thread_ts: None,
+                });
+                window.set_status("Forwarding message");
+            },
+        );
     }
 
     fn copy_to_clipboard(&self, text: &str, status: &str) {
@@ -2829,6 +2882,17 @@ impl ConduitWindow {
     }
 
     fn show_conversation_switcher(&self) {
+        self.show_conversation_picker(
+            "Switch conversation",
+            "Search conversations",
+            |window, action| window.select_conversation(&action.channel_id, &action.title),
+        );
+    }
+
+    fn show_conversation_picker<F>(&self, title: &str, placeholder: &str, on_activate: F)
+    where
+        F: Fn(&Self, SidebarRowAction) + 'static,
+    {
         let imp = self.imp();
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
@@ -2839,7 +2903,7 @@ impl ConduitWindow {
         }
 
         let dialog = gtk::Window::builder()
-            .title("Switch conversation")
+            .title(title)
             .transient_for(self)
             .modal(true)
             .default_width(520)
@@ -2867,7 +2931,7 @@ impl ConduitWindow {
         dialog.add_controller(close_controller);
 
         let search = gtk::SearchEntry::new();
-        search.set_placeholder_text(Some("Search conversations"));
+        search.set_placeholder_text(Some(placeholder));
         container.append(&search);
 
         let list = gtk::ListBox::new();
@@ -2907,10 +2971,11 @@ impl ConduitWindow {
         let weak_window = self.downgrade();
         let actions_for_activate = actions.clone();
         let dialog_for_activate = dialog.clone();
+        let on_activate = Rc::new(on_activate);
         list.connect_row_activated(move |_, row| {
             let action = sidebar_row_action_for_index(&actions_for_activate.borrow(), row.index());
             if let (Some(window), Some(action)) = (weak_window.upgrade(), action) {
-                window.select_conversation(&action.channel_id, &action.title);
+                on_activate(&window, action);
                 dialog_for_activate.close();
             }
         });
@@ -3612,6 +3677,13 @@ impl ConduitWindow {
 
     fn message_html_context(&self, thread_ts: Option<&str>) -> MessageHtmlContext {
         let imp = self.imp();
+        let recent_reactions = imp
+            .settings
+            .borrow()
+            .as_ref()
+            .map(|settings| settings.strv(config::RECENT_REACTIONS_KEY))
+            .map(|names| names.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
         MessageHtmlContext {
             user_names: imp.user_names.borrow().clone(),
             user_group_names: imp.user_group_names.borrow().clone(),
@@ -3622,7 +3694,19 @@ impl ConduitWindow {
             timeline_scroll: TimelineScrollBehavior::Preserve,
             image_assets: imp.image_assets.borrow().clone(),
             failed_image_urls: imp.failed_image_assets.borrow().clone(),
+            recent_reactions,
         }
+    }
+
+    fn remember_recent_reaction(&self, name: &str) {
+        let settings = self.imp().settings.borrow().clone();
+        let Some(settings) = settings else {
+            return;
+        };
+        let stored = settings.strv(config::RECENT_REACTIONS_KEY);
+        let names = promoted_recent_reactions(stored.iter().map(|value| value.as_str()), name);
+        let values = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let _ = settings.set_strv(config::RECENT_REACTIONS_KEY, values);
     }
 
     fn current_message_snapshot(&self) -> WorkspaceSnapshot {
@@ -4435,5 +4519,17 @@ mod tests {
             "C123"
         ));
         assert!(!mutation_completion_reloads_visible_channel(None, "C123"));
+    }
+
+    #[test]
+    fn recent_reactions_are_promoted_deduplicated_and_bounded() {
+        assert_eq!(
+            promoted_recent_reactions(["thumbsup", "heart", "eyes", "fire"], "heart"),
+            vec!["heart", "thumbsup", "eyes"]
+        );
+        assert_eq!(
+            promoted_recent_reactions(["thumbsup", "heart"], "rocket"),
+            vec!["rocket", "thumbsup", "heart"]
+        );
     }
 }

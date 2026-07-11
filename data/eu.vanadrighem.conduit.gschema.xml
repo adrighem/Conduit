@@ -11,5 +11,10 @@
 			<summary>Show the Unreads sidebar section</summary>
 			<description>Whether unread conversations are duplicated into a separate Unreads section at the top of the conversation sidebar.</description>
 		</key>
+		<key name="recent-reactions" type="as">
+			<default>['smile', 'thumbsup', 'white_check_mark']</default>
+			<summary>Recently used message reactions</summary>
+			<description>The three most recently used emoji reaction names shown in message quick actions.</description>
+		</key>
 	</schema>
 </schemalist>

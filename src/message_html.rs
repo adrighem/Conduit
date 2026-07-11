@@ -20,6 +20,7 @@ pub struct MessageHtmlContext {
     pub timeline_scroll: TimelineScrollBehavior,
     pub image_assets: HashMap<String, String>,
     pub failed_image_urls: HashSet<String>,
+    pub recent_reactions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,6 +141,336 @@ fn document_heading(title: &str) -> String {
         "<h1 id=\"document-title\" class=\"visually-hidden\">{}</h1>",
         escape_html(title)
     )
+}
+
+#[derive(Clone, Copy)]
+struct EmojiOption {
+    name: &'static str,
+    glyph: &'static str,
+    category: &'static str,
+}
+
+const EMOJI_CATALOG: &[EmojiOption] = &[
+    EmojiOption {
+        name: "smile",
+        glyph: "🙂",
+        category: "Smileys",
+    },
+    EmojiOption {
+        name: "smiley",
+        glyph: "😃",
+        category: "Smileys",
+    },
+    EmojiOption {
+        name: "joy",
+        glyph: "😂",
+        category: "Smileys",
+    },
+    EmojiOption {
+        name: "laughing",
+        glyph: "😆",
+        category: "Smileys",
+    },
+    EmojiOption {
+        name: "heart_eyes",
+        glyph: "😍",
+        category: "Smileys",
+    },
+    EmojiOption {
+        name: "thinking_face",
+        glyph: "🤔",
+        category: "Smileys",
+    },
+    EmojiOption {
+        name: "sad",
+        glyph: "😢",
+        category: "Smileys",
+    },
+    EmojiOption {
+        name: "zany_face",
+        glyph: "🤪",
+        category: "Smileys",
+    },
+    EmojiOption {
+        name: "thumbsup",
+        glyph: "👍",
+        category: "People",
+    },
+    EmojiOption {
+        name: "thumbsdown",
+        glyph: "👎",
+        category: "People",
+    },
+    EmojiOption {
+        name: "clap",
+        glyph: "👏",
+        category: "People",
+    },
+    EmojiOption {
+        name: "pray",
+        glyph: "🙏",
+        category: "People",
+    },
+    EmojiOption {
+        name: "ok_hand",
+        glyph: "👌",
+        category: "People",
+    },
+    EmojiOption {
+        name: "eyes",
+        glyph: "👀",
+        category: "People",
+    },
+    EmojiOption {
+        name: "muscle",
+        glyph: "💪",
+        category: "People",
+    },
+    EmojiOption {
+        name: "wave",
+        glyph: "👋",
+        category: "People",
+    },
+    EmojiOption {
+        name: "heart",
+        glyph: "❤️",
+        category: "Nature",
+    },
+    EmojiOption {
+        name: "fire",
+        glyph: "🔥",
+        category: "Nature",
+    },
+    EmojiOption {
+        name: "sunny",
+        glyph: "☀️",
+        category: "Nature",
+    },
+    EmojiOption {
+        name: "star",
+        glyph: "⭐",
+        category: "Nature",
+    },
+    EmojiOption {
+        name: "sparkles",
+        glyph: "✨",
+        category: "Nature",
+    },
+    EmojiOption {
+        name: "seedling",
+        glyph: "🌱",
+        category: "Nature",
+    },
+    EmojiOption {
+        name: "dog",
+        glyph: "🐶",
+        category: "Nature",
+    },
+    EmojiOption {
+        name: "cat",
+        glyph: "🐱",
+        category: "Nature",
+    },
+    EmojiOption {
+        name: "coffee",
+        glyph: "☕",
+        category: "Food",
+    },
+    EmojiOption {
+        name: "cake",
+        glyph: "🍰",
+        category: "Food",
+    },
+    EmojiOption {
+        name: "pizza",
+        glyph: "🍕",
+        category: "Food",
+    },
+    EmojiOption {
+        name: "beer",
+        glyph: "🍺",
+        category: "Food",
+    },
+    EmojiOption {
+        name: "apple",
+        glyph: "🍎",
+        category: "Food",
+    },
+    EmojiOption {
+        name: "taco",
+        glyph: "🌮",
+        category: "Food",
+    },
+    EmojiOption {
+        name: "popcorn",
+        glyph: "🍿",
+        category: "Food",
+    },
+    EmojiOption {
+        name: "cookie",
+        glyph: "🍪",
+        category: "Food",
+    },
+    EmojiOption {
+        name: "tada",
+        glyph: "🎉",
+        category: "Activity",
+    },
+    EmojiOption {
+        name: "rocket",
+        glyph: "🚀",
+        category: "Activity",
+    },
+    EmojiOption {
+        name: "soccer",
+        glyph: "⚽",
+        category: "Activity",
+    },
+    EmojiOption {
+        name: "medal",
+        glyph: "🏅",
+        category: "Activity",
+    },
+    EmojiOption {
+        name: "dart",
+        glyph: "🎯",
+        category: "Activity",
+    },
+    EmojiOption {
+        name: "trophy",
+        glyph: "🏆",
+        category: "Activity",
+    },
+    EmojiOption {
+        name: "bulb",
+        glyph: "💡",
+        category: "Objects",
+    },
+    EmojiOption {
+        name: "warning",
+        glyph: "⚠️",
+        category: "Objects",
+    },
+    EmojiOption {
+        name: "white_check_mark",
+        glyph: "✅",
+        category: "Objects",
+    },
+    EmojiOption {
+        name: "x",
+        glyph: "❌",
+        category: "Objects",
+    },
+    EmojiOption {
+        name: "link",
+        glyph: "🔗",
+        category: "Objects",
+    },
+    EmojiOption {
+        name: "eyes_on",
+        glyph: "🔍",
+        category: "Objects",
+    },
+];
+
+fn reaction_picker_html() -> String {
+    let categories = ["Smileys", "People", "Nature", "Food", "Activity", "Objects"];
+    let category_buttons = categories
+        .iter()
+        .enumerate()
+        .map(|(index, category)| {
+            let selected = if index == 0 { "true" } else { "false" };
+            format!(
+                "<button type=\"button\" role=\"tab\" aria-selected=\"{selected}\" data-emoji-category=\"{category}\">{}</button>",
+                escape_html(category)
+            )
+        })
+        .collect::<String>();
+    let emoji_buttons = EMOJI_CATALOG
+        .iter()
+        .map(|emoji| {
+            let label = emoji.name.replace('_', " ");
+            format!(
+                "<button type=\"button\" class=\"emoji-choice\" data-emoji-name=\"{}\" data-category=\"{}\" data-search=\"{}\" title=\":{}:\" aria-label=\"{}\">{}</button>",
+                escape_html(emoji.name),
+                escape_html(emoji.category),
+                escape_html(&label),
+                escape_html(emoji.name),
+                escape_html(&label),
+                emoji.glyph
+            )
+        })
+        .collect::<String>();
+
+    format!(
+        "<dialog id=\"reaction-picker\" class=\"reaction-picker\" aria-labelledby=\"reaction-picker-title\"><header><h2 id=\"reaction-picker-title\">{}</h2><button type=\"button\" class=\"picker-close\" aria-label=\"{}\">×</button></header><label class=\"emoji-search-label\" for=\"emoji-search\">{}</label><input id=\"emoji-search\" class=\"emoji-search\" type=\"search\" autocomplete=\"off\" placeholder=\"{}\"><nav class=\"emoji-categories\" role=\"tablist\" aria-label=\"{}\">{category_buttons}</nav><div class=\"emoji-grid\" role=\"grid\" aria-label=\"{}\">{emoji_buttons}</div><p class=\"emoji-empty\" role=\"status\" hidden>{}</p></dialog>",
+        escape_html(&gettext("Add reaction")),
+        escape_html(&gettext("Close reaction picker")),
+        escape_html(&gettext("Search emoji by name")),
+        escape_html(&gettext("Search emoji")),
+        escape_html(&gettext("Emoji categories")),
+        escape_html(&gettext("Emoji")),
+        escape_html(&gettext("No emoji found")),
+    )
+}
+
+fn reaction_picker_script() -> &'static str {
+    r##"(function () {
+  const picker = document.getElementById("reaction-picker");
+  if (!picker) return;
+  const search = picker.querySelector("#emoji-search");
+  const choices = Array.from(picker.querySelectorAll(".emoji-choice"));
+  const tabs = Array.from(picker.querySelectorAll("[data-emoji-category]"));
+  const empty = picker.querySelector(".emoji-empty");
+  let activeCategory = "Smileys";
+  let reactionTemplate = "";
+  let opener = null;
+
+  function filterChoices() {
+    const query = search.value.trim().toLocaleLowerCase();
+    let visible = 0;
+    choices.forEach(function (choice) {
+      const matchesQuery = !query || choice.dataset.search.includes(query) || choice.dataset.emojiName.includes(query);
+      const matchesCategory = query || choice.dataset.category === activeCategory;
+      choice.hidden = !(matchesQuery && matchesCategory);
+      if (!choice.hidden) visible += 1;
+    });
+    empty.hidden = visible !== 0;
+  }
+
+  document.addEventListener("click", function (event) {
+    const trigger = event.target.closest("[data-open-reaction-picker]");
+    if (!trigger) return;
+    event.preventDefault();
+    opener = trigger;
+    reactionTemplate = trigger.dataset.reactionTemplate;
+    search.value = "";
+    filterChoices();
+    picker.showModal();
+    search.focus();
+  });
+
+  picker.querySelector(".picker-close").addEventListener("click", function () { picker.close(); });
+  picker.addEventListener("close", function () { if (opener) opener.focus(); });
+  search.addEventListener("input", filterChoices);
+  tabs.forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      activeCategory = tab.dataset.emojiCategory;
+      tabs.forEach(function (item) { item.setAttribute("aria-selected", String(item === tab)); });
+      search.value = "";
+      filterChoices();
+      const first = choices.find(function (choice) { return !choice.hidden; });
+      if (first) first.focus();
+    });
+  });
+  choices.forEach(function (choice) {
+    choice.addEventListener("click", function () {
+      const url = reactionTemplate.replace("__REACTION__", encodeURIComponent(choice.dataset.emojiName));
+      picker.close();
+      window.location.href = url;
+    });
+  });
+})();"##
 }
 
 pub fn placeholder_document(title: &str, message: &str) -> String {
@@ -347,9 +678,22 @@ fn html_document_with_language(
     script: Option<&str>,
     language: &str,
 ) -> String {
-    let script_tag = script
-        .filter(|script| !script.trim().is_empty())
-        .map(|script| format!("\n<script>\n{script}\n</script>"))
+    let has_message_actions = body.contains("class=\"quick-actions\"");
+    let scripts = [
+        script.filter(|script| !script.trim().is_empty()),
+        has_message_actions.then_some(reaction_picker_script()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    let script_tag = if scripts.is_empty() {
+        String::new()
+    } else {
+        format!("\n<script>\n{scripts}\n</script>")
+    };
+    let reaction_picker = has_message_actions
+        .then(reaction_picker_html)
         .unwrap_or_default();
 
     format!(
@@ -399,7 +743,7 @@ body {{
   overflow-wrap: anywhere;
 }}
 
-:where(a, summary, [tabindex]):focus-visible {{
+:where(a, button, input, summary, [tabindex]):focus-visible {{
   outline: 3px solid var(--accent);
   outline-offset: 2px;
 }}
@@ -713,11 +1057,13 @@ pre code {{
   flex-wrap: wrap;
   justify-self: end;
   align-items: center;
-  gap: 2px;
+  gap: 0;
   max-inline-size: 100%;
   overflow: visible;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  padding-block: 2px;
+  padding-inline: 2px;
+  border-radius: 10px;
   background: var(--page);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
   opacity: 1;
@@ -737,6 +1083,8 @@ pre code {{
   color: var(--text);
   font: inherit;
   line-height: 1;
+  cursor: pointer;
+  text-decoration: none;
 }}
 
 .action-button:hover {{
@@ -746,6 +1094,186 @@ pre code {{
 
 .action-button.is-active {{
   background: var(--success-soft);
+}}
+
+.action-divider {{
+  inline-size: 1px;
+  block-size: 24px;
+  margin-inline: 2px;
+  background: var(--line);
+}}
+
+.more-actions {{
+  position: relative;
+}}
+
+.more-actions > summary {{
+  list-style: none;
+}}
+
+.more-actions > summary::-webkit-details-marker {{
+  display: none;
+}}
+
+.more-actions-menu {{
+  position: absolute;
+  z-index: 4;
+  inset-block-start: calc(100% + 6px);
+  inset-inline-end: 0;
+  display: grid;
+  min-inline-size: 190px;
+  padding-block: 6px;
+  padding-inline: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--page);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}}
+
+.more-action {{
+  display: block;
+  padding-block: 8px;
+  padding-inline: 10px;
+  border-radius: 6px;
+  color: var(--text);
+  white-space: nowrap;
+}}
+
+.more-action:hover {{
+  background: var(--soft);
+  text-decoration: none;
+}}
+
+.reaction-picker {{
+  box-sizing: border-box;
+  inline-size: min(520px, calc(100vw - 24px));
+  max-block-size: min(620px, calc(100vh - 24px));
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--page);
+  color: var(--text);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.28);
+}}
+
+.reaction-picker::backdrop {{
+  background: rgba(0, 0, 0, 0.28);
+}}
+
+.reaction-picker > header {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-block: 14px 8px;
+  padding-inline: 16px;
+}}
+
+.reaction-picker h2 {{
+  margin: 0;
+  font-size: 18px;
+}}
+
+.picker-close,
+.emoji-categories button,
+.emoji-choice {{
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}}
+
+.picker-close {{
+  display: grid;
+  place-items: center;
+  inline-size: 34px;
+  block-size: 34px;
+  border-radius: 50%;
+  font-size: 24px;
+}}
+
+.picker-close:hover,
+.emoji-choice:hover {{
+  background: var(--soft);
+}}
+
+.emoji-search-label {{
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}}
+
+.emoji-search {{
+  box-sizing: border-box;
+  inline-size: calc(100% - 32px);
+  min-block-size: 40px;
+  margin-block: 0 10px;
+  margin-inline: 16px;
+  padding-block: 8px;
+  padding-inline: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+  color: var(--text);
+  font: inherit;
+}}
+
+.emoji-categories {{
+  display: flex;
+  gap: 2px;
+  padding-inline: 12px;
+  overflow-x: auto;
+  border-block-end: 1px solid var(--line);
+}}
+
+.emoji-categories button {{
+  min-block-size: 36px;
+  padding-inline: 9px;
+  border-block-end: 2px solid transparent;
+  color: var(--muted);
+  white-space: nowrap;
+}}
+
+.emoji-categories button[aria-selected="true"] {{
+  border-block-end-color: var(--accent);
+  color: var(--text);
+  font-weight: 700;
+}}
+
+.emoji-grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(42px, 1fr));
+  gap: 4px;
+  max-block-size: 360px;
+  padding-block: 12px;
+  padding-inline: 12px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}}
+
+.emoji-choice {{
+  display: grid;
+  place-items: center;
+  min-block-size: 42px;
+  border-radius: 8px;
+  font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+  font-size: 24px;
+}}
+
+.emoji-choice[hidden] {{
+  display: none;
+}}
+
+.emoji-empty {{
+  margin: 0;
+  padding-block: 24px;
+  padding-inline: 16px;
+  color: var(--muted);
+  text-align: center;
 }}
 
 .external-actions {{
@@ -842,12 +1370,14 @@ pre code {{
 <body>
 {}
 {}
+{}
 </body>
 </html>"#,
         escape_html(language),
         document_direction(language),
         escape_html(title),
         body,
+        reaction_picker,
         script_tag
     )
 }
@@ -1689,15 +2219,24 @@ fn message_actions_html(
 
     let thread_ts = action_thread_ts(message, context);
     let mut actions = String::new();
-    for (name, emoji, title) in quick_reactions() {
-        let reacted = message.user_reacted(name, context.current_user_id.as_deref());
+    for emoji in recent_reactions(context) {
+        let reacted = message.user_reacted(emoji.name, context.current_user_id.as_deref());
         actions.push_str(&action_button_html(
-            &reaction_action_url(channel_id, message, name, !reacted, thread_ts),
-            emoji,
-            &title,
+            &reaction_action_url(channel_id, message, emoji.name, !reacted, thread_ts),
+            emoji.glyph,
+            &gettext("React with {emoji}").replace("{emoji}", &emoji.name.replace('_', " ")),
             reacted,
         ));
     }
+    let reaction_template =
+        reaction_action_url(channel_id, message, "__REACTION__", true, thread_ts);
+    actions.push_str(&format!(
+        "<button type=\"button\" class=\"action-button\" data-open-reaction-picker data-reaction-template=\"{}\" title=\"{}\" aria-label=\"{}\">☺<span aria-hidden=\"true\">+</span></button>",
+        escape_html(&reaction_template),
+        escape_html(&gettext("Add reaction")),
+        escape_html(&gettext("Add reaction")),
+    ));
+    actions.push_str("<span class=\"action-divider\" aria-hidden=\"true\"></span>");
 
     if context.thread_ts.is_none() {
         let title = message
@@ -1713,34 +2252,43 @@ fn message_actions_html(
         ));
     }
 
+    actions.push_str(&action_button_html(
+        &forward_action_url(channel_id, message),
+        "↗",
+        &gettext("Forward message"),
+        false,
+    ));
+
     let starred = message.is_starred.unwrap_or(false);
     let save_title = if starred {
         gettext("Remove from saved items")
     } else {
         gettext("Save for later")
     };
-    actions.push_str(&action_button_html(
-        &save_action_url(channel_id, message, !starred, thread_ts),
-        if starred { "★" } else { "☆" },
-        &save_title,
-        starred,
-    ));
-    actions.push_str(&action_button_html(
-        &copy_link_action_url(channel_id, message),
-        "🔗",
-        &gettext("Copy link"),
-        false,
-    ));
-    actions.push_str(&action_button_html(
-        &copy_message_action_url(channel_id, message),
-        "📋",
-        &gettext("Copy message"),
-        false,
+    actions.push_str(&format!(
+        "<details class=\"more-actions\"><summary class=\"action-button\" title=\"{}\" aria-label=\"{}\">⋯</summary><div class=\"more-actions-menu\" role=\"menu\"><a class=\"more-action{}\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a></div></details>",
+        escape_html(&gettext("More actions")),
+        escape_html(&gettext("More actions")),
+        if starred { " is-active" } else { "" },
+        escape_html(&save_action_url(channel_id, message, !starred, thread_ts)),
+        escape_html(&save_title),
+        escape_html(&copy_link_action_url(channel_id, message)),
+        escape_html(&gettext("Copy link")),
+        escape_html(&copy_message_action_url(channel_id, message)),
+        escape_html(&gettext("Copy message")),
     ));
 
     format!(
         "<nav class=\"quick-actions\" aria-label=\"{}\">{actions}</nav>",
         escape_html(&gettext("Message actions"))
+    )
+}
+
+pub fn forward_action_url(channel_id: &str, message: &SlackMessage) -> String {
+    format!(
+        "conduit://forward?channel={}&ts={}",
+        encode_query(channel_id),
+        encode_query(&message.ts)
     )
 }
 
@@ -1852,12 +2400,23 @@ fn action_thread_ts<'a>(
     })
 }
 
-fn quick_reactions() -> [(&'static str, &'static str, String); 3] {
-    [
-        ("smile", "🙂", gettext("React with smile")),
-        ("thumbsup", "👍", gettext("React with thumbs up")),
-        ("white_check_mark", "✅", gettext("React with check")),
-    ]
+fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiOption> {
+    let requested = context.recent_reactions.iter().map(String::as_str).chain([
+        "smile",
+        "thumbsup",
+        "white_check_mark",
+    ]);
+    let mut seen = HashSet::new();
+    requested
+        .filter(|name| seen.insert(*name))
+        .filter_map(|name| {
+            EMOJI_CATALOG
+                .iter()
+                .find(|emoji| emoji.name == name)
+                .copied()
+        })
+        .take(3)
+        .collect()
 }
 
 fn action_button_html(href: &str, label: &str, title: &str, active: bool) -> String {
@@ -2102,6 +2661,16 @@ fn emoji_for_code(code: &str) -> Option<&'static str> {
         "+1" | "thumbsup" => Some("👍"),
         "-1" | "thumbsdown" => Some("👎"),
         "clap" => Some("👏"),
+        "coffee" => Some("☕"),
+        "cake" => Some("🍰"),
+        "pizza" => Some("🍕"),
+        "beer" => Some("🍺"),
+        "apple" => Some("🍎"),
+        "taco" => Some("🌮"),
+        "popcorn" => Some("🍿"),
+        "cookie" => Some("🍪"),
+        "dog" => Some("🐶"),
+        "cat" => Some("🐱"),
         "eyes" => Some("👀"),
         "fire" => Some("🔥"),
         "heart" => Some("❤️"),
@@ -2109,9 +2678,22 @@ fn emoji_for_code(code: &str) -> Option<&'static str> {
         "joy" => Some("😂"),
         "laughing" | "satisfied" => Some("😆"),
         "ok_hand" => Some("👌"),
+        "muscle" => Some("💪"),
+        "wave" => Some("👋"),
+        "sunny" => Some("☀️"),
+        "star" => Some("⭐"),
+        "sparkles" => Some("✨"),
+        "seedling" => Some("🌱"),
         "party_parrot" | "tada" => Some("🎉"),
         "pray" => Some("🙏"),
         "rocket" => Some("🚀"),
+        "soccer" => Some("⚽"),
+        "medal" => Some("🏅"),
+        "dart" => Some("🎯"),
+        "trophy" => Some("🏆"),
+        "bulb" => Some("💡"),
+        "warning" => Some("⚠️"),
+        "link" => Some("🔗"),
         "sad" => Some("😢"),
         "slightly_smiling_face" | "simple_smile" | "smile" => Some("🙂"),
         "smiley" => Some("😃"),
@@ -2370,7 +2952,7 @@ mod tests {
 
         assert!(html.contains("hello &lt;script&gt;alert(1)&lt;/script&gt; &amp; goodbye"));
         assert!(html.contains("&lt;bad author&gt;"));
-        assert!(!html.contains("<script>"));
+        assert!(!html.contains("hello <script>"));
     }
 
     #[test]
@@ -2614,6 +3196,11 @@ mod tests {
         }]);
         let context = MessageHtmlContext {
             current_user_id: Some("U999".to_string()),
+            recent_reactions: vec![
+                "heart".to_string(),
+                "thumbsup".to_string(),
+                "eyes".to_string(),
+            ],
             ..Default::default()
         };
 
@@ -2623,10 +3210,12 @@ mod tests {
         assert!(html.contains(">💬</a>"));
         assert!(html.contains(">thread (3)</a>"));
         assert!(html.contains(
-            "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=smile&amp;add=true"
+            "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=heart&amp;add=true"
         ));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
-        assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=white_check_mark&amp;add=true"));
+        assert!(html.contains(
+            "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true"
+        ));
         let reaction_chip = html
             .find("<span class=\"reaction is-active\">👍 1</span>")
             .unwrap();
@@ -2635,9 +3224,22 @@ mod tests {
         assert!(html.contains("conduit://save?channel=C123&amp;ts=1710000000.000100&amp;add=false"));
         assert!(html.contains("conduit://copy-link?channel=C123&amp;ts=1710000000.000100"));
         assert!(html.contains("conduit://copy-message?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains("aria-label=\"Copy message\""));
+        assert!(html.contains("conduit://forward?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains("data-open-reaction-picker"));
+        assert_eq!(html.matches("id=\"reaction-picker\"").count(), 1);
+        assert!(html.contains("id=\"emoji-search\""));
+        assert!(html.contains("role=\"tablist\""));
+        assert!(html.contains("class=\"emoji-grid\""));
+        assert!(html.contains("role=\"menu\""));
+        let quick_actions = &html[html.find("<nav class=\"quick-actions\"").unwrap()..];
+        let quick_actions = &quick_actions[..quick_actions.find("</nav>").unwrap()];
+        let recent = quick_actions.find("name=heart").unwrap();
+        let picker = quick_actions.find("data-open-reaction-picker").unwrap();
+        let thread = quick_actions.find("conduit://thread?").unwrap();
+        let forward = quick_actions.find("conduit://forward?").unwrap();
+        let more = quick_actions.find("class=\"more-actions\"").unwrap();
+        assert!(recent < picker && picker < thread && thread < forward && forward < more);
         for unavailable_action in [
-            "More actions",
             "Edit message",
             "Mark unread",
             "Remind me",

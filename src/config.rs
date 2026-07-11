@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 pub const APPLICATION_ID: &str = "eu.vanadrighem.conduit";
 pub const MESSAGE_DRAFTS_KEY: &str = "message-drafts";
+pub const RECENT_REACTIONS_KEY: &str = "recent-reactions";
 pub const SIDEBAR_SHOW_UNREADS_SECTION_KEY: &str = "sidebar-show-unreads-section";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GETTEXT_PACKAGE: &str = "conduit";
