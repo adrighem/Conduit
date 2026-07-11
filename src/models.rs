@@ -424,6 +424,35 @@ impl SlackFile {
             .or(self.url_private.as_deref())
             .or(self.url_private_download.as_deref())
     }
+
+    pub fn supported_media_kind(&self) -> Option<&'static str> {
+        let mime = self.mimetype.as_deref()?;
+        if mime.starts_with("image/") {
+            Some("image")
+        } else if matches!(
+            mime,
+            "video/mp4" | "video/webm" | "video/ogg" | "video/quicktime" | "video/x-matroska"
+        ) {
+            Some("video")
+        } else {
+            None
+        }
+    }
+
+    pub fn media_url(&self) -> Option<&str> {
+        match self.supported_media_kind()? {
+            "image" => self
+                .url_private_download
+                .as_deref()
+                .or(self.url_private.as_deref())
+                .or_else(|| self.preview_url()),
+            "video" => self
+                .url_private_download
+                .as_deref()
+                .or(self.url_private.as_deref()),
+            _ => None,
+        }
+    }
 }
 
 fn file_size_label(size: u64) -> String {
@@ -890,6 +919,29 @@ mod tests {
         };
 
         assert_eq!(file.preview_url(), Some("https://files.example/480.png"));
+    }
+
+    #[test]
+    fn media_file_uses_original_download_and_supports_common_video_types() {
+        let image = SlackFile {
+            mimetype: Some("image/png".to_string()),
+            url_private_download: Some("https://files.example/original.png".to_string()),
+            thumb_480: Some("https://files.example/preview.png".to_string()),
+            ..Default::default()
+        };
+        let video = SlackFile {
+            mimetype: Some("video/x-matroska".to_string()),
+            url_private: Some("https://files.example/video.mkv".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(image.supported_media_kind(), Some("image"));
+        assert_eq!(
+            image.media_url(),
+            Some("https://files.example/original.png")
+        );
+        assert_eq!(video.supported_media_kind(), Some("video"));
+        assert_eq!(video.media_url(), Some("https://files.example/video.mkv"));
     }
 
     #[test]

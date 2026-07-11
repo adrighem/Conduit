@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -86,6 +86,10 @@ pub enum RuntimeCommand {
         key: String,
         url: String,
     },
+    LoadMedia {
+        url: String,
+        name: String,
+    },
     PostMessage {
         channel_id: String,
         text: String,
@@ -153,6 +157,7 @@ pub enum RuntimeOperation {
     SavedItems,
     User,
     ImageAsset,
+    Media,
     PostMessage,
     Reaction,
     Saved,
@@ -170,6 +175,7 @@ pub enum RuntimeTarget {
     },
     User(String),
     Image(String),
+    Media(String),
     Message {
         channel_id: String,
         thread_ts: Option<String>,
@@ -287,6 +293,9 @@ impl RuntimeCommand {
                 RuntimeOperation::ImageAsset,
                 RuntimeTarget::Image(key.clone()),
             ),
+            Self::LoadMedia { url, .. } => {
+                OperationContext::new(RuntimeOperation::Media, RuntimeTarget::Media(url.clone()))
+            }
             Self::PostMessage {
                 channel_id,
                 thread_ts,
@@ -409,6 +418,12 @@ pub enum RuntimeEventKind {
     ImageAssetFailed {
         key: String,
     },
+    MediaLoaded {
+        url: String,
+        name: String,
+        path: PathBuf,
+        mime_type: String,
+    },
     MessagePosted {
         channel_id: String,
         message: Box<SlackMessage>,
@@ -504,6 +519,9 @@ impl RuntimeEventKind {
                     RuntimeOperation::ImageAsset,
                     RuntimeTarget::Image(key.clone()),
                 )
+            }
+            Self::MediaLoaded { url, .. } => {
+                OperationContext::new(RuntimeOperation::Media, RuntimeTarget::Media(url.clone()))
             }
             Self::SocketModeEvent(_) => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
@@ -923,6 +941,26 @@ fn image_asset_cache_key(key: &str) -> String {
     output
 }
 
+fn media_cache_path(url: &str, name: &str) -> PathBuf {
+    let digest = Sha256::digest(url.as_bytes());
+    let key = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 10
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        });
+    let filename = extension.map_or(key.clone(), |extension| format!("{key}.{extension}"));
+    config::media_cache_dir().join(filename)
+}
+
 fn image_data_uri(image: DownloadedImage) -> String {
     format!(
         "data:{};base64,{}",
@@ -1133,7 +1171,9 @@ fn dispatch_command(
                 RuntimeTaskLane::Navigation
             } else {
                 match &command {
-                    RuntimeCommand::LoadImageAsset { .. } => RuntimeTaskLane::Image,
+                    RuntimeCommand::LoadImageAsset { .. } | RuntimeCommand::LoadMedia { .. } => {
+                        RuntimeTaskLane::Image
+                    }
                     RuntimeCommand::UploadFile { .. } => RuntimeTaskLane::Upload,
                     RuntimeCommand::RefreshConversations
                     | RuntimeCommand::DiscoverConversations
@@ -1755,6 +1795,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                         .send_event(RuntimeEventKind::ImageAssetFailed { key });
                 }
             }
+        }
+        RuntimeCommand::LoadMedia { url, name } => {
+            let api = require_slack(context.slack)?;
+            let destination = media_cache_path(&url, &name);
+            let media = api.download_media(&url, &destination).await?;
+            context.events.send_event(RuntimeEventKind::MediaLoaded {
+                url,
+                name,
+                path: media.path,
+                mime_type: media.mime_type,
+            });
         }
         RuntimeCommand::PostMessage {
             channel_id,

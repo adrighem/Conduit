@@ -27,6 +27,10 @@ pub fn image_asset_cache_dir() -> PathBuf {
     app_cache_dir().join("image-assets")
 }
 
+pub fn media_cache_dir() -> PathBuf {
+    app_cache_dir().join("media")
+}
+
 pub fn state_cache_dir() -> PathBuf {
     app_cache_dir().join("state")
 }

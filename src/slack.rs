@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -7,6 +7,7 @@ use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
 
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
@@ -14,6 +15,7 @@ use crate::models::{
 };
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
 const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
@@ -365,6 +367,77 @@ impl SlackApi {
             mime_type,
             bytes: bytes.to_vec(),
         })
+    }
+
+    /// Downloads viewable Slack media to `destination` without retaining the
+    /// complete response in memory. The destination is replaced atomically
+    /// after a successful download and never contains a partial response.
+    pub async fn download_media(&self, url: &str, destination: &Path) -> Result<DownloadedMedia> {
+        let response = self
+            .authenticated_request(Method::GET, url)
+            .send()
+            .await
+            .context("failed to download Slack media")?
+            .error_for_status()
+            .context("Slack media returned an HTTP error")?;
+
+        let mime_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(supported_media_mime_type)
+            .ok_or_else(|| anyhow!("Slack media has an unsupported content type"))?
+            .to_string();
+
+        ensure_media_size(response.content_length())?;
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("failed to create the Slack media cache directory")?;
+        }
+
+        let partial_path = partial_download_path(destination);
+        let result = async {
+            let mut file = tokio::fs::File::create(&partial_path)
+                .await
+                .context("failed to create the Slack media cache file")?;
+            let mut response = response;
+            let mut size = 0_u64;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .context("failed to read Slack media bytes")?
+            {
+                size = size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow!("Slack media is larger than 1 GiB"))?;
+                ensure_media_size(Some(size))?;
+                file.write_all(&chunk)
+                    .await
+                    .context("failed to write the Slack media cache file")?;
+            }
+            file.flush()
+                .await
+                .context("failed to flush the Slack media cache file")?;
+            drop(file);
+            tokio::fs::rename(&partial_path, destination)
+                .await
+                .context("failed to finalize the Slack media cache file")?;
+            Ok::<_, anyhow::Error>(size)
+        }
+        .await;
+
+        match result {
+            Ok(size) => Ok(DownloadedMedia {
+                path: destination.to_path_buf(),
+                mime_type,
+                size,
+            }),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&partial_path).await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn post_message(
@@ -790,6 +863,36 @@ pub struct DownloadedImage {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DownloadedMedia {
+    pub path: PathBuf,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+fn supported_media_mime_type(content_type: &str) -> Option<&str> {
+    let mime_type = content_type.split(';').next()?.trim();
+    (mime_type.starts_with("image/")
+        || matches!(
+            mime_type,
+            "video/mp4" | "video/webm" | "video/quicktime" | "video/x-matroska" | "video/ogg"
+        ))
+    .then_some(mime_type)
+}
+
+fn ensure_media_size(size: Option<u64>) -> Result<()> {
+    if size.is_some_and(|size| size > MAX_MEDIA_DOWNLOAD_BYTES) {
+        return Err(anyhow!("Slack media is larger than 1 GiB"));
+    }
+    Ok(())
+}
+
+fn partial_download_path(destination: &Path) -> PathBuf {
+    let mut name = destination.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.part", std::process::id()));
+    destination.with_file_name(name)
+}
+
 #[derive(Debug, Clone)]
 pub struct UploadProgressUpdate {
     pub fraction: f64,
@@ -1118,6 +1221,42 @@ mod tests {
             DEFAULT_RETRY_AFTER_SECONDS
         );
         assert_eq!(retry_after_seconds("120"), MAX_RETRY_AFTER_SECONDS);
+    }
+
+    #[test]
+    fn media_content_types_allow_images_and_common_video_formats() {
+        assert_eq!(
+            supported_media_mime_type("image/jpeg; charset=binary"),
+            Some("image/jpeg")
+        );
+        assert_eq!(supported_media_mime_type("image/avif"), Some("image/avif"));
+        assert_eq!(supported_media_mime_type("video/mp4"), Some("video/mp4"));
+        assert_eq!(
+            supported_media_mime_type("video/webm; codecs=vp9"),
+            Some("video/webm")
+        );
+        assert_eq!(supported_media_mime_type("audio/mpeg"), None);
+        assert_eq!(supported_media_mime_type("text/html"), None);
+        assert_eq!(supported_media_mime_type("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn media_download_size_is_bounded() {
+        assert!(ensure_media_size(None).is_ok());
+        assert!(ensure_media_size(Some(MAX_MEDIA_DOWNLOAD_BYTES)).is_ok());
+        assert!(ensure_media_size(Some(MAX_MEDIA_DOWNLOAD_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn partial_media_download_lives_next_to_destination() {
+        let destination = Path::new("/tmp/conduit/media/photo.jpg");
+        let partial = partial_download_path(destination);
+
+        assert_eq!(partial.parent(), destination.parent());
+        assert!(partial
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("photo.jpg.") && name.ends_with(".part")));
     }
 
     #[test]

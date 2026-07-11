@@ -13,14 +13,14 @@ keyring = { version = "3.6.3", default-features = false, features = ["sync-secre
 open = "5.3"
 pulldown-cmark = "0.13"
 rand = "0.9"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "multipart", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "multipart", "stream", "system-proxy"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 slack-blocks = "0.25"
 slack-morphism = { version = "2.22.0", default-features = false }
 tiny_http = "0.12"
-tokio = { version = "1.52", features = ["fs", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.52", features = ["fs", "io-util", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 url = "2.5"
 urlencoding = "2.1"

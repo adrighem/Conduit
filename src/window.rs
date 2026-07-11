@@ -20,7 +20,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -177,6 +177,7 @@ mod imp {
         pub(super) workspace_view: RefCell<WorkspaceViewState>,
         pub current_user_id: RefCell<Option<String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
+        pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub thread_view: RefCell<Option<webkit6::WebView>>,
         pub image_assets: RefCell<HashMap<String, String>>,
         pub pending_image_assets: RefCell<HashSet<String>>,
@@ -246,6 +247,39 @@ struct SidebarRowAction {
     action: ConversationPickerAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MediaGalleryItem {
+    url: String,
+    name: String,
+    kind: MediaKind,
+}
+
+#[derive(Debug)]
+struct MediaViewer {
+    surface_stack: gtk::Stack,
+    content_stack: gtk::Stack,
+    image_scroller: gtk::ScrolledWindow,
+    picture: gtk::Picture,
+    title: gtk::Label,
+    zoom_label: gtk::Label,
+    zoom_out_button: gtk::Button,
+    zoom_in_button: gtk::Button,
+    zoom_reset_button: gtk::Button,
+    previous_button: gtk::Button,
+    next_button: gtk::Button,
+    gallery: Vec<MediaGalleryItem>,
+    index: usize,
+    zoom: f64,
+    natural_size: (i32, i32),
+    loaded_path: Option<PathBuf>,
+}
+
 impl SidebarRowAction {
     fn from_model(model: &SidebarRowModel) -> Self {
         Self {
@@ -302,6 +336,47 @@ fn picker_sections(
 
 fn picker_sections_empty(sections: &ConversationPickerSections) -> bool {
     sections.conversations.is_empty() && sections.channels.is_empty() && sections.people.is_empty()
+}
+
+fn media_gallery_items(messages: &[SlackMessage]) -> Vec<MediaGalleryItem> {
+    messages
+        .iter()
+        .flat_map(|message| message.files.as_deref().unwrap_or_default())
+        .filter_map(|file| {
+            let kind = match file.supported_media_kind()? {
+                "image" => MediaKind::Image,
+                "video" => MediaKind::Video,
+                _ => return None,
+            };
+            Some(MediaGalleryItem {
+                url: file.media_url()?.to_string(),
+                name: file.display_title().to_string(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn apply_media_zoom(viewer: &MediaViewer) {
+    viewer
+        .zoom_label
+        .set_label(&format!("{:.0}%", viewer.zoom * 100.0));
+    if (viewer.zoom - 1.0).abs() < f64::EPSILON {
+        viewer.picture.set_size_request(-1, -1);
+        viewer.picture.set_hexpand(true);
+        viewer.picture.set_vexpand(true);
+        return;
+    }
+    let viewport_width = viewer.image_scroller.width().max(1);
+    let viewport_height = viewer.image_scroller.height().max(1);
+    let base_width = viewer.natural_size.0.min(viewport_width).max(1);
+    let base_height = viewer.natural_size.1.min(viewport_height).max(1);
+    viewer.picture.set_hexpand(false);
+    viewer.picture.set_vexpand(false);
+    viewer.picture.set_size_request(
+        (base_width as f64 * viewer.zoom) as i32,
+        (base_height as f64 * viewer.zoom) as i32,
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,6 +609,7 @@ enum RuntimeFailureRecovery {
     SavedItems,
     User(String),
     Image(String),
+    Media,
     PostMessage {
         channel_id: String,
         thread_ts: Option<String>,
@@ -587,6 +663,7 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
         (RuntimeOperation::ImageAsset, RuntimeTarget::Image(key)) => {
             RuntimeFailureRecovery::Image(key.clone())
         }
+        (RuntimeOperation::Media, RuntimeTarget::Media(_)) => RuntimeFailureRecovery::Media,
         (
             RuntimeOperation::PostMessage,
             RuntimeTarget::Message {
@@ -937,8 +1014,11 @@ impl ConduitWindow {
         let network_session = self.create_message_network_session();
 
         let message_view = self.create_message_web_view(&network_session);
-        self.imp().message_view_box.append(&message_view);
+        let viewer = self.create_media_viewer(&message_view);
+        self.imp().message_view_box.append(&viewer.surface_stack);
         *self.imp().message_view.borrow_mut() = Some(message_view);
+        *self.imp().media_viewer.borrow_mut() = Some(viewer);
+        self.setup_media_viewer_callbacks();
 
         let thread_view = self.create_message_web_view(&network_session);
         self.imp().thread_view_box.append(&thread_view);
@@ -949,6 +1029,443 @@ impl ConduitWindow {
             &gettext("Thread"),
             &gettext("No thread open"),
         ));
+    }
+
+    fn create_media_viewer(&self, message_view: &webkit6::WebView) -> MediaViewer {
+        let surface_stack = gtk::Stack::new();
+        surface_stack.set_hexpand(true);
+        surface_stack.set_vexpand(true);
+        surface_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        surface_stack.add_named(message_view, Some("timeline"));
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        root.add_css_class("view");
+        let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        toolbar.set_margin_top(6);
+        toolbar.set_margin_bottom(6);
+        toolbar.set_margin_start(6);
+        toolbar.set_margin_end(6);
+
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.set_tooltip_text(Some("Close media viewer"));
+        let previous_button = gtk::Button::from_icon_name("go-previous-symbolic");
+        previous_button.set_tooltip_text(Some("Previous media"));
+        let next_button = gtk::Button::from_icon_name("go-next-symbolic");
+        next_button.set_tooltip_text(Some("Next media"));
+        let title = gtk::Label::new(None);
+        title.set_hexpand(true);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        title.set_xalign(0.0);
+
+        let zoom_out = gtk::Button::from_icon_name("zoom-out-symbolic");
+        zoom_out.set_tooltip_text(Some("Zoom out"));
+        let zoom_label = gtk::Label::new(Some("100%"));
+        zoom_label.set_width_chars(5);
+        let zoom_in = gtk::Button::from_icon_name("zoom-in-symbolic");
+        zoom_in.set_tooltip_text(Some("Zoom in"));
+        let zoom_reset = gtk::Button::from_icon_name("zoom-original-symbolic");
+        zoom_reset.set_tooltip_text(Some("Reset zoom"));
+        let save = gtk::Button::from_icon_name("document-save-symbolic");
+        save.set_tooltip_text(Some("Save media as"));
+        let fullscreen = gtk::Button::from_icon_name("view-fullscreen-symbolic");
+        fullscreen.set_tooltip_text(Some("Toggle fullscreen"));
+
+        for widget in [
+            close.upcast_ref::<gtk::Widget>(),
+            previous_button.upcast_ref(),
+            next_button.upcast_ref(),
+            title.upcast_ref(),
+            zoom_out.upcast_ref(),
+            zoom_label.upcast_ref(),
+            zoom_in.upcast_ref(),
+            zoom_reset.upcast_ref(),
+            save.upcast_ref(),
+            fullscreen.upcast_ref(),
+        ] {
+            toolbar.append(widget);
+        }
+        root.append(&toolbar);
+
+        let content_stack = gtk::Stack::new();
+        content_stack.set_hexpand(true);
+        content_stack.set_vexpand(true);
+        content_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        let image_scroller = gtk::ScrolledWindow::new();
+        image_scroller.set_hexpand(true);
+        image_scroller.set_vexpand(true);
+        let picture = gtk::Picture::new();
+        picture.set_can_shrink(true);
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
+        image_scroller.set_child(Some(&picture));
+        content_stack.add_named(&image_scroller, Some("image"));
+
+        let loading = gtk::Spinner::new();
+        loading.set_spinning(true);
+        loading.set_halign(gtk::Align::Center);
+        loading.set_valign(gtk::Align::Center);
+        content_stack.add_named(&loading, Some("loading"));
+        root.append(&content_stack);
+        surface_stack.add_named(&root, Some("media"));
+        surface_stack.set_visible_child_name("timeline");
+
+        self.connect_media_viewer_button(&close, |window| window.close_media_viewer());
+        self.connect_media_viewer_button(&previous_button, |window| window.navigate_media(-1));
+        self.connect_media_viewer_button(&next_button, |window| window.navigate_media(1));
+        self.connect_media_viewer_button(&zoom_out, |window| window.adjust_media_zoom(0.8));
+        self.connect_media_viewer_button(&zoom_in, |window| window.adjust_media_zoom(1.25));
+        self.connect_media_viewer_button(&zoom_reset, |window| window.reset_media_zoom());
+        self.connect_media_viewer_button(&save, |window| window.save_current_media());
+        self.connect_media_viewer_button(&fullscreen, |window| window.toggle_media_fullscreen());
+
+        MediaViewer {
+            surface_stack,
+            content_stack,
+            image_scroller,
+            picture,
+            title,
+            zoom_label,
+            zoom_out_button: zoom_out,
+            zoom_in_button: zoom_in,
+            zoom_reset_button: zoom_reset,
+            previous_button,
+            next_button,
+            gallery: Vec::new(),
+            index: 0,
+            zoom: 1.0,
+            natural_size: (0, 0),
+            loaded_path: None,
+        }
+    }
+
+    fn connect_media_viewer_button<F>(&self, button: &gtk::Button, callback: F)
+    where
+        F: Fn(&Self) + 'static,
+    {
+        let weak_window = self.downgrade();
+        button.connect_clicked(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                callback(&window);
+            }
+        });
+    }
+
+    fn setup_media_viewer_callbacks(&self) {
+        let viewer_ref = self.imp().media_viewer.borrow();
+        let Some(viewer) = viewer_ref.as_ref() else {
+            return;
+        };
+
+        let scroll = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
+        );
+        let weak_window = self.downgrade();
+        scroll.connect_scroll(move |_, _, dy| {
+            if let Some(window) = weak_window.upgrade() {
+                window.adjust_media_zoom(if dy < 0.0 { 1.1 } else { 1.0 / 1.1 });
+            }
+            glib::Propagation::Stop
+        });
+        viewer.image_scroller.add_controller(scroll);
+
+        let close_click = gtk::GestureClick::new();
+        close_click.set_button(gtk::gdk::BUTTON_PRIMARY);
+        let weak_window = self.downgrade();
+        close_click.connect_released(move |_, _, _, _| {
+            if let Some(window) = weak_window.upgrade() {
+                window.close_media_viewer();
+            }
+        });
+        viewer.picture.add_controller(close_click);
+
+        let context_click = gtk::GestureClick::new();
+        context_click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        let weak_window = self.downgrade();
+        context_click.connect_pressed(move |_, _, x, y| {
+            if let Some(window) = weak_window.upgrade() {
+                window.show_media_context_menu(x, y);
+            }
+        });
+        viewer.content_stack.add_controller(context_click);
+
+        let swipe = gtk::GestureSwipe::new();
+        let weak_window = self.downgrade();
+        swipe.connect_swipe(move |_, velocity_x, _| {
+            if velocity_x.abs() >= 100.0 {
+                if let Some(window) = weak_window.upgrade() {
+                    window.navigate_media(if velocity_x < 0.0 { 1 } else { -1 });
+                }
+            }
+        });
+        viewer.content_stack.add_controller(swipe);
+
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak_window = self.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let Some(window) = weak_window.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            match key {
+                gtk::gdk::Key::Escape => window.close_media_viewer(),
+                gtk::gdk::Key::Left => window.navigate_media(-1),
+                gtk::gdk::Key::Right => window.navigate_media(1),
+                _ => return glib::Propagation::Proceed,
+            }
+            glib::Propagation::Stop
+        });
+        viewer.surface_stack.add_controller(keys);
+    }
+
+    fn open_media_viewer(&self, item: MediaGalleryItem) {
+        let snapshot = self.current_message_snapshot();
+        let mut gallery = media_gallery_items(&snapshot.channel_messages);
+        if !gallery.iter().any(|candidate| candidate.url == item.url) {
+            gallery.push(item.clone());
+        }
+        let index = gallery
+            .iter()
+            .position(|candidate| candidate.url == item.url)
+            .unwrap_or_default();
+        if let Some(viewer) = self.imp().media_viewer.borrow_mut().as_mut() {
+            viewer.gallery = gallery;
+            viewer.index = index;
+            viewer.surface_stack.set_visible_child_name("media");
+        }
+        self.imp().message_composer.set_visible(false);
+        self.imp().message_status_label.set_visible(false);
+        self.load_current_media();
+    }
+
+    fn load_current_media(&self) {
+        let item = {
+            let mut viewer_ref = self.imp().media_viewer.borrow_mut();
+            let Some(viewer) = viewer_ref.as_mut() else {
+                return;
+            };
+            let Some(item) = viewer.gallery.get(viewer.index).cloned() else {
+                return;
+            };
+            viewer.title.set_label(&item.name);
+            viewer.loaded_path = None;
+            viewer.content_stack.set_visible_child_name("loading");
+            for button in [
+                &viewer.zoom_out_button,
+                &viewer.zoom_in_button,
+                &viewer.zoom_reset_button,
+            ] {
+                button.set_sensitive(false);
+            }
+            viewer.previous_button.set_sensitive(viewer.index > 0);
+            viewer
+                .next_button
+                .set_sensitive(viewer.index + 1 < viewer.gallery.len());
+            item
+        };
+        self.reset_media_zoom();
+        self.set_status("Loading media");
+        self.send_command(RuntimeCommand::LoadMedia {
+            url: item.url,
+            name: item.name,
+        });
+    }
+
+    fn navigate_media(&self, offset: i32) {
+        let changed = {
+            let mut viewer_ref = self.imp().media_viewer.borrow_mut();
+            let Some(viewer) = viewer_ref.as_mut() else {
+                return;
+            };
+            let next = viewer.index as i32 + offset;
+            if next < 0 || next >= viewer.gallery.len() as i32 {
+                false
+            } else {
+                viewer.index = next as usize;
+                true
+            }
+        };
+        if changed {
+            self.load_current_media();
+        }
+    }
+
+    fn adjust_media_zoom(&self, factor: f64) {
+        if let Some(viewer) = self.imp().media_viewer.borrow_mut().as_mut() {
+            if viewer.content_stack.visible_child_name().as_deref() != Some("image") {
+                return;
+            }
+            viewer.zoom = (viewer.zoom * factor).clamp(0.1, 8.0);
+            apply_media_zoom(viewer);
+        }
+    }
+
+    fn reset_media_zoom(&self) {
+        if let Some(viewer) = self.imp().media_viewer.borrow_mut().as_mut() {
+            viewer.zoom = 1.0;
+            apply_media_zoom(viewer);
+        }
+    }
+
+    fn close_media_viewer(&self) {
+        if let Some(viewer) = self.imp().media_viewer.borrow().as_ref() {
+            viewer.surface_stack.set_visible_child_name("timeline");
+        }
+        self.imp().message_status_label.set_visible(true);
+        self.sync_workspace_chrome();
+        if self.is_fullscreen() {
+            self.unfullscreen();
+        }
+    }
+
+    fn toggle_media_fullscreen(&self) {
+        if self.is_fullscreen() {
+            self.unfullscreen();
+        } else {
+            self.fullscreen();
+        }
+    }
+
+    fn show_media_context_menu(&self, x: f64, y: f64) {
+        let viewer_ref = self.imp().media_viewer.borrow();
+        let Some(viewer) = viewer_ref.as_ref() else {
+            return;
+        };
+        if viewer.loaded_path.is_none() {
+            return;
+        }
+        let popover = gtk::Popover::new();
+        popover.set_parent(&viewer.content_stack);
+        popover.set_has_arrow(true);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        menu.set_margin_top(6);
+        menu.set_margin_bottom(6);
+        menu.set_margin_start(6);
+        menu.set_margin_end(6);
+        let save = gtk::Button::with_label("Save As…");
+        save.add_css_class("flat");
+        let weak_window = self.downgrade();
+        let popover_for_save = popover.clone();
+        save.connect_clicked(move |_| {
+            popover_for_save.popdown();
+            if let Some(window) = weak_window.upgrade() {
+                window.save_current_media();
+            }
+        });
+        menu.append(&save);
+        popover.set_child(Some(&menu));
+        popover.popup();
+    }
+
+    fn save_current_media(&self) {
+        let (source, name) = {
+            let viewer_ref = self.imp().media_viewer.borrow();
+            let Some(viewer) = viewer_ref.as_ref() else {
+                return;
+            };
+            let Some(source) = viewer.loaded_path.clone() else {
+                self.set_status("Media is still loading");
+                return;
+            };
+            let name = viewer
+                .gallery
+                .get(viewer.index)
+                .map(|item| item.name.clone())
+                .unwrap_or_else(|| "media".to_string());
+            let name = PathBuf::from(name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("media")
+                .to_string();
+            (source, name)
+        };
+        let dialog = gtk::FileDialog::builder()
+            .title("Save Media As")
+            .initial_name(&name)
+            .accept_label("Save")
+            .modal(true)
+            .build();
+        let weak_window = self.downgrade();
+        dialog.save(Some(self), None::<&gio::Cancellable>, move |result| {
+            let Ok(destination) = result else {
+                return;
+            };
+            if let Some(window) = weak_window.upgrade() {
+                let source = gio::File::for_path(&source);
+                let weak_window = window.downgrade();
+                source.copy_async(
+                    &destination,
+                    gio::FileCopyFlags::OVERWRITE,
+                    glib::Priority::DEFAULT,
+                    None::<&gio::Cancellable>,
+                    None,
+                    move |result| {
+                        if let Some(window) = weak_window.upgrade() {
+                            match result {
+                                Ok(()) => window.set_status("Media saved"),
+                                Err(error) => {
+                                    window.set_status(&format!("Could not save media: {error}"))
+                                }
+                            }
+                        }
+                    },
+                );
+            }
+        });
+    }
+
+    fn present_loaded_media(&self, path: PathBuf, mime_type: &str) {
+        let mut viewer_ref = self.imp().media_viewer.borrow_mut();
+        let Some(viewer) = viewer_ref.as_mut() else {
+            return;
+        };
+        viewer.loaded_path = Some(path.clone());
+        if mime_type.starts_with("image/") {
+            match gtk::gdk::Texture::from_filename(&path) {
+                Ok(texture) => {
+                    viewer.natural_size = (texture.width(), texture.height());
+                    viewer.picture.set_paintable(Some(&texture));
+                    viewer.content_stack.set_visible_child_name("image");
+                    for button in [
+                        &viewer.zoom_out_button,
+                        &viewer.zoom_in_button,
+                        &viewer.zoom_reset_button,
+                    ] {
+                        button.set_sensitive(true);
+                    }
+                    apply_media_zoom(viewer);
+                    self.set_status("Image loaded");
+                }
+                Err(error) => self.set_status(&format!("Could not display image: {error}")),
+            }
+            return;
+        }
+
+        if let Some(existing) = viewer.content_stack.child_by_name("video") {
+            viewer.content_stack.remove(&existing);
+        }
+        let file = gio::File::for_path(&path);
+        let video = gtk::Video::for_file(Some(&file));
+        video.set_autoplay(true);
+        video.set_loop(false);
+        video.set_hexpand(true);
+        video.set_vexpand(true);
+        let close_click = gtk::GestureClick::new();
+        close_click.set_button(gtk::gdk::BUTTON_PRIMARY);
+        let weak_window = self.downgrade();
+        close_click.connect_released(move |_, presses, _, _| {
+            if presses >= 2 {
+                if let Some(window) = weak_window.upgrade() {
+                    window.close_media_viewer();
+                }
+            }
+        });
+        video.add_controller(close_click);
+        viewer.content_stack.add_named(&video, Some("video"));
+        viewer.content_stack.set_visible_child_name("video");
+        viewer.zoom_label.set_label("—");
+        self.set_status("Video loaded");
     }
 
     fn create_message_network_session(&self) -> webkit6::NetworkSession {
@@ -1656,6 +2173,23 @@ impl ConduitWindow {
                 );
                 self.mark_image_asset_failed(&key);
             }
+            RuntimeEventKind::MediaLoaded {
+                url,
+                name: _,
+                path,
+                mime_type,
+            } => {
+                let is_current = self
+                    .imp()
+                    .media_viewer
+                    .borrow()
+                    .as_ref()
+                    .and_then(|viewer| viewer.gallery.get(viewer.index))
+                    .is_some_and(|item| item.url == url);
+                if is_current {
+                    self.present_loaded_media(path, &mime_type);
+                }
+            }
             RuntimeEventKind::MessagePosted {
                 channel_id,
                 message,
@@ -2268,6 +2802,27 @@ impl ConduitWindow {
                 self.forward_message(&channel_id, &ts);
                 true
             }
+            Some("media") => {
+                let Some(media_url) = query_param(url, "url").filter(|url| {
+                    url::Url::parse(url)
+                        .ok()
+                        .is_some_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+                }) else {
+                    return true;
+                };
+                let name = query_param(url, "name").unwrap_or_else(|| "Media".to_string());
+                let kind = match query_param(url, "kind").as_deref() {
+                    Some("image") => MediaKind::Image,
+                    Some("video") => MediaKind::Video,
+                    _ => return true,
+                };
+                self.open_media_viewer(MediaGalleryItem {
+                    url: media_url,
+                    name,
+                    kind,
+                });
+                true
+            }
             _ => true,
         }
     }
@@ -2420,6 +2975,7 @@ impl ConduitWindow {
 
     fn reset_workspace_state(&self) {
         self.flush_current_drafts();
+        self.close_media_viewer();
         let imp = self.imp();
         imp.workspace_view.borrow_mut().reset();
         *imp.current_user_id.borrow_mut() = None;
@@ -2581,6 +3137,10 @@ impl ConduitWindow {
                 );
             }
             RuntimeFailureRecovery::Image(key) => self.mark_image_asset_failed(&key),
+            RuntimeFailureRecovery::Media => {
+                self.set_status(error);
+                self.close_media_viewer();
+            }
             RuntimeFailureRecovery::PostMessage {
                 channel_id,
                 thread_ts,

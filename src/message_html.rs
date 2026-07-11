@@ -1574,7 +1574,7 @@ fn message_article(
         message_body_html(message, context)
     );
 
-    article.push_str(&attachments_html(message, context));
+    article.push_str(&attachments_html(channel_id, message, context));
     article.push_str(&message_responses_html(channel_id, message, context));
     article.push_str(&message_actions_html(channel_id, message, context));
     article.push_str("</article>");
@@ -1660,7 +1660,7 @@ fn message_part_html(
         message_body_html(message, context)
     );
 
-    part.push_str(&attachments_html(message, context));
+    part.push_str(&attachments_html(channel_id, message, context));
     part.push_str(&message_responses_html(channel_id, message, context));
     part.push_str(&message_actions_html(channel_id, message, context));
     part.push_str("</div>");
@@ -2013,7 +2013,11 @@ fn text_block_html(text: &str, class_name: Option<&str>, context: &MessageHtmlCo
     }
 }
 
-fn attachments_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
+fn attachments_html(
+    channel_id: Option<&str>,
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+) -> String {
     let Some(files) = message.files.as_ref().filter(|files| !files.is_empty()) else {
         return String::new();
     };
@@ -2022,16 +2026,21 @@ fn attachments_html(message: &SlackMessage, context: &MessageHtmlContext) -> Str
         .iter()
         .map(|file| {
             let label = file.display_title();
-            if file.is_image() {
-                if let Some(url) = file.preview_url() {
+            if let (Some(channel_id), Some(kind), Some(url)) =
+                (channel_id, file.supported_media_kind(), file.media_url())
+            {
+                let viewer_url = media_action_url(channel_id, &message.ts, url, label, kind);
+                if kind == "image" {
+                    let preview_url = file.preview_url().unwrap_or(url);
                     return image_figure_html(
-                        url,
-                        file.permalink.as_deref().or(file.url_private.as_deref()),
+                        preview_url,
+                        Some(&viewer_url),
                         label,
                         Some(label),
                         context,
                     );
                 }
+                return attachment_chip_html(label, Some(&viewer_url));
             }
 
             attachment_chip_html(
@@ -2044,9 +2053,22 @@ fn attachments_html(message: &SlackMessage, context: &MessageHtmlContext) -> Str
     format!("<div class=\"attachments\">{attachments}</div>")
 }
 
+pub fn media_action_url(channel_id: &str, ts: &str, url: &str, name: &str, kind: &str) -> String {
+    format!(
+        "conduit://media?channel={}&ts={}&url={}&name={}&kind={}",
+        encode_query(channel_id),
+        encode_query(ts),
+        encode_query(url),
+        encode_query(name),
+        encode_query(kind),
+    )
+}
+
 fn attachment_chip_html(label: &str, link: Option<&str>) -> String {
     let label = escape_html(&gettext("Attachment: {name}").replace("{name}", label));
-    if let Some(link) = link.filter(|link| is_http_url(link)) {
+    if let Some(link) =
+        link.filter(|link| is_http_url(link) || link.starts_with("conduit://media?"))
+    {
         format!(
             "<a class=\"attachment\" href=\"{}\" rel=\"noreferrer noopener\">{label}</a>",
             escape_html(link)
@@ -2125,7 +2147,9 @@ fn image_figure_html(
         .unwrap_or_default();
 
     let figure = format!("<figure class=\"image-attachment\">{image}{caption}</figure>");
-    if let Some(link) = link.filter(|link| is_http_url(link)) {
+    if let Some(link) =
+        link.filter(|link| is_http_url(link) || link.starts_with("conduit://media?"))
+    {
         format!(
             "<a class=\"image-link\" href=\"{}\" rel=\"noreferrer noopener\">{figure}</a>",
             escape_html(link)
@@ -3348,6 +3372,33 @@ mod tests {
         assert!(html.contains("loading=\"lazy\""));
         assert!(html.contains("src=\"data:image/png;base64,abc\""));
         assert!(html.contains("Diagram"));
+    }
+
+    #[test]
+    fn image_attachment_opens_original_media_in_internal_viewer() {
+        let preview = "https://files.slack.com/preview.png";
+        let original = "https://files.slack.com/original.png";
+        let mut message = message("image");
+        message.files = Some(vec![SlackFile {
+            title: Some("Diagram".to_string()),
+            mimetype: Some("image/png".to_string()),
+            url_private_download: Some(original.to_string()),
+            thumb_480: Some(preview.to_string()),
+            ..Default::default()
+        }]);
+
+        let context = MessageHtmlContext {
+            image_assets: HashMap::from([(
+                preview.to_string(),
+                "data:image/png;base64,x".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let html = conversation_document("C123", &[message], &context);
+
+        assert!(html.contains("conduit://media?"));
+        assert!(html.contains("url=https%3A%2F%2Ffiles.slack.com%2Foriginal.png"));
+        assert!(html.contains("src=\"data:image/png;base64,x\""));
     }
 
     #[test]
