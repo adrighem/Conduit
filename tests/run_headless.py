@@ -39,6 +39,11 @@ def run_test() -> int:
         ).stdout.splitlines()
         environment = os.environ.copy()
         environment["DBUS_SESSION_BUS_ADDRESS"] = output[0]
+        # Headless/containerized test environments commonly disallow the user
+        # namespaces required by WebKit's Bubblewrap sandbox. This process is
+        # already isolated to a disposable X display and D-Bus session, so
+        # disable that nested sandbox only for the UI test and its children.
+        environment["WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"] = "1"
         window_manager = subprocess.Popen(
             ["xfwm4", "--replace"],
             env=environment,
