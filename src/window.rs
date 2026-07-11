@@ -204,8 +204,21 @@ mod imp {
             obj.configure_auth_ui();
             obj.setup_settings();
             obj.setup_callbacks();
-            obj.show_loading("Checking secure storage");
-            obj.send_session_command(RuntimeCommand::LoadStoredToken);
+            if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
+                obj.show_workspace(AuthInfo {
+                    team: Some("Test Workspace".to_string()),
+                    ..AuthInfo::default()
+                });
+                obj.populate_conversations(vec![SlackConversation {
+                    id: "C_TEST".to_string(),
+                    name: Some("general".to_string()),
+                    is_channel: Some(true),
+                    ..SlackConversation::default()
+                }]);
+            } else {
+                obj.show_loading("Checking secure storage");
+                obj.send_session_command(RuntimeCommand::LoadStoredToken);
+            }
         }
     }
 
@@ -1265,6 +1278,18 @@ impl ConduitWindow {
         self.add_window_action("focus-composer", |window| window.focus_composer());
         self.add_window_action("upload-file", |window| window.choose_file_for_upload());
         self.add_window_action("close-thread", |window| window.close_thread());
+
+        let shortcut_controller = gtk::ShortcutController::new();
+        shortcut_controller.set_scope(gtk::ShortcutScope::Global);
+        for shortcut in WINDOW_SHORTCUTS {
+            for accelerator in shortcut.accelerators {
+                let trigger = gtk::ShortcutTrigger::parse_string(accelerator)
+                    .expect("window shortcut accelerator should be valid");
+                let action = gtk::NamedAction::new(shortcut.action);
+                shortcut_controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+            }
+        }
+        self.add_controller(shortcut_controller);
 
         if let Some(application) = self.application() {
             for shortcut in WINDOW_SHORTCUTS {
@@ -2808,6 +2833,9 @@ impl ConduitWindow {
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
         let items = sidebar::conversation_switcher_items(&conversations, &user_names, "");
+        if let Some(path) = std::env::var_os("CONDUIT_TEST_EVENT_LOG") {
+            let _ = std::fs::write(path, "conversation-switcher-opened\n");
+        }
         if items.is_empty() {
             self.set_status("No conversations loaded");
             return;

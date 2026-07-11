@@ -31,7 +31,10 @@ jobs:
             libwebkitgtk-6.0-dev \
             meson \
             ninja-build \
-            pkg-config
+            pkg-config \
+            xdotool \
+            xfwm4 \
+            xvfb
 
       - name: Format
         run: cargo fmt --check
