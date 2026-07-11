@@ -595,6 +595,8 @@ pub struct SlackUser {
     pub id: Option<String>,
     pub name: Option<String>,
     pub real_name: Option<String>,
+    pub deleted: Option<bool>,
+    pub is_bot: Option<bool>,
     pub profile: Option<SlackUserProfile>,
 }
 

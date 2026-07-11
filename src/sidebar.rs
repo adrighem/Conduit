@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
-use crate::models::SlackConversation;
+use crate::models::{SlackConversation, SlackUser};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +67,26 @@ pub struct SidebarRowModel {
     pub private: bool,
     pub muted: bool,
     pub external: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationPickerAction {
+    OpenConversation,
+    JoinChannel,
+    OpenDirectMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPickerItem {
+    pub row: SidebarRowModel,
+    pub action: ConversationPickerAction,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationPickerSections {
+    pub conversations: Vec<ConversationPickerItem>,
+    pub channels: Vec<ConversationPickerItem>,
+    pub people: Vec<ConversationPickerItem>,
 }
 
 impl SidebarRowModel {
@@ -254,6 +274,95 @@ pub fn conversation_switcher_items(
 
     sort_rows_by_title(&mut items);
     items
+}
+
+pub fn conversation_picker_sections(
+    conversations: &[SlackConversation],
+    discovered_channels: &[SlackConversation],
+    discovered_users: &[SlackUser],
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    query: &str,
+) -> ConversationPickerSections {
+    let normalized_query = query.trim().to_lowercase();
+    let conversation_ids = conversations
+        .iter()
+        .map(|conversation| conversation.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let direct_message_users = conversations
+        .iter()
+        .filter(|conversation| conversation.is_im.unwrap_or(false))
+        .filter_map(|conversation| conversation.user.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+
+    let conversations = conversation_switcher_items(conversations, user_names, query)
+        .into_iter()
+        .map(|row| ConversationPickerItem {
+            row,
+            action: ConversationPickerAction::OpenConversation,
+        })
+        .collect();
+
+    let mut channels = discovered_channels
+        .iter()
+        .filter(|channel| !conversation_ids.contains(channel.id.as_str()))
+        .map(|channel| SidebarRowModel::from_conversation(channel, user_names, None))
+        .filter(|row| row.matches_query(&normalized_query))
+        .map(|row| ConversationPickerItem {
+            row,
+            action: ConversationPickerAction::JoinChannel,
+        })
+        .collect::<Vec<_>>();
+    sort_picker_items(&mut channels);
+
+    let mut people = discovered_users
+        .iter()
+        .filter_map(|user| {
+            let id = user.id.as_deref()?.trim();
+            if id.is_empty()
+                || Some(id) == current_user_id
+                || direct_message_users.contains(id)
+                || user.deleted.unwrap_or(false)
+                || user.is_bot.unwrap_or(false)
+            {
+                return None;
+            }
+            let title = user.display_name()?;
+            let row = SidebarRowModel {
+                id: id.to_string(),
+                title,
+                kind: ConversationKind::DirectMessage,
+                unread: false,
+                unread_count: 0,
+                selected: false,
+                private: true,
+                muted: false,
+                external: false,
+            };
+            row.matches_query(&normalized_query)
+                .then_some(ConversationPickerItem {
+                    row,
+                    action: ConversationPickerAction::OpenDirectMessage,
+                })
+        })
+        .collect::<Vec<_>>();
+    sort_picker_items(&mut people);
+
+    ConversationPickerSections {
+        conversations,
+        channels,
+        people,
+    }
+}
+
+fn sort_picker_items(items: &mut [ConversationPickerItem]) {
+    items.sort_by(|left, right| {
+        left.row
+            .title
+            .to_lowercase()
+            .cmp(&right.row.title.to_lowercase())
+            .then_with(|| left.row.id.cmp(&right.row.id))
+    });
 }
 
 fn build_sidebar_sections_from_rows(
@@ -1000,5 +1109,77 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Ada Lovelace, Grace Hopper");
+    }
+
+    #[test]
+    fn conversation_picker_lists_new_channels_and_people_after_existing_conversations() {
+        let general = channel("C1", "general");
+        let existing_dm = SlackConversation {
+            id: "D1".to_string(),
+            user: Some("U1".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        let discovered_channels = vec![general.clone(), channel("C2", "random")];
+        let users = vec![
+            SlackUser {
+                id: Some("U1".to_string()),
+                real_name: Some("Ada Lovelace".to_string()),
+                ..Default::default()
+            },
+            SlackUser {
+                id: Some("U2".to_string()),
+                real_name: Some("Grace Hopper".to_string()),
+                ..Default::default()
+            },
+            SlackUser {
+                id: Some("U_SELF".to_string()),
+                real_name: Some("Current User".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let sections = conversation_picker_sections(
+            &[general, existing_dm],
+            &discovered_channels,
+            &users,
+            &HashMap::from([("U1".to_string(), "Ada Lovelace".to_string())]),
+            Some("U_SELF"),
+            "",
+        );
+
+        assert_eq!(sections.conversations.len(), 2);
+        assert_eq!(sections.channels.len(), 1);
+        assert_eq!(sections.channels[0].row.title, "#random");
+        assert_eq!(
+            sections.channels[0].action,
+            ConversationPickerAction::JoinChannel
+        );
+        assert_eq!(sections.people.len(), 1);
+        assert_eq!(sections.people[0].row.title, "Grace Hopper");
+        assert_eq!(
+            sections.people[0].action,
+            ConversationPickerAction::OpenDirectMessage
+        );
+    }
+
+    #[test]
+    fn conversation_picker_searches_across_all_sections() {
+        let sections = conversation_picker_sections(
+            &[channel("C1", "general")],
+            &[channel("C2", "project-rainbow")],
+            &[SlackUser {
+                id: Some("U2".to_string()),
+                real_name: Some("Rainbow Dash".to_string()),
+                ..Default::default()
+            }],
+            &HashMap::new(),
+            None,
+            "rainbow",
+        );
+
+        assert!(sections.conversations.is_empty());
+        assert_eq!(sections.channels[0].row.id, "C2");
+        assert_eq!(sections.people[0].row.id, "U2");
     }
 }

@@ -40,7 +40,7 @@ use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::message_html::{self, MessageHtmlContext, TimelineScrollBehavior};
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUnreadState,
+    SlackMessage, SlackUnreadState, SlackUser,
 };
 use crate::rendering;
 use crate::runtime::{
@@ -48,7 +48,10 @@ use crate::runtime::{
     RuntimeEventMeta, RuntimeIdentity, RuntimeOperation, RuntimeTarget, SessionId,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
-use crate::sidebar::{self, SidebarRowModel, SidebarSectionModel};
+use crate::sidebar::{
+    self, ConversationPickerAction, ConversationPickerItem, ConversationPickerSections,
+    SidebarRowModel, SidebarSectionModel,
+};
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::socket_mode::{
     SocketModeEvent, SocketModeMessageEvent, SocketModeMessageKind, SocketModeReactionEvent,
@@ -152,6 +155,8 @@ mod imp {
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
         pub conversations: RefCell<Vec<SlackConversation>>,
+        pub discovered_channels: RefCell<Vec<SlackConversation>>,
+        pub discovered_users: RefCell<Vec<SlackUser>>,
         pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
         pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<HashMap<String, String>>,
@@ -238,6 +243,7 @@ glib::wrapper! {
 struct SidebarRowAction {
     channel_id: String,
     title: String,
+    action: ConversationPickerAction,
 }
 
 impl SidebarRowAction {
@@ -245,6 +251,15 @@ impl SidebarRowAction {
         Self {
             channel_id: model.id.clone(),
             title: model.title.clone(),
+            action: ConversationPickerAction::OpenConversation,
+        }
+    }
+
+    fn from_picker_item(item: &ConversationPickerItem) -> Self {
+        Self {
+            channel_id: item.row.id.clone(),
+            title: item.row.title.clone(),
+            action: item.action,
         }
     }
 }
@@ -254,6 +269,39 @@ fn sidebar_row_action_for_index(
     row_index: i32,
 ) -> Option<SidebarRowAction> {
     actions.get(&row_index).cloned()
+}
+
+fn picker_sections(
+    include_discovery: bool,
+    conversations: &[SlackConversation],
+    discovered_channels: &[SlackConversation],
+    discovered_users: &[SlackUser],
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    query: &str,
+) -> ConversationPickerSections {
+    let channels = if include_discovery {
+        discovered_channels
+    } else {
+        &[]
+    };
+    let users = if include_discovery {
+        discovered_users
+    } else {
+        &[]
+    };
+    sidebar::conversation_picker_sections(
+        conversations,
+        channels,
+        users,
+        user_names,
+        current_user_id,
+        query,
+    )
+}
+
+fn picker_sections_empty(sections: &ConversationPickerSections) -> bool {
+    sections.conversations.is_empty() && sections.channels.is_empty() && sections.people.is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1398,6 +1446,7 @@ impl ConduitWindow {
             RuntimeEventKind::Authenticated(auth) => {
                 if !self.imp().connect_requested.get() {
                     self.show_workspace(auth);
+                    self.send_command(RuntimeCommand::DiscoverConversations);
                 }
             }
             RuntimeEventKind::ConversationsLoaded(conversations) => {
@@ -1410,6 +1459,30 @@ impl ConduitWindow {
                 if !self.imp().connect_requested.get() {
                     self.show_conversation_load_error(&error);
                 }
+            }
+            RuntimeEventKind::ConversationCandidatesLoaded { channels, users } => {
+                let names = users
+                    .iter()
+                    .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
+                    .collect::<HashMap<_, _>>();
+                self.populate_user_names(names);
+                *self.imp().discovered_channels.borrow_mut() = channels;
+                *self.imp().discovered_users.borrow_mut() = users;
+            }
+            RuntimeEventKind::ConversationOpened(conversation) => {
+                let channel_id = conversation.id.clone();
+                let title = conversation.display_name_with_users(&self.imp().user_names.borrow());
+                let mut conversations = self.imp().conversations.borrow().clone();
+                if let Some(existing) = conversations
+                    .iter_mut()
+                    .find(|existing| existing.id == channel_id)
+                {
+                    *existing = conversation;
+                } else {
+                    conversations.push(conversation);
+                }
+                self.populate_conversations(conversations);
+                self.select_conversation(&channel_id, &title);
             }
             RuntimeEventKind::ConversationUnreadUpdated {
                 channel_id,
@@ -2245,6 +2318,7 @@ impl ConduitWindow {
         self.show_conversation_picker(
             "Forward message",
             "Choose a conversation",
+            false,
             move |window, action| {
                 window.send_command(RuntimeCommand::PostMessage {
                     channel_id: action.channel_id,
@@ -2355,6 +2429,8 @@ impl ConduitWindow {
         imp.pending_sent_drafts.borrow_mut().clear();
         imp.pending_upload_drafts.borrow_mut().clear();
         imp.conversations.borrow_mut().clear();
+        imp.discovered_channels.borrow_mut().clear();
+        imp.discovered_users.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
         imp.user_group_names.borrow_mut().clear();
@@ -2885,19 +2961,50 @@ impl ConduitWindow {
         self.show_conversation_picker(
             "Switch conversation",
             "Search conversations",
-            |window, action| window.select_conversation(&action.channel_id, &action.title),
+            true,
+            |window, action| match action.action {
+                ConversationPickerAction::OpenConversation => {
+                    window.select_conversation(&action.channel_id, &action.title)
+                }
+                ConversationPickerAction::JoinChannel => {
+                    window.send_command(RuntimeCommand::JoinConversation {
+                        channel_id: action.channel_id,
+                    });
+                }
+                ConversationPickerAction::OpenDirectMessage => {
+                    window.send_command(RuntimeCommand::OpenDirectMessage {
+                        user_id: action.channel_id,
+                    });
+                }
+            },
         );
     }
 
-    fn show_conversation_picker<F>(&self, title: &str, placeholder: &str, on_activate: F)
-    where
+    fn show_conversation_picker<F>(
+        &self,
+        title: &str,
+        placeholder: &str,
+        include_discovery: bool,
+        on_activate: F,
+    ) where
         F: Fn(&Self, SidebarRowAction) + 'static,
     {
         let imp = self.imp();
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
-        let items = sidebar::conversation_switcher_items(&conversations, &user_names, "");
-        if items.is_empty() {
+        let discovered_channels = imp.discovered_channels.borrow().clone();
+        let discovered_users = imp.discovered_users.borrow().clone();
+        let current_user_id = imp.current_user_id.borrow().clone();
+        let sections = picker_sections(
+            include_discovery,
+            &conversations,
+            &discovered_channels,
+            &discovered_users,
+            &user_names,
+            current_user_id.as_deref(),
+            "",
+        );
+        if picker_sections_empty(&sections) {
             self.set_status("No conversations loaded");
             return;
         }
@@ -2946,24 +3053,31 @@ impl ConduitWindow {
 
         let actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        self.populate_conversation_switcher_list(&list, &actions, &items);
+        self.populate_conversation_picker_list(&list, &actions, &sections);
 
         let weak_window = self.downgrade();
         let list_for_search = list.clone();
         let actions_for_search = actions.clone();
         let conversations_for_search = conversations.clone();
         let user_names_for_search = user_names.clone();
+        let discovered_channels_for_search = discovered_channels.clone();
+        let discovered_users_for_search = discovered_users.clone();
+        let current_user_id_for_search = current_user_id.clone();
         search.connect_search_changed(move |entry| {
             if let Some(window) = weak_window.upgrade() {
-                let items = sidebar::conversation_switcher_items(
+                let sections = picker_sections(
+                    include_discovery,
                     &conversations_for_search,
+                    &discovered_channels_for_search,
+                    &discovered_users_for_search,
                     &user_names_for_search,
+                    current_user_id_for_search.as_deref(),
                     entry.text().as_str(),
                 );
-                window.populate_conversation_switcher_list(
+                window.populate_conversation_picker_list(
                     &list_for_search,
                     &actions_for_search,
-                    &items,
+                    &sections,
                 );
             }
         });
@@ -2984,36 +3098,62 @@ impl ConduitWindow {
         search.grab_focus();
     }
 
-    fn populate_conversation_switcher_list(
+    fn populate_conversation_picker_list(
         &self,
         list: &gtk::ListBox,
         actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
-        items: &[SidebarRowModel],
+        sections: &ConversationPickerSections,
     ) {
         self.clear_list(list);
         actions.borrow_mut().clear();
 
-        if items.is_empty() {
+        if picker_sections_empty(sections) {
             self.append_placeholder(list, "No matching conversations");
             return;
         }
 
-        for item in items {
-            self.append_conversation_switcher_row(list, actions, item);
+        for (title, items) in [
+            ("Conversations", sections.conversations.as_slice()),
+            ("Channels", sections.channels.as_slice()),
+            ("People", sections.people.as_slice()),
+        ] {
+            if items.is_empty() {
+                continue;
+            }
+            self.append_picker_section_header(list, title);
+            for item in items {
+                self.append_conversation_picker_row(list, actions, item);
+            }
         }
     }
 
-    fn append_conversation_switcher_row(
+    fn append_picker_section_header(&self, list: &gtk::ListBox, title: &str) {
+        let row = gtk::ListBoxRow::new();
+        row.set_selectable(false);
+        row.set_activatable(false);
+        let label = gtk::Label::new(Some(title));
+        label.set_xalign(0.0);
+        label.set_margin_top(10);
+        label.set_margin_bottom(4);
+        label.set_margin_start(9);
+        label.set_margin_end(9);
+        label.add_css_class("caption");
+        label.add_css_class("heading");
+        row.set_child(Some(&label));
+        list.append(&row);
+    }
+
+    fn append_conversation_picker_row(
         &self,
         list: &gtk::ListBox,
         actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
-        model: &SidebarRowModel,
+        item: &ConversationPickerItem,
     ) {
-        let row = sidebar_row_widget(model, SidebarRowLayout::switcher());
+        let row = sidebar_row_widget(&item.row, SidebarRowLayout::switcher());
         list.append(&row);
         actions
             .borrow_mut()
-            .insert(row.index(), SidebarRowAction::from_model(model));
+            .insert(row.index(), SidebarRowAction::from_picker_item(item));
     }
 
     fn refresh_current_conversation_title(&self) {
@@ -4064,6 +4204,7 @@ mod tests {
             SidebarRowAction {
                 channel_id: "D123".to_string(),
                 title: "Mohamed Moulay".to_string(),
+                action: ConversationPickerAction::OpenConversation,
             }
         );
     }
@@ -4073,6 +4214,7 @@ mod tests {
         let action = SidebarRowAction {
             channel_id: "C123".to_string(),
             title: "#general".to_string(),
+            action: ConversationPickerAction::OpenConversation,
         };
         let mut actions = HashMap::new();
         actions.insert(4, action.clone());

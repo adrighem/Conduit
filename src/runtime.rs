@@ -19,7 +19,7 @@ use crate::auth::{
 use crate::config;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUnreadState, SlackUserGroup, StoredToken,
+    SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, StoredToken,
 };
 use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent};
@@ -50,6 +50,13 @@ pub enum RuntimeCommand {
     SignOut,
     Disconnect,
     RefreshConversations,
+    DiscoverConversations,
+    JoinConversation {
+        channel_id: String,
+    },
+    OpenDirectMessage {
+        user_id: String,
+    },
     LoadHistory {
         channel_id: String,
     },
@@ -135,6 +142,8 @@ pub enum RuntimeOperation {
     SignOut,
     Disconnect,
     Conversations,
+    ConversationDiscovery,
+    OpenConversation,
     History,
     OlderHistory,
     Thread,
@@ -227,6 +236,18 @@ impl RuntimeCommand {
             Self::RefreshConversations => {
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
             }
+            Self::DiscoverConversations => OperationContext::new(
+                RuntimeOperation::ConversationDiscovery,
+                RuntimeTarget::Workspace,
+            ),
+            Self::JoinConversation { channel_id } => OperationContext::new(
+                RuntimeOperation::OpenConversation,
+                RuntimeTarget::Channel(channel_id.clone()),
+            ),
+            Self::OpenDirectMessage { user_id } => OperationContext::new(
+                RuntimeOperation::OpenConversation,
+                RuntimeTarget::User(user_id.clone()),
+            ),
             Self::LoadHistory { channel_id } => OperationContext::new(
                 RuntimeOperation::History,
                 RuntimeTarget::Channel(channel_id.clone()),
@@ -336,6 +357,11 @@ pub enum RuntimeEventKind {
     Authenticated(AuthInfo),
     ConversationsLoaded(Vec<SlackConversation>),
     ConversationsLoadFailed(String),
+    ConversationCandidatesLoaded {
+        channels: Vec<SlackConversation>,
+        users: Vec<SlackUser>,
+    },
+    ConversationOpened(SlackConversation),
     ConversationUnreadUpdated {
         channel_id: String,
         unread_state: SlackUnreadState,
@@ -419,6 +445,14 @@ impl RuntimeEventKind {
             | Self::ConversationNotificationCandidate { .. } => {
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
             }
+            Self::ConversationCandidatesLoaded { .. } => OperationContext::new(
+                RuntimeOperation::ConversationDiscovery,
+                RuntimeTarget::Workspace,
+            ),
+            Self::ConversationOpened(conversation) => OperationContext::new(
+                RuntimeOperation::OpenConversation,
+                RuntimeTarget::Channel(conversation.id.clone()),
+            ),
             Self::HistoryLoaded {
                 channel_id,
                 append_older,
@@ -1101,9 +1135,9 @@ fn dispatch_command(
                 match &command {
                     RuntimeCommand::LoadImageAsset { .. } => RuntimeTaskLane::Image,
                     RuntimeCommand::UploadFile { .. } => RuntimeTaskLane::Upload,
-                    RuntimeCommand::RefreshConversations | RuntimeCommand::LoadUser { .. } => {
-                        RuntimeTaskLane::Background
-                    }
+                    RuntimeCommand::RefreshConversations
+                    | RuntimeCommand::DiscoverConversations
+                    | RuntimeCommand::LoadUser { .. } => RuntimeTaskLane::Background,
                     _ => RuntimeTaskLane::Interactive,
                 }
             };
@@ -1515,6 +1549,32 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 cached_user_names,
             )
             .await?;
+        }
+        RuntimeCommand::DiscoverConversations => {
+            let api = require_slack(context.slack)?;
+            let channels = api.discover_conversations().await?;
+            let users = api.users().await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationCandidatesLoaded { channels, users });
+        }
+        RuntimeCommand::JoinConversation { channel_id } => {
+            let api = require_slack(context.slack)?;
+            context.events.send_status("Joining conversation");
+            let conversation = api.join_conversation(&channel_id).await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationOpened(conversation));
+        }
+        RuntimeCommand::OpenDirectMessage { user_id } => {
+            let api = require_slack(context.slack)?;
+            context.events.send_status("Opening direct message");
+            let mut conversation = api.open_direct_message(&user_id).await?;
+            conversation.user = Some(user_id);
+            conversation.is_im = Some(true);
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationOpened(conversation));
         }
         RuntimeCommand::LoadHistory { channel_id } => {
             let api = require_slack(context.slack)?;
@@ -2976,6 +3036,23 @@ mod tests {
                     channel_id: "C123".to_string(),
                     thread_ts: "1710000000.000001".to_string(),
                 },
+            )
+        );
+        assert_eq!(
+            RuntimeCommand::DiscoverConversations.operation_context(),
+            OperationContext::new(
+                RuntimeOperation::ConversationDiscovery,
+                RuntimeTarget::Workspace,
+            )
+        );
+        assert_eq!(
+            RuntimeCommand::OpenDirectMessage {
+                user_id: "U123".to_string(),
+            }
+            .operation_context(),
+            OperationContext::new(
+                RuntimeOperation::OpenConversation,
+                RuntimeTarget::User("U123".to_string()),
             )
         );
 

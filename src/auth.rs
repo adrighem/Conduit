@@ -21,6 +21,7 @@ pub const DEFAULT_REDIRECT_PORT: u16 = 8934;
 pub const DEFAULT_USER_SCOPES: &[&str] = &[
     "channels:read",
     "channels:history",
+    "channels:join",
     "channels:write",
     "groups:read",
     "groups:history",
@@ -537,8 +538,11 @@ mod tests {
     }
 
     #[test]
-    fn default_user_scopes_include_user_group_read() {
+    fn default_user_scopes_include_discovery_and_user_group_access() {
         assert!(DEFAULT_USER_SCOPES.contains(&"usergroups:read"));
+        assert!(DEFAULT_USER_SCOPES.contains(&"channels:join"));
+        assert!(DEFAULT_USER_SCOPES.contains(&"users:read"));
+        assert!(DEFAULT_USER_SCOPES.contains(&"im:write"));
     }
 
     #[test]

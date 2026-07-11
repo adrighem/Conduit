@@ -26,6 +26,7 @@ const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
 const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROPERTIES";
 const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
 const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
+const USERS_LIST_METHOD: &str = "users.list";
 const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
 
 #[derive(Clone)]
@@ -92,6 +93,67 @@ impl SlackApi {
         conversations.sort_by_key(|conversation| conversation.display_name().to_lowercase());
         log_conversation_properties(USERS_CONVERSATIONS_METHOD, &conversations);
         Ok(conversations)
+    }
+
+    /// Lists every accessible public or private channel, including channels the
+    /// current user has not joined yet.
+    pub async fn discover_conversations(&self) -> Result<Vec<SlackConversation>> {
+        let mut cursor: Option<String> = None;
+        let mut conversations = Vec::new();
+
+        loop {
+            let params = paginated_list_params(cursor.as_deref(), true);
+            let response: ConversationListResponse =
+                self.post_form(CONVERSATIONS_LIST_METHOD, &params).await?;
+            conversations.extend(
+                response
+                    .channels
+                    .into_iter()
+                    .filter(is_discoverable_conversation),
+            );
+
+            cursor = next_cursor(response.response_metadata);
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        conversations.sort_by_key(|conversation| conversation.display_name().to_lowercase());
+        Ok(conversations)
+    }
+
+    /// Lists workspace users across every page returned by Slack.
+    pub async fn users(&self) -> Result<Vec<SlackUser>> {
+        let mut cursor: Option<String> = None;
+        let mut users = Vec::new();
+
+        loop {
+            let params = paginated_list_params(cursor.as_deref(), false);
+            let response: UsersListResponse = self.post_form(USERS_LIST_METHOD, &params).await?;
+            users.extend(response.members);
+
+            cursor = next_cursor(response.response_metadata);
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        users.sort_by_key(|user| user.display_name().unwrap_or_default().to_lowercase());
+        Ok(users)
+    }
+
+    pub async fn join_conversation(&self, channel_id: &str) -> Result<SlackConversation> {
+        let response: ConversationJoinResponse = self
+            .post_form("conversations.join", &[("channel", channel_id.to_string())])
+            .await?;
+        Ok(response.channel)
+    }
+
+    pub async fn open_direct_message(&self, user_id: &str) -> Result<SlackConversation> {
+        let response: ConversationOpenResponse = self
+            .post_form("conversations.open", &[("users", user_id.to_string())])
+            .await?;
+        Ok(response.channel)
     }
 
     pub fn can_mark_read(&self) -> bool {
@@ -517,6 +579,38 @@ impl SlackApi {
     }
 }
 
+fn paginated_list_params(
+    cursor: Option<&str>,
+    include_channel_types: bool,
+) -> Vec<(&'static str, String)> {
+    let mut params = Vec::with_capacity(4);
+    if include_channel_types {
+        params.push(("types", "public_channel,private_channel".to_string()));
+        params.push(("exclude_archived", "true".to_string()));
+    }
+    params.push(("limit", "200".to_string()));
+    if let Some(cursor) = cursor.map(str::trim).filter(|cursor| !cursor.is_empty()) {
+        params.push(("cursor", cursor.to_string()));
+    }
+    params
+}
+
+fn next_cursor(metadata: Option<ResponseMetadata>) -> Option<String> {
+    metadata
+        .and_then(|metadata| metadata.next_cursor)
+        .map(|cursor| cursor.trim().to_string())
+        .filter(|cursor| !cursor.is_empty())
+}
+
+fn is_discoverable_conversation(conversation: &SlackConversation) -> bool {
+    !conversation.is_archived.unwrap_or(false)
+        && (conversation.is_channel.unwrap_or(false)
+            || conversation.is_group.unwrap_or(false)
+            || conversation.is_private.unwrap_or(false))
+        && !conversation.is_im.unwrap_or(false)
+        && !conversation.is_mpim.unwrap_or(false)
+}
+
 fn retry_after_delay(response: &reqwest::Response) -> Duration {
     let seconds = response
         .headers()
@@ -858,6 +952,31 @@ struct ConversationInfoResponse {
 impl_slack_response!(ConversationInfoResponse);
 
 #[derive(Debug, Deserialize)]
+struct ConversationJoinResponse {
+    ok: bool,
+    error: Option<String>,
+    channel: SlackConversation,
+}
+impl_slack_response!(ConversationJoinResponse);
+
+#[derive(Debug, Deserialize)]
+struct ConversationOpenResponse {
+    ok: bool,
+    error: Option<String>,
+    channel: SlackConversation,
+}
+impl_slack_response!(ConversationOpenResponse);
+
+#[derive(Debug, Deserialize)]
+struct UsersListResponse {
+    ok: bool,
+    error: Option<String>,
+    members: Vec<SlackUser>,
+    response_metadata: Option<ResponseMetadata>,
+}
+impl_slack_response!(UsersListResponse);
+
+#[derive(Debug, Deserialize)]
 struct HistoryResponse {
     ok: bool,
     error: Option<String>,
@@ -1009,6 +1128,78 @@ mod tests {
             rate_limit_retries_for_method("conversations.history"),
             MAX_RATE_LIMIT_RETRIES
         );
+    }
+
+    #[test]
+    fn discovery_requests_only_non_archived_channel_types() {
+        assert_eq!(
+            paginated_list_params(Some(" next-page "), true),
+            vec![
+                ("types", "public_channel,private_channel".to_string()),
+                ("exclude_archived", "true".to_string()),
+                ("limit", "200".to_string()),
+                ("cursor", "next-page".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn users_requests_are_paginated_without_channel_parameters() {
+        assert_eq!(
+            paginated_list_params(Some("users-page"), false),
+            vec![
+                ("limit", "200".to_string()),
+                ("cursor", "users-page".to_string()),
+            ]
+        );
+        assert_eq!(
+            paginated_list_params(Some("  "), false),
+            vec![("limit", "200".to_string())]
+        );
+    }
+
+    #[test]
+    fn discovery_filter_rejects_archived_channels_and_direct_messages() {
+        let public_channel = SlackConversation {
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let private_channel = SlackConversation {
+            is_private: Some(true),
+            ..Default::default()
+        };
+        let archived_channel = SlackConversation {
+            is_channel: Some(true),
+            is_archived: Some(true),
+            ..Default::default()
+        };
+        let direct_message = SlackConversation {
+            is_im: Some(true),
+            ..Default::default()
+        };
+
+        assert!(is_discoverable_conversation(&public_channel));
+        assert!(is_discoverable_conversation(&private_channel));
+        assert!(!is_discoverable_conversation(&archived_channel));
+        assert!(!is_discoverable_conversation(&direct_message));
+    }
+
+    #[test]
+    fn pagination_cursor_is_trimmed_and_empty_values_end_pagination() {
+        assert_eq!(
+            next_cursor(Some(ResponseMetadata {
+                next_cursor: Some(" next-page ".to_string()),
+            }))
+            .as_deref(),
+            Some("next-page")
+        );
+        assert_eq!(
+            next_cursor(Some(ResponseMetadata {
+                next_cursor: Some("  ".to_string()),
+            })),
+            None
+        );
+        assert_eq!(next_cursor(None), None);
     }
 
     #[test]
