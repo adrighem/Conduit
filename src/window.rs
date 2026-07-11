@@ -361,22 +361,26 @@ fn apply_media_zoom(viewer: &MediaViewer) {
     viewer
         .zoom_label
         .set_label(&format!("{:.0}%", viewer.zoom * 100.0));
-    if (viewer.zoom - 1.0).abs() < f64::EPSILON {
-        viewer.picture.set_size_request(-1, -1);
-        viewer.picture.set_hexpand(true);
-        viewer.picture.set_vexpand(true);
-        return;
-    }
     let viewport_width = viewer.image_scroller.width().max(1);
     let viewport_height = viewer.image_scroller.height().max(1);
-    let base_width = viewer.natural_size.0.min(viewport_width).max(1);
-    let base_height = viewer.natural_size.1.min(viewport_height).max(1);
-    viewer.picture.set_hexpand(false);
-    viewer.picture.set_vexpand(false);
-    viewer.picture.set_size_request(
-        (base_width as f64 * viewer.zoom) as i32,
-        (base_height as f64 * viewer.zoom) as i32,
+    let (width, height) = media_zoom_size(
+        viewer.natural_size,
+        (viewport_width, viewport_height),
+        viewer.zoom,
     );
+    viewer.picture.set_size_request(width, height);
+}
+
+fn media_zoom_size(natural: (i32, i32), viewport: (i32, i32), zoom: f64) -> (i32, i32) {
+    let natural_width = natural.0.max(1) as f64;
+    let natural_height = natural.1.max(1) as f64;
+    let fit_scale = (viewport.0.max(1) as f64 / natural_width)
+        .min(viewport.1.max(1) as f64 / natural_height)
+        .min(1.0);
+    (
+        (natural_width * fit_scale * zoom).round().max(1.0) as i32,
+        (natural_height * fit_scale * zoom).round().max(1.0) as i32,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1096,9 +1100,14 @@ impl ConduitWindow {
         let picture = gtk::Picture::new();
         picture.set_can_shrink(true);
         picture.set_content_fit(gtk::ContentFit::Contain);
-        picture.set_hexpand(true);
-        picture.set_vexpand(true);
-        image_scroller.set_child(Some(&picture));
+        picture.set_halign(gtk::Align::Center);
+        picture.set_valign(gtk::Align::Center);
+        let image_canvas = gtk::CenterBox::new();
+        image_canvas.set_orientation(gtk::Orientation::Vertical);
+        image_canvas.set_hexpand(true);
+        image_canvas.set_vexpand(true);
+        image_canvas.set_center_widget(Some(&picture));
+        image_scroller.set_child(Some(&image_canvas));
         content_stack.add_named(&image_scroller, Some("image"));
 
         let loading = gtk::Spinner::new();
@@ -4445,6 +4454,13 @@ impl ConduitWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_zoom_scales_below_fit_size_without_distorting_aspect_ratio() {
+        assert_eq!(media_zoom_size((1600, 900), (800, 600), 1.0), (800, 450));
+        assert_eq!(media_zoom_size((1600, 900), (800, 600), 0.5), (400, 225));
+        assert_eq!(media_zoom_size((400, 200), (800, 600), 0.25), (100, 50));
+    }
     use crate::runtime::{RuntimeOperation, RuntimeTarget};
     use crate::sidebar::ConversationKind;
 
