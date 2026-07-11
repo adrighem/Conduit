@@ -17,6 +17,7 @@ if xvfb_run.found() and xdotool.found() and xfwm4.found()
       'GSETTINGS_BACKEND=memory',
       'GDK_DEBUG=no-portals',
       'GDK_BACKEND=x11',
+      'GSK_RENDERER=cairo',
       'GTK_A11Y=none',
       'XDG_SESSION_TYPE=x11',
     ],

@@ -23,6 +23,30 @@ def wait_until(predicate, timeout: float = 40.0, interval: float = 0.1):
     raise AssertionError(f"condition was not met within {timeout:.1f}s")
 
 
+def wait_for_window(process: subprocess.Popen[str], timeout: float = 40.0) -> str:
+    def find_window() -> str | None:
+        return_code = process.poll()
+        if return_code is not None:
+            _, stderr = process.communicate()
+            raise AssertionError(
+                f"Conduit exited with {return_code} before showing a window:\n{stderr}"
+            )
+        result = subprocess.run(
+            [
+                "xdotool",
+                "search",
+                "--onlyvisible",
+                "--pid",
+                str(process.pid),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return next(iter(result.stdout.splitlines()), None)
+
+    return wait_until(find_window, timeout=timeout)
+
+
 def compile_test_schema(schema: Path, directory: Path) -> None:
     shutil.copy2(schema, directory / schema.name)
     subprocess.run(
@@ -68,22 +92,11 @@ def main() -> None:
         process = subprocess.Popen(
             [str(binary)],
             env=environment,
+            text=True,
+            stderr=subprocess.PIPE,
         )
         try:
-            window_id = subprocess.run(
-                [
-                    "xdotool",
-                    "search",
-                    "--sync",
-                    "--onlyvisible",
-                    "--pid",
-                    str(process.pid),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=40,
-            ).stdout.splitlines()[0]
+            window_id = wait_for_window(process)
             subprocess.run(
                 ["xdotool", "windowactivate", "--sync", window_id], check=True
             )

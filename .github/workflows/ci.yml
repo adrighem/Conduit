@@ -49,4 +49,4 @@ jobs:
         run: |
           meson setup _build
           meson compile -C _build
-          meson test -C _build
+          meson test -C _build --print-errorlogs
