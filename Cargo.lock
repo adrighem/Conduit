@@ -413,6 +413,7 @@ dependencies = [
  "anyhow",
  "base64",
  "futures-util",
+ "gdk-pixbuf",
  "gettext-rs",
  "gtk4",
  "keyring",

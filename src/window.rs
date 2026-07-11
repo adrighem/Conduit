@@ -267,7 +267,8 @@ struct MediaViewer {
     surface_stack: gtk::Stack,
     content_stack: gtk::Stack,
     image_scroller: gtk::ScrolledWindow,
-    picture: gtk::Picture,
+    image: gtk::DrawingArea,
+    image_source: Rc<RefCell<Option<gdk_pixbuf::Pixbuf>>>,
     title: gtk::Label,
     zoom_label: gtk::Label,
     zoom_out_button: gtk::Button,
@@ -370,7 +371,10 @@ fn apply_media_zoom(viewer: &MediaViewer) {
         (viewport_width, viewport_height),
         viewer.zoom,
     );
-    viewer.picture.set_size_request(width, height);
+    viewer.image.set_content_width(width);
+    viewer.image.set_content_height(height);
+    viewer.image.queue_resize();
+    viewer.image.queue_draw();
 }
 
 fn media_zoom_size(natural: (i32, i32), viewport: (i32, i32), zoom: f64) -> (i32, i32) {
@@ -1105,16 +1109,30 @@ impl ConduitWindow {
         let image_scroller = gtk::ScrolledWindow::new();
         image_scroller.set_hexpand(true);
         image_scroller.set_vexpand(true);
-        let picture = gtk::Picture::new();
-        picture.set_can_shrink(true);
-        picture.set_content_fit(gtk::ContentFit::Contain);
-        picture.set_halign(gtk::Align::Center);
-        picture.set_valign(gtk::Align::Center);
+        let image = gtk::DrawingArea::new();
+        image.set_halign(gtk::Align::Center);
+        image.set_valign(gtk::Align::Center);
+        let image_source = Rc::new(RefCell::new(None::<gdk_pixbuf::Pixbuf>));
+        let draw_source = image_source.clone();
+        image.set_draw_func(move |_, context, width, height| {
+            let source = draw_source.borrow();
+            let Some(pixbuf) = source.as_ref() else {
+                return;
+            };
+            let source_width = pixbuf.width().max(1) as f64;
+            let source_height = pixbuf.height().max(1) as f64;
+            context.scale(
+                width.max(1) as f64 / source_width,
+                height.max(1) as f64 / source_height,
+            );
+            context.set_source_pixbuf(pixbuf, 0.0, 0.0);
+            let _ = context.paint();
+        });
         let image_canvas = gtk::CenterBox::new();
         image_canvas.set_orientation(gtk::Orientation::Vertical);
         image_canvas.set_hexpand(true);
         image_canvas.set_vexpand(true);
-        image_canvas.set_center_widget(Some(&picture));
+        image_canvas.set_center_widget(Some(&image));
         image_scroller.set_child(Some(&image_canvas));
         content_stack.add_named(&image_scroller, Some("image"));
 
@@ -1140,7 +1158,8 @@ impl ConduitWindow {
             surface_stack,
             content_stack,
             image_scroller,
-            picture,
+            image,
+            image_source,
             title,
             zoom_label,
             zoom_out_button: zoom_out,
@@ -1186,6 +1205,17 @@ impl ConduitWindow {
         });
         viewer.image_scroller.add_controller(scroll);
 
+        for property in ["width", "height"] {
+            let weak_window = self.downgrade();
+            viewer
+                .image_scroller
+                .connect_notify_local(Some(property), move |_, _| {
+                    if let Some(window) = weak_window.upgrade() {
+                        window.reapply_media_zoom();
+                    }
+                });
+        }
+
         let close_click = gtk::GestureClick::new();
         close_click.set_button(gtk::gdk::BUTTON_PRIMARY);
         let weak_window = self.downgrade();
@@ -1194,7 +1224,7 @@ impl ConduitWindow {
                 window.close_media_viewer();
             }
         });
-        viewer.picture.add_controller(close_click);
+        viewer.image.add_controller(close_click);
 
         let context_click = gtk::GestureClick::new();
         context_click.set_button(gtk::gdk::BUTTON_SECONDARY);
@@ -1324,6 +1354,14 @@ impl ConduitWindow {
         }
     }
 
+    fn reapply_media_zoom(&self) {
+        if let Some(viewer) = self.imp().media_viewer.borrow().as_ref() {
+            if viewer.content_stack.visible_child_name().as_deref() == Some("image") {
+                apply_media_zoom(viewer);
+            }
+        }
+    }
+
     fn close_media_viewer(&self) {
         if let Some(viewer) = self.imp().media_viewer.borrow().as_ref() {
             viewer.surface_stack.set_visible_child_name("timeline");
@@ -1439,10 +1477,10 @@ impl ConduitWindow {
         };
         viewer.loaded_path = Some(path.clone());
         if mime_type.starts_with("image/") {
-            match gtk::gdk::Texture::from_filename(&path) {
-                Ok(texture) => {
-                    viewer.natural_size = (texture.width(), texture.height());
-                    viewer.picture.set_paintable(Some(&texture));
+            match gdk_pixbuf::Pixbuf::from_file(&path) {
+                Ok(pixbuf) => {
+                    viewer.natural_size = (pixbuf.width(), pixbuf.height());
+                    *viewer.image_source.borrow_mut() = Some(pixbuf);
                     viewer.content_stack.set_visible_child_name("image");
                     for button in [
                         &viewer.zoom_out_button,
