@@ -99,6 +99,8 @@ mod imp {
         #[template_child]
         pub unreads_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
+        pub threads_button: TemplateChild<gtk::ToggleButton>,
+        #[template_child]
         pub files_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub saved_button: TemplateChild<gtk::ToggleButton>,
@@ -387,6 +389,7 @@ fn media_zoom_size(natural: (i32, i32), viewport: (i32, i32), zoom: f64) -> (i32
 enum WorkspaceNavigationSelection {
     Messages,
     Unreads,
+    Threads,
     Files,
     Saved,
 }
@@ -397,6 +400,7 @@ fn workspace_navigation_selection(
     match main_view {
         MainMessageView::Conversation => Some(WorkspaceNavigationSelection::Messages),
         MainMessageView::Unreads => Some(WorkspaceNavigationSelection::Unreads),
+        MainMessageView::Threads => Some(WorkspaceNavigationSelection::Threads),
         MainMessageView::Files => Some(WorkspaceNavigationSelection::Files),
         MainMessageView::Saved => Some(WorkspaceNavigationSelection::Saved),
         MainMessageView::Placeholder | MainMessageView::Search => None,
@@ -977,6 +981,10 @@ impl ConduitWindow {
                 gettext("Unreads"),
             ),
             (
+                imp.threads_button.get().upcast::<gtk::Widget>(),
+                gettext("Threads"),
+            ),
+            (
                 imp.files_button.get().upcast::<gtk::Widget>(),
                 gettext("Files"),
             ),
@@ -1547,6 +1555,7 @@ impl ConduitWindow {
         self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
         self.connect_widget(&imp.messages_button.get(), |window| window.show_messages());
         self.connect_widget(&imp.unreads_button.get(), |window| window.show_unreads());
+        self.connect_widget(&imp.threads_button.get(), |window| window.show_threads());
         self.connect_widget(&imp.files_button.get(), |window| window.show_files());
         self.connect_widget(&imp.refresh_button.get(), |window| {
             window.refresh_conversations()
@@ -2389,6 +2398,14 @@ impl ConduitWindow {
         self.render_closed_thread();
         let items = self.unread_items();
         self.populate_unreads(items);
+        self.imp().workspace_split.set_show_content(true);
+    }
+
+    fn show_threads(&self) {
+        self.flush_current_drafts();
+        self.imp().workspace_view.borrow_mut().show_threads();
+        self.render_closed_thread();
+        self.populate_threads();
         self.imp().workspace_split.set_show_content(true);
     }
 
@@ -3743,6 +3760,8 @@ impl ConduitWindow {
             .set_active(selection == Some(WorkspaceNavigationSelection::Messages));
         imp.unreads_button
             .set_active(selection == Some(WorkspaceNavigationSelection::Unreads));
+        imp.threads_button
+            .set_active(selection == Some(WorkspaceNavigationSelection::Threads));
         imp.files_button
             .set_active(selection == Some(WorkspaceNavigationSelection::Files));
         imp.saved_button
@@ -3940,6 +3959,27 @@ impl ConduitWindow {
         imp.message_title.set_title(&gettext("Unreads"));
         self.render_conversations();
         self.load_message_html(&message_html::unreads_document(&items));
+    }
+
+    fn populate_threads(&self) {
+        let observed = self.imp().workspace_view.borrow().observed_threads();
+        let roots = observed
+            .iter()
+            .map(|(_, message)| message.clone())
+            .collect::<Vec<_>>();
+        self.request_user_names(&roots);
+        self.request_image_assets(roots.iter());
+        let items = observed
+            .into_iter()
+            .map(|(channel_id, root)| message_html::ThreadInboxItem {
+                channel_title: self.conversation_title(&channel_id),
+                channel_id,
+                root,
+            })
+            .collect::<Vec<_>>();
+        self.imp().message_title.set_title(&gettext("Threads"));
+        let context = self.message_html_context(None);
+        self.load_message_html(&message_html::threads_document(&items, &context));
     }
 
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
@@ -4364,6 +4404,7 @@ impl ConduitWindow {
                 }
             }
             MainMessageView::Unreads => self.populate_unreads(self.unread_items()),
+            MainMessageView::Threads => self.populate_threads(),
             MainMessageView::Search => self.populate_search_results(snapshot.search_results),
             MainMessageView::Files => self.populate_files(snapshot.files),
             MainMessageView::Saved => self.populate_saved_items(snapshot.saved_items),
@@ -5126,6 +5167,10 @@ mod tests {
             Some(WorkspaceNavigationSelection::Unreads)
         );
         assert_eq!(
+            workspace_navigation_selection(MainMessageView::Threads),
+            Some(WorkspaceNavigationSelection::Threads)
+        );
+        assert_eq!(
             workspace_navigation_selection(MainMessageView::Files),
             Some(WorkspaceNavigationSelection::Files)
         );
@@ -5149,6 +5194,7 @@ mod tests {
         for view in [
             MainMessageView::Placeholder,
             MainMessageView::Unreads,
+            MainMessageView::Threads,
             MainMessageView::Search,
             MainMessageView::Files,
             MainMessageView::Saved,
@@ -5175,11 +5221,13 @@ mod tests {
             "<property name=\"label\" translatable=\"yes\">Message</property>",
             "<property name=\"label\" translatable=\"yes\">Reply</property>",
             "GtkToggleButton\" id=\"messages_button",
+            "GtkToggleButton\" id=\"threads_button",
             "<property name=\"group\">messages_button</property>",
             "<property name=\"icon-name\">view-list-symbolic</property>",
             "<property name=\"icon-name\">mail-unread-symbolic</property>",
             "<property name=\"tooltip-text\" translatable=\"yes\">Messages</property>",
             "<property name=\"tooltip-text\" translatable=\"yes\">Unreads</property>",
+            "<property name=\"tooltip-text\" translatable=\"yes\">Threads</property>",
             "<property name=\"enable-show-gesture\">False</property>",
             "GtkLabel\" id=\"message_status_label",
             "<property name=\"accessible-role\">status</property>",

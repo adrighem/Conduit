@@ -22,6 +22,7 @@ pub(crate) enum MainMessageView {
     Placeholder,
     Conversation,
     Unreads,
+    Threads,
     Search,
     Files,
     Saved,
@@ -281,6 +282,25 @@ impl WorkspaceViewState {
 
     pub(crate) fn show_unreads(&mut self) {
         self.navigate_to(MainMessageView::Unreads);
+    }
+
+    pub(crate) fn show_threads(&mut self) {
+        self.navigate_to(MainMessageView::Threads);
+    }
+
+    pub(crate) fn observed_threads(&self) -> Vec<(String, SlackMessage)> {
+        let mut threads = self
+            .channels
+            .iter()
+            .flat_map(|(channel_id, history)| {
+                history.messages.iter().filter_map(move |message| {
+                    (message.thread_ts.is_none() && message.has_thread())
+                        .then_some((channel_id.clone(), message.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        threads.sort_by(|left, right| right.1.ts.cmp(&left.1.ts));
+        threads
     }
 
     pub(crate) fn show_search(&mut self) {
@@ -867,7 +887,7 @@ impl WorkspaceViewState {
             MainMessageView::Search => self.search_loading = false,
             MainMessageView::Files => self.files_loading = false,
             MainMessageView::Saved => self.saved_loading = false,
-            MainMessageView::Placeholder | MainMessageView::Unreads => {}
+            MainMessageView::Placeholder | MainMessageView::Unreads | MainMessageView::Threads => {}
         }
     }
 
@@ -996,6 +1016,24 @@ mod tests {
         messages: Vec<SlackMessage>,
     ) -> HistoryApplyOutcome {
         state.apply_history(channel_id, messages, false, None, false, false)
+    }
+
+    #[test]
+    fn observed_threads_collect_roots_across_loaded_channels_newest_first() {
+        let mut state = WorkspaceViewState::default();
+        let mut older = message("1", "older thread");
+        older.reply_count = Some(2);
+        let mut newer = message("3", "newer thread");
+        newer.reply_count = Some(1);
+        apply_fresh(&mut state, "C1", vec![older, message("2", "plain")]);
+        apply_fresh(&mut state, "C2", vec![newer]);
+
+        let threads = state.observed_threads();
+
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].0, "C2");
+        assert_eq!(threads[0].1.ts, "3");
+        assert_eq!(threads[1].0, "C1");
     }
 
     #[test]

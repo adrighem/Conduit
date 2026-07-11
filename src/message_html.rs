@@ -607,6 +607,42 @@ pub fn unreads_document(items: &[ActivityItem]) -> String {
     html_document(&title, &body)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadInboxItem {
+    pub channel_id: String,
+    pub channel_title: String,
+    pub root: SlackMessage,
+}
+
+pub fn threads_document(items: &[ThreadInboxItem], context: &MessageHtmlContext) -> String {
+    if items.is_empty() {
+        return placeholder_document(
+            &gettext("Threads"),
+            &gettext("Threads you open or participate in will appear here"),
+        );
+    }
+
+    let title = gettext("Threads");
+    let mut body = format!(
+        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
+        document_heading(&title)
+    );
+    for item in items {
+        let reply_count = item.root.reply_count.unwrap_or_default();
+        let label = gettext("{channel} · {count} replies")
+            .replace("{channel}", &item.channel_title)
+            .replace("{count}", &reply_count.to_string());
+        body.push_str(&format!(
+            "<li class=\"message-list-item\"><a class=\"activity-row\" href=\"{}\">{}</a>{}</li>",
+            escape_html(&thread_action_url(&item.channel_id, &item.root.ts)),
+            escape_html(&label),
+            message_article(Some(&item.channel_id), &item.root, context),
+        ));
+    }
+    body.push_str("</ol></main>");
+    html_document(&title, &body)
+}
+
 pub fn files_document(files: &[SlackFile]) -> String {
     if files.is_empty() {
         return placeholder_document(&gettext("Files"), &gettext("No files"));
@@ -3492,6 +3528,24 @@ mod tests {
         assert!(html.contains("No files"));
         assert!(!html.contains("<a class=\"file-row\""));
         assert!(!html.contains("<section class=\"file-row\""));
+    }
+
+    #[test]
+    fn threads_document_links_roots_to_existing_thread_navigation() {
+        let mut root = message("A useful thread");
+        root.reply_count = Some(3);
+        let html = threads_document(
+            &[ThreadInboxItem {
+                channel_id: "C123".to_string(),
+                channel_title: "general".to_string(),
+                root,
+            }],
+            &MessageHtmlContext::default(),
+        );
+
+        assert!(html.contains("general · 3 replies"));
+        assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains("A useful thread"));
     }
 
     #[test]

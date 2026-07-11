@@ -244,6 +244,13 @@
                                   </object>
                                 </child>
                                 <child>
+                                  <object class="GtkToggleButton" id="threads_button">
+                                    <property name="group">messages_button</property>
+                                    <property name="icon-name">mail-replied-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Threads</property>
+                                  </object>
+                                </child>
+                                <child>
                                   <object class="GtkToggleButton" id="files_button">
                                     <property name="group">messages_button</property>
                                     <property name="icon-name">folder-documents-symbolic</property>
