@@ -2833,9 +2833,6 @@ impl ConduitWindow {
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
         let items = sidebar::conversation_switcher_items(&conversations, &user_names, "");
-        if let Some(path) = std::env::var_os("CONDUIT_TEST_EVENT_LOG") {
-            let _ = std::fs::write(path, "conversation-switcher-opened\n");
-        }
         if items.is_empty() {
             self.set_status("No conversations loaded");
             return;
@@ -2857,6 +2854,7 @@ impl ConduitWindow {
         dialog.set_child(Some(&container));
 
         let close_controller = gtk::EventControllerKey::new();
+        close_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         let dialog_for_close = dialog.clone();
         close_controller.connect_key_pressed(move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape {

@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 
-SWITCHER_EVENT = "conversation-switcher-opened\n"
+SWITCHER_TITLE = "Switch conversation"
 
 
 def wait_until(predicate, timeout: float = 40.0, interval: float = 0.1):
@@ -34,6 +34,15 @@ def compile_test_schema(schema: Path, directory: Path) -> None:
     )
 
 
+def visible_window_ids(name: str) -> list[str]:
+    result = subprocess.run(
+        ["xdotool", "search", "--onlyvisible", "--name", f"^{name}$"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.splitlines() if result.returncode == 0 else []
+
+
 def main() -> None:
     binary = Path(os.environ["CONDUIT_TEST_BINARY"])
     resource = Path(os.environ["CONDUIT_TEST_RESOURCE"])
@@ -44,14 +53,11 @@ def main() -> None:
     ) as temporary:
         temporary_path = Path(temporary)
         compile_test_schema(schema, temporary_path)
-        event_log = temporary_path / "events.log"
-
         environment = os.environ.copy()
         environment.update(
             {
                 "CONDUIT_RESOURCE_PATH": str(resource),
                 "CONDUIT_TEST_WORKSPACE": "1",
-                "CONDUIT_TEST_EVENT_LOG": str(event_log),
                 "GSETTINGS_SCHEMA_DIR": str(temporary_path),
                 "XDG_CACHE_HOME": str(temporary_path / "cache"),
                 "XDG_CONFIG_HOME": str(temporary_path / "config"),
@@ -89,7 +95,7 @@ def main() -> None:
             ).stdout.strip()
             assert focused_window == window_id
             time.sleep(0.2)
-            assert not event_log.exists()
+            assert not visible_window_ids(SWITCHER_TITLE)
             subprocess.run(
                 [
                     "xdotool",
@@ -102,10 +108,12 @@ def main() -> None:
                 ],
                 check=True,
             )
-            wait_until(
-                lambda: event_log.exists() and event_log.read_text() == SWITCHER_EVENT,
-                timeout=10.0,
+            switcher_id = wait_until(lambda: next(iter(visible_window_ids(SWITCHER_TITLE)), None))
+            subprocess.run(
+                ["xdotool", "windowactivate", "--sync", switcher_id], check=True
             )
+            subprocess.run(["xdotool", "key", "Escape"], check=True)
+            wait_until(lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0)
         finally:
             process.terminate()
             try:
