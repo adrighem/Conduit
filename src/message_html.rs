@@ -4,6 +4,7 @@ use gettextrs::gettext;
 
 use crate::activity::ActivityItem;
 use crate::debug;
+use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
 use crate::models::{SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage};
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
@@ -21,6 +22,7 @@ pub struct MessageHtmlContext {
     pub image_assets: HashMap<String, String>,
     pub failed_image_urls: HashSet<String>,
     pub recent_reactions: Vec<String>,
+    pub custom_emojis: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -143,238 +145,14 @@ fn document_heading(title: &str) -> String {
     )
 }
 
-#[derive(Clone, Copy)]
-struct EmojiOption {
-    name: &'static str,
-    glyph: &'static str,
-    category: &'static str,
-}
-
-const EMOJI_CATALOG: &[EmojiOption] = &[
-    EmojiOption {
-        name: "smile",
-        glyph: "🙂",
-        category: "Smileys",
-    },
-    EmojiOption {
-        name: "smiley",
-        glyph: "😃",
-        category: "Smileys",
-    },
-    EmojiOption {
-        name: "joy",
-        glyph: "😂",
-        category: "Smileys",
-    },
-    EmojiOption {
-        name: "laughing",
-        glyph: "😆",
-        category: "Smileys",
-    },
-    EmojiOption {
-        name: "heart_eyes",
-        glyph: "😍",
-        category: "Smileys",
-    },
-    EmojiOption {
-        name: "thinking_face",
-        glyph: "🤔",
-        category: "Smileys",
-    },
-    EmojiOption {
-        name: "sad",
-        glyph: "😢",
-        category: "Smileys",
-    },
-    EmojiOption {
-        name: "zany_face",
-        glyph: "🤪",
-        category: "Smileys",
-    },
-    EmojiOption {
-        name: "thumbsup",
-        glyph: "👍",
-        category: "People",
-    },
-    EmojiOption {
-        name: "thumbsdown",
-        glyph: "👎",
-        category: "People",
-    },
-    EmojiOption {
-        name: "clap",
-        glyph: "👏",
-        category: "People",
-    },
-    EmojiOption {
-        name: "pray",
-        glyph: "🙏",
-        category: "People",
-    },
-    EmojiOption {
-        name: "ok_hand",
-        glyph: "👌",
-        category: "People",
-    },
-    EmojiOption {
-        name: "eyes",
-        glyph: "👀",
-        category: "People",
-    },
-    EmojiOption {
-        name: "muscle",
-        glyph: "💪",
-        category: "People",
-    },
-    EmojiOption {
-        name: "wave",
-        glyph: "👋",
-        category: "People",
-    },
-    EmojiOption {
-        name: "heart",
-        glyph: "❤️",
-        category: "Nature",
-    },
-    EmojiOption {
-        name: "fire",
-        glyph: "🔥",
-        category: "Nature",
-    },
-    EmojiOption {
-        name: "sunny",
-        glyph: "☀️",
-        category: "Nature",
-    },
-    EmojiOption {
-        name: "star",
-        glyph: "⭐",
-        category: "Nature",
-    },
-    EmojiOption {
-        name: "sparkles",
-        glyph: "✨",
-        category: "Nature",
-    },
-    EmojiOption {
-        name: "seedling",
-        glyph: "🌱",
-        category: "Nature",
-    },
-    EmojiOption {
-        name: "dog",
-        glyph: "🐶",
-        category: "Nature",
-    },
-    EmojiOption {
-        name: "cat",
-        glyph: "🐱",
-        category: "Nature",
-    },
-    EmojiOption {
-        name: "coffee",
-        glyph: "☕",
-        category: "Food",
-    },
-    EmojiOption {
-        name: "cake",
-        glyph: "🍰",
-        category: "Food",
-    },
-    EmojiOption {
-        name: "pizza",
-        glyph: "🍕",
-        category: "Food",
-    },
-    EmojiOption {
-        name: "beer",
-        glyph: "🍺",
-        category: "Food",
-    },
-    EmojiOption {
-        name: "apple",
-        glyph: "🍎",
-        category: "Food",
-    },
-    EmojiOption {
-        name: "taco",
-        glyph: "🌮",
-        category: "Food",
-    },
-    EmojiOption {
-        name: "popcorn",
-        glyph: "🍿",
-        category: "Food",
-    },
-    EmojiOption {
-        name: "cookie",
-        glyph: "🍪",
-        category: "Food",
-    },
-    EmojiOption {
-        name: "tada",
-        glyph: "🎉",
-        category: "Activity",
-    },
-    EmojiOption {
-        name: "rocket",
-        glyph: "🚀",
-        category: "Activity",
-    },
-    EmojiOption {
-        name: "soccer",
-        glyph: "⚽",
-        category: "Activity",
-    },
-    EmojiOption {
-        name: "medal",
-        glyph: "🏅",
-        category: "Activity",
-    },
-    EmojiOption {
-        name: "dart",
-        glyph: "🎯",
-        category: "Activity",
-    },
-    EmojiOption {
-        name: "trophy",
-        glyph: "🏆",
-        category: "Activity",
-    },
-    EmojiOption {
-        name: "bulb",
-        glyph: "💡",
-        category: "Objects",
-    },
-    EmojiOption {
-        name: "warning",
-        glyph: "⚠️",
-        category: "Objects",
-    },
-    EmojiOption {
-        name: "white_check_mark",
-        glyph: "✅",
-        category: "Objects",
-    },
-    EmojiOption {
-        name: "x",
-        glyph: "❌",
-        category: "Objects",
-    },
-    EmojiOption {
-        name: "link",
-        glyph: "🔗",
-        category: "Objects",
-    },
-    EmojiOption {
-        name: "eyes_on",
-        glyph: "🔍",
-        category: "Objects",
-    },
-];
-
-fn reaction_picker_html() -> String {
-    let categories = ["Smileys", "People", "Nature", "Food", "Activity", "Objects"];
+fn reaction_picker_html(context: &MessageHtmlContext) -> String {
+    let catalog = EmojiCatalog::new(&context.custom_emojis);
+    let entries = catalog.entries();
+    let mut categories = entries
+        .iter()
+        .map(|emoji| emoji.category)
+        .collect::<Vec<_>>();
+    categories.dedup();
     let category_buttons = categories
         .iter()
         .enumerate()
@@ -386,18 +164,17 @@ fn reaction_picker_html() -> String {
             )
         })
         .collect::<String>();
-    let emoji_buttons = EMOJI_CATALOG
+    let emoji_buttons = entries
         .iter()
         .map(|emoji| {
-            let label = emoji.name.replace('_', " ");
             format!(
                 "<button type=\"button\" class=\"emoji-choice\" data-emoji-name=\"{}\" data-category=\"{}\" data-search=\"{}\" title=\":{}:\" aria-label=\"{}\">{}</button>",
-                escape_html(emoji.name),
+                escape_html(&emoji.name),
                 escape_html(emoji.category),
-                escape_html(&label),
-                escape_html(emoji.name),
-                escape_html(&label),
-                emoji.glyph
+                escape_html(&format!("{} {}", emoji.name, emoji.label).to_lowercase()),
+                escape_html(&emoji.name),
+                escape_html(&emoji.label),
+                emoji_value_html(&emoji.value, true),
             )
         })
         .collect::<String>();
@@ -433,7 +210,14 @@ fn reaction_picker_script() -> &'static str {
       const matchesQuery = !query || choice.dataset.search.includes(query) || choice.dataset.emojiName.includes(query);
       const matchesCategory = query || choice.dataset.category === activeCategory;
       choice.hidden = !(matchesQuery && matchesCategory);
-      if (!choice.hidden) visible += 1;
+      if (!choice.hidden) {
+        const image = choice.querySelector("img[data-src]");
+        if (image) {
+          image.src = image.dataset.src;
+          image.removeAttribute("data-src");
+        }
+        visible += 1;
+      }
     });
     empty.hidden = visible !== 0;
   }
@@ -476,6 +260,20 @@ fn reaction_picker_script() -> &'static str {
     });
   });
 })();"##
+}
+
+fn emoji_value_html(value: &EmojiValue, lazy: bool) -> String {
+    match value {
+        EmojiValue::Unicode(glyph) => escape_html(glyph),
+        EmojiValue::CustomImage(url) if lazy => format!(
+            "<img class=\"custom-emoji\" data-src=\"{}\" alt=\"\" aria-hidden=\"true\">",
+            escape_html(url)
+        ),
+        EmojiValue::CustomImage(url) => format!(
+            "<img class=\"custom-emoji\" src=\"{}\" alt=\"\" aria-hidden=\"true\" loading=\"lazy\">",
+            escape_html(url)
+        ),
+    }
 }
 
 pub fn placeholder_document(title: &str, message: &str) -> String {
@@ -547,6 +345,7 @@ pub fn conversation_document_with_focus(
         }
     }
     body.push_str("</main>");
+    body.push_str(&reaction_picker_html(context));
 
     let mut scripts = Vec::new();
     if let Some(scroll_script) = timeline_scroll_script(channel_id, context.timeline_scroll) {
@@ -585,6 +384,9 @@ pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -
         ));
     }
     body.push_str("</main>");
+    if rendered > 0 {
+        body.push_str(&reaction_picker_html(context));
+    }
 
     html_document(&title, &body)
 }
@@ -640,6 +442,7 @@ pub fn threads_document(items: &[ThreadInboxItem], context: &MessageHtmlContext)
         ));
     }
     body.push_str("</ol></main>");
+    body.push_str(&reaction_picker_html(context));
     html_document(&title, &body)
 }
 
@@ -677,6 +480,7 @@ pub fn search_results_document(results: &[SearchMatch], context: &MessageHtmlCon
         body.push_str("</li>");
     }
     body.push_str("</ol></main>");
+    body.push_str(&reaction_picker_html(context));
 
     html_document(&title, &body)
 }
@@ -733,10 +537,6 @@ fn html_document_with_language(
     } else {
         format!("\n<script>\n{scripts}\n</script>")
     };
-    let reaction_picker = has_message_actions
-        .then(reaction_picker_html)
-        .unwrap_or_default();
-
     format!(
         r#"<!doctype html>
 <html lang="{}" dir="{}">
@@ -942,6 +742,14 @@ pre code {{
 .emoji {{
   font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
   line-height: 1;
+}}
+
+.custom-emoji {{
+  display: inline-block;
+  inline-size: 1.25em;
+  block-size: 1.25em;
+  object-fit: contain;
+  vertical-align: -0.25em;
 }}
 
 .attachments,
@@ -1225,6 +1033,12 @@ pre code {{
   cursor: pointer;
 }}
 
+.emoji-choice .custom-emoji {{
+  inline-size: 30px;
+  block-size: 30px;
+  vertical-align: middle;
+}}
+
 .picker-close {{
   display: grid;
   place-items: center;
@@ -1411,14 +1225,12 @@ pre code {{
 <body>
 {}
 {}
-{}
 </body>
 </html>"#,
         escape_html(language),
         document_direction(language),
         escape_html(title),
         body,
-        reaction_picker,
         script_tag
     )
 }
@@ -2229,7 +2041,7 @@ fn reactions_html(message: &SlackMessage, context: &MessageHtmlContext) -> Strin
             Some(format!(
                 "<span class=\"reaction{}\">{} {}</span>",
                 active_class,
-                escape_html(&reaction_label(name)),
+                reaction_label(name, context),
                 count
             ))
         })
@@ -2285,11 +2097,11 @@ fn message_actions_html(
     let thread_ts = action_thread_ts(message, context);
     let mut actions = String::new();
     for emoji in recent_reactions(context) {
-        let reacted = message.user_reacted(emoji.name, context.current_user_id.as_deref());
-        actions.push_str(&action_button_html(
-            &reaction_action_url(channel_id, message, emoji.name, !reacted, thread_ts),
-            emoji.glyph,
-            &gettext("React with {emoji}").replace("{emoji}", &emoji.name.replace('_', " ")),
+        let reacted = message.user_reacted(&emoji.name, context.current_user_id.as_deref());
+        actions.push_str(&action_button_content_html(
+            &reaction_action_url(channel_id, message, &emoji.name, !reacted, thread_ts),
+            &emoji_value_html(&emoji.value, false),
+            &gettext("React with {emoji}").replace("{emoji}", &emoji.label),
             reacted,
         ));
     }
@@ -2465,7 +2277,7 @@ fn action_thread_ts<'a>(
     })
 }
 
-fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiOption> {
+fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
     let requested = context.recent_reactions.iter().map(String::as_str).chain([
         "smile",
         "thumbsup",
@@ -2474,17 +2286,30 @@ fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiOption> {
     let mut seen = HashSet::new();
     requested
         .filter(|name| seen.insert(*name))
-        .filter_map(|name| {
-            EMOJI_CATALOG
-                .iter()
-                .find(|emoji| emoji.name == name)
-                .copied()
-        })
+        .filter_map(|name| emoji_entry(name, context))
         .take(3)
         .collect()
 }
 
+fn emoji_entry(name: &str, context: &MessageHtmlContext) -> Option<EmojiEntry> {
+    let catalog = EmojiCatalog::new(&context.custom_emojis);
+    let value = catalog.resolve(name)?;
+    let label = emojis::get_by_shortcode(name)
+        .map(|emoji| emoji.name().to_string())
+        .unwrap_or_else(|| name.replace(['_', '-'], " "));
+    Some(EmojiEntry {
+        name: name.to_string(),
+        label,
+        category: "",
+        value,
+    })
+}
+
 fn action_button_html(href: &str, label: &str, title: &str, active: bool) -> String {
+    action_button_content_html(href, &escape_html(label), title, active)
+}
+
+fn action_button_content_html(href: &str, content: &str, title: &str, active: bool) -> String {
     let active_class = if active { " is-active" } else { "" };
     format!(
         "<a class=\"action-button{}\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
@@ -2492,7 +2317,7 @@ fn action_button_html(href: &str, label: &str, title: &str, active: bool) -> Str
         escape_html(href),
         escape_html(title),
         escape_html(title),
-        escape_html(label)
+        content
     )
 }
 
@@ -2500,15 +2325,11 @@ fn encode_query(value: &str) -> String {
     urlencoding::encode(value).into_owned()
 }
 
-fn reaction_label(name: &str) -> String {
-    emoji_for_code(name)
-        .or(match name {
-            "+1" => Some("👍"),
-            "-1" => Some("👎"),
-            _ => None,
-        })
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!(":{name}:"))
+fn reaction_label(name: &str, context: &MessageHtmlContext) -> String {
+    EmojiCatalog::new(&context.custom_emojis)
+        .resolve(name)
+        .map(|value| emoji_value_html(&value, false))
+        .unwrap_or_else(|| escape_html(&format!(":{name}:")))
 }
 
 fn mrkdwn_to_html(text: &str, context: &MessageHtmlContext) -> String {
@@ -2555,7 +2376,7 @@ fn render_inline(text: &str, context: &MessageHtmlContext) -> String {
             continue;
         }
 
-        if let Some((html, consumed)) = render_emoji_shortcode(rest) {
+        if let Some((html, consumed)) = render_emoji_shortcode(rest, context) {
             output.push_str(&html);
             rest = &rest[consumed..];
             continue;
@@ -2683,7 +2504,7 @@ fn slack_special_entity_html(raw: &str) -> String {
     }
 }
 
-fn render_emoji_shortcode(text: &str) -> Option<(String, usize)> {
+fn render_emoji_shortcode(text: &str, context: &MessageHtmlContext) -> Option<(String, usize)> {
     if !text.starts_with(':') {
         return None;
     }
@@ -2700,7 +2521,7 @@ fn render_emoji_shortcode(text: &str) -> Option<(String, usize)> {
     }
 
     let shortcode = &text[..end + 1];
-    let emoji = emoji_for_code(code);
+    let emoji = EmojiCatalog::new(&context.custom_emojis).resolve(code);
     if debug::enabled() {
         debug::log(
             "render",
@@ -2711,69 +2532,15 @@ fn render_emoji_shortcode(text: &str) -> Option<(String, usize)> {
     let rendered = emoji
         .map(|emoji| {
             format!(
-                "<span class=\"emoji\" title=\":{}:\">{}</span>",
+                "<span class=\"emoji\" title=\":{}:\" role=\"img\" aria-label=\"{}\">{}</span>",
                 escape_html(code),
-                emoji
+                escape_html(&code.replace(['_', '-'], " ")),
+                emoji_value_html(&emoji, false),
             )
         })
         .unwrap_or_else(|| escape_html(shortcode));
 
     Some((rendered, end + 1))
-}
-
-fn emoji_for_code(code: &str) -> Option<&'static str> {
-    match code {
-        "+1" | "thumbsup" => Some("👍"),
-        "-1" | "thumbsdown" => Some("👎"),
-        "clap" => Some("👏"),
-        "coffee" => Some("☕"),
-        "cake" => Some("🍰"),
-        "pizza" => Some("🍕"),
-        "beer" => Some("🍺"),
-        "apple" => Some("🍎"),
-        "taco" => Some("🌮"),
-        "popcorn" => Some("🍿"),
-        "cookie" => Some("🍪"),
-        "dog" => Some("🐶"),
-        "cat" => Some("🐱"),
-        "eyes" => Some("👀"),
-        "fire" => Some("🔥"),
-        "heart" => Some("❤️"),
-        "heart_eyes" => Some("😍"),
-        "joy" => Some("😂"),
-        "laughing" | "satisfied" => Some("😆"),
-        "ok_hand" => Some("👌"),
-        "muscle" => Some("💪"),
-        "wave" => Some("👋"),
-        "sunny" => Some("☀️"),
-        "star" => Some("⭐"),
-        "sparkles" => Some("✨"),
-        "seedling" => Some("🌱"),
-        "party_parrot" | "tada" => Some("🎉"),
-        "pray" => Some("🙏"),
-        "rocket" => Some("🚀"),
-        "soccer" => Some("⚽"),
-        "medal" => Some("🏅"),
-        "dart" => Some("🎯"),
-        "trophy" => Some("🏆"),
-        "bulb" => Some("💡"),
-        "warning" => Some("⚠️"),
-        "link" => Some("🔗"),
-        "sad" => Some("😢"),
-        "slightly_smiling_face" | "simple_smile" | "smile" => Some("🙂"),
-        "smiley" => Some("😃"),
-        "stuck_out_tongue" | "face_with_tongue" => Some("😛"),
-        "stuck_out_tongue_closed_eyes" => Some("😝"),
-        "stuck_out_tongue_winking_eye" => Some("😜"),
-        "sweat_smile" => Some("😅"),
-        "thinking_face" => Some("🤔"),
-        "troll" => Some("🧌"),
-        "white_check_mark" => Some("✅"),
-        "yum" => Some("😋"),
-        "zany_face" => Some("🤪"),
-        "x" => Some("❌"),
-        _ => None,
-    }
 }
 
 fn render_wrapped(
@@ -3073,8 +2840,10 @@ mod tests {
             &MessageHtmlContext::default(),
         );
 
-        assert!(html.contains("<span class=\"emoji\" title=\":rocket:\">🚀</span>"));
-        assert!(html.contains("<span class=\"emoji\" title=\":stuck_out_tongue:\">😛</span>"));
+        assert!(html.contains("title=\":rocket:\" role=\"img\""));
+        assert!(html.contains(">🚀</span>"));
+        assert!(html.contains("title=\":stuck_out_tongue:\" role=\"img\""));
+        assert!(html.contains(">😛</span>"));
         assert!(html.contains(":unknown_custom_emoji:"));
     }
 
@@ -3090,7 +2859,33 @@ mod tests {
             &context,
         );
 
-        assert!(html.contains("<span class=\"emoji\" title=\":troll:\">🧌</span>"));
+        assert!(html.contains("title=\":troll:\" role=\"img\""));
+        assert!(html.contains(">🧌</span>"));
+    }
+
+    #[test]
+    fn workspace_emoji_are_shared_by_messages_quick_actions_and_picker() {
+        let context = MessageHtmlContext {
+            custom_emojis: HashMap::from([
+                (
+                    "party_parrot".to_string(),
+                    "https://emoji.example/party-parrot.gif".to_string(),
+                ),
+                ("parrot_alias".to_string(), "alias:party_parrot".to_string()),
+            ]),
+            recent_reactions: vec!["party_parrot".to_string()],
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("dance :parrot_alias:")], &context);
+
+        assert!(html.contains("title=\":parrot_alias:\" role=\"img\""));
+        assert!(html.contains("src=\"https://emoji.example/party-parrot.gif\""));
+        assert!(html.contains("name=party_parrot"));
+        assert!(html.contains("data-emoji-name=\"party_parrot\""));
+        assert!(html.contains("data-category=\"Workspace\""));
+        assert!(html.contains("data-src=\"https://emoji.example/party-parrot.gif\""));
+        assert!(html.contains("data-category=\"Flags\""));
     }
 
     #[test]
@@ -3380,7 +3175,7 @@ mod tests {
 
         assert!(html.contains("thread_ts=1710000000.000100"));
         assert!(!html.contains("conduit://thread?"));
-        assert!(html.contains("<span class=\"emoji\" title=\":stuck_out_tongue:\">😛</span>"));
+        assert!(html.contains("title=\":stuck_out_tongue:\" role=\"img\""));
         assert!(html.contains("src=\"data:image/png;base64,thread\""));
         assert!(html.contains("Thread image"));
     }

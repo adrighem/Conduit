@@ -71,6 +71,19 @@ impl WorkspaceStore {
         .await
     }
 
+    pub async fn load_custom_emojis(&self) -> Result<HashMap<String, String>> {
+        Ok(self
+            .load_state()
+            .await?
+            .map(|state| state.custom_emojis)
+            .unwrap_or_default())
+    }
+
+    pub async fn store_custom_emojis(&self, emojis: &HashMap<String, String>) -> Result<()> {
+        self.update_state(|state| state.custom_emojis = emojis.clone())
+            .await
+    }
+
     pub async fn load_history(&self, channel_id: &str) -> Result<Option<Vec<SlackMessage>>> {
         Ok(self
             .load_state()
@@ -213,6 +226,8 @@ struct CachedWorkspaceState {
     channel_histories: HashMap<String, Vec<SlackMessage>>,
     #[serde(default)]
     thread_replies: HashMap<String, Vec<SlackMessage>>,
+    #[serde(default)]
+    custom_emojis: HashMap<String, String>,
 }
 
 impl CachedWorkspaceState {
@@ -223,6 +238,7 @@ impl CachedWorkspaceState {
             user_names: HashMap::new(),
             channel_histories: HashMap::new(),
             thread_replies: HashMap::new(),
+            custom_emojis: HashMap::new(),
         }
     }
 }
@@ -338,6 +354,22 @@ mod tests {
                     .expect("missing cached thread")[0]
                     .ts,
                 "1710000000.000100"
+            );
+
+            let emojis = HashMap::from([
+                (
+                    "party_parrot".to_string(),
+                    "https://emoji.example/parrot.gif".to_string(),
+                ),
+                ("ship_it".to_string(), "alias:rocket".to_string()),
+            ]);
+            store
+                .store_custom_emojis(&emojis)
+                .await
+                .expect("emoji store failed");
+            assert_eq!(
+                store.load_custom_emojis().await.expect("emoji load failed"),
+                emojis
             );
         });
 

@@ -67,7 +67,7 @@ The client uses Slack's user-token PKCE flow (`oauth.v2.user.access`) and reques
 Required user scopes:
 
 ```text
-channels:read,channels:history,channels:write,groups:read,groups:history,groups:write,im:read,im:history,im:write,mpim:read,mpim:history,mpim:write,users:read,usergroups:read,chat:write,search:read,stars:read,stars:write,reactions:read,reactions:write,files:read,files:write
+channels:read,channels:history,channels:write,groups:read,groups:history,groups:write,im:read,im:history,im:write,mpim:read,mpim:history,mpim:write,users:read,usergroups:read,emoji:read,chat:write,search:read,stars:read,stars:write,reactions:read,reactions:write,files:read,files:write
 ```
 
 If you connected Conduit before new scopes were added, Slack may keep using the older grant. Use **Sign Out** in the workspace menu, confirm the app has the scopes above, and reconnect so read markers, search, saved items, reactions, and file access have the permissions they expect.

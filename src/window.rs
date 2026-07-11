@@ -184,6 +184,7 @@ mod imp {
         pub image_assets: RefCell<HashMap<String, String>>,
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
+        pub custom_emojis: RefCell<HashMap<String, String>>,
     }
 
     #[glib::object_subclass]
@@ -2211,6 +2212,10 @@ impl ConduitWindow {
             RuntimeEventKind::UserGroupsLoaded { names, members } => {
                 self.populate_user_groups(names, members);
             }
+            RuntimeEventKind::EmojiCatalogLoaded(emojis) => {
+                *self.imp().custom_emojis.borrow_mut() = emojis;
+                self.rerender_current_messages();
+            }
             RuntimeEventKind::ImageAssetLoaded { key, data_uri } => {
                 crate::debug::log(
                     "ui",
@@ -3063,6 +3068,7 @@ impl ConduitWindow {
         imp.image_assets.borrow_mut().clear();
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
+        imp.custom_emojis.borrow_mut().clear();
         set_text_view_text(&imp.message_entry, "");
         set_text_view_text(&imp.thread_entry, "");
         imp.send_button.set_sensitive(true);
@@ -4483,6 +4489,7 @@ impl ConduitWindow {
             image_assets: imp.image_assets.borrow().clone(),
             failed_image_urls: imp.failed_image_assets.borrow().clone(),
             recent_reactions,
+            custom_emojis: imp.custom_emojis.borrow().clone(),
         }
     }
 

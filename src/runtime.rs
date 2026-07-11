@@ -156,6 +156,7 @@ pub enum RuntimeOperation {
     Files,
     SavedItems,
     User,
+    Emoji,
     ImageAsset,
     Media,
     PostMessage,
@@ -411,6 +412,7 @@ pub enum RuntimeEventKind {
         names: HashMap<String, String>,
         members: HashMap<String, Vec<String>>,
     },
+    EmojiCatalogLoaded(HashMap<String, String>),
     ImageAssetLoaded {
         key: String,
         data_uri: String,
@@ -513,6 +515,9 @@ impl RuntimeEventKind {
             }
             Self::UserNamesLoaded(_) | Self::UserGroupsLoaded { .. } => {
                 OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace)
+            }
+            Self::EmojiCatalogLoaded(_) => {
+                OperationContext::new(RuntimeOperation::Emoji, RuntimeTarget::Workspace)
             }
             Self::ImageAssetLoaded { key, .. } | Self::ImageAssetFailed { key } => {
                 OperationContext::new(
@@ -1289,6 +1294,38 @@ fn spawn_workspace_tasks(
     spawn_session_task(state, identity.session, async move {
         load_cached_user_names_shared(&hydration_events, &hydration_connection).await;
         load_cached_conversations(&hydration_events, &hydration_connection.workspace_store).await;
+        load_cached_custom_emojis(&hydration_events, &hydration_connection.workspace_store).await;
+
+        let emoji_events = hydration_events.clone();
+        let emoji_connection = hydration_connection.clone();
+        let emoji_limits = hydration_limits.clone();
+        spawn_request_task(
+            &state_after_hydration,
+            TrackedRequest::new(
+                identity,
+                OperationContext::new(RuntimeOperation::Emoji, RuntimeTarget::Workspace),
+            ),
+            async move {
+                let _permit = emoji_limits.acquire(RuntimeTaskLane::Background).await;
+                match emoji_connection.slack.custom_emojis().await {
+                    Ok(emojis) => {
+                        if let Some(store) = emoji_connection.workspace_store.as_ref() {
+                            if let Err(error) = store.store_custom_emojis(&emojis).await {
+                                crate::debug::log(
+                                    "store",
+                                    &format!("CustomEmojiStoreFailed error={error:#}"),
+                                );
+                            }
+                        }
+                        emoji_events.send_event(RuntimeEventKind::EmojiCatalogLoaded(emojis));
+                    }
+                    Err(error) => crate::debug::log(
+                        "runtime",
+                        &format!("CustomEmojiRefreshFailed error={error:#}"),
+                    ),
+                }
+            },
+        );
 
         let refresh_events = hydration_events.clone();
         let refresh_connection = hydration_connection.clone();
@@ -1373,6 +1410,25 @@ async fn load_cached_user_names_shared(
         .lock()
         .expect("runtime user cache lock poisoned")
         .extend(cached_names);
+}
+
+async fn load_cached_custom_emojis(
+    events: &RuntimeEventSender,
+    workspace_store: &Option<WorkspaceStore>,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+    match store.load_custom_emojis().await {
+        Ok(emojis) if !emojis.is_empty() => {
+            events.send_event(RuntimeEventKind::EmojiCatalogLoaded(emojis));
+        }
+        Ok(_) => {}
+        Err(error) => crate::debug::log(
+            "store",
+            &format!("CustomEmojiCacheLoadFailed error={error:#}"),
+        ),
+    }
 }
 
 async fn handle_connected_command(

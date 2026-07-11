@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -142,6 +142,14 @@ impl SlackApi {
 
         users.sort_by_key(|user| user.display_name().unwrap_or_default().to_lowercase());
         Ok(users)
+    }
+
+    /// Lists workspace-defined emoji. Slack represents aliases as
+    /// `alias:target`, which is intentionally preserved for catalog-level
+    /// resolution.
+    pub async fn custom_emojis(&self) -> Result<HashMap<String, String>> {
+        let response: EmojiListResponse = self.post_form("emoji.list", &[]).await?;
+        Ok(response.emoji)
     }
 
     pub async fn join_conversation(&self, channel_id: &str) -> Result<SlackConversation> {
@@ -1140,6 +1148,15 @@ struct UserGroupsListResponse {
 impl_slack_response!(UserGroupsListResponse);
 
 #[derive(Debug, Deserialize)]
+struct EmojiListResponse {
+    ok: bool,
+    error: Option<String>,
+    #[serde(default)]
+    emoji: HashMap<String, String>,
+}
+impl_slack_response!(EmojiListResponse);
+
+#[derive(Debug, Deserialize)]
 struct PostMessageResponse {
     ok: bool,
     error: Option<String>,
@@ -1238,6 +1255,27 @@ mod tests {
         assert_eq!(supported_media_mime_type("audio/mpeg"), None);
         assert_eq!(supported_media_mime_type("text/html"), None);
         assert_eq!(supported_media_mime_type("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn emoji_list_response_preserves_urls_and_aliases() {
+        let response: EmojiListResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "emoji": {
+                "party_parrot": "https://emoji.example/parrot.gif",
+                "ship_it": "alias:rocket"
+            }
+        }))
+        .expect("emoji response should parse");
+
+        assert_eq!(
+            response.emoji.get("party_parrot").map(String::as_str),
+            Some("https://emoji.example/parrot.gif")
+        );
+        assert_eq!(
+            response.emoji.get("ship_it").map(String::as_str),
+            Some("alias:rocket")
+        );
     }
 
     #[test]
