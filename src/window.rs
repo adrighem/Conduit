@@ -808,7 +808,11 @@ fn promoted_recent_reactions<'a>(
 }
 
 fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
-    let url = file.preview_url()?;
+    let url = if file.supported_media_kind() == Some("video") {
+        file.video_preview_url()?
+    } else {
+        file.preview_url()?
+    };
     Some((url.to_string(), url.to_string()))
 }
 
@@ -925,7 +929,7 @@ fn message_web_view_feature_policy() -> MessageWebViewFeaturePolicy {
         html5_local_storage: true,
         file_url_access: false,
         universal_file_url_access: false,
-        media: false,
+        media: true,
         webgl: false,
         webaudio: false,
     }
@@ -5070,7 +5074,7 @@ mod tests {
         assert!(features.html5_local_storage);
         assert!(!features.file_url_access);
         assert!(!features.universal_file_url_access);
-        assert!(!features.media);
+        assert!(features.media);
         assert!(!features.webgl);
         assert!(!features.webaudio);
     }

@@ -355,6 +355,8 @@ pub struct SlackFile {
     pub thumb_480: Option<String>,
     pub thumb_720: Option<String>,
     pub thumb_1024: Option<String>,
+    pub thumb_video: Option<String>,
+    pub url_static_preview: Option<String>,
     pub permalink: Option<String>,
     pub channels: Option<Vec<String>>,
     pub groups: Option<Vec<String>>,
@@ -378,8 +380,9 @@ impl SlackFile {
     }
 
     pub fn preview_url(&self) -> Option<&str> {
-        self.thumb_480
+        self.url_static_preview
             .as_deref()
+            .or(self.thumb_480.as_deref())
             .or(self.thumb_360.as_deref())
             .or(self.thumb_720.as_deref())
             .or(self.thumb_1024.as_deref())
@@ -391,6 +394,12 @@ impl SlackFile {
                     .then_some(self.url_private.as_deref())
                     .flatten()
             })
+    }
+
+    pub fn video_preview_url(&self) -> Option<&str> {
+        self.preview_url()
+            .or(self.thumb_video.as_deref())
+            .or(self.url_private.as_deref())
     }
 
     fn is_declared_image(&self) -> bool {
@@ -942,6 +951,40 @@ mod tests {
         );
         assert_eq!(video.supported_media_kind(), Some("video"));
         assert_eq!(video.media_url(), Some("https://files.example/video.mkv"));
+    }
+
+    #[test]
+    fn video_file_prefers_slack_static_preview_and_preserves_motion_thumbnail() {
+        let file: SlackFile = serde_json::from_value(serde_json::json!({
+            "mimetype": "video/mp4",
+            "thumb_480": "https://files.example/legacy-preview.png",
+            "thumb_video": "https://files.example/motion-preview.mp4",
+            "url_static_preview": "https://files.example/static-preview.png"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            file.preview_url(),
+            Some("https://files.example/static-preview.png")
+        );
+        assert_eq!(
+            file.thumb_video.as_deref(),
+            Some("https://files.example/motion-preview.mp4")
+        );
+        assert_eq!(
+            file.video_preview_url(),
+            Some("https://files.example/static-preview.png")
+        );
+
+        let fallback = SlackFile {
+            mimetype: Some("video/mp4".to_string()),
+            url_private: Some("https://files.example/video-preview.mp4".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fallback.video_preview_url(),
+            Some("https://files.example/video-preview.mp4")
+        );
     }
 
     #[test]

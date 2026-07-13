@@ -21,7 +21,9 @@ use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
     SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, StoredToken,
 };
-use crate::slack::{DownloadedImage, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
+use crate::slack::{
+    DownloadedPreviewAsset, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT,
+};
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent};
 use crate::store::WorkspaceStore;
 
@@ -924,7 +926,11 @@ impl ImageAssetCache {
     async fn load(&self, key: &str) -> Result<Option<String>> {
         let path = self.path_for_key(key);
         match tokio::fs::read_to_string(&path).await {
-            Ok(data_uri) if data_uri.starts_with("data:image/") => Ok(Some(data_uri)),
+            Ok(data_uri)
+                if data_uri.starts_with("data:image/") || data_uri.starts_with("data:video/") =>
+            {
+                Ok(Some(data_uri))
+            }
             Ok(_) => Ok(None),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error)
@@ -983,11 +989,11 @@ fn media_cache_path(url: &str, name: &str) -> PathBuf {
     config::media_cache_dir().join(filename)
 }
 
-fn image_data_uri(image: DownloadedImage) -> String {
+fn preview_asset_data_uri(asset: DownloadedPreviewAsset) -> String {
     format!(
         "data:{};base64,{}",
-        image.mime_type,
-        BASE64.encode(image.bytes)
+        asset.mime_type,
+        BASE64.encode(asset.bytes)
     )
 }
 
@@ -1828,18 +1834,18 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 ),
             }
 
-            match api.download_image(&url).await {
-                Ok(image) => {
+            match api.download_preview_asset(&url).await {
+                Ok(asset) => {
                     crate::debug::log(
                         "runtime",
                         &format!(
                             "ImageAssetLoaded key={} mime_type={} bytes={}",
                             crate::debug::url_for_log(&key),
-                            image.mime_type,
-                            image.bytes.len()
+                            asset.mime_type,
+                            asset.bytes.len()
                         ),
                     );
-                    let data_uri = image_data_uri(image);
+                    let data_uri = preview_asset_data_uri(asset);
                     if let Err(error) = context.image_cache.store(&key, &data_uri).await {
                         crate::debug::log(
                             "runtime",
@@ -3490,7 +3496,7 @@ mod tests {
     }
 
     #[test]
-    fn image_asset_cache_round_trips_data_uri() {
+    fn preview_asset_cache_round_trips_image_and_video_data_uris() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time before Unix epoch")
@@ -3529,6 +3535,22 @@ mod tests {
                     .expect("cache load failed")
                     .as_deref(),
                 Some("data:image/png;base64,abc")
+            );
+
+            cache
+                .store(
+                    "https://files.example/video.mp4",
+                    "data:video/mp4;base64,def",
+                )
+                .await
+                .expect("cache store failed");
+            assert_eq!(
+                cache
+                    .load("https://files.example/video.mp4")
+                    .await
+                    .expect("cache load failed")
+                    .as_deref(),
+                Some("data:video/mp4;base64,def")
             );
         });
 

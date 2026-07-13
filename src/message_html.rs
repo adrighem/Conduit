@@ -824,7 +824,8 @@ pre code {{
   background: var(--soft);
 }}
 
-.image-attachment {{
+.image-attachment,
+.video-attachment {{
   display: grid;
   gap: 6px;
   max-inline-size: 520px;
@@ -832,13 +833,44 @@ pre code {{
   margin-inline: 0;
 }}
 
-.image-attachment img {{
+.image-attachment img,
+.video-attachment img,
+.video-attachment video {{
   display: block;
   inline-size: auto;
   max-inline-size: 100%;
   max-block-size: 420px;
   border-radius: 8px;
   background: var(--soft);
+}}
+
+.video-preview {{
+  display: grid;
+  inline-size: fit-content;
+  max-inline-size: 100%;
+}}
+
+.video-preview > * {{
+  grid-area: 1 / 1;
+}}
+
+.video-preview .image-placeholder {{
+  min-inline-size: min(280px, 100%);
+}}
+
+.video-play {{
+  display: grid;
+  place-items: center;
+  align-self: center;
+  justify-self: center;
+  inline-size: 52px;
+  block-size: 52px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.68);
+  color: white;
+  font-size: 24px;
+  line-height: 1;
+  z-index: 1;
 }}
 
 .image-caption {{
@@ -1951,6 +1983,12 @@ fn attachments_html(
                         context,
                     );
                 }
+                if kind == "video" {
+                    if let Some(poster_url) = file.video_preview_url() {
+                        return video_figure_html(poster_url, &viewer_url, label, context);
+                    }
+                    return attachment_chip_html(label, Some(&viewer_url));
+                }
                 return attachment_chip_html(label, Some(&viewer_url));
             }
 
@@ -1996,7 +2034,74 @@ fn image_figure_html(
     caption: Option<&str>,
     context: &MessageHtmlContext,
 ) -> String {
-    let image = if let Some(src) = context.image_assets.get(asset_key) {
+    let image = preview_image_html(
+        asset_key,
+        alt,
+        &gettext("Loading image preview"),
+        &gettext("Image preview unavailable"),
+        context,
+    );
+
+    let caption = attachment_caption_html(caption);
+    let figure = format!("<figure class=\"image-attachment\">{image}{caption}</figure>");
+    if let Some(link) =
+        link.filter(|link| is_http_url(link) || link.starts_with("conduit://media?"))
+    {
+        format!(
+            "<a class=\"image-link\" href=\"{}\" rel=\"noreferrer noopener\">{figure}</a>",
+            escape_html(link)
+        )
+    } else {
+        figure
+    }
+}
+
+fn video_figure_html(
+    poster_key: &str,
+    viewer_url: &str,
+    label: &str,
+    context: &MessageHtmlContext,
+) -> String {
+    let alt = gettext("Video preview: {name}").replace("{name}", label);
+    let poster = if context
+        .image_assets
+        .get(poster_key)
+        .is_some_and(|asset| asset.starts_with("data:video/"))
+    {
+        let src = context.image_assets.get(poster_key).unwrap();
+        format!(
+            "<video preload=\"metadata\" muted playsinline src=\"{}\" aria-label=\"{}\"></video>",
+            escape_html(src),
+            escape_html(&alt)
+        )
+    } else {
+        preview_image_html(
+            poster_key,
+            &alt,
+            &gettext("Loading video preview"),
+            &gettext("Video preview unavailable"),
+            context,
+        )
+    };
+    let play = "<span class=\"video-play\" aria-hidden=\"true\">▶</span>";
+    let caption = attachment_caption_html(Some(label));
+    let aria_label = gettext("Play video: {name}").replace("{name}", label);
+
+    format!(
+        "<a class=\"video-link\" href=\"{}\" aria-label=\"{}\" rel=\"noreferrer noopener\"><figure class=\"video-attachment\"><div class=\"video-preview\">{poster}{play}</div>{caption}</figure></a>",
+        escape_html(viewer_url),
+        escape_html(&aria_label),
+    )
+}
+
+fn preview_image_html(
+    asset_key: &str,
+    alt: &str,
+    loading_label: &str,
+    unavailable_label: &str,
+    context: &MessageHtmlContext,
+) -> String {
+    if let Some(src) = context.image_assets.get(asset_key) {
         if debug::enabled() {
             debug::log(
                 "render",
@@ -2017,7 +2122,7 @@ fn image_figure_html(
         }
         format!(
             "<div class=\"image-placeholder\">{}</div>",
-            escape_html(&gettext("Image preview unavailable"))
+            escape_html(unavailable_label)
         )
     } else if is_http_url(asset_key) && !requires_authenticated_image(asset_key) {
         if debug::enabled() {
@@ -2043,10 +2148,12 @@ fn image_figure_html(
         }
         format!(
             "<div class=\"image-placeholder\">{}</div>",
-            escape_html(&gettext("Loading image preview"))
+            escape_html(loading_label)
         )
-    };
+    }
+}
 
+fn attachment_caption_html(caption: Option<&str>) -> String {
     let caption = caption
         .filter(|caption| !caption.trim().is_empty())
         .map(|caption| {
@@ -2056,18 +2163,7 @@ fn image_figure_html(
             )
         })
         .unwrap_or_default();
-
-    let figure = format!("<figure class=\"image-attachment\">{image}{caption}</figure>");
-    if let Some(link) =
-        link.filter(|link| is_http_url(link) || link.starts_with("conduit://media?"))
-    {
-        format!(
-            "<a class=\"image-link\" href=\"{}\" rel=\"noreferrer noopener\">{figure}</a>",
-            escape_html(link)
-        )
-    } else {
-        figure
-    }
+    caption
 }
 
 fn message_responses_html(
@@ -3355,6 +3451,97 @@ mod tests {
         let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
 
         assert!(html.contains("Loading image preview"));
+    }
+
+    #[test]
+    fn renders_video_attachment_thumbnail_linked_to_internal_viewer() {
+        let preview = "https://files.slack.com/video-preview.png";
+        let original = "https://files.slack.com/video.mp4";
+        let mut message = message("video");
+        message.files = Some(vec![SlackFile {
+            title: Some("Demo clip".to_string()),
+            mimetype: Some("video/mp4".to_string()),
+            url_private_download: Some(original.to_string()),
+            url_static_preview: Some(preview.to_string()),
+            ..Default::default()
+        }]);
+        let context = MessageHtmlContext {
+            image_assets: HashMap::from([(
+                preview.to_string(),
+                "data:image/png;base64,video-poster".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message], &context);
+
+        assert!(html.contains("class=\"video-attachment\""));
+        assert!(html.contains("src=\"data:image/png;base64,video-poster\""));
+        assert!(html.contains("alt=\"Video preview: Demo clip\""));
+        assert!(html.contains("aria-label=\"Play video: Demo clip\""));
+        assert!(html.contains("kind=video"));
+        assert!(html.contains("url=https%3A%2F%2Ffiles.slack.com%2Fvideo.mp4"));
+        assert!(html.contains("class=\"video-play\" aria-hidden=\"true\""));
+    }
+
+    #[test]
+    fn renders_video_preview_placeholder_while_thumbnail_loads() {
+        let mut message = message("video");
+        message.files = Some(vec![SlackFile {
+            title: Some("Demo clip".to_string()),
+            mimetype: Some("video/mp4".to_string()),
+            url_private: Some("https://files.slack.com/video.mp4".to_string()),
+            thumb_360: Some("https://files.slack.com/video-preview.png".to_string()),
+            ..Default::default()
+        }]);
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains("class=\"video-attachment\""));
+        assert!(html.contains("Loading video preview"));
+    }
+
+    #[test]
+    fn video_without_static_thumbnail_uses_bounded_video_preview_asset() {
+        let mut message = message("video");
+        message.files = Some(vec![SlackFile {
+            title: Some("Demo clip".to_string()),
+            mimetype: Some("video/mp4".to_string()),
+            url_private: Some("https://files.slack.com/video.mp4".to_string()),
+            ..Default::default()
+        }]);
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains("class=\"video-attachment\""));
+        assert!(html.contains("Loading video preview"));
+        assert!(html.contains("kind=video"));
+    }
+
+    #[test]
+    fn renders_loaded_motion_video_preview() {
+        let preview = "https://files.slack.com/video-preview.mp4";
+        let mut message = message("video");
+        message.files = Some(vec![SlackFile {
+            title: Some("Demo clip".to_string()),
+            mimetype: Some("video/mp4".to_string()),
+            url_private_download: Some("https://files.slack.com/original.mp4".to_string()),
+            thumb_video: Some(preview.to_string()),
+            ..Default::default()
+        }]);
+        let context = MessageHtmlContext {
+            image_assets: HashMap::from([(
+                preview.to_string(),
+                "data:video/mp4;base64,motion-preview".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message], &context);
+
+        assert!(html.contains("<video preload=\"metadata\" muted playsinline"));
+        assert!(html.contains("src=\"data:video/mp4;base64,motion-preview\""));
+        assert!(html.contains("aria-label=\"Video preview: Demo clip\""));
     }
 
     #[test]

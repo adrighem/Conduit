@@ -20,6 +20,7 @@ use crate::search::{
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
 const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PREVIEW_VIDEO_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
 const MAX_RETRY_AFTER_SECONDS: u64 = 30;
@@ -443,14 +444,14 @@ impl SlackApi {
         Ok(response.usergroups)
     }
 
-    pub async fn download_image(&self, url: &str) -> Result<DownloadedImage> {
+    pub async fn download_preview_asset(&self, url: &str) -> Result<DownloadedPreviewAsset> {
         let response = self
             .authenticated_request(Method::GET, url)
             .send()
             .await
-            .context("failed to download Slack image preview")?
+            .context("failed to download Slack attachment preview")?
             .error_for_status()
-            .context("Slack image preview returned an HTTP error")?;
+            .context("Slack attachment preview returned an HTTP error")?;
 
         let mime_type = response
             .headers()
@@ -458,26 +459,40 @@ impl SlackApi {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .map(str::trim)
-            .filter(|value| value.starts_with("image/"))
-            .ok_or_else(|| anyhow!("Slack image preview did not return an image content type"))?
+            .filter(|value| {
+                value.starts_with("image/")
+                    || matches!(
+                        *value,
+                        "video/mp4" | "video/webm" | "video/quicktime" | "video/ogg"
+                    )
+            })
+            .ok_or_else(|| {
+                anyhow!("Slack attachment preview returned an unsupported content type")
+            })?
             .to_string();
+
+        let max_bytes = if mime_type.starts_with("video/") {
+            MAX_PREVIEW_VIDEO_BYTES
+        } else {
+            MAX_PREVIEW_IMAGE_BYTES
+        };
 
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_PREVIEW_IMAGE_BYTES as u64)
+            .is_some_and(|length| length > max_bytes as u64)
         {
-            return Err(anyhow!("Slack image preview is larger than 8 MiB"));
+            return Err(anyhow!("Slack attachment preview is too large"));
         }
 
         let bytes = response
             .bytes()
             .await
-            .context("failed to read Slack image preview bytes")?;
-        if bytes.len() > MAX_PREVIEW_IMAGE_BYTES {
-            return Err(anyhow!("Slack image preview is larger than 8 MiB"));
+            .context("failed to read Slack attachment preview bytes")?;
+        if bytes.len() > max_bytes {
+            return Err(anyhow!("Slack attachment preview is too large"));
         }
 
-        Ok(DownloadedImage {
+        Ok(DownloadedPreviewAsset {
             mime_type,
             bytes: bytes.to_vec(),
         })
@@ -972,7 +987,7 @@ fn conversation_latest_ts(conversation: &SlackConversation) -> Option<&str> {
 }
 
 #[derive(Debug, Clone)]
-pub struct DownloadedImage {
+pub struct DownloadedPreviewAsset {
     pub mime_type: String,
     pub bytes: Vec<u8>,
 }

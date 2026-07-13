@@ -30,7 +30,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Paged channel history and threaded replies.
 - Multiline message and thread composers with persistent per-conversation drafts.
 - File uploads with progress reporting.
-- Edited and deleted messages, Slack links and mentions, user-group mentions, common Block Kit content, code blocks, attachments, and image previews.
+- Edited and deleted messages, Slack links and mentions, user-group mentions, common Block Kit content, code blocks, attachments, and image and video previews.
 - Workspace custom emoji in messages, reactions, and the searchable reaction picker.
 - Add and remove reactions, save messages for Later, copy message text or links, and forward messages.
 
