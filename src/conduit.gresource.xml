@@ -12,8 +12,6 @@
     <file alias="icons/hicolor/128x128/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/128x128/apps/eu.vanadrighem.conduit.png</file>
     <file alias="icons/hicolor/256x256/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/256x256/apps/eu.vanadrighem.conduit.png</file>
     <file alias="icons/hicolor/512x512/apps/eu.vanadrighem.conduit.png">../data/icons/hicolor/512x512/apps/eu.vanadrighem.conduit.png</file>
-    <file alias="icons/hicolor/128x128/apps/eu.vanadrighem.conduit-about.png">../data/icons/hicolor/128x128/apps/eu.vanadrighem.conduit-about.png</file>
-    <file alias="icons/hicolor/256x256/apps/eu.vanadrighem.conduit-about.png">../data/icons/hicolor/256x256/apps/eu.vanadrighem.conduit-about.png</file>
-    <file alias="icons/hicolor/512x512/apps/eu.vanadrighem.conduit-about.png">../data/icons/hicolor/512x512/apps/eu.vanadrighem.conduit-about.png</file>
+    <file alias="icons/hicolor/scalable/apps/eu.vanadrighem.conduit.svg">../data/icons/hicolor/scalable/apps/eu.vanadrighem.conduit.svg</file>
   </gresource>
 </gresources>

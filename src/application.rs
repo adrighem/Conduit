@@ -30,7 +30,7 @@ use crate::shortcuts::APP_SHORTCUTS;
 use crate::ConduitWindow;
 
 const OPEN_CONVERSATION_ACTION: &str = "app.open-conversation";
-const ABOUT_ICON_NAME: &str = "eu.vanadrighem.conduit-about";
+const ABOUT_ICON_NAME: &str = config::APPLICATION_ID;
 const ABOUT_LOGO_SIZE: i32 = 192;
 
 fn resize_about_logo(dialog: &adw::AboutDialog) -> bool {
@@ -363,7 +363,7 @@ mod tests {
     fn about_logo_is_larger_than_libadwaita_default() {
         const LIBADWAITA_ABOUT_ICON_SIZE: i32 = 128;
 
-        assert_eq!(ABOUT_ICON_NAME, "eu.vanadrighem.conduit-about");
+        assert_eq!(ABOUT_ICON_NAME, config::APPLICATION_ID);
         assert!(ABOUT_LOGO_SIZE > LIBADWAITA_ABOUT_ICON_SIZE);
     }
 
