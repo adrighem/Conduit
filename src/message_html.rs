@@ -201,6 +201,7 @@ fn reaction_picker_script() -> &'static str {
   const search = picker.querySelector("#emoji-search");
   const choices = Array.from(picker.querySelectorAll(".emoji-choice"));
   const grid = picker.querySelector(".emoji-grid");
+  const categories = picker.querySelector(".emoji-categories");
   const tabs = Array.from(picker.querySelectorAll("[data-emoji-category]"));
   const empty = picker.querySelector(".emoji-empty");
   let activeCategory = "Smileys";
@@ -219,9 +220,14 @@ fn reaction_picker_script() -> &'static str {
     return fieldTokens(term, value).reduce(function (best, token) {
       const position = token.indexOf(term);
       if (position < 0) return best;
-      const completion = Math.floor(Array.from(term).length * 100 / Math.max(Array.from(token).length, 1));
-      const placement = token === term ? 100 : position === 0 ? 90 : 75;
-      const score = Math.floor(Math.floor(completion * placement / 100) * fieldWeight / 100);
+      const termLength = Array.from(term).length;
+      const tokenLength = Math.max(Array.from(token).length, 1);
+      const matchScore = token === term
+        ? 100
+        : position === 0
+          ? Math.min(90, 50 + termLength * 10)
+          : Math.floor(Math.floor(termLength * 100 / tokenLength) * 75 / 100);
+      const score = Math.floor(matchScore * fieldWeight / 100);
       return Math.max(best, score);
     }, -1);
   }
@@ -241,13 +247,14 @@ fn reaction_picker_script() -> &'static str {
 
   function filterChoices() {
     const terms = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+    categories.hidden = terms.length > 0;
     let visible = 0;
     choices.forEach(function (choice) {
       const score = choiceMatchScore(choice, terms);
       const matchesQuery = score !== null;
       const matchesCategory = terms.length > 0 || choice.dataset.category === activeCategory;
       choice.hidden = !(matchesQuery && matchesCategory);
-      choice.dataset.matchBand = String(Math.floor((score || 0) / 10));
+      choice.dataset.matchBand = String(Math.min(Math.floor((score || 0) / 5), 19));
       if (!choice.hidden) {
         const image = choice.querySelector("img[data-src]");
         if (image) {
@@ -475,7 +482,7 @@ pub fn threads_document(items: &[ThreadInboxItem], context: &MessageHtmlContext)
     if items.is_empty() {
         return placeholder_document(
             &gettext("Threads"),
-            &gettext("Threads you open or participate in will appear here"),
+            &gettext("No threads have been discovered yet"),
         );
     }
 
@@ -486,9 +493,14 @@ pub fn threads_document(items: &[ThreadInboxItem], context: &MessageHtmlContext)
     );
     for item in items {
         let reply_count = item.root.reply_count.unwrap_or_default();
-        let label = gettext("{channel} · {count} replies")
+        let mut label = gettext("{channel} · {count} replies")
             .replace("{channel}", &item.channel_title)
             .replace("{count}", &reply_count.to_string());
+        if let Some(unread_count) = item.root.unread_count.filter(|count| *count > 0) {
+            label.push_str(
+                &gettext(" · {count} unread").replace("{count}", &unread_count.to_string()),
+            );
+        }
         body.push_str(&format!(
             "<li class=\"message-list-item\"><a class=\"activity-row\" href=\"{}\">{}</a>{}</li>",
             escape_html(&thread_action_url(&item.channel_id, &item.root.ts)),
@@ -1171,6 +1183,10 @@ pre code {{
   border-block-end: 1px solid var(--line);
 }}
 
+.emoji-categories[hidden] {{
+  display: none;
+}}
+
 .emoji-categories button {{
   min-block-size: 36px;
   padding-inline: 9px;
@@ -1533,6 +1549,11 @@ fn load_more_action_html(url: &str, label: &str) -> String {
 }
 
 fn activity_item_html(item: &ActivityItem) -> String {
+    let action_url = item
+        .thread_ts
+        .as_deref()
+        .map(|thread_ts| thread_action_url(&item.channel_id, thread_ts))
+        .unwrap_or_else(|| unreads_open_action_url(&item.channel_id));
     format!(
         concat!(
             "<li><a class=\"activity-row\" href=\"{}\">",
@@ -1541,7 +1562,7 @@ fn activity_item_html(item: &ActivityItem) -> String {
             "<span class=\"activity-meta\">{}</span>",
             "</a></li>"
         ),
-        escape_html(&unreads_open_action_url(&item.channel_id)),
+        escape_html(&action_url),
         escape_html(&item.title),
         escape_html(&item.unread_label()),
         escape_html(&item.kind.label())
@@ -3070,6 +3091,10 @@ mod tests {
         assert!(html.contains("data-category=\"Workspace\""));
         assert!(html.contains("data-src=\"https://emoji.example/party-parrot.gif\""));
         assert!(html.contains("data-category=\"Flags\""));
+        assert!(html.contains("categories.hidden = terms.length > 0"));
+        assert!(html.contains(".emoji-categories[hidden]"));
+        assert!(html.contains("Math.min(90, 50 + termLength * 10)"));
+        assert!(html.contains("Math.min(Math.floor((score || 0) / 5), 19)"));
     }
 
     #[test]
@@ -3568,6 +3593,7 @@ mod tests {
     fn unreads_document_renders_rows() {
         let items = vec![ActivityItem {
             channel_id: "C123".to_string(),
+            thread_ts: None,
             title: "#general & friends".to_string(),
             kind: ActivityKind::PublicChannel,
             unread: true,
@@ -3591,6 +3617,21 @@ mod tests {
 
         assert!(html.contains("No unread conversations"));
         assert!(!html.contains("<a class=\"activity-row\""));
+    }
+
+    #[test]
+    fn unreads_document_links_thread_activity_to_the_thread() {
+        let html = unreads_document(&[ActivityItem {
+            channel_id: "C123".to_string(),
+            thread_ts: Some("1710000000.000100".to_string()),
+            title: "#general: Deployment".to_string(),
+            kind: ActivityKind::Thread,
+            unread: true,
+            unread_count: 2,
+        }]);
+
+        assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains("Thread"));
     }
 
     #[test]
@@ -3725,6 +3766,8 @@ mod tests {
         }];
         let search = search_results_document(&results, &MessageHtmlContext::default());
         assert!(search.contains("<ol class=\"message-list\"><li class=\"message-list-item\">"));
+        assert_eq!(search.matches("<ol class=\"message-list\">").count(), 1);
+        assert!(!search.contains("<section"));
         assert!(search.contains("<time class=\"metadata\""));
         assert!(search.contains("id=\"message-1710000000.000100\" tabindex=\"-1\""));
 

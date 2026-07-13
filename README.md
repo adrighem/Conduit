@@ -19,11 +19,12 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 ### Conversations and navigation
 
 - Adaptive GNOME interface for channels, direct messages, and group messages.
+- Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state.
 - Sections for Messages, Unreads, observed threads, Files, and Later.
 - Fast conversation switcher with discovery of channels and people.
 - Cached conversations, names, histories, threads, and read state for responsive startup.
 - Unread badges, muted and external-conversation indicators, read markers, and desktop notifications for incoming realtime events.
-- Multi-word, case-insensitive substring filtering with relevance-band ranking across conversation, forwarding, message, and emoji searches.
+- Multi-word, case-insensitive substring filtering with globally ranked, category-free results across conversation, forwarding, message, and emoji searches. Group-DM ranking also considers the share of other participants whose names match, and group titles omit your own name.
 
 ### Messaging
 
@@ -37,8 +38,10 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 ### Search, files, and media
 
 - Workspace message search with Slack modifiers such as `from:`, `in:`, and `has:` preserved.
+- A persistent Threads inbox assembled from fetched history, opened threads, realtime replies, and Slack subscription/unread metadata.
 - Relevance-ranked multi-term results while retaining Slack's own result order for close matches.
 - Files and saved-item views with navigation back to their source messages.
+- Slack message permalinks for the connected workspace open directly inside Conduit.
 - Internal image and video viewer with galleries, zoom, fullscreen, context actions, and Save As.
 
 ### Sync and resilience
@@ -55,6 +58,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - OAuth requires your own Slack app unless a packaged build supplies a client ID.
 - Socket Mode is optional and requires separate Slack app configuration and an `xapp-` token.
 - Workspace search is bounded by Slack's search API and cannot guarantee arbitrary middle-of-word discovery outside the candidates Slack returns.
+- Slack's public API cannot enumerate every historical subscribed thread. Conduit retains and reconciles every thread it discovers, but a fresh installation builds its thread catalog progressively as history and replies are fetched.
 - Threads and Unreads reflect the conversations and activity Conduit has observed; they are not complete Slack-wide activity aggregators.
 - File and workspace-search views currently load a bounded result set rather than every page.
 - Rich composer formatting, autocomplete, message editing/deletion controls, typing indicators, presence, avatars, calls, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.

@@ -17,6 +17,7 @@ use crate::auth::{
     SlackOAuthClient, TokenStore,
 };
 use crate::config;
+use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
     SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, StoredToken,
@@ -24,11 +25,14 @@ use crate::models::{
 use crate::slack::{
     DownloadedPreviewAsset, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT,
 };
-use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent};
+use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::WorkspaceStore;
+use crate::thread_catalog::ThreadRecord;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
-const UNREAD_STATE_PRIORITY_REFRESH_LIMIT: usize = 30;
+const MAX_UNREAD_REFRESH_PASSES: usize = 3;
+const UNREAD_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(1);
+const CONVERSATION_PATCH_BATCH_SIZE: usize = 20;
 const NAVIGATION_TASK_CONCURRENCY: usize = 2;
 const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
 const BACKGROUND_TASK_CONCURRENCY: usize = 3;
@@ -94,6 +98,11 @@ pub enum RuntimeCommand {
     },
     MarkConversationRead {
         channel_id: String,
+        ts: String,
+    },
+    MarkThreadRead {
+        channel_id: String,
+        thread_ts: String,
         ts: String,
     },
     PostMessage {
@@ -212,6 +221,7 @@ impl RuntimeCommand {
                 | Self::PostMessage { .. }
                 | Self::SetReaction { .. }
                 | Self::SetSaved { .. }
+                | Self::MarkThreadRead { .. }
                 | Self::UploadFile { .. }
         )
     }
@@ -308,6 +318,17 @@ impl RuntimeCommand {
                 RuntimeOperation::ReadMarker,
                 RuntimeTarget::Channel(channel_id.clone()),
             ),
+            Self::MarkThreadRead {
+                channel_id,
+                thread_ts,
+                ..
+            } => OperationContext::new(
+                RuntimeOperation::ReadMarker,
+                RuntimeTarget::Thread {
+                    channel_id: channel_id.clone(),
+                    thread_ts: thread_ts.clone(),
+                },
+            ),
             Self::PostMessage {
                 channel_id,
                 thread_ts,
@@ -383,6 +404,10 @@ pub enum RuntimeEventKind {
         users: Vec<SlackUser>,
     },
     ConversationOpened(SlackConversation),
+    ConversationsPatched {
+        conversations: Vec<SlackConversation>,
+        unread_states: Vec<(String, SlackUnreadState, Option<String>)>,
+    },
     ConversationUnreadUpdated {
         channel_id: String,
         unread_state: SlackUnreadState,
@@ -395,6 +420,7 @@ pub enum RuntimeEventKind {
         channel_id: String,
         messages: Vec<SlackMessage>,
     },
+    ThreadCatalogLoaded(Vec<ThreadRecord>),
     HistoryLoaded {
         channel_id: String,
         messages: Vec<SlackMessage>,
@@ -472,8 +498,10 @@ impl RuntimeEventKind {
                 OperationContext::new(RuntimeOperation::Authenticate, RuntimeTarget::Workspace)
             }
             Self::ConversationsLoaded(_)
+            | Self::ConversationsPatched { .. }
             | Self::ConversationsLoadFailed(_)
             | Self::ConversationUnreadUpdated { .. }
+            | Self::ThreadCatalogLoaded(_)
             | Self::ConversationNotificationCandidate { .. } => {
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
             }
@@ -1294,8 +1322,16 @@ fn spawn_authentication_task<F>(
                         connection
                     };
 
+                    let current_user_id = auth.user_id.clone();
                     events.send_event(RuntimeEventKind::Authenticated(auth));
-                    spawn_workspace_tasks(&state_for_task, identity, events, connection, limits);
+                    spawn_workspace_tasks(
+                        &state_for_task,
+                        identity,
+                        events,
+                        connection,
+                        limits,
+                        current_user_id,
+                    );
                 }
                 Err(error) => events.send_event(RuntimeEventKind::Error(error.to_string())),
             }
@@ -1309,6 +1345,7 @@ fn spawn_workspace_tasks(
     events: RuntimeEventSender,
     connection: RuntimeConnection,
     limits: RuntimeTaskLimits,
+    current_user_id: Option<String>,
 ) {
     let state_after_hydration = Arc::clone(state);
     let hydration_events = events.clone();
@@ -1317,6 +1354,7 @@ fn spawn_workspace_tasks(
     spawn_session_task(state, identity.session, async move {
         load_cached_user_names_shared(&hydration_events, &hydration_connection).await;
         load_cached_conversations(&hydration_events, &hydration_connection.workspace_store).await;
+        load_cached_thread_catalog(&hydration_events, &hydration_connection.workspace_store).await;
         load_cached_custom_emojis(&hydration_events, &hydration_connection.workspace_store).await;
 
         let emoji_events = hydration_events.clone();
@@ -1417,7 +1455,12 @@ fn spawn_workspace_tasks(
         spawn_session_task(
             state,
             identity.session,
-            run_socket_mode(app_token, socket_events),
+            run_socket_mode(
+                app_token,
+                socket_events,
+                connection.workspace_store.clone(),
+                current_user_id,
+            ),
         );
     }
 }
@@ -1577,19 +1620,28 @@ fn conversation_unread_refresh_candidates(conversations: &[SlackConversation]) -
         .iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .filter(|conversation| !conversation.id.trim().is_empty())
-        .map(|conversation| {
-            (
-                conversation.display_name().to_lowercase(),
-                conversation.id.clone(),
-            )
+        .map(|conversation| ChannelHistoryPrefetchCandidate {
+            id: conversation.id.clone(),
+            unread: conversation.has_unread_activity(),
+            unread_count: conversation.unread_activity_count(),
+            activity_score: conversation_activity_score(conversation),
+            title: conversation.display_name().to_lowercase(),
         })
         .collect::<Vec<_>>();
 
-    candidates.sort();
-    candidates.dedup_by(|left, right| left.1 == right.1);
+    candidates.sort_by(|left, right| {
+        right
+            .unread
+            .cmp(&left.unread)
+            .then_with(|| right.unread_count.cmp(&left.unread_count))
+            .then_with(|| right.activity_score.total_cmp(&left.activity_score))
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates.dedup_by(|left, right| left.id == right.id);
     candidates
         .into_iter()
-        .map(|(_, channel_id)| channel_id)
+        .map(|candidate| candidate.id)
         .collect()
 }
 
@@ -1681,6 +1733,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             context.events.send_status("Joining conversation");
             let conversation = api.join_conversation(&channel_id).await?;
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.store_conversation(&conversation).await?;
+            }
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -1691,6 +1746,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let mut conversation = api.open_direct_message(&user_id).await?;
             conversation.user = Some(user_id);
             conversation.is_im = Some(true);
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.store_conversation(&conversation).await?;
+            }
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -1701,6 +1759,13 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             load_cached_history(context.events, context.workspace_store, &channel_id).await;
             context.events.send_status("Loading conversation");
             let page = api.history(&channel_id).await?;
+            observe_thread_history(
+                context.events,
+                context.workspace_store,
+                &channel_id,
+                &page.messages,
+            )
+            .await;
             store_history(context.workspace_store, &channel_id, &page.messages).await;
             crate::debug::log(
                 "runtime",
@@ -1721,6 +1786,13 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             );
             context.events.send_status("Loading older messages");
             let page = api.history_page(&channel_id, Some(&cursor)).await?;
+            observe_thread_history(
+                context.events,
+                context.workspace_store,
+                &channel_id,
+                &page.messages,
+            )
+            .await;
             store_merged_history(context.workspace_store, &channel_id, &page.messages).await;
             send_history_loaded(context.events, channel_id, page, true);
         }
@@ -1729,6 +1801,37 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             load_cached_thread(context.events, context.workspace_store, &channel_id, &ts).await;
             context.events.send_status("Loading thread");
             let page = api.thread_replies(&channel_id, &ts).await?;
+            observe_thread_page(
+                context.events,
+                context.workspace_store,
+                &channel_id,
+                &ts,
+                &page.messages,
+                !page.has_more && page.next_cursor.is_none(),
+            )
+            .await;
+            if !page.has_more && page.next_cursor.is_none() {
+                if let Some(latest_ts) = page
+                    .messages
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .max()
+                {
+                    if let Some(store) = context.workspace_store.as_ref() {
+                        if let Err(error) =
+                            store.mark_thread_read(&channel_id, &ts, latest_ts).await
+                        {
+                            crate::debug::log(
+                            "store",
+                            &format!("ThreadReadStoreFailed channel_id={channel_id} ts={ts} error={error:#}"),
+                        );
+                        } else {
+                            load_cached_thread_catalog(context.events, context.workspace_store)
+                                .await;
+                        }
+                    }
+                }
+            }
             store_thread(context.workspace_store, &channel_id, &ts, &page.messages).await;
             send_thread_loaded(context.events, channel_id, ts, page, false);
         }
@@ -1746,6 +1849,53 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let page = api
                 .thread_replies_page(&channel_id, &ts, Some(&cursor))
                 .await?;
+            let merged_messages = if let Some(store) = context.workspace_store.as_ref() {
+                match store
+                    .store_merged_thread(&channel_id, &ts, &page.messages)
+                    .await
+                {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        crate::debug::log(
+                            "store",
+                            &format!("ThreadMergeStoreFailed channel_id={channel_id} ts={ts} error={error:#}"),
+                        );
+                        page.messages.clone()
+                    }
+                }
+            } else {
+                page.messages.clone()
+            };
+            observe_thread_page(
+                context.events,
+                context.workspace_store,
+                &channel_id,
+                &ts,
+                &page.messages,
+                !page.has_more && page.next_cursor.is_none(),
+            )
+            .await;
+            if !page.has_more && page.next_cursor.is_none() {
+                if let Some(latest_ts) = merged_messages
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .max()
+                {
+                    if let Some(store) = context.workspace_store.as_ref() {
+                        if let Err(error) =
+                            store.mark_thread_read(&channel_id, &ts, latest_ts).await
+                        {
+                            crate::debug::log(
+                        "store",
+                        &format!("ThreadReadStoreFailed channel_id={channel_id} ts={ts} error={error:#}"),
+                    );
+                        } else {
+                            load_cached_thread_catalog(context.events, context.workspace_store)
+                                .await;
+                        }
+                    }
+                }
+            }
             send_thread_loaded(context.events, channel_id, ts, page, true);
         }
         RuntimeCommand::LoadMessageContext(location) => {
@@ -1890,10 +2040,21 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 api,
                 context.events,
                 context.read_marks,
+                context.workspace_store,
                 &channel_id,
                 &ts,
             )
             .await;
+        }
+        RuntimeCommand::MarkThreadRead {
+            channel_id,
+            thread_ts,
+            ts,
+        } => {
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.mark_thread_read(&channel_id, &thread_ts, &ts).await?;
+                load_cached_thread_catalog(context.events, context.workspace_store).await;
+            }
         }
         RuntimeCommand::PostMessage {
             channel_id,
@@ -1979,12 +2140,63 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
     Ok(())
 }
 
-async fn run_socket_mode(app_token: String, events: RuntimeEventSender) {
+async fn run_socket_mode(
+    app_token: String,
+    events: RuntimeEventSender,
+    workspace_store: Option<WorkspaceStore>,
+    current_user_id: Option<String>,
+) {
     let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
 
     loop {
         let events_for_run = events.clone();
+        let store_for_run = workspace_store.clone();
+        let user_for_run = current_user_id.clone();
         let result = socket_mode::run_once(&app_token, move |event| {
+            if let (Some(store), SocketModeEvent::Message(message)) =
+                (store_for_run.clone(), &event)
+            {
+                let channel_id = message.channel_id.clone();
+                let posted = message.kind == SocketModeMessageKind::Posted;
+                let message = message.message.clone();
+                let current_user_id = user_for_run.clone();
+                let catalog_events = events_for_run.clone();
+                tokio::spawn(async move {
+                    if posted && message.user.as_deref() != current_user_id.as_deref()
+                    {
+                        if let Err(error) = store
+                            .mark_conversation_unread_from_event(&channel_id, &message.ts)
+                            .await
+                        {
+                            crate::debug::log(
+                                "store",
+                                &format!("ConversationRealtimeStoreFailed channel_id={channel_id} error={error:#}"),
+                            );
+                        }
+                    }
+                    if posted {
+                        if let Err(error) = store
+                            .observe_thread_realtime(&channel_id, &message, current_user_id.as_deref())
+                            .await
+                        {
+                            crate::debug::log(
+                                "store",
+                                &format!("ThreadRealtimeStoreFailed channel_id={channel_id} error={error:#}"),
+                            );
+                        } else {
+                          match store.load_thread_catalog().await {
+                            Ok(records) if !records.is_empty() => catalog_events
+                                .send_event(RuntimeEventKind::ThreadCatalogLoaded(records)),
+                            Ok(_) => {}
+                            Err(error) => crate::debug::log(
+                                "store",
+                                &format!("ThreadCatalogLoadFailed error={error:#}"),
+                            ),
+                          }
+                        }
+                    }
+                });
+            }
             events_for_run.send_event(RuntimeEventKind::SocketModeEvent(event));
         })
         .await;
@@ -2136,14 +2348,37 @@ async fn load_conversations_with_api(
     workspace_store: &Option<WorkspaceStore>,
 ) -> Result<Vec<SlackConversation>> {
     events.send_status("Loading conversations");
-    let conversations = api.conversations().await?;
-    store_conversations(workspace_store, &conversations).await;
+    let fresh = api.conversations().await?;
+    let conversations = if let Some(store) = workspace_store.as_ref() {
+        store.reconcile_conversations(fresh).await?
+    } else {
+        reconcile_conversation_snapshot(Vec::new(), fresh)?
+    };
     crate::debug::log(
         "runtime",
         &format!("ConversationsLoaded count={}", conversations.len()),
     );
     events.send_event(RuntimeEventKind::ConversationsLoaded(conversations.clone()));
     Ok(conversations)
+}
+
+fn reconcile_conversation_snapshot(
+    cached: Vec<SlackConversation>,
+    fresh: Vec<SlackConversation>,
+) -> Result<Vec<SlackConversation>> {
+    if fresh.is_empty() && !cached.is_empty() {
+        return Err(anyhow!(
+            "Slack returned an unexpectedly empty conversation membership snapshot"
+        ));
+    }
+
+    let mut catalog = ConversationCatalog::from_cached(cached);
+    let mut snapshot = catalog.begin_membership_snapshot();
+    for conversation in fresh {
+        snapshot.upsert(conversation);
+    }
+    catalog.commit_membership_snapshot(snapshot);
+    Ok(catalog.conversations())
 }
 
 async fn load_conversations_best_effort_with_api(
@@ -2158,9 +2393,8 @@ async fn load_conversations_best_effort_with_api(
             refresh_conversation_unread_states_best_effort(
                 events,
                 api,
-                unread_refresh_candidates
-                    .iter()
-                    .take(UNREAD_STATE_PRIORITY_REFRESH_LIMIT),
+                workspace_store,
+                unread_refresh_candidates.iter(),
             )
             .await;
             prefetch_channel_histories_best_effort(events, api, workspace_store, &conversations)
@@ -2182,26 +2416,132 @@ async fn load_conversations_best_effort_with_api(
 async fn refresh_conversation_unread_states_best_effort<'a>(
     events: &RuntimeEventSender,
     api: &SlackApi,
+    workspace_store: &Option<WorkspaceStore>,
     channel_ids: impl IntoIterator<Item = &'a String>,
 ) {
-    for channel_id in channel_ids {
-        match api.unread_state(channel_id).await {
-            Ok(unread_state) => {
-                crate::debug::log(
-                    "runtime",
-                    &format!(
-                        "ConversationUnreadRefreshed channel_id={channel_id} known={} unread={} display_count={}",
-                        unread_state.known, unread_state.has_unread, unread_state.display_count
-                    ),
-                );
-                send_conversation_unread_update(events, channel_id, unread_state);
-            }
+    let mut pending = channel_ids.into_iter().cloned().collect::<Vec<_>>();
+    if let Some(store) = workspace_store.as_ref() {
+        match store.load_pending_unread_refresh().await {
+            Ok(cached_pending) => pending.extend(cached_pending),
             Err(error) => crate::debug::log(
-                "runtime",
-                &format!("ConversationUnreadRefreshFailed channel_id={channel_id} error={error:#}"),
+                "store",
+                &format!("PendingUnreadRefreshLoadFailed error={error:#}"),
             ),
         }
     }
+    pending.sort();
+    pending.dedup();
+    if let Some(store) = workspace_store.as_ref() {
+        if let Err(error) = store.store_pending_unread_refresh(&pending).await {
+            crate::debug::log(
+                "store",
+                &format!("PendingUnreadRefreshStoreFailed error={error:#}"),
+            );
+        }
+    }
+    let mut enriched_batch = Vec::new();
+    let mut unread_batch = Vec::new();
+    for pass in 0..MAX_UNREAD_REFRESH_PASSES {
+        let mut failed = Vec::new();
+        for channel_id in std::mem::take(&mut pending) {
+            match api.conversation_with_unread_state(&channel_id).await {
+                Ok((details, unread_state)) => {
+                    let server_last_read = details.as_ref().and_then(|details| {
+                        details.extra.get("last_read")?.as_str().map(str::to_string)
+                    });
+                    if let Some(mut details) = details {
+                        if details.is_mpim.unwrap_or(false) {
+                            match api.conversation_members(&channel_id).await {
+                                Ok(members) => {
+                                    details.extra.insert(
+                                        "members".to_string(),
+                                        serde_json::json!(members),
+                                    );
+                                }
+                                Err(error) => crate::debug::log(
+                                    "runtime",
+                                    &format!("ConversationMembersRefreshFailed channel_id={channel_id} error={error:#}"),
+                                ),
+                            }
+                        }
+                        if let Some(store) = workspace_store.as_ref() {
+                            if let Err(error) = store.merge_conversation(&details).await {
+                                crate::debug::log(
+                                    "store",
+                                    &format!("ConversationEnrichmentStoreFailed channel_id={channel_id} error={error:#}"),
+                                );
+                            }
+                        }
+                        enriched_batch.push(details);
+                    }
+                    crate::debug::log(
+                        "runtime",
+                        &format!(
+                            "ConversationUnreadRefreshed channel_id={channel_id} known={} unread={} display_count={}",
+                            unread_state.known, unread_state.has_unread, unread_state.display_count
+                        ),
+                    );
+                    if unread_state.known
+                        && store_conversation_unread_state(
+                            workspace_store,
+                            &channel_id,
+                            unread_state,
+                            server_last_read.as_deref(),
+                        )
+                        .await
+                    {
+                        unread_batch.push((channel_id.clone(), unread_state, server_last_read));
+                    } else if !unread_state.known {
+                        failed.push(channel_id.clone());
+                    }
+                    if enriched_batch.len() + unread_batch.len() >= CONVERSATION_PATCH_BATCH_SIZE {
+                        send_conversation_patch_batch(
+                            events,
+                            &mut enriched_batch,
+                            &mut unread_batch,
+                        );
+                    }
+                }
+                Err(error) => {
+                    crate::debug::log(
+                        "runtime",
+                        &format!("ConversationUnreadRefreshFailed channel_id={channel_id} pass={} error={error:#}", pass + 1),
+                    );
+                    failed.push(channel_id);
+                }
+            }
+        }
+        pending = failed;
+        if pending.is_empty() {
+            break;
+        }
+        if pass + 1 < MAX_UNREAD_REFRESH_PASSES {
+            tokio::time::sleep(UNREAD_REFRESH_RETRY_DELAY).await;
+        }
+    }
+    if let Some(store) = workspace_store.as_ref() {
+        if let Err(error) = store.store_pending_unread_refresh(&pending).await {
+            crate::debug::log(
+                "store",
+                &format!("PendingUnreadRefreshStoreFailed error={error:#}"),
+            );
+        }
+    }
+    send_conversation_patch_batch(events, &mut enriched_batch, &mut unread_batch);
+}
+
+fn send_conversation_patch_batch(
+    events: &RuntimeEventSender,
+    conversations: &mut Vec<SlackConversation>,
+    unread_states: &mut Vec<(String, SlackUnreadState, Option<String>)>,
+) {
+    if conversations.is_empty() && unread_states.is_empty() {
+        return;
+    }
+    events.send_event(RuntimeEventKind::ConversationsPatched {
+        conversations: std::mem::take(conversations),
+        unread_states: std::mem::take(unread_states),
+    });
 }
 
 async fn prefetch_channel_histories_best_effort(
@@ -2246,7 +2586,16 @@ async fn prefetch_channel_histories_best_effort(
 
         match api.history(&channel_id).await {
             Ok(page) => {
-                send_conversation_unread_update(events, &channel_id, page.unread_state);
+                if store_conversation_unread_state(
+                    workspace_store,
+                    &channel_id,
+                    page.unread_state,
+                    None,
+                )
+                .await
+                {
+                    send_conversation_unread_update(events, &channel_id, page.unread_state);
+                }
                 send_conversation_notification_candidate(events, &channel_id, &page.messages);
                 crate::debug::log(
                     "runtime",
@@ -2395,6 +2744,7 @@ async fn mark_conversation_read_best_effort(
     api: &SlackApi,
     events: &RuntimeEventSender,
     read_marks: &mut HashMap<String, String>,
+    workspace_store: &Option<WorkspaceStore>,
     channel_id: &str,
     latest_ts: &str,
 ) {
@@ -2406,6 +2756,7 @@ async fn mark_conversation_read_best_effort(
         .get(channel_id)
         .is_some_and(|marked_ts| marked_ts.as_str() >= latest_ts)
     {
+        clear_cached_conversation_unread(workspace_store, channel_id, latest_ts).await;
         events.send_event(RuntimeEventKind::ConversationMarkedRead {
             channel_id: channel_id.to_string(),
             ts: latest_ts.to_string(),
@@ -2432,10 +2783,96 @@ async fn mark_conversation_read_best_effort(
     }
 
     read_marks.insert(channel_id.to_string(), latest_ts.to_string());
+    clear_cached_conversation_unread(workspace_store, channel_id, latest_ts).await;
     events.send_event(RuntimeEventKind::ConversationMarkedRead {
         channel_id: channel_id.to_string(),
         ts: latest_ts.to_string(),
     });
+}
+
+async fn clear_cached_conversation_unread(
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+    latest_ts: &str,
+) {
+    if let Some(store) = workspace_store.as_ref() {
+        if let Err(error) = store
+            .clear_conversation_unread_state(channel_id, latest_ts)
+            .await
+        {
+            crate::debug::log(
+                "store",
+                &format!("ConversationReadStoreFailed channel_id={channel_id} error={error:#}"),
+            );
+        }
+    }
+}
+
+async fn store_conversation_unread_state(
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+    unread_state: SlackUnreadState,
+    server_last_read: Option<&str>,
+) -> bool {
+    let Some(store) = workspace_store.as_ref() else {
+        return unread_state.known;
+    };
+    match store
+        .apply_conversation_unread_state(channel_id, unread_state, server_last_read)
+        .await
+    {
+        Ok(applied) => applied,
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!("ConversationUnreadStoreFailed channel_id={channel_id} error={error:#}"),
+            );
+            false
+        }
+    }
+}
+
+async fn observe_thread_history(
+    events: &RuntimeEventSender,
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+    messages: &[SlackMessage],
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+    if let Err(error) = store.observe_thread_history(channel_id, messages).await {
+        crate::debug::log(
+            "store",
+            &format!("ThreadCatalogStoreFailed error={error:#}"),
+        );
+        return;
+    }
+    load_cached_thread_catalog(events, workspace_store).await;
+}
+
+async fn observe_thread_page(
+    events: &RuntimeEventSender,
+    workspace_store: &Option<WorkspaceStore>,
+    channel_id: &str,
+    root_ts: &str,
+    messages: &[SlackMessage],
+    complete: bool,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+    if let Err(error) = store
+        .observe_thread_page(channel_id, root_ts, messages, complete)
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!("ThreadCatalogStoreFailed error={error:#}"),
+        );
+        return;
+    }
+    load_cached_thread_catalog(events, workspace_store).await;
 }
 
 fn workspace_store_id(auth: &AuthInfo) -> String {
@@ -2473,19 +2910,22 @@ async fn load_cached_conversations(
     }
 }
 
-async fn store_conversations(
+async fn load_cached_thread_catalog(
+    events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
-    conversations: &[SlackConversation],
 ) {
     let Some(store) = workspace_store.as_ref() else {
         return;
     };
-
-    if let Err(error) = store.store_conversations(conversations).await {
-        crate::debug::log(
+    match store.load_thread_catalog().await {
+        Ok(records) if !records.is_empty() => {
+            events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records));
+        }
+        Ok(_) => {}
+        Err(error) => crate::debug::log(
             "runtime",
-            &format!("CachedConversationsStoreFailed error={error:#}"),
-        );
+            &format!("CachedThreadCatalogLoadFailed error={error:#}"),
+        ),
     }
 }
 
@@ -3480,19 +3920,55 @@ mod tests {
     }
 
     #[test]
-    fn conversation_unread_refresh_candidates_cover_visible_titles_first() {
+    fn conversation_unread_refresh_candidates_prioritize_attention_and_cover_every_item() {
         let conversations = vec![
             channel("C-zebra", 0, None),
             archived_channel("C-archived", 10),
-            dm("D-ada", 0),
+            dm("D-ada", 4),
             channel("C-aggregator", 0, None),
             channel("C-127", 0, None),
         ];
 
         assert_eq!(
             conversation_unread_refresh_candidates(&conversations),
-            vec!["C-127", "C-aggregator", "C-zebra", "D-ada"]
+            vec!["D-ada", "C-127", "C-aggregator", "C-zebra"]
         );
+
+        let many = (0..75)
+            .map(|index| channel(&format!("C{index}"), 0, None))
+            .collect::<Vec<_>>();
+        assert_eq!(conversation_unread_refresh_candidates(&many).len(), 75);
+    }
+
+    #[test]
+    fn membership_reconciliation_preserves_enriched_unread_fields() {
+        let mut cached = channel("C1", 5, Some("1710000000.000000"));
+        cached
+            .extra
+            .insert("unread_count_display".to_string(), serde_json::json!(3));
+        let fresh = SlackConversation {
+            id: "C1".to_string(),
+            name: Some("renamed".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+
+        let reconciled = reconcile_conversation_snapshot(vec![cached], vec![fresh])
+            .expect("snapshot should reconcile");
+
+        assert_eq!(reconciled[0].name.as_deref(), Some("renamed"));
+        assert_eq!(reconciled[0].unread_activity_count(), 5);
+        assert_eq!(reconciled[0].unread_state().display_count, 3);
+    }
+
+    #[test]
+    fn suspicious_empty_membership_snapshot_does_not_erase_cache() {
+        let cached = vec![channel("C1", 0, None)];
+
+        assert!(reconcile_conversation_snapshot(cached, Vec::new()).is_err());
+        assert!(reconcile_conversation_snapshot(Vec::new(), Vec::new())
+            .expect("an empty first workspace snapshot is valid")
+            .is_empty());
     }
 
     #[test]

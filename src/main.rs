@@ -23,6 +23,7 @@ mod application;
 mod auth;
 mod composer;
 mod config;
+mod conversation_catalog;
 mod debug;
 mod drafts;
 mod emoji;
@@ -37,6 +38,7 @@ mod sidebar_widgets;
 mod slack;
 mod socket_mode;
 mod store;
+mod thread_catalog;
 mod window;
 mod workspace_state;
 

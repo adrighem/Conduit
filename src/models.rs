@@ -68,7 +68,7 @@ pub struct SlackConversation {
 
 impl SlackConversation {
     pub fn display_name(&self) -> String {
-        self.display_name_with_users(&HashMap::new())
+        self.display_name_with_users(&HashMap::new(), None)
     }
 
     pub fn display_user_ids(&self) -> Vec<String> {
@@ -168,7 +168,11 @@ impl SlackConversation {
             || self.extra_bool("is_shared")
     }
 
-    pub fn display_name_with_users(&self, user_names: &HashMap<String, String>) -> String {
+    pub fn display_name_with_users(
+        &self,
+        user_names: &HashMap<String, String>,
+        current_user_id: Option<&str>,
+    ) -> String {
         if self.is_im.unwrap_or(false) {
             if let Some(user) = &self.user {
                 if let Some(name) = user_names.get(user) {
@@ -179,9 +183,13 @@ impl SlackConversation {
         }
 
         if self.is_mpim.unwrap_or(false) {
-            if let Some(name) = self.group_direct_message_display_name(user_names) {
+            if let Some(name) = self.group_direct_message_display_name(user_names, current_user_id)
+            {
                 return name;
             }
+            // Slack's legacy MPIM `name` can contain the current user's handle.
+            // Until member metadata is available, use a neutral fallback.
+            return format!("Group DM {}", self.id);
         }
 
         if let Some(name) = &self.name {
@@ -208,10 +216,22 @@ impl SlackConversation {
     fn group_direct_message_display_name(
         &self,
         user_names: &HashMap<String, String>,
+        current_user_id: Option<&str>,
     ) -> Option<String> {
+        let names = self.group_direct_message_participant_names(user_names, current_user_id);
+
+        (!names.is_empty()).then(|| names.join(", "))
+    }
+
+    pub fn group_direct_message_participant_names(
+        &self,
+        user_names: &HashMap<String, String>,
+        excluded_user_id: Option<&str>,
+    ) -> Vec<String> {
         let mut names = self
             .group_direct_message_user_ids()
             .into_iter()
+            .filter(|user_id| Some(user_id.as_str()) != excluded_user_id)
             .map(|user_id| {
                 user_names
                     .get(&user_id)
@@ -222,12 +242,8 @@ impl SlackConversation {
             })
             .collect::<Vec<_>>();
 
-        if names.is_empty() {
-            return None;
-        }
-
         names.sort_by_key(|name| name.to_lowercase());
-        Some(names.join(", "))
+        names
     }
 
     fn group_direct_message_user_ids(&self) -> Vec<String> {
@@ -492,6 +508,16 @@ pub struct SlackMessage {
     pub ts: String,
     pub thread_ts: Option<String>,
     pub reply_count: Option<u64>,
+    #[serde(default)]
+    pub reply_users: Option<Vec<String>>,
+    #[serde(default)]
+    pub latest_reply: Option<String>,
+    #[serde(default)]
+    pub subscribed: Option<bool>,
+    #[serde(default)]
+    pub last_read: Option<String>,
+    #[serde(default)]
+    pub unread_count: Option<u64>,
     pub is_starred: Option<bool>,
     pub edited: Option<SlackMessageEdit>,
     pub reactions: Option<Vec<SlackReaction>>,
@@ -701,7 +727,10 @@ mod tests {
         };
         let names = HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]);
 
-        assert_eq!(conversation.display_name_with_users(&names), "Ada Lovelace");
+        assert_eq!(
+            conversation.display_name_with_users(&names, None),
+            "Ada Lovelace"
+        );
     }
 
     #[test]
@@ -721,13 +750,37 @@ mod tests {
 
         assert_eq!(conversation.display_user_ids(), vec!["U1", "U2", "U3"]);
         assert_eq!(
-            conversation.display_name_with_users(&names),
+            conversation.display_name_with_users(&names, None),
             "Ada, Grace, Zoe"
         );
     }
 
     #[test]
-    fn group_dm_display_name_falls_back_to_member_ids_or_slack_name() {
+    fn group_dm_display_name_excludes_current_user() {
+        let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G123",
+            "is_mpim": true,
+            "members": ["U_SELF", "U2", "U1"]
+        }))
+        .expect("failed to parse group direct message");
+        let names = HashMap::from([
+            ("U_SELF".to_string(), "Vincent".to_string()),
+            ("U1".to_string(), "Robey".to_string()),
+            ("U2".to_string(), "Fatima".to_string()),
+        ]);
+
+        assert_eq!(
+            conversation.display_name_with_users(&names, Some("U_SELF")),
+            "Fatima, Robey"
+        );
+        assert_eq!(
+            conversation.group_direct_message_participant_names(&names, Some("U_SELF")),
+            vec!["Fatima", "Robey"]
+        );
+    }
+
+    #[test]
+    fn group_dm_display_name_falls_back_to_member_ids_or_neutral_label() {
         let with_members: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G123",
             "name": "mpdm-old-slack-name",
@@ -749,12 +802,12 @@ mod tests {
         };
 
         assert_eq!(
-            with_members.display_name_with_users(&HashMap::new()),
+            with_members.display_name_with_users(&HashMap::new(), None),
             "U1, U2, U3"
         );
         assert_eq!(
-            without_members.display_name_with_users(&HashMap::new()),
-            "fallback-name"
+            without_members.display_name_with_users(&HashMap::new(), None),
+            "Group DM G456"
         );
     }
 

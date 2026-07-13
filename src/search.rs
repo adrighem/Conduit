@@ -6,8 +6,11 @@ pub const SECONDARY_FIELD_WEIGHT: u8 = 85;
 pub const ID_FIELD_WEIGHT: u8 = 55;
 
 const EXACT_PLACEMENT_WEIGHT: u8 = 100;
-const PREFIX_PLACEMENT_WEIGHT: u8 = 90;
 const INTERIOR_PLACEMENT_WEIGHT: u8 = 75;
+const PREFIX_BASE_SCORE: u32 = 50;
+const PREFIX_LENGTH_SCORE: u32 = 10;
+const MAX_PREFIX_SCORE: u32 = 90;
+const RELEVANCE_BAND_WIDTH: u8 = 5;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchField<'a> {
@@ -30,12 +33,12 @@ impl MatchScore {
         self.0
     }
 
-    /// Returns the ten-point relevance band. Scores from 90 through 100 share
+    /// Returns the five-point relevance band. Scores from 95 through 100 share
     /// the highest band so a perfect match does not become an absolute sort key.
     pub const fn band(self) -> u8 {
-        let band = self.0 / 10;
-        if band > 9 {
-            9
+        let band = self.0 / RELEVANCE_BAND_WIDTH;
+        if band > 19 {
+            19
         } else {
             band
         }
@@ -58,6 +61,17 @@ impl SearchQuery {
         self.terms.is_empty()
     }
 
+    pub fn matches_any_term(&self, value: &str) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+
+        let value = value.to_lowercase();
+        self.terms
+            .iter()
+            .any(|term| best_match_in_field(term, &value).is_some())
+    }
+
     /// Scores a match from 0 to 100, or returns `None` unless every query term
     /// occurs in at least one field.
     ///
@@ -65,13 +79,14 @@ impl SearchQuery {
     /// non-alphanumeric characters, and lengths are Unicode character counts.
     /// A term's score is:
     ///
-    /// `completion × placement × field weight`
-    ///
-    /// where completion is `term length / containing token length`, placement
-    /// is 100% for exact, 90% for prefix, or 75% for an interior substring, and
-    /// field weight is supplied by the caller. Terms containing punctuation are
-    /// matched against the complete field so searches such as `c-r` still work.
-    /// The final score is 70% of the mean term score plus 30% of the weakest term.
+    /// Exact token matches score 100. Prefix matches score from 60 through 90
+    /// based on query length, so useful short name prefixes are not penalized by
+    /// the length of the full name. Interior substrings use completion
+    /// (`term length / containing token length`) at a 75% placement weight. The
+    /// result is then multiplied by the caller's field weight. Terms containing
+    /// punctuation are matched against the complete field so searches such as
+    /// `c-r` still work. The final score is 70% of the mean term score plus 30%
+    /// of the weakest term.
     pub fn score<'a>(
         &self,
         fields: impl IntoIterator<Item = SearchField<'a>>,
@@ -124,15 +139,17 @@ fn token_match_score(term: &str, token: &str) -> Option<u8> {
     let byte_offset = token.find(term)?;
     let term_length = term.chars().count() as u32;
     let token_length = token.chars().count() as u32;
-    let completion = term_length * 100 / token_length.max(1);
-    let placement = if term_length == token_length {
-        EXACT_PLACEMENT_WEIGHT
+    if term_length == token_length {
+        Some(EXACT_PLACEMENT_WEIGHT)
     } else if byte_offset == 0 {
-        PREFIX_PLACEMENT_WEIGHT
+        Some((PREFIX_BASE_SCORE + term_length * PREFIX_LENGTH_SCORE).min(MAX_PREFIX_SCORE) as u8)
     } else {
-        INTERIOR_PLACEMENT_WEIGHT
-    };
-    Some(weighted_percentage(completion as u8, placement))
+        let completion = term_length * 100 / token_length.max(1);
+        Some(weighted_percentage(
+            completion as u8,
+            INTERIOR_PLACEMENT_WEIGHT,
+        ))
+    }
 }
 
 fn weighted_percentage(score: u8, weight: u8) -> u8 {
@@ -174,6 +191,15 @@ mod tests {
     }
 
     #[test]
+    fn detects_when_any_term_matches_a_value() {
+        let query = SearchQuery::parse("fat rob");
+
+        assert!(query.matches_any_term("Fatima"));
+        assert!(query.matches_any_term("Robey"));
+        assert!(!query.matches_any_term("Ada Lovelace"));
+    }
+
+    #[test]
     fn terms_can_match_across_searchable_fields() {
         assert!(matches_all_terms("arch vin", ["#architecture", "Vincent"]));
         assert!(matches_all_terms("   ", ["anything"]));
@@ -182,7 +208,8 @@ mod tests {
     #[test]
     fn scores_exact_prefix_and_interior_matches() {
         assert_eq!(score("support", "support").percentage(), 100);
-        assert_eq!(score("supp", "support").percentage(), 51);
+        assert_eq!(score("supp", "support").percentage(), 90);
+        assert_eq!(score("s", "support").percentage(), 60);
         assert_eq!(score("port", "support").percentage(), 42);
     }
 
@@ -196,7 +223,7 @@ mod tests {
             ])
             .expect("expected a match");
 
-        assert_eq!(score.percentage(), 63);
+        assert_eq!(score.percentage(), 90);
     }
 
     #[test]
@@ -206,22 +233,29 @@ mod tests {
             .score([SearchField::new("support brokerage", PRIMARY_FIELD_WEIGHT)])
             .expect("expected a match");
 
-        // support = 100; broker prefix of brokerage = 59. Mean = 79.
-        assert_eq!(score.percentage(), 73);
+        // support = 100; broker is a strong prefix of brokerage = 90.
+        assert_eq!(score.percentage(), 93);
+    }
+
+    #[test]
+    fn short_name_prefixes_receive_strong_multi_word_scores() {
+        assert_eq!(score("fat rob", "Fatima Robey").percentage(), 80);
     }
 
     #[test]
     fn splits_tokens_on_unicode_non_alphanumeric_characters() {
         assert_eq!(score("orange", "broker-orange-support").percentage(), 100);
-        assert_eq!(score("fé", "FÉdération").percentage(), 18);
+        assert_eq!(score("fé", "FÉdération").percentage(), 70);
         assert!(matches_all_terms("c-r", ["C-RAINBOW"]));
     }
 
     #[test]
-    fn groups_scores_into_ten_point_bands() {
-        assert_eq!(MatchScore(89).band(), 8);
-        assert_eq!(MatchScore(90).band(), 9);
-        assert_eq!(MatchScore(100).band(), 9);
+    fn groups_scores_into_five_point_bands() {
+        assert_eq!(MatchScore(89).band(), 17);
+        assert_eq!(MatchScore(90).band(), 18);
+        assert_eq!(MatchScore(94).band(), 18);
+        assert_eq!(MatchScore(95).band(), 19);
+        assert_eq!(MatchScore(100).band(), 19);
     }
 
     #[test]

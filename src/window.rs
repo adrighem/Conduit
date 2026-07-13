@@ -36,6 +36,7 @@ use crate::composer::{
     set_text_view_text, text_view_enter_action, text_view_text, TextViewEnterAction,
 };
 use crate::config;
+use crate::conversation_catalog::ConversationCatalog;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::message_html::{self, MessageHtmlContext, TimelineScrollBehavior};
 use crate::models::{
@@ -56,6 +57,7 @@ use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::socket_mode::{
     SocketModeEvent, SocketModeMessageEvent, SocketModeMessageKind, SocketModeReactionEvent,
 };
+use crate::thread_catalog::ThreadCatalog;
 use crate::workspace_state::{
     ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
     ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceScrollBehavior, WorkspaceSnapshot,
@@ -157,10 +159,15 @@ mod imp {
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
         pub conversations: RefCell<Vec<SlackConversation>>,
+        pub(super) conversation_catalog: RefCell<ConversationCatalog>,
+        pub pending_opened_conversation_ids: RefCell<HashSet<String>>,
         pub discovered_channels: RefCell<Vec<SlackConversation>>,
         pub discovered_users: RefCell<Vec<SlackUser>>,
+        pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
         pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
+        pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
+        pub seen_realtime_messages: RefCell<HashSet<String>>,
         pub user_names: RefCell<HashMap<String, String>>,
         pub user_group_names: RefCell<HashMap<String, String>>,
         pub user_group_members: RefCell<HashMap<String, Vec<String>>>,
@@ -181,6 +188,7 @@ mod imp {
         pub message_view: RefCell<Option<webkit6::WebView>>,
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub thread_view: RefCell<Option<webkit6::WebView>>,
+        pub(super) thread_catalog: RefCell<ThreadCatalog>,
         pub image_assets: RefCell<HashMap<String, String>>,
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
@@ -248,6 +256,14 @@ struct SidebarRowAction {
     channel_id: String,
     title: String,
     action: ConversationPickerAction,
+}
+
+#[derive(Debug, Clone)]
+struct ConversationPickerView {
+    list: gtk::ListBox,
+    search: gtk::SearchEntry,
+    actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
+    include_discovery: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +355,14 @@ fn picker_sections(
 }
 
 fn picker_sections_empty(sections: &ConversationPickerSections) -> bool {
-    sections.conversations.is_empty() && sections.channels.is_empty() && sections.people.is_empty()
+    sections.search_results.as_ref().map_or_else(
+        || {
+            sections.conversations.is_empty()
+                && sections.channels.is_empty()
+                && sections.people.is_empty()
+        },
+        Vec::is_empty,
+    )
 }
 
 fn media_gallery_items(messages: &[SlackMessage]) -> Vec<MediaGalleryItem> {
@@ -854,6 +877,59 @@ fn slack_permalink_ts(ts: &str) -> Option<String> {
     }
 
     Some(format!("{seconds}{fraction}"))
+}
+
+fn slack_timestamp_from_permalink(value: &str) -> Option<String> {
+    let digits = value.strip_prefix('p').unwrap_or(value);
+    if digits.len() <= 6 || !digits.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    let split = digits.len() - 6;
+    Some(format!("{}.{}", &digits[..split], &digits[split..]))
+}
+
+fn slack_message_location(uri: &str, workspace_url: Option<&str>) -> Option<SearchMessageLocation> {
+    let workspace_url = url::Url::parse(workspace_url?).ok()?;
+    let url = url::Url::parse(uri).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str()? != workspace_url.host_str()?
+        || !url.host_str()?.ends_with(".slack.com")
+    {
+        return None;
+    }
+
+    let mut segments = url.path_segments()?;
+    if segments.next()? != "archives" {
+        return None;
+    }
+    let channel_id = segments.next()?;
+    if channel_id.is_empty()
+        || !channel_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let message_ts = slack_timestamp_from_permalink(segments.next()?)?;
+    if segments.next().is_some() {
+        return None;
+    }
+    let thread_ts = match query_param(&url, "thread_ts") {
+        Some(thread_ts) => {
+            let normalized = if let Some((seconds, fraction)) = thread_ts.split_once('.') {
+                (!seconds.is_empty()
+                    && fraction.len() == 6
+                    && seconds.chars().all(|character| character.is_ascii_digit())
+                    && fraction.chars().all(|character| character.is_ascii_digit()))
+                .then_some(thread_ts)?
+            } else {
+                slack_timestamp_from_permalink(&thread_ts)?
+            };
+            Some(normalized)
+        }
+        None => None,
+    };
+    SearchMessageLocation::new(channel_id, &message_ts, thread_ts.as_deref())
 }
 
 fn realtime_message_marks_unread(
@@ -2072,27 +2148,64 @@ impl ConduitWindow {
                 self.populate_user_names(names);
                 *self.imp().discovered_channels.borrow_mut() = channels;
                 *self.imp().discovered_users.borrow_mut() = users;
+                self.refresh_open_conversation_picker();
             }
             RuntimeEventKind::ConversationOpened(conversation) => {
                 let channel_id = conversation.id.clone();
-                let title = conversation.display_name_with_users(&self.imp().user_names.borrow());
-                let mut conversations = self.imp().conversations.borrow().clone();
-                if let Some(existing) = conversations
-                    .iter_mut()
-                    .find(|existing| existing.id == channel_id)
-                {
-                    *existing = conversation;
-                } else {
-                    conversations.push(conversation);
-                }
-                self.populate_conversations(conversations);
+                let imp = self.imp();
+                let title = conversation.display_name_with_users(
+                    &imp.user_names.borrow(),
+                    imp.current_user_id.borrow().as_deref(),
+                );
+                imp.conversation_catalog
+                    .borrow_mut()
+                    .upsert_metadata(conversation);
+                imp.pending_opened_conversation_ids
+                    .borrow_mut()
+                    .insert(channel_id.clone());
+                self.sync_conversations_from_catalog();
                 self.select_conversation(&channel_id, &title);
+            }
+            RuntimeEventKind::ConversationsPatched {
+                conversations,
+                unread_states,
+            } => {
+                let mut catalog = self.imp().conversation_catalog.borrow_mut();
+                for conversation in conversations {
+                    catalog.upsert_metadata(conversation);
+                }
+                for (channel_id, unread_state, server_last_read) in unread_states {
+                    let newer_local_read = self
+                        .imp()
+                        .local_read_ts_by_channel
+                        .borrow()
+                        .get(&channel_id)
+                        .is_some_and(|local| {
+                            server_last_read
+                                .as_deref()
+                                .is_none_or(|server| local.as_str() > server)
+                        });
+                    if self
+                        .visible_channel_id()
+                        .as_deref()
+                        .is_none_or(|visible| visible != channel_id)
+                        && !newer_local_read
+                    {
+                        catalog.apply_realtime_unread(&channel_id, unread_state);
+                    }
+                }
+                drop(catalog);
+                self.sync_conversations_from_catalog();
             }
             RuntimeEventKind::ConversationUnreadUpdated {
                 channel_id,
                 unread_state,
             } => self.apply_conversation_unread_state(&channel_id, unread_state),
-            RuntimeEventKind::ConversationMarkedRead { channel_id, ts: _ } => {
+            RuntimeEventKind::ConversationMarkedRead { channel_id, ts } => {
+                self.imp()
+                    .local_read_ts_by_channel
+                    .borrow_mut()
+                    .insert(channel_id.clone(), ts);
                 self.mark_conversation_locally_read(&channel_id);
                 self.render_conversations();
                 if self.current_main_view() == MainMessageView::Unreads {
@@ -2103,6 +2216,14 @@ impl ConduitWindow {
                 channel_id,
                 messages,
             } => self.notify_if_new_messages(&channel_id, &messages),
+            RuntimeEventKind::ThreadCatalogLoaded(records) => {
+                *self.imp().thread_catalog.borrow_mut() = ThreadCatalog::from_records(records);
+                if self.current_main_view() == MainMessageView::Threads {
+                    self.populate_threads();
+                } else if self.current_main_view() == MainMessageView::Unreads {
+                    self.populate_unreads(self.unread_items());
+                }
+            }
             RuntimeEventKind::HistoryLoaded {
                 channel_id,
                 messages,
@@ -2762,7 +2883,12 @@ impl ConduitWindow {
         match url.scheme() {
             "conduit" => self.handle_message_action_url(&url),
             "http" | "https" => {
-                self.open_external_link(uri);
+                let workspace_url = self.imp().workspace_url.borrow().clone();
+                if let Some(location) = slack_message_location(uri, workspace_url.as_deref()) {
+                    self.open_message_context(location);
+                } else {
+                    self.open_external_link(uri);
+                }
                 true
             }
             "about" | "app" => false,
@@ -3099,9 +3225,14 @@ impl ConduitWindow {
         *imp.workspace_id.borrow_mut() = None;
         imp.workspace_ready.set(false);
         imp.latest_message_ts_by_channel.borrow_mut().clear();
+        imp.local_read_ts_by_channel.borrow_mut().clear();
+        imp.seen_realtime_messages.borrow_mut().clear();
+        imp.pending_opened_conversation_ids.borrow_mut().clear();
+        *imp.thread_catalog.borrow_mut() = ThreadCatalog::default();
         imp.pending_sent_drafts.borrow_mut().clear();
         imp.pending_upload_drafts.borrow_mut().clear();
         imp.conversations.borrow_mut().clear();
+        *imp.conversation_catalog.borrow_mut() = ConversationCatalog::default();
         imp.discovered_channels.borrow_mut().clear();
         imp.discovered_users.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
@@ -3359,9 +3490,44 @@ impl ConduitWindow {
     }
 
     fn populate_conversations(&self, conversations: Vec<SlackConversation>) {
+        let incoming_ids = conversations
+            .iter()
+            .map(|conversation| conversation.id.as_str())
+            .collect::<HashSet<_>>();
+        let pending_ids = self.imp().pending_opened_conversation_ids.borrow().clone();
+        let preserve_opened = {
+            let catalog = self.imp().conversation_catalog.borrow();
+            pending_ids
+                .iter()
+                .filter(|id| !incoming_ids.contains(id.as_str()))
+                .filter_map(|id| catalog.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut catalog = self.imp().conversation_catalog.borrow_mut();
+            let mut snapshot = catalog.begin_membership_snapshot();
+            for conversation in conversations {
+                snapshot.upsert(conversation);
+            }
+            if !catalog.commit_membership_snapshot(snapshot) {
+                return;
+            }
+            for conversation in preserve_opened {
+                catalog.upsert_opened(conversation);
+            }
+        }
+        self.imp()
+            .pending_opened_conversation_ids
+            .borrow_mut()
+            .clear();
+        self.sync_conversations_from_catalog();
+    }
+
+    fn sync_conversations_from_catalog(&self) {
         self.imp().sidebar_loading.set(false);
         *self.imp().sidebar_error.borrow_mut() = None;
-        *self.imp().conversations.borrow_mut() = conversations;
+        *self.imp().conversations.borrow_mut() =
+            self.imp().conversation_catalog.borrow().conversations();
         self.request_conversation_user_names();
         self.render_conversations();
         if self.current_main_view() == MainMessageView::Unreads {
@@ -3371,6 +3537,7 @@ impl ConduitWindow {
         }
         self.imp().workspace_ready.set(true);
         self.activate_pending_notification_target();
+        self.refresh_open_conversation_picker();
     }
 
     fn populate_user_names(&self, user_names: HashMap<String, String>) {
@@ -3416,6 +3583,7 @@ impl ConduitWindow {
         if should_render_sidebar {
             self.render_conversations();
         }
+        self.refresh_open_conversation_picker();
         self.refresh_current_conversation_title();
         self.rerender_current_messages();
     }
@@ -3464,13 +3632,12 @@ impl ConduitWindow {
     }
 
     fn mark_conversation_locally_read(&self, channel_id: &str) {
-        let mut conversations = self.imp().conversations.borrow_mut();
-        if let Some(conversation) = conversations
-            .iter_mut()
-            .find(|conversation| conversation.id == channel_id)
-        {
-            conversation.clear_unread_activity();
-        }
+        self.imp()
+            .conversation_catalog
+            .borrow_mut()
+            .mark_read(channel_id);
+        *self.imp().conversations.borrow_mut() =
+            self.imp().conversation_catalog.borrow().conversations();
     }
 
     fn apply_conversation_unread_state(&self, channel_id: &str, unread_state: SlackUnreadState) {
@@ -3485,21 +3652,35 @@ impl ConduitWindow {
             return;
         }
 
-        let changed = {
-            let mut conversations = self.imp().conversations.borrow_mut();
-            let Some(conversation) = conversations
-                .iter_mut()
-                .find(|conversation| conversation.id == channel_id)
-            else {
-                return;
-            };
-
-            let previous_unread = conversation.has_unread_activity();
-            let previous_count = conversation.unread_activity_count();
-            conversation.apply_unread_state(unread_state);
-            previous_unread != conversation.has_unread_activity()
-                || previous_count != conversation.unread_activity_count()
-        };
+        let previous = self
+            .imp()
+            .conversation_catalog
+            .borrow()
+            .get(channel_id)
+            .map(|conversation| {
+                (
+                    conversation.has_unread_activity(),
+                    conversation.unread_activity_count(),
+                )
+            });
+        self.imp()
+            .conversation_catalog
+            .borrow_mut()
+            .apply_realtime_unread(channel_id, unread_state);
+        *self.imp().conversations.borrow_mut() =
+            self.imp().conversation_catalog.borrow().conversations();
+        let current = self
+            .imp()
+            .conversation_catalog
+            .borrow()
+            .get(channel_id)
+            .map(|conversation| {
+                (
+                    conversation.has_unread_activity(),
+                    conversation.unread_activity_count(),
+                )
+            });
+        let changed = previous != current;
 
         if changed {
             self.render_conversations();
@@ -3510,20 +3691,23 @@ impl ConduitWindow {
     }
 
     fn mark_conversation_locally_unread(&self, channel_id: &str) -> bool {
-        let mut conversations = self.imp().conversations.borrow_mut();
-        let Some(conversation) = conversations
-            .iter_mut()
-            .find(|conversation| conversation.id == channel_id)
-        else {
-            return false;
-        };
-
-        let unread_count = conversation.unread_activity_count().saturating_add(1);
-        conversation.unread_count = Some(unread_count);
-        conversation
-            .extra
-            .insert("has_unreads".to_string(), serde_json::json!(true));
-        true
+        let existing_unread_count = self
+            .imp()
+            .conversation_catalog
+            .borrow()
+            .get(channel_id)
+            .map(SlackConversation::unread_activity_count);
+        let unread_count = existing_unread_count.unwrap_or_default().saturating_add(1);
+        self.imp()
+            .conversation_catalog
+            .borrow_mut()
+            .apply_realtime_unread(
+                channel_id,
+                SlackUnreadState::from_parts(true, true, unread_count),
+            );
+        *self.imp().conversations.borrow_mut() =
+            self.imp().conversation_catalog.borrow().conversations();
+        existing_unread_count.is_some()
     }
 
     fn channel_load_more_url(&self, channel_id: &str) -> Option<String> {
@@ -3553,6 +3737,7 @@ impl ConduitWindow {
             &user_names,
             sidebar::SidebarBuildOptions {
                 selected_channel: selected_channel.as_deref(),
+                current_user_id: imp.current_user_id.borrow().as_deref(),
                 query: imp.sidebar_filter_entry.text().as_str(),
                 unread_only: imp.sidebar_unread_filter_button.is_active(),
                 show_unreads_section: self.show_unreads_section(),
@@ -3572,6 +3757,11 @@ impl ConduitWindow {
             sidebar::SidebarListModel::Sections(sections) => {
                 for section in sections {
                     self.append_sidebar_section(&imp.conversation_list, &section);
+                }
+            }
+            sidebar::SidebarListModel::Rows(rows) => {
+                for row in rows {
+                    self.append_sidebar_conversation(&imp.conversation_list, &row);
                 }
             }
         }
@@ -3733,31 +3923,33 @@ impl ConduitWindow {
             Rc::new(RefCell::new(HashMap::new()));
         self.populate_conversation_picker_list(&list, &actions, &sections);
 
+        *self.imp().conversation_picker_view.borrow_mut() = Some(ConversationPickerView {
+            list: list.clone(),
+            search: search.clone(),
+            actions: actions.clone(),
+            include_discovery,
+        });
+
         let weak_window = self.downgrade();
-        let list_for_search = list.clone();
-        let actions_for_search = actions.clone();
-        let conversations_for_search = conversations.clone();
-        let user_names_for_search = user_names.clone();
-        let discovered_channels_for_search = discovered_channels.clone();
-        let discovered_users_for_search = discovered_users.clone();
-        let current_user_id_for_search = current_user_id.clone();
-        search.connect_search_changed(move |entry| {
+        search.connect_search_changed(move |_| {
             if let Some(window) = weak_window.upgrade() {
-                let sections = picker_sections(
-                    include_discovery,
-                    &conversations_for_search,
-                    &discovered_channels_for_search,
-                    &discovered_users_for_search,
-                    &user_names_for_search,
-                    current_user_id_for_search.as_deref(),
-                    entry.text().as_str(),
-                );
-                window.populate_conversation_picker_list(
-                    &list_for_search,
-                    &actions_for_search,
-                    &sections,
-                );
+                window.refresh_open_conversation_picker();
             }
+        });
+
+        let weak_window = self.downgrade();
+        let list_for_close = list.clone();
+        dialog.connect_close_request(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                let mut active = window.imp().conversation_picker_view.borrow_mut();
+                if active
+                    .as_ref()
+                    .is_some_and(|view| view.list == list_for_close)
+                {
+                    active.take();
+                }
+            }
+            glib::Propagation::Proceed
         });
 
         let weak_window = self.downgrade();
@@ -3776,6 +3968,26 @@ impl ConduitWindow {
         search.grab_focus();
     }
 
+    fn refresh_open_conversation_picker(&self) {
+        let Some(view) = self.imp().conversation_picker_view.borrow().clone() else {
+            return;
+        };
+        let query = view.search.text();
+        let sections = {
+            let imp = self.imp();
+            picker_sections(
+                view.include_discovery,
+                &imp.conversations.borrow(),
+                &imp.discovered_channels.borrow(),
+                &imp.discovered_users.borrow(),
+                &imp.user_names.borrow(),
+                imp.current_user_id.borrow().as_deref(),
+                query.as_str(),
+            )
+        };
+        self.populate_conversation_picker_list(&view.list, &view.actions, &sections);
+    }
+
     fn populate_conversation_picker_list(
         &self,
         list: &gtk::ListBox,
@@ -3787,6 +3999,13 @@ impl ConduitWindow {
 
         if picker_sections_empty(sections) {
             self.append_placeholder(list, "No matching conversations");
+            return;
+        }
+
+        if let Some(results) = sections.search_results.as_deref() {
+            for item in results {
+                self.append_conversation_picker_row(list, actions, item);
+            }
             return;
         }
 
@@ -4087,7 +4306,45 @@ impl ConduitWindow {
     }
 
     fn populate_threads(&self) {
-        let observed = self.imp().workspace_view.borrow().observed_threads();
+        let mut observed = self
+            .imp()
+            .workspace_view
+            .borrow()
+            .observed_threads()
+            .into_iter()
+            .map(|(channel_id, root)| ((channel_id, root.ts.clone()), root))
+            .collect::<HashMap<_, _>>();
+        for record in self.imp().thread_catalog.borrow().records() {
+            if record.subscribed == Some(false) {
+                continue;
+            }
+            if let Some(root) = record.root.as_ref() {
+                let mut root = root.clone();
+                root.reply_count = Some(record.reply_count);
+                if let crate::thread_catalog::ThreadUnreadState::Known { count, .. } =
+                    &record.unread
+                {
+                    root.unread_count = Some(*count);
+                }
+                observed.insert(
+                    (record.key.channel_id.clone(), record.key.root_ts.clone()),
+                    root,
+                );
+            }
+        }
+        let mut observed = observed
+            .into_iter()
+            .map(|((channel_id, _), root)| (channel_id, root))
+            .collect::<Vec<_>>();
+        observed.sort_by(|(left_channel, left), (right_channel, right)| {
+            right
+                .latest_reply
+                .as_deref()
+                .unwrap_or(&right.ts)
+                .cmp(left.latest_reply.as_deref().unwrap_or(&left.ts))
+                .then_with(|| left_channel.cmp(right_channel))
+                .then_with(|| left.ts.cmp(&right.ts))
+        });
         let roots = observed
             .iter()
             .map(|(_, message)| message.clone())
@@ -4152,11 +4409,19 @@ impl ConduitWindow {
         let reading_channel = self.visible_channel_id();
         let current_user_id = self.imp().current_user_id.borrow().clone();
 
-        if realtime_message_marks_unread(
-            reading_channel.as_deref(),
-            current_user_id.as_deref(),
-            &event,
-        ) && !self.mark_conversation_locally_unread(&channel_id)
+        let first_delivery = event.kind != SocketModeMessageKind::Posted
+            || self
+                .imp()
+                .seen_realtime_messages
+                .borrow_mut()
+                .insert(format!("{}:{}", event.channel_id, event.message.ts));
+        if first_delivery
+            && realtime_message_marks_unread(
+                reading_channel.as_deref(),
+                current_user_id.as_deref(),
+                &event,
+            )
+            && !self.mark_conversation_locally_unread(&channel_id)
         {
             self.refresh_conversations();
         }
@@ -4203,6 +4468,19 @@ impl ConduitWindow {
                         WorkspaceScrollBehavior::Preserve
                     }),
                 );
+            }
+            if event.kind == SocketModeMessageKind::Posted {
+                if let Some(thread_ts) = message
+                    .thread_ts
+                    .as_deref()
+                    .filter(|thread_ts| *thread_ts != message.ts)
+                {
+                    self.send_command(RuntimeCommand::MarkThreadRead {
+                        channel_id: channel_id.clone(),
+                        thread_ts: thread_ts.to_string(),
+                        ts: message.ts.clone(),
+                    });
+                }
             }
         }
 
@@ -4357,19 +4635,41 @@ impl ConduitWindow {
     }
 
     fn conversation_title(&self, channel_id: &str) -> String {
-        let user_names = self.imp().user_names.borrow().clone();
-        self.imp()
-            .conversations
+        let imp = self.imp();
+        let user_names = imp.user_names.borrow().clone();
+        let current_user_id = imp.current_user_id.borrow().clone();
+        imp.conversations
             .borrow()
             .iter()
             .find(|conversation| conversation.id == channel_id)
-            .map(|conversation| conversation.display_name_with_users(&user_names))
+            .map(|conversation| {
+                conversation.display_name_with_users(&user_names, current_user_id.as_deref())
+            })
             .unwrap_or_else(|| "Slack".to_string())
     }
 
     fn unread_items(&self) -> Vec<ActivityItem> {
         let imp = self.imp();
-        activity::build_activity_items(&imp.conversations.borrow(), &imp.user_names.borrow())
+        let conversations = imp.conversations.borrow();
+        let user_names = imp.user_names.borrow();
+        let current_user_id = imp.current_user_id.borrow();
+        let mut items =
+            activity::build_activity_items(&conversations, &user_names, current_user_id.as_deref());
+        let conversation_titles = conversations
+            .iter()
+            .map(|conversation| {
+                (
+                    conversation.id.clone(),
+                    conversation.display_name_with_users(&user_names, current_user_id.as_deref()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        items.extend(activity::build_thread_activity_items(
+            imp.thread_catalog.borrow().clone().into_records(),
+            &conversation_titles,
+        ));
+        activity::sort_activity_items(&mut items);
+        items
     }
 
     fn clear_list(&self, list: &gtk::ListBox) {
@@ -4631,6 +4931,57 @@ mod tests {
     }
     use crate::runtime::{RuntimeOperation, RuntimeTarget};
     use crate::sidebar::ConversationKind;
+
+    #[test]
+    fn connected_workspace_slack_permalink_resolves_to_internal_message() {
+        let location = slack_message_location(
+            "https://signicat.slack.com/archives/C032HRKUBHQ/p1783592777735299",
+            Some("https://signicat.slack.com/"),
+        )
+        .expect("permalink should resolve");
+
+        assert_eq!(location.channel_id(), "C032HRKUBHQ");
+        assert_eq!(location.message_ts(), "1783592777.735299");
+        assert_eq!(location.thread_ts(), None);
+    }
+
+    #[test]
+    fn slack_reply_permalink_preserves_thread_root() {
+        let location = slack_message_location(
+            "https://signicat.slack.com/archives/C123/p1783592777735299?thread_ts=1783500000.000001&cid=C123",
+            Some("https://signicat.slack.com"),
+        )
+        .expect("reply permalink should resolve");
+
+        assert_eq!(location.message_ts(), "1783592777.735299");
+        assert_eq!(location.thread_ts(), Some("1783500000.000001"));
+    }
+
+    #[test]
+    fn slack_permalink_parser_rejects_external_and_malformed_links() {
+        let workspace = Some("https://signicat.slack.com");
+        for uri in [
+            "https://other.slack.com/archives/C123/p1783592777735299",
+            "https://example.com/archives/C123/p1783592777735299",
+            "https://signicat.slack.com/client/C123/p1783592777735299",
+            "https://signicat.slack.com/archives/C-123/p1783592777735299",
+            "https://signicat.slack.com/archives/C123/p123",
+            "https://signicat.slack.com/archives/C123/p17835927777oops",
+            "https://signicat.slack.com/archives/C123/p1783592777735299?thread_ts=oops.bad",
+            "https://signicat.slack.com/archives/C123/p1783592777735299/extra",
+        ] {
+            assert_eq!(slack_message_location(uri, workspace), None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn generated_permalink_round_trips_to_internal_location() {
+        let workspace = "https://signicat.slack.com";
+        let uri = message_permalink(workspace, "C123", "1783592777.735299").unwrap();
+        let location = slack_message_location(&uri, Some(workspace)).unwrap();
+        assert_eq!(location.channel_id(), "C123");
+        assert_eq!(location.message_ts(), "1783592777.735299");
+    }
 
     fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {
         SidebarRowModel {

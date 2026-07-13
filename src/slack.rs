@@ -23,7 +23,7 @@ const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PREVIEW_VIDEO_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
-const MAX_RETRY_AFTER_SECONDS: u64 = 30;
+const MAX_RETRY_AFTER_SECONDS: u64 = 300;
 pub(crate) const CHANNEL_HISTORY_PAGE_LIMIT: usize = 30;
 pub(crate) const MESSAGE_CONTEXT_LIMIT: usize = 15;
 const UNREAD_STATE_HISTORY_LIMIT: usize = 1;
@@ -175,7 +175,7 @@ impl SlackApi {
                     "types",
                     "public_channel,private_channel,mpim,im".to_string(),
                 ),
-                ("exclude_archived", "true".to_string()),
+                ("exclude_archived", "false".to_string()),
                 ("limit", "200".to_string()),
             ];
             if let Some(cursor) = cursor.as_ref() {
@@ -306,22 +306,28 @@ impl SlackApi {
         ))
     }
 
-    pub async fn unread_state(&self, channel_id: &str) -> Result<SlackUnreadState> {
+    pub async fn conversation_with_unread_state(
+        &self,
+        channel_id: &str,
+    ) -> Result<(Option<SlackConversation>, SlackUnreadState)> {
         let mut last_read: Option<String> = None;
+        let mut details = None;
 
         match self.conversation_info(channel_id).await {
             Ok(conversation) => {
                 let unread_state = conversation.unread_state();
                 if unread_state.known {
-                    return Ok(unread_state);
+                    return Ok((Some(conversation), unread_state));
                 }
 
                 last_read = conversation_last_read_ts(&conversation).map(ToString::to_string);
                 if let (Some(last_read), Some(latest_ts)) =
                     (last_read.as_deref(), conversation_latest_ts(&conversation))
                 {
-                    return Ok(unread_state_from_last_read(last_read, latest_ts));
+                    let unread_state = unread_state_from_last_read(last_read, latest_ts);
+                    return Ok((Some(conversation), unread_state));
                 }
+                details = Some(conversation);
             }
             Err(error) => crate::debug::log(
                 "slack",
@@ -333,16 +339,19 @@ impl SlackApi {
         let response: HistoryResponse = self.post_form("conversations.history", &params).await?;
         let unread_state = unread_state_from_history_response(&response);
         if unread_state.known {
-            return Ok(unread_state);
+            return Ok((details, unread_state));
         }
 
         if let (Some(last_read), Some(latest_message)) =
             (last_read.as_deref(), response.messages.first())
         {
-            return Ok(unread_state_from_last_read(last_read, &latest_message.ts));
+            return Ok((
+                details,
+                unread_state_from_last_read(last_read, &latest_message.ts),
+            ));
         }
 
-        Ok(unread_state)
+        Ok((details, unread_state))
     }
 
     pub async fn conversation_info(&self, channel_id: &str) -> Result<SlackConversation> {
@@ -350,6 +359,30 @@ impl SlackApi {
             .post_form("conversations.info", &[("channel", channel_id.to_string())])
             .await?;
         Ok(response.channel)
+    }
+
+    pub async fn conversation_members(&self, channel_id: &str) -> Result<Vec<String>> {
+        let mut cursor: Option<String> = None;
+        let mut members = Vec::new();
+        loop {
+            let mut params = vec![
+                ("channel", channel_id.to_string()),
+                ("limit", "200".to_string()),
+            ];
+            if let Some(cursor) = cursor.as_ref() {
+                params.push(("cursor", cursor.clone()));
+            }
+            let response: ConversationMembersResponse =
+                self.post_form("conversations.members", &params).await?;
+            members.extend(response.members);
+            cursor = next_cursor(response.response_metadata);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        members.sort();
+        members.dedup();
+        Ok(members)
     }
 
     pub async fn thread_replies(&self, channel_id: &str, ts: &str) -> Result<SlackMessagePage> {
@@ -835,14 +868,8 @@ fn retry_after_seconds(value: &str) -> u64 {
 }
 
 fn rate_limit_retries_for_method(method: &str) -> usize {
-    if matches!(
-        method,
-        CONVERSATIONS_LIST_METHOD | USERS_CONVERSATIONS_METHOD
-    ) {
-        0
-    } else {
-        MAX_RATE_LIMIT_RETRIES
-    }
+    let _ = method;
+    MAX_RATE_LIMIT_RETRIES
 }
 
 fn history_request_params(
@@ -1200,6 +1227,15 @@ struct ConversationOpenResponse {
 impl_slack_response!(ConversationOpenResponse);
 
 #[derive(Debug, Deserialize)]
+struct ConversationMembersResponse {
+    ok: bool,
+    error: Option<String>,
+    members: Vec<String>,
+    response_metadata: Option<ResponseMetadata>,
+}
+impl_slack_response!(ConversationMembersResponse);
+
+#[derive(Debug, Deserialize)]
 struct UsersListResponse {
     ok: bool,
     error: Option<String>,
@@ -1383,7 +1419,7 @@ mod tests {
             },
         ];
 
-        let ranked = filter_workspace_search_matches("supp", matches);
+        let ranked = filter_workspace_search_matches("support", matches);
 
         assert_eq!(ranked[0].text.as_deref(), Some("support"));
         assert_eq!(ranked[1].text.as_deref(), Some("supportive"));
@@ -1453,7 +1489,8 @@ mod tests {
             retry_after_seconds("not-a-number"),
             DEFAULT_RETRY_AFTER_SECONDS
         );
-        assert_eq!(retry_after_seconds("120"), MAX_RETRY_AFTER_SECONDS);
+        assert_eq!(retry_after_seconds("120"), 120);
+        assert_eq!(retry_after_seconds("900"), MAX_RETRY_AFTER_SECONDS);
     }
 
     #[test]
@@ -1514,9 +1551,15 @@ mod tests {
     }
 
     #[test]
-    fn conversations_list_rate_limits_fail_fast() {
-        assert_eq!(rate_limit_retries_for_method(CONVERSATIONS_LIST_METHOD), 0);
-        assert_eq!(rate_limit_retries_for_method(USERS_CONVERSATIONS_METHOD), 0);
+    fn conversation_catalog_requests_retry_rate_limits() {
+        assert_eq!(
+            rate_limit_retries_for_method(CONVERSATIONS_LIST_METHOD),
+            MAX_RATE_LIMIT_RETRIES
+        );
+        assert_eq!(
+            rate_limit_retries_for_method(USERS_CONVERSATIONS_METHOD),
+            MAX_RATE_LIMIT_RETRIES
+        );
         assert_eq!(
             rate_limit_retries_for_method("conversations.history"),
             MAX_RATE_LIMIT_RETRIES
