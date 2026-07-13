@@ -195,3 +195,17 @@
   - `meson test -C _build --print-errorlogs`: pass, 4 tests
   - `git diff --check`: pass
 - Notes: no public issue/PR actions were taken; the user explicitly requested the branch push.
+
+## 2026-07-13 CI Follow-up
+
+- Scope: investigate the latest failing CI action and implement the minimal local fix.
+- GitHub Actions: runs `29235054733`, `29232864322`, and `29232284948` failed at strict Clippy on a constant runtime assertion.
+- Local fix: converted the About-logo size invariant to a const assertion compatible with Clippy 1.97.
+- Local checks:
+  - `cargo fmt --check`: pass
+  - `cargo test --all-targets`: pass, 284 tests
+  - `meson compile -C _build`: pass
+  - `meson test -C _build --print-errorlogs`: pass, 4 tests
+  - `git diff --check`: pass
+- Exact Clippy validation is unavailable locally because this system has no Clippy component; the raw GitHub job log supplies the lint and prescribed fix.
+- No issue, pull request, label, release, or comment action was taken; the focused CI-fix commit is authorized for push by this request.

@@ -364,7 +364,7 @@ mod tests {
         const LIBADWAITA_ABOUT_ICON_SIZE: i32 = 128;
 
         assert_eq!(ABOUT_ICON_NAME, config::APPLICATION_ID);
-        assert!(ABOUT_LOGO_SIZE > LIBADWAITA_ABOUT_ICON_SIZE);
+        const { assert!(ABOUT_LOGO_SIZE > LIBADWAITA_ABOUT_ICON_SIZE) };
     }
 
     #[test]

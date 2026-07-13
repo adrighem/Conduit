@@ -86,3 +86,10 @@
 - Kept exact search result context transient so opening an older result cannot replace the authoritative latest-history cache.
 - Scoped notifications and drafts by Slack team and user; draft completion clears only unchanged submitted text.
 - No issue, pull request, label, release, or public comment action is needed. The user explicitly authorized pushing the verified local stack.
+
+## 2026-07-13 CI Follow-up
+
+- Diagnosed CI run `29235054733`: formatting passed and strict Clippy 1.97 failed only on `assertions_on_constants` in the About-logo size test.
+- Kept the invariant as a compile-time assertion instead of suppressing the lint.
+- The checkout Node.js deprecation notice is unrelated to the failure and does not justify broadening this fix.
+- No issue, pull request, label, release, or comment action was taken; the request authorizes pushing this focused CI fix.

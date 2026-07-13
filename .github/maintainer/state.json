@@ -1,21 +1,21 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-10-architecture-ux-modernization",
+  "last_manual_run": "2026-07-13-ci-follow-up",
   "last_known_open_issues": 0,
   "last_known_open_pull_requests": 0,
   "last_known_total_issues": 0,
   "last_known_total_pull_requests": 0,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 194 tests",
+    "cargo_test": "pass: 284 tests",
     "meson_compile": "pass",
     "meson_test": "pass",
-    "github_actions": "latest CI run 29091467301 passed on origin/main at 227b099; failed run 29090777347 was superseded",
-    "cargo_clippy": "pass: cargo clippy --all-targets --all-features -- -D warnings"
+    "github_actions": "latest CI run 29235054733 failed at Clippy 1.97 assertions_on_constants; minimal local fix prepared",
+    "cargo_clippy": "not available locally; failure and prescribed fix verified from raw GitHub job log"
   },
   "notes": {
     "skill_package": "gh-helper overview plus CI-focused verification; no backlog triage actions were needed",
-    "clippy": "cargo-clippy and clippy-driver are 0.1.95; CI and contributor docs now use cargo clippy --all-targets -- -D warnings",
-    "worktree": "architecture and UX modernization stack verified; user-authorized push pending final documentation commit"
+    "clippy": "CI tracks stable Clippy and treats warnings as errors; constant invariants should use const assertions",
+    "worktree": "CI fix is local and unpushed alongside existing feature work"
   }
 }
