@@ -30,6 +30,7 @@ mod message_html;
 mod models;
 mod rendering;
 mod runtime;
+mod search;
 mod shortcuts;
 mod sidebar;
 mod sidebar_widgets;

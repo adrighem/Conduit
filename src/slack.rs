@@ -13,6 +13,9 @@ use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
     SlackUser, SlackUserGroup, StoredToken,
 };
+use crate::search::{
+    SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
+};
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
@@ -30,6 +33,104 @@ const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
 const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
 const USERS_LIST_METHOD: &str = "users.list";
 const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
+
+fn workspace_search_api_query(query: &str) -> String {
+    let mut in_quoted_phrase = false;
+    query
+        .split_whitespace()
+        .map(|term| {
+            let quoted = in_quoted_phrase || term.contains('"');
+            if term.matches('"').count() % 2 == 1 {
+                in_quoted_phrase = !in_quoted_phrase;
+            }
+            if quoted
+                || workspace_search_term_is_modifier(term)
+                || term.contains('*')
+                || term.chars().count() < 3
+            {
+                term.to_string()
+            } else {
+                format!("{term}*")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn workspace_search_term_is_modifier(term: &str) -> bool {
+    term.starts_with('-') || term.contains(':')
+}
+
+fn workspace_search_content_query(query: &str) -> String {
+    let mut in_quoted_modifier = false;
+    query
+        .split_whitespace()
+        .filter(|term| {
+            if in_quoted_modifier {
+                if term.matches('"').count() % 2 == 1 {
+                    in_quoted_modifier = false;
+                }
+                return false;
+            }
+            if workspace_search_term_is_modifier(term) {
+                if term.matches('"').count() % 2 == 1 {
+                    in_quoted_modifier = true;
+                }
+                return false;
+            }
+            true
+        })
+        .map(|term| term.trim_matches(['"', '*']))
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn filter_workspace_search_matches(query: &str, matches: Vec<SearchMatch>) -> Vec<SearchMatch> {
+    let content_query = workspace_search_content_query(query);
+    let search_query = SearchQuery::parse(&content_query);
+    let mut ranked = matches
+        .into_iter()
+        .enumerate()
+        .filter_map(|(original_index, item)| {
+            let score = search_query.score([
+                SearchField::new(
+                    item.text.as_deref().unwrap_or_default(),
+                    PRIMARY_FIELD_WEIGHT,
+                ),
+                SearchField::new(
+                    item.username.as_deref().unwrap_or_default(),
+                    SECONDARY_FIELD_WEIGHT,
+                ),
+                SearchField::new(item.user.as_deref().unwrap_or_default(), ID_FIELD_WEIGHT),
+                SearchField::new(
+                    item.channel
+                        .as_ref()
+                        .and_then(|channel| channel.name.as_deref())
+                        .unwrap_or_default(),
+                    SECONDARY_FIELD_WEIGHT,
+                ),
+                SearchField::new(
+                    item.channel
+                        .as_ref()
+                        .and_then(|channel| channel.id.as_deref())
+                        .unwrap_or_default(),
+                    ID_FIELD_WEIGHT,
+                ),
+            ])?;
+            Some((score, original_index, item))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(
+        |(left_score, left_index, _), (right_score, right_index, _)| {
+            right_score
+                .band()
+                .cmp(&left_score.band())
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
+    ranked.into_iter().map(|(_, _, item)| item).collect()
+}
 
 #[derive(Clone)]
 pub struct SlackApi {
@@ -291,17 +392,21 @@ impl SlackApi {
     }
 
     pub async fn search_messages(&self, query: &str) -> Result<Vec<SearchMatch>> {
+        let api_query = workspace_search_api_query(query);
         let response: SearchResponse = self
             .post_form(
                 "search.messages",
                 &[
-                    ("query", query.to_string()),
-                    ("count", "40".to_string()),
+                    ("query", api_query),
+                    ("count", "100".to_string()),
                     ("page", "1".to_string()),
                 ],
             )
             .await?;
-        Ok(response.messages.matches)
+        Ok(filter_workspace_search_matches(
+            query,
+            response.messages.matches,
+        ))
     }
 
     pub async fn saved_items(&self) -> Result<Vec<SavedItem>> {
@@ -1206,6 +1311,101 @@ mod tests {
             ts: ts.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn workspace_search_adds_prefix_wildcards_and_preserves_modifiers() {
+        assert_eq!(
+            workspace_search_api_query(
+                "  supp bro ui from:ada -in:random has::eyes: \"exact quoted phrase\"  "
+            ),
+            "supp* bro* ui from:ada -in:random has::eyes: \"exact quoted phrase\""
+        );
+    }
+
+    #[test]
+    fn workspace_search_ignores_quoted_modifier_values_when_filtering_results() {
+        assert_eq!(
+            workspace_search_content_query("broker from:\"Ada Lovelace\" support"),
+            "broker support"
+        );
+    }
+
+    #[test]
+    fn workspace_search_results_match_all_content_substrings() {
+        let matches = vec![
+            SearchMatch {
+                username: Some("Ada Lovelace".to_string()),
+                text: Some("The broker needs online payment support".to_string()),
+                ..Default::default()
+            },
+            SearchMatch {
+                username: Some("Ada Lovelace".to_string()),
+                text: Some("The broker migration is complete".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let filtered = filter_workspace_search_matches("SUPP bro from:ada", matches);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].text.as_deref(),
+            Some("The broker needs online payment support")
+        );
+    }
+
+    #[test]
+    fn workspace_search_prioritizes_relevance_bands_over_api_order() {
+        let matches = vec![
+            SearchMatch {
+                text: Some("supportive".to_string()),
+                ..Default::default()
+            },
+            SearchMatch {
+                text: Some("support".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let ranked = filter_workspace_search_matches("supp", matches);
+
+        assert_eq!(ranked[0].text.as_deref(), Some("support"));
+        assert_eq!(ranked[1].text.as_deref(), Some("supportive"));
+    }
+
+    #[test]
+    fn workspace_search_preserves_api_order_within_a_relevance_band() {
+        let matches = vec![
+            SearchMatch {
+                text: Some("support".to_string()),
+                username: Some("Zed".to_string()),
+                ..Default::default()
+            },
+            SearchMatch {
+                text: Some("support".to_string()),
+                username: Some("Ada".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let ranked = filter_workspace_search_matches("support", matches);
+
+        assert_eq!(ranked[0].username.as_deref(), Some("Zed"));
+        assert_eq!(ranked[1].username.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn modifier_only_workspace_search_keeps_api_results() {
+        let matches = vec![SearchMatch {
+            text: Some("Any message".to_string()),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            filter_workspace_search_matches("from:ada in:general", matches).len(),
+            1
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use crate::models::{SlackConversation, SlackUser};
+use crate::search::{MatchScore, SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,10 +195,11 @@ impl SidebarRowModel {
         }
     }
 
-    fn matches_query(&self, query: &str) -> bool {
-        query.is_empty()
-            || self.title.to_lowercase().contains(query)
-            || self.id.to_lowercase().contains(query)
+    fn match_score(&self, query: &SearchQuery) -> Option<MatchScore> {
+        query.score([
+            SearchField::new(self.title.as_str(), PRIMARY_FIELD_WEIGHT),
+            SearchField::new(self.id.as_str(), ID_FIELD_WEIGHT),
+        ])
     }
 }
 
@@ -218,7 +220,7 @@ pub fn build_sidebar_list(
         return SidebarListModel::Placeholder(SidebarPlaceholder::Empty);
     }
 
-    let query = normalized_query(options.query);
+    let query = SearchQuery::parse(options.query);
     let rows = conversations
         .iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
@@ -229,9 +231,9 @@ pub fn build_sidebar_list(
         .map(|conversation| {
             SidebarRowModel::from_conversation(conversation, user_names, options.selected_channel)
         })
-        .filter(|row| row.matches_query(&query) && (!options.unread_only || row.unread));
+        .filter(|row| row.match_score(&query).is_some() && (!options.unread_only || row.unread));
 
-    let mut sections = build_sidebar_sections_from_rows(rows);
+    let mut sections = build_sidebar_sections_from_rows(rows, Some(&query));
     if options.unread_only || !options.show_unreads_section {
         sections.retain(|section| section.kind != SidebarSectionKind::Unreads);
     }
@@ -256,6 +258,7 @@ fn build_sidebar_sections(
             .map(|conversation| {
                 SidebarRowModel::from_conversation(conversation, user_names, selected_channel)
             }),
+        None,
     )
 }
 
@@ -264,15 +267,15 @@ pub fn conversation_switcher_items(
     user_names: &HashMap<String, String>,
     query: &str,
 ) -> Vec<SidebarRowModel> {
-    let query = normalized_query(query);
+    let query = SearchQuery::parse(query);
     let mut items = conversations
         .iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .map(|conversation| SidebarRowModel::from_conversation(conversation, user_names, None))
-        .filter(|item| item.matches_query(&query))
+        .filter(|item| item.match_score(&query).is_some())
         .collect::<Vec<_>>();
 
-    sort_rows_by_title(&mut items);
+    sort_rows_by_title(&mut items, Some(&query));
     items
 }
 
@@ -284,7 +287,7 @@ pub fn conversation_picker_sections(
     current_user_id: Option<&str>,
     query: &str,
 ) -> ConversationPickerSections {
-    let normalized_query = query.trim().to_lowercase();
+    let search_query = SearchQuery::parse(query);
     let conversation_ids = conversations
         .iter()
         .map(|conversation| conversation.id.as_str())
@@ -307,13 +310,13 @@ pub fn conversation_picker_sections(
         .iter()
         .filter(|channel| !conversation_ids.contains(channel.id.as_str()))
         .map(|channel| SidebarRowModel::from_conversation(channel, user_names, None))
-        .filter(|row| row.matches_query(&normalized_query))
+        .filter(|row| row.match_score(&search_query).is_some())
         .map(|row| ConversationPickerItem {
             row,
             action: ConversationPickerAction::JoinChannel,
         })
         .collect::<Vec<_>>();
-    sort_picker_items(&mut channels);
+    sort_picker_items(&mut channels, Some(&search_query));
 
     let mut people = discovered_users
         .iter()
@@ -339,14 +342,15 @@ pub fn conversation_picker_sections(
                 muted: false,
                 external: false,
             };
-            row.matches_query(&normalized_query)
+            row.match_score(&search_query)
+                .is_some()
                 .then_some(ConversationPickerItem {
                     row,
                     action: ConversationPickerAction::OpenDirectMessage,
                 })
         })
         .collect::<Vec<_>>();
-    sort_picker_items(&mut people);
+    sort_picker_items(&mut people, Some(&search_query));
 
     ConversationPickerSections {
         conversations,
@@ -355,18 +359,21 @@ pub fn conversation_picker_sections(
     }
 }
 
-fn sort_picker_items(items: &mut [ConversationPickerItem]) {
+fn sort_picker_items(items: &mut [ConversationPickerItem], query: Option<&SearchQuery>) {
     items.sort_by(|left, right| {
-        left.row
-            .title
-            .to_lowercase()
-            .cmp(&right.row.title.to_lowercase())
-            .then_with(|| left.row.id.cmp(&right.row.id))
+        compare_relevance(&left.row, &right.row, query).then_with(|| {
+            left.row
+                .title
+                .to_lowercase()
+                .cmp(&right.row.title.to_lowercase())
+                .then_with(|| left.row.id.cmp(&right.row.id))
+        })
     });
 }
 
 fn build_sidebar_sections_from_rows(
     rows: impl IntoIterator<Item = SidebarRowModel>,
+    query: Option<&SearchQuery>,
 ) -> Vec<SidebarSectionModel> {
     let mut unreads = Vec::new();
     let mut channels = Vec::new();
@@ -389,11 +396,11 @@ fn build_sidebar_sections_from_rows(
         }
     }
 
-    sort_unread_rows(&mut unreads);
-    sort_rows_by_title(&mut channels);
-    sort_rows_by_title(&mut direct_messages);
-    sort_rows_by_title(&mut group_direct_messages);
-    sort_rows_by_title(&mut other);
+    sort_unread_rows(&mut unreads, query);
+    sort_rows_by_title(&mut channels, query);
+    sort_rows_by_title(&mut direct_messages, query);
+    sort_rows_by_title(&mut group_direct_messages, query);
+    sort_rows_by_title(&mut other, query);
 
     [
         section(SidebarSectionKind::Unreads, unreads),
@@ -408,10 +415,6 @@ fn build_sidebar_sections_from_rows(
     .into_iter()
     .flatten()
     .collect()
-}
-
-fn normalized_query(query: &str) -> String {
-    query.trim().to_lowercase()
 }
 
 pub fn conversation_kind(conversation: &SlackConversation) -> ConversationKind {
@@ -473,18 +476,42 @@ fn section(kind: SidebarSectionKind, rows: Vec<SidebarRowModel>) -> Option<Sideb
     })
 }
 
-fn sort_rows_by_title(rows: &mut [SidebarRowModel]) {
-    rows.sort_by_key(|row| (title_sort_key(&row.title), row.id.clone()));
+fn sort_rows_by_title(rows: &mut [SidebarRowModel], query: Option<&SearchQuery>) {
+    rows.sort_by(|left, right| {
+        compare_relevance(left, right, query).then_with(|| {
+            (title_sort_key(&left.title), &left.id).cmp(&(title_sort_key(&right.title), &right.id))
+        })
+    });
 }
 
-fn sort_unread_rows(rows: &mut [SidebarRowModel]) {
-    rows.sort_by_key(|row| {
-        (
-            Reverse(row.unread_count),
-            title_sort_key(&row.title),
-            row.id.clone(),
-        )
+fn sort_unread_rows(rows: &mut [SidebarRowModel], query: Option<&SearchQuery>) {
+    rows.sort_by(|left, right| {
+        compare_relevance(left, right, query).then_with(|| {
+            (
+                Reverse(left.unread_count),
+                title_sort_key(&left.title),
+                &left.id,
+            )
+                .cmp(&(
+                    Reverse(right.unread_count),
+                    title_sort_key(&right.title),
+                    &right.id,
+                ))
+        })
     });
+}
+
+fn compare_relevance(
+    left: &SidebarRowModel,
+    right: &SidebarRowModel,
+    query: Option<&SearchQuery>,
+) -> std::cmp::Ordering {
+    let Some(query) = query.filter(|query| !query.is_empty()) else {
+        return std::cmp::Ordering::Equal;
+    };
+    let left_band = left.match_score(query).map_or(0, MatchScore::band);
+    let right_band = right.match_score(query).map_or(0, MatchScore::band);
+    right_band.cmp(&left_band)
 }
 
 fn title_sort_key(title: &str) -> String {
@@ -1092,6 +1119,80 @@ mod tests {
     }
 
     #[test]
+    fn conversation_filters_match_all_substring_terms_in_any_order() {
+        let conversations = [channel("C123", "broker-orange-support")];
+
+        let matches = conversation_switcher_items(&conversations, &HashMap::new(), "  SUPP   bro ");
+        let misses = conversation_switcher_items(&conversations, &HashMap::new(), "bro sales");
+
+        assert_eq!(matches[0].id, "C123");
+        assert!(misses.is_empty());
+    }
+
+    #[test]
+    fn conversation_switcher_prioritizes_relevance_bands_then_alphabet() {
+        let conversations = [
+            channel("C1", "alpha-support"),
+            channel("C2", "zebra-supp"),
+            channel("C3", "beta-supple"),
+        ];
+
+        let items = conversation_switcher_items(&conversations, &HashMap::new(), "supp");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            // Exact "supp" wins. The other two are in the same ten-point band,
+            // so their existing alphabetical ordering remains intact.
+            vec!["C2", "C1", "C3"]
+        );
+    }
+
+    #[test]
+    fn sidebar_relevance_band_precedes_existing_unread_count_sort() {
+        let mut alphabetical = channel("C1", "alpha-support");
+        alphabetical.unread_count = Some(10);
+        let mut relevant = channel("C2", "zebra-supp");
+        relevant.unread_count = Some(1);
+
+        let sections = list_sections(build_sidebar_list(
+            &[alphabetical, relevant],
+            &HashMap::new(),
+            SidebarBuildOptions {
+                query: "supp",
+                show_unreads_section: true,
+                ..Default::default()
+            },
+        ));
+
+        assert_eq!(
+            titles(section(&sections, SidebarSectionKind::Unreads)),
+            vec!["#zebra-supp", "#alpha-support"]
+        );
+        assert_eq!(
+            titles(section(&sections, SidebarSectionKind::Channels)),
+            vec!["#zebra-supp", "#alpha-support"]
+        );
+    }
+
+    #[test]
+    fn empty_query_preserves_existing_conversation_order() {
+        let conversations = [channel("C2", "zebra"), channel("C1", "alpha")];
+
+        let items = conversation_switcher_items(&conversations, &HashMap::new(), "  ");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C1", "C2"]
+        );
+    }
+
+    #[test]
     fn conversation_switcher_searches_resolved_group_dm_member_names() {
         let group_dm: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G123",
@@ -1179,6 +1280,46 @@ mod tests {
         );
 
         assert!(sections.conversations.is_empty());
+        assert_eq!(sections.channels[0].row.id, "C2");
+        assert_eq!(sections.people[0].row.id, "U2");
+    }
+
+    #[test]
+    fn conversation_picker_matches_terms_across_title_and_id() {
+        let sections = conversation_picker_sections(
+            &[],
+            &[channel("C-RAINBOW", "project-rainbow")],
+            &[],
+            &HashMap::new(),
+            None,
+            "rain c-r",
+        );
+
+        assert_eq!(sections.channels[0].row.id, "C-RAINBOW");
+    }
+
+    #[test]
+    fn conversation_picker_ranks_each_section_by_relevance_band() {
+        let sections = conversation_picker_sections(
+            &[],
+            &[channel("C1", "alpha-support"), channel("C2", "zebra-supp")],
+            &[
+                SlackUser {
+                    id: Some("U1".to_string()),
+                    real_name: Some("Alpha Support".to_string()),
+                    ..Default::default()
+                },
+                SlackUser {
+                    id: Some("U2".to_string()),
+                    real_name: Some("Zebra Supp".to_string()),
+                    ..Default::default()
+                },
+            ],
+            &HashMap::new(),
+            None,
+            "supp",
+        );
+
         assert_eq!(sections.channels[0].row.id, "C2");
         assert_eq!(sections.people[0].row.id, "U2");
     }

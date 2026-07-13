@@ -30,6 +30,27 @@ use crate::shortcuts::APP_SHORTCUTS;
 use crate::ConduitWindow;
 
 const OPEN_CONVERSATION_ACTION: &str = "app.open-conversation";
+const ABOUT_ICON_NAME: &str = "eu.vanadrighem.conduit-about";
+const ABOUT_LOGO_SIZE: i32 = 192;
+
+fn resize_about_logo(dialog: &adw::AboutDialog) -> bool {
+    let mut widgets = vec![dialog.clone().upcast::<gtk::Widget>()];
+    while let Some(widget) = widgets.pop() {
+        if let Ok(image) = widget.clone().downcast::<gtk::Image>() {
+            if image.icon_name().as_deref() == Some(ABOUT_ICON_NAME) {
+                image.set_pixel_size(ABOUT_LOGO_SIZE);
+                return true;
+            }
+        }
+
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            widgets.push(current);
+        }
+    }
+    false
+}
 
 fn conversation_notification_id(workspace_id: &str, channel_id: &str) -> String {
     let mut digest = Sha256::new();
@@ -303,7 +324,7 @@ impl ConduitApplication {
         };
         let about = adw::AboutDialog::builder()
             .application_name("Conduit")
-            .application_icon("eu.vanadrighem.conduit-about")
+            .application_icon(ABOUT_ICON_NAME)
             .developer_name("Vincent van Adrighem")
             .version(VERSION)
             .developers(vec!["Vincent van Adrighem"])
@@ -311,6 +332,11 @@ impl ConduitApplication {
             .translator_credits(gettext("translator-credits"))
             .copyright("© 2026 Vincent van Adrighem")
             .build();
+        let logo_resized = resize_about_logo(&about);
+        debug_assert!(
+            logo_resized,
+            "libadwaita About dialog did not contain the application icon"
+        );
 
         about.present(Some(&window));
     }
@@ -330,6 +356,14 @@ mod tests {
         assert!(id.starts_with("message:"));
         assert!(!id.contains("T123"));
         assert!(!id.contains("C123"));
+    }
+
+    #[test]
+    fn about_logo_is_larger_than_libadwaita_default() {
+        const LIBADWAITA_ABOUT_ICON_SIZE: i32 = 128;
+
+        assert_eq!(ABOUT_ICON_NAME, "eu.vanadrighem.conduit-about");
+        assert!(ABOUT_LOGO_SIZE > LIBADWAITA_ABOUT_ICON_SIZE);
     }
 
     #[test]

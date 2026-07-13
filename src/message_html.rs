@@ -167,12 +167,14 @@ fn reaction_picker_html(context: &MessageHtmlContext) -> String {
         .collect::<String>();
     let emoji_buttons = entries
         .iter()
-        .map(|emoji| {
+        .enumerate()
+        .map(|(index, emoji)| {
             format!(
-                "<button type=\"button\" class=\"emoji-choice\" data-emoji-name=\"{}\" data-category=\"{}\" data-search=\"{}\" title=\":{}:\" aria-label=\"{}\">{}</button>",
+                "<button type=\"button\" class=\"emoji-choice\" data-emoji-name=\"{}\" data-emoji-label=\"{}\" data-category=\"{}\" data-original-index=\"{}\" title=\":{}:\" aria-label=\"{}\">{}</button>",
                 escape_html(&emoji.name),
+                escape_html(&emoji.label),
                 escape_html(emoji.category),
-                escape_html(&format!("{} {}", emoji.name, emoji.label).to_lowercase()),
+                index,
                 escape_html(&emoji.name),
                 escape_html(&emoji.label),
                 emoji_value_html(&emoji.value, true),
@@ -198,19 +200,54 @@ fn reaction_picker_script() -> &'static str {
   if (!picker) return;
   const search = picker.querySelector("#emoji-search");
   const choices = Array.from(picker.querySelectorAll(".emoji-choice"));
+  const grid = picker.querySelector(".emoji-grid");
   const tabs = Array.from(picker.querySelectorAll("[data-emoji-category]"));
   const empty = picker.querySelector(".emoji-empty");
   let activeCategory = "Smileys";
   let reactionTemplate = "";
   let opener = null;
 
+  function fieldTokens(term, value) {
+    const normalized = value.toLocaleLowerCase();
+    const alphanumericTerm = Array.from(term).every(function (character) {
+      return /[\p{L}\p{N}]/u.test(character);
+    });
+    return alphanumericTerm ? normalized.match(/[\p{L}\p{N}]+/gu) || [] : [normalized];
+  }
+
+  function termFieldScore(term, value, fieldWeight) {
+    return fieldTokens(term, value).reduce(function (best, token) {
+      const position = token.indexOf(term);
+      if (position < 0) return best;
+      const completion = Math.floor(Array.from(term).length * 100 / Math.max(Array.from(token).length, 1));
+      const placement = token === term ? 100 : position === 0 ? 90 : 75;
+      const score = Math.floor(Math.floor(completion * placement / 100) * fieldWeight / 100);
+      return Math.max(best, score);
+    }, -1);
+  }
+
+  function choiceMatchScore(choice, terms) {
+    if (terms.length === 0) return 0;
+    const termScores = terms.map(function (term) {
+      return Math.max(
+        termFieldScore(term, choice.dataset.emojiName, 100),
+        termFieldScore(term, choice.dataset.emojiLabel, 85)
+      );
+    });
+    if (termScores.some(function (score) { return score < 0; })) return null;
+    const mean = Math.floor(termScores.reduce(function (sum, score) { return sum + score; }, 0) / termScores.length);
+    return Math.floor((70 * mean + 30 * Math.min(...termScores)) / 100);
+  }
+
   function filterChoices() {
-    const query = search.value.trim().toLocaleLowerCase();
+    const terms = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
     let visible = 0;
     choices.forEach(function (choice) {
-      const matchesQuery = !query || choice.dataset.search.includes(query) || choice.dataset.emojiName.includes(query);
-      const matchesCategory = query || choice.dataset.category === activeCategory;
+      const score = choiceMatchScore(choice, terms);
+      const matchesQuery = score !== null;
+      const matchesCategory = terms.length > 0 || choice.dataset.category === activeCategory;
       choice.hidden = !(matchesQuery && matchesCategory);
+      choice.dataset.matchBand = String(Math.floor((score || 0) / 10));
       if (!choice.hidden) {
         const image = choice.querySelector("img[data-src]");
         if (image) {
@@ -220,6 +257,17 @@ fn reaction_picker_script() -> &'static str {
         visible += 1;
       }
     });
+    choices
+      .slice()
+      .sort(function (left, right) {
+        if (left.hidden !== right.hidden) return left.hidden ? 1 : -1;
+        if (terms.length > 0 && !left.hidden) {
+          const bandDifference = Number(right.dataset.matchBand) - Number(left.dataset.matchBand);
+          if (bandDifference !== 0) return bandDifference;
+        }
+        return Number(left.dataset.originalIndex) - Number(right.dataset.originalIndex);
+      })
+      .forEach(function (choice) { grid.appendChild(choice); });
     empty.hidden = visible !== 0;
   }
 
@@ -1189,20 +1237,10 @@ pre code {{
 }}
 
 @media (hover: hover) and (pointer: fine) {{
-  .message,
-  .message-part {{
-    grid-template-columns: minmax(0, 1fr) auto;
-  }}
-
-  .message > :not(.quick-actions),
-  .message-part > :not(.quick-actions) {{
-    grid-column: 1;
-  }}
-
   .quick-actions {{
-    grid-row: 1;
-    grid-column: 2;
-    align-self: start;
+    position: absolute;
+    inset-block-start: 4px;
+    inset-inline-end: 0;
     opacity: 0;
     pointer-events: none;
   }}
@@ -2789,14 +2827,11 @@ mod tests {
             .split("@media (prefers-reduced-motion: reduce)")
             .next()
             .unwrap();
-        assert!(!fine_pointer_css.contains("position: absolute"));
-        assert!(!fine_pointer_css.contains("inset-"));
-        assert!(fine_pointer_css.contains("grid-template-columns: minmax(0, 1fr) auto"));
-        assert!(fine_pointer_css.contains(".message > :not(.quick-actions)"));
-        assert!(fine_pointer_css.contains("grid-column: 1"));
-        assert!(fine_pointer_css.contains("grid-row: 1"));
-        assert!(fine_pointer_css.contains("grid-column: 2"));
-        assert!(fine_pointer_css.contains("align-self: start"));
+        assert!(fine_pointer_css.contains("position: absolute"));
+        assert!(fine_pointer_css.contains("inset-block-start: 4px"));
+        assert!(fine_pointer_css.contains("inset-inline-end: 0"));
+        assert!(!fine_pointer_css.contains("grid-template-columns"));
+        assert!(!fine_pointer_css.contains("grid-column"));
         for physical_property in [
             "padding-right:",
             "padding-left:",
@@ -3142,6 +3177,11 @@ mod tests {
         assert!(html.contains("data-open-reaction-picker"));
         assert_eq!(html.matches("id=\"reaction-picker\"").count(), 1);
         assert!(html.contains("id=\"emoji-search\""));
+        assert!(html.contains("split(/\\s+/).filter(Boolean)"));
+        assert!(html.contains("function choiceMatchScore(choice, terms)"));
+        assert!(html.contains("70 * mean + 30 * Math.min(...termScores)"));
+        assert!(html.contains("data-original-index="));
+        assert!(html.contains("grid.appendChild(choice)"));
         assert!(html.contains("role=\"tablist\""));
         assert!(html.contains("class=\"emoji-grid\""));
         assert!(html.contains("role=\"menu\""));
