@@ -332,11 +332,12 @@ impl ConduitApplication {
             .translator_credits(gettext("translator-credits"))
             .copyright("© 2026 Vincent van Adrighem")
             .build();
-        let logo_resized = resize_about_logo(&about);
-        debug_assert!(
-            logo_resized,
-            "libadwaita About dialog did not contain the application icon"
-        );
+        // The dialog's internal widget tree is populated when it is mapped.
+        // Resizing the logo is cosmetic and must remain non-fatal if libadwaita
+        // changes that private widget tree in a future release.
+        about.connect_map(|dialog| {
+            let _ = resize_about_logo(dialog);
+        });
 
         about.present(Some(&window));
     }
