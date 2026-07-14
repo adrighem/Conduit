@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::lock::Mutex;
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -14,7 +15,8 @@ use crate::models::{SlackConversation, SlackMessage, SlackUnreadState, SlackUser
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 
 pub(crate) const CACHE_VERSION: u32 = 1;
-pub(crate) const SEARCH_INDEX_VERSION: u32 = 1;
+const DATABASE_SCHEMA_VERSION: u32 = 1;
+const DATABASE_FILENAME: &str = "state.sqlite3";
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 const SEEN_REALTIME_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
 const LOCAL_READ_TS_KEY: &str = "conduit_local_read_ts";
@@ -83,7 +85,7 @@ impl WorkspaceStore {
         fresh: Vec<SlackConversation>,
     ) -> Result<Vec<SlackConversation>> {
         let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await;
+        let mut state = self.load_state_for_update().await?;
         if fresh.is_empty() && !state.conversations.is_empty() {
             anyhow::bail!("Slack returned an unexpectedly empty conversation membership snapshot");
         }
@@ -142,7 +144,7 @@ impl WorkspaceStore {
         }
 
         let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await;
+        let mut state = self.load_state_for_update().await?;
         let Some(conversation) = state
             .conversations
             .iter_mut()
@@ -193,7 +195,7 @@ impl WorkspaceStore {
         }
 
         let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await;
+        let mut state = self.load_state_for_update().await?;
         let conversation = if let Some(conversation) = state
             .conversations
             .iter_mut()
@@ -255,7 +257,7 @@ impl WorkspaceStore {
         }
 
         let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await;
+        let mut state = self.load_state_for_update().await?;
         let previous_len = state.conversations.len();
         state
             .conversations
@@ -441,7 +443,7 @@ impl WorkspaceStore {
         messages: &[SlackMessage],
     ) -> Result<Vec<SlackMessage>> {
         let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await;
+        let mut state = self.load_state_for_update().await?;
         let key = thread_key(channel_id, thread_ts);
         let existing = state.thread_replies.get(&key).cloned().unwrap_or_default();
         let merged = merge_history_pages(&existing, messages);
@@ -527,7 +529,7 @@ impl WorkspaceStore {
 
     async fn update_state(&self, update: impl FnOnce(&mut CachedWorkspaceState)) -> Result<()> {
         let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await;
+        let mut state = self.load_state_for_update().await?;
         state.workspace_id = self.workspace_id.clone();
         update(&mut state);
         self.store_state(&state).await
@@ -539,7 +541,7 @@ impl WorkspaceStore {
         update: impl FnOnce(&mut SlackConversation),
     ) -> Result<bool> {
         let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await;
+        let mut state = self.load_state_for_update().await?;
         let Some(conversation) = state
             .conversations
             .iter_mut()
@@ -553,119 +555,48 @@ impl WorkspaceStore {
     }
 
     async fn load_state(&self) -> Result<Option<CachedWorkspaceState>> {
-        let path = self.path();
-        let data = match tokio::fs::read_to_string(&path).await {
-            Ok(data) => data,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read state cache {}", path.display()));
-            }
-        };
-
-        let state: CachedWorkspaceState = serde_json::from_str(&data)
-            .with_context(|| format!("failed to parse state cache {}", path.display()))?;
-        if state.version == CACHE_VERSION {
-            Ok(Some(state))
-        } else {
-            Ok(None)
-        }
+        let directory = self.directory.clone();
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = open_database(&directory)?;
+            migrate_legacy_workspace(&mut connection, &directory, &workspace_key, &workspace_id)?;
+            load_sqlite_state(&connection, &workspace_key)
+        })
+        .await
+        .context("workspace cache reader stopped unexpectedly")?
     }
 
-    async fn load_state_for_update(&self) -> CachedWorkspaceState {
-        let mut state = match self.load_state().await {
-            Ok(Some(state)) => state,
-            Ok(None) => CachedWorkspaceState::new(),
-            Err(error) => {
-                crate::debug::log(
-                    "store",
-                    &format!("StateCacheUpdateDiscardedUnreadableExistingState error={error:#}"),
-                );
-                CachedWorkspaceState::new()
-            }
-        };
+    async fn load_state_for_update(&self) -> Result<CachedWorkspaceState> {
+        let mut state = self
+            .load_state()
+            .await?
+            .unwrap_or_else(CachedWorkspaceState::new);
         state.workspace_id = self.workspace_id.clone();
-        state
+        Ok(state)
     }
 
     async fn store_state(&self, state: &CachedWorkspaceState) -> Result<()> {
-        tokio::fs::create_dir_all(&self.directory)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to create state cache directory {}",
-                    self.directory.display()
-                )
-            })?;
-
-        let path = self.path();
-        let tmp_path = path.with_extension("json.tmp");
-        let serialized =
-            serde_json::to_string_pretty(state).context("failed to serialize state")?;
-        tokio::fs::write(&tmp_path, serialized)
-            .await
-            .with_context(|| format!("failed to write state cache {}", tmp_path.display()))?;
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .with_context(|| format!("failed to replace state cache {}", path.display()))?;
-
-        let search_index = SearchProviderCache {
-            version: SEARCH_INDEX_VERSION,
-            workspace_id: &state.workspace_id,
-            conversations: &state.conversations,
-            user_names: &state.user_names,
-            user_search_aliases: &state.user_search_aliases,
-        };
-        let search_path = self.search_index_path();
-        let search_tmp_path = search_path.with_extension("search.json.tmp");
-        let serialized = serde_json::to_string(&search_index)
-            .context("failed to serialize conversation search index")?;
-        tokio::fs::write(&search_tmp_path, serialized)
-            .await
-            .with_context(|| {
-                format!("failed to write search index {}", search_tmp_path.display())
-            })?;
-        tokio::fs::rename(&search_tmp_path, &search_path)
-            .await
-            .with_context(|| format!("failed to replace search index {}", search_path.display()))?;
-
-        let marker = self.directory.join("active-workspace");
-        let marker_tmp = marker.with_extension("tmp");
-        tokio::fs::write(&marker_tmp, &self.workspace_key)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to write active workspace marker {}",
-                    marker_tmp.display()
-                )
-            })?;
-        tokio::fs::rename(&marker_tmp, &marker)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to replace active workspace marker {}",
-                    marker.display()
-                )
-            })
+        let directory = self.directory.clone();
+        let workspace_key = self.workspace_key.clone();
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = open_database(&directory)?;
+            store_sqlite_state(&mut connection, &workspace_key, &state)
+        })
+        .await
+        .context("workspace cache writer stopped unexpectedly")?
     }
 
+    #[cfg(test)]
     fn path(&self) -> PathBuf {
         self.directory.join(format!("{}.json", self.workspace_key))
     }
 
-    fn search_index_path(&self) -> PathBuf {
-        self.directory
-            .join(format!("{}.search.json", self.workspace_key))
+    #[cfg(test)]
+    fn database_path(&self) -> PathBuf {
+        database_path(&self.directory)
     }
-}
-
-#[derive(Serialize)]
-struct SearchProviderCache<'a> {
-    version: u32,
-    workspace_id: &'a str,
-    conversations: &'a [SlackConversation],
-    user_names: &'a HashMap<String, String>,
-    user_search_aliases: &'a HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -709,6 +640,421 @@ impl CachedWorkspaceState {
             custom_emojis: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct SearchProviderState {
+    pub(crate) workspace_id: String,
+    pub(crate) conversations: Vec<SlackConversation>,
+    pub(crate) user_names: HashMap<String, String>,
+    pub(crate) user_search_aliases: HashMap<String, Vec<String>>,
+}
+
+pub(crate) fn load_active_search_state(directory: &Path) -> Result<Option<SearchProviderState>> {
+    let mut connection = open_database(directory)?;
+    migrate_legacy_active_workspace(&mut connection, directory)?;
+    let workspace_key = connection
+        .query_row(
+            "SELECT active_workspace_key FROM app_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(workspace_key) = workspace_key else {
+        return Ok(None);
+    };
+    Ok(
+        load_sqlite_state(&connection, &workspace_key)?.map(|state| SearchProviderState {
+            workspace_id: state.workspace_id,
+            conversations: state.conversations,
+            user_names: state.user_names,
+            user_search_aliases: state.user_search_aliases,
+        }),
+    )
+}
+
+pub(crate) fn clear_active_workspace(directory: &Path) -> Result<()> {
+    if !database_path(directory).exists() {
+        let _ = std::fs::remove_file(directory.join("active-workspace"));
+        return Ok(());
+    }
+    let connection = open_database(directory)?;
+    connection.execute(
+        "UPDATE app_state SET active_workspace_key = NULL WHERE singleton = 1",
+        [],
+    )?;
+    let _ = std::fs::remove_file(directory.join("active-workspace"));
+    Ok(())
+}
+
+fn database_path(directory: &Path) -> PathBuf {
+    directory.join(DATABASE_FILENAME)
+}
+
+fn open_database(directory: &Path) -> Result<Connection> {
+    std::fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create state cache directory {}",
+            directory.display()
+        )
+    })?;
+    let connection = Connection::open(database_path(directory)).with_context(|| {
+        format!(
+            "failed to open workspace database in {}",
+            directory.display()
+        )
+    })?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+    let schema_version =
+        connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
+    if schema_version > DATABASE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "workspace database schema {schema_version} is newer than supported schema {DATABASE_SCHEMA_VERSION}"
+        );
+    }
+    connection.execute_batch(&format!(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         CREATE TABLE IF NOT EXISTS workspaces (
+             workspace_key TEXT PRIMARY KEY,
+             workspace_id TEXT NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS app_state (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             active_workspace_key TEXT REFERENCES workspaces(workspace_key)
+         );
+         INSERT OR IGNORE INTO app_state(singleton, active_workspace_key) VALUES (1, NULL);
+         CREATE TABLE IF NOT EXISTS workspace_items (
+             workspace_key TEXT NOT NULL REFERENCES workspaces(workspace_key) ON DELETE CASCADE,
+             kind TEXT NOT NULL,
+             item_key TEXT NOT NULL,
+             payload_json TEXT NOT NULL,
+             PRIMARY KEY (workspace_key, kind, item_key)
+         ) WITHOUT ROWID;
+         PRAGMA user_version = {DATABASE_SCHEMA_VERSION};"
+    ))?;
+    Ok(connection)
+}
+
+fn load_sqlite_state(
+    connection: &Connection,
+    workspace_key: &str,
+) -> Result<Option<CachedWorkspaceState>> {
+    let workspace_id = connection
+        .query_row(
+            "SELECT workspace_id FROM workspaces WHERE workspace_key = ?1",
+            [workspace_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(workspace_id) = workspace_id else {
+        return Ok(None);
+    };
+
+    let mut state = CachedWorkspaceState::new();
+    state.workspace_id = workspace_id;
+    let mut statement = connection.prepare(
+        "SELECT kind, item_key, payload_json
+         FROM workspace_items WHERE workspace_key = ?1 ORDER BY kind, item_key",
+    )?;
+    let rows = statement.query_map([workspace_key], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (kind, item_key, payload) = row?;
+        match kind.as_str() {
+            "conversation" => state
+                .conversations
+                .push(serde_json::from_str(&payload).context("invalid cached conversation")?),
+            "user_name" => {
+                state.user_names.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached user name")?,
+                );
+            }
+            "user_aliases" => {
+                state.user_search_aliases.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached user aliases")?,
+                );
+            }
+            "user_status" => {
+                state.user_statuses.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached user status")?,
+                );
+            }
+            "channel_history" => {
+                state.channel_histories.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached channel history")?,
+                );
+            }
+            "thread_replies" => {
+                state.thread_replies.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached thread replies")?,
+                );
+            }
+            "thread_record" => state
+                .thread_catalog
+                .push(serde_json::from_str(&payload).context("invalid cached thread record")?),
+            "pending_unread" => state.pending_unread_refresh.push(item_key),
+            "custom_emoji" => {
+                state.custom_emojis.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached custom emoji")?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(state))
+}
+
+fn store_sqlite_state(
+    connection: &mut Connection,
+    workspace_key: &str,
+    state: &CachedWorkspaceState,
+) -> Result<()> {
+    let desired = state_items(state)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT INTO workspaces(workspace_key, workspace_id) VALUES (?1, ?2)
+         ON CONFLICT(workspace_key) DO UPDATE SET workspace_id = excluded.workspace_id",
+        params![workspace_key, state.workspace_id],
+    )?;
+    sync_state_items(&transaction, workspace_key, desired)?;
+    transaction.execute(
+        "UPDATE app_state SET active_workspace_key = ?1 WHERE singleton = 1",
+        [workspace_key],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn sync_state_items(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    desired: HashMap<(String, String), String>,
+) -> Result<()> {
+    let mut current = HashMap::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT kind, item_key, payload_json FROM workspace_items WHERE workspace_key = ?1",
+        )?;
+        let rows = statement.query_map([workspace_key], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (key, payload) = row?;
+            current.insert(key, payload);
+        }
+    }
+
+    for ((kind, item_key), _) in current
+        .iter()
+        .filter(|(key, _)| !desired.contains_key(*key))
+    {
+        transaction.execute(
+            "DELETE FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+            params![workspace_key, kind, item_key],
+        )?;
+    }
+    for ((kind, item_key), payload) in desired {
+        if current.get(&(kind.clone(), item_key.clone())) == Some(&payload) {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace_key, kind, item_key)
+             DO UPDATE SET payload_json = excluded.payload_json",
+            params![workspace_key, kind, item_key, payload],
+        )?;
+    }
+    Ok(())
+}
+
+fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String), String>> {
+    let mut items = HashMap::new();
+    for conversation in &state.conversations {
+        insert_state_item(
+            &mut items,
+            "conversation",
+            conversation.id.clone(),
+            conversation,
+        )?;
+    }
+    for (key, value) in &state.user_names {
+        insert_state_item(&mut items, "user_name", key.clone(), value)?;
+    }
+    for (key, value) in &state.user_search_aliases {
+        insert_state_item(&mut items, "user_aliases", key.clone(), value)?;
+    }
+    for (key, value) in &state.user_statuses {
+        insert_state_item(&mut items, "user_status", key.clone(), value)?;
+    }
+    for (key, value) in &state.channel_histories {
+        insert_state_item(&mut items, "channel_history", key.clone(), value)?;
+    }
+    for (key, value) in &state.thread_replies {
+        insert_state_item(&mut items, "thread_replies", key.clone(), value)?;
+    }
+    for record in &state.thread_catalog {
+        insert_state_item(
+            &mut items,
+            "thread_record",
+            thread_key(&record.key.channel_id, &record.key.root_ts),
+            record,
+        )?;
+    }
+    for key in &state.pending_unread_refresh {
+        insert_state_item(&mut items, "pending_unread", key.clone(), &())?;
+    }
+    for (key, value) in &state.custom_emojis {
+        insert_state_item(&mut items, "custom_emoji", key.clone(), value)?;
+    }
+    Ok(items)
+}
+
+fn insert_state_item<T: Serialize + ?Sized>(
+    items: &mut HashMap<(String, String), String>,
+    kind: &str,
+    key: String,
+    value: &T,
+) -> Result<()> {
+    items.insert(
+        (kind.to_string(), key),
+        serde_json::to_string(value).context("failed to serialize cached workspace item")?,
+    );
+    Ok(())
+}
+
+fn migrate_legacy_workspace(
+    connection: &mut Connection,
+    directory: &Path,
+    workspace_key: &str,
+    workspace_id: &str,
+) -> Result<()> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_key = ?1)",
+        [workspace_key],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    let Some(mut state) = read_legacy_state(directory, workspace_key)? else {
+        return Ok(());
+    };
+    state.workspace_id = workspace_id.to_string();
+    store_sqlite_state(connection, workspace_key, &state)?;
+    remove_legacy_workspace_files(directory, workspace_key);
+    Ok(())
+}
+
+fn migrate_legacy_active_workspace(connection: &mut Connection, directory: &Path) -> Result<()> {
+    let active = connection
+        .query_row(
+            "SELECT active_workspace_key FROM app_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    if active.is_some() {
+        return Ok(());
+    }
+
+    let marked = std::fs::read_to_string(directory.join("active-workspace"))
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| is_workspace_key(key))
+        .and_then(|key| {
+            read_legacy_state(directory, &key)
+                .ok()
+                .flatten()
+                .filter(|state| !state.workspace_id.trim().is_empty())
+                .map(|state| (key, state))
+        });
+    let candidate = if let Some(marked) = marked {
+        Some(marked)
+    } else {
+        let mut candidates = legacy_states(directory)?;
+        (candidates.len() == 1).then(|| candidates.remove(0))
+    };
+    if let Some((workspace_key, state)) = candidate {
+        store_sqlite_state(connection, &workspace_key, &state)?;
+        remove_legacy_workspace_files(directory, &workspace_key);
+        let _ = std::fs::remove_file(directory.join("active-workspace"));
+    }
+    Ok(())
+}
+
+fn remove_legacy_workspace_files(directory: &Path, workspace_key: &str) {
+    let _ = std::fs::remove_file(directory.join(format!("{workspace_key}.json")));
+    let _ = std::fs::remove_file(directory.join(format!("{workspace_key}.search.json")));
+}
+
+fn legacy_states(directory: &Path) -> Result<Vec<(String, CachedWorkspaceState)>> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut states = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
+            continue;
+        };
+        let Some(key) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !is_workspace_key(key) {
+            continue;
+        }
+        if let Some(state) = read_legacy_state(directory, key)? {
+            if !state.workspace_id.trim().is_empty() {
+                states.push((key.to_string(), state));
+            }
+        }
+    }
+    Ok(states)
+}
+
+fn read_legacy_state(
+    directory: &Path,
+    workspace_key: &str,
+) -> Result<Option<CachedWorkspaceState>> {
+    let path = directory.join(format!("{workspace_key}.json"));
+    let data = match std::fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let state = match serde_json::from_str::<CachedWorkspaceState>(&data) {
+        Ok(state) if state.version == CACHE_VERSION => state,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    Ok(Some(state))
+}
+
+fn is_workspace_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn cache_key(value: &str) -> String {
@@ -876,11 +1222,12 @@ mod tests {
             .expect("missing upgraded state");
         assert_eq!(state.workspace_id, "T123:U123");
         assert_eq!(state.conversations[0].id, "D1");
+        assert!(!store.path().exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn workspace_store_writes_a_lightweight_active_search_index() {
+    fn workspace_store_exposes_a_lightweight_active_search_snapshot() {
         let directory = temp_cache_dir("workspace-search-index");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");
         runtime().block_on(async {
@@ -906,17 +1253,47 @@ mod tests {
                 .unwrap();
         });
 
-        let index = std::fs::read_to_string(store.search_index_path()).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&index).unwrap();
-        assert_eq!(value["version"], SEARCH_INDEX_VERSION);
-        assert_eq!(value["workspace_id"], "T123:U123");
-        assert_eq!(value["conversations"][0]["id"], "C1");
-        assert!(value.get("channel_histories").is_none());
-        assert!(!index.contains("private message body"));
-        assert_eq!(
-            std::fs::read_to_string(directory.join("active-workspace")).unwrap(),
-            store.workspace_key
-        );
+        let search_state = load_active_search_state(&directory).unwrap().unwrap();
+        assert_eq!(search_state.workspace_id, "T123:U123");
+        assert_eq!(search_state.conversations[0].id, "C1");
+        assert!(store.database_path().exists());
+
+        let connection = Connection::open(store.database_path()).unwrap();
+        let stored_private_body: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workspace_items
+                    WHERE workspace_key = ?1 AND kind = 'channel_history'
+                      AND payload_json LIKE '%private message body%'
+                )",
+                [&store.workspace_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored_private_body);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn clearing_the_active_workspace_preserves_its_cached_state() {
+        let directory = temp_cache_dir("workspace-clear-active");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+        });
+
+        clear_active_workspace(&directory).unwrap();
+
+        assert!(load_active_search_state(&directory).unwrap().is_none());
+        let cached = runtime().block_on(store.load_state()).unwrap().unwrap();
+        assert_eq!(cached.conversations[0].id, "C1");
         let _ = std::fs::remove_dir_all(directory);
     }
 

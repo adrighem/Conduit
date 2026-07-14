@@ -43,10 +43,6 @@ pub fn state_cache_dir() -> PathBuf {
     app_cache_dir().join("state")
 }
 
-pub fn active_workspace_marker_path() -> PathBuf {
-    state_cache_dir().join("active-workspace")
-}
-
 pub fn slack_client_id() -> Option<String> {
     let packaged_client_id = option_env!("CONDUIT_SLACK_CLIENT_ID")
         .map(ToString::to_string)
@@ -112,6 +108,5 @@ mod tests {
         assert!(attachment_cache_dir().starts_with(&app_cache));
         assert!(upload_staging_dir().starts_with(&app_cache));
         assert!(state_cache_dir().starts_with(&app_cache));
-        assert!(active_workspace_marker_path().starts_with(&app_cache));
     }
 }

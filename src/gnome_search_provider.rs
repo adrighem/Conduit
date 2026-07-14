@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
+
+#[cfg(test)]
+use std::fs;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -16,7 +18,7 @@ use crate::sidebar::{
     conversation_kind, conversation_switcher_items_with_aliases, ConversationKind,
     UserSearchAliases,
 };
-use crate::store::{CACHE_VERSION, SEARCH_INDEX_VERSION};
+use crate::store::{self, CACHE_VERSION};
 use crate::ConduitApplication;
 
 const OBJECT_PATH: &str = "/eu/vanadrighem/conduit/SearchProvider";
@@ -278,74 +280,18 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
 }
 
 fn cached_states(cache_dir: &Path) -> Vec<CachedSearchState> {
-    read_active_search_state(cache_dir)
-        .or_else(|| migrate_single_legacy_cache(cache_dir))
+    store::load_active_search_state(cache_dir)
+        .ok()
+        .flatten()
+        .map(|state| CachedSearchState {
+            version: CACHE_VERSION,
+            workspace_id: state.workspace_id,
+            conversations: state.conversations,
+            user_names: state.user_names,
+            user_search_aliases: state.user_search_aliases,
+        })
         .into_iter()
         .collect()
-}
-
-fn read_active_search_state(cache_dir: &Path) -> Option<CachedSearchState> {
-    let key = fs::read_to_string(cache_dir.join("active-workspace"))
-        .ok()
-        .map(|key| key.trim().to_string())
-        .filter(|key| is_workspace_key(key))?;
-    fs::read_to_string(cache_dir.join(format!("{key}.search.json")))
-        .ok()
-        .and_then(|contents| serde_json::from_str::<CachedSearchState>(&contents).ok())
-        .filter(|state| state.version == SEARCH_INDEX_VERSION)
-}
-
-fn migrate_single_legacy_cache(cache_dir: &Path) -> Option<CachedSearchState> {
-    let mut candidates = fs::read_dir(cache_dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let file_name = entry.file_name().into_string().ok()?;
-            let key = file_name.strip_suffix(".json")?;
-            is_workspace_key(key).then(|| (key.to_string(), entry.path()))
-        })
-        .filter_map(|(key, path)| {
-            let contents = fs::read_to_string(path).ok()?;
-            let state = serde_json::from_str::<CachedSearchState>(&contents).ok()?;
-            (state.version == CACHE_VERSION && !state.workspace_id.trim().is_empty())
-                .then_some((key, state))
-        });
-    let candidate = candidates.next()?;
-    if candidates.next().is_some() {
-        return None;
-    }
-
-    let (key, mut state) = candidate;
-    state.version = SEARCH_INDEX_VERSION;
-    persist_migrated_search_state(cache_dir, &key, &state).then_some(state)
-}
-
-fn persist_migrated_search_state(cache_dir: &Path, key: &str, state: &CachedSearchState) -> bool {
-    let search_path = cache_dir.join(format!("{key}.search.json"));
-    let search_tmp_path = search_path.with_extension("search.json.tmp");
-    let marker = cache_dir.join("active-workspace");
-    let marker_tmp = marker.with_extension("tmp");
-    let Some(serialized) = serde_json::to_string(state).ok() else {
-        return false;
-    };
-
-    if fs::write(&search_tmp_path, serialized).is_err()
-        || fs::rename(&search_tmp_path, &search_path).is_err()
-        || fs::write(&marker_tmp, key).is_err()
-        || fs::rename(&marker_tmp, &marker).is_err()
-    {
-        let _ = fs::remove_file(&search_tmp_path);
-        let _ = fs::remove_file(&marker_tmp);
-        return false;
-    }
-    true
-}
-
-fn is_workspace_key(key: &str) -> bool {
-    key.len() == 64
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn current_user_id(workspace_id: &str) -> Option<&str> {
@@ -378,19 +324,49 @@ mod tests {
     }
 
     fn write_index(directory: &Path, state: serde_json::Value) {
-        write_index_version(directory, state, SEARCH_INDEX_VERSION);
+        write_index_version(directory, state, CACHE_VERSION);
     }
 
     fn write_index_version(directory: &Path, mut state: serde_json::Value, version: u32) {
         const KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         fs::create_dir_all(directory).unwrap();
         state["version"] = serde_json::json!(version);
+        if version == CACHE_VERSION {
+            let workspace_id = state["workspace_id"].as_str().unwrap();
+            let conversations =
+                serde_json::from_value::<Vec<SlackConversation>>(state["conversations"].clone())
+                    .unwrap();
+            let user_names = serde_json::from_value::<HashMap<String, String>>(
+                state
+                    .get("user_names")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .unwrap();
+            let user_aliases = serde_json::from_value::<HashMap<String, Vec<String>>>(
+                state
+                    .get("user_search_aliases")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .unwrap();
+            let store = store::WorkspaceStore::new(directory.to_path_buf(), workspace_id);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    store.store_conversations(&conversations).await.unwrap();
+                    store.store_user_names(&user_names).await.unwrap();
+                    store
+                        .store_user_search_aliases(&user_aliases)
+                        .await
+                        .unwrap();
+                });
+            return;
+        }
         fs::write(directory.join("active-workspace"), KEY).unwrap();
-        fs::write(
-            directory.join(format!("{KEY}.search.json")),
-            state.to_string(),
-        )
-        .unwrap();
+        fs::write(directory.join(format!("{KEY}.json")), state.to_string()).unwrap();
     }
 
     fn write_legacy_cache(directory: &Path, key: &str, mut state: serde_json::Value) {
@@ -592,18 +568,13 @@ mod tests {
         let results = search(&directory, &["gen".into()]);
 
         assert_eq!(results.len(), 1);
-        assert_eq!(
-            fs::read_to_string(directory.join("active-workspace")).unwrap(),
-            KEY
-        );
-        let index = fs::read_to_string(directory.join(format!("{KEY}.search.json"))).unwrap();
-        assert!(!index.contains("must not enter the search index"));
-        assert_eq!(
-            serde_json::from_str::<CachedSearchState>(&index)
-                .unwrap()
-                .version,
-            SEARCH_INDEX_VERSION
-        );
+        assert!(directory.join("state.sqlite3").exists());
+        let state = store::load_active_search_state(&directory)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.workspace_id, "T123:U0");
+        assert_eq!(state.conversations.len(), 1);
+        assert!(!directory.join(format!("{KEY}.json")).exists());
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -627,8 +598,9 @@ mod tests {
 
         assert!(search(&directory, &["general".into()]).is_empty());
         assert!(!directory.join("active-workspace").exists());
-        assert!(!directory.join(format!("{KEY_A}.search.json")).exists());
-        assert!(!directory.join(format!("{KEY_B}.search.json")).exists());
+        assert!(store::load_active_search_state(&directory)
+            .unwrap()
+            .is_none());
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -662,7 +634,7 @@ mod tests {
                 "workspace_id": "T123:U0",
                 "conversations": [{"id": "C1", "name": "general", "is_channel": true}]
             }),
-            SEARCH_INDEX_VERSION + 1,
+            CACHE_VERSION + 1,
         );
 
         assert!(search(&directory, &[" ".into()]).is_empty());

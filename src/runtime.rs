@@ -1532,13 +1532,11 @@ fn dispatch_command(
 }
 
 fn finish_sign_out(events: &RuntimeEventSender, clear_result: Result<()>) {
-    if let Err(error) = std::fs::remove_file(config::active_workspace_marker_path()) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            crate::debug::log(
-                "store",
-                &format!("ActiveWorkspaceMarkerClearFailed error={error}"),
-            );
-        }
+    if let Err(error) = crate::store::clear_active_workspace(&config::state_cache_dir()) {
+        crate::debug::log(
+            "store",
+            &format!("ActiveWorkspaceClearFailed error={error:#}"),
+        );
     }
     if let Err(error) = clear_result {
         events.send_event(RuntimeEventKind::Error(error.to_string()));

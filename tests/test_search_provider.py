@@ -115,7 +115,9 @@ def main() -> None:
         state.mkdir(parents=True)
         workspace_key = "a" * 64
         (state / "active-workspace").write_text(workspace_key, encoding="utf-8")
-        (state / f"{workspace_key}.search.json").write_text(
+        # Seed the legacy cache format; the provider migrates it to SQLite on
+        # first use before answering the search request.
+        (state / f"{workspace_key}.json").write_text(
             json.dumps(
                 {
                     "version": 1,
