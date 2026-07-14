@@ -252,6 +252,24 @@ mod imp {
                 obj.send_session_command(RuntimeCommand::LoadStoredToken);
             }
         }
+
+        fn dispose(&self) {
+            // These popovers are manually parented to GtkTextView so they can
+            // point at the composer caret. Detach them before the template
+            // children are disposed; GtkTextView cannot remove unregistered
+            // direct children itself and otherwise loops while warning.
+            for completion in [
+                &self.message_emoji_completion,
+                &self.thread_emoji_completion,
+            ] {
+                if let Some(completion) = completion.borrow_mut().take() {
+                    completion.popover.popdown();
+                    if completion.popover.parent().is_some() {
+                        completion.popover.unparent();
+                    }
+                }
+            }
+        }
     }
 
     impl WidgetImpl for ConduitWindow {}

@@ -49,6 +49,53 @@ def call(environment: dict[str, str], method: str, *arguments: str) -> str:
     ).stdout
 
 
+def bus_name_owned(environment: dict[str, str]) -> bool:
+    output = subprocess.run(
+        [
+            "gdbus",
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.DBus",
+            "--object-path",
+            "/org/freedesktop/DBus",
+            "--method",
+            "org.freedesktop.DBus.NameHasOwner",
+            APP_ID,
+        ],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    ).stdout
+    return "true" in output.lower()
+
+
+def quit_application(environment: dict[str, str]) -> None:
+    subprocess.run(
+        [
+            "gdbus",
+            "call",
+            "--session",
+            "--dest",
+            APP_ID,
+            "--object-path",
+            "/eu/vanadrighem/conduit",
+            "--method",
+            "org.gtk.Actions.Activate",
+            "quit",
+            "[]",
+            "{}",
+        ],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
 def main() -> None:
     resource = Path(os.environ["CONDUIT_TEST_RESOURCE"])
     schema = Path(os.environ["CONDUIT_TEST_SCHEMA"])
@@ -148,6 +195,11 @@ def main() -> None:
             "workspace_id": "Test Workspace",
             "channel_id": "C_TEST",
         }
+
+        # Closing a window with manually parented composer popovers must not
+        # wedge GtkTextView disposal in a repeated warning loop.
+        quit_application(environment)
+        wait_until(lambda: not bus_name_owned(environment), timeout=10)
 
 
 if __name__ == "__main__":
