@@ -22,6 +22,9 @@ const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
 const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PREVIEW_VIDEO_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
 const MAX_RETRY_AFTER_SECONDS: u64 = 300;
 pub(crate) const CHANNEL_HISTORY_PAGE_LIMIT: usize = 30;
@@ -146,7 +149,11 @@ impl SlackApi {
     pub fn new(token: StoredToken) -> Self {
         let scopes = token_scope_set(token.scope.as_deref());
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .read_timeout(HTTP_READ_TIMEOUT)
+                .build()
+                .expect("valid Slack HTTP client configuration"),
             access_token: token.access_token,
             scopes,
             browser_cookie_d: token.browser_cookie_d,
@@ -849,6 +856,7 @@ impl SlackApi {
         loop {
             let response = self
                 .authenticated_request(Method::POST, &url)
+                .timeout(API_REQUEST_TIMEOUT)
                 .form(params)
                 .send()
                 .await

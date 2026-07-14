@@ -20,6 +20,8 @@ const KEYRING_SERVICE: &str = "eu.vanadrighem.conduit";
 const KEYRING_USER: &str = "slack-user-token";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const OAUTH_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const OAUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8934;
 pub const DEFAULT_USER_SCOPES: &[&str] = &[
@@ -117,7 +119,11 @@ pub struct SlackOAuthClient {
 impl SlackOAuthClient {
     pub fn new() -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(OAUTH_HTTP_CONNECT_TIMEOUT)
+                .timeout(OAUTH_HTTP_REQUEST_TIMEOUT)
+                .build()
+                .expect("valid OAuth HTTP client configuration"),
         }
     }
 

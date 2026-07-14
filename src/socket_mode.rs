@@ -11,6 +11,11 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::models::{SlackMessage, SlackUser};
 
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const WEBSOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketModeDisconnect {
@@ -69,32 +74,47 @@ pub async fn run_once(
     mut handle_event: impl FnMut(SocketModeEvent),
 ) -> Result<SocketModeDisconnect> {
     let url = SocketModeApi::new(app_token).open_connection().await?;
-    let (mut socket, _) = connect_async(&url)
+    let (mut socket, _) = tokio::time::timeout(WEBSOCKET_CONNECT_TIMEOUT, connect_async(&url))
         .await
+        .context("timed out connecting Slack Socket Mode WebSocket")?
         .context("failed to connect Slack Socket Mode WebSocket")?;
 
-    while let Some(message) = socket.next().await {
+    loop {
+        let message = tokio::time::timeout(WEBSOCKET_IDLE_TIMEOUT, socket.next())
+            .await
+            .context("Slack Socket Mode WebSocket became idle")?;
+        let Some(message) = message else {
+            break;
+        };
         match message.context("failed to read Slack Socket Mode WebSocket message")? {
             Message::Text(text) => {
-                if let Some(disconnect) =
-                    handle_text_message(text.as_str(), &mut socket, &mut handle_event).await?
+                if let Some(disconnect) = tokio::time::timeout(
+                    WEBSOCKET_WRITE_TIMEOUT,
+                    handle_text_message(text.as_str(), &mut socket, &mut handle_event),
+                )
+                .await
+                .context("timed out acknowledging Slack Socket Mode message")??
                 {
                     return Ok(disconnect);
                 }
             }
             Message::Binary(bytes) => {
                 if let Ok(text) = std::str::from_utf8(&bytes) {
-                    if let Some(disconnect) =
-                        handle_text_message(text, &mut socket, &mut handle_event).await?
+                    if let Some(disconnect) = tokio::time::timeout(
+                        WEBSOCKET_WRITE_TIMEOUT,
+                        handle_text_message(text, &mut socket, &mut handle_event),
+                    )
+                    .await
+                    .context("timed out acknowledging Slack Socket Mode message")??
                     {
                         return Ok(disconnect);
                     }
                 }
             }
             Message::Ping(payload) => {
-                socket
-                    .send(Message::Pong(payload))
+                tokio::time::timeout(WEBSOCKET_WRITE_TIMEOUT, socket.send(Message::Pong(payload)))
                     .await
+                    .context("timed out sending Slack Socket Mode pong")?
                     .context("failed to send Slack Socket Mode pong")?;
             }
             Message::Close(_) => return Ok(SocketModeDisconnect::ConnectionClosed),
@@ -277,7 +297,11 @@ struct SocketModeApi {
 impl SocketModeApi {
     fn new(app_token: &str) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .timeout(HTTP_REQUEST_TIMEOUT)
+                .build()
+                .expect("valid Socket Mode HTTP client configuration"),
             app_token: app_token.to_string(),
         }
     }
