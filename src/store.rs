@@ -14,6 +14,7 @@ use crate::models::{SlackConversation, SlackMessage, SlackUnreadState, SlackUser
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 
 const CACHE_VERSION: u32 = 1;
+pub(crate) const SEARCH_INDEX_VERSION: u32 = 1;
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 const SEEN_REALTIME_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
 const LOCAL_READ_TS_KEY: &str = "conduit_local_read_ts";
@@ -606,12 +607,65 @@ impl WorkspaceStore {
             .with_context(|| format!("failed to write state cache {}", tmp_path.display()))?;
         tokio::fs::rename(&tmp_path, &path)
             .await
-            .with_context(|| format!("failed to replace state cache {}", path.display()))
+            .with_context(|| format!("failed to replace state cache {}", path.display()))?;
+
+        let search_index = SearchProviderCache {
+            version: SEARCH_INDEX_VERSION,
+            workspace_id: &state.workspace_id,
+            conversations: &state.conversations,
+            user_names: &state.user_names,
+            user_search_aliases: &state.user_search_aliases,
+        };
+        let search_path = self.search_index_path();
+        let search_tmp_path = search_path.with_extension("search.json.tmp");
+        let serialized = serde_json::to_string(&search_index)
+            .context("failed to serialize conversation search index")?;
+        tokio::fs::write(&search_tmp_path, serialized)
+            .await
+            .with_context(|| {
+                format!("failed to write search index {}", search_tmp_path.display())
+            })?;
+        tokio::fs::rename(&search_tmp_path, &search_path)
+            .await
+            .with_context(|| format!("failed to replace search index {}", search_path.display()))?;
+
+        let marker = self.directory.join("active-workspace");
+        let marker_tmp = marker.with_extension("tmp");
+        tokio::fs::write(&marker_tmp, &self.workspace_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to write active workspace marker {}",
+                    marker_tmp.display()
+                )
+            })?;
+        tokio::fs::rename(&marker_tmp, &marker)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to replace active workspace marker {}",
+                    marker.display()
+                )
+            })
     }
 
     fn path(&self) -> PathBuf {
         self.directory.join(format!("{}.json", self.workspace_key))
     }
+
+    fn search_index_path(&self) -> PathBuf {
+        self.directory
+            .join(format!("{}.search.json", self.workspace_key))
+    }
+}
+
+#[derive(Serialize)]
+struct SearchProviderCache<'a> {
+    version: u32,
+    workspace_id: &'a str,
+    conversations: &'a [SlackConversation],
+    user_names: &'a HashMap<String, String>,
+    user_search_aliases: &'a HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -822,6 +876,47 @@ mod tests {
             .expect("missing upgraded state");
         assert_eq!(state.workspace_id, "T123:U123");
         assert_eq!(state.conversations[0].id, "D1");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_writes_a_lightweight_active_search_index() {
+        let directory = temp_cache_dir("workspace-search-index");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    is_channel: Some(true),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store
+                .store_history(
+                    "C1",
+                    &[SlackMessage {
+                        ts: "1.0".into(),
+                        text: Some("private message body".into()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+        });
+
+        let index = std::fs::read_to_string(store.search_index_path()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&index).unwrap();
+        assert_eq!(value["version"], SEARCH_INDEX_VERSION);
+        assert_eq!(value["workspace_id"], "T123:U123");
+        assert_eq!(value["conversations"][0]["id"], "C1");
+        assert!(value.get("channel_histories").is_none());
+        assert!(!index.contains("private message body"));
+        assert_eq!(
+            std::fs::read_to_string(directory.join("active-workspace")).unwrap(),
+            store.workspace_key
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 

@@ -68,12 +68,30 @@ impl<'a> EmojiCatalog<'a> {
         }));
         entries
     }
+}
+
+/// Widget-independent emoji picker data. Both the native composer popover and
+/// the WebView reaction picker are rendered from this model.
+#[derive(Debug, Clone)]
+pub struct EmojiPickerModel {
+    entries: Vec<EmojiEntry>,
+}
+
+impl EmojiPickerModel {
+    pub fn new(entries: Vec<EmojiEntry>) -> Self {
+        Self { entries }
+    }
+
+    pub fn entries(&self) -> &[EmojiEntry] {
+        &self.entries
+    }
 
     pub fn search(&self, query: &str) -> Vec<EmojiEntry> {
         let query = SearchQuery::parse(query);
         let mut matches = self
             .entries()
-            .into_iter()
+            .iter()
+            .cloned()
             .enumerate()
             .filter_map(|(index, entry)| {
                 let score = query.score([
@@ -86,6 +104,32 @@ impl<'a> EmojiCatalog<'a> {
         matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
         matches.into_iter().map(|(_, _, entry)| entry).collect()
     }
+}
+
+pub fn emoji_picker_accessible_label(entry: &EmojiEntry) -> String {
+    format!(":{}: — {}", entry.name, entry.label)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmojiPickerMove {
+    Previous,
+    Next,
+}
+
+/// Shared, clamped selection behavior for every emoji picker frontend.
+pub fn move_emoji_picker_selection(
+    selected: Option<usize>,
+    item_count: usize,
+    movement: EmojiPickerMove,
+) -> Option<usize> {
+    if item_count == 0 {
+        return None;
+    }
+    let current = selected.unwrap_or(0).min(item_count - 1);
+    Some(match movement {
+        EmojiPickerMove::Previous => current.saturating_sub(1),
+        EmojiPickerMove::Next => (current + 1).min(item_count - 1),
+    })
 }
 
 fn category_label(group: emojis::Group) -> &'static str {
@@ -147,20 +191,21 @@ mod tests {
             ("ship_it".to_string(), "alias:rocket".to_string()),
         ]);
         let catalog = EmojiCatalog::new(&custom);
+        let model = EmojiPickerModel::new(catalog.entries());
 
-        assert!(catalog
+        assert!(model
             .search("party parr")
             .iter()
             .any(|entry| entry.name == "party_parrot"));
-        assert!(catalog
+        assert!(model
             .search("ship it")
             .iter()
             .any(|entry| entry.name == "ship_it"));
-        assert!(catalog
+        assert!(model
             .search("grinning face")
             .iter()
             .any(|entry| entry.name == "grinning"));
-        assert!(catalog.search("definitely-not-an-emoji").is_empty());
+        assert!(model.search("definitely-not-an-emoji").is_empty());
     }
 
     #[test]
@@ -175,11 +220,57 @@ mod tests {
                 "https://emoji.example/party-parrot.gif".to_string(),
             ),
         ]);
-        let matches = EmojiCatalog::new(&custom).search("parrot");
+        let matches = EmojiPickerModel::new(EmojiCatalog::new(&custom).entries()).search("parrot");
 
         assert_eq!(
             matches.first().map(|entry| entry.name.as_str()),
             Some("parrot")
+        );
+    }
+
+    #[test]
+    fn picker_model_preserves_catalog_filtering_and_accessible_labels() {
+        let custom = HashMap::from([
+            (
+                "parrot".to_string(),
+                "https://emoji.example/parrot.gif".to_string(),
+            ),
+            (
+                "party_parrot".to_string(),
+                "https://emoji.example/party.gif".to_string(),
+            ),
+        ]);
+        let model = EmojiPickerModel::new(EmojiCatalog::new(&custom).entries());
+        let matches = model.search("parrot");
+
+        assert_eq!(matches[0].name, "parrot");
+        assert_eq!(
+            emoji_picker_accessible_label(&matches[0]),
+            ":parrot: — parrot"
+        );
+    }
+
+    #[test]
+    fn picker_selection_is_clamped_for_both_directions() {
+        assert_eq!(
+            move_emoji_picker_selection(Some(1), 3, EmojiPickerMove::Previous),
+            Some(0)
+        );
+        assert_eq!(
+            move_emoji_picker_selection(Some(1), 3, EmojiPickerMove::Next),
+            Some(2)
+        );
+        assert_eq!(
+            move_emoji_picker_selection(Some(0), 3, EmojiPickerMove::Previous),
+            Some(0)
+        );
+        assert_eq!(
+            move_emoji_picker_selection(Some(2), 3, EmojiPickerMove::Next),
+            Some(2)
+        );
+        assert_eq!(
+            move_emoji_picker_selection(Some(0), 0, EmojiPickerMove::Next),
+            None
         );
     }
 }

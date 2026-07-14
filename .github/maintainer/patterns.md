@@ -77,3 +77,9 @@
 - Issue footers are traceability, not proof of acceptance. Audit each acceptance list before closure, especially for lifecycle cleanup, interaction scope, and claims of shared architecture.
 - Stable-Clippy drift continues to make local parity important; broad feature batches should run the exact CI lint before push or pin a reviewed Rust toolchain.
 - Desktop integrations need an installed-session smoke test in addition to pure model tests because metadata discovery and D-Bus activation can fail outside unit-test coverage.
+
+## 2026-07-14 Acceptance-Gap Follow-up
+
+- Desktop search providers should read a deliberately small index, not deserialize the application's full offline state on the UI/D-Bus thread.
+- Cross-toolkit reuse is best expressed as a shared model and behavior contract; native GTK and WebView frontends still need thin platform-specific adapters.
+- Window-level keyboard routing can extend actions across a conversation surface, but must explicitly exclude editable/search/outside controls to preserve normal input behavior.

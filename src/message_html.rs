@@ -4,7 +4,9 @@ use gettextrs::gettext;
 
 use crate::activity::ActivityItem;
 use crate::debug;
-use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
+use crate::emoji::{
+    emoji_picker_accessible_label, EmojiCatalog, EmojiEntry, EmojiPickerModel, EmojiValue,
+};
 use crate::models::{
     SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage, SlackUserStatus,
 };
@@ -152,7 +154,8 @@ fn document_heading(title: &str) -> String {
 
 fn emoji_picker_html(context: &MessageHtmlContext) -> String {
     let catalog = EmojiCatalog::new(&context.custom_emojis);
-    let entries = catalog.entries();
+    let model = EmojiPickerModel::new(catalog.entries());
+    let entries = model.entries();
     let mut categories = entries
         .iter()
         .map(|emoji| emoji.category)
@@ -174,20 +177,20 @@ fn emoji_picker_html(context: &MessageHtmlContext) -> String {
         .enumerate()
         .map(|(index, emoji)| {
             format!(
-                "<button type=\"button\" class=\"emoji-choice\" data-emoji-name=\"{}\" data-emoji-label=\"{}\" data-category=\"{}\" data-original-index=\"{}\" title=\":{}:\" aria-label=\"{}\">{}</button>",
+                "<button id=\"emoji-choice-{index}\" type=\"button\" class=\"emoji-choice\" role=\"gridcell\" tabindex=\"-1\" aria-selected=\"false\" data-emoji-name=\"{}\" data-emoji-label=\"{}\" data-category=\"{}\" data-original-index=\"{}\" title=\":{}:\" aria-label=\"{}\">{}</button>",
                 escape_html(&emoji.name),
                 escape_html(&emoji.label),
                 escape_html(emoji.category),
                 index,
                 escape_html(&emoji.name),
-                escape_html(&emoji.label),
+                escape_html(&emoji_picker_accessible_label(emoji)),
                 emoji_value_html(&emoji.value, true),
             )
         })
         .collect::<String>();
 
     format!(
-        "<dialog id=\"emoji-picker\" class=\"emoji-picker\" aria-labelledby=\"emoji-picker-title\"><header><h2 id=\"emoji-picker-title\">{}</h2><button type=\"button\" class=\"picker-close\" aria-label=\"{}\">×</button></header><label class=\"emoji-search-label\" for=\"emoji-search\">{}</label><input id=\"emoji-search\" class=\"emoji-search\" type=\"search\" autocomplete=\"off\" placeholder=\"{}\"><nav class=\"emoji-categories\" role=\"tablist\" aria-label=\"{}\">{category_buttons}</nav><div class=\"emoji-grid\" role=\"grid\" aria-label=\"{}\">{emoji_buttons}</div><p class=\"emoji-empty\" role=\"status\" hidden>{}</p></dialog>",
+        "<dialog id=\"emoji-picker\" class=\"emoji-picker\" aria-labelledby=\"emoji-picker-title\"><header><h2 id=\"emoji-picker-title\">{}</h2><button type=\"button\" class=\"picker-close\" aria-label=\"{}\">×</button></header><label class=\"emoji-search-label\" for=\"emoji-search\">{}</label><input id=\"emoji-search\" class=\"emoji-search\" type=\"search\" role=\"combobox\" aria-controls=\"emoji-grid\" aria-expanded=\"true\" autocomplete=\"off\" placeholder=\"{}\"><nav class=\"emoji-categories\" role=\"tablist\" aria-label=\"{}\">{category_buttons}</nav><div id=\"emoji-grid\" class=\"emoji-grid\" role=\"grid\" aria-label=\"{}\">{emoji_buttons}</div><p class=\"emoji-empty\" role=\"status\" hidden>{}</p></dialog>",
         escape_html(&gettext("Add reaction")),
         escape_html(&gettext("Close emoji picker")),
         escape_html(&gettext("Search emoji by name")),
@@ -211,6 +214,42 @@ fn emoji_picker_script() -> &'static str {
   let activeCategory = "Smileys";
   let reactionTemplate = "";
   let opener = null;
+  let selectedChoice = null;
+
+  function visibleChoices() {
+    return choices.filter(function (choice) { return !choice.hidden; });
+  }
+
+  function selectChoice(choice, focus) {
+    selectedChoice = choice || null;
+    choices.forEach(function (item) {
+      const selected = item === selectedChoice;
+      item.setAttribute("aria-selected", String(selected));
+      item.tabIndex = selected ? 0 : -1;
+    });
+    if (selectedChoice) {
+      search.setAttribute("aria-activedescendant", selectedChoice.id);
+      selectedChoice.scrollIntoView({ block: "nearest" });
+      if (focus) selectedChoice.focus();
+    } else {
+      search.removeAttribute("aria-activedescendant");
+    }
+  }
+
+  function moveSelection(offset) {
+    const visible = visibleChoices();
+    if (visible.length === 0) return;
+    const current = Math.max(0, visible.indexOf(selectedChoice));
+    const next = Math.max(0, Math.min(visible.length - 1, current + offset));
+    selectChoice(visible[next], false);
+  }
+
+  function activateChoice(choice) {
+    if (!choice) return;
+    const url = reactionTemplate.replace("__REACTION__", encodeURIComponent(choice.dataset.emojiName));
+    picker.close();
+    window.location.href = url;
+  }
 
   function fieldTokens(term, value) {
     const normalized = value.toLocaleLowerCase();
@@ -280,6 +319,7 @@ fn emoji_picker_script() -> &'static str {
       })
       .forEach(function (choice) { grid.appendChild(choice); });
     empty.hidden = visible !== 0;
+    selectChoice(visibleChoices()[0] || null, false);
   }
 
   function cancelPicker(event) {
@@ -310,7 +350,17 @@ fn emoji_picker_script() -> &'static str {
   picker.querySelector(".picker-close").addEventListener("click", cancelPicker);
   picker.addEventListener("cancel", cancelPicker);
   picker.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") cancelPicker(event);
+    if (event.key === "Escape") {
+      cancelPicker(event);
+    } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+      event.preventDefault();
+      event.stopPropagation();
+      moveSelection(event.key === "ArrowUp" ? -1 : 1);
+    } else if (event.key === "Enter" && selectedChoice) {
+      event.preventDefault();
+      event.stopPropagation();
+      activateChoice(selectedChoice);
+    }
   }, true);
   picker.addEventListener("click", function (event) {
     if (event.target !== picker) return;
@@ -328,14 +378,12 @@ fn emoji_picker_script() -> &'static str {
       search.value = "";
       filterChoices();
       const first = choices.find(function (choice) { return !choice.hidden; });
-      if (first) first.focus();
+      if (first) selectChoice(first, true);
     });
   });
   choices.forEach(function (choice) {
     choice.addEventListener("click", function () {
-      const url = reactionTemplate.replace("__REACTION__", encodeURIComponent(choice.dataset.emojiName));
-      picker.close();
-      window.location.href = url;
+      activateChoice(choice);
     });
   });
 })();"##
@@ -1178,7 +1226,8 @@ pre code {{
 }}
 
 .picker-close:hover,
-.emoji-choice:hover {{
+.emoji-choice:hover,
+.emoji-choice[aria-selected="true"] {{
   background: var(--soft);
 }}
 
@@ -3464,12 +3513,34 @@ mod tests {
             "picker.querySelector(\".picker-close\").addEventListener(\"click\", cancelPicker)"
         ));
         assert!(html.contains("picker.addEventListener(\"cancel\", cancelPicker)"));
-        assert!(html.contains("if (event.key === \"Escape\") cancelPicker(event)"));
+        assert!(html.contains("if (event.key === \"Escape\") {"));
+        assert!(html.contains("cancelPicker(event);"));
         assert!(html.contains("if (event.target !== picker) return"));
         assert!(html.contains("if (!inside) cancelPicker(event)"));
         assert!(html.contains("if (opener) opener.focus()"));
         assert!(html.contains("Close emoji picker"));
         assert!(!html.contains("reaction-picker"));
+    }
+
+    #[test]
+    fn emoji_picker_exposes_shared_accessibility_and_keyboard_navigation() {
+        let html = conversation_document(
+            "C123",
+            &[message("Pick a reaction")],
+            &MessageHtmlContext::default(),
+        );
+
+        assert!(html.contains("role=\"combobox\""));
+        assert!(html.contains("aria-controls=\"emoji-grid\""));
+        assert!(html.contains("role=\"gridcell\""));
+        assert!(html.contains("aria-selected=\"false\""));
+        assert!(html.contains("function moveSelection(offset)"));
+        assert!(html.contains("event.key === \"ArrowUp\" || event.key === \"ArrowDown\""));
+        assert!(html.contains("moveSelection(event.key === \"ArrowUp\" ? -1 : 1)"));
+        assert!(html.contains("event.key === \"Enter\" && selectedChoice"));
+        assert!(html.contains("activateChoice(selectedChoice)"));
+        assert!(html.contains("search.setAttribute(\"aria-activedescendant\", selectedChoice.id)"));
+        assert!(html.contains(".emoji-choice[aria-selected=\"true\"]"));
     }
 
     #[test]

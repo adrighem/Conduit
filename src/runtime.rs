@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -40,6 +40,9 @@ const IMAGE_TASK_CONCURRENCY: usize = 4;
 const UPLOAD_TASK_CONCURRENCY: usize = 2;
 const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+const ATTACHMENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const ATTACHMENT_BASENAME_MAX_BYTES: usize = 180;
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
@@ -1078,8 +1081,8 @@ fn attachment_cache_path(url: &str, name: &str) -> PathBuf {
                 '_'
             }
         })
-        .take(120)
         .collect::<String>();
+    let basename = truncate_utf8(&basename, ATTACHMENT_BASENAME_MAX_BYTES);
     let basename = basename.trim_matches([' ', '.']).trim();
     let basename = if basename.is_empty() {
         "attachment"
@@ -1087,6 +1090,138 @@ fn attachment_cache_path(url: &str, name: &str) -> PathBuf {
         basename
     };
     config::attachment_cache_dir().join(format!("{key}-{basename}"))
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+#[derive(Clone, Copy)]
+struct AttachmentCachePolicy {
+    max_age: Duration,
+    max_bytes: u64,
+}
+
+impl Default for AttachmentCachePolicy {
+    fn default() -> Self {
+        Self {
+            max_age: ATTACHMENT_CACHE_MAX_AGE,
+            max_bytes: ATTACHMENT_CACHE_MAX_BYTES,
+        }
+    }
+}
+
+struct AttachmentCacheEntry {
+    path: PathBuf,
+    size: u64,
+    last_used: SystemTime,
+}
+
+fn prune_attachment_cache(
+    directory: &Path,
+    protected: Option<&Path>,
+    policy: AttachmentCachePolicy,
+    now: SystemTime,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut retained = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let is_protected = protected.is_some_and(|protected| protected == path);
+        let last_used = metadata
+            .accessed()
+            .ok()
+            .into_iter()
+            .chain(metadata.modified().ok())
+            .max()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let expired = now
+            .duration_since(last_used)
+            .is_ok_and(|age| age > policy.max_age);
+        if expired && !is_protected {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        // A concurrent download writes to a process-specific `.part` file.
+        // Never include an active partial in size eviction; age cleanup still
+        // removes abandoned partials left behind by an interrupted process.
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "part")
+        {
+            continue;
+        }
+        retained.push(AttachmentCacheEntry {
+            path,
+            size: metadata.len(),
+            last_used,
+        });
+    }
+
+    let mut total = retained
+        .iter()
+        .fold(0_u64, |total, entry| total.saturating_add(entry.size));
+    retained.sort_by(|left, right| {
+        left.last_used
+            .cmp(&right.last_used)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    for entry in retained {
+        if total <= policy.max_bytes {
+            break;
+        }
+        if protected.is_some_and(|protected| protected == entry.path) {
+            continue;
+        }
+        if std::fs::remove_file(&entry.path).is_ok() {
+            total = total.saturating_sub(entry.size);
+        }
+    }
+
+    Ok(())
+}
+
+async fn maintain_attachment_cache(protected: Option<PathBuf>) {
+    let directory = config::attachment_cache_dir();
+    let result = tokio::task::spawn_blocking(move || {
+        prune_attachment_cache(
+            &directory,
+            protected.as_deref(),
+            AttachmentCachePolicy::default(),
+            SystemTime::now(),
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => crate::debug::log(
+            "runtime",
+            &format!("AttachmentCacheCleanupFailed error={error}"),
+        ),
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("AttachmentCacheCleanupTaskFailed error={error}"),
+        ),
+    }
 }
 
 struct RemoveFileOnDrop(Option<PathBuf>);
@@ -1159,6 +1294,7 @@ async fn run_runtime(
     mut commands: mpsc::UnboundedReceiver<RuntimeRequest>,
     events: mpsc::UnboundedSender<RuntimeEvent>,
 ) {
+    maintain_attachment_cache(None).await;
     let state = Arc::new(Mutex::new(RuntimeState::new(SessionId::default())));
     let oauth = SlackOAuthClient::new();
     let image_cache = ImageAssetCache::new(config::image_asset_cache_dir());
@@ -1341,6 +1477,14 @@ fn dispatch_command(
 }
 
 fn finish_sign_out(events: &RuntimeEventSender, clear_result: Result<()>) {
+    if let Err(error) = std::fs::remove_file(config::active_workspace_marker_path()) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            crate::debug::log(
+                "store",
+                &format!("ActiveWorkspaceMarkerClearFailed error={error}"),
+            );
+        }
+    }
     if let Err(error) = clear_result {
         events.send_event(RuntimeEventKind::Error(error.to_string()));
     }
@@ -2219,6 +2363,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         RuntimeCommand::DownloadAttachment { url, name } => {
             let api = require_slack(context.slack)?;
             let destination = attachment_cache_path(&url, &name);
+            maintain_attachment_cache(Some(destination.clone())).await;
             let progress_events = context.events.clone();
             let attachment = api
                 .download_attachment(&url, &destination, move |update| {
@@ -2228,6 +2373,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     });
                 })
                 .await?;
+            maintain_attachment_cache(Some(attachment.path.clone())).await;
             context
                 .events
                 .send_event(RuntimeEventKind::AttachmentDownloaded {
@@ -3863,6 +4009,90 @@ mod tests {
                 "../../Quarterly: report?.pdf",
             )
         );
+    }
+
+    #[test]
+    fn attachment_cache_filename_stays_within_a_byte_safe_component_limit() {
+        let name = format!("{}.pdf", "é".repeat(200));
+        let path = attachment_cache_path("https://files.slack.com/long-name", &name);
+        let filename = path.file_name().and_then(|name| name.to_str()).unwrap();
+        let basename = filename.split_once('-').unwrap().1;
+
+        assert!(basename.len() <= ATTACHMENT_BASENAME_MAX_BYTES);
+        assert!(filename.len() <= 64 + 1 + ATTACHMENT_BASENAME_MAX_BYTES);
+        assert!(basename.is_char_boundary(basename.len()));
+    }
+
+    #[test]
+    fn attachment_cache_prunes_expired_files_but_preserves_active_download() {
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-attachment-age-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let expired = directory.join("expired");
+        let protected = directory.join("protected");
+        std::fs::write(&expired, b"old").unwrap();
+        std::fs::write(&protected, b"active").unwrap();
+
+        prune_attachment_cache(
+            &directory,
+            Some(&protected),
+            AttachmentCachePolicy {
+                max_age: Duration::from_secs(5),
+                max_bytes: u64::MAX,
+            },
+            SystemTime::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+
+        assert!(!expired.exists());
+        assert!(protected.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn attachment_cache_evicts_to_size_cap_without_removing_active_download() {
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-attachment-size-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let protected = directory.join("protected");
+        let partial = directory.join("concurrent.123.part");
+        std::fs::write(directory.join("first"), b"1111").unwrap();
+        std::fs::write(directory.join("second"), b"2222").unwrap();
+        std::fs::write(&protected, b"3333").unwrap();
+        std::fs::write(&partial, b"download in progress").unwrap();
+
+        prune_attachment_cache(
+            &directory,
+            Some(&protected),
+            AttachmentCachePolicy {
+                max_age: Duration::MAX,
+                max_bytes: 7,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        let retained_size = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "part")
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        assert!(protected.exists());
+        assert!(partial.exists());
+        assert!(retained_size <= 7);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

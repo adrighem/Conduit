@@ -40,7 +40,10 @@ use crate::composer::{
 use crate::config;
 use crate::conversation_catalog::ConversationCatalog;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
-use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
+use crate::emoji::{
+    emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
+    EmojiPickerModel, EmojiPickerMove, EmojiValue,
+};
 use crate::message_html::{self, MessageHtmlContext, TimelineScrollBehavior};
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
@@ -126,6 +129,8 @@ mod imp {
         #[template_child]
         pub message_title: TemplateChild<adw::WindowTitle>,
         #[template_child]
+        pub message_pane: TemplateChild<gtk::Box>,
+        #[template_child]
         pub message_view_box: TemplateChild<gtk::Box>,
         #[template_child]
         pub message_composer: TemplateChild<gtk::Box>,
@@ -147,6 +152,8 @@ mod imp {
         pub message_search_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub thread_title: TemplateChild<adw::WindowTitle>,
+        #[template_child]
+        pub thread_pane: TemplateChild<gtk::Box>,
         #[template_child]
         pub thread_view_box: TemplateChild<gtk::Box>,
         #[template_child]
@@ -257,6 +264,44 @@ mod imp {
 enum ComposerTarget {
     Message,
     Thread,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationPanePasteFocus {
+    MainPane,
+    ThreadPane,
+    Composer,
+    TextInput,
+    Outside,
+}
+
+fn conversation_pane_image_paste_target(
+    focus: ConversationPanePasteFocus,
+    clipboard_has_image: bool,
+    key: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+) -> Option<ComposerTarget> {
+    if !clipboard_has_image || !is_unmodified_paste_accelerator(key, state) {
+        return None;
+    }
+    match focus {
+        ConversationPanePasteFocus::MainPane => Some(ComposerTarget::Message),
+        ConversationPanePasteFocus::ThreadPane => Some(ComposerTarget::Thread),
+        ConversationPanePasteFocus::Composer
+        | ConversationPanePasteFocus::TextInput
+        | ConversationPanePasteFocus::Outside => None,
+    }
+}
+
+fn is_unmodified_paste_accelerator(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+    matches!(key, gtk::gdk::Key::v | gtk::gdk::Key::V)
+        && state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        && !state.intersects(
+            gtk::gdk::ModifierType::SHIFT_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK
+                | gtk::gdk::ModifierType::META_MASK,
+        )
 }
 
 const COMPOSER_TARGETS: [ComposerTarget; 2] = [ComposerTarget::Message, ComposerTarget::Thread];
@@ -1868,6 +1913,7 @@ impl ConduitWindow {
         });
         self.connect_image_paste(&imp.message_entry.get(), false);
         self.connect_image_paste(&imp.thread_entry.get(), true);
+        self.connect_conversation_pane_image_paste();
 
         for buffer in [imp.message_entry.buffer(), imp.thread_entry.buffer()] {
             let weak_window = self.downgrade();
@@ -2317,7 +2363,9 @@ impl ConduitWindow {
         let caret = buffer.cursor_position().max(0) as usize;
         let token = emoji_token_at_caret(&text, caret);
         let entries = token.as_ref().map_or_else(Vec::new, |token| {
-            EmojiCatalog::new(&self.imp().custom_emojis.borrow())
+            let custom_emojis = self.imp().custom_emojis.borrow();
+            let catalog = EmojiCatalog::new(&custom_emojis);
+            EmojiPickerModel::new(catalog.entries())
                 .search(&token.query)
                 .into_iter()
                 .take(10)
@@ -2361,10 +2409,9 @@ impl ConduitWindow {
             content.append(&preview);
             content.append(&label);
             row.set_child(Some(&content));
-            row.update_property(&[gtk::accessible::Property::Label(&format!(
-                ":{}: — {}",
-                entry.name, entry.label
-            ))]);
+            row.update_property(&[gtk::accessible::Property::Label(
+                &emoji_picker_accessible_label(entry),
+            )]);
             completion.list.append(&row);
         }
         completion
@@ -2390,7 +2437,7 @@ impl ConduitWindow {
         }
     }
 
-    fn move_composer_emoji_selection(&self, target: ComposerTarget, offset: i32) {
+    fn move_composer_emoji_selection(&self, target: ComposerTarget, movement: EmojiPickerMove) {
         let completion_ref = match target {
             ComposerTarget::Message => self.imp().message_emoji_completion.borrow(),
             ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow(),
@@ -2398,12 +2445,16 @@ impl ConduitWindow {
         let Some(completion) = completion_ref.as_ref() else {
             return;
         };
-        let last = completion.entries.len().saturating_sub(1) as i32;
-        let current = completion.list.selected_row().map_or(0, |row| row.index());
-        let next = (current + offset).clamp(0, last);
-        completion
+        let current = completion
             .list
-            .select_row(completion.list.row_at_index(next).as_ref());
+            .selected_row()
+            .map(|row| row.index().max(0) as usize);
+        if let Some(next) = move_emoji_picker_selection(current, completion.entries.len(), movement)
+        {
+            completion
+                .list
+                .select_row(completion.list.row_at_index(next as i32).as_ref());
+        }
     }
 
     fn accept_composer_emoji_completion(&self, target: ComposerTarget) {
@@ -2468,8 +2519,12 @@ impl ConduitWindow {
         }
 
         match emoji_completion_key_action(key, state) {
-            EmojiCompletionKeyAction::Previous => self.move_composer_emoji_selection(target, -1),
-            EmojiCompletionKeyAction::Next => self.move_composer_emoji_selection(target, 1),
+            EmojiCompletionKeyAction::Previous => {
+                self.move_composer_emoji_selection(target, EmojiPickerMove::Previous)
+            }
+            EmojiCompletionKeyAction::Next => {
+                self.move_composer_emoji_selection(target, EmojiPickerMove::Next)
+            }
             EmojiCompletionKeyAction::Accept => self.accept_composer_emoji_completion(target),
             EmojiCompletionKeyAction::Dismiss => self.dismiss_composer_emoji_completion(target),
             EmojiCompletionKeyAction::Ignore => return glib::Propagation::Proceed,
@@ -3291,42 +3346,127 @@ impl ConduitWindow {
             };
             let initial_comment = text_view_text(text_view).trim().to_string();
             let initial_comment = (!initial_comment.is_empty()).then_some(initial_comment);
-            let weak_window = window.downgrade();
-            clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| {
-                let Some(window) = weak_window.upgrade() else {
-                    return;
-                };
-                let texture = match result {
-                    Ok(Some(texture)) => texture,
-                    Ok(None) => {
-                        window.set_status("The clipboard image could not be read");
-                        return;
-                    }
-                    Err(error) => {
-                        window.set_status(&format!("Could not read clipboard image: {error}"));
-                        return;
-                    }
-                };
+            window.read_clipboard_image_for_upload(
+                clipboard,
+                &channel_id,
+                thread_ts.as_deref(),
+                initial_comment,
+            );
+        });
+    }
 
-                let directory = config::upload_staging_dir();
-                if let Err(error) = std::fs::create_dir_all(&directory) {
-                    window.set_status(&format!("Could not prepare screenshot upload: {error}"));
+    fn connect_conversation_pane_image_paste(&self) {
+        let controller = gtk::EventControllerKey::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak_window = self.downgrade();
+        controller.connect_key_pressed(move |_, key, _, state| {
+            let Some(window) = weak_window.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let clipboard = window.display().clipboard();
+            let Some(target) = window.conversation_pane_paste_target(
+                clipboard_formats_include_image(&clipboard.formats()),
+                key,
+                state,
+            ) else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(channel_id) = window.visible_channel_id() else {
+                window.set_status("Select a conversation before pasting an image");
+                return glib::Propagation::Stop;
+            };
+            let thread_ts = match target {
+                ComposerTarget::Message => None,
+                ComposerTarget::Thread => {
+                    let Some(thread_ts) = window.selected_thread_ts() else {
+                        window.set_status("Open a thread before pasting an image here");
+                        return glib::Propagation::Stop;
+                    };
+                    Some(thread_ts)
+                }
+            };
+            window.read_clipboard_image_for_upload(
+                clipboard,
+                &channel_id,
+                thread_ts.as_deref(),
+                None,
+            );
+            glib::Propagation::Stop
+        });
+        self.add_controller(controller);
+    }
+
+    fn conversation_pane_paste_target(
+        &self,
+        clipboard_has_image: bool,
+        key: gtk::gdk::Key,
+        state: gtk::gdk::ModifierType,
+    ) -> Option<ComposerTarget> {
+        let Some(focus) = self.focus() else {
+            return None;
+        };
+        let imp = self.imp();
+        let is_within = |widget: &gtk::Widget| focus == *widget || focus.is_ancestor(widget);
+        let main_entry = imp.message_entry.get().upcast::<gtk::Widget>();
+        let thread_entry = imp.thread_entry.get().upcast::<gtk::Widget>();
+        let focus_kind = if is_within(&main_entry) || is_within(&thread_entry) {
+            ConversationPanePasteFocus::Composer
+        } else if focus.is::<gtk::Editable>() || focus.is::<gtk::TextView>() {
+            ConversationPanePasteFocus::TextInput
+        } else if is_within(&imp.thread_pane.get().upcast::<gtk::Widget>()) {
+            ConversationPanePasteFocus::ThreadPane
+        } else if is_within(&imp.message_pane.get().upcast::<gtk::Widget>()) {
+            ConversationPanePasteFocus::MainPane
+        } else {
+            ConversationPanePasteFocus::Outside
+        };
+        conversation_pane_image_paste_target(focus_kind, clipboard_has_image, key, state)
+    }
+
+    fn read_clipboard_image_for_upload(
+        &self,
+        clipboard: gtk::gdk::Clipboard,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        initial_comment: Option<String>,
+    ) {
+        let channel_id = channel_id.to_string();
+        let thread_ts = thread_ts.map(ToString::to_string);
+        let weak_window = self.downgrade();
+        clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let texture = match result {
+                Ok(Some(texture)) => texture,
+                Ok(None) => {
+                    window.set_status("The clipboard image could not be read");
                     return;
                 }
-                let path = directory.join(screenshot_filename());
-                if let Err(error) = texture.save_to_png(&path) {
-                    let _ = std::fs::remove_file(&path);
-                    window.set_status(&format!("Could not encode clipboard image: {error}"));
+                Err(error) => {
+                    window.set_status(&format!("Could not read clipboard image: {error}"));
                     return;
                 }
-                window.begin_file_upload(
-                    &channel_id,
-                    thread_ts.as_deref(),
-                    path,
-                    initial_comment,
-                    true,
-                );
-            });
+            };
+
+            let directory = config::upload_staging_dir();
+            if let Err(error) = std::fs::create_dir_all(&directory) {
+                window.set_status(&format!("Could not prepare screenshot upload: {error}"));
+                return;
+            }
+            let path = directory.join(screenshot_filename());
+            if let Err(error) = texture.save_to_png(&path) {
+                let _ = std::fs::remove_file(&path);
+                window.set_status(&format!("Could not encode clipboard image: {error}"));
+                return;
+            }
+            window.begin_file_upload(
+                &channel_id,
+                thread_ts.as_deref(),
+                path,
+                initial_comment,
+                true,
+            );
         });
     }
 
@@ -5279,12 +5419,19 @@ impl ConduitWindow {
         application.withdraw_conversation_notification(&workspace_id, channel_id);
     }
 
-    pub(crate) fn open_notification_target(&self, workspace_id: String, channel_id: String) {
+    pub(crate) fn open_notification_target(
+        &self,
+        workspace_id: String,
+        channel_id: String,
+    ) -> bool {
+        let expected_channel_id = channel_id.clone();
         *self.imp().pending_notification_target.borrow_mut() = Some(NotificationTarget {
             workspace_id,
             channel_id,
         });
         self.activate_pending_notification_target();
+        self.imp().pending_notification_target.borrow().is_none()
+            && self.visible_channel_id().as_deref() == Some(expected_channel_id.as_str())
     }
 
     fn activate_pending_notification_target(&self) {
@@ -6386,6 +6533,67 @@ mod tests {
     }
 
     #[test]
+    fn conversation_pane_image_paste_targets_the_originating_pane() {
+        let control = gtk::gdk::ModifierType::CONTROL_MASK;
+        assert_eq!(
+            conversation_pane_image_paste_target(
+                ConversationPanePasteFocus::MainPane,
+                true,
+                gtk::gdk::Key::v,
+                control,
+            ),
+            Some(ComposerTarget::Message)
+        );
+        assert_eq!(
+            conversation_pane_image_paste_target(
+                ConversationPanePasteFocus::ThreadPane,
+                true,
+                gtk::gdk::Key::v,
+                control,
+            ),
+            Some(ComposerTarget::Thread)
+        );
+    }
+
+    #[test]
+    fn conversation_pane_image_paste_excludes_inputs_and_unrelated_widgets() {
+        let control = gtk::gdk::ModifierType::CONTROL_MASK;
+        for focus in [
+            ConversationPanePasteFocus::Composer,
+            ConversationPanePasteFocus::TextInput,
+            ConversationPanePasteFocus::Outside,
+        ] {
+            assert_eq!(
+                conversation_pane_image_paste_target(focus, true, gtk::gdk::Key::v, control),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_pane_image_paste_preserves_normal_paste_shortcuts() {
+        let control = gtk::gdk::ModifierType::CONTROL_MASK;
+        let main = ConversationPanePasteFocus::MainPane;
+        assert_eq!(
+            conversation_pane_image_paste_target(main, false, gtk::gdk::Key::v, control),
+            None
+        );
+        assert_eq!(
+            conversation_pane_image_paste_target(
+                main,
+                true,
+                gtk::gdk::Key::v,
+                control | gtk::gdk::ModifierType::SHIFT_MASK,
+            ),
+            None
+        );
+        assert_eq!(
+            conversation_pane_image_paste_target(main, true, gtk::gdk::Key::c, control,),
+            None
+        );
+    }
+
+    #[test]
     fn screenshot_staging_names_are_safe_png_files() {
         let first = screenshot_filename();
 
@@ -6448,6 +6656,8 @@ mod tests {
         for required in [
             "AdwNavigationSplitView\" id=\"workspace_split",
             "AdwOverlaySplitView\" id=\"thread_split",
+            "GtkBox\" id=\"message_pane",
+            "GtkBox\" id=\"thread_pane",
             "AdwNavigationPage",
             "GtkSearchBar\" id=\"message_search_bar",
             "AdwClamp",

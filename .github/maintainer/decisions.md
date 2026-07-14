@@ -107,3 +107,10 @@
 - Treat CI run `29325605695` as the immediate blocker: stable Clippy rejected three newly introduced patterns before tests or Meson validation ran.
 - Keep the fix behavioral and local: use eager `then_some` and reduce picker function argument counts through context structures rather than lint suppression.
 - CodeQL and enabled GitHub security scanning are clean. No public issue, label, closure, release, or repository-setting action was taken.
+
+## 2026-07-14 Acceptance-Gap Follow-up
+
+- Complete all four audited acceptance gaps before requesting closure: bound attachment-cache lifetime/size, route screenshot paste across the conversation surface, share a widget-independent emoji picker contract, and back GNOME search with a lightweight active-workspace index plus live D-Bus validation.
+- Keep the GNOME provider single-workspace by design until Conduit supports real workspace switching; an explicit active marker prevents stale cached workspaces from producing unopenable results.
+- Require remote stable Clippy, CI, and CodeQL before closing ISSUE:2, ISSUE:3, ISSUE:5, or ISSUE:7.
+- No public issue, closure, comment, label, or push action was taken in this follow-up.

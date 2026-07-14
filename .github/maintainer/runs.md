@@ -235,3 +235,11 @@
 - Local baseline before the lint fix: 327 Rust tests and all 4 Meson tests passed.
 - The installed maintainer package still lacks its referenced scripts and reference guides, so this run used `gh-helper`, `gh`, and manual intent/decision analysis.
 - No public issue, label, closure, release, or repository-setting action was taken.
+
+## 2026-07-14 Acceptance-Gap Follow-up
+
+- Current public backlog: ISSUE:2, ISSUE:3, ISSUE:5, and ISSUE:7 remain open; ISSUE:1, ISSUE:4, and ISSUE:6 were closed after CI and CodeQL passed on `855bd8b`.
+- Implemented locally: bounded attachment cache eviction and UTF-8-safe filenames; conversation-pane screenshot paste; shared emoji picker model plus reaction keyboard navigation; lightweight active-workspace GNOME index, real subsearch, stale filtering, metadata validation, and live D-Bus activation smoke coverage.
+- Local checks: formatting and all-target checks pass; 341 Rust tests pass; Meson compile and all 6 available Meson tests pass, including search-provider metadata and live D-Bus smoke tests.
+- Exact stable Clippy remains unavailable locally and must be verified by GitHub Actions before closure.
+- No public issue, closure, comment, label, or push action was taken in this follow-up.

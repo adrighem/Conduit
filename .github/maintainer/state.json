@@ -1,21 +1,21 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-14-post-feature-audit",
-  "last_known_open_issues": 7,
+  "last_manual_run": "2026-07-14-acceptance-gap-follow-up",
+  "last_known_open_issues": 4,
   "last_known_open_pull_requests": 0,
   "last_known_total_issues": 7,
   "last_known_total_pull_requests": 0,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 327 tests",
+    "cargo_test": "pass: 341 tests",
     "meson_compile": "pass",
     "meson_test": "pass",
-    "github_actions": "CodeQL passed on 8b3965d; CI 29325605695 failed strict Clippy before tests",
+    "github_actions": "CI 29325958493 and CodeQL 29325957810 passed on 855bd8b; follow-up not pushed",
     "cargo_clippy": "not available locally"
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
     "clippy": "CI tracks stable Clippy and treats warnings as errors",
-    "worktree": "clean; main has one validated strict-Clippy fix commit awaiting push approval"
+    "worktree": "clean; main has one validated ISSUE:2/3/5/7 follow-up commit awaiting push approval"
   }
 }

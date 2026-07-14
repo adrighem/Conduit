@@ -264,7 +264,18 @@ impl ConduitApplication {
         else {
             return;
         };
-        window.open_notification_target(workspace_id, channel_id);
+        if window.open_notification_target(workspace_id.clone(), channel_id.clone()) {
+            if let Some(path) = std::env::var_os("CONDUIT_TEST_OPEN_TARGET_FILE") {
+                let _ = std::fs::write(
+                    path,
+                    serde_json::json!({
+                        "workspace_id": workspace_id,
+                        "channel_id": channel_id,
+                    })
+                    .to_string(),
+                );
+            }
+        }
     }
 
     pub(crate) fn send_conversation_notification(

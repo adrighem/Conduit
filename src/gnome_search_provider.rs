@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 use crate::models::SlackConversation;
-use crate::sidebar::{conversation_switcher_items_with_aliases, UserSearchAliases};
+use crate::sidebar::{
+    conversation_kind, conversation_switcher_items_with_aliases, ConversationKind,
+    UserSearchAliases,
+};
+use crate::store::SEARCH_INDEX_VERSION;
 use crate::ConduitApplication;
 
 const OBJECT_PATH: &str = "/eu/vanadrighem/conduit/SearchProvider";
@@ -47,6 +51,7 @@ const INTERFACE_XML: &str = r#"
 
 #[derive(Debug, Deserialize)]
 struct CachedSearchState {
+    version: u32,
     #[serde(default)]
     workspace_id: String,
     #[serde(default)]
@@ -102,8 +107,9 @@ pub(crate) fn register(
                         call.return_value(Some(&(ids,).to_variant()));
                     }
                     "GetSubsearchResultSet" => {
+                        let previous_results = parameters.child_get::<Vec<String>>(0);
                         let terms = parameters.child_get::<Vec<String>>(1);
-                        let ids = search(&config::state_cache_dir(), &terms)
+                        let ids = subsearch(&config::state_cache_dir(), &previous_results, &terms)
                             .into_iter()
                             .map(|result| result.id)
                             .collect::<Vec<_>>();
@@ -139,35 +145,69 @@ pub(crate) fn register(
 }
 
 fn search(cache_dir: &Path, terms: &[String]) -> Vec<SearchResult> {
+    search_states(cached_states(cache_dir), terms, None)
+}
+
+fn subsearch(cache_dir: &Path, previous_ids: &[String], terms: &[String]) -> Vec<SearchResult> {
+    let mut allowed = HashMap::<String, HashSet<String>>::new();
+    for target in previous_ids.iter().filter_map(|id| decode_target(id)) {
+        allowed
+            .entry(target.workspace_id)
+            .or_default()
+            .insert(target.channel_id);
+    }
+    if allowed.is_empty() {
+        return Vec::new();
+    }
+    search_states(cached_states(cache_dir), terms, Some(&allowed))
+}
+
+fn search_states(
+    states: Vec<CachedSearchState>,
+    terms: &[String],
+    allowed: Option<&HashMap<String, HashSet<String>>>,
+) -> Vec<SearchResult> {
     let query = terms.join(" ");
     if query.trim().is_empty() {
         return Vec::new();
     }
 
-    let mut per_workspace = cached_states(cache_dir)
+    let mut per_workspace = states
         .into_iter()
         .filter(|state| !state.workspace_id.trim().is_empty())
-        .map(|state| {
+        .filter_map(|mut state| {
+            state.conversations.retain(|conversation| {
+                !conversation.is_archived.unwrap_or(false)
+                    && conversation_kind(conversation) != ConversationKind::Unknown
+            });
+            if let Some(allowed) = allowed {
+                let ids = allowed.get(&state.workspace_id)?;
+                state
+                    .conversations
+                    .retain(|conversation| ids.contains(&conversation.id));
+            }
             let current_user_id = current_user_id(&state.workspace_id);
-            conversation_switcher_items_with_aliases(
-                &state.conversations,
-                &state.user_names,
-                current_user_id,
-                &query,
-                Some(&state.user_search_aliases),
-                None,
+            Some(
+                conversation_switcher_items_with_aliases(
+                    &state.conversations,
+                    &state.user_names,
+                    current_user_id,
+                    &query,
+                    Some(&state.user_search_aliases),
+                    None,
+                )
+                .into_iter()
+                .map(|row| SearchResult {
+                    id: encode_target(&ResultTarget {
+                        workspace_id: state.workspace_id.clone(),
+                        channel_id: row.id,
+                    }),
+                    name: row.title,
+                    description: row.kind.accessible_name(),
+                    icon_name: row.kind.icon_name(),
+                })
+                .collect::<Vec<_>>(),
             )
-            .into_iter()
-            .map(|row| SearchResult {
-                id: encode_target(&ResultTarget {
-                    workspace_id: state.workspace_id.clone(),
-                    channel_id: row.id,
-                }),
-                name: row.title,
-                description: row.kind.accessible_name(),
-                icon_name: row.kind.icon_name(),
-            })
-            .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
 
@@ -195,8 +235,12 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
             state
                 .conversations
                 .into_iter()
+                .filter(|conversation| {
+                    !conversation.is_archived.unwrap_or(false)
+                        && conversation_kind(conversation) != ConversationKind::Unknown
+                })
                 .map(move |conversation| {
-                    let kind = crate::sidebar::conversation_kind(&conversation);
+                    let kind = conversation_kind(&conversation);
                     let target = ResultTarget {
                         workspace_id: workspace_id.clone(),
                         channel_id: conversation.id.clone(),
@@ -234,22 +278,18 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
 }
 
 fn cached_states(cache_dir: &Path) -> Vec<CachedSearchState> {
-    let Ok(entries) = fs::read_dir(cache_dir) else {
+    let key = fs::read_to_string(cache_dir.join("active-workspace"))
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let Some(key) = key else {
         return Vec::new();
     };
-    let mut paths = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths
+    fs::read_to_string(cache_dir.join(format!("{key}.search.json")))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<CachedSearchState>(&contents).ok())
+        .filter(|state| state.version == SEARCH_INDEX_VERSION)
         .into_iter()
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .filter_map(|contents| serde_json::from_str(&contents).ok())
         .collect()
 }
 
@@ -282,6 +322,22 @@ mod tests {
         std::env::temp_dir().join(format!("conduit-search-provider-{nonce}"))
     }
 
+    fn write_index(directory: &Path, state: serde_json::Value) {
+        write_index_version(directory, state, SEARCH_INDEX_VERSION);
+    }
+
+    fn write_index_version(directory: &Path, mut state: serde_json::Value, version: u32) {
+        const KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        fs::create_dir_all(directory).unwrap();
+        state["version"] = serde_json::json!(version);
+        fs::write(directory.join("active-workspace"), KEY).unwrap();
+        fs::write(
+            directory.join(format!("{KEY}.search.json")),
+            state.to_string(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn result_ids_round_trip_without_exposing_workspace_or_conversation_ids() {
         let target = ResultTarget {
@@ -298,9 +354,8 @@ mod tests {
     #[test]
     fn searches_cached_channels_and_direct_messages_with_shared_matching() {
         let directory = temp_dir();
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join("workspace.json"),
+        write_index(
+            &directory,
             serde_json::json!({
                 "workspace_id": "T123:U0",
                 "conversations": [
@@ -309,10 +364,8 @@ mod tests {
                 ],
                 "user_names": {"U1": "Žilvinas Kuusas"},
                 "user_search_aliases": {"U1": ["zilvinas", "kuusas"]}
-            })
-            .to_string(),
-        )
-        .unwrap();
+            }),
+        );
 
         let dm = search(&directory, &["Zilvinas".into(), "Kuu".into()]);
         assert_eq!(dm.len(), 1);
@@ -326,14 +379,150 @@ mod tests {
     }
 
     #[test]
+    fn searches_group_dms_without_the_current_user_and_skips_archived_results() {
+        let directory = temp_dir();
+        write_index(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U_SELF",
+                "conversations": [
+                    {"id": "M1", "is_mpim": true, "members": ["U_SELF", "U_FAT", "U_ROB"]},
+                    {"id": "C_OLD", "name": "fat-rob-archive", "is_channel": true, "is_archived": true},
+                    {"id": "UNKNOWN", "name": "fat rob unknown"}
+                ],
+                "user_names": {
+                    "U_SELF": "Vincent",
+                    "U_FAT": "Fatima",
+                    "U_ROB": "Robey"
+                }
+            }),
+        );
+
+        let results = search(&directory, &["fat".into(), "rob".into()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Fatima, Robey");
+        assert_eq!(results[0].description, "Group direct message");
+        assert!(!results[0].name.contains("Vincent"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn subsearch_only_refines_live_previous_results() {
+        let directory = temp_dir();
+        write_index(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [
+                    {"id": "D1", "user": "U1", "is_im": true},
+                    {"id": "D2", "user": "U2", "is_im": true}
+                ],
+                "user_names": {"U1": "Richard Adams", "U2": "Richard Brown"}
+            }),
+        );
+        let first = search(&directory, &["rich".into()]);
+        assert_eq!(first.len(), 2);
+        let d1 = first
+            .iter()
+            .find(|result| decode_target(&result.id).unwrap().channel_id == "D1")
+            .unwrap()
+            .id
+            .clone();
+
+        let refined = subsearch(&directory, std::slice::from_ref(&d1), &["richard".into()]);
+        assert_eq!(refined.len(), 1);
+        assert_eq!(refined[0].id, d1);
+        assert!(subsearch(&directory, &["invalid".into()], &["rich".into()]).is_empty());
+
+        write_index(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [
+                    {"id": "D1", "user": "U1", "is_im": true, "is_archived": true}
+                ],
+                "user_names": {"U1": "Richard Adams"}
+            }),
+        );
+        assert!(subsearch(&directory, &[d1], &["rich".into()]).is_empty());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn result_metadata_is_complete_and_omits_archived_targets() {
+        let directory = temp_dir();
+        write_index(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [
+                    {"id": "D1", "user": "U1", "is_im": true},
+                    {"id": "C_OLD", "name": "old", "is_channel": true, "is_archived": true}
+                ],
+                "user_names": {"U1": "Žilvinas Kuusas"}
+            }),
+        );
+        let dm = encode_target(&ResultTarget {
+            workspace_id: "T123:U0".into(),
+            channel_id: "D1".into(),
+        });
+        let archived = encode_target(&ResultTarget {
+            workspace_id: "T123:U0".into(),
+            channel_id: "C_OLD".into(),
+        });
+
+        let metas = result_metas(&directory, &[dm.clone(), archived]);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0]["id"].get::<String>().as_deref(), Some(dm.as_str()));
+        assert_eq!(
+            metas[0]["name"].get::<String>().as_deref(),
+            Some("Žilvinas Kuusas")
+        );
+        assert_eq!(
+            metas[0]["description"].get::<String>().as_deref(),
+            Some("Direct message")
+        );
+        assert!(metas[0].contains_key("gicon"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn dbus_interface_and_shell_metadata_agree() {
+        let interface = gio::DBusNodeInfo::for_xml(INTERFACE_XML)
+            .unwrap()
+            .lookup_interface("org.gnome.Shell.SearchProvider2")
+            .unwrap();
+        for method in [
+            "GetInitialResultSet",
+            "GetSubsearchResultSet",
+            "GetResultMetas",
+            "ActivateResult",
+            "LaunchSearch",
+        ] {
+            assert!(
+                interface.lookup_method(method).is_some(),
+                "missing {method}"
+            );
+        }
+
+        let metadata = include_str!("../data/eu.vanadrighem.conduit.search-provider.ini");
+        assert!(metadata.contains("DesktopId=eu.vanadrighem.conduit.desktop"));
+        assert!(metadata.contains("BusName=eu.vanadrighem.conduit"));
+        assert!(metadata.contains(&format!("ObjectPath={OBJECT_PATH}")));
+        assert!(metadata.contains("Version=2"));
+    }
+
+    #[test]
     fn ignores_empty_queries_and_unidentified_legacy_caches() {
         let directory = temp_dir();
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join("legacy.json"),
-            r#"{"conversations":[{"id":"C1","name":"general","is_channel":true}]}"#,
-        )
-        .unwrap();
+        write_index_version(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [{"id": "C1", "name": "general", "is_channel": true}]
+            }),
+            SEARCH_INDEX_VERSION + 1,
+        );
 
         assert!(search(&directory, &[" ".into()]).is_empty());
         assert!(search(&directory, &["general".into()]).is_empty());
