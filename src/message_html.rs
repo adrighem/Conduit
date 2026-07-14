@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use gettextrs::gettext;
+use serde::Serialize;
 
 use crate::activity::ActivityItem;
 use crate::debug;
@@ -39,6 +40,164 @@ pub enum TimelineScrollBehavior {
     PreservePrepend,
     Bottom,
     StickToBottom,
+}
+
+/// A small, typed command understood by the timeline's incremental DOM runtime.
+///
+/// Patch HTML is always produced by this module, so message contents pass through
+/// the same escaping and URL validation as a complete document render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub enum TimelineDomPatch {
+    InsertMessage {
+        position: TimelineInsertPosition,
+        html: String,
+    },
+    ReplaceMessage {
+        message_ts: String,
+        html: String,
+        part_html: String,
+    },
+    RemoveMessage {
+        message_ts: String,
+    },
+    ReplaceRegion {
+        message_ts: String,
+        region: TimelineMessageRegion,
+        html: String,
+    },
+    UpdateImage {
+        asset_key: String,
+        source: Option<String>,
+    },
+    UpdateUser {
+        user_id: String,
+        name: String,
+        status_html: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub enum TimelineInsertPosition {
+    Append,
+    Prepend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub enum TimelineMessageRegion {
+    Body,
+    Attachments,
+    Responses,
+}
+
+/// Render a message into a patch command. Incrementally inserted messages are
+/// intentionally standalone; the next complete render may visually regroup them.
+#[allow(dead_code)]
+pub fn insert_message_patch(
+    channel_id: &str,
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+    position: TimelineInsertPosition,
+) -> TimelineDomPatch {
+    TimelineDomPatch::InsertMessage {
+        position,
+        html: format!(
+            "<li class=\"message-list-item\">{}</li>",
+            message_article(Some(channel_id), message, context)
+        ),
+    }
+}
+
+#[allow(dead_code)]
+pub fn replace_message_patch(
+    channel_id: &str,
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+) -> TimelineDomPatch {
+    TimelineDomPatch::ReplaceMessage {
+        message_ts: message.ts.clone(),
+        html: message_article(Some(channel_id), message, context),
+        part_html: message_part_html(Some(channel_id), message, context),
+    }
+}
+
+#[allow(dead_code)]
+pub fn remove_message_patch(message_ts: impl Into<String>) -> TimelineDomPatch {
+    TimelineDomPatch::RemoveMessage {
+        message_ts: message_ts.into(),
+    }
+}
+
+#[allow(dead_code)]
+pub fn message_region_patch(
+    channel_id: &str,
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+    region: TimelineMessageRegion,
+) -> TimelineDomPatch {
+    let html = match region {
+        TimelineMessageRegion::Body => format!(
+            "<div class=\"body\" dir=\"auto\">{}</div>",
+            message_body_html(message, context)
+        ),
+        TimelineMessageRegion::Attachments => attachments_html(Some(channel_id), message, context),
+        TimelineMessageRegion::Responses => {
+            message_responses_html(Some(channel_id), message, context)
+        }
+    };
+    TimelineDomPatch::ReplaceRegion {
+        message_ts: message.ts.clone(),
+        region,
+        html,
+    }
+}
+
+#[allow(dead_code)]
+pub fn update_image_patch(
+    asset_key: impl Into<String>,
+    source: Option<String>,
+) -> TimelineDomPatch {
+    TimelineDomPatch::UpdateImage {
+        asset_key: asset_key.into(),
+        source,
+    }
+}
+
+#[allow(dead_code)]
+pub fn update_user_patch(
+    user_id: impl Into<String>,
+    name: impl Into<String>,
+    status: Option<&SlackUserStatus>,
+    custom_emojis: &HashMap<String, String>,
+) -> TimelineDomPatch {
+    TimelineDomPatch::UpdateUser {
+        user_id: user_id.into(),
+        name: name.into(),
+        status_html: status
+            .filter(|status| status.active_at(current_unix_seconds()))
+            .map(|status| user_status_html(status, custom_emojis))
+            .unwrap_or_default(),
+    }
+}
+
+/// JavaScript suitable for `WebView::evaluate_javascript`.
+#[allow(dead_code)]
+pub fn timeline_dom_patch_call(patch: &TimelineDomPatch) -> String {
+    let payload = serde_json::to_string(patch)
+        .expect("timeline DOM patch should serialize")
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    format!(
+        "window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch({payload}) : false;"
+    )
 }
 
 impl TimelineScrollBehavior {
@@ -477,7 +636,7 @@ pub fn conversation_document_with_focus(
     body.push_str("</main>");
     body.push_str(&emoji_picker_html(context));
 
-    let mut scripts = Vec::new();
+    let mut scripts = vec![timeline_dom_runtime_script().to_string()];
     if let Some(scroll_script) = timeline_scroll_script(channel_id, context.timeline_scroll) {
         scripts.push(scroll_script);
     }
@@ -767,6 +926,10 @@ a:hover {{
 
 .message-list-item {{
   display: block;
+}}
+
+[data-message-region]:empty {{
+  display: none;
 }}
 
 .message {{
@@ -1555,6 +1718,181 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
     ))
 }
 
+fn timeline_dom_runtime_script() -> &'static str {
+    r#"(function () {
+  function timelineRoot() {
+    return document.scrollingElement || document.documentElement;
+  }
+
+  function messageElement(messageTs) {
+    return Array.from(document.querySelectorAll("[data-message-ts]")).find(function (element) {
+      return element.dataset.messageTs === messageTs;
+    }) || null;
+  }
+
+  function imageElements(assetKey) {
+    return Array.from(document.querySelectorAll("[data-image-key]")).filter(function (element) {
+      return element.dataset.imageKey === assetKey;
+    });
+  }
+
+  function authorElements(userId) {
+    return Array.from(document.querySelectorAll("[data-author-user-id]")).filter(function (element) {
+      return element.dataset.authorUserId === userId;
+    });
+  }
+
+  function mentionElements(userId) {
+    return Array.from(document.querySelectorAll("[data-mention-user-id]")).filter(function (element) {
+      return element.dataset.mentionUserId === userId;
+    });
+  }
+
+  function fragment(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    return template.content;
+  }
+
+  function visibleAnchor() {
+    return Array.from(document.querySelectorAll("[data-message-ts]")).find(function (element) {
+      const rect = element.getBoundingClientRect();
+      return rect.bottom >= 0 && rect.top <= window.innerHeight;
+    }) || null;
+  }
+
+  function withPreservedScroll(mutate) {
+    const root = timelineRoot();
+    const wasAtBottom = root.scrollHeight - root.scrollTop - root.clientHeight <= 48;
+    const anchor = visibleAnchor();
+    const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
+    const oldScrollTop = root.scrollTop;
+    const changed = mutate();
+    if (!changed) return false;
+    function restore() {
+      if (wasAtBottom) {
+        root.scrollTop = root.scrollHeight;
+      } else if (anchor && anchor.isConnected) {
+        root.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+      } else {
+        root.scrollTop = oldScrollTop;
+      }
+    }
+    restore();
+    requestAnimationFrame(restore);
+    requestAnimationFrame(function () { requestAnimationFrame(restore); });
+    return true;
+  }
+
+  window.conduitApplyTimelinePatch = function (patch) {
+    if (!patch || typeof patch.type !== "string") return false;
+    return withPreservedScroll(function () {
+      if (patch.type === "insert-message") {
+        const list = document.querySelector(".message-list");
+        if (!list || typeof patch.html !== "string") return false;
+        if (patch.position === "prepend") list.prepend(fragment(patch.html));
+        else list.append(fragment(patch.html));
+        return true;
+      }
+
+      if (patch.type === "replace-message") {
+        const target = messageElement(patch.message_ts);
+        if (!target || typeof patch.html !== "string") return false;
+        const html = target.classList.contains("message-part") ? patch.part_html : patch.html;
+        if (typeof html !== "string") return false;
+        target.replaceWith(fragment(html));
+        return true;
+      }
+
+      if (patch.type === "remove-message") {
+        const target = messageElement(patch.message_ts);
+        if (!target) return false;
+        const item = target.closest(".message-list-item");
+        const stack = target.closest(".message-stack");
+        target.remove();
+        if (item && (!stack || stack.querySelectorAll("[data-message-ts]").length === 0)) item.remove();
+        return true;
+      }
+
+      if (patch.type === "replace-region") {
+        const target = messageElement(patch.message_ts);
+        if (!target || typeof patch.html !== "string") return false;
+        const region = target.querySelector('[data-message-region="' + patch.region + '"]');
+        if (!region) return false;
+        region.replaceChildren(fragment(patch.html));
+        return true;
+      }
+
+      if (patch.type === "update-image") {
+        const targets = imageElements(patch.asset_key);
+        if (targets.length === 0) return false;
+        targets.forEach(function (target) {
+          if (typeof patch.source === "string") {
+            const isVideo = patch.source.startsWith("data:video/");
+            if ((isVideo && target.matches("video")) || (!isVideo && target.matches("img"))) {
+              target.src = patch.source;
+            } else if (isVideo) {
+              const video = document.createElement("video");
+              video.preload = "metadata";
+              video.muted = true;
+              video.playsInline = true;
+              video.src = patch.source;
+              video.setAttribute("aria-label", target.dataset.imageAlt || "");
+              video.dataset.imageKey = patch.asset_key;
+              video.dataset.imageAlt = target.dataset.imageAlt || "";
+              video.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
+              target.replaceWith(video);
+            } else {
+              const image = document.createElement("img");
+              image.loading = "lazy";
+              image.decoding = "async";
+              image.src = patch.source;
+              image.alt = target.dataset.imageAlt || "";
+              image.dataset.imageKey = patch.asset_key;
+              image.dataset.imageAlt = image.alt;
+              image.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
+              target.replaceWith(image);
+            }
+          } else {
+            const placeholder = document.createElement("div");
+            placeholder.className = "image-placeholder";
+            placeholder.dataset.imageKey = patch.asset_key;
+            placeholder.dataset.imageAlt = target.dataset.imageAlt || "";
+            placeholder.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
+            placeholder.textContent = placeholder.dataset.imageUnavailable;
+            target.replaceWith(placeholder);
+          }
+        });
+        return true;
+      }
+
+      if (patch.type === "update-user") {
+        const targets = authorElements(patch.user_id);
+        const mentions = mentionElements(patch.user_id);
+        if (targets.length === 0 && mentions.length === 0) return false;
+        mentions.forEach(function (mention) {
+          mention.textContent = "@" + patch.name;
+        });
+        targets.forEach(function (target) {
+          const author = target.querySelector(".author");
+          if (author) author.textContent = patch.name;
+          const header = target.querySelector(".message-header");
+          if (!header) return;
+          const oldStatus = header.querySelector(".user-status");
+          if (oldStatus) oldStatus.remove();
+          if (patch.status_html) {
+            const status = fragment(patch.status_html);
+            if (author) author.after(status);
+          }
+        });
+        return true;
+      }
+      return false;
+    });
+  };
+})();"#
+}
+
 fn message_focus_script() -> &'static str {
     r#"(function () {
   function focusTarget() {
@@ -1609,16 +1947,20 @@ fn message_article(
     let author = author_label(message, context);
     let status = author_status_html(message, context);
     let mut article = format!(
-        "<article class=\"message\"{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}{}</header><div class=\"body\" dir=\"auto\">{}</div>",
+        "<article class=\"message\"{}{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}{}</header><div data-message-region=\"body\"><div class=\"body\" dir=\"auto\">{}</div></div>",
         message_target_attributes(Some(&message.ts)),
+        message_author_attribute(message),
         escape_html(&author),
         status,
         metadata_html(message),
         message_body_html(message, context)
     );
 
+    article.push_str("<div data-message-region=\"attachments\">");
     article.push_str(&attachments_html(channel_id, message, context));
+    article.push_str("</div><div data-message-region=\"responses\">");
     article.push_str(&message_responses_html(channel_id, message, context));
+    article.push_str("</div>");
     article.push_str(&message_actions_html(channel_id, message, context));
     article.push_str("</article>");
     article
@@ -1685,7 +2027,8 @@ fn message_group_article(
     let author = author_label(first_message, context);
     let status = author_status_html(first_message, context);
     let mut article = format!(
-        "<article class=\"message message-group\"><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}{}</header><div class=\"message-stack\">",
+        "<article class=\"message message-group\"{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}{}</header><div class=\"message-stack\">",
+        message_author_attribute(first_message),
         escape_html(&author),
         status,
         metadata_html(first_message)
@@ -1705,13 +2048,17 @@ fn message_part_html(
     context: &MessageHtmlContext,
 ) -> String {
     let mut part = format!(
-        "<div class=\"message-part\"{}><div class=\"body\" dir=\"auto\">{}</div>",
+        "<div class=\"message-part\"{}{}><div data-message-region=\"body\"><div class=\"body\" dir=\"auto\">{}</div></div>",
         message_target_attributes(Some(&message.ts)),
+        message_author_attribute(message),
         message_body_html(message, context)
     );
 
+    part.push_str("<div data-message-region=\"attachments\">");
     part.push_str(&attachments_html(channel_id, message, context));
+    part.push_str("</div><div data-message-region=\"responses\">");
     part.push_str(&message_responses_html(channel_id, message, context));
+    part.push_str("</div>");
     part.push_str(&message_actions_html(channel_id, message, context));
     part.push_str("</div>");
     part
@@ -1736,6 +2083,15 @@ fn message_target_attributes(ts: Option<&str>) -> String {
         escape_html(&id),
         escape_html(ts)
     )
+}
+
+fn message_author_attribute(message: &SlackMessage) -> String {
+    message
+        .user
+        .as_deref()
+        .filter(|user_id| !user_id.is_empty())
+        .map(|user_id| format!(" data-author-user-id=\"{}\"", escape_html(user_id)))
+        .unwrap_or_default()
 }
 
 fn message_groups(messages: &[SlackMessage]) -> Vec<Vec<&SlackMessage>> {
@@ -1930,8 +2286,12 @@ fn author_status_html(message: &SlackMessage, context: &MessageHtmlContext) -> S
     if !status.active_at(current_unix_seconds()) {
         return String::new();
     }
+    user_status_html(status, &context.custom_emojis)
+}
+
+fn user_status_html(status: &SlackUserStatus, custom_emojis: &HashMap<String, String>) -> String {
     let accessible = status.accessible_text();
-    let glyph = EmojiCatalog::new(&context.custom_emojis)
+    let glyph = EmojiCatalog::new(custom_emojis)
         .resolve(status.emoji_name())
         .map(|value| emoji_value_html(&value, false))
         .unwrap_or_else(|| "●".to_string());
@@ -2227,9 +2587,11 @@ fn video_figure_html(
     {
         let src = context.image_assets.get(poster_key).unwrap();
         format!(
-            "<video preload=\"metadata\" muted playsinline src=\"{}\" aria-label=\"{}\"></video>",
+            "<video preload=\"metadata\" muted playsinline src=\"{}\" aria-label=\"{}\" data-image-key=\"{}\" data-image-alt=\"{}\"></video>",
             escape_html(src),
-            escape_html(&alt)
+            escape_html(&alt),
+            escape_html(poster_key),
+            escape_html(&alt),
         )
     } else {
         preview_image_html(
@@ -2258,6 +2620,12 @@ fn preview_image_html(
     unavailable_label: &str,
     context: &MessageHtmlContext,
 ) -> String {
+    let patch_attributes = format!(
+        " data-image-key=\"{}\" data-image-alt=\"{}\" data-image-unavailable=\"{}\"",
+        escape_html(asset_key),
+        escape_html(alt),
+        escape_html(unavailable_label),
+    );
     if let Some(src) = context.image_assets.get(asset_key) {
         if debug::enabled() {
             debug::log(
@@ -2266,9 +2634,10 @@ fn preview_image_html(
             );
         }
         format!(
-            "<img loading=\"lazy\" decoding=\"async\" src=\"{}\" alt=\"{}\">",
+            "<img loading=\"lazy\" decoding=\"async\" src=\"{}\" alt=\"{}\"{}>",
             escape_html(src),
-            escape_html(alt)
+            escape_html(alt),
+            patch_attributes,
         )
     } else if context.failed_image_urls.contains(asset_key) {
         if debug::enabled() {
@@ -2278,8 +2647,9 @@ fn preview_image_html(
             );
         }
         format!(
-            "<div class=\"image-placeholder\">{}</div>",
-            escape_html(unavailable_label)
+            "<div class=\"image-placeholder\"{}>{}</div>",
+            patch_attributes,
+            escape_html(unavailable_label),
         )
     } else if is_http_url(asset_key) && !requires_authenticated_image(asset_key) {
         if debug::enabled() {
@@ -2292,9 +2662,10 @@ fn preview_image_html(
             );
         }
         format!(
-            "<img loading=\"lazy\" decoding=\"async\" src=\"{}\" alt=\"{}\">",
+            "<img loading=\"lazy\" decoding=\"async\" src=\"{}\" alt=\"{}\"{}>",
             escape_html(asset_key),
-            escape_html(alt)
+            escape_html(alt),
+            patch_attributes,
         )
     } else {
         if debug::enabled() {
@@ -2304,8 +2675,9 @@ fn preview_image_html(
             );
         }
         format!(
-            "<div class=\"image-placeholder\">{}</div>",
-            escape_html(loading_label)
+            "<div class=\"image-placeholder\"{}>{}</div>",
+            patch_attributes,
+            escape_html(loading_label),
         )
     }
 }
@@ -2799,7 +3171,11 @@ fn render_slack_entity(text: &str, context: &MessageHtmlContext) -> Option<(Stri
             .get(user_id)
             .cloned()
             .unwrap_or_else(|| user_id.to_string());
-        format!("<span class=\"mention\">@{}</span>", escape_html(&name))
+        format!(
+            "<span class=\"mention\" data-mention-user-id=\"{}\">@{}</span>",
+            escape_html(user_id),
+            escape_html(&name)
+        )
     } else if raw.starts_with("!subteam^") {
         user_group_mention_html(raw, context)
     } else if let Some(channel) = raw.strip_prefix('#') {
@@ -3209,7 +3585,7 @@ mod tests {
             &context,
         );
 
-        assert!(html.contains("<span class=\"mention\">@Ada</span>"));
+        assert!(html.contains("<span class=\"mention\" data-mention-user-id=\"U123\">@Ada</span>"));
         assert!(html.contains("#general"));
         assert!(html.contains("href=\"https://example.com\""));
         assert!(html.contains(">docs</a>"));
@@ -4102,5 +4478,91 @@ mod tests {
         );
         assert!(saved.contains("<ol class=\"message-list\"><li class=\"message-list-item\">"));
         assert!(saved.contains("<time class=\"metadata\""));
+    }
+
+    #[test]
+    fn conversation_document_installs_incremental_runtime_and_stable_regions() {
+        let html =
+            conversation_document("C123", &[message("hello")], &MessageHtmlContext::default());
+
+        assert!(html.contains("window.conduitApplyTimelinePatch"));
+        assert!(html.contains("data-author-user-id=\"U123\""));
+        for region in ["body", "attachments", "responses"] {
+            assert!(html.contains(&format!("data-message-region=\"{region}\"")));
+        }
+        assert!(html.contains("withPreservedScroll"));
+        assert!(html.contains("anchor.getBoundingClientRect().top - anchorTop"));
+        assert!(html.contains("patch.source.startsWith(\"data:video/\")"));
+        assert!(html.contains("document.createElement(\"video\")"));
+    }
+
+    #[test]
+    fn patch_call_serializes_untrusted_values_as_javascript_data() {
+        let patch = update_user_patch(
+            "U\"123",
+            "Ada & </script><script>alert(1)</script>\u{2028}",
+            Some(&SlackUserStatus {
+                text: "A&B".into(),
+                emoji: ":wave:".into(),
+                ..Default::default()
+            }),
+            &HashMap::new(),
+        );
+        let script = timeline_dom_patch_call(&patch);
+
+        assert!(script
+            .starts_with("window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch({"));
+        assert!(script.contains("U\\\"123"));
+        assert!(script.contains("\\u003c/script\\u003e"));
+        assert!(script.contains("\\u0026"));
+        assert!(script.contains("\\u2028"));
+        assert!(!script.contains("</script>"));
+    }
+
+    #[test]
+    fn message_patch_helpers_render_escaped_standalone_and_region_html() {
+        let mut context = MessageHtmlContext::default();
+        context
+            .user_names
+            .insert("U123".into(), "Ada <Admin>".into());
+        let message = message("Hello <everyone>");
+
+        let inserted =
+            insert_message_patch("C123", &message, &context, TimelineInsertPosition::Append);
+        let TimelineDomPatch::InsertMessage { position, html } = inserted else {
+            panic!("expected insert patch");
+        };
+        assert_eq!(position, TimelineInsertPosition::Append);
+        assert!(html.starts_with("<li class=\"message-list-item\"><article"));
+        assert!(html.contains("Ada &lt;Admin&gt;"));
+        assert!(html.contains("Hello &lt;everyone&gt;"));
+
+        let reactions =
+            message_region_patch("C123", &message, &context, TimelineMessageRegion::Responses);
+        assert_eq!(
+            reactions,
+            TimelineDomPatch::ReplaceRegion {
+                message_ts: message.ts.clone(),
+                region: TimelineMessageRegion::Responses,
+                html: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn image_placeholders_have_stable_escaped_patch_metadata() {
+        let file = SlackFile {
+            name: Some("preview.png".into()),
+            mimetype: Some("image/png".into()),
+            url_private: Some("https://files.slack.com/image?<unsafe>".into()),
+            ..Default::default()
+        };
+        let mut message = message("image");
+        message.files = Some(vec![file]);
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains("data-image-key=\"https://files.slack.com/image?&lt;unsafe&gt;\""));
+        assert!(html.contains("data-image-alt="));
+        assert!(html.contains("data-image-unavailable="));
     }
 }

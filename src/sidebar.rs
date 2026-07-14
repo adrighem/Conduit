@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::models::{SlackConversation, SlackUser, SlackUserStatus};
 use crate::search::{
@@ -41,7 +41,7 @@ impl ConversationKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidebarSectionKind {
     Unreads,
     Channels,
@@ -148,7 +148,7 @@ impl SidebarSectionModel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidebarPlaceholder {
     Loading,
     LoadFailed,
@@ -172,6 +172,134 @@ pub enum SidebarListModel {
     Placeholder(SidebarPlaceholder),
     Sections(Vec<SidebarSectionModel>),
     Rows(Vec<SidebarRowModel>),
+}
+
+/// Stable identity for an item rendered in the conversation sidebar.
+///
+/// A conversation can occur both in the unread section and in its regular
+/// section, so the section is part of its identity. Search results have no
+/// section. Keeping this identity separate from the row contents lets the UI
+/// update an existing widget when only unread, selection, or status data
+/// changes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SidebarItemKey {
+    Placeholder(SidebarPlaceholder),
+    SectionHeader(SidebarSectionKind),
+    Conversation {
+        section: Option<SidebarSectionKind>,
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarItemModel {
+    Placeholder(SidebarPlaceholder),
+    SectionHeader {
+        kind: SidebarSectionKind,
+        title: String,
+    },
+    Conversation(SidebarRowModel),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedSidebarItem {
+    pub key: SidebarItemKey,
+    pub model: SidebarItemModel,
+}
+
+/// The minimal set of keyed changes needed to reconcile two sidebar models.
+/// Positions refer to the new model. Updated entries retain their widget
+/// identity; inserted and removed entries require widget changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidebarModelDiff {
+    pub removed: Vec<SidebarItemKey>,
+    pub inserted: Vec<(usize, SidebarItemKey)>,
+    pub moved: Vec<(SidebarItemKey, usize)>,
+    pub updated: Vec<(SidebarItemKey, usize)>,
+}
+
+impl SidebarListModel {
+    pub fn keyed_items(&self) -> Vec<KeyedSidebarItem> {
+        match self {
+            Self::Placeholder(placeholder) => vec![KeyedSidebarItem {
+                key: SidebarItemKey::Placeholder(*placeholder),
+                model: SidebarItemModel::Placeholder(*placeholder),
+            }],
+            Self::Sections(sections) => sections
+                .iter()
+                .flat_map(|section| {
+                    let header = KeyedSidebarItem {
+                        key: SidebarItemKey::SectionHeader(section.kind),
+                        model: SidebarItemModel::SectionHeader {
+                            kind: section.kind,
+                            title: section.display_title(),
+                        },
+                    };
+                    std::iter::once(header).chain(section.rows.iter().cloned().map(|row| {
+                        KeyedSidebarItem {
+                            key: SidebarItemKey::Conversation {
+                                section: Some(section.kind),
+                                id: row.id.clone(),
+                            },
+                            model: SidebarItemModel::Conversation(row),
+                        }
+                    }))
+                })
+                .collect(),
+            Self::Rows(rows) => rows
+                .iter()
+                .cloned()
+                .map(|row| KeyedSidebarItem {
+                    key: SidebarItemKey::Conversation {
+                        section: None,
+                        id: row.id.clone(),
+                    },
+                    model: SidebarItemModel::Conversation(row),
+                })
+                .collect(),
+        }
+    }
+}
+
+pub fn diff_keyed_sidebar_items(
+    previous: &[KeyedSidebarItem],
+    next: &[KeyedSidebarItem],
+) -> SidebarModelDiff {
+    let previous_by_key: HashMap<_, _> = previous
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (&item.key, (index, &item.model)))
+        .collect();
+    let next_keys: HashSet<_> = next.iter().map(|item| &item.key).collect();
+
+    let removed = previous
+        .iter()
+        .filter(|item| !next_keys.contains(&item.key))
+        .map(|item| item.key.clone())
+        .collect();
+    let mut inserted = Vec::new();
+    let mut moved = Vec::new();
+    let mut updated = Vec::new();
+
+    for (next_index, item) in next.iter().enumerate() {
+        let Some((previous_index, previous_model)) = previous_by_key.get(&item.key) else {
+            inserted.push((next_index, item.key.clone()));
+            continue;
+        };
+        if *previous_index != next_index {
+            moved.push((item.key.clone(), next_index));
+        }
+        if *previous_model != &item.model {
+            updated.push((item.key.clone(), next_index));
+        }
+    }
+
+    SidebarModelDiff {
+        removed,
+        inserted,
+        moved,
+        updated,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2114,5 +2242,90 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["U1", "C1"]
         );
+    }
+
+    #[test]
+    fn keyed_sidebar_items_distinguish_duplicate_conversation_placements() {
+        let conversation = row("C1", 2, false);
+        let model = SidebarListModel::Sections(vec![
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Unreads,
+                title: SidebarSectionKind::Unreads.title(),
+                rows: vec![conversation.clone()],
+            },
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Channels,
+                title: SidebarSectionKind::Channels.title(),
+                rows: vec![conversation],
+            },
+        ]);
+
+        let items = model.keyed_items();
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items[1].key,
+            SidebarItemKey::Conversation {
+                section: Some(SidebarSectionKind::Unreads),
+                id: "C1".to_string(),
+            }
+        );
+        assert_eq!(
+            items[3].key,
+            SidebarItemKey::Conversation {
+                section: Some(SidebarSectionKind::Channels),
+                id: "C1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn keyed_sidebar_diff_retains_identity_for_content_updates_and_moves() {
+        let previous =
+            SidebarListModel::Rows(vec![row("C1", 0, false), row("C2", 0, false)]).keyed_items();
+        let next = SidebarListModel::Rows(vec![
+            row("C2", 3, true),
+            row("C3", 0, false),
+            row("C1", 0, false),
+        ])
+        .keyed_items();
+
+        let diff = diff_keyed_sidebar_items(&previous, &next);
+        assert!(diff.removed.is_empty());
+        assert_eq!(
+            diff.inserted,
+            vec![(
+                1,
+                SidebarItemKey::Conversation {
+                    section: None,
+                    id: "C3".to_string(),
+                }
+            )]
+        );
+        assert_eq!(diff.moved.len(), 2);
+        assert_eq!(
+            diff.updated,
+            vec![(
+                SidebarItemKey::Conversation {
+                    section: None,
+                    id: "C2".to_string(),
+                },
+                0
+            )]
+        );
+    }
+
+    #[test]
+    fn keyed_sidebar_diff_removes_obsolete_placeholder() {
+        let previous = SidebarListModel::Placeholder(SidebarPlaceholder::Loading).keyed_items();
+        let next = SidebarListModel::Rows(vec![row("C1", 0, false)]).keyed_items();
+
+        let diff = diff_keyed_sidebar_items(&previous, &next);
+        assert_eq!(
+            diff.removed,
+            vec![SidebarItemKey::Placeholder(SidebarPlaceholder::Loading)]
+        );
+        assert_eq!(diff.inserted.len(), 1);
+        assert!(diff.moved.is_empty());
+        assert!(diff.updated.is_empty());
     }
 }
