@@ -309,9 +309,15 @@ impl WorkspaceStore {
 
     pub async fn store_history(&self, channel_id: &str, messages: &[SlackMessage]) -> Result<()> {
         self.update_state(|state| {
-            state
+            let existing = state
                 .channel_histories
-                .insert(channel_id.to_string(), pruned_history(messages.to_vec()));
+                .get(channel_id)
+                .cloned()
+                .unwrap_or_default();
+            state.channel_histories.insert(
+                channel_id.to_string(),
+                merge_history_pages(&existing, messages),
+            );
         })
         .await
     }
@@ -588,8 +594,10 @@ fn thread_key(channel_id: &str, thread_ts: &str) -> String {
 }
 
 fn merge_history_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
-    let mut messages = existing.to_vec();
-    messages.extend(page.iter().cloned());
+    // Incoming API/realtime data wins for duplicate timestamps while cached
+    // messages missing from a bounded or in-flight page remain available.
+    let mut messages = page.to_vec();
+    messages.extend(existing.iter().cloned());
     pruned_history(messages)
 }
 
@@ -1313,6 +1321,56 @@ mod tests {
                     "1710000200.000000",
                     "1710000100.000000"
                 ]
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .find(|message| message.ts == "1710000200.000000")
+                    .and_then(|message| message.text.as_deref()),
+                Some("duplicate")
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stale_history_page_does_not_remove_newer_realtime_message() {
+        let directory = temp_cache_dir("workspace-store-realtime-history-race");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_merged_history(
+                    "D1",
+                    &[SlackMessage {
+                        ts: "5.0".to_string(),
+                        text: Some("realtime".to_string()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+            store
+                .store_history(
+                    "D1",
+                    &[SlackMessage {
+                        ts: "4.0".to_string(),
+                        text: Some("stale page".to_string()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let messages = store.load_history("D1").await.unwrap().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["5.0", "4.0"]
             );
         });
 

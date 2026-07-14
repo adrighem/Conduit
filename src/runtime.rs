@@ -1588,6 +1588,7 @@ fn recent_history_preview(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> 
 struct ChannelHistoryPrefetchCandidate {
     id: String,
     unread: bool,
+    direct_message: bool,
     unread_count: u64,
     activity_score: f64,
     title: String,
@@ -1608,9 +1609,13 @@ fn channel_history_prefetch_candidates(conversations: &[SlackConversation]) -> V
             .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.id.cmp(&right.id))
     });
-    candidates.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
-    candidates
+    let (urgent_direct_messages, mut remaining): (Vec<_>, Vec<_>) = candidates
         .into_iter()
+        .partition(|candidate| candidate.unread && candidate.direct_message);
+    remaining.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
+    urgent_direct_messages
+        .into_iter()
+        .chain(remaining)
         .map(|candidate| candidate.id)
         .collect()
 }
@@ -1623,6 +1628,8 @@ fn conversation_unread_refresh_candidates(conversations: &[SlackConversation]) -
         .map(|conversation| ChannelHistoryPrefetchCandidate {
             id: conversation.id.clone(),
             unread: conversation.has_unread_activity(),
+            direct_message: conversation.is_im.unwrap_or(false)
+                || conversation.is_mpim.unwrap_or(false),
             unread_count: conversation.unread_activity_count(),
             activity_score: conversation_activity_score(conversation),
             title: conversation.display_name().to_lowercase(),
@@ -1667,6 +1674,8 @@ fn channel_history_prefetch_candidate(
     Some(ChannelHistoryPrefetchCandidate {
         id: conversation.id.clone(),
         unread: conversation.has_unread_activity(),
+        direct_message: conversation.is_im.unwrap_or(false)
+            || conversation.is_mpim.unwrap_or(false),
         unread_count: conversation.unread_activity_count(),
         activity_score: conversation_activity_score(conversation),
         title: conversation.display_name().to_lowercase(),
@@ -2176,6 +2185,15 @@ async fn run_socket_mode(
                     }
                     if posted {
                         if let Err(error) = store
+                            .store_merged_history(&channel_id, std::slice::from_ref(&message))
+                            .await
+                        {
+                            crate::debug::log(
+                                "store",
+                                &format!("ConversationRealtimeHistoryStoreFailed channel_id={channel_id} error={error:#}"),
+                            );
+                        }
+                        if let Err(error) = store
                             .observe_thread_realtime(&channel_id, &message, current_user_id.as_deref())
                             .await
                         {
@@ -2397,8 +2415,28 @@ async fn load_conversations_best_effort_with_api(
                 unread_refresh_candidates.iter(),
             )
             .await;
-            prefetch_channel_histories_best_effort(events, api, workspace_store, &conversations)
-                .await;
+            let refreshed_conversations = if let Some(store) = workspace_store.as_ref() {
+                match store.load_conversations().await {
+                    Ok(Some(refreshed)) => refreshed,
+                    Ok(None) => conversations.clone(),
+                    Err(error) => {
+                        crate::debug::log(
+                            "store",
+                            &format!("ConversationPrefetchCatalogLoadFailed error={error:#}"),
+                        );
+                        conversations.clone()
+                    }
+                }
+            } else {
+                conversations.clone()
+            };
+            prefetch_channel_histories_best_effort(
+                events,
+                api,
+                workspace_store,
+                &refreshed_conversations,
+            )
+            .await;
             refresh_cached_dm_user_names(
                 events,
                 api,
@@ -3917,6 +3955,19 @@ mod tests {
         assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT);
         assert_eq!(candidates.first().map(String::as_str), Some("C14"));
         assert_eq!(candidates.last().map(String::as_str), Some("C3"));
+    }
+
+    #[test]
+    fn channel_history_prefetch_always_includes_unread_direct_messages() {
+        let mut conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
+            .map(|index| channel(&format!("C{index}"), (index + 10) as u64, None))
+            .collect::<Vec<_>>();
+        conversations.push(dm("D-urgent", 1));
+
+        let candidates = channel_history_prefetch_candidates(&conversations);
+
+        assert_eq!(candidates.first().map(String::as_str), Some("D-urgent"));
+        assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT + 1);
     }
 
     #[test]

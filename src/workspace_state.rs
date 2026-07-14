@@ -738,9 +738,20 @@ impl WorkspaceViewState {
         kind: RealtimeMessageKind,
     ) -> RealtimeMessageOutcome {
         let visible = self.visible_channel_id() == Some(channel_id);
-        let channel_changed = self.channels.get_mut(channel_id).is_some_and(|history| {
+        let history = self.channels.entry(channel_id.to_string()).or_default();
+        let channel_changed = {
             let base_changed = if history.loaded {
                 history.messages = merge_realtime_message(&history.messages, &message);
+                true
+            } else if kind == RealtimeMessageKind::Posted
+                && message
+                    .thread_ts
+                    .as_deref()
+                    .is_none_or(|thread_ts| thread_ts == message.ts)
+            {
+                history.messages = merge_realtime_message(&history.messages, &message);
+                history.loaded = true;
+                history.loading = false;
                 true
             } else {
                 false
@@ -754,7 +765,7 @@ impl WorkspaceViewState {
                     true
                 });
             base_changed || context_changed
-        });
+        };
         let render_channel = visible && channel_changed;
 
         let render_thread = self
@@ -1654,6 +1665,46 @@ mod tests {
         assert_eq!(
             state.open_thread("C1", "1"),
             ThreadOpenOutcome::RenderCurrent
+        );
+    }
+
+    #[test]
+    fn realtime_post_seeds_unopened_conversation_for_immediate_render() {
+        let mut state = WorkspaceViewState::default();
+
+        let outcome = state.apply_realtime_message(
+            "D1",
+            message("2", "new direct message"),
+            RealtimeMessageKind::Posted,
+        );
+
+        assert!(outcome.channel_changed);
+        assert!(!outcome.render_channel);
+        assert_eq!(
+            state.channel_messages("D1")[0].body_text(),
+            "new direct message"
+        );
+        assert_eq!(
+            state.select_conversation("D1").decision,
+            ConversationSelectionDecision::RenderCachedAndRefresh
+        );
+    }
+
+    #[test]
+    fn realtime_mutation_does_not_create_phantom_unopened_history() {
+        let mut state = WorkspaceViewState::default();
+
+        let outcome = state.apply_realtime_message(
+            "D1",
+            message("2", "edited"),
+            RealtimeMessageKind::Changed,
+        );
+
+        assert!(!outcome.channel_changed);
+        assert!(state.channel_messages("D1").is_empty());
+        assert_eq!(
+            state.select_conversation("D1").decision,
+            ConversationSelectionDecision::RequestFresh
         );
     }
 

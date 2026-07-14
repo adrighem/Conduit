@@ -48,6 +48,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 
 - Network and cache work runs away from the GTK UI thread.
 - Optional Slack Socket Mode ingestion for message, reaction, and conversation updates.
+- Realtime messages are cached for unopened conversations, and unread DMs are prioritized for background history refresh.
 - Automatic Socket Mode reconnect with capped backoff.
 - Scoped loading and error recovery so failures in one surface do not replace unrelated content.
 - Tokens are validated with `auth.test` and stored through the system Secret Service/keyring.
