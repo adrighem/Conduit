@@ -464,7 +464,9 @@
                           </object>
                         </property>
                         <property name="sidebar">
-                          <object class="AdwToolbarView">
+                          <object class="GtkOverlay">
+                            <child>
+                              <object class="AdwToolbarView">
                             <child type="top">
                               <object class="AdwHeaderBar">
                                 <property name="show-start-title-buttons">False</property>
@@ -547,6 +549,21 @@
                                 </child>
                               </object>
                             </property>
+                              </object>
+                            </child>
+                            <child type="overlay">
+                              <object class="GtkSeparator" id="thread_resize_handle">
+                                <property name="orientation">vertical</property>
+                                <property name="halign">start</property>
+                                <property name="valign">fill</property>
+                                <property name="width-request">10</property>
+                                <property name="focusable">True</property>
+                                <property name="tooltip-text" translatable="yes">Resize Thread Pane</property>
+                                <style>
+                                  <class name="wide"/>
+                                </style>
+                              </object>
+                            </child>
                           </object>
                         </property>
                       </object>

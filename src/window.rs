@@ -137,6 +137,8 @@ mod imp {
         #[template_child]
         pub thread_split: TemplateChild<adw::OverlaySplitView>,
         #[template_child]
+        pub thread_resize_handle: TemplateChild<gtk::Separator>,
+        #[template_child]
         pub message_entry: TemplateChild<gtk::TextView>,
         #[template_child]
         pub send_button: TemplateChild<gtk::Button>,
@@ -1139,6 +1141,15 @@ fn actively_reading_channel(
     window_active && selected_channel == Some(channel_id)
 }
 
+fn resized_end_sidebar_fraction(
+    starting_sidebar_width: f64,
+    horizontal_offset: f64,
+    split_width: f64,
+) -> Option<f64> {
+    (split_width > 0.0)
+        .then(|| ((starting_sidebar_width - horizontal_offset) / split_width).clamp(0.2, 0.8))
+}
+
 fn first_unread_message_ts(
     messages: &[SlackMessage],
     last_read: Option<&str>,
@@ -1228,6 +1239,69 @@ impl ConduitWindow {
     fn setup_adaptive_layout(&self) {
         let imp = self.imp();
 
+        imp.thread_resize_handle
+            .set_cursor_from_name(Some("col-resize"));
+        let initial_width = Rc::new(Cell::new(0.0));
+        let drag = gtk::GestureDrag::new();
+        let weak_window = self.downgrade();
+        let drag_initial_width = initial_width.clone();
+        drag.connect_drag_begin(move |_, _, _| {
+            if let Some(window) = weak_window.upgrade() {
+                let imp = window.imp();
+                let width = imp
+                    .thread_resize_handle
+                    .parent()
+                    .map(|parent| parent.width())
+                    .unwrap_or_else(|| {
+                        (f64::from(imp.thread_split.width())
+                            * imp.thread_split.sidebar_width_fraction())
+                            as i32
+                    });
+                drag_initial_width.set(f64::from(width));
+            }
+        });
+        let weak_window = self.downgrade();
+        drag.connect_drag_update(move |_, offset_x, _| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let split = &window.imp().thread_split;
+            if let Some(fraction) = resized_end_sidebar_fraction(
+                initial_width.get(),
+                offset_x,
+                f64::from(split.width()),
+            ) {
+                split.set_sidebar_width_fraction(fraction);
+            }
+        });
+        imp.thread_resize_handle.add_controller(drag);
+
+        let keys = gtk::EventControllerKey::new();
+        let weak_window = self.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let offset = match key {
+                gtk::gdk::Key::Left => -16.0,
+                gtk::gdk::Key::Right => 16.0,
+                _ => return glib::Propagation::Proceed,
+            };
+            let Some(window) = weak_window.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let imp = window.imp();
+            let split_width = f64::from(imp.thread_split.width());
+            let sidebar_width = imp
+                .thread_resize_handle
+                .parent()
+                .map(|parent| f64::from(parent.width()))
+                .unwrap_or(split_width * imp.thread_split.sidebar_width_fraction());
+            if let Some(fraction) = resized_end_sidebar_fraction(sidebar_width, offset, split_width)
+            {
+                imp.thread_split.set_sidebar_width_fraction(fraction);
+            }
+            glib::Propagation::Stop
+        });
+        imp.thread_resize_handle.add_controller(keys);
+
         let workspace_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
             700.0,
@@ -1261,6 +1335,11 @@ impl ConduitWindow {
             "max-sidebar-width",
             Some(&1000.0_f64.to_value()),
         );
+        thread_breakpoint.add_setter(
+            &imp.thread_resize_handle.get(),
+            "visible",
+            Some(&false.to_value()),
+        );
         self.add_breakpoint(thread_breakpoint);
     }
 
@@ -1270,6 +1349,8 @@ impl ConduitWindow {
             .update_property(&[gtk::accessible::Property::Label("Message")]);
         imp.thread_entry
             .update_property(&[gtk::accessible::Property::Label("Reply")]);
+        imp.thread_resize_handle
+            .update_property(&[gtk::accessible::Property::Label("Resize thread pane")]);
         imp.message_search_entry
             .update_property(&[gtk::accessible::Property::Label(
                 "Search workspace messages",
@@ -6773,6 +6854,7 @@ mod tests {
         for required in [
             "AdwNavigationSplitView\" id=\"workspace_split",
             "AdwOverlaySplitView\" id=\"thread_split",
+            "GtkSeparator\" id=\"thread_resize_handle",
             "GtkBox\" id=\"message_pane",
             "GtkBox\" id=\"thread_pane",
             "AdwNavigationPage",
@@ -6803,10 +6885,32 @@ mod tests {
             );
         }
 
+        assert!(template.contains("<property name=\"width-request\">10</property>"));
         assert!(!template.contains("<object class=\"GtkPaned\""));
         assert!(!template.contains("<property name=\"width-request\">460</property>"));
         assert!(!template.contains("<property name=\"width-request\">280</property>"));
         assert!(!template.contains("<property name=\"width-request\">220</property>"));
+    }
+
+    #[test]
+    fn thread_sidebar_resize_follows_end_edge_and_clamps() {
+        assert_eq!(
+            resized_end_sidebar_fraction(400.0, -100.0, 1_000.0),
+            Some(0.5)
+        );
+        assert_eq!(
+            resized_end_sidebar_fraction(400.0, 100.0, 1_000.0),
+            Some(0.3)
+        );
+        assert_eq!(
+            resized_end_sidebar_fraction(400.0, -1_000.0, 1_000.0),
+            Some(0.8)
+        );
+        assert_eq!(
+            resized_end_sidebar_fraction(400.0, 1_000.0, 1_000.0),
+            Some(0.2)
+        );
+        assert_eq!(resized_end_sidebar_fraction(400.0, 0.0, 0.0), None);
     }
 
     #[test]
