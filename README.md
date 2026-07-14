@@ -22,8 +22,8 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state.
 - Sections for Messages, Unreads, observed threads, Files, and Later.
 - Fast conversation switcher with discovery of channels and people.
-- GNOME Shell search-provider integration for opening cached channels and direct messages straight from the desktop overview, backed by a lightweight active-workspace index rather than message history.
-- Cached conversations, names, histories, threads, and read state for responsive startup.
+- GNOME Shell search-provider integration for opening cached channels and direct messages straight from the desktop overview. It reads only conversation and name metadata for the active workspace and never indexes message history.
+- Transactional SQLite caching for conversations, names, histories, threads, unread state, statuses, and custom emoji, with automatic migration from the earlier JSON cache.
 - Unread badges, muted and external-conversation indicators, read markers, and desktop notifications for incoming realtime events.
 - Slack status emoji and hover text for people in direct messages, shown consistently in navigation, switchers, titles, and message authors.
 - Multi-word, case-insensitive substring filtering with globally ranked, category-free results across conversation, forwarding, message, and emoji searches. Conversation ranking treats direct messages and people as one-person groups, while group DMs use the share of other participants whose names match; group titles omit your own name.
@@ -50,11 +50,12 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 
 ### Sync and resilience
 
-- Network and cache work runs away from the GTK UI thread.
+- Network and cache work runs away from the GTK UI thread, with short connection, request, and Socket Mode liveness deadlines.
 - Optional Slack Socket Mode ingestion for message, reaction, and conversation updates.
-- Realtime messages are cached for unopened conversations, and unread DMs are prioritized for background history refresh.
+- Realtime persistence is ordered through a bounded, session-owned queue; messages are cached for unopened conversations, and unread DMs are prioritized for background history refresh.
 - Automatic Socket Mode reconnect with capped backoff.
 - Scoped loading and error recovery so failures in one surface do not replace unrelated content.
+- Workspace state has one authoritative owner, while the WAL-backed SQLite cache applies incremental entity updates and supports concurrent desktop search reads.
 - Tokens are validated with `auth.test` and stored through the system Secret Service/keyring.
 
 ## Current limitations
@@ -68,7 +69,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - File and workspace-search views currently load a bounded result set rather than every page.
 - Rich composer formatting, autocomplete beyond emoji, message editing/deletion controls, typing indicators, live presence, avatars, calls, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
 - The Flatpak manifest is intended for development; Conduit is not yet published on Flathub and does not currently provide official binary releases.
-- Signing out removes the stored credential, but it does not currently purge cached workspace data or saved drafts from local storage.
+- Signing out removes the stored credential and clears the active-workspace selection, but it does not currently purge cached workspace data or saved drafts from local storage.
 
 ## Build and run
 
@@ -199,10 +200,10 @@ Debug output can contain private workspace metadata such as channel names, user 
 ## Local data and security
 
 - OAuth tokens and imported browser-session credentials are stored through the system Secret Service/keyring.
-- Workspace metadata, resolved names and statuses, emoji information, message and thread history, downloaded attachments, image/media data, and WebKit data are cached below the user's XDG cache directory without additional application-level encryption.
+- Workspace metadata, resolved names and statuses, emoji information, and message and thread history are stored in `state/state.sqlite3` below Conduit's XDG cache directory. Downloaded attachments, image/media data, and WebKit data are cached in sibling directories. None has additional application-level encryption.
 - Drafts and preferences are stored through GSettings.
-- **Sign Out** removes the keyring credential. It does not currently erase cached workspace content or drafts, and credential environment variables remain available for re-import.
-- Conduit restricts message navigation to supported internal actions and HTTP(S) links and disables file-URL access and several unused WebKit capabilities. This is not a claim of a formal security audit.
+- **Sign Out** removes the keyring credential and deactivates the workspace for desktop search. It does not currently erase cached workspace content or drafts, and credential environment variables remain available for re-import.
+- Authenticated preview, media, and attachment downloads accept only trusted Slack HTTPS URLs and enforce size bounds. Conduit also restricts message navigation to supported internal actions and HTTP(S) links and disables file-URL access and several unused WebKit capabilities. This is not a claim of a formal security audit.
 
 Never share tokens, cookies, private messages, or unredacted debug logs. See [SECURITY.md](SECURITY.md) for vulnerability-reporting guidance.
 
