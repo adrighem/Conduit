@@ -229,6 +229,14 @@ mod tests {
     }
 
     #[test]
+    fn catalog_searches_symbolic_and_numeric_shortcodes() {
+        let matches =
+            EmojiPickerModel::new(EmojiCatalog::new(&HashMap::new()).entries()).search("+1");
+
+        assert_eq!(matches.first().map(|entry| entry.name.as_str()), Some("+1"));
+    }
+
+    #[test]
     fn picker_model_preserves_catalog_filtering_and_accessible_labels() {
         let custom = HashMap::from([
             (

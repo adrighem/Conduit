@@ -1,6 +1,7 @@
 python = import('python').find_installation('python3')
 xvfb_run = find_program('xvfb-run', required: false)
 xdotool = find_program('xdotool', required: false)
+xclip = find_program('xclip', required: false)
 xfwm4 = find_program('xfwm4', required: false)
 
 test_service_conf = configuration_data()
@@ -42,9 +43,9 @@ if xvfb_run.found() and xfwm4.found()
   )
 endif
 
-if xvfb_run.found() and xdotool.found() and xfwm4.found()
+if xvfb_run.found() and xdotool.found() and xclip.found() and xfwm4.found()
   test(
-    'Ctrl-K keyboard shortcut',
+    'Keyboard shortcuts and emoji completion',
     python,
     args: [
       files('run_headless.py'),

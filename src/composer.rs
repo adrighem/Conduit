@@ -66,12 +66,7 @@ pub fn emoji_token_at_caret(text: &str, caret: usize) -> Option<EmojiToken> {
     }
 
     let query = characters[query_start..caret].iter().collect::<String>();
-    if query
-        .chars()
-        .filter(|character| character.is_ascii_alphabetic())
-        .count()
-        < 2
-    {
+    if query.chars().count() < 2 {
         return None;
     }
 
@@ -208,10 +203,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incomplete_completed_and_embedded_shortcode_tokens() {
+    fn accepts_valid_shortcode_characters_and_rejects_invalid_tokens() {
         assert_eq!(emoji_token_at_caret(":s", 2), None);
-        assert_eq!(emoji_token_at_caret(":12", 3), None);
-        assert_eq!(emoji_token_at_caret(":a1", 3), None);
+        assert_eq!(emoji_token_at_caret(":12", 3).unwrap().query, "12");
+        assert_eq!(emoji_token_at_caret(":a1", 3).unwrap().query, "a1");
+        assert_eq!(emoji_token_at_caret(":+1", 3).unwrap().query, "+1");
         assert_eq!(emoji_token_at_caret(":sm:", 4), None);
         assert_eq!(emoji_token_at_caret("https://sm", 10), None);
         assert_eq!(emoji_token_at_caret("12:30", 5), None);

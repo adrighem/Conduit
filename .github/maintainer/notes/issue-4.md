@@ -1,7 +1,8 @@
 # ISSUE:4 — Show filtered emoji picker when typing :xx
 
-- Status: implemented in `8b3965d`; closure-ready after CI is green
+- Status: reopened regression fixed locally; closure-ready after remote CI
 - Confidence: high
-- Implemented: shared catalog search, caret token parsing, native anchored popover in both composers, mouse and keyboard selection, token-only replacement, draft preservation
-- Residual risk: custom emoji suggestions use a placeholder glyph; live GTK interaction is covered indirectly rather than end-to-end
+- Root cause: the composer popover used autohide, which took focus as it opened and immediately triggered the focus-loss dismissal path
+- Fixed: non-autohiding composer-owned popover, all valid shortcode characters after the two-character threshold, and real workspace custom emoji previews
+- Validation: pure token/catalog tests plus a repeated Xvfb GTK test covering open, navigation, acceptance, Escape dismissal, and both composers
 - Public action: none taken

@@ -258,6 +258,10 @@ mod imp {
                     is_channel: Some(true),
                     ..SlackConversation::default()
                 }]);
+                obj.select_conversation("C_TEST", "#general");
+                if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
+                    obj.imp().thread_split.set_show_sidebar(true);
+                }
             } else {
                 obj.show_loading("Checking secure storage");
                 obj.send_session_command(RuntimeCommand::LoadStoredToken);
@@ -403,6 +407,24 @@ struct ComposerEmojiCompletion {
     list: gtk::ListBox,
     entries: Vec<EmojiEntry>,
     token: Option<EmojiToken>,
+}
+
+fn composer_emoji_preview(entry: &EmojiEntry) -> gtk::Widget {
+    match &entry.value {
+        EmojiValue::Unicode(value) => {
+            let preview = gtk::Label::new(Some(value));
+            preview.add_css_class("title-3");
+            preview.upcast()
+        }
+        EmojiValue::CustomImage(url) => {
+            let preview = gtk::Picture::for_file(&gio::File::for_uri(url));
+            preview.set_alternative_text(Some(&entry.label));
+            preview.set_can_shrink(true);
+            preview.set_content_fit(gtk::ContentFit::Contain);
+            preview.set_size_request(24, 24);
+            preview.upcast()
+        }
+    }
 }
 
 glib::wrapper! {
@@ -2564,7 +2586,10 @@ impl ConduitWindow {
         let text_view = self.composer_text_view(target);
         let popover = gtk::Popover::new();
         popover.set_parent(&text_view);
-        popover.set_autohide(true);
+        // Autohide popovers take focus when they open, which immediately trips
+        // the composer's focus-loss dismissal and prevents keyboard completion.
+        // We already dismiss explicitly when focus leaves the composer.
+        popover.set_autohide(false);
         popover.set_has_arrow(true);
         popover.set_position(gtk::PositionType::Bottom);
 
@@ -2688,12 +2713,7 @@ impl ConduitWindow {
             content.set_margin_bottom(6);
             content.set_margin_start(8);
             content.set_margin_end(8);
-            let preview = match &entry.value {
-                EmojiValue::Unicode(value) => *value,
-                EmojiValue::CustomImage(_) => "◆",
-            };
-            let preview = gtk::Label::new(Some(preview));
-            preview.add_css_class("title-3");
+            let preview = composer_emoji_preview(entry);
             let label = gtk::Label::new(Some(&format!(":{}:  {}", entry.name, entry.label)));
             label.set_xalign(0.0);
             label.set_hexpand(true);

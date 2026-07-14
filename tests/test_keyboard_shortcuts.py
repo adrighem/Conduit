@@ -67,6 +67,81 @@ def visible_window_ids(name: str) -> list[str]:
     return result.stdout.splitlines() if result.returncode == 0 else []
 
 
+def press(*keys: str) -> None:
+    subprocess.run(["xdotool", "key", *keys], check=True)
+
+
+def type_text(text: str) -> None:
+    subprocess.run(
+        ["xdotool", "type", "--clearmodifiers", "--delay", "10", text], check=True
+    )
+
+
+def clipboard_text() -> str:
+    return subprocess.run(
+        ["xclip", "-selection", "clipboard", "-o"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def composer_text() -> str:
+    press("ctrl+a", "ctrl+c")
+    time.sleep(0.05)
+    return wait_until(lambda: clipboard_text(), timeout=5.0)
+
+
+def replace_composer_text(text: str) -> None:
+    press("ctrl+a", "BackSpace")
+    type_text(text)
+    time.sleep(0.1)
+
+
+def verify_emoji_completion() -> None:
+    press("ctrl+m")
+    time.sleep(0.1)
+
+    replace_composer_text(":+1")
+    press("Return")
+    time.sleep(0.1)
+    completed = composer_text()
+    assert completed == ":+1:", completed
+
+    replace_composer_text(":sm")
+    press("Return")
+    time.sleep(0.1)
+    first = composer_text()
+    assert first.startswith(":") and first.endswith(":"), first
+
+    replace_composer_text(":sm")
+    press("Down")
+    time.sleep(0.05)
+    press("Return")
+    time.sleep(0.1)
+    second = composer_text()
+    assert second.startswith(":") and second.endswith(":"), second
+    assert second != first, (first, second)
+
+    replace_composer_text(":sm")
+    press("Escape", "Tab", "ctrl+m")
+    time.sleep(0.1)
+    assert composer_text() == ":sm"
+
+
+def stop_process(process: subprocess.Popen[str]) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+    if process.returncode not in (0, -15):
+        _, stderr = process.communicate()
+        raise AssertionError(f"Conduit exited with {process.returncode}:\n{stderr}")
+
+
 def main() -> None:
     binary = Path(os.environ["CONDUIT_TEST_BINARY"])
     resource = Path(os.environ["CONDUIT_TEST_RESOURCE"])
@@ -89,54 +164,59 @@ def main() -> None:
             }
         )
 
-        process = subprocess.Popen(
-            [str(binary)],
-            env=environment,
-            text=True,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            window_id = wait_for_window(process)
-            subprocess.run(
-                ["xdotool", "windowactivate", "--sync", window_id], check=True
-            )
-            focused_window = subprocess.run(
-                ["xdotool", "getwindowfocus"],
-                check=True,
-                capture_output=True,
+        for thread_composer in (False, True):
+            run_environment = environment.copy()
+            if thread_composer:
+                run_environment["CONDUIT_TEST_THREAD_COMPOSER"] = "1"
+            process = subprocess.Popen(
+                [str(binary)],
+                env=run_environment,
                 text=True,
-            ).stdout.strip()
-            assert focused_window == window_id
-            time.sleep(0.2)
-            assert not visible_window_ids(SWITCHER_TITLE)
-            subprocess.run(
-                [
-                    "xdotool",
-                    "keydown",
-                    "Control_L",
-                    "key",
-                    "k",
-                    "keyup",
-                    "Control_L",
-                ],
-                check=True,
+                stderr=subprocess.PIPE,
             )
-            switcher_id = wait_until(lambda: next(iter(visible_window_ids(SWITCHER_TITLE)), None))
-            subprocess.run(
-                ["xdotool", "windowactivate", "--sync", switcher_id], check=True
-            )
-            subprocess.run(["xdotool", "key", "Escape"], check=True)
-            wait_until(lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0)
-        finally:
-            process.terminate()
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+                window_id = wait_for_window(process)
+                subprocess.run(
+                    ["xdotool", "windowactivate", "--sync", window_id], check=True
+                )
+                focused_window = subprocess.run(
+                    ["xdotool", "getwindowfocus"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                assert focused_window == window_id
+                time.sleep(0.2)
 
-        if process.returncode not in (0, -15):
-            raise AssertionError(f"Conduit exited with {process.returncode}")
+                if not thread_composer:
+                    assert not visible_window_ids(SWITCHER_TITLE)
+                    subprocess.run(
+                        [
+                            "xdotool",
+                            "keydown",
+                            "Control_L",
+                            "key",
+                            "k",
+                            "keyup",
+                            "Control_L",
+                        ],
+                        check=True,
+                    )
+                    switcher_id = wait_until(
+                        lambda: next(iter(visible_window_ids(SWITCHER_TITLE)), None)
+                    )
+                    subprocess.run(
+                        ["xdotool", "windowactivate", "--sync", switcher_id],
+                        check=True,
+                    )
+                    press("Escape")
+                    wait_until(
+                        lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0
+                    )
+
+                verify_emoji_completion()
+            finally:
+                stop_process(process)
 
 
 if __name__ == "__main__":
