@@ -5,7 +5,9 @@ use gettextrs::gettext;
 use crate::activity::ActivityItem;
 use crate::debug;
 use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
-use crate::models::{SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage};
+use crate::models::{
+    SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage, SlackUserStatus,
+};
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
 const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
@@ -13,6 +15,8 @@ const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
     pub user_names: HashMap<String, String>,
+    pub user_statuses: HashMap<String, SlackUserStatus>,
+    pub direct_message_peer_id: Option<String>,
     pub user_group_names: HashMap<String, String>,
     pub user_group_members: HashMap<String, Vec<String>>,
     pub current_user_id: Option<String>,
@@ -146,7 +150,7 @@ fn document_heading(title: &str) -> String {
     )
 }
 
-fn reaction_picker_html(context: &MessageHtmlContext) -> String {
+fn emoji_picker_html(context: &MessageHtmlContext) -> String {
     let catalog = EmojiCatalog::new(&context.custom_emojis);
     let entries = catalog.entries();
     let mut categories = entries
@@ -183,9 +187,9 @@ fn reaction_picker_html(context: &MessageHtmlContext) -> String {
         .collect::<String>();
 
     format!(
-        "<dialog id=\"reaction-picker\" class=\"reaction-picker\" aria-labelledby=\"reaction-picker-title\"><header><h2 id=\"reaction-picker-title\">{}</h2><button type=\"button\" class=\"picker-close\" aria-label=\"{}\">×</button></header><label class=\"emoji-search-label\" for=\"emoji-search\">{}</label><input id=\"emoji-search\" class=\"emoji-search\" type=\"search\" autocomplete=\"off\" placeholder=\"{}\"><nav class=\"emoji-categories\" role=\"tablist\" aria-label=\"{}\">{category_buttons}</nav><div class=\"emoji-grid\" role=\"grid\" aria-label=\"{}\">{emoji_buttons}</div><p class=\"emoji-empty\" role=\"status\" hidden>{}</p></dialog>",
+        "<dialog id=\"emoji-picker\" class=\"emoji-picker\" aria-labelledby=\"emoji-picker-title\"><header><h2 id=\"emoji-picker-title\">{}</h2><button type=\"button\" class=\"picker-close\" aria-label=\"{}\">×</button></header><label class=\"emoji-search-label\" for=\"emoji-search\">{}</label><input id=\"emoji-search\" class=\"emoji-search\" type=\"search\" autocomplete=\"off\" placeholder=\"{}\"><nav class=\"emoji-categories\" role=\"tablist\" aria-label=\"{}\">{category_buttons}</nav><div class=\"emoji-grid\" role=\"grid\" aria-label=\"{}\">{emoji_buttons}</div><p class=\"emoji-empty\" role=\"status\" hidden>{}</p></dialog>",
         escape_html(&gettext("Add reaction")),
-        escape_html(&gettext("Close reaction picker")),
+        escape_html(&gettext("Close emoji picker")),
         escape_html(&gettext("Search emoji by name")),
         escape_html(&gettext("Search emoji")),
         escape_html(&gettext("Emoji categories")),
@@ -194,9 +198,9 @@ fn reaction_picker_html(context: &MessageHtmlContext) -> String {
     )
 }
 
-fn reaction_picker_script() -> &'static str {
+fn emoji_picker_script() -> &'static str {
     r##"(function () {
-  const picker = document.getElementById("reaction-picker");
+  const picker = document.getElementById("emoji-picker");
   if (!picker) return;
   const search = picker.querySelector("#emoji-search");
   const choices = Array.from(picker.querySelectorAll(".emoji-choice"));
@@ -278,13 +282,21 @@ fn reaction_picker_script() -> &'static str {
     empty.hidden = visible !== 0;
   }
 
+  function cancelPicker(event) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    if (picker.open) picker.close("cancel");
+  }
+
   document.addEventListener("click", function (event) {
     const menuAction = event.target.closest(".more-actions-menu a");
     if (menuAction) {
       const menu = menuAction.closest("details");
       if (menu) menu.open = false;
     }
-    const trigger = event.target.closest("[data-open-reaction-picker]");
+    const trigger = event.target.closest("[data-open-emoji-picker]");
     if (!trigger) return;
     event.preventDefault();
     opener = trigger;
@@ -295,7 +307,18 @@ fn reaction_picker_script() -> &'static str {
     search.focus();
   });
 
-  picker.querySelector(".picker-close").addEventListener("click", function () { picker.close(); });
+  picker.querySelector(".picker-close").addEventListener("click", cancelPicker);
+  picker.addEventListener("cancel", cancelPicker);
+  picker.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") cancelPicker(event);
+  }, true);
+  picker.addEventListener("click", function (event) {
+    if (event.target !== picker) return;
+    const bounds = picker.getBoundingClientRect();
+    const inside = event.clientX >= bounds.left && event.clientX <= bounds.right
+      && event.clientY >= bounds.top && event.clientY <= bounds.bottom;
+    if (!inside) cancelPicker(event);
+  });
   picker.addEventListener("close", function () { if (opener) opener.focus(); });
   search.addEventListener("input", filterChoices);
   tabs.forEach(function (tab) {
@@ -404,7 +427,7 @@ pub fn conversation_document_with_focus(
         body.push_str("<div id=\"conversation-read-sentinel\" aria-hidden=\"true\"></div>");
     }
     body.push_str("</main>");
-    body.push_str(&reaction_picker_html(context));
+    body.push_str(&emoji_picker_html(context));
 
     let mut scripts = Vec::new();
     if let Some(scroll_script) = timeline_scroll_script(channel_id, context.timeline_scroll) {
@@ -447,7 +470,7 @@ pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -
     }
     body.push_str("</main>");
     if rendered > 0 {
-        body.push_str(&reaction_picker_html(context));
+        body.push_str(&emoji_picker_html(context));
     }
 
     html_document(&title, &body)
@@ -509,7 +532,7 @@ pub fn threads_document(items: &[ThreadInboxItem], context: &MessageHtmlContext)
         ));
     }
     body.push_str("</ol></main>");
-    body.push_str(&reaction_picker_html(context));
+    body.push_str(&emoji_picker_html(context));
     html_document(&title, &body)
 }
 
@@ -547,7 +570,7 @@ pub fn search_results_document(results: &[SearchMatch], context: &MessageHtmlCon
         body.push_str("</li>");
     }
     body.push_str("</ol></main>");
-    body.push_str(&reaction_picker_html(context));
+    body.push_str(&emoji_picker_html(context));
 
     html_document(&title, &body)
 }
@@ -593,7 +616,7 @@ fn html_document_with_language(
     let has_message_actions = body.contains("class=\"quick-actions\"");
     let scripts = [
         script.filter(|script| !script.trim().is_empty()),
-        has_message_actions.then_some(reaction_picker_script()),
+        has_message_actions.then_some(emoji_picker_script()),
     ]
     .into_iter()
     .flatten()
@@ -739,6 +762,13 @@ a:hover {{
 .author {{
   min-inline-size: 0;
   font-weight: 700;
+}}
+
+.user-status {{
+  display: inline-flex;
+  align-items: center;
+  margin-inline-start: -4px;
+  border-radius: 4px;
 }}
 
 .metadata {{
@@ -1092,7 +1122,7 @@ pre code {{
   text-decoration: none;
 }}
 
-.reaction-picker {{
+.emoji-picker {{
   box-sizing: border-box;
   inline-size: min(520px, calc(100vw - 24px));
   max-block-size: min(620px, calc(100vh - 24px));
@@ -1105,11 +1135,11 @@ pre code {{
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.28);
 }}
 
-.reaction-picker::backdrop {{
+.emoji-picker::backdrop {{
   background: rgba(0, 0, 0, 0.28);
 }}
 
-.reaction-picker > header {{
+.emoji-picker > header {{
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1117,7 +1147,7 @@ pre code {{
   padding-inline: 16px;
 }}
 
-.reaction-picker h2 {{
+.emoji-picker h2 {{
   margin: 0;
   font-size: 18px;
 }}
@@ -1294,10 +1324,8 @@ pre code {{
   }}
 
   .message:hover > .quick-actions,
-  .message:focus-within > .quick-actions,
   .message-part:hover > .quick-actions,
-  .message-part:focus-within > .quick-actions,
-  .quick-actions:focus-within {{
+  .quick-actions:has(:focus-visible) {{
     opacity: 1;
     pointer-events: auto;
   }}
@@ -1525,10 +1553,12 @@ fn message_article(
     context: &MessageHtmlContext,
 ) -> String {
     let author = author_label(message, context);
+    let status = author_status_html(message, context);
     let mut article = format!(
-        "<article class=\"message\"{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}</header><div class=\"body\" dir=\"auto\">{}</div>",
+        "<article class=\"message\"{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}{}</header><div class=\"body\" dir=\"auto\">{}</div>",
         message_target_attributes(Some(&message.ts)),
         escape_html(&author),
+        status,
         metadata_html(message),
         message_body_html(message, context)
     );
@@ -1599,9 +1629,11 @@ fn message_group_article(
     };
 
     let author = author_label(first_message, context);
+    let status = author_status_html(first_message, context);
     let mut article = format!(
-        "<article class=\"message message-group\"><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}</header><div class=\"message-stack\">",
+        "<article class=\"message message-group\"><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}{}</header><div class=\"message-stack\">",
         escape_html(&author),
+        status,
         metadata_html(first_message)
     );
 
@@ -1831,6 +1863,38 @@ fn author_label(message: &SlackMessage, context: &MessageHtmlContext) -> String 
         .unwrap_or_else(|| message.author_label())
 }
 
+fn author_status_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
+    let Some(user_id) = message.user.as_deref() else {
+        return String::new();
+    };
+    if context.direct_message_peer_id.as_deref() != Some(user_id) {
+        return String::new();
+    }
+    let Some(status) = context.user_statuses.get(user_id) else {
+        return String::new();
+    };
+    if !status.active_at(current_unix_seconds()) {
+        return String::new();
+    }
+    let accessible = status.accessible_text();
+    let glyph = EmojiCatalog::new(&context.custom_emojis)
+        .resolve(status.emoji_name())
+        .map(|value| emoji_value_html(&value, false))
+        .unwrap_or_else(|| "●".to_string());
+    format!(
+        "<span class=\"user-status\" tabindex=\"0\" role=\"img\" title=\"{}\" aria-label=\"{}\">{glyph}</span>",
+        escape_html(&accessible),
+        escape_html(&format!("Status: {accessible}")),
+    )
+}
+
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or_default()
+}
+
 fn message_body_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
     if message.subtype.as_deref() == Some("message_deleted") {
         return format!(
@@ -2013,10 +2077,18 @@ fn attachments_html(
                 return attachment_chip_html(label, Some(&viewer_url));
             }
 
-            attachment_chip_html(
-                label,
-                file.permalink.as_deref().or(file.url_private.as_deref()),
-            )
+            let download_url = file
+                .download_url()
+                .filter(|url| is_http_url(url))
+                .map(|url| {
+                    let filename = file
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(label);
+                    attachment_action_url(url, filename)
+                });
+            attachment_chip_html(label, download_url.as_deref())
         })
         .collect::<String>();
 
@@ -2034,11 +2106,21 @@ pub fn media_action_url(channel_id: &str, ts: &str, url: &str, name: &str, kind:
     )
 }
 
+pub fn attachment_action_url(url: &str, name: &str) -> String {
+    format!(
+        "conduit://attachment?url={}&name={}",
+        encode_query(url),
+        encode_query(name),
+    )
+}
+
 fn attachment_chip_html(label: &str, link: Option<&str>) -> String {
     let label = escape_html(&gettext("Attachment: {name}").replace("{name}", label));
-    if let Some(link) =
-        link.filter(|link| is_http_url(link) || link.starts_with("conduit://media?"))
-    {
+    if let Some(link) = link.filter(|link| {
+        is_http_url(link)
+            || link.starts_with("conduit://media?")
+            || link.starts_with("conduit://attachment?")
+    }) {
         format!(
             "<a class=\"attachment\" href=\"{}\" rel=\"noreferrer noopener\">{label}</a>",
             escape_html(link)
@@ -2308,7 +2390,7 @@ fn message_actions_html(
     let reaction_template =
         reaction_action_url(channel_id, message, "__REACTION__", true, thread_ts);
     actions.push_str(&format!(
-        "<button type=\"button\" class=\"action-button\" data-open-reaction-picker data-reaction-template=\"{}\" title=\"{}\" aria-label=\"{}\">☺<span aria-hidden=\"true\">+</span></button>",
+        "<button type=\"button\" class=\"action-button\" data-open-emoji-picker data-reaction-template=\"{}\" title=\"{}\" aria-label=\"{}\">☺<span aria-hidden=\"true\">+</span></button>",
         escape_html(&reaction_template),
         escape_html(&gettext("Add reaction")),
         escape_html(&gettext("Add reaction")),
@@ -2947,6 +3029,12 @@ mod tests {
         assert!(fine_pointer_css.contains("position: absolute"));
         assert!(fine_pointer_css.contains("inset-block-start: 4px"));
         assert!(fine_pointer_css.contains("inset-inline-end: 0"));
+        assert!(fine_pointer_css.contains(".message:hover > .quick-actions"));
+        assert!(fine_pointer_css.contains(".message-part:hover > .quick-actions"));
+        assert!(fine_pointer_css.contains(".quick-actions:has(:focus-visible)"));
+        assert!(!fine_pointer_css.contains(".message:focus-within"));
+        assert!(!fine_pointer_css.contains(".message-part:focus-within"));
+        assert!(!fine_pointer_css.contains(".quick-actions:focus-within"));
         assert!(!fine_pointer_css.contains("grid-template-columns"));
         assert!(!fine_pointer_css.contains("grid-column"));
         for physical_property in [
@@ -2990,6 +3078,36 @@ mod tests {
         assert!(html.contains("hello &lt;script&gt;alert(1)&lt;/script&gt; &amp; goodbye"));
         assert!(html.contains("&lt;bad author&gt;"));
         assert!(!html.contains("hello <script>"));
+    }
+
+    #[test]
+    fn direct_dm_author_status_is_accessible_and_does_not_leak_to_other_contexts() {
+        let context = MessageHtmlContext {
+            user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
+            user_statuses: HashMap::from([(
+                "U123".to_string(),
+                SlackUserStatus {
+                    text: "Heads <down>".to_string(),
+                    emoji: ":brain:".to_string(),
+                    expiration: i64::MAX,
+                },
+            )]),
+            direct_message_peer_id: Some("U123".to_string()),
+            ..Default::default()
+        };
+        let html = conversation_document("D123", &[message("hello")], &context);
+
+        assert!(html.contains("class=\"user-status\""));
+        assert!(html.contains("title=\"Heads &lt;down&gt;\""));
+        assert!(html.contains("aria-label=\"Status: Heads &lt;down&gt;\""));
+        assert!(html.contains("tabindex=\"0\""));
+
+        let channel_context = MessageHtmlContext {
+            direct_message_peer_id: None,
+            ..context
+        };
+        let channel_html = conversation_document("C123", &[message("hello")], &channel_context);
+        assert!(!channel_html.contains("class=\"user-status\""));
     }
 
     #[test]
@@ -3295,8 +3413,9 @@ mod tests {
         assert!(html.contains("conduit://copy-link?channel=C123&amp;ts=1710000000.000100"));
         assert!(html.contains("conduit://copy-message?channel=C123&amp;ts=1710000000.000100"));
         assert!(html.contains("conduit://forward?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains("data-open-reaction-picker"));
-        assert_eq!(html.matches("id=\"reaction-picker\"").count(), 1);
+        assert!(html.contains("data-open-emoji-picker"));
+        assert_eq!(html.matches("id=\"emoji-picker\"").count(), 1);
+        assert!(html.contains("aria-labelledby=\"emoji-picker-title\""));
         assert!(html.contains("id=\"emoji-search\""));
         assert!(html.contains("split(/\\s+/).filter(Boolean)"));
         assert!(html.contains("function choiceMatchScore(choice, terms)"));
@@ -3310,7 +3429,7 @@ mod tests {
         let quick_actions = &html[html.find("<nav class=\"quick-actions\"").unwrap()..];
         let quick_actions = &quick_actions[..quick_actions.find("</nav>").unwrap()];
         let recent = quick_actions.find("name=heart").unwrap();
-        let picker = quick_actions.find("data-open-reaction-picker").unwrap();
+        let picker = quick_actions.find("data-open-emoji-picker").unwrap();
         let thread = quick_actions.find("conduit://thread?").unwrap();
         let forward = quick_actions.find("conduit://forward?").unwrap();
         let more = quick_actions.find("class=\"more-actions\"").unwrap();
@@ -3327,6 +3446,30 @@ mod tests {
             assert!(!html.contains(unavailable_action), "{unavailable_action}");
         }
         assert!(!html.contains("Remove +1"));
+    }
+
+    #[test]
+    fn emoji_picker_cancellation_is_shared_and_restores_focus() {
+        let html = conversation_document(
+            "C123",
+            &[message("Pick a reaction")],
+            &MessageHtmlContext::default(),
+        );
+
+        assert!(html.contains("function cancelPicker(event)"));
+        assert!(html.contains("event.preventDefault();"));
+        assert!(html.contains("event.stopPropagation();"));
+        assert!(html.contains("picker.close(\"cancel\")"));
+        assert!(html.contains(
+            "picker.querySelector(\".picker-close\").addEventListener(\"click\", cancelPicker)"
+        ));
+        assert!(html.contains("picker.addEventListener(\"cancel\", cancelPicker)"));
+        assert!(html.contains("if (event.key === \"Escape\") cancelPicker(event)"));
+        assert!(html.contains("if (event.target !== picker) return"));
+        assert!(html.contains("if (!inside) cancelPicker(event)"));
+        assert!(html.contains("if (opener) opener.focus()"));
+        assert!(html.contains("Close emoji picker"));
+        assert!(!html.contains("reaction-picker"));
     }
 
     #[test]
@@ -3461,6 +3604,32 @@ mod tests {
         assert!(html.contains("conduit://media?"));
         assert!(html.contains("url=https%3A%2F%2Ffiles.slack.com%2Foriginal.png"));
         assert!(html.contains("src=\"data:image/png;base64,x\""));
+    }
+
+    #[test]
+    fn unsupported_attachment_downloads_private_url_through_internal_action() {
+        let mut message = message("document");
+        message.files = Some(vec![SlackFile {
+            title: Some("Quarterly report".to_string()),
+            name: Some("quarterly-report.pdf".to_string()),
+            mimetype: Some("application/pdf".to_string()),
+            permalink: Some("https://workspace.slack.com/files/U1/F1".to_string()),
+            url_private: Some("https://files.slack.com/files-pri/F1/report.pdf".to_string()),
+            url_private_download: Some(
+                "https://files.slack.com/files-pri/F1/download/report.pdf".to_string(),
+            ),
+            ..Default::default()
+        }]);
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains("conduit://attachment?"));
+        assert!(html.contains(
+            "url=https%3A%2F%2Ffiles.slack.com%2Ffiles-pri%2FF1%2Fdownload%2Freport.pdf"
+        ));
+        assert!(html.contains("name=quarterly-report.pdf"));
+        assert!(html.contains("Attachment: Quarterly report"));
+        assert!(!html.contains("workspace.slack.com/files/U1/F1"));
     }
 
     #[test]

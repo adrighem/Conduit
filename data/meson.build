@@ -36,6 +36,10 @@ install_data('eu.vanadrighem.conduit.gschema.xml',
   install_dir: get_option('datadir') / 'glib-2.0' / 'schemas'
 )
 
+install_data('eu.vanadrighem.conduit.search-provider.ini',
+  install_dir: get_option('datadir') / 'gnome-shell' / 'search-providers'
+)
+
 compile_schemas = find_program('glib-compile-schemas', required: false, disabler: true)
 test('Validate schema file',
      compile_schemas,

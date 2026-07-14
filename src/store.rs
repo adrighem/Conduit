@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::conversation_catalog::ConversationCatalog;
-use crate::models::{SlackConversation, SlackMessage, SlackUnreadState};
+use crate::models::{SlackConversation, SlackMessage, SlackUnreadState, SlackUserStatus};
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 
 const CACHE_VERSION: u32 = 1;
@@ -22,6 +22,7 @@ const MAX_SEEN_REALTIME_MESSAGES: usize = 256;
 #[derive(Clone, Debug)]
 pub struct WorkspaceStore {
     directory: PathBuf,
+    workspace_id: String,
     workspace_key: String,
     update_lock: Arc<Mutex<()>>,
 }
@@ -30,6 +31,7 @@ impl WorkspaceStore {
     pub fn new(directory: PathBuf, workspace_id: &str) -> Self {
         Self {
             directory,
+            workspace_id: workspace_id.to_string(),
             workspace_key: cache_key(workspace_id),
             update_lock: Arc::new(Mutex::new(())),
         }
@@ -41,6 +43,12 @@ impl WorkspaceStore {
             .await?
             .map(|state| state.conversations)
             .filter(|conversations| !conversations.is_empty()))
+    }
+
+    /// Records the opaque workspace identity needed by desktop integrations,
+    /// including when an older cache is opened while offline.
+    pub async fn ensure_workspace_identity(&self) -> Result<()> {
+        self.update_state(|_| {}).await
     }
 
     pub async fn load_pending_unread_refresh(&self) -> Result<Vec<String>> {
@@ -286,6 +294,63 @@ impl WorkspaceStore {
         .await
     }
 
+    pub async fn load_user_search_aliases(&self) -> Result<HashMap<String, Vec<String>>> {
+        Ok(self
+            .load_state()
+            .await?
+            .map(|state| state.user_search_aliases)
+            .unwrap_or_default())
+    }
+
+    pub async fn store_user_search_aliases(
+        &self,
+        aliases: &HashMap<String, Vec<String>>,
+    ) -> Result<()> {
+        self.update_state(|state| {
+            state.user_search_aliases = aliases
+                .iter()
+                .filter(|(user_id, aliases)| {
+                    !user_id.trim().is_empty()
+                        && aliases.iter().any(|alias| !alias.trim().is_empty())
+                })
+                .map(|(user_id, aliases)| (user_id.clone(), aliases.clone()))
+                .collect();
+        })
+        .await
+    }
+
+    pub async fn load_user_statuses(&self) -> Result<HashMap<String, SlackUserStatus>> {
+        Ok(self
+            .load_state()
+            .await?
+            .map(|state| state.user_statuses)
+            .unwrap_or_default())
+    }
+
+    pub async fn store_user_statuses(
+        &self,
+        statuses: &HashMap<String, SlackUserStatus>,
+    ) -> Result<()> {
+        self.update_state(|state| state.user_statuses = statuses.clone())
+            .await
+    }
+
+    pub async fn store_user_status(
+        &self,
+        user_id: &str,
+        status: Option<SlackUserStatus>,
+    ) -> Result<()> {
+        self.update_state(|state| match status {
+            Some(status) => {
+                state.user_statuses.insert(user_id.to_string(), status);
+            }
+            None => {
+                state.user_statuses.remove(user_id);
+            }
+        })
+        .await
+    }
+
     pub async fn load_custom_emojis(&self) -> Result<HashMap<String, String>> {
         Ok(self
             .load_state()
@@ -462,6 +527,7 @@ impl WorkspaceStore {
     async fn update_state(&self, update: impl FnOnce(&mut CachedWorkspaceState)) -> Result<()> {
         let _guard = self.update_lock.lock().await;
         let mut state = self.load_state_for_update().await;
+        state.workspace_id = self.workspace_id.clone();
         update(&mut state);
         self.store_state(&state).await
     }
@@ -506,7 +572,7 @@ impl WorkspaceStore {
     }
 
     async fn load_state_for_update(&self) -> CachedWorkspaceState {
-        match self.load_state().await {
+        let mut state = match self.load_state().await {
             Ok(Some(state)) => state,
             Ok(None) => CachedWorkspaceState::new(),
             Err(error) => {
@@ -516,7 +582,9 @@ impl WorkspaceStore {
                 );
                 CachedWorkspaceState::new()
             }
-        }
+        };
+        state.workspace_id = self.workspace_id.clone();
+        state
     }
 
     async fn store_state(&self, state: &CachedWorkspaceState) -> Result<()> {
@@ -550,9 +618,15 @@ impl WorkspaceStore {
 struct CachedWorkspaceState {
     version: u32,
     #[serde(default)]
+    workspace_id: String,
+    #[serde(default)]
     conversations: Vec<SlackConversation>,
     #[serde(default)]
     user_names: HashMap<String, String>,
+    #[serde(default)]
+    user_search_aliases: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    user_statuses: HashMap<String, SlackUserStatus>,
     #[serde(default)]
     channel_histories: HashMap<String, Vec<SlackMessage>>,
     #[serde(default)]
@@ -569,8 +643,11 @@ impl CachedWorkspaceState {
     fn new() -> Self {
         Self {
             version: CACHE_VERSION,
+            workspace_id: String::new(),
             conversations: Vec::new(),
             user_names: HashMap::new(),
+            user_search_aliases: HashMap::new(),
+            user_statuses: HashMap::new(),
             channel_histories: HashMap::new(),
             thread_replies: HashMap::new(),
             thread_catalog: Vec::new(),
@@ -654,6 +731,15 @@ mod tests {
                 .expect("conversation store failed");
             assert_eq!(
                 store
+                    .load_state()
+                    .await
+                    .expect("workspace state load failed")
+                    .expect("missing cached workspace state")
+                    .workspace_id,
+                "T123:U123"
+            );
+            assert_eq!(
+                store
                     .load_conversations()
                     .await
                     .expect("conversation load failed")
@@ -712,6 +798,30 @@ mod tests {
             );
         });
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ensuring_workspace_identity_upgrades_an_existing_cache() {
+        let directory = temp_cache_dir("workspace-store-identity-upgrade");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        std::fs::write(
+            store.path(),
+            r#"{"version":1,"conversations":[{"id":"D1","is_im":true}]}"#,
+        )
+        .unwrap();
+
+        runtime()
+            .block_on(store.ensure_workspace_identity())
+            .expect("workspace identity upgrade failed");
+
+        let state = runtime()
+            .block_on(store.load_state())
+            .unwrap()
+            .expect("missing upgraded state");
+        assert_eq!(state.workspace_id, "T123:U123");
+        assert_eq!(state.conversations[0].id, "D1");
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -1163,6 +1273,49 @@ mod tests {
                     .map(String::as_str),
                 Some("Ada Lovelace")
             );
+
+            let aliases = HashMap::from([(
+                "U123".to_string(),
+                vec!["Ada".to_string(), "Ada Lovelace".to_string()],
+            )]);
+            store
+                .store_user_search_aliases(&aliases)
+                .await
+                .expect("user search alias store failed");
+            assert_eq!(
+                store
+                    .load_user_search_aliases()
+                    .await
+                    .expect("user search alias load failed"),
+                aliases
+            );
+
+            let status = SlackUserStatus {
+                text: "In a meeting".to_string(),
+                emoji: ":calendar:".to_string(),
+                expiration: 200,
+            };
+            store
+                .store_user_status("U123", Some(status.clone()))
+                .await
+                .expect("user status store failed");
+            assert_eq!(
+                store
+                    .load_user_statuses()
+                    .await
+                    .expect("user status load failed")
+                    .get("U123"),
+                Some(&status)
+            );
+            store
+                .store_user_status("U123", None)
+                .await
+                .expect("user status removal failed");
+            assert!(store
+                .load_user_statuses()
+                .await
+                .expect("user status load failed")
+                .is_empty());
         });
 
         let _ = std::fs::remove_dir_all(directory);

@@ -20,6 +20,7 @@
 
 use gtk::prelude::*;
 
+use crate::emoji::{EmojiCatalog, EmojiValue};
 use crate::sidebar::SidebarRowModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +51,11 @@ impl SidebarRowLayout {
     }
 }
 
-pub fn sidebar_row_widget(model: &SidebarRowModel, layout: SidebarRowLayout) -> gtk::ListBoxRow {
+pub fn sidebar_row_widget(
+    model: &SidebarRowModel,
+    layout: SidebarRowLayout,
+    custom_emojis: &std::collections::HashMap<String, String>,
+) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.set_selectable(true);
     row.set_activatable(true);
@@ -77,6 +82,28 @@ pub fn sidebar_row_widget(model: &SidebarRowModel, layout: SidebarRowLayout) -> 
         title.add_css_class("heading");
     }
     content.append(&title);
+
+    if let Some(status) = model.status.as_ref() {
+        let text = status.accessible_text();
+        let indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        match EmojiCatalog::new(custom_emojis).resolve(status.emoji_name()) {
+            Some(EmojiValue::Unicode(glyph)) => {
+                indicator.append(&gtk::Label::new(Some(glyph)));
+            }
+            Some(EmojiValue::CustomImage(url)) => {
+                let picture = gtk::Picture::for_file(&gtk::gio::File::for_uri(&url));
+                picture.set_content_fit(gtk::ContentFit::Contain);
+                picture.set_width_request(16);
+                picture.set_height_request(16);
+                indicator.append(&picture);
+            }
+            None => indicator.append(&gtk::Label::new(Some("●"))),
+        }
+        indicator.set_focusable(true);
+        indicator.set_tooltip_text(Some(&text));
+        indicator.update_property(&[gtk::accessible::Property::Label(&format!("Status: {text}"))]);
+        content.append(&indicator);
+    }
 
     if let Some(unread_label) = model.unread_badge_label() {
         let unread = gtk::Label::new(Some(&unread_label));

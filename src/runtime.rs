@@ -20,7 +20,7 @@ use crate::config;
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, StoredToken,
+    SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, SlackUserStatus, StoredToken,
 };
 use crate::slack::{
     DownloadedPreviewAsset, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT,
@@ -96,6 +96,10 @@ pub enum RuntimeCommand {
         url: String,
         name: String,
     },
+    DownloadAttachment {
+        url: String,
+        name: String,
+    },
     MarkConversationRead {
         channel_id: String,
         ts: String,
@@ -125,8 +129,10 @@ pub enum RuntimeCommand {
     },
     UploadFile {
         channel_id: String,
+        thread_ts: Option<String>,
         path: PathBuf,
         initial_comment: Option<String>,
+        remove_after_upload: bool,
     },
 }
 
@@ -175,6 +181,7 @@ pub enum RuntimeOperation {
     ReadMarker,
     ImageAsset,
     Media,
+    AttachmentDownload,
     PostMessage,
     Reaction,
     Saved,
@@ -193,11 +200,15 @@ pub enum RuntimeTarget {
     User(String),
     Image(String),
     Media(String),
+    Attachment(String),
     Message {
         channel_id: String,
         thread_ts: Option<String>,
     },
-    Upload(String),
+    Upload {
+        channel_id: String,
+        thread_ts: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -314,6 +325,10 @@ impl RuntimeCommand {
             Self::LoadMedia { url, .. } => {
                 OperationContext::new(RuntimeOperation::Media, RuntimeTarget::Media(url.clone()))
             }
+            Self::DownloadAttachment { url, .. } => OperationContext::new(
+                RuntimeOperation::AttachmentDownload,
+                RuntimeTarget::Attachment(url.clone()),
+            ),
             Self::MarkConversationRead { channel_id, .. } => OperationContext::new(
                 RuntimeOperation::ReadMarker,
                 RuntimeTarget::Channel(channel_id.clone()),
@@ -362,9 +377,16 @@ impl RuntimeCommand {
                     thread_ts: thread_ts.clone(),
                 },
             ),
-            Self::UploadFile { channel_id, .. } => OperationContext::new(
+            Self::UploadFile {
+                channel_id,
+                thread_ts,
+                ..
+            } => OperationContext::new(
                 RuntimeOperation::FileUpload,
-                RuntimeTarget::Upload(channel_id.clone()),
+                RuntimeTarget::Upload {
+                    channel_id: channel_id.clone(),
+                    thread_ts: thread_ts.clone(),
+                },
             ),
         }
     }
@@ -447,8 +469,11 @@ pub enum RuntimeEventKind {
     UserLoaded {
         user_id: String,
         display_name: String,
+        status: Option<SlackUserStatus>,
     },
     UserNamesLoaded(HashMap<String, String>),
+    UserSearchAliasesLoaded(HashMap<String, Vec<String>>),
+    UserStatusesLoaded(HashMap<String, SlackUserStatus>),
     UserGroupsLoaded {
         names: HashMap<String, String>,
         members: HashMap<String, Vec<String>>,
@@ -466,6 +491,15 @@ pub enum RuntimeEventKind {
         name: String,
         path: PathBuf,
         mime_type: String,
+    },
+    AttachmentDownloadProgress {
+        fraction: f64,
+        label: String,
+    },
+    AttachmentDownloaded {
+        url: String,
+        name: String,
+        path: PathBuf,
     },
     MessagePosted {
         channel_id: String,
@@ -560,7 +594,10 @@ impl RuntimeEventKind {
             Self::UserLoaded { user_id, .. } => {
                 OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone()))
             }
-            Self::UserNamesLoaded(_) | Self::UserGroupsLoaded { .. } => {
+            Self::UserNamesLoaded(_)
+            | Self::UserSearchAliasesLoaded(_)
+            | Self::UserStatusesLoaded(_)
+            | Self::UserGroupsLoaded { .. } => {
                 OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace)
             }
             Self::EmojiCatalogLoaded(_) => {
@@ -575,6 +612,10 @@ impl RuntimeEventKind {
             Self::MediaLoaded { url, .. } => {
                 OperationContext::new(RuntimeOperation::Media, RuntimeTarget::Media(url.clone()))
             }
+            Self::AttachmentDownloaded { url, .. } => OperationContext::new(
+                RuntimeOperation::AttachmentDownload,
+                RuntimeTarget::Attachment(url.clone()),
+            ),
             Self::SocketModeEvent(_) => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
@@ -586,6 +627,7 @@ impl RuntimeEventKind {
             | Self::MessagePosted { .. }
             | Self::ReactionUpdated { .. }
             | Self::SavedUpdated { .. }
+            | Self::AttachmentDownloadProgress { .. }
             | Self::FileUploadProgress { .. }
             | Self::FileUploaded(_) => fallback.clone(),
         }
@@ -1017,6 +1059,52 @@ fn media_cache_path(url: &str, name: &str) -> PathBuf {
     config::media_cache_dir().join(filename)
 }
 
+fn attachment_cache_path(url: &str, name: &str) -> PathBuf {
+    let digest = Sha256::digest(url.as_bytes());
+    let key = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let basename = name
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect::<String>();
+    let basename = basename.trim_matches([' ', '.']).trim();
+    let basename = if basename.is_empty() {
+        "attachment"
+    } else {
+        basename
+    };
+    config::attachment_cache_dir().join(format!("{key}-{basename}"))
+}
+
+struct RemoveFileOnDrop(Option<PathBuf>);
+
+impl RemoveFileOnDrop {
+    fn new(enabled: bool, path: &Path) -> Self {
+        Self(enabled.then(|| path.to_path_buf()))
+    }
+}
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn preview_asset_data_uri(asset: DownloadedPreviewAsset) -> String {
     format!(
         "data:{};base64,{}",
@@ -1227,9 +1315,9 @@ fn dispatch_command(
                 RuntimeTaskLane::Navigation
             } else {
                 match &command {
-                    RuntimeCommand::LoadImageAsset { .. } | RuntimeCommand::LoadMedia { .. } => {
-                        RuntimeTaskLane::Image
-                    }
+                    RuntimeCommand::LoadImageAsset { .. }
+                    | RuntimeCommand::LoadMedia { .. }
+                    | RuntimeCommand::DownloadAttachment { .. } => RuntimeTaskLane::Image,
                     RuntimeCommand::UploadFile { .. } => RuntimeTaskLane::Upload,
                     RuntimeCommand::RefreshConversations
                     | RuntimeCommand::DiscoverConversations
@@ -1352,7 +1440,18 @@ fn spawn_workspace_tasks(
     let hydration_connection = connection.clone();
     let hydration_limits = limits.clone();
     spawn_session_task(state, identity.session, async move {
+        if let Some(store) = hydration_connection.workspace_store.as_ref() {
+            if let Err(error) = store.ensure_workspace_identity().await {
+                crate::debug::log(
+                    "store",
+                    &format!("WorkspaceIdentityStoreFailed error={error:#}"),
+                );
+            }
+        }
         load_cached_user_names_shared(&hydration_events, &hydration_connection).await;
+        load_cached_user_search_aliases(&hydration_events, &hydration_connection.workspace_store)
+            .await;
+        load_cached_user_statuses(&hydration_events, &hydration_connection.workspace_store).await;
         load_cached_conversations(&hydration_events, &hydration_connection.workspace_store).await;
         load_cached_thread_catalog(&hydration_events, &hydration_connection.workspace_store).await;
         load_cached_custom_emojis(&hydration_events, &hydration_connection.workspace_store).await;
@@ -1476,6 +1575,51 @@ async fn load_cached_user_names_shared(
         .lock()
         .expect("runtime user cache lock poisoned")
         .extend(cached_names);
+}
+
+async fn load_cached_user_search_aliases(
+    events: &RuntimeEventSender,
+    workspace_store: &Option<WorkspaceStore>,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+    match store.load_user_search_aliases().await {
+        Ok(aliases) if !aliases.is_empty() => {
+            events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(aliases));
+        }
+        Ok(_) => {}
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("CachedUserSearchAliasesLoadFailed error={error:#}"),
+        ),
+    }
+}
+
+async fn load_cached_user_statuses(
+    events: &RuntimeEventSender,
+    workspace_store: &Option<WorkspaceStore>,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+    match store.load_user_statuses().await {
+        Ok(statuses) if !statuses.is_empty() => {
+            events.send_event(RuntimeEventKind::UserStatusesLoaded(statuses));
+        }
+        Ok(_) => {}
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("CachedUserStatusesLoadFailed error={error:#}"),
+        ),
+    }
+}
+
+fn user_statuses(users: &[SlackUser]) -> HashMap<String, SlackUserStatus> {
+    users
+        .iter()
+        .filter_map(|user| Some((user.id.clone()?, user.status()?)))
+        .collect()
 }
 
 async fn load_cached_custom_emojis(
@@ -1734,6 +1878,21 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             let channels = api.discover_conversations().await?;
             let users = api.users().await?;
+            let aliases = users
+                .iter()
+                .filter_map(|user| Some((user.id.clone()?, user.search_aliases())))
+                .collect::<HashMap<_, _>>();
+            let statuses = user_statuses(&users);
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.store_user_search_aliases(&aliases).await?;
+                store.store_user_statuses(&statuses).await?;
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::UserSearchAliasesLoaded(aliases));
+            context
+                .events
+                .send_event(RuntimeEventKind::UserStatusesLoaded(statuses));
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationCandidatesLoaded { channels, users });
@@ -1952,17 +2111,31 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 context.events.send_event(RuntimeEventKind::UserLoaded {
                     user_id,
                     display_name,
+                    status: None,
                 });
             } else {
                 let api = require_slack(context.slack)?;
-                let display_name = api.user_display_name(&user_id).await?;
+                let user = api.user(&user_id).await?;
+                let display_name = user.display_name().unwrap_or_else(|| user_id.clone());
+                let status = user.status();
                 context
                     .user_cache
                     .insert(user_id.clone(), display_name.clone());
                 store_user_name(context.workspace_store, &user_id, &display_name).await;
+                if let Some(store) = context.workspace_store.as_ref() {
+                    if let Err(error) = store.store_user_status(&user_id, status.clone()).await {
+                        crate::debug::log(
+                            "store",
+                            &format!(
+                                "CachedUserStatusStoreFailed user_id={user_id} error={error:#}"
+                            ),
+                        );
+                    }
+                }
                 context.events.send_event(RuntimeEventKind::UserLoaded {
                     user_id,
                     display_name,
+                    status,
                 });
             }
         }
@@ -2043,6 +2216,26 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 mime_type: media.mime_type,
             });
         }
+        RuntimeCommand::DownloadAttachment { url, name } => {
+            let api = require_slack(context.slack)?;
+            let destination = attachment_cache_path(&url, &name);
+            let progress_events = context.events.clone();
+            let attachment = api
+                .download_attachment(&url, &destination, move |update| {
+                    progress_events.send_event(RuntimeEventKind::AttachmentDownloadProgress {
+                        fraction: update.fraction,
+                        label: update.label,
+                    });
+                })
+                .await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::AttachmentDownloaded {
+                    url,
+                    name,
+                    path: attachment.path,
+                });
+        }
         RuntimeCommand::MarkConversationRead { channel_id, ts } => {
             let api = require_slack(context.slack)?;
             mark_conversation_read_best_effort(
@@ -2111,9 +2304,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         }
         RuntimeCommand::UploadFile {
             channel_id,
+            thread_ts,
             path,
             initial_comment,
+            remove_after_upload,
         } => {
+            let _temporary_upload = RemoveFileOnDrop::new(remove_after_upload, &path);
             let api = require_slack(context.slack)?;
             context
                 .events
@@ -2122,9 +2318,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     label: "Preparing upload".to_string(),
                 });
             let progress_events = context.events.clone();
-            let file = api
+            let upload = api
                 .upload_file(
                     &channel_id,
+                    thread_ts.as_deref(),
                     &path,
                     initial_comment.as_deref(),
                     move |update| {
@@ -2134,7 +2331,8 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                         });
                     },
                 )
-                .await?;
+                .await;
+            let file = upload?;
             let label = file
                 .title
                 .or(file.name)
@@ -2162,6 +2360,22 @@ async fn run_socket_mode(
         let store_for_run = workspace_store.clone();
         let user_for_run = current_user_id.clone();
         let result = socket_mode::run_once(&app_token, move |event| {
+            if let (Some(store), SocketModeEvent::UserChanged(user)) =
+                (store_for_run.clone(), &event)
+            {
+                let user = user.clone();
+                tokio::spawn(async move {
+                    let Some(user_id) = user.id.as_deref() else {
+                        return;
+                    };
+                    if let Err(error) = store.store_user_status(user_id, user.status()).await {
+                        crate::debug::log(
+                            "store",
+                            &format!("RealtimeUserStatusStoreFailed user_id={user_id} error={error:#}"),
+                        );
+                    }
+                });
+            }
             if let (Some(store), SocketModeEvent::Message(message)) =
                 (store_for_run.clone(), &event)
             {
@@ -3441,8 +3655,10 @@ mod tests {
         .supersedes_previous());
         assert!(!RuntimeCommand::UploadFile {
             channel_id: "C1".to_string(),
+            thread_ts: None,
             path: PathBuf::from("example.txt"),
             initial_comment: None,
+            remove_after_upload: false,
         }
         .supersedes_previous());
     }
@@ -3626,6 +3842,44 @@ mod tests {
             image_asset_cache_key("https://files.example/image.png"),
             "7db09e79cb28f1be72da3c1449cd42619e048f148310325cc2c8f55cd713aa0e"
         );
+    }
+
+    #[test]
+    fn attachment_cache_path_is_stable_and_sanitizes_remote_filename() {
+        let path = attachment_cache_path(
+            "https://files.slack.com/files-pri/F1/download/report",
+            "../../Quarterly: report?.pdf",
+        );
+        let filename = path.file_name().and_then(|name| name.to_str()).unwrap();
+
+        assert!(path.starts_with(config::attachment_cache_dir()));
+        assert!(filename.ends_with("-Quarterly_ report_.pdf"));
+        assert!(!filename.contains('/'));
+        assert!(!filename.contains(".."));
+        assert_eq!(
+            path,
+            attachment_cache_path(
+                "https://files.slack.com/files-pri/F1/download/report",
+                "../../Quarterly: report?.pdf",
+            )
+        );
+    }
+
+    #[test]
+    fn temporary_upload_guard_removes_staged_file() {
+        let path = std::env::temp_dir().join(format!(
+            "conduit-upload-cleanup-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&path, b"screenshot").unwrap();
+
+        {
+            let _guard = RemoveFileOnDrop::new(true, &path);
+            assert!(path.exists());
+        }
+
+        assert!(!path.exists());
     }
 
     #[test]

@@ -246,7 +246,7 @@ impl SlackConversation {
         names
     }
 
-    fn group_direct_message_user_ids(&self) -> Vec<String> {
+    pub fn group_direct_message_user_ids(&self) -> Vec<String> {
         let mut user_ids = Vec::new();
 
         for key in CONVERSATION_MEMBER_KEYS {
@@ -448,6 +448,12 @@ impl SlackFile {
             .as_deref()
             .or(self.url_private.as_deref())
             .or(self.url_private_download.as_deref())
+    }
+
+    pub fn download_url(&self) -> Option<&str> {
+        self.url_private_download
+            .as_deref()
+            .or(self.url_private.as_deref())
     }
 
     pub fn supported_media_kind(&self) -> Option<&'static str> {
@@ -654,7 +660,7 @@ pub struct SavedItem {
     pub message: Option<SlackMessage>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackUser {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -671,6 +677,66 @@ impl SlackUser {
             .and_then(SlackUserProfile::display_name)
             .or_else(|| self.real_name.clone())
             .or_else(|| self.name.clone())
+    }
+
+    /// Every human-readable identity Slack exposes for this user.
+    ///
+    /// The preferred display name remains the presentation label, while the
+    /// other values allow people to be found by real name, normalized name,
+    /// or Slack username.
+    pub fn search_aliases(&self) -> Vec<String> {
+        let profile = self.profile.as_ref();
+        let candidates = [
+            profile.and_then(|profile| profile.display_name.as_deref()),
+            profile.and_then(|profile| profile.display_name_normalized.as_deref()),
+            profile.and_then(|profile| profile.real_name.as_deref()),
+            profile.and_then(|profile| profile.real_name_normalized.as_deref()),
+            self.real_name.as_deref(),
+            self.name.as_deref(),
+        ];
+        let mut aliases = Vec::new();
+        for candidate in candidates.into_iter().flatten() {
+            let candidate = candidate.trim();
+            if !candidate.is_empty()
+                && !aliases
+                    .iter()
+                    .any(|alias: &String| alias.eq_ignore_ascii_case(candidate))
+            {
+                aliases.push(candidate.to_string());
+            }
+        }
+        aliases
+    }
+
+    pub fn status(&self) -> Option<SlackUserStatus> {
+        self.profile.as_ref().and_then(SlackUserProfile::status)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackUserStatus {
+    pub text: String,
+    pub emoji: String,
+    pub expiration: i64,
+}
+
+impl SlackUserStatus {
+    pub fn active_at(&self, unix_seconds: i64) -> bool {
+        (!self.text.trim().is_empty() || !self.emoji_name().is_empty())
+            && (self.expiration <= 0 || self.expiration > unix_seconds)
+    }
+
+    pub fn emoji_name(&self) -> &str {
+        self.emoji.trim().trim_matches(':')
+    }
+
+    pub fn accessible_text(&self) -> String {
+        let text = self.text.trim();
+        if text.is_empty() {
+            self.emoji_name().replace(['_', '-'], " ")
+        } else {
+            text.to_string()
+        }
     }
 }
 
@@ -697,10 +763,15 @@ impl SlackUserGroup {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackUserProfile {
     pub display_name: Option<String>,
+    pub display_name_normalized: Option<String>,
     pub real_name: Option<String>,
+    pub real_name_normalized: Option<String>,
+    pub status_text: Option<String>,
+    pub status_emoji: Option<String>,
+    pub status_expiration: Option<i64>,
 }
 
 impl SlackUserProfile {
@@ -711,11 +782,80 @@ impl SlackUserProfile {
             .cloned()
             .or_else(|| self.real_name.clone())
     }
+
+    pub fn status(&self) -> Option<SlackUserStatus> {
+        let status = SlackUserStatus {
+            text: self.status_text.clone().unwrap_or_default(),
+            emoji: self.status_emoji.clone().unwrap_or_default(),
+            expiration: self.status_expiration.unwrap_or_default(),
+        };
+        (!status.text.trim().is_empty() || !status.emoji_name().is_empty()).then_some(status)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_search_aliases_preserve_display_real_normalized_and_username_names() {
+        let user = SlackUser {
+            name: Some("zilvinas.kuusas".to_string()),
+            real_name: Some("Žilvinas Kuusas".to_string()),
+            profile: Some(SlackUserProfile {
+                display_name: Some("Žilvinas".to_string()),
+                display_name_normalized: Some("Zilvinas".to_string()),
+                real_name: Some("Žilvinas Kuusas".to_string()),
+                real_name_normalized: Some("Zilvinas Kuusas".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(user.display_name().as_deref(), Some("Žilvinas"));
+        assert_eq!(
+            user.search_aliases(),
+            vec![
+                "Žilvinas",
+                "Zilvinas",
+                "Žilvinas Kuusas",
+                "Zilvinas Kuusas",
+                "zilvinas.kuusas",
+            ]
+        );
+    }
+
+    #[test]
+    fn user_status_normalizes_emoji_and_honors_expiration() {
+        let status = SlackUserStatus {
+            text: "In a meeting".to_string(),
+            emoji: ":spiral_calendar_pad:".to_string(),
+            expiration: 200,
+        };
+
+        assert_eq!(status.emoji_name(), "spiral_calendar_pad");
+        assert!(status.active_at(199));
+        assert!(!status.active_at(200));
+
+        let permanent = SlackUserStatus {
+            expiration: 0,
+            ..status
+        };
+        assert!(permanent.active_at(i64::MAX));
+    }
+
+    #[test]
+    fn profile_exposes_text_only_status_but_ignores_empty_status() {
+        let profile = SlackUserProfile {
+            status_text: Some("Heads down".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.status().map(|status| status.accessible_text()),
+            Some("Heads down".to_string())
+        );
+        assert!(SlackUserProfile::default().status().is_none());
+    }
 
     #[test]
     fn dm_display_name_uses_loaded_user_name() {
@@ -981,6 +1121,30 @@ mod tests {
         };
 
         assert_eq!(file.preview_url(), Some("https://files.example/480.png"));
+    }
+
+    #[test]
+    fn file_download_prefers_private_download_and_never_permalink() {
+        let mut file = SlackFile {
+            permalink: Some("https://workspace.slack.com/files/U1/F1".to_string()),
+            url_private: Some("https://files.slack.com/files-pri/F1/file.pdf".to_string()),
+            url_private_download: Some(
+                "https://files.slack.com/files-pri/F1/download/file.pdf".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            file.download_url(),
+            Some("https://files.slack.com/files-pri/F1/download/file.pdf")
+        );
+        file.url_private_download = None;
+        assert_eq!(
+            file.download_url(),
+            Some("https://files.slack.com/files-pri/F1/file.pdf")
+        );
+        file.url_private = None;
+        assert_eq!(file.download_url(), None);
     }
 
     #[test]

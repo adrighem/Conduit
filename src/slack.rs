@@ -461,13 +461,18 @@ impl SlackApi {
     }
 
     pub async fn user_display_name(&self, user_id: &str) -> Result<String> {
+        Ok(self
+            .user(user_id)
+            .await?
+            .display_name()
+            .unwrap_or_else(|| user_id.to_string()))
+    }
+
+    pub async fn user(&self, user_id: &str) -> Result<SlackUser> {
         let response: UserInfoResponse = self
             .post_form("users.info", &[("user", user_id.to_string())])
             .await?;
-        Ok(response
-            .user
-            .display_name()
-            .unwrap_or_else(|| user_id.to_string()))
+        Ok(response.user)
     }
 
     pub async fn user_groups(&self) -> Result<Vec<SlackUserGroup>> {
@@ -602,6 +607,105 @@ impl SlackApi {
         }
     }
 
+    /// Downloads a private Slack attachment to a local cache path. Credentials
+    /// are only attached after the URL has been restricted to Slack-owned HTTPS
+    /// hosts, so an attachment can never forward the session to another host.
+    pub async fn download_attachment<F>(
+        &self,
+        url: &str,
+        destination: &Path,
+        progress: F,
+    ) -> Result<DownloadedAttachment>
+    where
+        F: Fn(DownloadProgressUpdate),
+    {
+        if !is_trusted_slack_download_url(url) {
+            return Err(anyhow!(
+                "attachment download URL is not a trusted Slack URL"
+            ));
+        }
+
+        if let Ok(metadata) = tokio::fs::metadata(destination).await {
+            if metadata.is_file() && metadata.len() > 0 {
+                ensure_attachment_size(Some(metadata.len()))?;
+                progress(DownloadProgressUpdate::new(1.0, "Attachment ready"));
+                return Ok(DownloadedAttachment {
+                    path: destination.to_path_buf(),
+                    size: metadata.len(),
+                });
+            }
+        }
+
+        progress(DownloadProgressUpdate::new(0.05, "Starting download"));
+        let response = self
+            .authenticated_request(Method::GET, url)
+            .send()
+            .await
+            .context("failed to download Slack attachment")?
+            .error_for_status()
+            .context("Slack attachment returned an HTTP error")?;
+        let expected_size = response.content_length();
+        ensure_attachment_size(expected_size)?;
+
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("failed to create the Slack attachment cache directory")?;
+        }
+
+        let partial_path = partial_download_path(destination);
+        let result = async {
+            let mut file = tokio::fs::File::create(&partial_path)
+                .await
+                .context("failed to create the Slack attachment cache file")?;
+            let mut response = response;
+            let mut size = 0_u64;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .context("failed to read Slack attachment bytes")?
+            {
+                size = size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow!("Slack attachment is larger than 1 GiB"))?;
+                ensure_attachment_size(Some(size))?;
+                file.write_all(&chunk)
+                    .await
+                    .context("failed to write the Slack attachment cache file")?;
+                if let Some(total) = expected_size.filter(|total| *total > 0) {
+                    let fraction = 0.05 + 0.9 * (size as f64 / total as f64).min(1.0);
+                    progress(DownloadProgressUpdate::new(
+                        fraction,
+                        "Downloading attachment",
+                    ));
+                }
+            }
+            file.flush()
+                .await
+                .context("failed to flush the Slack attachment cache file")?;
+            drop(file);
+            tokio::fs::rename(&partial_path, destination)
+                .await
+                .context("failed to finalize the Slack attachment cache file")?;
+            Ok::<_, anyhow::Error>(size)
+        }
+        .await;
+
+        match result {
+            Ok(size) => {
+                progress(DownloadProgressUpdate::new(1.0, "Attachment ready"));
+                Ok(DownloadedAttachment {
+                    path: destination.to_path_buf(),
+                    size,
+                })
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&partial_path).await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn post_message(
         &self,
         channel_id: &str,
@@ -672,6 +776,7 @@ impl SlackApi {
     pub async fn upload_file<F>(
         &self,
         channel_id: &str,
+        thread_ts: Option<&str>,
         path: &Path,
         initial_comment: Option<&str>,
         progress: F,
@@ -719,11 +824,7 @@ impl SlackApi {
 
         progress(UploadProgressUpdate::new(0.90, "Completing upload"));
         let files = json!([{ "id": upload.file_id, "title": filename }]).to_string();
-        let mut params = vec![("files", files), ("channel_id", channel_id.to_string())];
-        if let Some(initial_comment) = initial_comment.filter(|comment| !comment.trim().is_empty())
-        {
-            params.push(("initial_comment", initial_comment.to_string()));
-        }
+        let params = complete_upload_params(files, channel_id, thread_ts, initial_comment);
         let complete: CompleteUploadResponse = self
             .post_form("files.completeUploadExternal", &params)
             .await?;
@@ -812,6 +913,22 @@ impl SlackApi {
 
         request
     }
+}
+
+fn complete_upload_params(
+    files: String,
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    initial_comment: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![("files", files), ("channel_id", channel_id.to_string())];
+    if let Some(thread_ts) = thread_ts.filter(|thread_ts| !thread_ts.trim().is_empty()) {
+        params.push(("thread_ts", thread_ts.to_string()));
+    }
+    if let Some(initial_comment) = initial_comment.filter(|comment| !comment.trim().is_empty()) {
+        params.push(("initial_comment", initial_comment.to_string()));
+    }
+    params
 }
 
 fn paginated_list_params(
@@ -1026,6 +1143,40 @@ pub struct DownloadedMedia {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DownloadedAttachment {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadProgressUpdate {
+    pub fraction: f64,
+    pub label: String,
+}
+
+impl DownloadProgressUpdate {
+    fn new(fraction: f64, label: &str) -> Self {
+        Self {
+            fraction,
+            label: label.to_string(),
+        }
+    }
+}
+
+fn is_trusted_slack_download_url(url: &str) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    url.host_str().is_some_and(|host| {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        host == "slack.com" || host.ends_with(".slack.com")
+    })
+}
+
 fn supported_media_mime_type(content_type: &str) -> Option<&str> {
     let mime_type = content_type.split(';').next()?.trim();
     (mime_type.starts_with("image/")
@@ -1039,6 +1190,13 @@ fn supported_media_mime_type(content_type: &str) -> Option<&str> {
 fn ensure_media_size(size: Option<u64>) -> Result<()> {
     if size.is_some_and(|size| size > MAX_MEDIA_DOWNLOAD_BYTES) {
         return Err(anyhow!("Slack media is larger than 1 GiB"));
+    }
+    Ok(())
+}
+
+fn ensure_attachment_size(size: Option<u64>) -> Result<()> {
+    if size.is_some_and(|size| size > MAX_MEDIA_DOWNLOAD_BYTES) {
+        return Err(anyhow!("Slack attachment is larger than 1 GiB"));
     }
     Ok(())
 }
@@ -1536,6 +1694,49 @@ mod tests {
         assert!(ensure_media_size(None).is_ok());
         assert!(ensure_media_size(Some(MAX_MEDIA_DOWNLOAD_BYTES)).is_ok());
         assert!(ensure_media_size(Some(MAX_MEDIA_DOWNLOAD_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn attachment_authentication_is_restricted_to_slack_https_hosts() {
+        assert!(is_trusted_slack_download_url(
+            "https://files.slack.com/files-pri/T1-F1/download/report.pdf"
+        ));
+        assert!(is_trusted_slack_download_url(
+            "https://signicat.slack.com/files/U1/F1/report.pdf"
+        ));
+        assert!(is_trusted_slack_download_url("https://slack.com/file.pdf"));
+
+        assert!(!is_trusted_slack_download_url(
+            "http://files.slack.com/file.pdf"
+        ));
+        assert!(!is_trusted_slack_download_url(
+            "https://slack.com.evil.example/file.pdf"
+        ));
+        assert!(!is_trusted_slack_download_url(
+            "https://token@files.slack.com/file.pdf"
+        ));
+        assert!(!is_trusted_slack_download_url("not a URL"));
+    }
+
+    #[test]
+    fn attachment_download_size_is_bounded() {
+        assert!(ensure_attachment_size(None).is_ok());
+        assert!(ensure_attachment_size(Some(MAX_MEDIA_DOWNLOAD_BYTES)).is_ok());
+        assert!(ensure_attachment_size(Some(MAX_MEDIA_DOWNLOAD_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn completed_upload_targets_requested_thread() {
+        let params = complete_upload_params(
+            "files-json".to_string(),
+            "C123",
+            Some("1710000000.000100"),
+            Some("See screenshot"),
+        );
+
+        assert!(params.contains(&("channel_id", "C123".to_string())));
+        assert!(params.contains(&("thread_ts", "1710000000.000100".to_string())));
+        assert!(params.contains(&("initial_comment", "See screenshot".to_string())));
     }
 
     #[test]

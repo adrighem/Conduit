@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::search::{SearchField, SearchQuery, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmojiValue {
     Unicode(&'static str),
@@ -66,6 +68,24 @@ impl<'a> EmojiCatalog<'a> {
         }));
         entries
     }
+
+    pub fn search(&self, query: &str) -> Vec<EmojiEntry> {
+        let query = SearchQuery::parse(query);
+        let mut matches = self
+            .entries()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let score = query.score([
+                    SearchField::new(&entry.name, PRIMARY_FIELD_WEIGHT),
+                    SearchField::new(&entry.label, SECONDARY_FIELD_WEIGHT),
+                ])?;
+                Some((score.band(), index, entry))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        matches.into_iter().map(|(_, _, entry)| entry).collect()
+    }
 }
 
 fn category_label(group: emojis::Group) -> &'static str {
@@ -115,5 +135,51 @@ mod tests {
             ("two".to_string(), "alias:one".to_string()),
         ]);
         assert_eq!(EmojiCatalog::new(&custom).resolve("one"), None);
+    }
+
+    #[test]
+    fn catalog_searches_shortcodes_labels_and_workspace_emoji() {
+        let custom = HashMap::from([
+            (
+                "party_parrot".to_string(),
+                "https://emoji.example/parrot.gif".to_string(),
+            ),
+            ("ship_it".to_string(), "alias:rocket".to_string()),
+        ]);
+        let catalog = EmojiCatalog::new(&custom);
+
+        assert!(catalog
+            .search("party parr")
+            .iter()
+            .any(|entry| entry.name == "party_parrot"));
+        assert!(catalog
+            .search("ship it")
+            .iter()
+            .any(|entry| entry.name == "ship_it"));
+        assert!(catalog
+            .search("grinning face")
+            .iter()
+            .any(|entry| entry.name == "grinning"));
+        assert!(catalog.search("definitely-not-an-emoji").is_empty());
+    }
+
+    #[test]
+    fn catalog_search_prioritizes_stronger_shortcode_matches() {
+        let custom = HashMap::from([
+            (
+                "parrot".to_string(),
+                "https://emoji.example/parrot.gif".to_string(),
+            ),
+            (
+                "party_parrot".to_string(),
+                "https://emoji.example/party-parrot.gif".to_string(),
+            ),
+        ]);
+        let matches = EmojiCatalog::new(&custom).search("parrot");
+
+        assert_eq!(
+            matches.first().map(|entry| entry.name.as_str()),
+            Some("parrot")
+        );
     }
 }

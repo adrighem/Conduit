@@ -22,17 +22,20 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state.
 - Sections for Messages, Unreads, observed threads, Files, and Later.
 - Fast conversation switcher with discovery of channels and people.
+- GNOME Shell search-provider integration for opening cached channels and direct messages straight from the desktop overview.
 - Cached conversations, names, histories, threads, and read state for responsive startup.
 - Unread badges, muted and external-conversation indicators, read markers, and desktop notifications for incoming realtime events.
-- Multi-word, case-insensitive substring filtering with globally ranked, category-free results across conversation, forwarding, message, and emoji searches. Group-DM ranking also considers the share of other participants whose names match, and group titles omit your own name.
+- Slack status emoji and hover text for people in direct messages, shown consistently in navigation, switchers, titles, and message authors.
+- Multi-word, case-insensitive substring filtering with globally ranked, category-free results across conversation, forwarding, message, and emoji searches. Conversation ranking treats direct messages and people as one-person groups, while group DMs use the share of other participants whose names match; group titles omit your own name.
 
 ### Messaging
 
 - Paged channel history and threaded replies.
 - Multiline message and thread composers with persistent per-conversation drafts.
-- File uploads with progress reporting.
+- File uploads with progress reporting, including pasting clipboard screenshots directly into either composer.
+- Emoji completion after typing a colon and at least two characters, with filtered keyboard navigation in main messages and threads.
 - Edited and deleted messages, Slack links and mentions, user-group mentions, common Block Kit content, code blocks, attachments, and image and video previews.
-- Workspace custom emoji in messages, reactions, and the searchable reaction picker.
+- Workspace custom emoji in messages, reactions, composer completion, and the reusable searchable emoji picker.
 - Add and remove reactions, save messages for Later, copy message text or links, and forward messages.
 
 ### Search, files, and media
@@ -43,6 +46,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Files and saved-item views with navigation back to their source messages.
 - Slack message permalinks for the connected workspace open directly inside Conduit.
 - Internal image and video viewer with galleries, zoom, fullscreen, context actions, and Save As.
+- Unsupported Slack attachments download through authenticated, size-bounded local caching and open in the system's default application.
 
 ### Sync and resilience
 
@@ -62,7 +66,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Slack's public API cannot enumerate every historical subscribed thread. Conduit retains and reconciles every thread it discovers, but a fresh installation builds its thread catalog progressively as history and replies are fetched.
 - Threads and Unreads reflect the conversations and activity Conduit has observed; they are not complete Slack-wide activity aggregators.
 - File and workspace-search views currently load a bounded result set rather than every page.
-- Rich composer formatting, autocomplete, message editing/deletion controls, typing indicators, presence, avatars, calls, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
+- Rich composer formatting, autocomplete beyond emoji, message editing/deletion controls, typing indicators, live presence, avatars, calls, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
 - The Flatpak manifest is intended for development; Conduit is not yet published on Flathub and does not currently provide official binary releases.
 - Signing out removes the stored credential, but it does not currently purge cached workspace data or saved drafts from local storage.
 
@@ -174,6 +178,7 @@ export CONDUIT_SLACK_APP_TOKEN=xapp-...
 | Focus composer | `Ctrl+M` |
 | Send message | `Enter` |
 | Insert newline | `Shift+Enter` or `Ctrl+Enter` |
+| Complete emoji | Type `:` and at least two characters, then `Enter` or `Tab` |
 | Upload file | `Ctrl+O` |
 | Close thread | `Ctrl+Shift+W` |
 | Refresh conversations | `F5` |
@@ -194,7 +199,7 @@ Debug output can contain private workspace metadata such as channel names, user 
 ## Local data and security
 
 - OAuth tokens and imported browser-session credentials are stored through the system Secret Service/keyring.
-- Workspace metadata, resolved names, emoji information, message and thread history, image/media data, and WebKit data are cached below the user's XDG cache directory without additional application-level encryption.
+- Workspace metadata, resolved names and statuses, emoji information, message and thread history, downloaded attachments, image/media data, and WebKit data are cached below the user's XDG cache directory without additional application-level encryption.
 - Drafts and preferences are stored through GSettings.
 - **Sign Out** removes the keyring credential. It does not currently erase cached workspace content or drafts, and credential environment variables remain available for re-import.
 - Conduit restricts message navigation to supported internal actions and HTTP(S) links and disables file-URL access and several unused WebKit capabilities. This is not a claim of a formal security audit.

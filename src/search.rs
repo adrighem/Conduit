@@ -1,3 +1,5 @@
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+
 /// Weight used for the main, human-readable field of a search result.
 pub const PRIMARY_FIELD_WEIGHT: u8 = 100;
 /// Weight suitable for useful supporting fields such as labels or authors.
@@ -53,7 +55,11 @@ pub struct SearchQuery {
 impl SearchQuery {
     pub fn parse(query: &str) -> Self {
         Self {
-            terms: query.split_whitespace().map(str::to_lowercase).collect(),
+            terms: query
+                .split_whitespace()
+                .map(normalize_for_search)
+                .filter(|term| !term.is_empty())
+                .collect(),
         }
     }
 
@@ -66,7 +72,7 @@ impl SearchQuery {
             return false;
         }
 
-        let value = value.to_lowercase();
+        let value = normalize_for_search(value);
         self.terms
             .iter()
             .any(|term| best_match_in_field(term, &value).is_some())
@@ -97,7 +103,7 @@ impl SearchQuery {
 
         let fields = fields
             .into_iter()
-            .map(|field| (field.value.to_lowercase(), field.weight.min(100)))
+            .map(|field| (normalize_for_search(field.value), field.weight.min(100)))
             .collect::<Vec<_>>();
         let mut term_scores = Vec::with_capacity(self.terms.len());
 
@@ -120,6 +126,14 @@ impl SearchQuery {
         let weakest = u32::from(*term_scores.iter().min()?);
         Some(MatchScore(((70 * mean + 30 * weakest) / 100) as u8))
     }
+}
+
+fn normalize_for_search(value: &str) -> String {
+    value
+        .nfkd()
+        .filter(|character| !is_combining_mark(*character))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn best_match_in_field(term: &str, field: &str) -> Option<u8> {
@@ -247,6 +261,25 @@ mod tests {
         assert_eq!(score("orange", "broker-orange-support").percentage(), 100);
         assert_eq!(score("fé", "FÉdération").percentage(), 70);
         assert!(matches_all_terms("c-r", ["C-RAINBOW"]));
+    }
+
+    #[test]
+    fn matches_latin_names_without_requiring_diacritics() {
+        assert!(matches_all_terms("Zilvinas Kuusas", ["Žilvinas Kuusas"]));
+        assert!(matches_all_terms("Žilvinas", ["Zilvinas"]));
+    }
+
+    #[test]
+    fn matches_canonically_equivalent_composed_and_decomposed_text() {
+        let decomposed = "Z\u{030c}ilvinas";
+
+        assert!(matches_all_terms("Žilvinas", [decomposed]));
+        assert!(matches_all_terms(decomposed, ["Žilvinas"]));
+    }
+
+    #[test]
+    fn ignores_terms_that_only_contain_combining_marks() {
+        assert!(SearchQuery::parse("\u{030c}").is_empty());
     }
 
     #[test]

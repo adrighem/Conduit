@@ -74,9 +74,12 @@ fn conversation_target_from_variant(target: &glib::Variant) -> Option<(String, S
 
 mod imp {
     use super::*;
+    use std::cell::RefCell;
 
     #[derive(Debug, Default)]
-    pub struct ConduitApplication {}
+    pub struct ConduitApplication {
+        search_provider_registration: RefCell<Option<gio::RegistrationId>>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for ConduitApplication {
@@ -95,6 +98,27 @@ mod imp {
     }
 
     impl ApplicationImpl for ConduitApplication {
+        fn dbus_register(
+            &self,
+            connection: &gio::DBusConnection,
+            object_path: &str,
+        ) -> Result<(), glib::Error> {
+            self.parent_dbus_register(connection, object_path)?;
+            let registration =
+                crate::gnome_search_provider::register(connection, self.obj().as_ref())?;
+            self.search_provider_registration
+                .borrow_mut()
+                .replace(registration);
+            Ok(())
+        }
+
+        fn dbus_unregister(&self, connection: &gio::DBusConnection, object_path: &str) {
+            if let Some(registration) = self.search_provider_registration.borrow_mut().take() {
+                let _ = connection.unregister_object(registration);
+            }
+            self.parent_dbus_unregister(connection, object_path);
+        }
+
         // We connect to the activate callback to create a window when the application
         // has been launched. Additionally, this callback notifies us when the user
         // tries to launch a "second instance" of the application. When they try

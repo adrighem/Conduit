@@ -27,6 +27,7 @@ mod conversation_catalog;
 mod debug;
 mod drafts;
 mod emoji;
+mod gnome_search_provider;
 mod message_html;
 mod models;
 mod rendering;

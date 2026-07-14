@@ -31,6 +31,14 @@ pub fn media_cache_dir() -> PathBuf {
     app_cache_dir().join("media")
 }
 
+pub fn attachment_cache_dir() -> PathBuf {
+    app_cache_dir().join("attachments")
+}
+
+pub fn upload_staging_dir() -> PathBuf {
+    app_cache_dir().join("upload-staging")
+}
+
 pub fn state_cache_dir() -> PathBuf {
     app_cache_dir().join("state")
 }
@@ -97,6 +105,8 @@ mod tests {
         assert!(webkit_data_dir().starts_with(&app_cache));
         assert!(webkit_cache_dir().starts_with(&app_cache));
         assert!(image_asset_cache_dir().starts_with(&app_cache));
+        assert!(attachment_cache_dir().starts_with(&app_cache));
+        assert!(upload_staging_dir().starts_with(&app_cache));
         assert!(state_cache_dir().starts_with(&app_cache));
     }
 }

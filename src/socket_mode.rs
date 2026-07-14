@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::models::SlackMessage;
+use crate::models::{SlackMessage, SlackUser};
 
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
 
@@ -37,6 +37,7 @@ impl SocketModeDisconnect {
 pub enum SocketModeEvent {
     Message(Box<SocketModeMessageEvent>),
     Reaction(SocketModeReactionEvent),
+    UserChanged(SlackUser),
     RefreshConversations,
 }
 
@@ -169,6 +170,11 @@ pub fn socket_event_from_payload(payload: &Value) -> Option<SocketModeEvent> {
         "message" => message_event(event).map(|event| SocketModeEvent::Message(Box::new(event))),
         "reaction_added" => reaction_event(event, true).map(SocketModeEvent::Reaction),
         "reaction_removed" => reaction_event(event, false).map(SocketModeEvent::Reaction),
+        "user_change" => event
+            .get("user")
+            .cloned()
+            .and_then(|user| serde_json::from_value(user).ok())
+            .map(SocketModeEvent::UserChanged),
         event_type if conversation_refresh_event(event_type) => {
             Some(SocketModeEvent::RefreshConversations)
         }
@@ -419,6 +425,29 @@ mod tests {
                 added: true,
             }))
         );
+    }
+
+    #[test]
+    fn parses_user_profile_status_changes() {
+        let event = socket_event_from_payload(&payload(serde_json::json!({
+            "type": "user_change",
+            "user": {
+                "id": "U123",
+                "profile": {
+                    "display_name": "Ada",
+                    "status_text": "In a meeting",
+                    "status_emoji": ":spiral_calendar_pad:",
+                    "status_expiration": 200
+                }
+            }
+        })));
+
+        assert!(matches!(
+            event,
+            Some(SocketModeEvent::UserChanged(user))
+                if user.id.as_deref() == Some("U123")
+                    && user.status().is_some_and(|status| status.expiration == 200)
+        ));
     }
 
     #[test]

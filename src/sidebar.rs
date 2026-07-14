@@ -1,8 +1,14 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
-use crate::models::{SlackConversation, SlackUser};
-use crate::search::{MatchScore, SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT};
+use crate::models::{SlackConversation, SlackUser, SlackUserStatus};
+use crate::search::{
+    MatchScore, SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT,
+    SECONDARY_FIELD_WEIGHT,
+};
+
+pub type UserSearchAliases = HashMap<String, Vec<String>>;
+pub type UserStatuses = HashMap<String, SlackUserStatus>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
@@ -67,6 +73,8 @@ pub struct SidebarRowModel {
     pub private: bool,
     pub muted: bool,
     pub external: bool,
+    pub search_aliases: Vec<String>,
+    pub status: Option<SlackUserStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +124,9 @@ impl SidebarRowModel {
         }
         if self.external {
             label.push_str(", external");
+        }
+        if let Some(status) = self.status.as_ref() {
+            label.push_str(&format!(", status: {}", status.accessible_text()));
         }
         label
     }
@@ -173,6 +184,8 @@ pub struct SidebarBuildOptions<'a> {
     pub show_all: bool,
     pub loading: bool,
     pub has_error: bool,
+    pub user_search_aliases: Option<&'a UserSearchAliases>,
+    pub user_statuses: Option<&'a UserStatuses>,
 }
 
 impl SidebarRowModel {
@@ -182,7 +195,31 @@ impl SidebarRowModel {
         selected_channel: Option<&str>,
         current_user_id: Option<&str>,
     ) -> Self {
+        Self::from_conversation_with_aliases(
+            conversation,
+            user_names,
+            selected_channel,
+            current_user_id,
+            None,
+            None,
+        )
+    }
+
+    fn from_conversation_with_aliases(
+        conversation: &SlackConversation,
+        user_names: &HashMap<String, String>,
+        selected_channel: Option<&str>,
+        current_user_id: Option<&str>,
+        user_search_aliases: Option<&UserSearchAliases>,
+        user_statuses: Option<&UserStatuses>,
+    ) -> Self {
         let kind = conversation_kind(conversation);
+        let search_aliases = conversation_user_ids(conversation, current_user_id)
+            .into_iter()
+            .filter_map(|user_id| user_search_aliases?.get(&user_id))
+            .flatten()
+            .cloned()
+            .collect();
         Self {
             id: conversation.id.clone(),
             title: conversation.display_name_with_users(user_names, current_user_id),
@@ -195,15 +232,66 @@ impl SidebarRowModel {
                 || matches!(kind, ConversationKind::PrivateChannel),
             muted: conversation.is_muted_conversation(),
             external: conversation.is_external_conversation(),
+            search_aliases,
+            status: (kind == ConversationKind::DirectMessage)
+                .then(|| conversation.user.as_deref())
+                .flatten()
+                .and_then(|user_id| active_user_status(user_statuses, user_id)),
         }
     }
 
     fn match_score(&self, query: &SearchQuery) -> Option<MatchScore> {
-        query.score([
-            SearchField::new(self.title.as_str(), PRIMARY_FIELD_WEIGHT),
-            SearchField::new(self.id.as_str(), ID_FIELD_WEIGHT),
-        ])
+        query.score(
+            [
+                SearchField::new(self.title.as_str(), PRIMARY_FIELD_WEIGHT),
+                SearchField::new(self.id.as_str(), ID_FIELD_WEIGHT),
+            ]
+            .into_iter()
+            .chain(
+                self.search_aliases
+                    .iter()
+                    .map(|alias| SearchField::new(alias.as_str(), SECONDARY_FIELD_WEIGHT)),
+            ),
+        )
     }
+}
+
+pub fn user_search_aliases(users: &[SlackUser]) -> UserSearchAliases {
+    users
+        .iter()
+        .filter_map(|user| Some((user.id.clone()?, user.search_aliases())))
+        .collect()
+}
+
+fn conversation_user_ids(
+    conversation: &SlackConversation,
+    current_user_id: Option<&str>,
+) -> Vec<String> {
+    if conversation.is_im.unwrap_or(false) {
+        return conversation.user.iter().cloned().collect();
+    }
+    if conversation.is_mpim.unwrap_or(false) {
+        return conversation
+            .group_direct_message_user_ids()
+            .into_iter()
+            .filter(|user_id| Some(user_id.as_str()) != current_user_id)
+            .collect();
+    }
+    Vec::new()
+}
+
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or_default()
+}
+
+fn active_user_status(statuses: Option<&UserStatuses>, user_id: &str) -> Option<SlackUserStatus> {
+    statuses?
+        .get(user_id)
+        .filter(|status| status.active_at(current_unix_seconds()))
+        .cloned()
 }
 
 pub fn build_sidebar_list(
@@ -236,11 +324,13 @@ pub fn build_sidebar_list(
                 || conversation_visible_in_default_sidebar(conversation, options.selected_channel)
         })
         .map(|conversation| {
-            SidebarRowModel::from_conversation(
+            SidebarRowModel::from_conversation_with_aliases(
                 conversation,
                 user_names,
                 options.selected_channel,
                 options.current_user_id,
+                options.user_search_aliases,
+                options.user_statuses,
             )
         })
         .filter(|row| row.match_score(&query).is_some() && (!options.unread_only || row.unread))
@@ -251,11 +341,12 @@ pub fn build_sidebar_list(
     }
 
     if !query.is_empty() {
-        let participant_coverage = group_dm_participant_coverage(
+        let participant_coverage = conversation_participant_coverage(
             conversations,
             user_names,
             options.current_user_id,
             &query,
+            options.user_search_aliases,
         );
         sort_search_rows(&mut rows, &query, &participant_coverage);
         return SidebarListModel::Rows(rows);
@@ -286,28 +377,60 @@ fn build_sidebar_sections(
     )
 }
 
+#[cfg(test)]
 pub fn conversation_switcher_items(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
     current_user_id: Option<&str>,
     query: &str,
 ) -> Vec<SidebarRowModel> {
+    conversation_switcher_items_with_aliases(
+        conversations,
+        user_names,
+        current_user_id,
+        query,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn conversation_switcher_items_with_aliases(
+    conversations: &[SlackConversation],
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    query: &str,
+    user_search_aliases: Option<&UserSearchAliases>,
+    user_statuses: Option<&UserStatuses>,
+) -> Vec<SidebarRowModel> {
     let query = SearchQuery::parse(query);
     let mut items = conversations
         .iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .map(|conversation| {
-            SidebarRowModel::from_conversation(conversation, user_names, None, current_user_id)
+            SidebarRowModel::from_conversation_with_aliases(
+                conversation,
+                user_names,
+                None,
+                current_user_id,
+                user_search_aliases,
+                user_statuses,
+            )
         })
         .filter(|item| item.match_score(&query).is_some())
         .collect::<Vec<_>>();
 
-    let participant_coverage =
-        group_dm_participant_coverage(conversations, user_names, current_user_id, &query);
+    let participant_coverage = conversation_participant_coverage(
+        conversations,
+        user_names,
+        current_user_id,
+        &query,
+        user_search_aliases,
+    );
     sort_search_rows(&mut items, &query, &participant_coverage);
     items
 }
 
+#[cfg(test)]
 pub fn conversation_picker_sections(
     conversations: &[SlackConversation],
     discovered_channels: &[SlackConversation],
@@ -316,9 +439,80 @@ pub fn conversation_picker_sections(
     current_user_id: Option<&str>,
     query: &str,
 ) -> ConversationPickerSections {
+    conversation_picker_sections_with_aliases(
+        conversations,
+        discovered_channels,
+        discovered_users,
+        user_names,
+        current_user_id,
+        query,
+        &HashMap::new(),
+    )
+}
+
+#[cfg(test)]
+pub fn conversation_picker_sections_with_aliases(
+    conversations: &[SlackConversation],
+    discovered_channels: &[SlackConversation],
+    discovered_users: &[SlackUser],
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    query: &str,
+    known_user_search_aliases: &UserSearchAliases,
+) -> ConversationPickerSections {
+    conversation_picker_sections_with_statuses(
+        conversations,
+        discovered_channels,
+        discovered_users,
+        user_names,
+        current_user_id,
+        query,
+        known_user_search_aliases,
+        &HashMap::new(),
+    )
+}
+
+pub fn conversation_picker_sections_with_statuses(
+    conversations: &[SlackConversation],
+    discovered_channels: &[SlackConversation],
+    discovered_users: &[SlackUser],
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    query: &str,
+    known_user_search_aliases: &UserSearchAliases,
+    user_statuses: &UserStatuses,
+) -> ConversationPickerSections {
     let search_query = SearchQuery::parse(query);
-    let participant_coverage =
-        group_dm_participant_coverage(conversations, user_names, current_user_id, &search_query);
+    let mut all_user_search_aliases = known_user_search_aliases.clone();
+    all_user_search_aliases.extend(user_search_aliases(discovered_users));
+    let mut participant_coverage = conversation_participant_coverage(
+        conversations,
+        user_names,
+        current_user_id,
+        &search_query,
+        Some(&all_user_search_aliases),
+    );
+    for user in discovered_users {
+        let Some(user_id) = user
+            .id
+            .as_deref()
+            .filter(|user_id| !user_id.trim().is_empty())
+        else {
+            continue;
+        };
+        participant_coverage.insert(
+            user_id.to_string(),
+            ParticipantCoverage {
+                matched: usize::from(user_matches_query(
+                    user_id,
+                    user_names,
+                    Some(&all_user_search_aliases),
+                    &search_query,
+                )),
+                total: 1,
+            },
+        );
+    }
     let conversation_ids = conversations
         .iter()
         .map(|conversation| conversation.id.as_str())
@@ -329,14 +523,20 @@ pub fn conversation_picker_sections(
         .filter_map(|conversation| conversation.user.as_deref())
         .collect::<std::collections::HashSet<_>>();
 
-    let conversations: Vec<ConversationPickerItem> =
-        conversation_switcher_items(conversations, user_names, current_user_id, query)
-            .into_iter()
-            .map(|row| ConversationPickerItem {
-                row,
-                action: ConversationPickerAction::OpenConversation,
-            })
-            .collect();
+    let conversations: Vec<ConversationPickerItem> = conversation_switcher_items_with_aliases(
+        conversations,
+        user_names,
+        current_user_id,
+        query,
+        Some(&all_user_search_aliases),
+        Some(user_statuses),
+    )
+    .into_iter()
+    .map(|row| ConversationPickerItem {
+        row,
+        action: ConversationPickerAction::OpenConversation,
+    })
+    .collect();
 
     let mut channels = discovered_channels
         .iter()
@@ -375,6 +575,10 @@ pub fn conversation_picker_sections(
                 private: true,
                 muted: false,
                 external: false,
+                search_aliases: user.search_aliases(),
+                status: user
+                    .status()
+                    .filter(|status| status.active_at(current_unix_seconds())),
             };
             row.match_score(&search_query)
                 .is_some()
@@ -524,23 +728,42 @@ struct ParticipantCoverage {
     total: usize,
 }
 
-fn group_dm_participant_coverage(
+fn conversation_participant_coverage(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
     current_user_id: Option<&str>,
     query: &SearchQuery,
+    user_search_aliases: Option<&UserSearchAliases>,
 ) -> HashMap<String, ParticipantCoverage> {
     conversations
         .iter()
-        .filter(|conversation| conversation.is_mpim.unwrap_or(false))
         .filter_map(|conversation| {
-            let names =
-                conversation.group_direct_message_participant_names(user_names, current_user_id);
-            let total = names.len();
+            if conversation.is_im.unwrap_or(false) {
+                let user_id = conversation.user.as_deref()?;
+                return Some((
+                    conversation.id.clone(),
+                    ParticipantCoverage {
+                        matched: usize::from(user_matches_query(
+                            user_id,
+                            user_names,
+                            user_search_aliases,
+                            query,
+                        )),
+                        total: 1,
+                    },
+                ));
+            }
+            if !conversation.is_mpim.unwrap_or(false) {
+                return None;
+            }
+            let user_ids = conversation_user_ids(conversation, current_user_id);
+            let total = user_ids.len();
             (total > 0).then(|| {
-                let matched = names
+                let matched = user_ids
                     .iter()
-                    .filter(|name| query.matches_any_term(name))
+                    .filter(|user_id| {
+                        user_matches_query(user_id, user_names, user_search_aliases, query)
+                    })
                     .count();
                 (
                     conversation.id.clone(),
@@ -549,6 +772,21 @@ fn group_dm_participant_coverage(
             })
         })
         .collect()
+}
+
+fn user_matches_query(
+    user_id: &str,
+    user_names: &HashMap<String, String>,
+    user_search_aliases: Option<&UserSearchAliases>,
+    query: &SearchQuery,
+) -> bool {
+    user_names
+        .get(user_id)
+        .is_some_and(|name| query.matches_any_term(name))
+        || query.matches_any_term(user_id)
+        || user_search_aliases
+            .and_then(|aliases| aliases.get(user_id))
+            .is_some_and(|aliases| aliases.iter().any(|name| query.matches_any_term(name)))
 }
 
 fn sort_search_rows(
@@ -717,6 +955,8 @@ mod tests {
             private: false,
             muted: false,
             external: false,
+            search_aliases: Vec::new(),
+            status: None,
         }
     }
 
@@ -980,6 +1220,47 @@ mod tests {
             badgeless.accessible_label(),
             "Public channel: #general, unread"
         );
+    }
+
+    #[test]
+    fn direct_dm_rows_include_status_without_changing_title_or_group_dms() {
+        let direct = dm("D1", "U1");
+        let group: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G1",
+            "is_mpim": true,
+            "members": ["U1", "U2"]
+        }))
+        .expect("failed to parse group DM");
+        let names = HashMap::from([
+            ("U1".to_string(), "Ada".to_string()),
+            ("U2".to_string(), "Grace".to_string()),
+        ]);
+        let statuses = HashMap::from([(
+            "U1".to_string(),
+            SlackUserStatus {
+                text: "Heads down".to_string(),
+                emoji: ":brain:".to_string(),
+                expiration: i64::MAX,
+            },
+        )]);
+
+        let rows = list_rows(build_sidebar_list(
+            &[group, direct],
+            &names,
+            SidebarBuildOptions {
+                show_all: true,
+                query: "a",
+                user_statuses: Some(&statuses),
+                ..Default::default()
+            },
+        ));
+        let direct = rows.iter().find(|row| row.id == "D1").unwrap();
+        let group = rows.iter().find(|row| row.id == "G1").unwrap();
+
+        assert_eq!(direct.title, "Ada");
+        assert_eq!(direct.status.as_ref().unwrap().text, "Heads down");
+        assert!(direct.accessible_label().contains("status: Heads down"));
+        assert!(group.status.is_none());
     }
 
     #[test]
@@ -1293,6 +1574,120 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_search_ranks_matching_direct_dm_above_matching_group_dm() {
+        let direct = dm("D_RICHARD", "U_RICHARD");
+        let group: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G_RICHARD",
+            "is_mpim": true,
+            "members": ["U_SELF", "U_RICHARD", "U_OTHER"]
+        }))
+        .expect("failed to parse group DM");
+        let user_names = HashMap::from([
+            ("U_SELF".to_string(), "Vincent".to_string()),
+            ("U_RICHARD".to_string(), "Richard".to_string()),
+            ("U_OTHER".to_string(), "Ada".to_string()),
+        ]);
+
+        let rows = list_rows(build_sidebar_list(
+            &[group, direct],
+            &user_names,
+            SidebarBuildOptions {
+                current_user_id: Some("U_SELF"),
+                query: "richard",
+                show_all: true,
+                ..Default::default()
+            },
+        ));
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["D_RICHARD", "G_RICHARD"]
+        );
+    }
+
+    #[test]
+    fn picker_ranks_existing_and_prospective_dms_above_group_dms() {
+        let direct = dm("D_EVANS", "U_EVANS");
+        let group: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G_RICHARD",
+            "is_mpim": true,
+            "members": ["U_SELF", "U_HEKKERS", "U_OTHER"]
+        }))
+        .expect("failed to parse group DM");
+        let discovered_person = SlackUser {
+            id: Some("U_SUNDLOF".to_string()),
+            real_name: Some("Richard Sundlöf".to_string()),
+            ..Default::default()
+        };
+        let user_names = HashMap::from([
+            ("U_SELF".to_string(), "Vincent".to_string()),
+            ("U_EVANS".to_string(), "Richard Evans".to_string()),
+            ("U_HEKKERS".to_string(), "Richard Hekkers".to_string()),
+            ("U_OTHER".to_string(), "Ada".to_string()),
+        ]);
+
+        let results = conversation_picker_sections(
+            &[group, direct],
+            &[],
+            &[discovered_person],
+            &user_names,
+            Some("U_SELF"),
+            "richard",
+        )
+        .search_results
+        .expect("search should produce flat results");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| item.row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["D_EVANS", "U_SUNDLOF", "G_RICHARD"]
+        );
+    }
+
+    #[test]
+    fn forward_picker_uses_singular_dm_coverage_but_keeps_relevance_primary() {
+        let alias_dm = dm("D_SVEN", "U_SVEN");
+        let exact_group: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G_RICHARD",
+            "is_mpim": true,
+            "members": ["U_SELF", "U_RICHARD", "U_OTHER"]
+        }))
+        .expect("failed to parse group DM");
+        let user_names = HashMap::from([
+            ("U_SELF".to_string(), "Vincent".to_string()),
+            ("U_SVEN".to_string(), "Sven".to_string()),
+            ("U_RICHARD".to_string(), "Richard".to_string()),
+            ("U_OTHER".to_string(), "Ada".to_string()),
+        ]);
+        let aliases = HashMap::from([(
+            "U_SVEN".to_string(),
+            vec!["Sven Richard Samdal".to_string()],
+        )]);
+
+        let results = conversation_picker_sections_with_aliases(
+            &[alias_dm, exact_group],
+            &[],
+            &[],
+            &user_names,
+            Some("U_SELF"),
+            "richard",
+            &aliases,
+        )
+        .search_results
+        .expect("search should produce flat results");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| item.row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["G_RICHARD", "D_SVEN"]
+        );
+    }
+
+    #[test]
     fn group_dm_search_ranks_by_matching_participant_coverage_and_excludes_self() {
         let full_match: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G_FULL",
@@ -1387,6 +1782,30 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_filter_finds_existing_dm_by_user_alias() {
+        let conversation = dm("D_ZILVINAS", "U_ZILVINAS");
+        let user_names = HashMap::from([("U_ZILVINAS".to_string(), "Žilvinas".to_string())]);
+        let aliases = HashMap::from([(
+            "U_ZILVINAS".to_string(),
+            vec!["Žilvinas Kuusas".to_string(), "zilvinas.kuusas".to_string()],
+        )]);
+
+        let rows = list_rows(build_sidebar_list(
+            &[conversation],
+            &user_names,
+            SidebarBuildOptions {
+                query: "Kuusas",
+                user_search_aliases: Some(&aliases),
+                ..Default::default()
+            },
+        ));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "D_ZILVINAS");
+        assert_eq!(rows[0].title, "Žilvinas");
+    }
+
+    #[test]
     fn conversation_picker_lists_new_channels_and_people_after_existing_conversations() {
         let general = channel("C1", "general");
         let existing_dm = SlackConversation {
@@ -1440,6 +1859,116 @@ mod tests {
     }
 
     #[test]
+    fn conversation_picker_finds_existing_dm_by_real_normalized_and_username_aliases() {
+        let existing_dm = SlackConversation {
+            id: "D_ZILVINAS".to_string(),
+            user: Some("U_ZILVINAS".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        let user = SlackUser {
+            id: Some("U_ZILVINAS".to_string()),
+            name: Some("zilvinas.kuusas".to_string()),
+            real_name: Some("Žilvinas Kuusas".to_string()),
+            profile: Some(crate::models::SlackUserProfile {
+                display_name: Some("Žilvinas".to_string()),
+                display_name_normalized: Some("Zilvinas".to_string()),
+                real_name: Some("Žilvinas Kuusas".to_string()),
+                real_name_normalized: Some("Zilvinas Kuusas".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let user_names = HashMap::from([("U_ZILVINAS".to_string(), "Žilvinas".to_string())]);
+        let cached_aliases = user_search_aliases(std::slice::from_ref(&user));
+
+        for query in ["Zilvinas Kuusas", "Kuusas", "zilvinas.kuusas"] {
+            let results = conversation_picker_sections_with_aliases(
+                std::slice::from_ref(&existing_dm),
+                &[],
+                &[],
+                &user_names,
+                None,
+                query,
+                &cached_aliases,
+            )
+            .search_results
+            .expect("search should produce flat results");
+
+            assert_eq!(results.len(), 1, "query: {query}");
+            assert_eq!(results[0].row.id, "D_ZILVINAS");
+            assert_eq!(results[0].row.title, "Žilvinas");
+            assert_eq!(
+                results[0].action,
+                ConversationPickerAction::OpenConversation
+            );
+        }
+    }
+
+    #[test]
+    fn group_dm_alias_search_uses_participant_coverage_and_excludes_self() {
+        let focused: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G_FOCUSED",
+            "is_mpim": true,
+            "members": ["U_SELF", "U_ZILVINAS"]
+        }))
+        .expect("failed to parse focused group DM");
+        let broad: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G_BROAD",
+            "is_mpim": true,
+            "members": ["U_SELF", "U_ZILVINAS", "U_ADA"]
+        }))
+        .expect("failed to parse broad group DM");
+        let user_names = HashMap::from([
+            ("U_SELF".to_string(), "Vincent".to_string()),
+            ("U_ZILVINAS".to_string(), "Žilvinas".to_string()),
+            ("U_ADA".to_string(), "Ada".to_string()),
+        ]);
+        let aliases = HashMap::from([
+            (
+                "U_SELF".to_string(),
+                vec!["Vincent SecretSurname".to_string()],
+            ),
+            (
+                "U_ZILVINAS".to_string(),
+                vec!["Žilvinas Kuusas".to_string()],
+            ),
+        ]);
+
+        let results = conversation_picker_sections_with_aliases(
+            &[broad.clone(), focused],
+            &[],
+            &[],
+            &user_names,
+            Some("U_SELF"),
+            "Kuusas",
+            &aliases,
+        )
+        .search_results
+        .expect("search should produce flat results");
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| item.row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["G_FOCUSED", "G_BROAD"]
+        );
+
+        let self_results = conversation_picker_sections_with_aliases(
+            &[broad],
+            &[],
+            &[],
+            &user_names,
+            Some("U_SELF"),
+            "SecretSurname",
+            &aliases,
+        )
+        .search_results
+        .expect("search should produce flat results");
+        assert!(self_results.is_empty());
+    }
+
+    #[test]
     fn conversation_picker_searches_across_all_sections() {
         let sections = conversation_picker_sections(
             &[channel("C1", "general")],
@@ -1462,7 +1991,7 @@ mod tests {
                 .iter()
                 .map(|item| item.row.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["C2", "U2"]
+            vec!["U2", "C2"]
         );
         assert!(sections.conversations.is_empty());
         assert!(sections.channels.is_empty());

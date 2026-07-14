@@ -33,15 +33,18 @@ use webkit6::prelude::*;
 use crate::activity::{self, ActivityItem};
 use crate::auth;
 use crate::composer::{
-    set_text_view_text, text_view_enter_action, text_view_text, TextViewEnterAction,
+    emoji_completion_key_action, emoji_token_at_caret, replace_emoji_token, set_text_view_text,
+    text_view_enter_action, text_view_text, EmojiCompletionKeyAction, EmojiToken,
+    TextViewEnterAction,
 };
 use crate::config;
 use crate::conversation_catalog::ConversationCatalog;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
+use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
 use crate::message_html::{self, MessageHtmlContext, TimelineScrollBehavior};
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUnreadState, SlackUser,
+    SlackMessage, SlackUnreadState, SlackUser, SlackUserStatus,
 };
 use crate::rendering;
 use crate::runtime::{
@@ -169,6 +172,9 @@ mod imp {
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
         pub seen_realtime_messages: RefCell<HashSet<String>>,
         pub user_names: RefCell<HashMap<String, String>>,
+        pub user_search_aliases: RefCell<sidebar::UserSearchAliases>,
+        pub user_statuses: RefCell<sidebar::UserStatuses>,
+        pub status_expiry_generation: Cell<u64>,
         pub user_group_names: RefCell<HashMap<String, String>>,
         pub user_group_members: RefCell<HashMap<String, Vec<String>>>,
         pub pending_user_ids: RefCell<HashSet<String>>,
@@ -180,7 +186,7 @@ mod imp {
         pub drafts: RefCell<Drafts>,
         pub draft_save_generation: Cell<u64>,
         pub pending_sent_drafts: RefCell<HashMap<DraftKey, String>>,
-        pub pending_upload_drafts: RefCell<HashMap<String, Option<String>>>,
+        pub pending_upload_drafts: RefCell<HashMap<DraftKey, Option<String>>>,
         pub sidebar_loading: Cell<bool>,
         pub sidebar_error: RefCell<Option<String>>,
         pub(super) workspace_view: RefCell<WorkspaceViewState>,
@@ -193,6 +199,8 @@ mod imp {
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
         pub custom_emojis: RefCell<HashMap<String, String>>,
+        pub(super) message_emoji_completion: RefCell<Option<ComposerEmojiCompletion>>,
+        pub(super) thread_emoji_completion: RefCell<Option<ComposerEmojiCompletion>>,
     }
 
     #[glib::object_subclass]
@@ -243,6 +251,22 @@ mod imp {
     impl WindowImpl for ConduitWindow {}
     impl ApplicationWindowImpl for ConduitWindow {}
     impl AdwApplicationWindowImpl for ConduitWindow {}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerTarget {
+    Message,
+    Thread,
+}
+
+const COMPOSER_TARGETS: [ComposerTarget; 2] = [ComposerTarget::Message, ComposerTarget::Thread];
+
+#[derive(Debug)]
+struct ComposerEmojiCompletion {
+    popover: gtk::Popover,
+    list: gtk::ListBox,
+    entries: Vec<EmojiEntry>,
+    token: Option<EmojiToken>,
 }
 
 glib::wrapper! {
@@ -333,6 +357,8 @@ fn picker_sections(
     user_names: &HashMap<String, String>,
     current_user_id: Option<&str>,
     query: &str,
+    user_search_aliases: &sidebar::UserSearchAliases,
+    user_statuses: &sidebar::UserStatuses,
 ) -> ConversationPickerSections {
     let channels = if include_discovery {
         discovered_channels
@@ -344,13 +370,15 @@ fn picker_sections(
     } else {
         &[]
     };
-    sidebar::conversation_picker_sections(
+    sidebar::conversation_picker_sections_with_statuses(
         conversations,
         channels,
         users,
         user_names,
         current_user_id,
         query,
+        user_search_aliases,
+        user_statuses,
     )
 }
 
@@ -612,15 +640,54 @@ fn record_draft_submission(
 }
 
 fn record_upload_submission(
-    pending: &mut HashMap<String, Option<String>>,
-    channel_id: &str,
+    pending: &mut HashMap<DraftKey, Option<String>>,
+    key: DraftKey,
     initial_comment: Option<String>,
 ) -> bool {
-    if pending.contains_key(channel_id) {
+    if pending.contains_key(&key) {
         return false;
     }
-    pending.insert(channel_id.to_string(), initial_comment);
+    pending.insert(key, initial_comment);
     true
+}
+
+fn clipboard_formats_include_image(formats: &gtk::gdk::ContentFormats) -> bool {
+    formats.contains_type(gtk::gdk::Texture::static_type())
+        || formats
+            .mime_types()
+            .iter()
+            .any(|mime_type| clipboard_mime_type_is_image(mime_type))
+}
+
+fn clipboard_mime_type_is_image(mime_type: &str) -> bool {
+    mime_type
+        .split(';')
+        .next()
+        .is_some_and(|mime_type| mime_type.trim().starts_with("image/"))
+}
+
+fn screenshot_filename() -> String {
+    let timestamp = glib::DateTime::now_local()
+        .ok()
+        .and_then(|date_time| date_time.format("%Y-%m-%d_%H-%M-%S").ok())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "clipboard".to_string());
+    format!("Screenshot-{timestamp}-{:08x}.png", rand::random::<u32>())
+}
+
+fn clear_stale_upload_staging() {
+    let directory = config::upload_staging_dir();
+    if let Err(error) = std::fs::remove_dir_all(&directory) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            crate::debug::log(
+                "ui",
+                &format!(
+                    "StaleUploadCleanupFailed path={} error={error}",
+                    directory.display()
+                ),
+            );
+        }
+    }
 }
 
 fn conversation_refresh_start_shows_sidebar_loading() -> bool {
@@ -646,6 +713,7 @@ enum RuntimeFailureRecovery {
     User(String),
     Image(String),
     Media,
+    Attachment,
     PostMessage {
         channel_id: String,
         thread_ts: Option<String>,
@@ -658,7 +726,10 @@ enum RuntimeFailureRecovery {
         channel_id: String,
         thread_ts: Option<String>,
     },
-    Upload(String),
+    Upload {
+        channel_id: String,
+        thread_ts: Option<String>,
+    },
     NonDisruptive,
 }
 
@@ -700,6 +771,9 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
             RuntimeFailureRecovery::Image(key.clone())
         }
         (RuntimeOperation::Media, RuntimeTarget::Media(_)) => RuntimeFailureRecovery::Media,
+        (RuntimeOperation::AttachmentDownload, RuntimeTarget::Attachment(_)) => {
+            RuntimeFailureRecovery::Attachment
+        }
         (
             RuntimeOperation::PostMessage,
             RuntimeTarget::Message {
@@ -730,9 +804,16 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
             channel_id: channel_id.clone(),
             thread_ts: thread_ts.clone(),
         },
-        (RuntimeOperation::FileUpload, RuntimeTarget::Upload(channel_id)) => {
-            RuntimeFailureRecovery::Upload(channel_id.clone())
-        }
+        (
+            RuntimeOperation::FileUpload,
+            RuntimeTarget::Upload {
+                channel_id,
+                thread_ts,
+            },
+        ) => RuntimeFailureRecovery::Upload {
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts.clone(),
+        },
         _ => RuntimeFailureRecovery::NonDisruptive,
     }
 }
@@ -749,6 +830,21 @@ fn mutation_target_is_active(
 
 fn connected_workspace_status(workspace_name: Option<&str>) -> String {
     format!("Connected to {}", workspace_name.unwrap_or("Slack"))
+}
+
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or_default()
+}
+
+fn nearest_status_expiration(statuses: &HashMap<String, SlackUserStatus>, now: i64) -> Option<i64> {
+    statuses
+        .values()
+        .map(|status| status.expiration)
+        .filter(|expiration| *expiration > now)
+        .min()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1692,6 +1788,7 @@ impl ConduitWindow {
     fn setup_callbacks(&self) {
         let imp = self.imp();
 
+        clear_stale_upload_staging();
         self.setup_window_actions();
         self.connect_close_request(|window| {
             window.flush_drafts();
@@ -1718,6 +1815,10 @@ impl ConduitWindow {
         self.connect_widget(&imp.close_thread_button.get(), |window| {
             window.close_thread()
         });
+
+        for target in COMPOSER_TARGETS {
+            self.setup_composer_emoji_completion(target);
+        }
 
         let weak_window = self.downgrade();
         imp.browser_session_check.connect_toggled(move |_| {
@@ -1760,6 +1861,8 @@ impl ConduitWindow {
         self.connect_text_view_send_shortcut(&imp.thread_entry.get(), |window| {
             window.post_thread_reply()
         });
+        self.connect_image_paste(&imp.message_entry.get(), false);
+        self.connect_image_paste(&imp.thread_entry.get(), true);
 
         for buffer in [imp.message_entry.buffer(), imp.thread_entry.buffer()] {
             let weak_window = self.downgrade();
@@ -1978,15 +2081,28 @@ impl ConduitWindow {
         }
     }
 
-    fn complete_upload_draft(&self, channel_id: &str, submitted: Option<&str>) {
+    fn complete_upload_draft(
+        &self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        submitted: Option<&str>,
+    ) {
         let Some(submitted) = submitted else {
             return;
         };
-        let Some(key) = self.draft_key(channel_id, None) else {
+        let Some(key) = self.draft_key(channel_id, thread_ts) else {
             return;
         };
-        let current_text = (self.visible_channel_id().as_deref() == Some(channel_id))
-            .then(|| text_view_text(&self.imp().message_entry));
+        let current_target_matches = self.visible_channel_id().as_deref() == Some(channel_id)
+            && thread_ts
+                .is_none_or(|thread_ts| self.selected_thread_ts().as_deref() == Some(thread_ts));
+        let current_text = current_target_matches.then(|| {
+            if thread_ts.is_some() {
+                text_view_text(&self.imp().thread_entry)
+            } else {
+                text_view_text(&self.imp().message_entry)
+            }
+        });
         let stored_text = self
             .imp()
             .drafts
@@ -2003,7 +2119,11 @@ impl ConduitWindow {
             self.persist_drafts();
         }
         if current_text.is_some() {
-            set_text_view_text(&self.imp().message_entry, "");
+            if thread_ts.is_some() {
+                set_text_view_text(&self.imp().thread_entry, "");
+            } else {
+                set_text_view_text(&self.imp().message_entry, "");
+            }
         }
     }
 
@@ -2091,6 +2211,267 @@ impl ConduitWindow {
         text_view.add_controller(controller);
     }
 
+    fn composer_text_view(&self, target: ComposerTarget) -> gtk::TextView {
+        match target {
+            ComposerTarget::Message => self.imp().message_entry.get(),
+            ComposerTarget::Thread => self.imp().thread_entry.get(),
+        }
+    }
+
+    fn setup_composer_emoji_completion(&self, target: ComposerTarget) {
+        let text_view = self.composer_text_view(target);
+        let popover = gtk::Popover::new();
+        popover.set_parent(&text_view);
+        popover.set_autohide(true);
+        popover.set_has_arrow(true);
+        popover.set_position(gtk::PositionType::Bottom);
+
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::Single);
+        list.set_activate_on_single_click(true);
+        list.update_property(&[gtk::accessible::Property::Label("Emoji suggestions")]);
+
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroller.set_min_content_width(280);
+        scroller.set_max_content_height(320);
+        scroller.set_propagate_natural_height(true);
+        scroller.set_child(Some(&list));
+        popover.set_child(Some(&scroller));
+
+        let completion = ComposerEmojiCompletion {
+            popover: popover.clone(),
+            list: list.clone(),
+            entries: Vec::new(),
+            token: None,
+        };
+        match target {
+            ComposerTarget::Message => {
+                *self.imp().message_emoji_completion.borrow_mut() = Some(completion)
+            }
+            ComposerTarget::Thread => {
+                *self.imp().thread_emoji_completion.borrow_mut() = Some(completion)
+            }
+        }
+
+        let weak_window = self.downgrade();
+        list.connect_row_activated(move |_, _| {
+            if let Some(window) = weak_window.upgrade() {
+                window.accept_composer_emoji_completion(target);
+            }
+        });
+
+        let weak_window = self.downgrade();
+        text_view.buffer().connect_changed(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.refresh_composer_emoji_completion(target);
+            }
+        });
+
+        let weak_window = self.downgrade();
+        text_view.buffer().connect_mark_set(move |_, _, mark| {
+            if mark.name().as_deref() == Some("insert") {
+                if let Some(window) = weak_window.upgrade() {
+                    window.refresh_composer_emoji_completion(target);
+                }
+            }
+        });
+
+        let weak_window = self.downgrade();
+        text_view.connect_has_focus_notify(move |text_view| {
+            if text_view.has_focus() {
+                return;
+            }
+            let weak_window = weak_window.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(window) = weak_window.upgrade() {
+                    if !window.composer_text_view(target).has_focus() {
+                        window.dismiss_composer_emoji_completion(target);
+                    }
+                }
+            });
+        });
+
+        let controller = gtk::EventControllerKey::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak_window = self.downgrade();
+        controller.connect_key_pressed(move |_, key, _, state| {
+            weak_window
+                .upgrade()
+                .map_or(glib::Propagation::Proceed, |window| {
+                    window.handle_composer_emoji_completion_key(target, key, state)
+                })
+        });
+        text_view.add_controller(controller);
+    }
+
+    fn refresh_composer_emoji_completion(&self, target: ComposerTarget) {
+        let text_view = self.composer_text_view(target);
+        let buffer = text_view.buffer();
+        let text = text_view_text(&text_view);
+        let caret = buffer.cursor_position().max(0) as usize;
+        let token = emoji_token_at_caret(&text, caret);
+        let entries = token.as_ref().map_or_else(Vec::new, |token| {
+            EmojiCatalog::new(&self.imp().custom_emojis.borrow())
+                .search(&token.query)
+                .into_iter()
+                .take(10)
+                .collect::<Vec<_>>()
+        });
+
+        let mut completion_ref = match target {
+            ComposerTarget::Message => self.imp().message_emoji_completion.borrow_mut(),
+            ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow_mut(),
+        };
+        let Some(completion) = completion_ref.as_mut() else {
+            return;
+        };
+        completion.token = token;
+        completion.entries = entries;
+
+        while let Some(child) = completion.list.first_child() {
+            completion.list.remove(&child);
+        }
+        if completion.entries.is_empty() {
+            completion.popover.popdown();
+            return;
+        }
+
+        for entry in &completion.entries {
+            let row = gtk::ListBoxRow::new();
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            content.set_margin_top(6);
+            content.set_margin_bottom(6);
+            content.set_margin_start(8);
+            content.set_margin_end(8);
+            let preview = match &entry.value {
+                EmojiValue::Unicode(value) => *value,
+                EmojiValue::CustomImage(_) => "◆",
+            };
+            let preview = gtk::Label::new(Some(preview));
+            preview.add_css_class("title-3");
+            let label = gtk::Label::new(Some(&format!(":{}:  {}", entry.name, entry.label)));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            content.append(&preview);
+            content.append(&label);
+            row.set_child(Some(&content));
+            row.update_property(&[gtk::accessible::Property::Label(&format!(
+                ":{}: — {}",
+                entry.name, entry.label
+            ))]);
+            completion.list.append(&row);
+        }
+        completion
+            .list
+            .select_row(completion.list.row_at_index(0).as_ref());
+
+        let insert = buffer.iter_at_offset(buffer.cursor_position());
+        completion
+            .popover
+            .set_pointing_to(Some(&text_view.iter_location(&insert)));
+        completion.popover.popup();
+    }
+
+    fn dismiss_composer_emoji_completion(&self, target: ComposerTarget) {
+        let mut completion_ref = match target {
+            ComposerTarget::Message => self.imp().message_emoji_completion.borrow_mut(),
+            ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow_mut(),
+        };
+        if let Some(completion) = completion_ref.as_mut() {
+            completion.token = None;
+            completion.entries.clear();
+            completion.popover.popdown();
+        }
+    }
+
+    fn move_composer_emoji_selection(&self, target: ComposerTarget, offset: i32) {
+        let completion_ref = match target {
+            ComposerTarget::Message => self.imp().message_emoji_completion.borrow(),
+            ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow(),
+        };
+        let Some(completion) = completion_ref.as_ref() else {
+            return;
+        };
+        let last = completion.entries.len().saturating_sub(1) as i32;
+        let current = completion.list.selected_row().map_or(0, |row| row.index());
+        let next = (current + offset).clamp(0, last);
+        completion
+            .list
+            .select_row(completion.list.row_at_index(next).as_ref());
+    }
+
+    fn accept_composer_emoji_completion(&self, target: ComposerTarget) {
+        let selection = {
+            let completion_ref = match target {
+                ComposerTarget::Message => self.imp().message_emoji_completion.borrow(),
+                ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow(),
+            };
+            let Some(completion) = completion_ref.as_ref() else {
+                return;
+            };
+            let Some(token) = completion.token.clone() else {
+                return;
+            };
+            let index = completion
+                .list
+                .selected_row()
+                .map_or(0, |row| row.index().max(0) as usize);
+            let Some(entry) = completion.entries.get(index) else {
+                return;
+            };
+            (token, entry.name.clone())
+        };
+
+        let text_view = self.composer_text_view(target);
+        let buffer = text_view.buffer();
+        let (updated, caret) =
+            replace_emoji_token(&text_view_text(&text_view), &selection.0, &selection.1);
+        let replacement = updated
+            .chars()
+            .skip(selection.0.start)
+            .take(caret.saturating_sub(selection.0.start))
+            .collect::<String>();
+        let mut start = buffer.iter_at_offset(selection.0.start as i32);
+        let mut end = buffer.iter_at_offset(selection.0.end as i32);
+        buffer.begin_user_action();
+        buffer.delete(&mut start, &mut end);
+        buffer.insert(&mut start, &replacement);
+        buffer.place_cursor(&buffer.iter_at_offset(caret as i32));
+        buffer.end_user_action();
+        self.dismiss_composer_emoji_completion(target);
+        text_view.grab_focus();
+    }
+
+    fn handle_composer_emoji_completion_key(
+        &self,
+        target: ComposerTarget,
+        key: gtk::gdk::Key,
+        state: gtk::gdk::ModifierType,
+    ) -> glib::Propagation {
+        let is_open = {
+            let completion_ref = match target {
+                ComposerTarget::Message => self.imp().message_emoji_completion.borrow(),
+                ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow(),
+            };
+            completion_ref
+                .as_ref()
+                .is_some_and(|completion| completion.popover.is_visible())
+        };
+        if !is_open {
+            return glib::Propagation::Proceed;
+        }
+
+        match emoji_completion_key_action(key, state) {
+            EmojiCompletionKeyAction::Previous => self.move_composer_emoji_selection(target, -1),
+            EmojiCompletionKeyAction::Next => self.move_composer_emoji_selection(target, 1),
+            EmojiCompletionKeyAction::Accept => self.accept_composer_emoji_completion(target),
+            EmojiCompletionKeyAction::Dismiss => self.dismiss_composer_emoji_completion(target),
+            EmojiCompletionKeyAction::Ignore => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
+    }
+
     fn handle_runtime_event(&self, event: RuntimeEvent) {
         let RuntimeEvent { meta, kind } = event;
         if !self.imp().request_coordinator.borrow().accepts(&meta) {
@@ -2146,6 +2527,12 @@ impl ConduitWindow {
                     .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
                     .collect::<HashMap<_, _>>();
                 self.populate_user_names(names);
+                self.replace_user_statuses(
+                    users
+                        .iter()
+                        .filter_map(|user| Some((user.id.clone()?, user.status()?)))
+                        .collect(),
+                );
                 *self.imp().discovered_channels.borrow_mut() = channels;
                 *self.imp().discovered_users.borrow_mut() = users;
                 self.refresh_open_conversation_picker();
@@ -2362,16 +2749,34 @@ impl ConduitWindow {
             RuntimeEventKind::UserLoaded {
                 user_id,
                 display_name,
+                status,
             } => {
-                self.populate_user_names(HashMap::from([(user_id, display_name)]));
+                self.populate_user_names(HashMap::from([(user_id.clone(), display_name)]));
+                if let Some(status) = status {
+                    self.populate_user_statuses(HashMap::from([(user_id, status)]));
+                }
             }
             RuntimeEventKind::UserNamesLoaded(user_names) => self.populate_user_names(user_names),
+            RuntimeEventKind::UserSearchAliasesLoaded(aliases) => {
+                *self.imp().user_search_aliases.borrow_mut() = aliases;
+                self.render_conversations();
+                self.refresh_open_conversation_picker();
+            }
+            RuntimeEventKind::UserStatusesLoaded(statuses) => {
+                self.replace_user_statuses(statuses);
+            }
             RuntimeEventKind::UserGroupsLoaded { names, members } => {
                 self.populate_user_groups(names, members);
             }
             RuntimeEventKind::EmojiCatalogLoaded(emojis) => {
                 *self.imp().custom_emojis.borrow_mut() = emojis;
+                self.render_conversations();
+                self.refresh_open_conversation_picker();
+                self.refresh_current_conversation_title();
                 self.rerender_current_messages();
+                for target in COMPOSER_TARGETS {
+                    self.refresh_composer_emoji_completion(target);
+                }
             }
             RuntimeEventKind::ImageAssetLoaded { key, data_uri } => {
                 crate::debug::log(
@@ -2406,6 +2811,15 @@ impl ConduitWindow {
                     .is_some_and(|item| item.url == url);
                 if is_current {
                     self.present_loaded_media(path, &mime_type);
+                }
+            }
+            RuntimeEventKind::AttachmentDownloadProgress { fraction, label } => {
+                self.set_status(&format!("{label} ({:.0}%)", fraction * 100.0));
+            }
+            RuntimeEventKind::AttachmentDownloaded { url: _, name, path } => {
+                match open::that(&path) {
+                    Ok(()) => self.set_status(&format!("Opened {name}")),
+                    Err(error) => self.set_status(&format!("Could not open {name}: {error}")),
                 }
             }
             RuntimeEventKind::MessagePosted {
@@ -2457,20 +2871,26 @@ impl ConduitWindow {
             RuntimeEventKind::FileUploaded(name) => {
                 let imp = self.imp();
                 imp.upload_button.set_sensitive(true);
+                imp.thread_send_button.set_sensitive(true);
                 imp.upload_progress.set_fraction(1.0);
                 imp.upload_progress.set_text(Some("Upload complete"));
                 self.set_status(&format!("Uploaded {name}"));
-                let uploaded_channel = match &meta.context.target {
-                    RuntimeTarget::Upload(channel_id) => Some(channel_id.as_str()),
+                let upload_target = match &meta.context.target {
+                    RuntimeTarget::Upload {
+                        channel_id,
+                        thread_ts,
+                    } => Some((channel_id.as_str(), thread_ts.as_deref())),
                     _ => None,
                 };
-                if let Some(channel_id) = uploaded_channel {
-                    let submitted = imp.pending_upload_drafts.borrow_mut().remove(channel_id);
-                    self.complete_upload_draft(channel_id, submitted.flatten().as_deref());
-                    if self.visible_channel_id().as_deref() == Some(channel_id) {
-                        self.force_next_channel_bottom_render(channel_id);
-                        self.request_channel_history(channel_id);
-                    }
+                if let Some((channel_id, thread_ts)) = upload_target {
+                    let submitted = self.draft_key(channel_id, thread_ts).and_then(|key| {
+                        imp.pending_upload_drafts
+                            .borrow_mut()
+                            .remove(&key)
+                            .flatten()
+                    });
+                    self.complete_upload_draft(channel_id, thread_ts, submitted.as_deref());
+                    self.reload_after_message(channel_id, thread_ts);
                 }
             }
         }
@@ -2751,11 +3171,15 @@ impl ConduitWindow {
             self.set_status("Select a conversation");
             return;
         };
+        let Some(upload_key) = self.draft_key(&channel_id, None) else {
+            self.set_status("No Slack workspace is active");
+            return;
+        };
         if self
             .imp()
             .pending_upload_drafts
             .borrow()
-            .contains_key(&channel_id)
+            .contains_key(&upload_key)
         {
             self.set_status(&gettext("A file is already being uploaded here."));
             return;
@@ -2773,30 +3197,131 @@ impl ConduitWindow {
             if let Ok(file) = result {
                 if let Some(path) = file.path() {
                     if let Some(window) = weak_window.upgrade() {
-                        let imp = window.imp();
                         let initial_comment =
                             (!initial_comment.is_empty()).then(|| initial_comment.clone());
-                        window.flush_current_drafts();
-                        if !record_upload_submission(
-                            &mut imp.pending_upload_drafts.borrow_mut(),
-                            &channel_id,
-                            initial_comment.clone(),
-                        ) {
-                            window.set_status(&gettext("A file is already being uploaded here."));
-                            return;
-                        }
-                        imp.upload_button.set_sensitive(false);
-                        imp.upload_progress.set_visible(true);
-                        imp.upload_progress.set_fraction(0.0);
-                        imp.upload_progress.set_text(Some("Starting upload"));
-                        window.send_command(RuntimeCommand::UploadFile {
-                            channel_id: channel_id.clone(),
-                            path,
-                            initial_comment,
-                        });
+                        window.begin_file_upload(&channel_id, None, path, initial_comment, false);
                     }
                 }
             }
+        });
+    }
+
+    fn begin_file_upload(
+        &self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        path: PathBuf,
+        initial_comment: Option<String>,
+        remove_after_upload: bool,
+    ) {
+        if self.imp().runtime.borrow().is_none() {
+            self.set_status("No Slack workspace is active");
+            if remove_after_upload {
+                let _ = std::fs::remove_file(path);
+            }
+            return;
+        }
+        let Some(key) = self.draft_key(channel_id, thread_ts) else {
+            self.set_status("No Slack workspace is active");
+            if remove_after_upload {
+                let _ = std::fs::remove_file(path);
+            }
+            return;
+        };
+        self.flush_current_drafts();
+        if !record_upload_submission(
+            &mut self.imp().pending_upload_drafts.borrow_mut(),
+            key,
+            initial_comment.clone(),
+        ) {
+            self.set_status(&gettext("A file is already being uploaded here."));
+            if remove_after_upload {
+                let _ = std::fs::remove_file(path);
+            }
+            return;
+        }
+
+        let imp = self.imp();
+        if thread_ts.is_some() {
+            imp.thread_send_button.set_sensitive(false);
+        } else {
+            imp.upload_button.set_sensitive(false);
+        }
+        imp.upload_progress.set_visible(true);
+        imp.upload_progress.set_fraction(0.0);
+        imp.upload_progress.set_text(Some("Starting upload"));
+        self.send_command(RuntimeCommand::UploadFile {
+            channel_id: channel_id.to_string(),
+            thread_ts: thread_ts.map(ToString::to_string),
+            path,
+            initial_comment,
+            remove_after_upload,
+        });
+    }
+
+    fn connect_image_paste(&self, text_view: &gtk::TextView, thread: bool) {
+        let weak_window = self.downgrade();
+        text_view.connect_paste_clipboard(move |text_view| {
+            let clipboard = text_view.display().clipboard();
+            if !clipboard_formats_include_image(&clipboard.formats()) {
+                return;
+            }
+            text_view.stop_signal_emission_by_name("paste-clipboard");
+
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let Some(channel_id) = window.visible_channel_id() else {
+                window.set_status("Select a conversation before pasting an image");
+                return;
+            };
+            let thread_ts = if thread {
+                let Some(thread_ts) = window.selected_thread_ts() else {
+                    window.set_status("Open a thread before pasting an image here");
+                    return;
+                };
+                Some(thread_ts)
+            } else {
+                None
+            };
+            let initial_comment = text_view_text(text_view).trim().to_string();
+            let initial_comment = (!initial_comment.is_empty()).then_some(initial_comment);
+            let weak_window = window.downgrade();
+            clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                let texture = match result {
+                    Ok(Some(texture)) => texture,
+                    Ok(None) => {
+                        window.set_status("The clipboard image could not be read");
+                        return;
+                    }
+                    Err(error) => {
+                        window.set_status(&format!("Could not read clipboard image: {error}"));
+                        return;
+                    }
+                };
+
+                let directory = config::upload_staging_dir();
+                if let Err(error) = std::fs::create_dir_all(&directory) {
+                    window.set_status(&format!("Could not prepare screenshot upload: {error}"));
+                    return;
+                }
+                let path = directory.join(screenshot_filename());
+                if let Err(error) = texture.save_to_png(&path) {
+                    let _ = std::fs::remove_file(&path);
+                    window.set_status(&format!("Could not encode clipboard image: {error}"));
+                    return;
+                }
+                window.begin_file_upload(
+                    &channel_id,
+                    thread_ts.as_deref(),
+                    path,
+                    initial_comment,
+                    true,
+                );
+            });
         });
     }
 
@@ -3066,6 +3591,25 @@ impl ConduitWindow {
                 });
                 true
             }
+            Some("attachment") => {
+                let Some(attachment_url) = query_param(url, "url").filter(|url| {
+                    url::Url::parse(url)
+                        .ok()
+                        .is_some_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+                }) else {
+                    self.set_status("Invalid attachment link");
+                    return true;
+                };
+                let name = query_param(url, "name")
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "Attachment".to_string());
+                self.set_status(&format!("Downloading {name}"));
+                self.send_command(RuntimeCommand::DownloadAttachment {
+                    url: attachment_url,
+                    name,
+                });
+                true
+            }
             _ => true,
         }
     }
@@ -3237,6 +3781,10 @@ impl ConduitWindow {
         imp.discovered_users.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
+        imp.user_search_aliases.borrow_mut().clear();
+        imp.user_statuses.borrow_mut().clear();
+        imp.status_expiry_generation
+            .set(imp.status_expiry_generation.get().saturating_add(1));
         imp.user_group_names.borrow_mut().clear();
         imp.user_group_members.borrow_mut().clear();
         imp.pending_user_ids.borrow_mut().clear();
@@ -3390,6 +3938,7 @@ impl ConduitWindow {
                 self.set_status(error);
                 self.close_media_viewer();
             }
+            RuntimeFailureRecovery::Attachment => self.set_status(error),
             RuntimeFailureRecovery::PostMessage {
                 channel_id,
                 thread_ts,
@@ -3416,14 +3965,20 @@ impl ConduitWindow {
                     self.set_status(error);
                 }
             }
-            RuntimeFailureRecovery::Upload(channel_id) => {
+            RuntimeFailureRecovery::Upload {
+                channel_id,
+                thread_ts,
+            } => {
                 let imp = self.imp();
-                imp.pending_upload_drafts.borrow_mut().remove(&channel_id);
+                if let Some(key) = self.draft_key(&channel_id, thread_ts.as_deref()) {
+                    imp.pending_upload_drafts.borrow_mut().remove(&key);
+                }
                 imp.upload_button.set_sensitive(true);
+                imp.thread_send_button.set_sensitive(true);
                 imp.upload_progress.set_visible(false);
                 imp.upload_progress.set_fraction(0.0);
                 imp.upload_progress.set_text(Some("Upload failed"));
-                if self.mutation_target_is_active(&channel_id, None) {
+                if self.mutation_target_is_active(&channel_id, thread_ts.as_deref()) {
                     self.set_status(error);
                 }
             }
@@ -3588,6 +4143,44 @@ impl ConduitWindow {
         self.rerender_current_messages();
     }
 
+    fn populate_user_statuses(&self, statuses: HashMap<String, SlackUserStatus>) {
+        if statuses.is_empty() {
+            return;
+        }
+        self.imp().user_statuses.borrow_mut().extend(statuses);
+        self.user_statuses_changed();
+    }
+
+    fn replace_user_statuses(&self, statuses: HashMap<String, SlackUserStatus>) {
+        *self.imp().user_statuses.borrow_mut() = statuses;
+        self.user_statuses_changed();
+    }
+
+    fn user_statuses_changed(&self) {
+        self.render_conversations();
+        self.refresh_open_conversation_picker();
+        self.refresh_current_conversation_title();
+        self.rerender_current_messages();
+
+        let imp = self.imp();
+        let generation = imp.status_expiry_generation.get().saturating_add(1);
+        imp.status_expiry_generation.set(generation);
+        let now = current_unix_seconds();
+        let Some(expiration) = nearest_status_expiration(&imp.user_statuses.borrow(), now) else {
+            return;
+        };
+        let delay = Duration::from_secs(expiration.saturating_sub(now).max(1) as u64);
+        let weak_window = self.downgrade();
+        glib::timeout_add_local_once(delay, move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            if window.imp().status_expiry_generation.get() == generation {
+                window.user_statuses_changed();
+            }
+        });
+    }
+
     fn populate_user_groups(
         &self,
         names: HashMap<String, String>,
@@ -3731,6 +4324,7 @@ impl ConduitWindow {
         let imp = self.imp();
         let conversations = imp.conversations.borrow().clone();
         let user_names = imp.user_names.borrow().clone();
+        let user_search_aliases = imp.user_search_aliases.borrow();
         let selected_channel = self.visible_channel_id();
         let model = sidebar::build_sidebar_list(
             &conversations,
@@ -3744,6 +4338,8 @@ impl ConduitWindow {
                 show_all: imp.sidebar_all_filter_button.is_active(),
                 loading: imp.sidebar_loading.get(),
                 has_error: imp.sidebar_error.borrow().is_some(),
+                user_search_aliases: Some(&user_search_aliases),
+                user_statuses: Some(&imp.user_statuses.borrow()),
             },
         );
 
@@ -3801,7 +4397,11 @@ impl ConduitWindow {
     }
 
     fn append_sidebar_conversation(&self, list: &gtk::ListBox, model: &SidebarRowModel) {
-        let row = sidebar_row_widget(model, SidebarRowLayout::sidebar());
+        let row = sidebar_row_widget(
+            model,
+            SidebarRowLayout::sidebar(),
+            &self.imp().custom_emojis.borrow(),
+        );
         list.append(&row);
         self.register_sidebar_row_action(row.index(), model);
         if model.selected && list.selected_row().is_none() {
@@ -3863,6 +4463,8 @@ impl ConduitWindow {
         let discovered_channels = imp.discovered_channels.borrow().clone();
         let discovered_users = imp.discovered_users.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
+        let user_search_aliases = imp.user_search_aliases.borrow().clone();
+        let user_statuses = imp.user_statuses.borrow().clone();
         let sections = picker_sections(
             include_discovery,
             &conversations,
@@ -3871,6 +4473,8 @@ impl ConduitWindow {
             &user_names,
             current_user_id.as_deref(),
             "",
+            &user_search_aliases,
+            &user_statuses,
         );
         if picker_sections_empty(&sections) {
             self.set_status("No conversations loaded");
@@ -3983,6 +4587,8 @@ impl ConduitWindow {
                 &imp.user_names.borrow(),
                 imp.current_user_id.borrow().as_deref(),
                 query.as_str(),
+                &imp.user_search_aliases.borrow(),
+                &imp.user_statuses.borrow(),
             )
         };
         self.populate_conversation_picker_list(&view.list, &view.actions, &sections);
@@ -4046,7 +4652,11 @@ impl ConduitWindow {
         actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
         item: &ConversationPickerItem,
     ) {
-        let row = sidebar_row_widget(&item.row, SidebarRowLayout::switcher());
+        let row = sidebar_row_widget(
+            &item.row,
+            SidebarRowLayout::switcher(),
+            &self.imp().custom_emojis.borrow(),
+        );
         list.append(&row);
         actions
             .borrow_mut()
@@ -4059,7 +4669,42 @@ impl ConduitWindow {
             if let Some(channel_id) = self.visible_channel_id() {
                 imp.message_title
                     .set_title(&self.conversation_title(&channel_id));
+                self.refresh_conversation_title_status(&channel_id);
             }
+        }
+    }
+
+    fn refresh_conversation_title_status(&self, channel_id: &str) {
+        let imp = self.imp();
+        let status = imp
+            .conversations
+            .borrow()
+            .iter()
+            .find(|conversation| conversation.id == channel_id)
+            .filter(|conversation| conversation.is_im.unwrap_or(false))
+            .and_then(|conversation| conversation.user.as_deref().map(str::to_string))
+            .and_then(|user_id| imp.user_statuses.borrow().get(&user_id).cloned())
+            .filter(|status| status.active_at(current_unix_seconds()));
+        if let Some(status) = status {
+            let emoji = crate::emoji::EmojiCatalog::new(&imp.custom_emojis.borrow())
+                .resolve(status.emoji_name())
+                .and_then(|value| match value {
+                    crate::emoji::EmojiValue::Unicode(glyph) => Some(glyph.to_string()),
+                    crate::emoji::EmojiValue::CustomImage(_) => None,
+                })
+                .unwrap_or_else(|| "●".to_string());
+            let text = status.accessible_text();
+            imp.message_title.set_subtitle(&format!("{emoji} {text}"));
+            imp.message_title.set_tooltip_text(Some(&text));
+            imp.message_title
+                .update_property(&[gtk::accessible::Property::Description(&format!(
+                    "Status: {text}"
+                ))]);
+        } else {
+            imp.message_title.set_subtitle("");
+            imp.message_title.set_tooltip_text(None);
+            imp.message_title
+                .update_property(&[gtk::accessible::Property::Description("")]);
         }
     }
 
@@ -4079,6 +4724,12 @@ impl ConduitWindow {
             .set_active(selection == Some(WorkspaceNavigationSelection::Saved));
         imp.message_composer
             .set_visible(workspace_composer_visible(main_view));
+        if main_view != MainMessageView::Conversation {
+            imp.message_title.set_subtitle("");
+            imp.message_title.set_tooltip_text(None);
+            imp.message_title
+                .update_property(&[gtk::accessible::Property::Description("")]);
+        }
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
@@ -4095,6 +4746,7 @@ impl ConduitWindow {
             .select_conversation(channel_id);
         let current_messages = imp.workspace_view.borrow().snapshot().channel_messages;
         imp.message_title.set_title(title);
+        self.refresh_conversation_title_status(channel_id);
         self.restore_channel_draft(channel_id);
         set_text_view_text(&imp.thread_entry, "");
         imp.thread_split.set_show_sidebar(false);
@@ -4399,6 +5051,24 @@ impl ConduitWindow {
         match event {
             SocketModeEvent::Message(event) => self.apply_socket_message(*event),
             SocketModeEvent::Reaction(event) => self.apply_socket_reaction(event),
+            SocketModeEvent::UserChanged(user) => {
+                let Some(user_id) = user.id.clone() else {
+                    return;
+                };
+                if let Some(display_name) = user.display_name() {
+                    self.populate_user_names(HashMap::from([(user_id.clone(), display_name)]));
+                }
+                let mut statuses = self.imp().user_statuses.borrow().clone();
+                match user.status() {
+                    Some(status) => {
+                        statuses.insert(user_id, status);
+                    }
+                    None => {
+                        statuses.remove(&user_id);
+                    }
+                }
+                self.replace_user_statuses(statuses);
+            }
             SocketModeEvent::RefreshConversations => self.refresh_conversations(),
         }
     }
@@ -4861,6 +5531,19 @@ impl ConduitWindow {
             .unwrap_or_default();
         MessageHtmlContext {
             user_names: imp.user_names.borrow().clone(),
+            user_statuses: imp.user_statuses.borrow().clone(),
+            direct_message_peer_id: (self.current_main_view() == MainMessageView::Conversation)
+                .then(|| self.visible_channel_id())
+                .flatten()
+                .and_then(|channel_id| {
+                    imp.conversations
+                        .borrow()
+                        .iter()
+                        .find(|conversation| {
+                            conversation.id == channel_id && conversation.is_im.unwrap_or(false)
+                        })
+                        .and_then(|conversation| conversation.user.clone())
+                }),
             user_group_names: imp.user_group_names.borrow().clone(),
             user_group_members: imp.user_group_members.borrow().clone(),
             current_user_id: imp.current_user_id.borrow().clone(),
@@ -4994,6 +5677,8 @@ mod tests {
             private: true,
             muted: false,
             external: false,
+            search_aliases: Vec::new(),
+            status: None,
         }
     }
 
@@ -5191,6 +5876,11 @@ mod tests {
                 RuntimeFailureRecovery::Image("asset".to_string()),
             ),
             (
+                RuntimeOperation::AttachmentDownload,
+                RuntimeTarget::Attachment("https://files.slack.com/file.pdf".to_string()),
+                RuntimeFailureRecovery::Attachment,
+            ),
+            (
                 RuntimeOperation::PostMessage,
                 main_message.clone(),
                 RuntimeFailureRecovery::PostMessage {
@@ -5224,8 +5914,14 @@ mod tests {
             ),
             (
                 RuntimeOperation::FileUpload,
-                RuntimeTarget::Upload("C123".to_string()),
-                RuntimeFailureRecovery::Upload("C123".to_string()),
+                RuntimeTarget::Upload {
+                    channel_id: "C123".to_string(),
+                    thread_ts: Some("1.0".to_string()),
+                },
+                RuntimeFailureRecovery::Upload {
+                    channel_id: "C123".to_string(),
+                    thread_ts: Some("1.0".to_string()),
+                },
             ),
             (
                 RuntimeOperation::SocketMode,
@@ -5331,6 +6027,35 @@ mod tests {
             "Connected to Signicat"
         );
         assert_eq!(connected_workspace_status(None), "Connected to Slack");
+    }
+
+    #[test]
+    fn status_expiration_scheduler_selects_nearest_future_expiration() {
+        let statuses = HashMap::from([
+            (
+                "expired".to_string(),
+                SlackUserStatus {
+                    expiration: 90,
+                    ..Default::default()
+                },
+            ),
+            (
+                "later".to_string(),
+                SlackUserStatus {
+                    expiration: 200,
+                    ..Default::default()
+                },
+            ),
+            (
+                "next".to_string(),
+                SlackUserStatus {
+                    expiration: 150,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(nearest_status_expiration(&statuses, 100), Some(150));
     }
 
     #[test]
@@ -5623,15 +6348,41 @@ mod tests {
         let mut uploads = HashMap::new();
         assert!(record_upload_submission(
             &mut uploads,
-            "C123",
+            DraftKey::new("T123:U123", "C123", None),
             Some("comment".into())
         ));
         assert!(!record_upload_submission(
             &mut uploads,
-            "C123",
+            DraftKey::new("T123:U123", "C123", None),
             Some("replacement".into())
         ));
-        assert!(record_upload_submission(&mut uploads, "C999", None));
+        assert!(record_upload_submission(
+            &mut uploads,
+            DraftKey::new("T123:U123", "C123", Some("1.0")),
+            None
+        ));
+        assert!(record_upload_submission(
+            &mut uploads,
+            DraftKey::new("T123:U123", "C999", None),
+            None
+        ));
+    }
+
+    #[test]
+    fn clipboard_image_detection_does_not_intercept_text_paste() {
+        assert!(clipboard_mime_type_is_image("image/png"));
+        assert!(clipboard_mime_type_is_image("image/jpeg; charset=binary"));
+        assert!(!clipboard_mime_type_is_image("text/plain"));
+        assert!(!clipboard_mime_type_is_image("application/pdf"));
+    }
+
+    #[test]
+    fn screenshot_staging_names_are_safe_png_files() {
+        let first = screenshot_filename();
+
+        assert!(first.starts_with("Screenshot-"));
+        assert!(first.ends_with(".png"));
+        assert!(!first.contains('/'));
     }
 
     #[test]
@@ -5802,6 +6553,14 @@ mod tests {
         assert_eq!(
             promoted_recent_reactions(["thumbsup", "heart"], "rocket"),
             vec!["rocket", "thumbsup", "heart"]
+        );
+    }
+
+    #[test]
+    fn emoji_completion_is_wired_to_both_composers() {
+        assert_eq!(
+            COMPOSER_TARGETS,
+            [ComposerTarget::Message, ComposerTarget::Thread]
         );
     }
 }
