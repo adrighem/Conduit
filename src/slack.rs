@@ -483,6 +483,7 @@ impl SlackApi {
     }
 
     pub async fn download_preview_asset(&self, url: &str) -> Result<DownloadedPreviewAsset> {
+        ensure_trusted_slack_download_url(url)?;
         let response = self
             .authenticated_request(Method::GET, url)
             .send()
@@ -540,6 +541,7 @@ impl SlackApi {
     /// complete response in memory. The destination is replaced atomically
     /// after a successful download and never contains a partial response.
     pub async fn download_media(&self, url: &str, destination: &Path) -> Result<DownloadedMedia> {
+        ensure_trusted_slack_download_url(url)?;
         let response = self
             .authenticated_request(Method::GET, url)
             .send()
@@ -619,11 +621,7 @@ impl SlackApi {
     where
         F: Fn(DownloadProgressUpdate),
     {
-        if !is_trusted_slack_download_url(url) {
-            return Err(anyhow!(
-                "attachment download URL is not a trusted Slack URL"
-            ));
-        }
+        ensure_trusted_slack_download_url(url)?;
 
         if let Ok(metadata) = tokio::fs::metadata(destination).await {
             if metadata.is_file() && metadata.len() > 0 {
@@ -1177,6 +1175,13 @@ fn is_trusted_slack_download_url(url: &str) -> bool {
     })
 }
 
+fn ensure_trusted_slack_download_url(url: &str) -> Result<()> {
+    if !is_trusted_slack_download_url(url) {
+        return Err(anyhow!("download URL is not a trusted Slack URL"));
+    }
+    Ok(())
+}
+
 fn supported_media_mime_type(content_type: &str) -> Option<&str> {
     let mime_type = content_type.split(';').next()?.trim();
     (mime_type.starts_with("image/")
@@ -1697,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_authentication_is_restricted_to_slack_https_hosts() {
+    fn authenticated_downloads_are_restricted_to_slack_https_hosts() {
         assert!(is_trusted_slack_download_url(
             "https://files.slack.com/files-pri/T1-F1/download/report.pdf"
         ));
@@ -1716,6 +1721,11 @@ mod tests {
             "https://token@files.slack.com/file.pdf"
         ));
         assert!(!is_trusted_slack_download_url("not a URL"));
+        assert!(ensure_trusted_slack_download_url(
+            "https://files.slack.com/files-pri/T1-F1/download/report.pdf"
+        )
+        .is_ok());
+        assert!(ensure_trusted_slack_download_url("https://evil.example/preview.png").is_err());
     }
 
     #[test]
