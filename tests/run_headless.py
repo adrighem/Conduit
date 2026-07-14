@@ -5,10 +5,35 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from xml.sax.saxutils import escape
+
+
+def wait_for_window_manager(environment: dict[str, str], process: subprocess.Popen) -> None:
+    xprop = shutil.which("xprop")
+    if xprop is None:
+        time.sleep(0.5)
+        return
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("xfwm4 exited before becoming ready")
+        supported = subprocess.run(
+            [xprop, "-root", "_NET_SUPPORTED"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if supported.returncode == 0 and "_NET_ACTIVE_WINDOW" in supported.stdout:
+            return
+        time.sleep(0.1)
+    raise RuntimeError("xfwm4 did not advertise _NET_ACTIVE_WINDOW within 10 seconds")
 
 
 def run_test() -> int:
@@ -59,6 +84,7 @@ def run_test() -> int:
             stderr=subprocess.DEVNULL,
         )
         try:
+            wait_for_window_manager(environment, window_manager)
             return subprocess.run(
                 [sys.executable, *sys.argv[1:]], env=environment
             ).returncode

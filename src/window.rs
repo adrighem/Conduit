@@ -586,27 +586,40 @@ enum MessageNotificationAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageNotificationDelivery {
+    Snapshot,
+    Realtime { first_delivery: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MessageNotificationState<'a> {
-    channel_id: &'a str,
-    selected_channel: Option<&'a str>,
     previous_latest_ts: Option<&'a str>,
     latest_ts: &'a str,
     latest_message_user: Option<&'a str>,
     current_user: Option<&'a str>,
     has_unread: bool,
     muted: bool,
+    actively_reading: bool,
+    delivery: MessageNotificationDelivery,
 }
 
 fn message_notification_action(state: MessageNotificationState<'_>) -> MessageNotificationAction {
-    let has_newer_message = state
-        .previous_latest_ts
-        .is_some_and(|previous_ts| state.latest_ts > previous_ts);
-    let selected = state.selected_channel == Some(state.channel_id);
+    let has_newer_message = match state.delivery {
+        MessageNotificationDelivery::Realtime { first_delivery } => first_delivery,
+        MessageNotificationDelivery::Snapshot => state
+            .previous_latest_ts
+            .is_some_and(|previous_ts| state.latest_ts > previous_ts),
+    };
     let own_message = state
         .latest_message_user
         .is_some_and(|user| Some(user) == state.current_user);
 
-    if has_newer_message && state.has_unread && !state.muted && !selected && !own_message {
+    if has_newer_message
+        && state.has_unread
+        && !state.muted
+        && !state.actively_reading
+        && !own_message
+    {
         MessageNotificationAction::Notify
     } else {
         MessageNotificationAction::RecordOnly
@@ -620,6 +633,13 @@ fn message_notification_body(message: Option<&SlackMessage>) -> String {
         .filter(|text| !text.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| gettext("New message"))
+}
+
+fn notification_baseline_after(previous_ts: Option<&str>, candidate_ts: &str) -> String {
+    previous_ts
+        .filter(|previous_ts| *previous_ts >= candidate_ts)
+        .unwrap_or(candidate_ts)
+        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1097,17 +1117,26 @@ fn slack_message_location(uri: &str, workspace_url: Option<&str>) -> Option<Sear
 }
 
 fn realtime_message_marks_unread(
-    reading_channel: Option<&str>,
+    selected_channel: Option<&str>,
+    window_active: bool,
     current_user_id: Option<&str>,
     event: &SocketModeMessageEvent,
 ) -> bool {
     event.kind == SocketModeMessageKind::Posted
-        && reading_channel != Some(event.channel_id.as_str())
+        && !actively_reading_channel(window_active, selected_channel, event.channel_id.as_str())
         && event
             .message
             .user
             .as_deref()
             .is_none_or(|user| Some(user) != current_user_id)
+}
+
+fn actively_reading_channel(
+    window_active: bool,
+    selected_channel: Option<&str>,
+    channel_id: &str,
+) -> bool {
+    window_active && selected_channel == Some(channel_id)
 }
 
 fn first_unread_message_ts(
@@ -2635,6 +2664,8 @@ impl ConduitWindow {
                 conversations,
                 unread_states,
             } => {
+                let window_active = self.is_active();
+                let selected_channel = self.visible_channel_id();
                 let mut catalog = self.imp().conversation_catalog.borrow_mut();
                 for conversation in conversations {
                     catalog.upsert_metadata(conversation);
@@ -2650,11 +2681,11 @@ impl ConduitWindow {
                                 .as_deref()
                                 .is_none_or(|server| local.as_str() > server)
                         });
-                    if self
-                        .visible_channel_id()
-                        .as_deref()
-                        .is_none_or(|visible| visible != channel_id)
-                        && !newer_local_read
+                    if !actively_reading_channel(
+                        window_active,
+                        selected_channel.as_deref(),
+                        &channel_id,
+                    ) && !newer_local_read
                     {
                         catalog.apply_realtime_unread(&channel_id, unread_state);
                     }
@@ -2680,7 +2711,11 @@ impl ConduitWindow {
             RuntimeEventKind::ConversationNotificationCandidate {
                 channel_id,
                 messages,
-            } => self.notify_if_new_messages(&channel_id, &messages),
+            } => self.notify_if_new_messages(
+                &channel_id,
+                &messages,
+                MessageNotificationDelivery::Snapshot,
+            ),
             RuntimeEventKind::ThreadCatalogLoaded(records) => {
                 *self.imp().thread_catalog.borrow_mut() = ThreadCatalog::from_records(records);
                 if self.current_main_view() == MainMessageView::Threads {
@@ -2713,7 +2748,11 @@ impl ConduitWindow {
                         .snapshot()
                         .channel_messages;
                     if outcome.notify_new_messages {
-                        self.notify_if_new_messages(&channel_id, &rendered_messages);
+                        self.notify_if_new_messages(
+                            &channel_id,
+                            &rendered_messages,
+                            MessageNotificationDelivery::Snapshot,
+                        );
                     }
                     self.populate_history_with_scroll(
                         &channel_id,
@@ -4398,11 +4437,11 @@ impl ConduitWindow {
         if !unread_state.known {
             return;
         }
-        if self
-            .visible_channel_id()
-            .as_deref()
-            .is_some_and(|selected_channel| selected_channel == channel_id)
-        {
+        if actively_reading_channel(
+            self.is_active(),
+            self.visible_channel_id().as_deref(),
+            channel_id,
+        ) {
             return;
         }
 
@@ -5253,6 +5292,7 @@ impl ConduitWindow {
         if first_delivery
             && realtime_message_marks_unread(
                 reading_channel.as_deref(),
+                self.is_active(),
                 current_user_id.as_deref(),
                 &event,
             )
@@ -5320,7 +5360,11 @@ impl ConduitWindow {
         }
 
         if event.kind == SocketModeMessageKind::Posted {
-            self.notify_if_new_messages(&channel_id, std::slice::from_ref(&message));
+            self.notify_if_new_messages(
+                &channel_id,
+                std::slice::from_ref(&message),
+                MessageNotificationDelivery::Realtime { first_delivery },
+            );
         }
         self.request_user_names(std::slice::from_ref(&message));
         self.request_image_assets(std::iter::once(&message));
@@ -5351,7 +5395,12 @@ impl ConduitWindow {
         }
     }
 
-    fn notify_if_new_messages(&self, channel_id: &str, messages: &[SlackMessage]) {
+    fn notify_if_new_messages(
+        &self,
+        channel_id: &str,
+        messages: &[SlackMessage],
+        delivery: MessageNotificationDelivery,
+    ) {
         let Some(latest_ts) = SlackMessage::latest_ts(messages.iter()) else {
             return;
         };
@@ -5365,22 +5414,26 @@ impl ConduitWindow {
             .get(channel_id)
             .cloned();
 
-        self.imp()
-            .latest_message_ts_by_channel
-            .borrow_mut()
-            .insert(channel_id.to_string(), latest_ts.clone());
+        self.imp().latest_message_ts_by_channel.borrow_mut().insert(
+            channel_id.to_string(),
+            notification_baseline_after(previous_ts.as_deref(), &latest_ts),
+        );
 
-        let selected_channel = self.visible_channel_id();
+        let actively_reading = actively_reading_channel(
+            self.is_active(),
+            self.visible_channel_id().as_deref(),
+            channel_id,
+        );
         let (has_unread, muted) = self.notification_conversation_state(channel_id);
         let action = message_notification_action(MessageNotificationState {
-            channel_id,
-            selected_channel: selected_channel.as_deref(),
             previous_latest_ts: previous_ts.as_deref(),
             latest_ts: latest_ts.as_str(),
             latest_message_user: latest_message.and_then(|message| message.user.as_deref()),
             current_user: current_user_id.as_deref(),
             has_unread,
             muted,
+            actively_reading,
+            delivery,
         });
 
         if action == MessageNotificationAction::Notify {
@@ -6351,14 +6404,30 @@ mod tests {
     fn notification_policy_notifies_only_for_new_unread_incoming_messages() {
         assert_eq!(
             message_notification_action(MessageNotificationState {
-                channel_id: "C123",
-                selected_channel: Some("C456"),
                 previous_latest_ts: Some("1710000100.000000"),
                 latest_ts: "1710000200.000000",
                 latest_message_user: Some("U456"),
                 current_user: Some("U123"),
                 has_unread: true,
                 muted: false,
+                actively_reading: false,
+                delivery: MessageNotificationDelivery::Snapshot,
+            }),
+            MessageNotificationAction::Notify
+        );
+
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                previous_latest_ts: None,
+                latest_ts: "1710000200.000000",
+                latest_message_user: Some("U456"),
+                current_user: Some("U123"),
+                has_unread: true,
+                muted: false,
+                actively_reading: false,
+                delivery: MessageNotificationDelivery::Realtime {
+                    first_delivery: true,
+                },
             }),
             MessageNotificationAction::Notify
         );
@@ -6367,14 +6436,14 @@ mod tests {
     #[test]
     fn notification_policy_records_without_notifying_for_non_notifyable_messages() {
         let notifyable = MessageNotificationState {
-            channel_id: "C123",
-            selected_channel: Some("C456"),
             previous_latest_ts: Some("1710000100.000000"),
             latest_ts: "1710000200.000000",
             latest_message_user: Some("U456"),
             current_user: Some("U123"),
             has_unread: true,
             muted: false,
+            actively_reading: false,
+            delivery: MessageNotificationDelivery::Snapshot,
         };
 
         assert_eq!(
@@ -6386,7 +6455,17 @@ mod tests {
         );
         assert_eq!(
             message_notification_action(MessageNotificationState {
-                selected_channel: Some("C123"),
+                actively_reading: true,
+                ..notifyable
+            }),
+            MessageNotificationAction::RecordOnly
+        );
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                previous_latest_ts: None,
+                delivery: MessageNotificationDelivery::Realtime {
+                    first_delivery: false,
+                },
                 ..notifyable
             }),
             MessageNotificationAction::RecordOnly
@@ -6428,6 +6507,28 @@ mod tests {
         assert_eq!(
             message_notification_body(Some(&message("1710000200.000000", "Hello"))),
             "Hello"
+        );
+    }
+
+    #[test]
+    fn notification_baseline_never_regresses_for_delayed_snapshots() {
+        let baseline = notification_baseline_after(None, "1710000200.000000");
+        assert_eq!(baseline, "1710000200.000000");
+
+        let baseline = notification_baseline_after(Some(&baseline), "1710000100.000000");
+        assert_eq!(baseline, "1710000200.000000");
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                previous_latest_ts: Some(&baseline),
+                latest_ts: "1710000200.000000",
+                latest_message_user: Some("U456"),
+                current_user: Some("U123"),
+                has_unread: true,
+                muted: false,
+                actively_reading: false,
+                delivery: MessageNotificationDelivery::Snapshot,
+            }),
+            MessageNotificationAction::RecordOnly
         );
     }
 
@@ -6726,13 +6827,31 @@ mod tests {
 
         assert!(!realtime_message_marks_unread(
             Some("C123"),
+            true,
             Some("U999"),
             &event
         ));
-        assert!(!realtime_message_marks_unread(None, Some("U123"), &event));
-        assert!(!realtime_message_marks_unread(None, Some("U999"), &changed));
+        assert!(!realtime_message_marks_unread(
+            None,
+            true,
+            Some("U123"),
+            &event
+        ));
+        assert!(!realtime_message_marks_unread(
+            None,
+            true,
+            Some("U999"),
+            &changed
+        ));
         assert!(realtime_message_marks_unread(
             Some("C999"),
+            true,
+            Some("U999"),
+            &event
+        ));
+        assert!(realtime_message_marks_unread(
+            Some("C123"),
+            false,
             Some("U999"),
             &event
         ));

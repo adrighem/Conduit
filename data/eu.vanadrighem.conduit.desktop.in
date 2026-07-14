@@ -7,3 +7,4 @@ Type=Application
 Categories=Network;Chat;InstantMessaging;GTK;
 Keywords=Slack;Chat;Messaging;GTK;
 StartupNotify=true
+X-GNOME-UsesNotifications=true

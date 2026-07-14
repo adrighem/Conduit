@@ -32,6 +32,7 @@ def main() -> None:
     desktop = read_ini(data / "eu.vanadrighem.conduit.desktop.in")["Desktop Entry"]
     assert desktop["Type"] == "Application"
     assert desktop["Icon"] == "eu.vanadrighem.conduit"
+    assert desktop["X-GNOME-UsesNotifications"] == "true"
 
     meson = (data / "meson.build").read_text(encoding="utf-8")
     assert "eu.vanadrighem.conduit.search-provider.ini" in meson
