@@ -40,6 +40,7 @@ const IMAGE_TASK_CONCURRENCY: usize = 4;
 const UPLOAD_TASK_CONCURRENCY: usize = 2;
 const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+const SOCKET_MODE_PERSISTENCE_QUEUE_CAPACITY: usize = 128;
 const ATTACHMENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const ATTACHMENT_BASENAME_MAX_BYTES: usize = 180;
@@ -2556,81 +2557,50 @@ async fn run_socket_mode(
 
     loop {
         let events_for_run = events.clone();
-        let store_for_run = workspace_store.clone();
-        let user_for_run = current_user_id.clone();
+        let mut persistence_tasks = tokio::task::JoinSet::new();
+        let persistence_sender = workspace_store.clone().map(|store| {
+            let (sender, receiver) = mpsc::channel(SOCKET_MODE_PERSISTENCE_QUEUE_CAPACITY);
+            persistence_tasks.spawn(persist_realtime_events(
+                receiver,
+                store,
+                current_user_id.clone(),
+                events_for_run.clone(),
+            ));
+            sender
+        });
+        let persistence_for_run = persistence_sender.clone();
         let result = socket_mode::run_once(&app_token, move |event| {
-            if let (Some(store), SocketModeEvent::UserChanged(user)) =
-                (store_for_run.clone(), &event)
-            {
-                let user = user.clone();
-                tokio::spawn(async move {
-                    let Some(user_id) = user.id.as_deref() else {
-                        return;
-                    };
-                    if let Err(error) = store.store_user_status(user_id, user.status()).await {
+            if let Some(sender) = persistence_for_run.as_ref() {
+                let persistence_event = match &event {
+                    SocketModeEvent::UserChanged(user) => {
+                        Some(RealtimePersistenceEvent::UserChanged(user.clone()))
+                    }
+                    SocketModeEvent::Message(message) => {
+                        Some(RealtimePersistenceEvent::Message(message.clone()))
+                    }
+                    SocketModeEvent::Reaction(_) | SocketModeEvent::RefreshConversations => None,
+                };
+                if let Some(persistence_event) = persistence_event {
+                    if let Err(error) = sender.try_send(persistence_event) {
                         crate::debug::log(
                             "store",
-                            &format!("RealtimeUserStatusStoreFailed user_id={user_id} error={error:#}"),
+                            &format!("RealtimePersistenceQueueRejected error={error}"),
                         );
                     }
-                });
-            }
-            if let (Some(store), SocketModeEvent::Message(message)) =
-                (store_for_run.clone(), &event)
-            {
-                let channel_id = message.channel_id.clone();
-                let posted = message.kind == SocketModeMessageKind::Posted;
-                let message = message.message.clone();
-                let current_user_id = user_for_run.clone();
-                let catalog_events = events_for_run.clone();
-                tokio::spawn(async move {
-                    if posted && message.user.as_deref() != current_user_id.as_deref()
-                    {
-                        if let Err(error) = store
-                            .mark_conversation_unread_from_event(&channel_id, &message.ts)
-                            .await
-                        {
-                            crate::debug::log(
-                                "store",
-                                &format!("ConversationRealtimeStoreFailed channel_id={channel_id} error={error:#}"),
-                            );
-                        }
-                    }
-                    if posted {
-                        if let Err(error) = store
-                            .store_merged_history(&channel_id, std::slice::from_ref(&message))
-                            .await
-                        {
-                            crate::debug::log(
-                                "store",
-                                &format!("ConversationRealtimeHistoryStoreFailed channel_id={channel_id} error={error:#}"),
-                            );
-                        }
-                        if let Err(error) = store
-                            .observe_thread_realtime(&channel_id, &message, current_user_id.as_deref())
-                            .await
-                        {
-                            crate::debug::log(
-                                "store",
-                                &format!("ThreadRealtimeStoreFailed channel_id={channel_id} error={error:#}"),
-                            );
-                        } else {
-                          match store.load_thread_catalog().await {
-                            Ok(records) if !records.is_empty() => catalog_events
-                                .send_event(RuntimeEventKind::ThreadCatalogLoaded(records)),
-                            Ok(_) => {}
-                            Err(error) => crate::debug::log(
-                                "store",
-                                &format!("ThreadCatalogLoadFailed error={error:#}"),
-                            ),
-                          }
-                        }
-                    }
-                });
+                }
             }
             events_for_run.send_event(RuntimeEventKind::SocketModeEvent(event));
         })
         .await;
+        drop(persistence_sender);
+        while let Some(join_result) = persistence_tasks.join_next().await {
+            if let Err(error) = join_result {
+                crate::debug::log(
+                    "store",
+                    &format!("RealtimePersistenceWorkerFailed error={error}"),
+                );
+            }
+        }
 
         let timing = match result {
             Ok(SocketModeDisconnect::LinkDisabled) => {
@@ -2658,6 +2628,92 @@ async fn run_socket_mode(
 
         reconnect_delay = timing.next_backoff;
         tokio::time::sleep(timing.sleep).await;
+    }
+}
+
+#[derive(Debug)]
+enum RealtimePersistenceEvent {
+    UserChanged(SlackUser),
+    Message(Box<crate::socket_mode::SocketModeMessageEvent>),
+}
+
+async fn persist_realtime_events(
+    mut receiver: mpsc::Receiver<RealtimePersistenceEvent>,
+    store: WorkspaceStore,
+    current_user_id: Option<String>,
+    events: RuntimeEventSender,
+) {
+    while let Some(event) = receiver.recv().await {
+        match event {
+            RealtimePersistenceEvent::UserChanged(user) => {
+                let Some(user_id) = user.id.as_deref() else {
+                    continue;
+                };
+                if let Err(error) = store.store_user_status(user_id, user.status()).await {
+                    crate::debug::log(
+                        "store",
+                        &format!("RealtimeUserStatusStoreFailed user_id={user_id} error={error:#}"),
+                    );
+                }
+            }
+            RealtimePersistenceEvent::Message(message) => {
+                persist_realtime_message(&store, &current_user_id, &events, *message).await;
+            }
+        }
+    }
+}
+
+async fn persist_realtime_message(
+    store: &WorkspaceStore,
+    current_user_id: &Option<String>,
+    events: &RuntimeEventSender,
+    message_event: crate::socket_mode::SocketModeMessageEvent,
+) {
+    if message_event.kind != SocketModeMessageKind::Posted {
+        return;
+    }
+    let channel_id = message_event.channel_id;
+    let message = message_event.message;
+    if message.user.as_deref() != current_user_id.as_deref() {
+        if let Err(error) = store
+            .mark_conversation_unread_from_event(&channel_id, &message.ts)
+            .await
+        {
+            crate::debug::log(
+                "store",
+                &format!("ConversationRealtimeStoreFailed channel_id={channel_id} error={error:#}"),
+            );
+        }
+    }
+    if let Err(error) = store
+        .store_merged_history(&channel_id, std::slice::from_ref(&message))
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!(
+                "ConversationRealtimeHistoryStoreFailed channel_id={channel_id} error={error:#}"
+            ),
+        );
+    }
+    if let Err(error) = store
+        .observe_thread_realtime(&channel_id, &message, current_user_id.as_deref())
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!("ThreadRealtimeStoreFailed channel_id={channel_id} error={error:#}"),
+        );
+    } else {
+        match store.load_thread_catalog().await {
+            Ok(records) if !records.is_empty() => {
+                events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                crate::debug::log("store", &format!("ThreadCatalogLoadFailed error={error:#}"))
+            }
+        }
     }
 }
 
@@ -3992,6 +4048,74 @@ mod tests {
                 events.recv().await.map(|event| event.kind),
                 Some(RuntimeEventKind::SignedOut)
             ));
+        });
+    }
+
+    #[test]
+    fn realtime_persistence_worker_drains_events_in_session_scope() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-realtime-persistence-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+            store
+                .store_conversations(&[crate::models::SlackConversation {
+                    id: "C1".into(),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            let (runtime_events, _receiver) = mpsc::unbounded_channel();
+            let event_sender = RuntimeEventSender::new(
+                runtime_events,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
+            );
+            let (sender, receiver) = mpsc::channel(2);
+            let worker = tokio::spawn(persist_realtime_events(
+                receiver,
+                store.clone(),
+                Some("U_SELF".into()),
+                event_sender,
+            ));
+            for ts in ["1.0", "2.0"] {
+                sender
+                    .send(RealtimePersistenceEvent::Message(Box::new(
+                        crate::socket_mode::SocketModeMessageEvent {
+                            channel_id: "C1".into(),
+                            message: SlackMessage {
+                                ts: ts.into(),
+                                user: Some("U_OTHER".into()),
+                                text: Some(format!("message {ts}")),
+                                ..Default::default()
+                            },
+                            kind: SocketModeMessageKind::Posted,
+                        },
+                    )))
+                    .await
+                    .unwrap();
+            }
+            drop(sender);
+            worker.await.unwrap();
+
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            assert_eq!(history.len(), 2);
+            let conversation = store.load_conversations().await.unwrap().unwrap().remove(0);
+            assert_eq!(conversation.unread_activity_count(), 2);
+            let _ = std::fs::remove_dir_all(directory);
         });
     }
 

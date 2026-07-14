@@ -362,6 +362,7 @@ mod tests {
                         .store_user_search_aliases(&user_aliases)
                         .await
                         .unwrap();
+                    store.ensure_workspace_identity().await.unwrap();
                 });
             return;
         }

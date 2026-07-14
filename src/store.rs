@@ -51,7 +51,9 @@ impl WorkspaceStore {
     /// Records the opaque workspace identity needed by desktop integrations,
     /// including when an older cache is opened while offline.
     pub async fn ensure_workspace_identity(&self) -> Result<()> {
-        self.update_state(|_| {}).await
+        let _guard = self.update_lock.lock().await;
+        let state = self.load_state_for_update().await?;
+        self.store_state_with_activation(&state, true).await
     }
 
     pub async fn load_pending_unread_refresh(&self) -> Result<Vec<String>> {
@@ -577,12 +579,20 @@ impl WorkspaceStore {
     }
 
     async fn store_state(&self, state: &CachedWorkspaceState) -> Result<()> {
+        self.store_state_with_activation(state, false).await
+    }
+
+    async fn store_state_with_activation(
+        &self,
+        state: &CachedWorkspaceState,
+        activate: bool,
+    ) -> Result<()> {
         let directory = self.directory.clone();
         let workspace_key = self.workspace_key.clone();
         let state = state.clone();
         tokio::task::spawn_blocking(move || {
             let mut connection = open_database(&directory)?;
-            store_sqlite_state(&mut connection, &workspace_key, &state)
+            store_sqlite_state(&mut connection, &workspace_key, &state, activate)
         })
         .await
         .context("workspace cache writer stopped unexpectedly")?
@@ -822,6 +832,7 @@ fn store_sqlite_state(
     connection: &mut Connection,
     workspace_key: &str,
     state: &CachedWorkspaceState,
+    activate: bool,
 ) -> Result<()> {
     let desired = state_items(state)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -831,10 +842,12 @@ fn store_sqlite_state(
         params![workspace_key, state.workspace_id],
     )?;
     sync_state_items(&transaction, workspace_key, desired)?;
-    transaction.execute(
-        "UPDATE app_state SET active_workspace_key = ?1 WHERE singleton = 1",
-        [workspace_key],
-    )?;
+    if activate {
+        transaction.execute(
+            "UPDATE app_state SET active_workspace_key = ?1 WHERE singleton = 1",
+            [workspace_key],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -959,7 +972,7 @@ fn migrate_legacy_workspace(
         return Ok(());
     };
     state.workspace_id = workspace_id.to_string();
-    store_sqlite_state(connection, workspace_key, &state)?;
+    store_sqlite_state(connection, workspace_key, &state, false)?;
     remove_legacy_workspace_files(directory, workspace_key);
     Ok(())
 }
@@ -995,7 +1008,7 @@ fn migrate_legacy_active_workspace(connection: &mut Connection, directory: &Path
         (candidates.len() == 1).then(|| candidates.remove(0))
     };
     if let Some((workspace_key, state)) = candidate {
-        store_sqlite_state(connection, &workspace_key, &state)?;
+        store_sqlite_state(connection, &workspace_key, &state, true)?;
         remove_legacy_workspace_files(directory, &workspace_key);
         let _ = std::fs::remove_file(directory.join("active-workspace"));
     }
@@ -1251,6 +1264,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            store.ensure_workspace_identity().await.unwrap();
         });
 
         let search_state = load_active_search_state(&directory).unwrap().unwrap();
@@ -1287,9 +1301,22 @@ mod tests {
                 }])
                 .await
                 .unwrap();
+            store.ensure_workspace_identity().await.unwrap();
         });
 
         clear_active_workspace(&directory).unwrap();
+        runtime().block_on(async {
+            store
+                .store_history(
+                    "C1",
+                    &[SlackMessage {
+                        ts: "1.0".into(),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+        });
 
         assert!(load_active_search_state(&directory).unwrap().is_none());
         let cached = runtime().block_on(store.load_state()).unwrap().unwrap();
