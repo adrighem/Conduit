@@ -3402,9 +3402,7 @@ impl ConduitWindow {
         key: gtk::gdk::Key,
         state: gtk::gdk::ModifierType,
     ) -> Option<ComposerTarget> {
-        let Some(focus) = self.focus() else {
-            return None;
-        };
+        let focus = self.focus()?;
         let imp = self.imp();
         let is_within = |widget: &gtk::Widget| focus == *widget || focus.is_ancestor(widget);
         let main_entry = imp.message_entry.get().upcast::<gtk::Widget>();
