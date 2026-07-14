@@ -13,7 +13,7 @@ use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{SlackConversation, SlackMessage, SlackUnreadState, SlackUserStatus};
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 
-const CACHE_VERSION: u32 = 1;
+pub(crate) const CACHE_VERSION: u32 = 1;
 pub(crate) const SEARCH_INDEX_VERSION: u32 = 1;
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 const SEEN_REALTIME_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";

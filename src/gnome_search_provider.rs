@@ -16,7 +16,7 @@ use crate::sidebar::{
     conversation_kind, conversation_switcher_items_with_aliases, ConversationKind,
     UserSearchAliases,
 };
-use crate::store::SEARCH_INDEX_VERSION;
+use crate::store::{CACHE_VERSION, SEARCH_INDEX_VERSION};
 use crate::ConduitApplication;
 
 const OBJECT_PATH: &str = "/eu/vanadrighem/conduit/SearchProvider";
@@ -49,7 +49,7 @@ const INTERFACE_XML: &str = r#"
 </node>
 "#;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CachedSearchState {
     version: u32,
     #[serde(default)]
@@ -278,19 +278,74 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
 }
 
 fn cached_states(cache_dir: &Path) -> Vec<CachedSearchState> {
+    read_active_search_state(cache_dir)
+        .or_else(|| migrate_single_legacy_cache(cache_dir))
+        .into_iter()
+        .collect()
+}
+
+fn read_active_search_state(cache_dir: &Path) -> Option<CachedSearchState> {
     let key = fs::read_to_string(cache_dir.join("active-workspace"))
         .ok()
         .map(|key| key.trim().to_string())
-        .filter(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    let Some(key) = key else {
-        return Vec::new();
-    };
+        .filter(|key| is_workspace_key(key))?;
     fs::read_to_string(cache_dir.join(format!("{key}.search.json")))
         .ok()
         .and_then(|contents| serde_json::from_str::<CachedSearchState>(&contents).ok())
         .filter(|state| state.version == SEARCH_INDEX_VERSION)
-        .into_iter()
-        .collect()
+}
+
+fn migrate_single_legacy_cache(cache_dir: &Path) -> Option<CachedSearchState> {
+    let mut candidates = fs::read_dir(cache_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name().into_string().ok()?;
+            let key = file_name.strip_suffix(".json")?;
+            is_workspace_key(key).then(|| (key.to_string(), entry.path()))
+        })
+        .filter_map(|(key, path)| {
+            let contents = fs::read_to_string(path).ok()?;
+            let state = serde_json::from_str::<CachedSearchState>(&contents).ok()?;
+            (state.version == CACHE_VERSION && !state.workspace_id.trim().is_empty())
+                .then_some((key, state))
+        });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+
+    let (key, mut state) = candidate;
+    state.version = SEARCH_INDEX_VERSION;
+    persist_migrated_search_state(cache_dir, &key, &state).then_some(state)
+}
+
+fn persist_migrated_search_state(cache_dir: &Path, key: &str, state: &CachedSearchState) -> bool {
+    let search_path = cache_dir.join(format!("{key}.search.json"));
+    let search_tmp_path = search_path.with_extension("search.json.tmp");
+    let marker = cache_dir.join("active-workspace");
+    let marker_tmp = marker.with_extension("tmp");
+    let Some(serialized) = serde_json::to_string(state).ok() else {
+        return false;
+    };
+
+    if fs::write(&search_tmp_path, serialized).is_err()
+        || fs::rename(&search_tmp_path, &search_path).is_err()
+        || fs::write(&marker_tmp, key).is_err()
+        || fs::rename(&marker_tmp, &marker).is_err()
+    {
+        let _ = fs::remove_file(&search_tmp_path);
+        let _ = fs::remove_file(&marker_tmp);
+        return false;
+    }
+    true
+}
+
+fn is_workspace_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn current_user_id(workspace_id: &str) -> Option<&str> {
@@ -336,6 +391,12 @@ mod tests {
             state.to_string(),
         )
         .unwrap();
+    }
+
+    fn write_legacy_cache(directory: &Path, key: &str, mut state: serde_json::Value) {
+        fs::create_dir_all(directory).unwrap();
+        state["version"] = serde_json::json!(CACHE_VERSION);
+        fs::write(directory.join(format!("{key}.json")), state.to_string()).unwrap();
     }
 
     #[test]
@@ -510,6 +571,86 @@ mod tests {
         assert!(metadata.contains("BusName=eu.vanadrighem.conduit"));
         assert!(metadata.contains(&format!("ObjectPath={OBJECT_PATH}")));
         assert!(metadata.contains("Version=2"));
+    }
+
+    #[test]
+    fn migrates_a_single_legacy_workspace_for_provider_only_startup() {
+        const KEY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let directory = temp_dir();
+        write_legacy_cache(
+            &directory,
+            KEY,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [
+                    {"id": "C1", "name": "general", "is_channel": true}
+                ],
+                "messages": {"C1": [{"text": "must not enter the search index"}]}
+            }),
+        );
+
+        let results = search(&directory, &["gen".into()]);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            fs::read_to_string(directory.join("active-workspace")).unwrap(),
+            KEY
+        );
+        let index = fs::read_to_string(directory.join(format!("{KEY}.search.json"))).unwrap();
+        assert!(!index.contains("must not enter the search index"));
+        assert_eq!(
+            serde_json::from_str::<CachedSearchState>(&index)
+                .unwrap()
+                .version,
+            SEARCH_INDEX_VERSION
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn refuses_to_guess_between_multiple_legacy_workspaces() {
+        const KEY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const KEY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let directory = temp_dir();
+        for (key, workspace) in [(KEY_A, "T1:U1"), (KEY_B, "T2:U2")] {
+            write_legacy_cache(
+                &directory,
+                key,
+                serde_json::json!({
+                    "workspace_id": workspace,
+                    "conversations": [
+                        {"id": "C1", "name": "general", "is_channel": true}
+                    ]
+                }),
+            );
+        }
+
+        assert!(search(&directory, &["general".into()]).is_empty());
+        assert!(!directory.join("active-workspace").exists());
+        assert!(!directory.join(format!("{KEY_A}.search.json")).exists());
+        assert!(!directory.join(format!("{KEY_B}.search.json")).exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ignores_invalid_legacy_cache_candidates() {
+        const KEY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let directory = temp_dir();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(format!("{KEY}.json")),
+            serde_json::json!({
+                "version": CACHE_VERSION + 1,
+                "workspace_id": "T1:U1",
+                "conversations": [{"id": "C1", "name": "general", "is_channel": true}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(search(&directory, &["general".into()]).is_empty());
+        assert!(!directory.join("active-workspace").exists());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

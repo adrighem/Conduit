@@ -3,6 +3,14 @@ xvfb_run = find_program('xvfb-run', required: false)
 xdotool = find_program('xdotool', required: false)
 xfwm4 = find_program('xfwm4', required: false)
 
+test_service_conf = configuration_data()
+test_service_conf.set('bindir', meson.project_build_root() / 'src')
+configure_file(
+  input: '../data/eu.vanadrighem.conduit.service.in',
+  output: 'eu.vanadrighem.conduit.service',
+  configuration: test_service_conf,
+)
+
 test(
   'Search provider metadata',
   python,
@@ -21,6 +29,7 @@ if xvfb_run.found() and xfwm4.found()
       'CONDUIT_TEST_BINARY=' + meson.project_build_root() / 'src' / meson.project_name(),
       'CONDUIT_TEST_RESOURCE=' + meson.project_build_root() / 'src' / 'conduit.gresource',
       'CONDUIT_TEST_SCHEMA=' + meson.project_source_root() / 'data' / 'eu.vanadrighem.conduit.gschema.xml',
+      'CONDUIT_TEST_DBUS_SERVICE_DIR=' + meson.current_build_dir(),
       'GSETTINGS_BACKEND=memory',
       'GDK_DEBUG=no-portals',
       'GDK_BACKEND=x11',

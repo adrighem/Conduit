@@ -8,16 +8,23 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from xml.sax.saxutils import escape
 
 
 def run_test() -> int:
     with tempfile.TemporaryDirectory(prefix="conduit-dbus-") as temporary:
         config = Path(temporary) / "bus.conf"
+        service_dir = os.environ.get("CONDUIT_TEST_DBUS_SERVICE_DIR")
+        service_config = (
+            f"  <servicedir>{escape(service_dir)}</servicedir>\n"
+            if service_dir
+            else ""
+        )
         config.write_text(
-            """<busconfig>
+            f"""<busconfig>
   <type>session</type>
   <listen>unix:tmpdir=/tmp</listen>
-  <policy context="default">
+{service_config}  <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
     <allow own="*"/>
