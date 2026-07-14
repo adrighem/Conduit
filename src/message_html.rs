@@ -1059,6 +1059,11 @@ pre code {{
   background: var(--soft);
   color: var(--muted);
   font-size: 12px;
+  text-decoration: none;
+}}
+
+.reaction:hover {{
+  text-decoration: none;
 }}
 
 .reaction.thread-reaction {{
@@ -2323,7 +2328,7 @@ fn message_responses_html(
     message: &SlackMessage,
     context: &MessageHtmlContext,
 ) -> String {
-    let mut responses = reactions_html(message, context);
+    let mut responses = reactions_html(channel_id, message, context);
     responses.push_str(&thread_response_html(channel_id, message, context));
 
     if responses.is_empty() {
@@ -2333,7 +2338,11 @@ fn message_responses_html(
     }
 }
 
-fn reactions_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
+fn reactions_html(
+    channel_id: Option<&str>,
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+) -> String {
     message
         .reactions
         .as_ref()
@@ -2365,16 +2374,35 @@ fn reactions_html(message: &SlackMessage, context: &MessageHtmlContext) -> Strin
             let tooltip = if participants.is_empty() {
                 gettext("No participant details available")
             } else {
-                gettext("Reacted: {names}").replace("{names}", &participants.join(", "))
+                gettext("{names}: {reaction}")
+                    .replace("{names}", &participants.join(", "))
+                    .replace("{reaction}", &reaction_tooltip_text(name, context))
             };
-            Some(format!(
-                "<span class=\"reaction{}\" tabindex=\"0\" title=\"{}\" aria-label=\"{}\">{} {}</span>",
-                active_class,
-                escape_html(&tooltip),
-                escape_html(&tooltip),
-                reaction_label(name, context),
-                count
-            ))
+            let content = format!("{} {count}", reaction_label(name, context));
+            Some(if let Some(channel_id) = channel_id.filter(|_| !message.ts.is_empty()) {
+                format!(
+                    "<a class=\"reaction{}\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
+                    active_class,
+                    escape_html(&reaction_action_url(
+                        channel_id,
+                        message,
+                        name,
+                        !active,
+                        action_thread_ts(message, context),
+                    )),
+                    escape_html(&tooltip),
+                    escape_html(&tooltip),
+                    content,
+                )
+            } else {
+                format!(
+                    "<span class=\"reaction{}\" tabindex=\"0\" title=\"{}\" aria-label=\"{}\">{}</span>",
+                    active_class,
+                    escape_html(&tooltip),
+                    escape_html(&tooltip),
+                    content,
+                )
+            })
         })
         .collect::<String>()
 }
@@ -2669,6 +2697,13 @@ fn reaction_label(name: &str, context: &MessageHtmlContext) -> String {
         .resolve(name)
         .map(|value| emoji_value_html(&value, false))
         .unwrap_or_else(|| escape_html(&format!(":{name}:")))
+}
+
+fn reaction_tooltip_text(name: &str, context: &MessageHtmlContext) -> String {
+    match EmojiCatalog::new(&context.custom_emojis).resolve(name) {
+        Some(EmojiValue::Unicode(value)) => value.to_string(),
+        Some(EmojiValue::CustomImage(_)) | None => format!(":{name}:"),
+    }
 }
 
 fn mrkdwn_to_html(text: &str, context: &MessageHtmlContext) -> String {
@@ -3425,14 +3460,29 @@ mod tests {
         let mut message = message("threaded");
         message.reply_count = Some(3);
         message.is_starred = Some(true);
-        message.reactions = Some(vec![SlackReaction {
-            name: Some("thumbsup".to_string()),
-            count: Some(1),
-            users: Some(vec!["U999".to_string()]),
-        }]);
+        message.reactions = Some(vec![
+            SlackReaction {
+                name: Some("thumbsup".to_string()),
+                count: Some(3),
+                users: Some(vec![
+                    "U999".to_string(),
+                    "U456".to_string(),
+                    "U123".to_string(),
+                ]),
+            },
+            SlackReaction {
+                name: Some("eyes".to_string()),
+                count: Some(1),
+                users: Some(vec!["U456".to_string()]),
+            },
+        ]);
         let context = MessageHtmlContext {
             current_user_id: Some("U999".to_string()),
-            user_names: HashMap::from([("U999".to_string(), "Ada Lovelace".to_string())]),
+            user_names: HashMap::from([
+                ("U999".to_string(), "Ada Lovelace".to_string()),
+                ("U456".to_string(), "Grace Hopper".to_string()),
+                ("U123".to_string(), "Linus Torvalds".to_string()),
+            ]),
             recent_reactions: vec![
                 "heart".to_string(),
                 "thumbsup".to_string(),
@@ -3451,11 +3501,15 @@ mod tests {
         ));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
         assert!(html.contains(
+            "href=\"conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true\" title=\"Grace Hopper: 👀\""
+        ));
+        assert!(html.contains(
             "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true"
         ));
-        let reaction_chip = html.find("<span class=\"reaction is-active\"").unwrap();
-        assert!(html.contains("title=\"Reacted: Ada Lovelace\""));
-        assert!(html.contains("aria-label=\"Reacted: Ada Lovelace\""));
+        let reaction_chip = html.find("<a class=\"reaction is-active\"").unwrap();
+        assert!(html.contains("title=\"Ada Lovelace, Grace Hopper, Linus Torvalds: 👍\""));
+        assert!(html.contains("aria-label=\"Ada Lovelace, Grace Hopper, Linus Torvalds: 👍\""));
+        assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
         let thread_chip = html.find("<a class=\"reaction thread-reaction\"").unwrap();
         assert!(reaction_chip < thread_chip);
         assert!(html.contains("conduit://save?channel=C123&amp;ts=1710000000.000100&amp;add=false"));
@@ -3495,6 +3549,33 @@ mod tests {
             assert!(!html.contains(unavailable_action), "{unavailable_action}");
         }
         assert!(!html.contains("Remove +1"));
+    }
+
+    #[test]
+    fn reaction_chip_toggle_preserves_thread_context() {
+        let mut reply = message("reply");
+        reply.thread_ts = Some("1710000000.000000".to_string());
+        reply.reactions = Some(vec![SlackReaction {
+            name: Some("party_parrot".to_string()),
+            count: Some(1),
+            users: Some(vec!["U456".to_string()]),
+        }]);
+        let context = MessageHtmlContext {
+            current_user_id: Some("U999".to_string()),
+            user_names: HashMap::from([("U456".to_string(), "Grace Hopper".to_string())]),
+            custom_emojis: HashMap::from([(
+                "party_parrot".to_string(),
+                "https://example.com/party-parrot.gif".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[reply], &context);
+
+        assert!(html.contains(
+            "href=\"conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=party_parrot&amp;add=true&amp;thread_ts=1710000000.000000\""
+        ));
+        assert!(html.contains("title=\"Grace Hopper: :party_parrot:\""));
     }
 
     #[test]
