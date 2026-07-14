@@ -38,7 +38,6 @@ use crate::composer::{
     TextViewEnterAction,
 };
 use crate::config;
-use crate::conversation_catalog::ConversationCatalog;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::emoji::{
     emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
@@ -70,8 +69,8 @@ use crate::socket_mode::{
 use crate::thread_catalog::ThreadCatalog;
 use crate::workspace_state::{
     ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
-    ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceScrollBehavior, WorkspaceSnapshot,
-    WorkspaceViewState,
+    ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceScrollBehavior, WorkspaceSessionState,
+    WorkspaceSnapshot,
 };
 
 mod imp {
@@ -174,8 +173,7 @@ mod imp {
         pub settings: RefCell<Option<gio::Settings>>,
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
-        pub conversations: RefCell<Vec<SlackConversation>>,
-        pub(super) conversation_catalog: RefCell<ConversationCatalog>,
+        pub(super) workspace: WorkspaceSessionState,
         pub pending_opened_conversation_ids: RefCell<HashSet<String>>,
         pub discovered_channels: RefCell<Vec<SlackConversation>>,
         pub discovered_users: RefCell<Vec<SlackUser>>,
@@ -202,12 +200,10 @@ mod imp {
         pub pending_upload_drafts: RefCell<HashMap<DraftKey, Option<String>>>,
         pub sidebar_loading: Cell<bool>,
         pub sidebar_error: RefCell<Option<String>>,
-        pub(super) workspace_view: RefCell<WorkspaceViewState>,
         pub current_user_id: RefCell<Option<String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub thread_view: RefCell<Option<webkit6::WebView>>,
-        pub(super) thread_catalog: RefCell<ThreadCatalog>,
         pub image_assets: RefCell<HashMap<String, String>>,
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
@@ -2916,7 +2912,8 @@ impl ConduitWindow {
                     &imp.user_names.borrow(),
                     imp.current_user_id.borrow().as_deref(),
                 );
-                imp.conversation_catalog
+                imp.workspace
+                    .conversations
                     .borrow_mut()
                     .upsert_metadata(conversation);
                 imp.pending_opened_conversation_ids
@@ -2931,7 +2928,7 @@ impl ConduitWindow {
             } => {
                 let window_active = self.is_active();
                 let selected_channel = self.visible_channel_id();
-                let mut catalog = self.imp().conversation_catalog.borrow_mut();
+                let mut catalog = self.imp().workspace.conversations.borrow_mut();
                 for conversation in conversations {
                     catalog.upsert_metadata(conversation);
                 }
@@ -2982,7 +2979,7 @@ impl ConduitWindow {
                 MessageNotificationDelivery::Snapshot,
             ),
             RuntimeEventKind::ThreadCatalogLoaded(records) => {
-                *self.imp().thread_catalog.borrow_mut() = ThreadCatalog::from_records(records);
+                *self.imp().workspace.threads.borrow_mut() = ThreadCatalog::from_records(records);
                 if self.current_main_view() == MainMessageView::Threads {
                     self.populate_threads();
                 } else if self.current_main_view() == MainMessageView::Unreads {
@@ -2997,7 +2994,7 @@ impl ConduitWindow {
                 append_older,
                 cached,
             } => {
-                let outcome = self.imp().workspace_view.borrow_mut().apply_history(
+                let outcome = self.imp().workspace.view.borrow_mut().apply_history(
                     &channel_id,
                     messages,
                     has_more,
@@ -3008,7 +3005,8 @@ impl ConduitWindow {
                 if outcome.visible {
                     let rendered_messages = self
                         .imp()
-                        .workspace_view
+                        .workspace
+                        .view
                         .borrow()
                         .snapshot()
                         .channel_messages;
@@ -3041,7 +3039,7 @@ impl ConduitWindow {
                 next_cursor,
                 append_older,
             } => {
-                let outcome = self.imp().workspace_view.borrow_mut().apply_thread(
+                let outcome = self.imp().workspace.view.borrow_mut().apply_thread(
                     &channel_id,
                     &ts,
                     messages,
@@ -3052,7 +3050,8 @@ impl ConduitWindow {
                 if let ThreadApplyOutcome::Applied { scroll } = outcome {
                     let rendered_messages = self
                         .imp()
-                        .workspace_view
+                        .workspace
+                        .view
                         .borrow()
                         .snapshot()
                         .thread_messages;
@@ -3069,14 +3068,16 @@ impl ConduitWindow {
             RuntimeEventKind::MessageContextLoaded { location, messages } => {
                 let visible = self
                     .imp()
-                    .workspace_view
+                    .workspace
+                    .view
                     .borrow_mut()
                     .apply_message_context(&location, messages);
                 if visible {
                     if let Some(thread_ts) = location.thread_ts() {
                         let messages = self
                             .imp()
-                            .workspace_view
+                            .workspace
+                            .view
                             .borrow()
                             .current_thread_messages()
                             .to_vec();
@@ -3089,7 +3090,8 @@ impl ConduitWindow {
                     } else {
                         let messages = self
                             .imp()
-                            .workspace_view
+                            .workspace
+                            .view
                             .borrow()
                             .channel_messages(location.channel_id())
                             .to_vec();
@@ -3105,25 +3107,26 @@ impl ConduitWindow {
             RuntimeEventKind::SearchLoaded(results) => {
                 let visible = self
                     .imp()
-                    .workspace_view
+                    .workspace
+                    .view
                     .borrow_mut()
                     .apply_search_results(results);
                 if visible {
-                    let results = self.imp().workspace_view.borrow().search_results().to_vec();
+                    let results = self.imp().workspace.view.borrow().search_results().to_vec();
                     self.populate_search_results(results);
                 }
             }
             RuntimeEventKind::FilesLoaded(files) => {
-                let visible = self.imp().workspace_view.borrow_mut().apply_files(files);
+                let visible = self.imp().workspace.view.borrow_mut().apply_files(files);
                 if visible {
-                    let files = self.imp().workspace_view.borrow().files().to_vec();
+                    let files = self.imp().workspace.view.borrow().files().to_vec();
                     self.populate_files(files);
                 }
             }
             RuntimeEventKind::SavedItemsLoaded(items) => {
-                let visible = self.imp().workspace_view.borrow_mut().apply_saved(items);
+                let visible = self.imp().workspace.view.borrow_mut().apply_saved(items);
                 if visible {
-                    let items = self.imp().workspace_view.borrow().saved_items().to_vec();
+                    let items = self.imp().workspace.view.borrow().saved_items().to_vec();
                     self.populate_saved_items(items);
                 }
             }
@@ -3511,7 +3514,7 @@ impl ConduitWindow {
             self.select_conversation(&channel_id, &title);
         } else {
             let title = gettext("Select a conversation");
-            self.imp().workspace_view.borrow_mut().show_placeholder();
+            self.imp().workspace.view.borrow_mut().show_placeholder();
             self.imp().message_title.set_title(&title);
             self.show_message_placeholder(&title);
             self.render_closed_thread();
@@ -3522,7 +3525,7 @@ impl ConduitWindow {
 
     fn show_unreads(&self) {
         self.flush_current_drafts();
-        self.imp().workspace_view.borrow_mut().show_unreads();
+        self.imp().workspace.view.borrow_mut().show_unreads();
         self.render_closed_thread();
         let items = self.unread_items();
         self.populate_unreads(items);
@@ -3531,7 +3534,7 @@ impl ConduitWindow {
 
     fn show_threads(&self) {
         self.flush_current_drafts();
-        self.imp().workspace_view.borrow_mut().show_threads();
+        self.imp().workspace.view.borrow_mut().show_threads();
         self.render_closed_thread();
         self.populate_threads();
         self.imp().workspace_split.set_show_content(true);
@@ -3540,7 +3543,7 @@ impl ConduitWindow {
     fn show_files(&self) {
         self.flush_current_drafts();
         let title = gettext("Files");
-        self.imp().workspace_view.borrow_mut().start_files();
+        self.imp().workspace.view.borrow_mut().start_files();
         self.render_closed_thread();
         self.imp().message_title.set_title(&title);
         self.render_conversations();
@@ -3555,7 +3558,7 @@ impl ConduitWindow {
     fn show_later(&self) {
         self.flush_current_drafts();
         let title = gettext("Later");
-        self.imp().workspace_view.borrow_mut().start_saved();
+        self.imp().workspace.view.borrow_mut().start_saved();
         self.imp().message_title.set_title(&title);
         self.render_closed_thread();
         self.render_conversations();
@@ -3574,7 +3577,7 @@ impl ConduitWindow {
             return;
         }
         self.flush_current_drafts();
-        self.imp().workspace_view.borrow_mut().start_search();
+        self.imp().workspace.view.borrow_mut().start_search();
         let title = gettext("Search results");
         self.render_closed_thread();
         self.render_conversations();
@@ -3918,7 +3921,7 @@ impl ConduitWindow {
 
     fn close_thread(&self) {
         self.flush_current_drafts();
-        self.imp().workspace_view.borrow_mut().close_thread();
+        self.imp().workspace.view.borrow_mut().close_thread();
         self.render_closed_thread();
     }
 
@@ -3930,7 +3933,8 @@ impl ConduitWindow {
         }
         let outcome = self
             .imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .open_thread(channel_id, ts);
         self.restore_thread_draft(channel_id, ts);
@@ -3938,7 +3942,8 @@ impl ConduitWindow {
             ThreadOpenOutcome::RenderCurrent => {
                 let messages = self
                     .imp()
-                    .workspace_view
+                    .workspace
+                    .view
                     .borrow()
                     .current_thread_messages()
                     .to_vec();
@@ -3971,7 +3976,8 @@ impl ConduitWindow {
         }
         if !self
             .imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .focus_message(&location)
         {
@@ -4275,21 +4281,23 @@ impl ConduitWindow {
 
     fn find_message(&self, channel_id: &str, ts: &str) -> Option<SlackMessage> {
         self.imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow()
             .find_message(channel_id, ts)
     }
 
     fn note_thread_reply_posted(&self, channel_id: &str, thread_ts: &str) {
         let should_render = {
-            let mut state = self.imp().workspace_view.borrow_mut();
+            let mut state = self.imp().workspace.view.borrow_mut();
             state.increment_thread_reply(channel_id, thread_ts)
                 && state.visible_channel_id() == Some(channel_id)
         };
         if should_render {
             let messages = self
                 .imp()
-                .workspace_view
+                .workspace
+                .view
                 .borrow()
                 .channel_messages(channel_id)
                 .to_vec();
@@ -4304,7 +4312,7 @@ impl ConduitWindow {
     fn reload_after_message(&self, channel_id: &str, thread_ts: Option<&str>) {
         if let Some(thread_ts) = thread_ts {
             let should_load = {
-                let mut state = self.imp().workspace_view.borrow_mut();
+                let mut state = self.imp().workspace.view.borrow_mut();
                 state.visible_channel_id() == Some(channel_id)
                     && state.selected_thread_ts() == Some(thread_ts)
                     && state.begin_thread_history_request()
@@ -4355,7 +4363,7 @@ impl ConduitWindow {
         self.flush_current_drafts();
         self.close_media_viewer();
         let imp = self.imp();
-        imp.workspace_view.borrow_mut().reset();
+        imp.workspace.reset();
         *imp.current_user_id.borrow_mut() = None;
         *imp.workspace_id.borrow_mut() = None;
         imp.workspace_ready.set(false);
@@ -4363,11 +4371,8 @@ impl ConduitWindow {
         imp.local_read_ts_by_channel.borrow_mut().clear();
         imp.seen_realtime_messages.borrow_mut().clear();
         imp.pending_opened_conversation_ids.borrow_mut().clear();
-        *imp.thread_catalog.borrow_mut() = ThreadCatalog::default();
         imp.pending_sent_drafts.borrow_mut().clear();
         imp.pending_upload_drafts.borrow_mut().clear();
-        imp.conversations.borrow_mut().clear();
-        *imp.conversation_catalog.borrow_mut() = ConversationCatalog::default();
         imp.discovered_channels.borrow_mut().clear();
         imp.discovered_users.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
@@ -4454,7 +4459,7 @@ impl ConduitWindow {
         let imp = self.imp();
         if !imp.sidebar_loading.replace(true) {
             *imp.sidebar_error.borrow_mut() = None;
-            if imp.conversations.borrow().is_empty() {
+            if imp.workspace.conversations.borrow().is_empty() {
                 self.render_conversations();
             }
         }
@@ -4467,7 +4472,8 @@ impl ConduitWindow {
             RuntimeFailureRecovery::History(channel_id) => {
                 let outcome = self
                     .imp()
-                    .workspace_view
+                    .workspace
+                    .view
                     .borrow_mut()
                     .fail_history(&channel_id);
                 if outcome.active {
@@ -4483,7 +4489,8 @@ impl ConduitWindow {
             } => {
                 let outcome = self
                     .imp()
-                    .workspace_view
+                    .workspace
+                    .view
                     .borrow_mut()
                     .fail_thread(&channel_id, &thread_ts);
                 if outcome.active {
@@ -4494,7 +4501,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeFailureRecovery::Search => {
-                let outcome = self.imp().workspace_view.borrow_mut().fail_search();
+                let outcome = self.imp().workspace.view.borrow_mut().fail_search();
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
@@ -4503,7 +4510,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeFailureRecovery::Files => {
-                let outcome = self.imp().workspace_view.borrow_mut().fail_files();
+                let outcome = self.imp().workspace.view.borrow_mut().fail_files();
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
@@ -4512,7 +4519,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeFailureRecovery::SavedItems => {
-                let outcome = self.imp().workspace_view.borrow_mut().fail_saved();
+                let outcome = self.imp().workspace.view.borrow_mut().fail_saved();
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
@@ -4593,7 +4600,7 @@ impl ConduitWindow {
     }
 
     fn mutation_target_is_active(&self, channel_id: &str, thread_ts: Option<&str>) -> bool {
-        let state = self.imp().workspace_view.borrow();
+        let state = self.imp().workspace.view.borrow();
         mutation_target_is_active(
             state.visible_channel_id(),
             state.selected_thread_ts(),
@@ -4626,7 +4633,7 @@ impl ConduitWindow {
 
     fn patch_image_asset(&self, key: &str, source: Option<String>) {
         let (main_view, main_uses_asset, thread_uses_asset) = {
-            let state = self.imp().workspace_view.borrow();
+            let state = self.imp().workspace.view.borrow();
             let main = state.visible_channel_id().is_some_and(|channel_id| {
                 messages_use_image_asset(state.channel_messages(channel_id), key)
             });
@@ -4662,7 +4669,7 @@ impl ConduitWindow {
 
     fn set_sidebar_error(&self, error: &str) {
         let imp = self.imp();
-        let has_conversations = !imp.conversations.borrow().is_empty();
+        let has_conversations = !imp.workspace.conversations.borrow().is_empty();
         imp.sidebar_loading.set(false);
         *imp.sidebar_error.borrow_mut() = Some(error.to_string());
         if sidebar_error_change_needs_render(has_conversations) {
@@ -4677,7 +4684,7 @@ impl ConduitWindow {
             .collect::<HashSet<_>>();
         let pending_ids = self.imp().pending_opened_conversation_ids.borrow().clone();
         let preserve_opened = {
-            let catalog = self.imp().conversation_catalog.borrow();
+            let catalog = self.imp().workspace.conversations.borrow();
             pending_ids
                 .iter()
                 .filter(|id| !incoming_ids.contains(id.as_str()))
@@ -4685,7 +4692,7 @@ impl ConduitWindow {
                 .collect::<Vec<_>>()
         };
         {
-            let mut catalog = self.imp().conversation_catalog.borrow_mut();
+            let mut catalog = self.imp().workspace.conversations.borrow_mut();
             let mut snapshot = catalog.begin_membership_snapshot();
             for conversation in conversations {
                 snapshot.upsert(conversation);
@@ -4707,8 +4714,6 @@ impl ConduitWindow {
     fn sync_conversations_from_catalog(&self) {
         self.imp().sidebar_loading.set(false);
         *self.imp().sidebar_error.borrow_mut() = None;
-        *self.imp().conversations.borrow_mut() =
-            self.imp().conversation_catalog.borrow().conversations();
         self.request_conversation_user_names();
         self.render_conversations();
         if self.current_main_view() == MainMessageView::Unreads {
@@ -4752,7 +4757,7 @@ impl ConduitWindow {
 
         let should_render_sidebar = {
             let imp = self.imp();
-            let conversations = imp.conversations.borrow();
+            let conversations = imp.workspace.conversations.borrow().conversations();
             changed_user_ids.iter().any(|user_id| {
                 sidebar_user_name_update_needs_render(
                     &conversations,
@@ -4839,7 +4844,7 @@ impl ConduitWindow {
 
     fn patch_user_on_timelines(&self, user_id: &str) {
         let (main_view, main_uses_user, main_reaction_user, thread_uses_user, thread_reaction_user) = {
-            let state = self.imp().workspace_view.borrow();
+            let state = self.imp().workspace.view.borrow();
             let main_messages = state
                 .visible_channel_id()
                 .map(|channel_id| state.channel_messages(channel_id));
@@ -4944,11 +4949,10 @@ impl ConduitWindow {
 
     fn mark_conversation_locally_read(&self, channel_id: &str) {
         self.imp()
-            .conversation_catalog
+            .workspace
+            .conversations
             .borrow_mut()
             .mark_read(channel_id);
-        *self.imp().conversations.borrow_mut() =
-            self.imp().conversation_catalog.borrow().conversations();
     }
 
     fn apply_conversation_unread_state(&self, channel_id: &str, unread_state: SlackUnreadState) {
@@ -4965,7 +4969,8 @@ impl ConduitWindow {
 
         let previous = self
             .imp()
-            .conversation_catalog
+            .workspace
+            .conversations
             .borrow()
             .get(channel_id)
             .map(|conversation| {
@@ -4975,14 +4980,14 @@ impl ConduitWindow {
                 )
             });
         self.imp()
-            .conversation_catalog
+            .workspace
+            .conversations
             .borrow_mut()
             .apply_realtime_unread(channel_id, unread_state);
-        *self.imp().conversations.borrow_mut() =
-            self.imp().conversation_catalog.borrow().conversations();
         let current = self
             .imp()
-            .conversation_catalog
+            .workspace
+            .conversations
             .borrow()
             .get(channel_id)
             .map(|conversation| {
@@ -5004,26 +5009,27 @@ impl ConduitWindow {
     fn mark_conversation_locally_unread(&self, channel_id: &str) -> bool {
         let existing_unread_count = self
             .imp()
-            .conversation_catalog
+            .workspace
+            .conversations
             .borrow()
             .get(channel_id)
             .map(SlackConversation::unread_activity_count);
         let unread_count = existing_unread_count.unwrap_or_default().saturating_add(1);
         self.imp()
-            .conversation_catalog
+            .workspace
+            .conversations
             .borrow_mut()
             .apply_realtime_unread(
                 channel_id,
                 SlackUnreadState::from_parts(true, true, unread_count),
             );
-        *self.imp().conversations.borrow_mut() =
-            self.imp().conversation_catalog.borrow().conversations();
         existing_unread_count.is_some()
     }
 
     fn channel_load_more_url(&self, channel_id: &str) -> Option<String> {
         self.imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow()
             .channel_cursor(channel_id)
             .map(|cursor| message_html::load_more_action_url(channel_id, cursor, None))
@@ -5031,7 +5037,8 @@ impl ConduitWindow {
 
     fn thread_load_more_url(&self, channel_id: &str, ts: &str) -> Option<String> {
         self.imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow()
             .thread_cursor()
             .map(|cursor| message_html::load_more_action_url(channel_id, cursor, Some(ts)))
@@ -5041,7 +5048,7 @@ impl ConduitWindow {
         let started = Instant::now();
         self.sync_workspace_chrome();
         let imp = self.imp();
-        let conversations = imp.conversations.borrow().clone();
+        let conversations = imp.workspace.conversations.borrow().conversations();
         let user_names = imp.user_names.borrow().clone();
         let user_search_aliases = imp.user_search_aliases.borrow();
         let selected_channel = self.visible_channel_id();
@@ -5238,7 +5245,7 @@ impl ConduitWindow {
         F: Fn(&Self, SidebarRowAction) + 'static,
     {
         let imp = self.imp();
-        let conversations = imp.conversations.borrow().clone();
+        let conversations = imp.workspace.conversations.borrow().conversations();
         let user_names = imp.user_names.borrow().clone();
         let discovered_channels = imp.discovered_channels.borrow().clone();
         let discovered_users = imp.discovered_users.borrow().clone();
@@ -5361,10 +5368,11 @@ impl ConduitWindow {
         let query = view.search.text();
         let sections = {
             let imp = self.imp();
+            let conversations = imp.workspace.conversations.borrow().conversations();
             picker_sections(
                 view.include_discovery,
                 sidebar::ConversationPickerSource {
-                    conversations: &imp.conversations.borrow(),
+                    conversations: &conversations,
                     discovered_channels: &imp.discovered_channels.borrow(),
                     discovered_users: &imp.discovered_users.borrow(),
                     user_names: &imp.user_names.borrow(),
@@ -5461,10 +5469,10 @@ impl ConduitWindow {
     fn refresh_conversation_title_status(&self, channel_id: &str) {
         let imp = self.imp();
         let status = imp
+            .workspace
             .conversations
             .borrow()
-            .iter()
-            .find(|conversation| conversation.id == channel_id)
+            .get(channel_id)
             .filter(|conversation| conversation.is_im.unwrap_or(false))
             .and_then(|conversation| conversation.user.as_deref().map(str::to_string))
             .and_then(|user_id| imp.user_statuses.borrow().get(&user_id).cloned())
@@ -5494,7 +5502,7 @@ impl ConduitWindow {
 
     fn sync_workspace_chrome(&self) {
         let imp = self.imp();
-        let main_view = imp.workspace_view.borrow().main_view();
+        let main_view = imp.workspace.view.borrow().main_view();
         let selection = workspace_navigation_selection(main_view);
         imp.messages_button
             .set_active(selection == Some(WorkspaceNavigationSelection::Messages));
@@ -5525,10 +5533,11 @@ impl ConduitWindow {
         let imp = self.imp();
         self.withdraw_conversation_notification(channel_id);
         let outcome = imp
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .select_conversation(channel_id);
-        let current_messages = imp.workspace_view.borrow().snapshot().channel_messages;
+        let current_messages = imp.workspace.view.borrow().snapshot().channel_messages;
         imp.message_title.set_title(title);
         self.refresh_conversation_title_status(channel_id);
         self.restore_channel_draft(channel_id);
@@ -5581,7 +5590,8 @@ impl ConduitWindow {
     fn request_channel_history(&self, channel_id: &str) {
         if !self
             .imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .begin_history_request(channel_id)
         {
@@ -5595,7 +5605,8 @@ impl ConduitWindow {
 
     fn force_next_channel_bottom_render(&self, channel_id: &str) {
         self.imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .force_next_bottom(channel_id);
     }
@@ -5618,22 +5629,17 @@ impl ConduitWindow {
         imp.message_title
             .set_title(&self.conversation_title(channel_id));
         let mut context = self.message_html_context(None);
-        if !imp.workspace_view.borrow().has_channel_context(channel_id) {
+        if !imp.workspace.view.borrow().has_channel_context(channel_id) {
             context.load_more_url = self.channel_load_more_url(channel_id);
         }
-        let has_unread = imp
+        let (has_unread, last_read, unread_count) = imp
+            .workspace
             .conversations
             .borrow()
-            .iter()
-            .find(|conversation| conversation.id == channel_id)
-            .is_some_and(SlackConversation::has_unread_activity);
-        let (last_read, unread_count) = imp
-            .conversations
-            .borrow()
-            .iter()
-            .find(|conversation| conversation.id == channel_id)
+            .get(channel_id)
             .map(|conversation| {
                 (
+                    conversation.has_unread_activity(),
                     conversation
                         .extra
                         .get("last_read")
@@ -5649,7 +5655,8 @@ impl ConduitWindow {
         }
         context.timeline_scroll = scroll_behavior;
         let explicit_focus_ts = imp
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .take_channel_focus_for_render(channel_id, &messages);
         let unread_focus_ts = has_unread
@@ -5718,7 +5725,8 @@ impl ConduitWindow {
         self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(Some(ts));
         if !imp
-            .workspace_view
+            .workspace
+            .view
             .borrow()
             .has_thread_context(channel_id, ts)
         {
@@ -5726,7 +5734,8 @@ impl ConduitWindow {
         }
         context.timeline_scroll = scroll_behavior;
         let focus_message_ts = imp
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .take_thread_focus_for_render(channel_id, ts, &messages);
         let html = generate_html("thread", || {
@@ -5750,13 +5759,14 @@ impl ConduitWindow {
     fn populate_threads(&self) {
         let mut observed = self
             .imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow()
             .observed_threads()
             .into_iter()
             .map(|(channel_id, root)| ((channel_id, root.ts.clone()), root))
             .collect::<HashMap<_, _>>();
-        for record in self.imp().thread_catalog.borrow().records() {
+        for record in self.imp().workspace.threads.borrow().records() {
             if record.subscribed == Some(false) {
                 continue;
             }
@@ -5893,7 +5903,7 @@ impl ConduitWindow {
             SocketModeMessageKind::Deleted => RealtimeMessageKind::Deleted,
         };
         let (channel_dom_kind, thread_dom_kind) = {
-            let state = self.imp().workspace_view.borrow();
+            let state = self.imp().workspace.view.borrow();
             let channel_kind =
                 realtime_dom_patch_kind(kind, state.channel_messages(&channel_id), &message);
             let thread_kind = state
@@ -5908,14 +5918,16 @@ impl ConduitWindow {
 
         let outcome = self
             .imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .apply_realtime_message(&channel_id, message.clone(), kind);
 
         if outcome.render_channel {
             if self
                 .imp()
-                .workspace_view
+                .workspace
+                .view
                 .borrow()
                 .has_channel_context(&channel_id)
             {
@@ -5938,7 +5950,8 @@ impl ConduitWindow {
             if let Some(thread_ts) = self.selected_thread_ts() {
                 if self
                     .imp()
-                    .workspace_view
+                    .workspace
+                    .view
                     .borrow()
                     .has_thread_context(&channel_id, &thread_ts)
                 {
@@ -5998,14 +6011,16 @@ impl ConduitWindow {
         };
         let outcome = self
             .imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow_mut()
             .apply_reaction(&update);
 
         if outcome.changed {
             let updated_message = self
                 .imp()
-                .workspace_view
+                .workspace
+                .view
                 .borrow()
                 .find_message(&update.channel_id, &update.ts);
             let Some(updated_message) = updated_message else {
@@ -6086,10 +6101,10 @@ impl ConduitWindow {
 
     fn notification_conversation_state(&self, channel_id: &str) -> (bool, bool) {
         self.imp()
+            .workspace
             .conversations
             .borrow()
-            .iter()
-            .find(|conversation| conversation.id == channel_id)
+            .get(channel_id)
             .map(|conversation| {
                 (
                     conversation.has_unread_activity(),
@@ -6172,10 +6187,10 @@ impl ConduitWindow {
         let imp = self.imp();
         let user_names = imp.user_names.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
-        imp.conversations
+        imp.workspace
+            .conversations
             .borrow()
-            .iter()
-            .find(|conversation| conversation.id == channel_id)
+            .get(channel_id)
             .map(|conversation| {
                 conversation.display_name_with_users(&user_names, current_user_id.as_deref())
             })
@@ -6184,7 +6199,7 @@ impl ConduitWindow {
 
     fn unread_items(&self) -> Vec<ActivityItem> {
         let imp = self.imp();
-        let conversations = imp.conversations.borrow();
+        let conversations = imp.workspace.conversations.borrow().conversations();
         let user_names = imp.user_names.borrow();
         let current_user_id = imp.current_user_id.borrow();
         let mut items =
@@ -6199,7 +6214,7 @@ impl ConduitWindow {
             })
             .collect::<HashMap<_, _>>();
         items.extend(activity::build_thread_activity_items(
-            imp.thread_catalog.borrow().clone().into_records(),
+            imp.workspace.threads.borrow().clone().into_records(),
             &conversation_titles,
         ));
         activity::sort_activity_items(&mut items);
@@ -6303,8 +6318,10 @@ impl ConduitWindow {
     fn request_conversation_user_names(&self) {
         let mut ids = self
             .imp()
+            .workspace
             .conversations
             .borrow()
+            .conversations()
             .iter()
             .flat_map(SlackConversation::display_user_ids)
             .collect::<Vec<_>>();
@@ -6431,12 +6448,11 @@ impl ConduitWindow {
             .then(|| self.visible_channel_id())
             .flatten()
             .and_then(|channel_id| {
-                imp.conversations
+                imp.workspace
+                    .conversations
                     .borrow()
-                    .iter()
-                    .find(|conversation| {
-                        conversation.id == channel_id && conversation.is_im.unwrap_or(false)
-                    })
+                    .get(&channel_id)
+                    .filter(|conversation| conversation.is_im.unwrap_or(false))
                     .and_then(|conversation| conversation.user.clone())
             })
     }
@@ -6496,12 +6512,13 @@ impl ConduitWindow {
     }
 
     fn current_message_snapshot(&self) -> WorkspaceSnapshot {
-        self.imp().workspace_view.borrow().snapshot()
+        self.imp().workspace.view.borrow().snapshot()
     }
 
     fn selected_channel_id(&self) -> Option<String> {
         self.imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow()
             .last_channel_id()
             .map(ToString::to_string)
@@ -6509,7 +6526,8 @@ impl ConduitWindow {
 
     fn visible_channel_id(&self) -> Option<String> {
         self.imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow()
             .visible_channel_id()
             .map(ToString::to_string)
@@ -6517,14 +6535,15 @@ impl ConduitWindow {
 
     fn selected_thread_ts(&self) -> Option<String> {
         self.imp()
-            .workspace_view
+            .workspace
+            .view
             .borrow()
             .selected_thread_ts()
             .map(ToString::to_string)
     }
 
     fn current_main_view(&self) -> MainMessageView {
-        self.imp().workspace_view.borrow().main_view()
+        self.imp().workspace.view.borrow().main_view()
     }
 }
 

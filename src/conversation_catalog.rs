@@ -40,6 +40,10 @@ impl ConversationCatalog {
         self.entries.get(id).map(|entry| &entry.conversation)
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()

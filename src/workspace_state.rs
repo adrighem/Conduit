@@ -10,11 +10,33 @@
 //! This module deliberately has no dependency on GTK, WebKit, or the runtime. Callers apply
 //! the returned outcomes to their views and translate request decisions into runtime commands.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage, SlackReaction,
 };
+use crate::thread_catalog::ThreadCatalog;
+
+/// Canonical workspace-domain state owned by the window controller.
+///
+/// Keeping the catalogs and navigation state behind one owner makes session reset explicit and
+/// prevents the GTK layer from maintaining parallel conversation collections.
+#[derive(Debug, Default)]
+pub(crate) struct WorkspaceSessionState {
+    pub(crate) conversations: RefCell<ConversationCatalog>,
+    pub(crate) view: RefCell<WorkspaceViewState>,
+    pub(crate) threads: RefCell<ThreadCatalog>,
+}
+
+impl WorkspaceSessionState {
+    pub(crate) fn reset(&self) {
+        *self.conversations.borrow_mut() = ConversationCatalog::default();
+        self.view.borrow_mut().reset();
+        *self.threads.borrow_mut() = ThreadCatalog::default();
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum MainMessageView {
@@ -1106,6 +1128,25 @@ mod tests {
         assert!(!state.search_loading());
         assert!(!state.files_loading());
         assert!(!state.saved_loading());
+    }
+
+    #[test]
+    fn workspace_session_reset_clears_its_canonical_domain_state() {
+        let session = WorkspaceSessionState::default();
+        *session.conversations.borrow_mut() =
+            ConversationCatalog::from_cached([crate::models::SlackConversation {
+                id: "C1".to_string(),
+                ..Default::default()
+            }]);
+        session.view.borrow_mut().show_unreads();
+
+        session.reset();
+
+        assert!(session.conversations.borrow().is_empty());
+        assert_eq!(
+            session.view.borrow().main_view(),
+            MainMessageView::Placeholder
+        );
     }
 
     #[test]
