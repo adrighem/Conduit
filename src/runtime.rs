@@ -226,172 +226,240 @@ impl OperationContext {
     }
 }
 
-impl RuntimeCommand {
-    pub fn supersedes_previous(&self) -> bool {
-        !matches!(
-            self,
-            Self::SignOut
-                | Self::Disconnect
-                | Self::PostMessage { .. }
-                | Self::SetReaction { .. }
-                | Self::SetSaved { .. }
-                | Self::MarkThreadRead { .. }
-                | Self::UploadFile { .. }
-        )
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeCommandDescriptor {
+    context: OperationContext,
+    supersedes_previous: bool,
+    navigation_slot: Option<NavigationSlot>,
+    lane: RuntimeTaskLane,
+}
 
-    fn navigation_slot(&self) -> Option<NavigationSlot> {
-        match self {
-            Self::LoadHistory { .. }
-            | Self::LoadOlderHistory { .. }
-            | Self::SearchMessages { .. }
-            | Self::LoadFiles
-            | Self::LoadSavedItems => Some(NavigationSlot::Main),
-            Self::LoadThread { .. } | Self::LoadOlderThread { .. } => Some(NavigationSlot::Thread),
-            Self::LoadMessageContext(location) => Some(if location.thread_ts().is_some() {
-                NavigationSlot::Thread
-            } else {
-                NavigationSlot::Main
-            }),
-            _ => None,
+impl RuntimeCommandDescriptor {
+    fn request(context: OperationContext, lane: RuntimeTaskLane) -> Self {
+        Self {
+            context,
+            supersedes_previous: true,
+            navigation_slot: None,
+            lane,
         }
     }
 
-    pub fn operation_context(&self) -> OperationContext {
+    fn navigation(context: OperationContext, slot: NavigationSlot) -> Self {
+        Self {
+            context,
+            supersedes_previous: true,
+            navigation_slot: Some(slot),
+            lane: RuntimeTaskLane::Navigation,
+        }
+    }
+
+    fn mutation(context: OperationContext, lane: RuntimeTaskLane) -> Self {
+        Self {
+            context,
+            supersedes_previous: false,
+            navigation_slot: None,
+            lane,
+        }
+    }
+}
+
+impl RuntimeCommand {
+    fn descriptor(&self) -> RuntimeCommandDescriptor {
+        let workspace = |operation| OperationContext::new(operation, RuntimeTarget::Workspace);
+        let channel = |operation, channel_id: &str| {
+            OperationContext::new(operation, RuntimeTarget::Channel(channel_id.to_string()))
+        };
+        let thread = |operation, channel_id: &str, thread_ts: &str| {
+            OperationContext::new(
+                operation,
+                RuntimeTarget::Thread {
+                    channel_id: channel_id.to_string(),
+                    thread_ts: thread_ts.to_string(),
+                },
+            )
+        };
+
         match self {
-            Self::LoadStoredToken => {
-                OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace)
-            }
+            Self::LoadStoredToken => RuntimeCommandDescriptor::request(
+                workspace(RuntimeOperation::Startup),
+                RuntimeTaskLane::Interactive,
+            ),
             Self::StartOAuth { .. } | Self::StartBrowserSession { .. } => {
-                OperationContext::new(RuntimeOperation::Authenticate, RuntimeTarget::Workspace)
+                RuntimeCommandDescriptor::request(
+                    workspace(RuntimeOperation::Authenticate),
+                    RuntimeTaskLane::Interactive,
+                )
             }
-            Self::SignOut => {
-                OperationContext::new(RuntimeOperation::SignOut, RuntimeTarget::Workspace)
-            }
-            Self::Disconnect => {
-                OperationContext::new(RuntimeOperation::Disconnect, RuntimeTarget::Workspace)
-            }
-            Self::RefreshConversations => {
-                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
-            }
-            Self::DiscoverConversations => OperationContext::new(
-                RuntimeOperation::ConversationDiscovery,
-                RuntimeTarget::Workspace,
+            Self::SignOut => RuntimeCommandDescriptor::mutation(
+                workspace(RuntimeOperation::SignOut),
+                RuntimeTaskLane::Interactive,
             ),
-            Self::JoinConversation { channel_id } => OperationContext::new(
-                RuntimeOperation::OpenConversation,
-                RuntimeTarget::Channel(channel_id.clone()),
+            Self::Disconnect => RuntimeCommandDescriptor::mutation(
+                workspace(RuntimeOperation::Disconnect),
+                RuntimeTaskLane::Interactive,
             ),
-            Self::OpenDirectMessage { user_id } => OperationContext::new(
-                RuntimeOperation::OpenConversation,
-                RuntimeTarget::User(user_id.clone()),
+            Self::RefreshConversations => RuntimeCommandDescriptor::request(
+                workspace(RuntimeOperation::Conversations),
+                RuntimeTaskLane::Background,
             ),
-            Self::LoadHistory { channel_id } => OperationContext::new(
-                RuntimeOperation::History,
-                RuntimeTarget::Channel(channel_id.clone()),
+            Self::DiscoverConversations => RuntimeCommandDescriptor::request(
+                workspace(RuntimeOperation::ConversationDiscovery),
+                RuntimeTaskLane::Background,
             ),
-            Self::LoadOlderHistory { channel_id, .. } => OperationContext::new(
-                RuntimeOperation::OlderHistory,
-                RuntimeTarget::Channel(channel_id.clone()),
+            Self::JoinConversation { channel_id } => RuntimeCommandDescriptor::request(
+                channel(RuntimeOperation::OpenConversation, channel_id),
+                RuntimeTaskLane::Interactive,
             ),
-            Self::LoadThread { channel_id, ts } => OperationContext::new(
-                RuntimeOperation::Thread,
-                RuntimeTarget::Thread {
-                    channel_id: channel_id.clone(),
-                    thread_ts: ts.clone(),
+            Self::OpenDirectMessage { user_id } => RuntimeCommandDescriptor::request(
+                OperationContext::new(
+                    RuntimeOperation::OpenConversation,
+                    RuntimeTarget::User(user_id.clone()),
+                ),
+                RuntimeTaskLane::Interactive,
+            ),
+            Self::LoadHistory { channel_id } => RuntimeCommandDescriptor::navigation(
+                channel(RuntimeOperation::History, channel_id),
+                NavigationSlot::Main,
+            ),
+            Self::LoadOlderHistory { channel_id, .. } => RuntimeCommandDescriptor::navigation(
+                channel(RuntimeOperation::OlderHistory, channel_id),
+                NavigationSlot::Main,
+            ),
+            Self::LoadThread { channel_id, ts } => RuntimeCommandDescriptor::navigation(
+                thread(RuntimeOperation::Thread, channel_id, ts),
+                NavigationSlot::Thread,
+            ),
+            Self::LoadOlderThread { channel_id, ts, .. } => RuntimeCommandDescriptor::navigation(
+                thread(RuntimeOperation::OlderThread, channel_id, ts),
+                NavigationSlot::Thread,
+            ),
+            Self::LoadMessageContext(location) => RuntimeCommandDescriptor::navigation(
+                message_context_operation_context(location),
+                if location.thread_ts().is_some() {
+                    NavigationSlot::Thread
+                } else {
+                    NavigationSlot::Main
                 },
             ),
-            Self::LoadOlderThread { channel_id, ts, .. } => OperationContext::new(
-                RuntimeOperation::OlderThread,
-                RuntimeTarget::Thread {
-                    channel_id: channel_id.clone(),
-                    thread_ts: ts.clone(),
-                },
+            Self::SearchMessages { .. } => RuntimeCommandDescriptor::navigation(
+                workspace(RuntimeOperation::Search),
+                NavigationSlot::Main,
             ),
-            Self::LoadMessageContext(location) => message_context_operation_context(location),
-            Self::SearchMessages { .. } => {
-                OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace)
-            }
-            Self::LoadFiles => {
-                OperationContext::new(RuntimeOperation::Files, RuntimeTarget::Workspace)
-            }
-            Self::LoadSavedItems => {
-                OperationContext::new(RuntimeOperation::SavedItems, RuntimeTarget::Workspace)
-            }
-            Self::LoadUser { user_id } => {
-                OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone()))
-            }
-            Self::LoadImageAsset { key, .. } => OperationContext::new(
-                RuntimeOperation::ImageAsset,
-                RuntimeTarget::Image(key.clone()),
+            Self::LoadFiles => RuntimeCommandDescriptor::navigation(
+                workspace(RuntimeOperation::Files),
+                NavigationSlot::Main,
             ),
-            Self::LoadMedia { url, .. } => {
-                OperationContext::new(RuntimeOperation::Media, RuntimeTarget::Media(url.clone()))
-            }
-            Self::DownloadAttachment { url, .. } => OperationContext::new(
-                RuntimeOperation::AttachmentDownload,
-                RuntimeTarget::Attachment(url.clone()),
+            Self::LoadSavedItems => RuntimeCommandDescriptor::navigation(
+                workspace(RuntimeOperation::SavedItems),
+                NavigationSlot::Main,
             ),
-            Self::MarkConversationRead { channel_id, .. } => OperationContext::new(
-                RuntimeOperation::ReadMarker,
-                RuntimeTarget::Channel(channel_id.clone()),
+            Self::LoadUser { user_id } => RuntimeCommandDescriptor::request(
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone())),
+                RuntimeTaskLane::Background,
+            ),
+            Self::LoadImageAsset { key, .. } => RuntimeCommandDescriptor::request(
+                OperationContext::new(
+                    RuntimeOperation::ImageAsset,
+                    RuntimeTarget::Image(key.clone()),
+                ),
+                RuntimeTaskLane::Image,
+            ),
+            Self::LoadMedia { url, .. } => RuntimeCommandDescriptor::request(
+                OperationContext::new(RuntimeOperation::Media, RuntimeTarget::Media(url.clone())),
+                RuntimeTaskLane::Image,
+            ),
+            Self::DownloadAttachment { url, .. } => RuntimeCommandDescriptor::request(
+                OperationContext::new(
+                    RuntimeOperation::AttachmentDownload,
+                    RuntimeTarget::Attachment(url.clone()),
+                ),
+                RuntimeTaskLane::Image,
+            ),
+            Self::MarkConversationRead { channel_id, .. } => RuntimeCommandDescriptor::request(
+                channel(RuntimeOperation::ReadMarker, channel_id),
+                RuntimeTaskLane::Interactive,
             ),
             Self::MarkThreadRead {
                 channel_id,
                 thread_ts,
                 ..
-            } => OperationContext::new(
-                RuntimeOperation::ReadMarker,
-                RuntimeTarget::Thread {
-                    channel_id: channel_id.clone(),
-                    thread_ts: thread_ts.clone(),
-                },
+            } => RuntimeCommandDescriptor::mutation(
+                thread(RuntimeOperation::ReadMarker, channel_id, thread_ts),
+                RuntimeTaskLane::Interactive,
             ),
             Self::PostMessage {
                 channel_id,
                 thread_ts,
                 ..
-            } => OperationContext::new(
-                RuntimeOperation::PostMessage,
-                RuntimeTarget::Message {
-                    channel_id: channel_id.clone(),
-                    thread_ts: thread_ts.clone(),
-                },
+            } => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::PostMessage,
+                    RuntimeTarget::Message {
+                        channel_id: channel_id.clone(),
+                        thread_ts: thread_ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Interactive,
             ),
             Self::SetReaction {
                 channel_id,
                 thread_ts,
                 ..
-            } => OperationContext::new(
-                RuntimeOperation::Reaction,
-                RuntimeTarget::Message {
-                    channel_id: channel_id.clone(),
-                    thread_ts: thread_ts.clone(),
-                },
+            } => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::Reaction,
+                    RuntimeTarget::Message {
+                        channel_id: channel_id.clone(),
+                        thread_ts: thread_ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Interactive,
             ),
             Self::SetSaved {
                 channel_id,
                 thread_ts,
                 ..
-            } => OperationContext::new(
-                RuntimeOperation::Saved,
-                RuntimeTarget::Message {
-                    channel_id: channel_id.clone(),
-                    thread_ts: thread_ts.clone(),
-                },
+            } => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::Saved,
+                    RuntimeTarget::Message {
+                        channel_id: channel_id.clone(),
+                        thread_ts: thread_ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Interactive,
             ),
             Self::UploadFile {
                 channel_id,
                 thread_ts,
                 ..
-            } => OperationContext::new(
-                RuntimeOperation::FileUpload,
-                RuntimeTarget::Upload {
-                    channel_id: channel_id.clone(),
-                    thread_ts: thread_ts.clone(),
-                },
+            } => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::FileUpload,
+                    RuntimeTarget::Upload {
+                        channel_id: channel_id.clone(),
+                        thread_ts: thread_ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Upload,
             ),
         }
+    }
+
+    pub fn supersedes_previous(&self) -> bool {
+        self.descriptor().supersedes_previous
+    }
+
+    fn navigation_slot(&self) -> Option<NavigationSlot> {
+        self.descriptor().navigation_slot
+    }
+
+    fn task_lane(&self) -> RuntimeTaskLane {
+        self.descriptor().lane
+    }
+
+    pub fn operation_context(&self) -> OperationContext {
+        self.descriptor().context
     }
 }
 
@@ -1447,20 +1515,7 @@ fn dispatch_command(
                 ));
                 return;
             };
-            let lane = if command.navigation_slot().is_some() {
-                RuntimeTaskLane::Navigation
-            } else {
-                match &command {
-                    RuntimeCommand::LoadImageAsset { .. }
-                    | RuntimeCommand::LoadMedia { .. }
-                    | RuntimeCommand::DownloadAttachment { .. } => RuntimeTaskLane::Image,
-                    RuntimeCommand::UploadFile { .. } => RuntimeTaskLane::Upload,
-                    RuntimeCommand::RefreshConversations
-                    | RuntimeCommand::DiscoverConversations
-                    | RuntimeCommand::LoadUser { .. } => RuntimeTaskLane::Background,
-                    _ => RuntimeTaskLane::Interactive,
-                }
-            };
+            let lane = command.task_lane();
             let tracked_request = TrackedRequest::for_command(identity, &command);
             let image_cache = image_cache.clone();
             let limits = limits.clone();
@@ -4198,6 +4253,44 @@ mod tests {
             thread_context.navigation_slot(),
             Some(NavigationSlot::Thread)
         );
+    }
+
+    #[test]
+    fn runtime_command_descriptor_owns_scheduling_policy() {
+        let main_navigation = RuntimeCommand::LoadFiles.descriptor();
+        assert_eq!(main_navigation.lane, RuntimeTaskLane::Navigation);
+        assert_eq!(main_navigation.navigation_slot, Some(NavigationSlot::Main));
+        assert!(main_navigation.supersedes_previous);
+
+        let background = RuntimeCommand::DiscoverConversations.descriptor();
+        assert_eq!(background.lane, RuntimeTaskLane::Background);
+        assert_eq!(background.navigation_slot, None);
+
+        let image = RuntimeCommand::LoadImageAsset {
+            key: "preview".to_string(),
+            url: "https://files.slack.com/preview".to_string(),
+        }
+        .descriptor();
+        assert_eq!(image.lane, RuntimeTaskLane::Image);
+
+        let upload = RuntimeCommand::UploadFile {
+            channel_id: "C123".to_string(),
+            thread_ts: None,
+            path: PathBuf::from("upload.png"),
+            initial_comment: None,
+            remove_after_upload: false,
+        }
+        .descriptor();
+        assert_eq!(upload.lane, RuntimeTaskLane::Upload);
+        assert!(!upload.supersedes_previous);
+
+        let interactive = RuntimeCommand::MarkConversationRead {
+            channel_id: "C123".to_string(),
+            ts: "1710000000.000100".to_string(),
+        }
+        .descriptor();
+        assert_eq!(interactive.lane, RuntimeTaskLane::Interactive);
+        assert!(interactive.supersedes_previous);
     }
 
     #[test]
