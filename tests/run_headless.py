@@ -13,6 +13,12 @@ from xml.sax.saxutils import escape
 
 def run_test() -> int:
     with tempfile.TemporaryDirectory(prefix="conduit-dbus-") as temporary:
+        environment = os.environ.copy()
+        # Headless/containerized test environments commonly disallow the user
+        # namespaces required by WebKit's Bubblewrap sandbox. The activated
+        # service inherits the D-Bus daemon's environment, so this must be set
+        # before that daemon starts.
+        environment["WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"] = "1"
         config = Path(temporary) / "bus.conf"
         service_dir = os.environ.get("CONDUIT_TEST_DBUS_SERVICE_DIR")
         service_config = (
@@ -40,17 +46,12 @@ def run_test() -> int:
                 "--print-address=1",
                 "--print-pid=1",
             ],
+            env=environment,
             check=True,
             capture_output=True,
             text=True,
         ).stdout.splitlines()
-        environment = os.environ.copy()
         environment["DBUS_SESSION_BUS_ADDRESS"] = output[0]
-        # Headless/containerized test environments commonly disallow the user
-        # namespaces required by WebKit's Bubblewrap sandbox. This process is
-        # already isolated to a disposable X display and D-Bus session, so
-        # disable that nested sandbox only for the UI test and its children.
-        environment["WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"] = "1"
         window_manager = subprocess.Popen(
             ["xfwm4", "--replace"],
             env=environment,
