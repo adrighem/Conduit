@@ -523,18 +523,22 @@ impl SlackApi {
             return Err(anyhow!("Slack attachment preview is too large"));
         }
 
-        let bytes = response
-            .bytes()
+        let initial_capacity = response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(max_bytes);
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .context("failed to read Slack attachment preview bytes")?;
-        if bytes.len() > max_bytes {
-            return Err(anyhow!("Slack attachment preview is too large"));
+            .context("failed to read Slack attachment preview bytes")?
+        {
+            append_bounded_preview_chunk(&mut bytes, &chunk, max_bytes)?;
         }
 
-        Ok(DownloadedPreviewAsset {
-            mime_type,
-            bytes: bytes.to_vec(),
-        })
+        Ok(DownloadedPreviewAsset { mime_type, bytes })
     }
 
     /// Downloads viewable Slack media to `destination` without retaining the
@@ -1182,6 +1186,18 @@ fn ensure_trusted_slack_download_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+fn append_bounded_preview_chunk(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<()> {
+    let next_size = bytes
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| anyhow!("Slack attachment preview is too large"))?;
+    if next_size > max_bytes {
+        return Err(anyhow!("Slack attachment preview is too large"));
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
 fn supported_media_mime_type(content_type: &str) -> Option<&str> {
     let mime_type = content_type.split(';').next()?.trim();
     (mime_type.starts_with("image/")
@@ -1699,6 +1715,17 @@ mod tests {
         assert!(ensure_media_size(None).is_ok());
         assert!(ensure_media_size(Some(MAX_MEDIA_DOWNLOAD_BYTES)).is_ok());
         assert!(ensure_media_size(Some(MAX_MEDIA_DOWNLOAD_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn preview_chunks_are_rejected_before_exceeding_the_memory_limit() {
+        let mut bytes = vec![1, 2];
+        append_bounded_preview_chunk(&mut bytes, &[3, 4], 4).unwrap();
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+
+        let error = append_bounded_preview_chunk(&mut bytes, &[5], 4).unwrap_err();
+        assert!(error.to_string().contains("too large"));
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
     }
 
     #[test]
