@@ -351,15 +351,18 @@ fn sidebar_row_action_for_index(
 
 fn picker_sections(
     include_discovery: bool,
-    conversations: &[SlackConversation],
-    discovered_channels: &[SlackConversation],
-    discovered_users: &[SlackUser],
-    user_names: &HashMap<String, String>,
-    current_user_id: Option<&str>,
+    source: sidebar::ConversationPickerSource<'_>,
     query: &str,
-    user_search_aliases: &sidebar::UserSearchAliases,
-    user_statuses: &sidebar::UserStatuses,
 ) -> ConversationPickerSections {
+    let sidebar::ConversationPickerSource {
+        conversations,
+        discovered_channels,
+        discovered_users,
+        user_names,
+        current_user_id,
+        known_user_search_aliases,
+        user_statuses,
+    } = source;
     let channels = if include_discovery {
         discovered_channels
     } else {
@@ -371,14 +374,16 @@ fn picker_sections(
         &[]
     };
     sidebar::conversation_picker_sections_with_statuses(
-        conversations,
-        channels,
-        users,
-        user_names,
-        current_user_id,
+        sidebar::ConversationPickerSource {
+            conversations,
+            discovered_channels: channels,
+            discovered_users: users,
+            user_names,
+            current_user_id,
+            known_user_search_aliases,
+            user_statuses,
+        },
         query,
-        user_search_aliases,
-        user_statuses,
     )
 }
 
@@ -4467,14 +4472,16 @@ impl ConduitWindow {
         let user_statuses = imp.user_statuses.borrow().clone();
         let sections = picker_sections(
             include_discovery,
-            &conversations,
-            &discovered_channels,
-            &discovered_users,
-            &user_names,
-            current_user_id.as_deref(),
+            sidebar::ConversationPickerSource {
+                conversations: &conversations,
+                discovered_channels: &discovered_channels,
+                discovered_users: &discovered_users,
+                user_names: &user_names,
+                current_user_id: current_user_id.as_deref(),
+                known_user_search_aliases: &user_search_aliases,
+                user_statuses: &user_statuses,
+            },
             "",
-            &user_search_aliases,
-            &user_statuses,
         );
         if picker_sections_empty(&sections) {
             self.set_status("No conversations loaded");
@@ -4581,14 +4588,16 @@ impl ConduitWindow {
             let imp = self.imp();
             picker_sections(
                 view.include_discovery,
-                &imp.conversations.borrow(),
-                &imp.discovered_channels.borrow(),
-                &imp.discovered_users.borrow(),
-                &imp.user_names.borrow(),
-                imp.current_user_id.borrow().as_deref(),
+                sidebar::ConversationPickerSource {
+                    conversations: &imp.conversations.borrow(),
+                    discovered_channels: &imp.discovered_channels.borrow(),
+                    discovered_users: &imp.discovered_users.borrow(),
+                    user_names: &imp.user_names.borrow(),
+                    current_user_id: imp.current_user_id.borrow().as_deref(),
+                    known_user_search_aliases: &imp.user_search_aliases.borrow(),
+                    user_statuses: &imp.user_statuses.borrow(),
+                },
                 query.as_str(),
-                &imp.user_search_aliases.borrow(),
-                &imp.user_statuses.borrow(),
             )
         };
         self.populate_conversation_picker_list(&view.list, &view.actions, &sections);

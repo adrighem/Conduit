@@ -225,3 +225,13 @@
   - strict Clippy: unavailable locally
 - The installed maintainer package contains no referenced triage script or reference guides, so this run used the documented manual fallback.
 - No public issue/PR or repository-setting action was taken.
+
+## 2026-07-14 Post-Feature Audit
+
+- GitHub backlog: 7 open issues (ISSUE:1–7), 0 open pull requests, 0 unread notifications, 0 Dependabot alerts, and 0 code-scanning alerts.
+- Commit `8b3965d` implements the core behavior across all seven issues, but acceptance review recommends closing only ISSUE:1, ISSUE:4, and ISSUE:6 after green CI.
+- Keep ISSUE:2 open for bounded attachment-cache eviction, ISSUE:3 for conversation-pane-wide paste, ISSUE:5 for a genuinely shared picker boundary, and ISSUE:7 for subsearch/metadata hardening and installed GNOME validation.
+- CodeQL run `29325605218` passed. CI run `29325605695` failed at strict Clippy before tests and Meson ran; the minimal fix is validated in a local commit awaiting push approval.
+- Local baseline before the lint fix: 327 Rust tests and all 4 Meson tests passed.
+- The installed maintainer package still lacks its referenced scripts and reference guides, so this run used `gh-helper`, `gh`, and manual intent/decision analysis.
+- No public issue, label, closure, release, or repository-setting action was taken.

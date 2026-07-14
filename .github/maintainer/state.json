@@ -1,21 +1,21 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-14-maintainer-pass",
-  "last_known_open_issues": 1,
+  "last_manual_run": "2026-07-14-post-feature-audit",
+  "last_known_open_issues": 7,
   "last_known_open_pull_requests": 0,
-  "last_known_total_issues": 1,
+  "last_known_total_issues": 7,
   "last_known_total_pull_requests": 0,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 290 tests",
+    "cargo_test": "pass: 327 tests",
     "meson_compile": "pass",
     "meson_test": "pass",
-    "github_actions": "latest CI and CodeQL passed on f03ed8b",
+    "github_actions": "CodeQL passed on 8b3965d; CI 29325605695 failed strict Clippy before tests",
     "cargo_clippy": "not available locally"
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
     "clippy": "CI tracks stable Clippy and treats warnings as errors",
-    "worktree": "validated DM synchronization fix and maintainer memory are local and uncommitted; ISSUE:1 is next"
+    "worktree": "clean; main has one validated strict-Clippy fix commit awaiting push approval"
   }
 }

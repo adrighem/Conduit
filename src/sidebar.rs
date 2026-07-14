@@ -234,7 +234,7 @@ impl SidebarRowModel {
             external: conversation.is_external_conversation(),
             search_aliases,
             status: (kind == ConversationKind::DirectMessage)
-                .then(|| conversation.user.as_deref())
+                .then_some(conversation.user.as_deref())
                 .flatten()
                 .and_then(|user_id| active_user_status(user_statuses, user_id)),
         }
@@ -461,27 +461,42 @@ pub fn conversation_picker_sections_with_aliases(
     known_user_search_aliases: &UserSearchAliases,
 ) -> ConversationPickerSections {
     conversation_picker_sections_with_statuses(
+        ConversationPickerSource {
+            conversations,
+            discovered_channels,
+            discovered_users,
+            user_names,
+            current_user_id,
+            known_user_search_aliases,
+            user_statuses: &HashMap::new(),
+        },
+        query,
+    )
+}
+
+pub struct ConversationPickerSource<'a> {
+    pub conversations: &'a [SlackConversation],
+    pub discovered_channels: &'a [SlackConversation],
+    pub discovered_users: &'a [SlackUser],
+    pub user_names: &'a HashMap<String, String>,
+    pub current_user_id: Option<&'a str>,
+    pub known_user_search_aliases: &'a UserSearchAliases,
+    pub user_statuses: &'a UserStatuses,
+}
+
+pub fn conversation_picker_sections_with_statuses(
+    source: ConversationPickerSource<'_>,
+    query: &str,
+) -> ConversationPickerSections {
+    let ConversationPickerSource {
         conversations,
         discovered_channels,
         discovered_users,
         user_names,
         current_user_id,
-        query,
         known_user_search_aliases,
-        &HashMap::new(),
-    )
-}
-
-pub fn conversation_picker_sections_with_statuses(
-    conversations: &[SlackConversation],
-    discovered_channels: &[SlackConversation],
-    discovered_users: &[SlackUser],
-    user_names: &HashMap<String, String>,
-    current_user_id: Option<&str>,
-    query: &str,
-    known_user_search_aliases: &UserSearchAliases,
-    user_statuses: &UserStatuses,
-) -> ConversationPickerSections {
+        user_statuses,
+    } = source;
     let search_query = SearchQuery::parse(query);
     let mut all_user_search_aliases = known_user_search_aliases.clone();
     all_user_search_aliases.extend(user_search_aliases(discovered_users));

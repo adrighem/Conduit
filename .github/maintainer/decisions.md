@@ -100,3 +100,10 @@
 - Treat ISSUE:1 as the next focused bug. Its quick-action toolbar is pinned by pointer focus through `:focus-within`; fix it without weakening keyboard access.
 - Defer repository ruleset changes until explicit approval because they alter public repository policy. Update `actions/checkout` separately from product fixes.
 - No issue comment, label, closure, pull request, release, or repository-setting change was made.
+
+## 2026-07-14 Post-Feature Audit
+
+- Do not bulk-close ISSUE:1–7 solely from commit footers. ISSUE:1, ISSUE:4, and ISSUE:6 are closure-ready once remote CI is green; ISSUE:2, ISSUE:3, ISSUE:5, and ISSUE:7 retain concrete acceptance gaps.
+- Treat CI run `29325605695` as the immediate blocker: stable Clippy rejected three newly introduced patterns before tests or Meson validation ran.
+- Keep the fix behavioral and local: use eager `then_some` and reduce picker function argument counts through context structures rather than lint suppression.
+- CodeQL and enabled GitHub security scanning are clean. No public issue, label, closure, release, or repository-setting action was taken.
