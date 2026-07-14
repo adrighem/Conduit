@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -16,6 +18,8 @@ use crate::{config, models::StoredToken};
 
 const KEYRING_SERVICE: &str = "eu.vanadrighem.conduit";
 const KEYRING_USER: &str = "slack-user-token";
+const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+const OAUTH_CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8934;
 pub const DEFAULT_USER_SCOPES: &[&str] = &[
@@ -305,7 +309,9 @@ async fn wait_for_oauth_callback(
     expected_state: String,
     debug: bool,
 ) -> Result<OAuthCallback> {
-    tokio::task::spawn_blocking(move || {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut cancellation_guard = CancelBlockingCallbackOnDrop::new(Arc::clone(&cancelled));
+    let callback = tokio::task::spawn_blocking(move || {
         let addr = SocketAddr::from(([127, 0, 0, 1], redirect_port));
         auth_debug(debug, &format!("binding local callback server on {addr}"));
         let server = Server::http(addr)
@@ -314,16 +320,69 @@ async fn wait_for_oauth_callback(
         auth_debug(debug, "opening authorization URL in default browser");
         open::that_detached(&authorize_url).context("failed to open Slack authorization URL")?;
 
-        auth_debug(debug, "waiting up to 300 seconds for Slack callback");
-        let request = server
-            .recv_timeout(Duration::from_secs(300))
+        receive_oauth_callback(&server, &expected_state, &cancelled, debug)
+    })
+    .await??;
+    cancellation_guard.disarm();
+    Ok(callback)
+}
+
+struct CancelBlockingCallbackOnDrop {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancelBlockingCallbackOnDrop {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelBlockingCallbackOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn receive_oauth_callback(
+    server: &Server,
+    expected_state: &str,
+    cancelled: &AtomicBool,
+    debug: bool,
+) -> Result<OAuthCallback> {
+    auth_debug(debug, "waiting up to 300 seconds for Slack callback");
+    let deadline = Instant::now() + OAUTH_CALLBACK_TIMEOUT;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(anyhow!("Slack authorization was cancelled"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("Slack authorization timed out"));
+        }
+        let Some(request) = server
+            .recv_timeout(remaining.min(OAUTH_CALLBACK_POLL_INTERVAL))
             .context("failed to receive OAuth callback")?
-            .ok_or_else(|| anyhow!("Slack authorization timed out"))?;
+        else {
+            continue;
+        };
         let callback_url = Url::parse(&format!("http://127.0.0.1{}", request.url()))
             .context("failed to parse OAuth callback URL")?;
         let params: HashMap<String, String> = callback_url.query_pairs().into_owned().collect();
 
-        let state_ok = params.get("state").map(String::as_str) == Some(expected_state.as_str());
+        let state_ok = params.get("state").map(String::as_str) == Some(expected_state);
+        let terminal = callback_url.path() == "/callback"
+            && state_ok
+            && (params.contains_key("code") || params.contains_key("error"));
         auth_debug(
             debug,
             &format!(
@@ -334,25 +393,31 @@ async fn wait_for_oauth_callback(
                 params.contains_key("code")
             ),
         );
-        let success = state_ok && params.contains_key("code");
-        let page = callback_page(success);
-        let mut response = Response::from_string(page).with_status_code(if success {
-            StatusCode(200)
-        } else {
-            StatusCode(400)
-        });
-        if let Ok(header) = Header::from_bytes("Content-Type", "text/html; charset=utf-8") {
-            response = response.with_header(header);
+        let success = terminal && params.contains_key("code") && !params.contains_key("error");
+        respond_to_oauth_request(request, success);
+        if !terminal {
+            continue;
         }
-        let _ = request.respond(response);
 
-        Ok(OAuthCallback {
+        return Ok(OAuthCallback {
             code: params.get("code").cloned(),
             state: params.get("state").cloned(),
             error: params.get("error").cloned(),
-        })
-    })
-    .await?
+        });
+    }
+}
+
+fn respond_to_oauth_request(request: tiny_http::Request, success: bool) {
+    let page = callback_page(success);
+    let mut response = Response::from_string(page).with_status_code(if success {
+        StatusCode(200)
+    } else {
+        StatusCode(400)
+    });
+    if let Ok(header) = Header::from_bytes("Content-Type", "text/html; charset=utf-8") {
+        response = response.with_header(header);
+    }
+    let _ = request.respond(response);
 }
 
 fn callback_page(success: bool) -> &'static str {
@@ -500,7 +565,31 @@ fn auth_debug(enabled: bool, message: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
     use super::*;
+
+    fn callback_server() -> (SocketAddr, Server) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        (address, Server::http(address).unwrap())
+    }
+
+    fn send_callback_request(address: SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(address).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
 
     #[test]
     fn builds_user_token_authorize_url() {
@@ -536,6 +625,41 @@ mod tests {
             Some("S256")
         );
         assert_eq!(params.get("state").map(String::as_str), Some("state"));
+    }
+
+    #[test]
+    fn oauth_callback_ignores_unrelated_requests_until_valid_callback() {
+        let (address, server) = callback_server();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let receiver_cancelled = Arc::clone(&cancelled);
+        let receiver = thread::spawn(move || {
+            receive_oauth_callback(&server, "expected", &receiver_cancelled, false)
+        });
+
+        let rejected = send_callback_request(address, "/callback?code=wrong&state=unexpected");
+        assert!(rejected.starts_with("HTTP/1.1 400"));
+        let accepted = send_callback_request(address, "/callback?code=valid&state=expected");
+        assert!(accepted.starts_with("HTTP/1.1 200"));
+
+        let callback = receiver.join().unwrap().unwrap();
+        assert_eq!(callback.code.as_deref(), Some("valid"));
+        assert_eq!(callback.state.as_deref(), Some("expected"));
+    }
+
+    #[test]
+    fn cancelled_oauth_callback_releases_its_listener_promptly() {
+        let (address, server) = callback_server();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let receiver_cancelled = Arc::clone(&cancelled);
+        let receiver = thread::spawn(move || {
+            receive_oauth_callback(&server, "expected", &receiver_cancelled, false)
+        });
+
+        cancelled.store(true, Ordering::Release);
+        let error = receiver.join().unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        TcpListener::bind(address).expect("OAuth callback listener was not released");
     }
 
     #[test]
