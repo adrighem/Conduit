@@ -573,15 +573,17 @@ fn auth_debug(enabled: bool, message: &str) {
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex;
     use std::thread;
 
     use super::*;
 
+    static CALLBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn callback_server() -> (SocketAddr, Server) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        (address, Server::http(address).unwrap())
+        let server = Server::http(("127.0.0.1", 0)).unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        (address, server)
     }
 
     fn send_callback_request(address: SocketAddr, path: &str) -> String {
@@ -595,6 +597,17 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
+    }
+
+    fn wait_for_listener_release(address: SocketAddr) -> TcpListener {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match TcpListener::bind(address) {
+                Ok(listener) => return listener,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Err(error) => panic!("OAuth callback listener was not released: {error}"),
+            }
+        }
     }
 
     #[test]
@@ -635,6 +648,9 @@ mod tests {
 
     #[test]
     fn oauth_callback_ignores_unrelated_requests_until_valid_callback() {
+        let _test_guard = CALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (address, server) = callback_server();
         let cancelled = Arc::new(AtomicBool::new(false));
         let receiver_cancelled = Arc::clone(&cancelled);
@@ -654,6 +670,9 @@ mod tests {
 
     #[test]
     fn cancelled_oauth_callback_releases_its_listener_promptly() {
+        let _test_guard = CALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (address, server) = callback_server();
         let cancelled = Arc::new(AtomicBool::new(false));
         let receiver_cancelled = Arc::clone(&cancelled);
@@ -665,7 +684,7 @@ mod tests {
         let error = receiver.join().unwrap().unwrap_err();
 
         assert!(error.to_string().contains("cancelled"));
-        TcpListener::bind(address).expect("OAuth callback listener was not released");
+        let _listener = wait_for_listener_release(address);
     }
 
     #[test]
