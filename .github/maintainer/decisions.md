@@ -93,3 +93,10 @@
 - Kept the invariant as a compile-time assertion instead of suppressing the lint.
 - The checkout Node.js deprecation notice is unrelated to the failure and does not justify broadening this fix.
 - No issue, pull request, label, release, or comment action was taken; the request authorizes pushing this focused CI fix.
+
+## 2026-07-14 Maintainer Pass
+
+- Ship the validated DM synchronization fix before starting another code change; it addresses observed message visibility loss but remains uncommitted and has no remote CI result.
+- Treat ISSUE:1 as the next focused bug. Its quick-action toolbar is pinned by pointer focus through `:focus-within`; fix it without weakening keyboard access.
+- Defer repository ruleset changes until explicit approval because they alter public repository policy. Update `actions/checkout` separately from product fixes.
+- No issue comment, label, closure, pull request, release, or repository-setting change was made.

@@ -209,3 +209,19 @@
   - `git diff --check`: pass
 - Exact Clippy validation is unavailable locally because this system has no Clippy component; the raw GitHub job log supplies the lint and prescribed fix.
 - No issue, pull request, label, release, or comment action was taken; the focused CI-fix commit is authorized for push by this request.
+
+## 2026-07-14 Maintainer Pass
+
+- GitHub: 1 open issue (ISSUE:1), 0 open pull requests, 0 unread notifications, 0 Dependabot alerts, and 0 code-scanning alerts.
+- Latest remote CI and CodeQL passed on `f03ed8b`.
+- ISSUE:1 is actionable: pointer focus keeps one quick-action toolbar open while hover reveals another; the fix should replace `:focus-within` visibility with keyboard-specific focus behavior.
+- Current local work: DM synchronization fix in README/runtime/store/workspace state; 290 Rust tests pass.
+- Local checks:
+  - `cargo fmt --check`: pass
+  - `cargo test --all-targets`: pass, 290 tests
+  - `meson compile -C _build`: pass
+  - `meson test -C _build --print-errorlogs`: pass, 4 tests
+  - `git diff --check`: pass
+  - strict Clippy: unavailable locally
+- The installed maintainer package contains no referenced triage script or reference guides, so this run used the documented manual fallback.
+- No public issue/PR or repository-setting action was taken.

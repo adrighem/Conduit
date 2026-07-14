@@ -1,21 +1,21 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-13-ci-follow-up",
-  "last_known_open_issues": 0,
+  "last_manual_run": "2026-07-14-maintainer-pass",
+  "last_known_open_issues": 1,
   "last_known_open_pull_requests": 0,
-  "last_known_total_issues": 0,
+  "last_known_total_issues": 1,
   "last_known_total_pull_requests": 0,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 284 tests",
+    "cargo_test": "pass: 290 tests",
     "meson_compile": "pass",
     "meson_test": "pass",
-    "github_actions": "latest CI run 29235054733 failed at Clippy 1.97 assertions_on_constants; minimal local fix prepared",
-    "cargo_clippy": "not available locally; failure and prescribed fix verified from raw GitHub job log"
+    "github_actions": "latest CI and CodeQL passed on f03ed8b",
+    "cargo_clippy": "not available locally"
   },
   "notes": {
-    "skill_package": "gh-helper overview plus CI-focused verification; no backlog triage actions were needed",
-    "clippy": "CI tracks stable Clippy and treats warnings as errors; constant invariants should use const assertions",
-    "worktree": "CI fix is local and unpushed alongside existing feature work"
+    "skill_package": "manual fallback; referenced triage script and guides are absent",
+    "clippy": "CI tracks stable Clippy and treats warnings as errors",
+    "worktree": "validated DM synchronization fix and maintainer memory are local and uncommitted; ISSUE:1 is next"
   }
 }

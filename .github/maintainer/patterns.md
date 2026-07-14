@@ -65,3 +65,9 @@
 - Historical search context must be modeled separately from normal history; treating a bounded context page as history silently corrupts navigation and pagination semantics.
 - Async composer/upload completion should identify one in-flight submission and compare against current text before clearing persistent drafts.
 - Desktop notification targets and persisted user content need both workspace and user identity, even before multi-workspace switching exists.
+
+## 2026-07-14 Maintainer Pass
+
+- Realtime delivery and unread metadata are insufficient unless unopened conversation bodies are also cached and survive stale in-flight history responses.
+- CSS `:focus-within` does not distinguish keyboard focus from pointer clicks. For hover-only affordances, preserve keyboard access with `:focus-visible` or explicit input-modality state.
+- Keep product fixes separate from repository-policy changes so branch protection and workflow upgrades remain deliberate and reversible.
