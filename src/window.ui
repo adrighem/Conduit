@@ -282,12 +282,6 @@
                                     <property name="tooltip-text" translatable="yes">Show Unread Conversations</property>
                                   </object>
                                 </child>
-                                <child>
-                                  <object class="GtkToggleButton" id="sidebar_all_filter_button">
-                                    <property name="icon-name">view-list-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Show All Conversations</property>
-                                  </object>
-                                </child>
                               </object>
                             </child>
                             <child>
@@ -332,8 +326,8 @@
                         <property name="enable-show-gesture">False</property>
                         <property name="enable-hide-gesture">True</property>
                         <property name="min-sidebar-width">340</property>
-                        <property name="max-sidebar-width">500</property>
-                        <property name="sidebar-width-fraction">0.4</property>
+                        <property name="max-sidebar-width">10000</property>
+                        <property name="sidebar-width-fraction">0.6666666666666666</property>
                         <property name="sidebar-width-unit">sp</property>
                         <property name="content">
                           <object class="AdwToolbarView">

@@ -46,7 +46,6 @@ pub enum SidebarSectionKind {
     Unreads,
     Channels,
     DirectMessages,
-    GroupDirectMessages,
     Other,
 }
 
@@ -56,7 +55,6 @@ impl SidebarSectionKind {
             Self::Unreads => "Unreads",
             Self::Channels => "Channels",
             Self::DirectMessages => "Direct messages",
-            Self::GroupDirectMessages => "Group direct messages",
             Self::Other => "Other",
         }
     }
@@ -309,7 +307,6 @@ pub struct SidebarBuildOptions<'a> {
     pub query: &'a str,
     pub unread_only: bool,
     pub show_unreads_section: bool,
-    pub show_all: bool,
     pub loading: bool,
     pub has_error: bool,
     pub user_search_aliases: Option<&'a UserSearchAliases>,
@@ -448,8 +445,7 @@ pub fn build_sidebar_list(
                 || conversation_kind(conversation) != ConversationKind::Unknown
         })
         .filter(|conversation| {
-            options.show_all
-                || conversation_visible_in_default_sidebar(conversation, options.selected_channel)
+            conversation_visible_in_default_sidebar(conversation, options.selected_channel)
         })
         .map(|conversation| {
             SidebarRowModel::from_conversation_with_aliases(
@@ -781,7 +777,6 @@ fn build_sidebar_sections_from_rows(
     let mut unreads = Vec::new();
     let mut channels = Vec::new();
     let mut direct_messages = Vec::new();
-    let mut group_direct_messages = Vec::new();
     let mut other = Vec::new();
 
     for row in rows {
@@ -793,8 +788,9 @@ fn build_sidebar_sections_from_rows(
             ConversationKind::PublicChannel | ConversationKind::PrivateChannel => {
                 channels.push(row)
             }
-            ConversationKind::DirectMessage => direct_messages.push(row),
-            ConversationKind::GroupDirectMessage => group_direct_messages.push(row),
+            ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
+                direct_messages.push(row)
+            }
             ConversationKind::Unknown => other.push(row),
         }
     }
@@ -802,17 +798,12 @@ fn build_sidebar_sections_from_rows(
     sort_unread_rows(&mut unreads, query);
     sort_rows_by_title(&mut channels, query);
     sort_rows_by_title(&mut direct_messages, query);
-    sort_rows_by_title(&mut group_direct_messages, query);
     sort_rows_by_title(&mut other, query);
 
     [
         section(SidebarSectionKind::Unreads, unreads),
         section(SidebarSectionKind::Channels, channels),
         section(SidebarSectionKind::DirectMessages, direct_messages),
-        section(
-            SidebarSectionKind::GroupDirectMessages,
-            group_direct_messages,
-        ),
         section(SidebarSectionKind::Other, other),
     ]
     .into_iter()
@@ -846,7 +837,14 @@ pub fn conversation_visible_in_default_sidebar(
         return false;
     }
 
-    true
+    match conversation_kind(conversation) {
+        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
+            conversation.has_unread_activity()
+        }
+        ConversationKind::PublicChannel
+        | ConversationKind::PrivateChannel
+        | ConversationKind::Unknown => true,
+    }
 }
 
 fn section(kind: SidebarSectionKind, rows: Vec<SidebarRowModel>) -> Option<SidebarSectionModel> {
@@ -1124,9 +1122,9 @@ mod tests {
     }
 
     #[test]
-    fn groups_channels_dms_and_group_dms_into_default_sections() {
+    fn groups_channels_and_all_dms_into_default_sections() {
         let mut user_names = HashMap::new();
-        user_names.insert("U1".to_string(), "Ada Lovelace".to_string());
+        user_names.insert("U1".to_string(), "Zoe".to_string());
 
         let sections = build_sidebar_sections(
             &[
@@ -1145,11 +1143,7 @@ mod tests {
         );
         assert_eq!(
             titles(section(&sections, SidebarSectionKind::DirectMessages)),
-            vec!["Ada Lovelace"]
-        );
-        assert_eq!(
-            titles(section(&sections, SidebarSectionKind::GroupDirectMessages)),
-            vec!["Group DM M1"]
+            vec!["Group DM M1", "Zoe"]
         );
     }
 
@@ -1240,37 +1234,32 @@ mod tests {
     }
 
     #[test]
-    fn default_sidebar_visibility_keeps_the_complete_subscribed_catalog() {
+    fn default_sidebar_visibility_hides_read_inactive_dms() {
         let active_channel = channel("C1", "general");
-        let active_dm: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "D1",
-            "user": "U1",
-            "is_im": true,
-            "priority": 0.42
-        }))
-        .expect("failed to parse active DM");
-        let dormant_dm: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "D2",
-            "user": "U2",
-            "is_im": true,
-            "properties": {
-                "is_dormant": true
-            }
-        }))
-        .expect("failed to parse dormant DM");
-        let unopened_dm = dm("D3", "U3");
+        let read_dm = dm("D1", "U1");
+        let read_group_dm = mpim("M1", "triage");
 
         assert!(conversation_visible_in_default_sidebar(
             &active_channel,
             None
         ));
-        assert!(conversation_visible_in_default_sidebar(&active_dm, None));
-        assert!(conversation_visible_in_default_sidebar(&dormant_dm, None));
-        assert!(conversation_visible_in_default_sidebar(&unopened_dm, None));
+        assert!(!conversation_visible_in_default_sidebar(&read_dm, None));
+        assert!(!conversation_visible_in_default_sidebar(
+            &read_group_dm,
+            None
+        ));
+        assert!(conversation_visible_in_default_sidebar(
+            &read_dm,
+            Some("D1")
+        ));
+        assert!(conversation_visible_in_default_sidebar(
+            &read_group_dm,
+            Some("M1")
+        ));
     }
 
     #[test]
-    fn default_sidebar_visibility_keeps_unread_and_deleted_dm_history() {
+    fn default_sidebar_visibility_keeps_unread_dms_but_hides_read_deleted_dms() {
         let mut unread_dormant = dm("D1", "U1");
         unread_dormant.unread_count = Some(2);
         unread_dormant.extra.insert(
@@ -1293,7 +1282,7 @@ mod tests {
             &selected_deleted,
             Some("D2")
         ));
-        assert!(conversation_visible_in_default_sidebar(
+        assert!(!conversation_visible_in_default_sidebar(
             &selected_deleted,
             None
         ));
@@ -1367,13 +1356,15 @@ mod tests {
 
     #[test]
     fn direct_dm_rows_include_status_without_changing_title_or_group_dms() {
-        let direct = dm("D1", "U1");
-        let group: SlackConversation = serde_json::from_value(serde_json::json!({
+        let mut direct = dm("D1", "U1");
+        direct.unread_count = Some(1);
+        let mut group: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G1",
             "is_mpim": true,
             "members": ["U1", "U2"]
         }))
         .expect("failed to parse group DM");
+        group.unread_count = Some(1);
         let names = HashMap::from([
             ("U1".to_string(), "Ada".to_string()),
             ("U2".to_string(), "Grace".to_string()),
@@ -1391,7 +1382,6 @@ mod tests {
             &[group, direct],
             &names,
             SidebarBuildOptions {
-                show_all: true,
                 query: "a",
                 user_statuses: Some(&statuses),
                 ..Default::default()
@@ -1511,6 +1501,30 @@ mod tests {
                 },
             )),
             SidebarPlaceholder::NoMatches
+        );
+    }
+
+    #[test]
+    fn sidebar_list_only_keeps_unread_or_selected_dms() {
+        let read_dm = dm("D_READ", "U_READ");
+        let selected_group_dm = mpim("M_SELECTED", "selected");
+        let mut unread_group_dm = mpim("M_UNREAD", "unread");
+        unread_group_dm.unread_count = Some(1);
+        let conversations = [read_dm, selected_group_dm, unread_group_dm];
+
+        let sections = list_sections(build_sidebar_list(
+            &conversations,
+            &HashMap::new(),
+            SidebarBuildOptions {
+                selected_channel: Some("M_SELECTED"),
+                ..Default::default()
+            },
+        ));
+        let rows = &section(&sections, SidebarSectionKind::DirectMessages).rows;
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["M_SELECTED", "M_UNREAD"]
         );
     }
 
@@ -1660,6 +1674,22 @@ mod tests {
     }
 
     #[test]
+    fn conversation_switcher_sorts_direct_and_group_dms_together() {
+        let conversations = [dm("D1", "U1"), mpim("M1", "triage")];
+        let user_names = HashMap::from([("U1".to_string(), "Zoe".to_string())]);
+
+        let items = conversation_switcher_items(&conversations, &user_names, None, "");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Group DM M1", "Zoe"]
+        );
+    }
+
+    #[test]
     fn sidebar_relevance_band_precedes_existing_unread_count_sort() {
         let mut alphabetical = channel("C1", "alpha-support");
         alphabetical.unread_count = Some(10);
@@ -1705,7 +1735,6 @@ mod tests {
             SidebarBuildOptions {
                 query: "fat rob",
                 show_unreads_section: true,
-                show_all: true,
                 ..Default::default()
             },
         ));
@@ -1718,13 +1747,15 @@ mod tests {
 
     #[test]
     fn sidebar_search_ranks_matching_direct_dm_above_matching_group_dm() {
-        let direct = dm("D_RICHARD", "U_RICHARD");
-        let group: SlackConversation = serde_json::from_value(serde_json::json!({
+        let mut direct = dm("D_RICHARD", "U_RICHARD");
+        direct.unread_count = Some(1);
+        let mut group: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G_RICHARD",
             "is_mpim": true,
             "members": ["U_SELF", "U_RICHARD", "U_OTHER"]
         }))
         .expect("failed to parse group DM");
+        group.unread_count = Some(1);
         let user_names = HashMap::from([
             ("U_SELF".to_string(), "Vincent".to_string()),
             ("U_RICHARD".to_string(), "Richard".to_string()),
@@ -1737,7 +1768,6 @@ mod tests {
             SidebarBuildOptions {
                 current_user_id: Some("U_SELF"),
                 query: "richard",
-                show_all: true,
                 ..Default::default()
             },
         ));
@@ -1832,18 +1862,20 @@ mod tests {
 
     #[test]
     fn group_dm_search_ranks_by_matching_participant_coverage_and_excludes_self() {
-        let full_match: SlackConversation = serde_json::from_value(serde_json::json!({
+        let mut full_match: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G_FULL",
             "is_mpim": true,
             "members": ["U_SELF", "U_FAT", "U_ROB"]
         }))
         .expect("failed to parse full-match group DM");
-        let partial_match: SlackConversation = serde_json::from_value(serde_json::json!({
+        full_match.unread_count = Some(1);
+        let mut partial_match: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G_PARTIAL",
             "is_mpim": true,
             "members": ["U_SELF", "U_AARON", "U_BOTH"]
         }))
         .expect("failed to parse partial-match group DM");
+        partial_match.unread_count = Some(1);
         let user_names = HashMap::from([
             ("U_SELF".to_string(), "Vincent".to_string()),
             ("U_FAT".to_string(), "Fatima".to_string()),
@@ -1859,7 +1891,6 @@ mod tests {
             SidebarBuildOptions {
                 current_user_id: Some("U_SELF"),
                 query: "fat rob",
-                show_all: true,
                 ..Default::default()
             },
         ));
@@ -1926,7 +1957,8 @@ mod tests {
 
     #[test]
     fn sidebar_filter_finds_existing_dm_by_user_alias() {
-        let conversation = dm("D_ZILVINAS", "U_ZILVINAS");
+        let mut conversation = dm("D_ZILVINAS", "U_ZILVINAS");
+        conversation.unread_count = Some(1);
         let user_names = HashMap::from([("U_ZILVINAS".to_string(), "Žilvinas".to_string())]);
         let aliases = HashMap::from([(
             "U_ZILVINAS".to_string(),

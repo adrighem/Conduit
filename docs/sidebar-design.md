@@ -22,7 +22,7 @@ Included for 1.0:
 - Workspace/account menu with sign out.
 - Conversation filtering by display title and Slack conversation ID.
 - Unread-only conversation filtering.
-- Sections for unreads, channels, direct messages, group direct messages, and unknown conversations.
+- Sections for unreads, channels, direct messages, and unknown conversations.
 - Native selectable and activatable conversation rows.
 - Unread counts, selected state, type icons, and accessible row labels.
 - Empty, loading, filtered-empty, and load-error states.
@@ -55,7 +55,7 @@ The sidebar is the start child of the workspace `GtkPaned`. It is a vertical `Gt
 - Conversation filter entry with placeholder text `Filter conversations`.
 - Unread-only toggle button using `mail-unread-symbolic`.
 - Scrollable `GtkListBox` named `conversation_list`, styled with `navigation-sidebar`.
-- Status footer label named `workspace_status_label`.
+- Status footer label named `workspace_status_label`, used for transient progress and errors.
 
 The conversation list is a native GTK `ListBox`; every section header and conversation row is created in Rust.
 
@@ -90,8 +90,9 @@ Sections are rendered in this order:
 1. `Unreads` when enabled in Preferences
 2. `Channels`
 3. `Direct messages`
-4. `Group direct messages`
-5. `Other`
+4. `Other`
+
+One-to-one and group direct messages share the `Direct messages` section and are sorted together. Their distinct conversation kinds are retained for row icons, accessibility labels, and Slack-specific behavior.
 
 Unread conversations can be duplicated: when the Preferences setting `Show Unreads section` is enabled, they appear in `Unreads` and also in their normal section. This keeps `Unreads` as a shortcut section rather than moving the conversation out of its normal location. The setting is disabled by default, so unread conversations stay in their normal sections unless the shortcut section is explicitly enabled.
 
@@ -118,6 +119,8 @@ Classification uses Slack conversation flags:
 - Anything else maps to `Unknown`.
 
 Archived conversations are filtered out before section construction.
+
+Channels remain visible in the sidebar. Direct messages, including group direct messages, are shown only while they have unread activity or are open in the conversation pane. Switchers and pickers always retain the complete loaded catalog.
 
 ## Row Model
 

@@ -59,6 +59,13 @@ impl ConversationCatalog {
         conversations
     }
 
+    /// Removes a conversation after membership has ended locally or remotely.
+    pub(crate) fn remove(&mut self, id: &str) -> Option<SlackConversation> {
+        let revision = self.next_revision();
+        self.last_committed_snapshot = self.last_committed_snapshot.max(revision);
+        self.entries.remove(id).map(|entry| entry.conversation)
+    }
+
     pub(crate) fn begin_membership_snapshot(&mut self) -> MembershipSnapshot {
         MembershipSnapshot {
             revision: self.next_revision(),
@@ -166,8 +173,14 @@ impl ConversationCatalog {
         self.apply_unread(id, state);
     }
 
-    pub(crate) fn mark_read(&mut self, id: &str) {
-        self.apply_unread(id, SlackUnreadState::from_parts(true, false, 0));
+    pub(crate) fn advance_read_cursor(&mut self, id: &str, ts: &str, remaining_unread: u64) {
+        self.apply_unread(
+            id,
+            SlackUnreadState::from_parts(true, remaining_unread > 0, remaining_unread),
+        );
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.conversation.advance_read_cursor(ts, remaining_unread);
+        }
     }
 
     fn insert_cached(&mut self, conversation: SlackConversation) {
@@ -343,6 +356,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_removal_returns_and_forgets_the_conversation() {
+        let mut catalog =
+            ConversationCatalog::from_cached([conversation("C1"), conversation("C2")]);
+        let mut stale_snapshot = catalog.begin_membership_snapshot();
+        stale_snapshot.upsert(conversation("C1"));
+
+        assert_eq!(catalog.remove("C1").map(|item| item.id), Some("C1".into()));
+        assert!(catalog.get("C1").is_none());
+        assert_eq!(catalog.len(), 1);
+        assert!(!catalog.commit_membership_snapshot(stale_snapshot));
+        assert!(catalog.get("C1").is_none());
+        assert!(catalog.remove("missing").is_none());
+    }
+
+    #[test]
     fn conversation_opened_during_refresh_survives_that_snapshot() {
         let mut catalog = ConversationCatalog::from_cached([conversation("C1")]);
         let mut snapshot = catalog.begin_membership_snapshot();
@@ -409,7 +437,7 @@ mod tests {
         stale.unread_count = Some(5);
         snapshot.upsert(stale);
 
-        catalog.mark_read("C1");
+        catalog.advance_read_cursor("C1", "20.0", 0);
         assert!(catalog.commit_membership_snapshot(snapshot));
 
         let unread = catalog.get("C1").unwrap().unread_state();

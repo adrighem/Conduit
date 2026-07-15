@@ -101,6 +101,51 @@ impl ThreadCatalog {
         ThreadKey::new(channel_id, root_ts).and_then(|key| self.records.get(&key))
     }
 
+    /// Build the thread-inbox projection from locally observed roots and persisted Slack
+    /// metadata. Catalog records win because they carry the most complete reply and unread data.
+    pub(crate) fn inbox_projection(
+        &self,
+        observed: impl IntoIterator<Item = (String, SlackMessage)>,
+    ) -> Vec<(String, SlackMessage)> {
+        let mut roots = observed
+            .into_iter()
+            .map(|(channel_id, root)| ((channel_id, root.ts.clone()), root))
+            .collect::<HashMap<_, _>>();
+
+        for record in self.records.values() {
+            if record.subscribed == Some(false) {
+                continue;
+            }
+            let Some(root) = record.root.as_ref() else {
+                continue;
+            };
+            let mut root = root.clone();
+            root.reply_count = Some(record.reply_count);
+            if let ThreadUnreadState::Known { count, .. } = &record.unread {
+                root.unread_count = Some(*count);
+            }
+            roots.insert(
+                (record.key.channel_id.clone(), record.key.root_ts.clone()),
+                root,
+            );
+        }
+
+        let mut roots = roots
+            .into_iter()
+            .map(|((channel_id, _), root)| (channel_id, root))
+            .collect::<Vec<_>>();
+        roots.sort_by(|(left_channel, left), (right_channel, right)| {
+            right
+                .latest_reply
+                .as_deref()
+                .unwrap_or(&right.ts)
+                .cmp(left.latest_reply.as_deref().unwrap_or(&left.ts))
+                .then_with(|| left_channel.cmp(right_channel))
+                .then_with(|| left.ts.cmp(&right.ts))
+        });
+        roots
+    }
+
     /// Additively discovers roots and orphan replies in any history page.
     pub(crate) fn observe_history(&mut self, channel_id: &str, messages: &[SlackMessage]) {
         for message in messages {
@@ -519,5 +564,23 @@ mod tests {
         assert!(ThreadCatalog::from_records(records)
             .get("C2", "2.0")
             .is_some());
+    }
+
+    #[test]
+    fn inbox_projection_merges_observed_roots_with_authoritative_catalog_metadata() {
+        let mut catalog = ThreadCatalog::default();
+        let mut catalog_root = root("1.0", 3);
+        catalog_root.latest_reply = Some("4.0".into());
+        catalog_root.unread_count = Some(2);
+        catalog.observe_thread("C1", "1.0", &[catalog_root], false);
+
+        let mut observed_root = root("1.0", 1);
+        observed_root.latest_reply = Some("2.0".into());
+        let projection = catalog.inbox_projection(vec![("C1".into(), observed_root)]);
+
+        assert_eq!(projection.len(), 1);
+        assert_eq!(projection[0].1.reply_count, Some(3));
+        assert_eq!(projection[0].1.unread_count, Some(2));
+        assert_eq!(projection[0].1.latest_reply.as_deref(), Some("4.0"));
     }
 }

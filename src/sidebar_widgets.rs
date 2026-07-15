@@ -34,8 +34,8 @@ pub struct SidebarRowLayout {
 impl SidebarRowLayout {
     pub fn sidebar() -> Self {
         Self {
-            margin_top: 3,
-            margin_bottom: 3,
+            margin_top: 1,
+            margin_bottom: 1,
             margin_start: 6,
             margin_end: 6,
         }
@@ -152,5 +152,16 @@ mod tests {
     fn title_weight_uses_bold_only_for_unread_rows() {
         assert_eq!(sidebar_title_weight(false), gtk::pango::Weight::Normal);
         assert_eq!(sidebar_title_weight(true), gtk::pango::Weight::Bold);
+    }
+
+    #[test]
+    fn sidebar_rows_are_denser_than_switcher_rows() {
+        let sidebar = SidebarRowLayout::sidebar();
+        let switcher = SidebarRowLayout::switcher();
+
+        assert!(sidebar.margin_top < switcher.margin_top);
+        assert!(sidebar.margin_bottom < switcher.margin_bottom);
+        assert_eq!(sidebar.margin_top, 1);
+        assert_eq!(sidebar.margin_bottom, 1);
     }
 }

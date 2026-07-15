@@ -60,8 +60,12 @@ pub enum RuntimeCommand {
     SignOut,
     Disconnect,
     RefreshConversations,
+    DiscoverChannels,
     DiscoverConversations,
     JoinConversation {
+        channel_id: String,
+    },
+    LeaveConversation {
         channel_id: String,
     },
     OpenDirectMessage {
@@ -90,6 +94,9 @@ pub enum RuntimeCommand {
     LoadFiles,
     LoadSavedItems,
     LoadUser {
+        user_id: String,
+    },
+    LoadUserProfile {
         user_id: String,
     },
     LoadImageAsset {
@@ -173,6 +180,7 @@ pub enum RuntimeOperation {
     Conversations,
     ConversationDiscovery,
     OpenConversation,
+    LeaveConversation,
     History,
     OlderHistory,
     Thread,
@@ -307,8 +315,16 @@ impl RuntimeCommand {
                 workspace(RuntimeOperation::ConversationDiscovery),
                 RuntimeTaskLane::Background,
             ),
+            Self::DiscoverChannels => RuntimeCommandDescriptor::request(
+                workspace(RuntimeOperation::ConversationDiscovery),
+                RuntimeTaskLane::Background,
+            ),
             Self::JoinConversation { channel_id } => RuntimeCommandDescriptor::request(
                 channel(RuntimeOperation::OpenConversation, channel_id),
+                RuntimeTaskLane::Interactive,
+            ),
+            Self::LeaveConversation { channel_id } => RuntimeCommandDescriptor::mutation(
+                channel(RuntimeOperation::LeaveConversation, channel_id),
                 RuntimeTaskLane::Interactive,
             ),
             Self::OpenDirectMessage { user_id } => RuntimeCommandDescriptor::request(
@@ -354,10 +370,15 @@ impl RuntimeCommand {
                 workspace(RuntimeOperation::SavedItems),
                 NavigationSlot::Main,
             ),
-            Self::LoadUser { user_id } => RuntimeCommandDescriptor::request(
-                OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone())),
-                RuntimeTaskLane::Background,
-            ),
+            Self::LoadUser { user_id } | Self::LoadUserProfile { user_id } => {
+                RuntimeCommandDescriptor::request(
+                    OperationContext::new(
+                        RuntimeOperation::User,
+                        RuntimeTarget::User(user_id.clone()),
+                    ),
+                    RuntimeTaskLane::Background,
+                )
+            }
             Self::LoadImageAsset { key, .. } => RuntimeCommandDescriptor::request(
                 OperationContext::new(
                     RuntimeOperation::ImageAsset,
@@ -493,11 +514,12 @@ pub enum RuntimeEventKind {
     Authenticated(AuthInfo),
     ConversationsLoaded(Vec<SlackConversation>),
     ConversationsLoadFailed(String),
-    ConversationCandidatesLoaded {
-        channels: Vec<SlackConversation>,
-        users: Vec<SlackUser>,
-    },
+    ConversationChannelsDiscovered(Vec<SlackConversation>),
+    ConversationPeopleDiscovered(Vec<SlackUser>),
     ConversationOpened(SlackConversation),
+    ConversationLeft {
+        channel_id: String,
+    },
     ConversationsPatched {
         conversations: Vec<SlackConversation>,
         unread_states: Vec<(String, SlackUnreadState, Option<String>)>,
@@ -543,6 +565,7 @@ pub enum RuntimeEventKind {
         display_name: String,
         status: Option<SlackUserStatus>,
     },
+    UserProfileLoaded(SlackUser),
     UserNamesLoaded(HashMap<String, String>),
     UserSearchAliasesLoaded(HashMap<String, Vec<String>>),
     UserStatusesLoaded(HashMap<String, SlackUserStatus>),
@@ -615,13 +638,19 @@ impl RuntimeEventKind {
                 RuntimeOperation::ReadMarker,
                 RuntimeTarget::Channel(channel_id.clone()),
             ),
-            Self::ConversationCandidatesLoaded { .. } => OperationContext::new(
-                RuntimeOperation::ConversationDiscovery,
-                RuntimeTarget::Workspace,
-            ),
+            Self::ConversationChannelsDiscovered(_) | Self::ConversationPeopleDiscovered(_) => {
+                OperationContext::new(
+                    RuntimeOperation::ConversationDiscovery,
+                    RuntimeTarget::Workspace,
+                )
+            }
             Self::ConversationOpened(conversation) => OperationContext::new(
                 RuntimeOperation::OpenConversation,
                 RuntimeTarget::Channel(conversation.id.clone()),
+            ),
+            Self::ConversationLeft { channel_id } => OperationContext::new(
+                RuntimeOperation::LeaveConversation,
+                RuntimeTarget::Channel(channel_id.clone()),
             ),
             Self::HistoryLoaded {
                 channel_id,
@@ -666,6 +695,10 @@ impl RuntimeEventKind {
             Self::UserLoaded { user_id, .. } => {
                 OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone()))
             }
+            Self::UserProfileLoaded(user) => OperationContext::new(
+                RuntimeOperation::User,
+                RuntimeTarget::User(user.id.clone().unwrap_or_default()),
+            ),
             Self::UserNamesLoaded(_)
             | Self::UserSearchAliasesLoaded(_)
             | Self::UserStatusesLoaded(_)
@@ -2075,6 +2108,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         RuntimeCommand::DiscoverConversations => {
             let api = require_slack(context.slack)?;
             let channels = api.discover_conversations().await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationChannelsDiscovered(channels));
             let users = api.users().await?;
             let aliases = users
                 .iter()
@@ -2093,7 +2129,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .send_event(RuntimeEventKind::UserStatusesLoaded(statuses));
             context
                 .events
-                .send_event(RuntimeEventKind::ConversationCandidatesLoaded { channels, users });
+                .send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
+        }
+        RuntimeCommand::DiscoverChannels => {
+            let api = require_slack(context.slack)?;
+            let channels = api.discover_conversations().await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationChannelsDiscovered(channels));
         }
         RuntimeCommand::JoinConversation { channel_id } => {
             let api = require_slack(context.slack)?;
@@ -2105,6 +2148,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
+        }
+        RuntimeCommand::LeaveConversation { channel_id } => {
+            let api = require_slack(context.slack)?;
+            context.events.send_status("Leaving channel");
+            api.leave_conversation(&channel_id).await?;
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.remove_conversation(&channel_id).await?;
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationLeft { channel_id });
         }
         RuntimeCommand::OpenDirectMessage { user_id } => {
             let api = require_slack(context.slack)?;
@@ -2176,28 +2230,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 !page.has_more && page.next_cursor.is_none(),
             )
             .await;
-            if !page.has_more && page.next_cursor.is_none() {
-                if let Some(latest_ts) = page
-                    .messages
-                    .iter()
-                    .map(|message| message.ts.as_str())
-                    .max()
-                {
-                    if let Some(store) = context.workspace_store.as_ref() {
-                        if let Err(error) =
-                            store.mark_thread_read(&channel_id, &ts, latest_ts).await
-                        {
-                            crate::debug::log(
-                            "store",
-                            &format!("ThreadReadStoreFailed channel_id={channel_id} ts={ts} error={error:#}"),
-                        );
-                        } else {
-                            load_cached_thread_catalog(context.events, context.workspace_store)
-                                .await;
-                        }
-                    }
-                }
-            }
             store_thread(context.workspace_store, &channel_id, &ts, &page.messages).await;
             send_thread_loaded(context.events, channel_id, ts, page, false);
         }
@@ -2215,23 +2247,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let page = api
                 .thread_replies_page(&channel_id, &ts, Some(&cursor))
                 .await?;
-            let merged_messages = if let Some(store) = context.workspace_store.as_ref() {
-                match store
+            if let Some(store) = context.workspace_store.as_ref() {
+                if let Err(error) = store
                     .store_merged_thread(&channel_id, &ts, &page.messages)
                     .await
                 {
-                    Ok(messages) => messages,
-                    Err(error) => {
-                        crate::debug::log(
-                            "store",
-                            &format!("ThreadMergeStoreFailed channel_id={channel_id} ts={ts} error={error:#}"),
-                        );
-                        page.messages.clone()
-                    }
+                    crate::debug::log(
+                        "store",
+                        &format!("ThreadMergeStoreFailed channel_id={channel_id} ts={ts} error={error:#}"),
+                    );
                 }
-            } else {
-                page.messages.clone()
-            };
+            }
             observe_thread_page(
                 context.events,
                 context.workspace_store,
@@ -2241,27 +2267,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 !page.has_more && page.next_cursor.is_none(),
             )
             .await;
-            if !page.has_more && page.next_cursor.is_none() {
-                if let Some(latest_ts) = merged_messages
-                    .iter()
-                    .map(|message| message.ts.as_str())
-                    .max()
-                {
-                    if let Some(store) = context.workspace_store.as_ref() {
-                        if let Err(error) =
-                            store.mark_thread_read(&channel_id, &ts, latest_ts).await
-                        {
-                            crate::debug::log(
-                        "store",
-                        &format!("ThreadReadStoreFailed channel_id={channel_id} ts={ts} error={error:#}"),
-                    );
-                        } else {
-                            load_cached_thread_catalog(context.events, context.workspace_store)
-                                .await;
-                        }
-                    }
-                }
-            }
             send_thread_loaded(context.events, channel_id, ts, page, true);
         }
         RuntimeCommand::LoadMessageContext(location) => {
@@ -2336,6 +2341,20 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     status,
                 });
             }
+        }
+        RuntimeCommand::LoadUserProfile { user_id } => {
+            let api = require_slack(context.slack)?;
+            let mut user = api.user(&user_id).await?;
+            match api.user_profile(&user_id).await {
+                Ok(profile) => user.profile = Some(profile),
+                Err(error) => crate::debug::log(
+                    "runtime",
+                    &format!("UserProfileFieldsUnavailable user_id={user_id} error={error:#}"),
+                ),
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::UserProfileLoaded(user));
         }
         RuntimeCommand::LoadImageAsset { key, url } => {
             let api = require_slack(context.slack)?;
@@ -4388,6 +4407,16 @@ mod tests {
         assert_eq!(background.lane, RuntimeTaskLane::Background);
         assert_eq!(background.navigation_slot, None);
 
+        let channel_discovery = RuntimeCommand::DiscoverChannels.descriptor();
+        assert_eq!(channel_discovery.lane, RuntimeTaskLane::Background);
+        assert_eq!(
+            channel_discovery.context,
+            OperationContext::new(
+                RuntimeOperation::ConversationDiscovery,
+                RuntimeTarget::Workspace,
+            )
+        );
+
         let image = RuntimeCommand::LoadImageAsset {
             key: "preview".to_string(),
             url: "https://files.slack.com/preview".to_string(),
@@ -4413,11 +4442,38 @@ mod tests {
         .descriptor();
         assert_eq!(interactive.lane, RuntimeTaskLane::Interactive);
         assert!(interactive.supersedes_previous);
+
+        let leave = RuntimeCommand::LeaveConversation {
+            channel_id: "C123".to_string(),
+        }
+        .descriptor();
+        assert_eq!(leave.lane, RuntimeTaskLane::Interactive);
+        assert!(!leave.supersedes_previous);
+        assert_eq!(
+            leave.context,
+            OperationContext::new(
+                RuntimeOperation::LeaveConversation,
+                RuntimeTarget::Channel("C123".to_string()),
+            )
+        );
     }
 
     #[test]
     fn runtime_event_context_uses_loaded_resource_target() {
         let fallback = OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace);
+        for event in [
+            RuntimeEventKind::ConversationChannelsDiscovered(Vec::new()),
+            RuntimeEventKind::ConversationPeopleDiscovered(Vec::new()),
+        ] {
+            assert_eq!(
+                event.operation_context(&fallback),
+                OperationContext::new(
+                    RuntimeOperation::ConversationDiscovery,
+                    RuntimeTarget::Workspace,
+                )
+            );
+        }
+
         let event = RuntimeEventKind::HistoryLoaded {
             channel_id: "C123".to_string(),
             messages: Vec::new(),

@@ -13,7 +13,7 @@ This slice implements the smallest useful native version:
 - Slack history calls return page metadata with `has_more` and `response_metadata.next_cursor`.
 - Channel history fetches use a larger bounded page size and expose a **Load older messages** action at the top of the WebKit message timeline.
 - Thread replies use the same cursor model and expose **Load more replies** at the bottom of the thread timeline.
-- The thread pane opens as a readable side rail, not as a fixed one-third split: narrow windows use a balanced split, normal windows target roughly 380px for the thread, and wide windows grow it toward 40% with a 500px cap.
+- The thread pane defaults to two-thirds of the conversation area, leaving one-third for the main channel pane. It can be resized down to one-fifth but not beyond the two-thirds maximum. Narrow windows retain the adaptive overlay presentation.
 - The GTK window keeps cursors in memory and merges loaded pages by Slack timestamp, newest first, before rendering chronologically.
 - Fresh channel history loads mark the conversation read at the newest loaded message timestamp when the token has a read-marker write scope.
 - Read-marker calls are best effort and debug logged; failures do not block message loading.

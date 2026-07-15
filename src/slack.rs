@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
-    SlackUser, SlackUserGroup, StoredToken,
+    SlackUser, SlackUserGroup, SlackUserProfile, StoredToken,
 };
 use crate::search::{
     SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
@@ -268,6 +268,16 @@ impl SlackApi {
         Ok(response.channel)
     }
 
+    pub async fn leave_conversation(&self, channel_id: &str) -> Result<()> {
+        let _: BasicResponse = self
+            .post_form(
+                "conversations.leave",
+                &[("channel", channel_id.to_string())],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn open_direct_message(&self, user_id: &str) -> Result<SlackConversation> {
         let response: ConversationOpenResponse = self
             .post_form("conversations.open", &[("users", user_id.to_string())])
@@ -480,6 +490,19 @@ impl SlackApi {
             .post_form("users.info", &[("user", user_id.to_string())])
             .await?;
         Ok(response.user)
+    }
+
+    pub async fn user_profile(&self, user_id: &str) -> Result<SlackUserProfile> {
+        let response: UserProfileResponse = self
+            .post_form(
+                "users.profile.get",
+                &[
+                    ("user", user_id.to_string()),
+                    ("include_labels", "true".to_string()),
+                ],
+            )
+            .await?;
+        Ok(response.profile)
     }
 
     pub async fn user_groups(&self) -> Result<Vec<SlackUserGroup>> {
@@ -1482,6 +1505,14 @@ struct UserInfoResponse {
     user: SlackUser,
 }
 impl_slack_response!(UserInfoResponse);
+
+#[derive(Debug, Deserialize)]
+struct UserProfileResponse {
+    ok: bool,
+    error: Option<String>,
+    profile: SlackUserProfile,
+}
+impl_slack_response!(UserProfileResponse);
 
 #[derive(Debug, Deserialize)]
 struct UserGroupsListResponse {

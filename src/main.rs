@@ -40,6 +40,7 @@ mod slack;
 mod socket_mode;
 mod store;
 mod thread_catalog;
+mod thread_pane;
 mod window;
 mod workspace_state;
 

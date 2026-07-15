@@ -168,9 +168,15 @@ struct ThreadViewState {
     messages: Vec<SlackMessage>,
     context_messages: Option<Vec<SlackMessage>>,
     next_cursor: Option<String>,
-    loading: bool,
-    loaded: bool,
+    status: ThreadLoadStatus,
     focus_ts: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadLoadStatus {
+    Loading,
+    Ready,
+    Failed,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -300,6 +306,23 @@ impl WorkspaceViewState {
 
     pub(crate) fn show_placeholder(&mut self) {
         self.navigate_to(MainMessageView::Placeholder);
+    }
+
+    pub(crate) fn remove_conversation(&mut self, channel_id: &str) {
+        self.channels.remove(channel_id);
+        if self.last_channel_id.as_deref() == Some(channel_id) {
+            self.last_channel_id = None;
+            if self.main_view == MainMessageView::Conversation {
+                self.main_view = MainMessageView::Placeholder;
+            }
+        }
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.channel_id == channel_id)
+        {
+            self.thread = None;
+        }
     }
 
     pub(crate) fn show_unreads(&mut self) {
@@ -504,13 +527,13 @@ impl WorkspaceViewState {
             if thread.channel_id == channel_id && thread.ts == ts {
                 thread.focus_ts = None;
                 thread.context_messages = None;
-                return if thread.loaded {
-                    ThreadOpenOutcome::RenderCurrent
-                } else if thread.loading {
-                    ThreadOpenOutcome::AwaitFresh
-                } else {
-                    thread.loading = true;
-                    ThreadOpenOutcome::RequestFresh
+                return match thread.status {
+                    ThreadLoadStatus::Ready => ThreadOpenOutcome::RenderCurrent,
+                    ThreadLoadStatus::Loading => ThreadOpenOutcome::AwaitFresh,
+                    ThreadLoadStatus::Failed => {
+                        thread.status = ThreadLoadStatus::Loading;
+                        ThreadOpenOutcome::RequestFresh
+                    }
                 };
             }
         }
@@ -521,8 +544,7 @@ impl WorkspaceViewState {
             messages: Vec::new(),
             context_messages: None,
             next_cursor: None,
-            loading: true,
-            loaded: false,
+            status: ThreadLoadStatus::Loading,
             focus_ts: None,
         });
         ThreadOpenOutcome::RequestFresh
@@ -532,10 +554,10 @@ impl WorkspaceViewState {
         let Some(thread) = &mut self.thread else {
             return false;
         };
-        if thread.loading {
+        if thread.status == ThreadLoadStatus::Loading {
             false
         } else {
-            thread.loading = true;
+            thread.status = ThreadLoadStatus::Loading;
             true
         }
     }
@@ -547,10 +569,11 @@ impl WorkspaceViewState {
         if thread.channel_id != channel_id || thread.ts != ts {
             return WorkspaceFailureOutcome::default();
         }
-        thread.loading = false;
-        if thread.messages.is_empty() {
-            thread.loaded = false;
-        }
+        thread.status = if thread.messages.is_empty() {
+            ThreadLoadStatus::Failed
+        } else {
+            ThreadLoadStatus::Ready
+        };
         WorkspaceFailureOutcome {
             active: true,
             has_content: !thread.messages.is_empty(),
@@ -606,7 +629,7 @@ impl WorkspaceViewState {
                 return false;
             }
             thread.context_messages = Some(normalize_messages(messages));
-            thread.loading = false;
+            thread.status = ThreadLoadStatus::Ready;
             return true;
         }
 
@@ -719,10 +742,9 @@ impl WorkspaceViewState {
         } else {
             normalize_messages(messages)
         };
-        thread.loaded = true;
+        thread.status = ThreadLoadStatus::Ready;
         thread.context_messages = None;
         thread.next_cursor = usable_cursor(has_more, next_cursor);
-        thread.loading = false;
         ThreadApplyOutcome::Applied {
             scroll: if append_older {
                 WorkspaceScrollBehavior::PreservePrepend
@@ -799,7 +821,7 @@ impl WorkspaceViewState {
                     && message.ts != thread.ts
             })
             .is_some_and(|thread| {
-                let base_changed = if thread.loaded {
+                let base_changed = if thread.status == ThreadLoadStatus::Ready {
                     thread.messages = merge_realtime_message(&thread.messages, &message);
                     true
                 } else {
@@ -1173,6 +1195,32 @@ mod tests {
             ConversationSelectionDecision::RenderCurrent
         );
         assert_eq!(current.scroll, Some(WorkspaceScrollBehavior::StickToBottom));
+    }
+
+    #[test]
+    fn removing_selected_conversation_clears_navigation_and_cached_history() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        assert_eq!(state.visible_channel_id(), Some("C1"));
+
+        state.remove_conversation("C1");
+
+        assert_eq!(state.visible_channel_id(), None);
+        assert_eq!(state.last_channel_id(), None);
+        assert_eq!(state.main_view(), MainMessageView::Placeholder);
+        assert!(!state.channels.contains_key("C1"));
+    }
+
+    #[test]
+    fn removing_last_conversation_does_not_interrupt_another_main_view() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        state.show_unreads();
+
+        state.remove_conversation("C1");
+
+        assert_eq!(state.last_channel_id(), None);
+        assert_eq!(state.main_view(), MainMessageView::Unreads);
     }
 
     #[test]

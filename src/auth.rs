@@ -39,6 +39,8 @@ pub const DEFAULT_USER_SCOPES: &[&str] = &[
     "mpim:history",
     "mpim:write",
     "users:read",
+    "users:read.email",
+    "users.profile:read",
     "usergroups:read",
     "emoji:read",
     "chat:write",
@@ -692,6 +694,8 @@ mod tests {
         assert!(DEFAULT_USER_SCOPES.contains(&"usergroups:read"));
         assert!(DEFAULT_USER_SCOPES.contains(&"channels:join"));
         assert!(DEFAULT_USER_SCOPES.contains(&"users:read"));
+        assert!(DEFAULT_USER_SCOPES.contains(&"users:read.email"));
+        assert!(DEFAULT_USER_SCOPES.contains(&"users.profile:read"));
         assert!(DEFAULT_USER_SCOPES.contains(&"im:write"));
         assert!(DEFAULT_USER_SCOPES.contains(&"emoji:read"));
     }

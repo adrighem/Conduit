@@ -67,6 +67,28 @@ pub struct SlackConversation {
 }
 
 impl SlackConversation {
+    pub fn last_read_ts(&self) -> Option<&str> {
+        self.extra.get("last_read").and_then(Value::as_str)
+    }
+
+    pub fn latest_message_ts(&self) -> Option<&str> {
+        self.extra.get("latest").and_then(|latest| {
+            latest
+                .as_str()
+                .or_else(|| latest.get("ts").and_then(Value::as_str))
+        })
+    }
+
+    pub fn advance_read_cursor(&mut self, ts: &str, remaining_unread: u64) {
+        self.extra
+            .insert("last_read".to_string(), Value::String(ts.to_string()));
+        self.apply_unread_state(SlackUnreadState::from_parts(
+            true,
+            remaining_unread > 0,
+            remaining_unread,
+        ));
+    }
+
     pub fn display_name(&self) -> String {
         self.display_name_with_users(&HashMap::new(), None)
     }
@@ -667,6 +689,9 @@ pub struct SlackUser {
     pub real_name: Option<String>,
     pub deleted: Option<bool>,
     pub is_bot: Option<bool>,
+    pub tz: Option<String>,
+    pub tz_label: Option<String>,
+    pub tz_offset: Option<i64>,
     pub profile: Option<SlackUserProfile>,
 }
 
@@ -772,6 +797,39 @@ pub struct SlackUserProfile {
     pub status_text: Option<String>,
     pub status_emoji: Option<String>,
     pub status_expiration: Option<i64>,
+    pub title: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub skype: Option<String>,
+    pub pronouns: Option<String>,
+    pub about: Option<String>,
+    pub location: Option<String>,
+    pub image_72: Option<String>,
+    pub image_192: Option<String>,
+    pub image_512: Option<String>,
+    pub image_original: Option<String>,
+    #[serde(default)]
+    pub fields: HashMap<String, SlackProfileField>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlackProfileField {
+    pub value: Option<String>,
+    pub alt: Option<String>,
+    pub label: Option<String>,
+}
+
+impl SlackProfileField {
+    pub fn display_value(&self) -> Option<&str> {
+        self.alt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.value
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+            })
+    }
 }
 
 impl SlackUserProfile {
@@ -1258,5 +1316,20 @@ mod tests {
             ..reply
         };
         assert_eq!(parent.message_location().unwrap().thread_ts(), None);
+    }
+
+    #[test]
+    fn advancing_read_cursor_preserves_messages_after_the_cursor() {
+        let mut conversation = SlackConversation {
+            id: "C123".into(),
+            unread_count: Some(3),
+            ..Default::default()
+        };
+
+        conversation.advance_read_cursor("2.0", 1);
+
+        assert_eq!(conversation.last_read_ts(), Some("2.0"));
+        assert!(conversation.has_unread_activity());
+        assert_eq!(conversation.unread_activity_count(), 1);
     }
 }

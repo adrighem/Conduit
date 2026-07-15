@@ -167,8 +167,9 @@ impl WorkspaceStore {
         Ok(true)
     }
 
-    /// Clears cached unread state for one conversation atomically.
-    pub async fn clear_conversation_unread_state(
+    /// Advances one cached conversation's read cursor without assuming that
+    /// messages newer than the supplied cursor have been read.
+    pub async fn advance_conversation_read_cursor(
         &self,
         channel_id: &str,
         last_read: &str,
@@ -178,13 +179,31 @@ impl WorkspaceStore {
         }
 
         self.update_conversation(channel_id, |conversation| {
-            conversation.clear_unread_activity();
+            let reached_latest = conversation
+                .latest_message_ts()
+                .is_none_or(|latest| latest <= last_read);
+            if reached_latest {
+                conversation.clear_unread_activity();
+            }
+            conversation.extra.insert(
+                "last_read".to_string(),
+                serde_json::Value::String(last_read.to_string()),
+            );
             conversation.extra.insert(
                 LOCAL_READ_TS_KEY.to_string(),
                 serde_json::Value::String(last_read.to_string()),
             );
         })
         .await
+    }
+
+    pub async fn clear_conversation_unread_state(
+        &self,
+        channel_id: &str,
+        last_read: &str,
+    ) -> Result<bool> {
+        self.advance_conversation_read_cursor(channel_id, last_read)
+            .await
     }
 
     pub async fn mark_conversation_unread_from_event(

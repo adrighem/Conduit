@@ -9,7 +9,8 @@ use crate::emoji::{
     emoji_picker_accessible_label, EmojiCatalog, EmojiEntry, EmojiPickerModel, EmojiValue,
 };
 use crate::models::{
-    SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage, SlackUserStatus,
+    SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage, SlackUser,
+    SlackUserStatus,
 };
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
@@ -18,8 +19,8 @@ const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
     pub user_names: HashMap<String, String>,
+    pub conversation_titles: HashMap<String, String>,
     pub user_statuses: HashMap<String, SlackUserStatus>,
-    pub direct_message_peer_id: Option<String>,
     pub user_group_names: HashMap<String, String>,
     pub user_group_members: HashMap<String, Vec<String>>,
     pub current_user_id: Option<String>,
@@ -31,6 +32,7 @@ pub struct MessageHtmlContext {
     pub recent_reactions: Vec<String>,
     pub custom_emojis: HashMap<String, String>,
     pub read_marker_url: Option<String>,
+    pub first_unread_ts: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -104,10 +106,13 @@ pub fn insert_message_patch(
     context: &MessageHtmlContext,
     position: TimelineInsertPosition,
 ) -> TimelineDomPatch {
+    let unread_separator = (context.first_unread_ts.as_deref() == Some(message.ts.as_str()))
+        .then(unread_separator_html)
+        .unwrap_or_default();
     TimelineDomPatch::InsertMessage {
         position,
         html: format!(
-            "<li class=\"message-list-item\">{}</li>",
+            "{unread_separator}<li class=\"message-list-item\">{}</li>",
             message_article(Some(channel_id), message, context)
         ),
     }
@@ -508,10 +513,12 @@ fn emoji_picker_script() -> &'static str {
 
   picker.querySelector(".picker-close").addEventListener("click", cancelPicker);
   picker.addEventListener("cancel", cancelPicker);
+  document.addEventListener("keydown", function (event) {
+    if (!picker.open || (event.key !== "Escape" && event.key !== "Esc")) return;
+    cancelPicker(event);
+  }, true);
   picker.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") {
-      cancelPicker(event);
-    } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
       event.preventDefault();
       event.stopPropagation();
       moveSelection(event.key === "ArrowUp" ? -1 : 1);
@@ -548,6 +555,31 @@ fn emoji_picker_script() -> &'static str {
 })();"##
 }
 
+fn author_actions_script() -> &'static str {
+    r#"(function () {
+  function closeAuthorMenus(except) {
+    document.querySelectorAll("details.author-actions[open]").forEach(function (menu) {
+      if (menu !== except) menu.open = false;
+    });
+  }
+
+  document.addEventListener("click", function (event) {
+    const menu = event.target.closest("details.author-actions");
+    if (!menu) closeAuthorMenus(null);
+  });
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape" && event.key !== "Esc") return;
+    const menu = document.querySelector("details.author-actions[open]");
+    if (!menu) return;
+    event.preventDefault();
+    menu.open = false;
+    const author = menu.querySelector("summary");
+    if (author) author.focus();
+  }, true);
+})();"#
+}
+
 fn emoji_value_html(value: &EmojiValue, lazy: bool) -> String {
     match value {
         EmojiValue::Unicode(glyph) => escape_html(glyph),
@@ -573,6 +605,124 @@ pub fn placeholder_document(title: &str, message: &str) -> String {
     )
 }
 
+pub fn user_profile_document(user: &SlackUser, context: &MessageHtmlContext) -> String {
+    let profile = user.profile.as_ref();
+    let display_name = user
+        .display_name()
+        .unwrap_or_else(|| gettext("Unknown person"));
+    let full_name = profile
+        .and_then(|profile| profile.real_name.as_deref())
+        .or(user.real_name.as_deref())
+        .unwrap_or(&display_name);
+    let image = profile.and_then(|profile| {
+        profile
+            .image_original
+            .as_deref()
+            .or(profile.image_512.as_deref())
+            .or(profile.image_192.as_deref())
+            .or(profile.image_72.as_deref())
+    });
+    let mut body = format!(
+        "<main class=\"profile-page\" aria-labelledby=\"document-title\"><nav><a href=\"conduit://profile-close\">← {}</a></nav><header class=\"profile-header\">",
+        profile_text_html(&gettext("Back to conversation"), context)
+    );
+    if let Some(image) = image.filter(|url| is_http_url(url)) {
+        body.push_str(&format!(
+            "<img class=\"profile-picture\" src=\"{}\" alt=\"{}\">",
+            escape_html(image),
+            escape_html(&format!("{} profile picture", full_name))
+        ));
+    }
+    body.push_str(&format!(
+        "<div><h1 id=\"document-title\">{}</h1><p class=\"profile-full-name\">{}</p></div></header><dl class=\"profile-details\">",
+        profile_text_html(&display_name, context), profile_text_html(full_name, context)
+    ));
+    let mut detail = |label: &str, value: Option<&str>| {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            body.push_str(&format!(
+                "<div><dt>{}</dt><dd dir=\"auto\">{}</dd></div>",
+                profile_text_html(label, context),
+                profile_text_html(value, context)
+            ));
+        }
+    };
+    if let Some(status) = user.status() {
+        let status_value = [status.emoji.as_str(), status.text.as_str()]
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        detail(&gettext("Status"), Some(&status_value));
+        if status.expiration > 0 {
+            let expiration = gtk::glib::DateTime::from_unix_local(status.expiration)
+                .ok()
+                .and_then(|datetime| datetime.format("%c %Z").ok())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| status.expiration.to_string());
+            detail(&gettext("Status expiration"), Some(&expiration));
+        }
+    }
+    detail(
+        &gettext("Job title"),
+        profile.and_then(|p| p.title.as_deref()),
+    );
+    detail(
+        &gettext("Pronouns"),
+        profile.and_then(|p| p.pronouns.as_deref()),
+    );
+    detail(&gettext("Email"), profile.and_then(|p| p.email.as_deref()));
+    detail(&gettext("Phone"), profile.and_then(|p| p.phone.as_deref()));
+    detail(&gettext("Skype"), profile.and_then(|p| p.skype.as_deref()));
+    detail(&gettext("About"), profile.and_then(|p| p.about.as_deref()));
+    detail(
+        &gettext("Location"),
+        profile
+            .and_then(|p| p.location.as_deref())
+            .or(user.tz_label.as_deref()),
+    );
+    detail(&gettext("Time zone"), user.tz.as_deref());
+    if let Some(profile) = profile {
+        let mut fields = profile.fields.iter().collect::<Vec<_>>();
+        fields.sort_by(|(left_id, left), (right_id, right)| {
+            left.label
+                .as_deref()
+                .unwrap_or(left_id)
+                .cmp(right.label.as_deref().unwrap_or(right_id))
+        });
+        for (field_id, field) in fields {
+            detail(
+                field.label.as_deref().unwrap_or(field_id),
+                field.display_value(),
+            );
+        }
+    }
+    body.push_str("</dl></main>");
+    html_document(&display_name, &body)
+}
+
+fn profile_text_html(text: &str, context: &MessageHtmlContext) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some((html, consumed)) = render_emoji_shortcode(rest, context) {
+            output.push_str(&html);
+            rest = &rest[consumed..];
+            continue;
+        }
+        let next = rest
+            .chars()
+            .next()
+            .expect("non-empty string has a character");
+        if next == '\n' {
+            output.push_str("<br>");
+        } else {
+            output.push_str(&escape_html(&next.to_string()));
+        }
+        rest = &rest[next.len_utf8()..];
+    }
+    output
+}
+
 #[cfg(test)]
 pub fn conversation_document(
     channel_id: &str,
@@ -592,7 +742,7 @@ pub fn conversation_document_with_focus(
         return placeholder_document(&gettext("Messages"), &gettext("No messages"));
     }
 
-    let groups = message_groups(messages);
+    let groups = message_groups(messages, context.first_unread_ts.as_deref());
     debug::log(
         "render",
         &format!(
@@ -620,24 +770,34 @@ pub fn conversation_document_with_focus(
     }
     body.push_str("<ol class=\"message-list\">");
     for group in groups {
+        if group
+            .first()
+            .is_some_and(|message| context.first_unread_ts.as_deref() == Some(message.ts.as_str()))
+        {
+            body.push_str(&unread_separator_html());
+        }
         body.push_str("<li class=\"message-list-item\">");
         body.push_str(&message_group_article(Some(channel_id), &group, context));
         body.push_str("</li>");
     }
     body.push_str("</ol>");
+    if context.read_marker_url.is_some()
+        && context.first_unread_ts.is_none()
+        && context.thread_ts.is_some()
+    {
+        body.push_str("<div id=\"timeline-read-sentinel\" aria-hidden=\"true\"></div>");
+    }
     if context.thread_ts.is_some() {
         if let Some(url) = context.load_more_url.as_deref() {
             body.push_str(&load_more_action_html(url, &gettext("Load more replies")));
         }
     }
-    if context.thread_ts.is_none() && context.read_marker_url.is_some() {
-        body.push_str("<div id=\"conversation-read-sentinel\" aria-hidden=\"true\"></div>");
-    }
     body.push_str("</main>");
     body.push_str(&emoji_picker_html(context));
 
     let mut scripts = vec![timeline_dom_runtime_script().to_string()];
-    if let Some(scroll_script) = timeline_scroll_script(channel_id, context.timeline_scroll) {
+    let scroll_identity = timeline_scroll_identity(channel_id, context.thread_ts.as_deref());
+    if let Some(scroll_script) = timeline_scroll_script(&scroll_identity, context.timeline_scroll) {
         scripts.push(scroll_script);
     }
     if !focus_attribute.is_empty() {
@@ -821,9 +981,11 @@ fn html_document_with_language(
     language: &str,
 ) -> String {
     let has_message_actions = body.contains("class=\"quick-actions\"");
+    let has_author_actions = body.contains("class=\"author-actions\"");
     let scripts = [
         script.filter(|script| !script.trim().is_empty()),
         has_message_actions.then_some(emoji_picker_script()),
+        has_author_actions.then_some(author_actions_script()),
     ]
     .into_iter()
     .flatten()
@@ -905,6 +1067,29 @@ a:hover {{
   padding-inline: 12px;
 }}
 
+.profile-page {{
+  box-sizing: border-box;
+  max-inline-size: 720px;
+  margin-inline: auto;
+  padding-block: 24px;
+  padding-inline: 20px;
+}}
+
+.profile-header {{
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin-block: 28px;
+}}
+
+.profile-header h1 {{ margin: 0; }}
+.profile-full-name {{ margin: 4px 0 0; color: var(--muted); }}
+.profile-picture {{ inline-size: 128px; block-size: 128px; border-radius: 50%; object-fit: cover; }}
+.profile-details {{ display: grid; gap: 0; margin: 0; }}
+.profile-details > div {{ padding-block: 12px; border-block-end: 1px solid var(--line); }}
+.profile-details dt {{ color: var(--muted); font-size: 12px; font-weight: 700; }}
+.profile-details dd {{ margin: 3px 0 0; }}
+
 .visually-hidden {{
   position: absolute;
   inline-size: 1px;
@@ -927,6 +1112,25 @@ a:hover {{
 .message-list-item {{
   display: block;
 }}
+
+.unread-separator {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-block: 4px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+}}
+
+.unread-separator::before,
+.unread-separator::after {{
+  content: "";
+  flex: 1;
+  border-block-start: 1px solid currentColor;
+}}
+
+.unread-boundary-item:empty {{ display: none; }}
 
 [data-message-region]:empty {{
   display: none;
@@ -951,6 +1155,57 @@ a:hover {{
 .message-stack {{
   display: grid;
   gap: 8px;
+}}
+
+.author-actions {{
+  position: relative;
+  display: inline-block;
+}}
+
+.author-actions > summary {{
+  cursor: pointer;
+  list-style: none;
+  padding-block: 1px;
+  padding-inline: 4px;
+  border-radius: 4px;
+}}
+
+.author-actions > summary::-webkit-details-marker {{ display: none; }}
+
+.author-actions > summary::after {{
+  content: "▾";
+  margin-inline-start: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}}
+
+.author-actions > summary:hover,
+.author-actions[open] > summary {{
+  background: var(--soft);
+}}
+
+.author-menu {{
+  position: absolute;
+  z-index: 10;
+  display: grid;
+  min-inline-size: 130px;
+  margin-block-start: 4px;
+  padding-block: 4px;
+  padding-inline: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--page);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 18%);
+}}
+
+.author-menu a {{
+  padding-block: 7px;
+  padding-inline: 12px;
+}}
+
+.author-menu a:hover {{
+  background: var(--soft);
+  text-decoration: none;
 }}
 
 .message-part {{
@@ -1718,6 +1973,13 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
     ))
 }
 
+fn timeline_scroll_identity(channel_id: &str, thread_ts: Option<&str>) -> String {
+    match thread_ts {
+        Some(thread_ts) => format!("thread:{channel_id}:{thread_ts}"),
+        None => format!("channel:{channel_id}"),
+    }
+}
+
 fn timeline_dom_runtime_script() -> &'static str {
     r#"(function () {
   function timelineRoot() {
@@ -1760,6 +2022,65 @@ fn timeline_dom_runtime_script() -> &'static str {
       return rect.bottom >= 0 && rect.top <= window.innerHeight;
     }) || null;
   }
+
+  let viewportAnchor = null;
+  let viewportAnchorTop = 0;
+  let viewportWidth = window.innerWidth;
+  let restoringViewportAnchor = false;
+  let rememberViewportAnchorFrame = 0;
+
+  function rememberViewportAnchor() {
+    if (restoringViewportAnchor) return;
+    const anchor = visibleAnchor();
+    if (!anchor) return;
+    viewportAnchor = anchor;
+    viewportAnchorTop = anchor.getBoundingClientRect().top;
+  }
+
+  function scheduleRememberViewportAnchor() {
+    if (restoringViewportAnchor || rememberViewportAnchorFrame) return;
+    rememberViewportAnchorFrame = requestAnimationFrame(function () {
+      rememberViewportAnchorFrame = 0;
+      rememberViewportAnchor();
+    });
+  }
+
+  document.addEventListener("click", function (event) {
+    const message = event.target && event.target.closest
+      ? event.target.closest("[data-message-ts]")
+      : null;
+    if (!message) return;
+    viewportAnchor = message;
+    viewportAnchorTop = message.getBoundingClientRect().top;
+  }, true);
+
+  function preserveViewportAnchorDuringResize() {
+    const nextWidth = window.innerWidth;
+    if (Math.abs(nextWidth - viewportWidth) < 0.5) {
+      scheduleRememberViewportAnchor();
+      return;
+    }
+    viewportWidth = nextWidth;
+    if (!viewportAnchor || !viewportAnchor.isConnected) {
+      rememberViewportAnchor();
+      return;
+    }
+
+    const root = timelineRoot();
+    const currentTop = viewportAnchor.getBoundingClientRect().top;
+    root.scrollTop += currentTop - viewportAnchorTop;
+    restoringViewportAnchor = true;
+    requestAnimationFrame(function () {
+      restoringViewportAnchor = false;
+    });
+  }
+
+  window.addEventListener("scroll", scheduleRememberViewportAnchor, { passive: true });
+  window.addEventListener("resize", preserveViewportAnchorDuringResize, { passive: true });
+  if ("ResizeObserver" in window) {
+    new ResizeObserver(preserveViewportAnchorDuringResize).observe(document.documentElement);
+  }
+  requestAnimationFrame(rememberViewportAnchor);
 
   function withPreservedScroll(mutate) {
     const root = timelineRoot();
@@ -1874,7 +2195,7 @@ fn timeline_dom_runtime_script() -> &'static str {
           mention.textContent = "@" + patch.name;
         });
         targets.forEach(function (target) {
-          const author = target.querySelector(".author");
+          const author = target.querySelector(".author-label");
           if (author) author.textContent = patch.name;
           const header = target.querySelector(".message-header");
           if (!header) return;
@@ -1882,7 +2203,8 @@ fn timeline_dom_runtime_script() -> &'static str {
           if (oldStatus) oldStatus.remove();
           if (patch.status_html) {
             const status = fragment(patch.status_html);
-            if (author) author.after(status);
+            const identity = author && (author.closest(".author-actions") || author);
+            if (identity) identity.after(status);
           }
         });
         return true;
@@ -1908,11 +2230,6 @@ fn message_focus_script() -> &'static str {
       return;
     }
     target.scrollIntoView({ block: "center", inline: "nearest" });
-    try {
-      target.focus({ preventScroll: true });
-    } catch (_) {
-      target.focus();
-    }
   }
 
   window.addEventListener("load", focusTarget, { once: true });
@@ -1925,16 +2242,60 @@ fn read_marker_script(url: &str) -> String {
     let url = serde_json::to_string(url).expect("read marker URL should serialize");
     format!(
         r#"(function () {{
-  const sentinel = document.getElementById("conversation-read-sentinel");
-  if (!sentinel || !("IntersectionObserver" in window)) return;
-  let sent = false;
+  if (!("IntersectionObserver" in window)) return;
+  const sentinel = document.getElementById("timeline-read-sentinel");
+  if (sentinel) {{
+    const sentinelObserver = new IntersectionObserver(function (entries) {{
+      if (!entries.some(function (entry) {{ return entry.isIntersecting; }})) return;
+      sentinelObserver.disconnect();
+      window.location.href = {url};
+    }}, {{ threshold: 1.0 }});
+    sentinelObserver.observe(sentinel);
+    return;
+  }}
+  let lastSent = "";
+  let timer = 0;
+  const visible = new Set();
+  function timestampAfter(left, right) {{ return left.localeCompare(right) > 0; }}
+  function schedule() {{
+    window.clearTimeout(timer);
+    timer = window.setTimeout(function () {{
+      const newest = Array.from(visible).sort().pop();
+      if (!newest || !timestampAfter(newest, lastSent)) return;
+      lastSent = newest;
+      const ordered = Array.from(document.querySelectorAll("[data-message-ts]"));
+      const currentIndex = ordered.findIndex(function (message) {{ return message.dataset.messageTs === newest; }});
+      const next = currentIndex >= 0 ? ordered[currentIndex + 1] : null;
+      const separator = document.querySelector(".unread-separator");
+      if (separator && next) next.before(separator);
+      else if (separator) separator.remove();
+      const target = new URL({url});
+      target.searchParams.set("ts", newest);
+      window.location.href = target.toString();
+    }}, 500);
+  }}
   const observer = new IntersectionObserver(function (entries) {{
-    if (sent || !entries.some(function (entry) {{ return entry.isIntersecting; }})) return;
-    sent = true;
-    observer.disconnect();
-    window.location.href = {url};
-  }}, {{ threshold: 1.0 }});
-  observer.observe(sentinel);
+    entries.forEach(function (entry) {{
+      const ts = entry.target.dataset.messageTs;
+      if (!ts) return;
+      if (entry.isIntersecting) visible.add(ts); else visible.delete(ts);
+    }});
+    schedule();
+  }}, {{ threshold: 0.01 }});
+  function observeUnreadMessages() {{
+    const boundary = document.querySelector(".unread-separator");
+    if (!boundary) return;
+    let afterBoundary = false;
+    document.querySelectorAll(".unread-separator, [data-message-ts]").forEach(function (node) {{
+      if (node.classList.contains("unread-separator")) {{ afterBoundary = true; return; }}
+      if (afterBoundary && !node.dataset.readObserved) {{
+        node.dataset.readObserved = "true";
+        observer.observe(node);
+      }}
+    }});
+  }}
+  observeUnreadMessages();
+  new MutationObserver(observeUnreadMessages).observe(document.querySelector(".message-list"), {{ childList: true, subtree: true }});
 }})();"#
     )
 }
@@ -1947,11 +2308,10 @@ fn message_article(
     let author = author_label(message, context);
     let status = author_status_html(message, context);
     let mut article = format!(
-        "<article class=\"message\"{}{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}{}</header><div data-message-region=\"body\"><div class=\"body\" dir=\"auto\">{}</div></div>",
+        "<article class=\"message\"{}{}><header class=\"message-header\">{}{}</header><div data-message-region=\"body\"><div class=\"body\" dir=\"auto\">{}</div></div>",
         message_target_attributes(Some(&message.ts)),
         message_author_attribute(message),
-        escape_html(&author),
-        status,
+        author_identity_html(message, &author, &status),
         metadata_html(message),
         message_body_html(message, context)
     );
@@ -2027,10 +2387,9 @@ fn message_group_article(
     let author = author_label(first_message, context);
     let status = author_status_html(first_message, context);
     let mut article = format!(
-        "<article class=\"message message-group\"{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span>{}{}</header><div class=\"message-stack\">",
+        "<article class=\"message message-group\"{}><header class=\"message-header\">{}{}</header><div class=\"message-stack\">",
         message_author_attribute(first_message),
-        escape_html(&author),
-        status,
+        author_identity_html(first_message, &author, &status),
         metadata_html(first_message)
     );
 
@@ -2040,6 +2399,22 @@ fn message_group_article(
 
     article.push_str("</div></article>");
     article
+}
+
+fn author_identity_html(message: &SlackMessage, author: &str, status: &str) -> String {
+    let label = escape_html(author);
+    let Some(user_id) = message.user.as_deref().filter(|id| !id.is_empty()) else {
+        return format!("<span class=\"author author-label\" dir=\"auto\">{label}</span>{status}");
+    };
+    format!(
+        "<details class=\"author-actions\"><summary class=\"author author-label\" dir=\"auto\" title=\"{}\">{label}</summary><nav class=\"author-menu\" aria-label=\"{}\"><a href=\"{}\">{}</a><a href=\"{}\">{}</a></nav></details>{status}",
+        escape_html(&format!("{}: {author}", gettext("Person actions"))),
+        escape_html(&gettext("Person actions")),
+        escape_html(&user_message_action_url(user_id)),
+        escape_html(&gettext("Message")),
+        escape_html(&user_profile_action_url(user_id)),
+        escape_html(&gettext("Profile")),
+    )
 }
 
 fn message_part_html(
@@ -2094,15 +2469,19 @@ fn message_author_attribute(message: &SlackMessage) -> String {
         .unwrap_or_default()
 }
 
-fn message_groups(messages: &[SlackMessage]) -> Vec<Vec<&SlackMessage>> {
+fn message_groups<'a>(
+    messages: &'a [SlackMessage],
+    first_unread_ts: Option<&str>,
+) -> Vec<Vec<&'a SlackMessage>> {
     let ordered = messages.iter().rev().collect::<Vec<_>>();
     let mut groups: Vec<Vec<&SlackMessage>> = Vec::new();
 
     for message in ordered {
         if let Some(group) = groups.last_mut() {
-            if group
-                .last()
-                .is_some_and(|previous| can_group_messages(previous, message))
+            if first_unread_ts != Some(message.ts.as_str())
+                && group
+                    .last()
+                    .is_some_and(|previous| can_group_messages(previous, message))
             {
                 group.push(message);
                 continue;
@@ -2113,6 +2492,14 @@ fn message_groups(messages: &[SlackMessage]) -> Vec<Vec<&SlackMessage>> {
     }
 
     groups
+}
+
+fn unread_separator_html() -> String {
+    format!(
+        "<li class=\"unread-boundary-item\"><div class=\"unread-separator\" role=\"separator\" aria-label=\"{}\"><span>{}</span></div></li>",
+        escape_html(&gettext("Unread messages")),
+        escape_html(&gettext("New"))
+    )
 }
 
 fn can_group_messages(previous: &SlackMessage, current: &SlackMessage) -> bool {
@@ -2148,12 +2535,19 @@ fn search_result_article(result: &SearchMatch, context: &MessageHtmlContext) -> 
     let channel = result
         .channel
         .as_ref()
-        .and_then(|channel| channel.name.as_deref())
-        .map(|name| format!("#{name}"))
+        .and_then(|channel| {
+            channel
+                .id
+                .as_deref()
+                .and_then(|id| context.conversation_titles.get(id).cloned())
+                .or_else(|| channel.name.as_deref().map(|name| format!("#{name}")))
+        })
         .unwrap_or_else(|| "Slack".to_string());
     let author = result
-        .username
+        .user
         .as_deref()
+        .and_then(|user_id| context.user_names.get(user_id).map(String::as_str))
+        .or(result.username.as_deref())
         .or(result.user.as_deref())
         .map(ToString::to_string)
         .unwrap_or_else(|| gettext("Unknown"));
@@ -2233,10 +2627,67 @@ fn timestamp_html(ts: &str) -> String {
 
 fn localized_timestamp_parts(ts: &str) -> Option<(String, String, String)> {
     let datetime = slack_ts_datetime(ts)?;
+    let now = gtk::glib::DateTime::now_local().ok()?;
+    localized_timestamp_parts_at(&datetime, &now)
+}
+
+fn localized_timestamp_parts_at(
+    datetime: &gtk::glib::DateTime,
+    now: &gtk::glib::DateTime,
+) -> Option<(String, String, String)> {
     let machine = datetime.format_iso8601().ok()?.to_string();
     let full = datetime.format("%c %Z").ok()?.to_string();
-    let short = datetime.format("%X").ok()?.to_string();
+    let short = compact_timestamp_text(datetime, now)?;
     Some((machine, full, short))
+}
+
+fn compact_timestamp_text(
+    datetime: &gtk::glib::DateTime,
+    now: &gtk::glib::DateTime,
+) -> Option<String> {
+    let time = datetime.format(&gettext("%H:%M")).ok()?.to_string();
+    let days_old = local_calendar_day(datetime) - local_calendar_day(now);
+    let days_old = -days_old;
+
+    let day = match days_old {
+        0 => return Some(time),
+        1 => gettext("Yesterday"),
+        2..=5 => datetime.format("%A").ok()?.to_string(),
+        _ => {
+            let include_year = days_old >= 183 && datetime.year() != now.year();
+            let format = if include_year {
+                gettext("%b %e, %Y")
+            } else {
+                gettext("%b %e")
+            };
+            datetime
+                .format(&format)
+                .ok()?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    };
+
+    Some(
+        gettext("{day}, {time}")
+            .replace("{day}", &day)
+            .replace("{time}", &time),
+    )
+}
+
+fn local_calendar_day(datetime: &gtk::glib::DateTime) -> i64 {
+    // Convert a civil date to a monotonic day number. Time and UTC offset are
+    // intentionally ignored: relative labels follow the user's local dates.
+    let mut year = i64::from(datetime.year());
+    let month = i64::from(datetime.month());
+    let day = i64::from(datetime.day_of_month());
+    year -= i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
 }
 
 fn slack_ts_datetime(ts: &str) -> Option<gtk::glib::DateTime> {
@@ -2277,9 +2728,6 @@ fn author_status_html(message: &SlackMessage, context: &MessageHtmlContext) -> S
     let Some(user_id) = message.user.as_deref() else {
         return String::new();
     };
-    if context.direct_message_peer_id.as_deref() != Some(user_id) {
-        return String::new();
-    }
     let Some(status) = context.user_statuses.get(user_id) else {
         return String::new();
     };
@@ -2987,6 +3435,23 @@ pub fn mark_read_action_url(channel_id: &str, ts: &str) -> String {
     )
 }
 
+pub fn user_message_action_url(user_id: &str) -> String {
+    format!("conduit://user-message?user={}", encode_query(user_id))
+}
+
+pub fn user_profile_action_url(user_id: &str) -> String {
+    format!("conduit://user-profile?user={}", encode_query(user_id))
+}
+
+pub fn mark_thread_read_action_url(channel_id: &str, thread_ts: &str, ts: &str) -> String {
+    format!(
+        "conduit://mark-read?channel={}&thread_ts={}&ts={}",
+        encode_query(channel_id),
+        encode_query(thread_ts),
+        encode_query(ts)
+    )
+}
+
 pub fn message_context_action_url(location: &SearchMessageLocation) -> String {
     let mut url = format!(
         "conduit://message?channel={}&ts={}",
@@ -3541,7 +4006,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_dm_author_status_is_accessible_and_does_not_leak_to_other_contexts() {
+    fn author_status_is_accessible_in_direct_group_and_channel_messages() {
         let context = MessageHtmlContext {
             user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
             user_statuses: HashMap::from([(
@@ -3552,22 +4017,18 @@ mod tests {
                     expiration: i64::MAX,
                 },
             )]),
-            direct_message_peer_id: Some("U123".to_string()),
             ..Default::default()
         };
-        let html = conversation_document("D123", &[message("hello")], &context);
 
-        assert!(html.contains("class=\"user-status\""));
-        assert!(html.contains("title=\"Heads &lt;down&gt;\""));
-        assert!(html.contains("aria-label=\"Status: Heads &lt;down&gt;\""));
-        assert!(html.contains("tabindex=\"0\""));
+        for conversation_id in ["D123", "G123", "C123"] {
+            let html = conversation_document(conversation_id, &[message("hello")], &context);
 
-        let channel_context = MessageHtmlContext {
-            direct_message_peer_id: None,
-            ..context
-        };
-        let channel_html = conversation_document("C123", &[message("hello")], &channel_context);
-        assert!(!channel_html.contains("class=\"user-status\""));
+            assert!(html.contains("class=\"author author-label\" dir=\"auto\" title=\"Person actions: Ada\">Ada</summary>"));
+            assert!(html.contains("<span class=\"user-status\""));
+            assert!(html.contains("title=\"Heads &lt;down&gt;\""));
+            assert!(html.contains("aria-label=\"Status: Heads &lt;down&gt;\""));
+            assert!(html.contains("tabindex=\"0\""));
+        }
     }
 
     #[test]
@@ -3697,6 +4158,54 @@ mod tests {
     }
 
     #[test]
+    fn compact_timestamp_uses_relative_days_then_dates_and_years() {
+        let timezone = gtk::glib::TimeZone::local();
+        let now = gtk::glib::DateTime::new(&timezone, 2026, 7, 15, 12, 0, 0.0).unwrap();
+        let at = |year, month, day| {
+            gtk::glib::DateTime::new(&timezone, year, month, day, 9, 30, 0.0).unwrap()
+        };
+
+        let today = at(2026, 7, 15);
+        assert_eq!(
+            compact_timestamp_text(&today, &now).as_deref(),
+            today.format(&gettext("%H:%M")).ok().as_deref()
+        );
+
+        let yesterday = compact_timestamp_text(&at(2026, 7, 14), &now).unwrap();
+        assert!(yesterday.contains(&gettext("Yesterday")));
+
+        let five_days_ago = at(2026, 7, 10);
+        let weekday = five_days_ago.format("%A").unwrap().to_string();
+        assert!(compact_timestamp_text(&five_days_ago, &now)
+            .unwrap()
+            .contains(&weekday));
+
+        let six_days_ago = at(2026, 7, 9);
+        let date_without_year = six_days_ago
+            .format(&gettext("%b %e"))
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let six_days_label = compact_timestamp_text(&six_days_ago, &now).unwrap();
+        assert!(six_days_label.contains(&date_without_year));
+        assert!(!six_days_label.contains("2026"));
+
+        let recent_previous_year_now = at(2026, 1, 10);
+        let recent_previous_year = at(2025, 12, 31);
+        assert!(
+            !compact_timestamp_text(&recent_previous_year, &recent_previous_year_now)
+                .unwrap()
+                .contains("2025")
+        );
+
+        let old_previous_year = at(2025, 12, 31);
+        assert!(compact_timestamp_text(&old_previous_year, &now)
+            .unwrap()
+            .contains("2025"));
+    }
+
+    #[test]
     fn conversation_messages_include_stable_scroll_anchors() {
         let html = conversation_document(
             "C123",
@@ -3720,7 +4229,7 @@ mod tests {
         let html = conversation_document("C123", &[message("paged")], &context);
 
         assert!(html.contains("mode = \"preserve-prepend\""));
-        assert!(html.contains("conduit:timeline-anchor:C123"));
+        assert!(html.contains("conduit:timeline-anchor:channel:C123"));
     }
 
     #[test]
@@ -3970,7 +4479,9 @@ mod tests {
             "picker.querySelector(\".picker-close\").addEventListener(\"click\", cancelPicker)"
         ));
         assert!(html.contains("picker.addEventListener(\"cancel\", cancelPicker)"));
-        assert!(html.contains("if (event.key === \"Escape\") {"));
+        assert!(html.contains(
+            "if (!picker.open || (event.key !== \"Escape\" && event.key !== \"Esc\")) return"
+        ));
         assert!(html.contains("cancelPicker(event);"));
         assert!(html.contains("if (event.target !== picker) return"));
         assert!(html.contains("if (!inside) cancelPicker(event)"));
@@ -4001,19 +4512,39 @@ mod tests {
     }
 
     #[test]
-    fn unread_conversation_marks_read_only_when_bottom_sentinel_is_visible() {
+    fn unread_conversation_advances_to_the_newest_visible_message() {
         let context = MessageHtmlContext {
             read_marker_url: Some(mark_read_action_url("C123", "1710000000.000100")),
+            first_unread_ts: Some("1710000000.000100".into()),
             ..Default::default()
         };
 
         let html = conversation_document("C123", &[message("unread")], &context);
 
-        assert!(html.contains("id=\"conversation-read-sentinel\""));
+        assert!(html.contains("class=\"unread-separator\""));
         assert!(html.contains("new IntersectionObserver"));
-        assert!(html.contains(
-            "window.location.href = \"conduit://mark-read?channel=C123&ts=1710000000.000100\""
-        ));
+        assert!(html.contains("target.searchParams.set(\"ts\", newest)"));
+        assert!(html.contains("if (separator && next) next.before(separator)"));
+    }
+
+    #[test]
+    fn thread_read_marker_and_scroll_state_are_scoped_to_the_thread() {
+        let context = MessageHtmlContext {
+            thread_ts: Some("1710000000.000100".into()),
+            read_marker_url: Some(mark_thread_read_action_url(
+                "C123",
+                "1710000000.000100",
+                "1710000001.000200",
+            )),
+            timeline_scroll: TimelineScrollBehavior::StickToBottom,
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("reply")], &context);
+
+        assert!(html.contains("id=\"timeline-read-sentinel\""));
+        assert!(html.contains("thread_ts=1710000000.000100"));
+        assert!(html.contains("conduit:timeline-at-bottom:thread:C123:1710000000.000100"));
     }
 
     #[test]
@@ -4417,6 +4948,47 @@ mod tests {
     }
 
     #[test]
+    fn search_results_resolve_dm_group_dm_and_author_display_names() {
+        let results = vec![
+            SearchMatch {
+                channel: Some(crate::models::SlackSearchChannel {
+                    id: Some("D123".to_string()),
+                    name: Some("directmessage".to_string()),
+                }),
+                user: Some("U_AUTHOR".to_string()),
+                username: Some("legacy-name".to_string()),
+                text: Some("Direct result".to_string()),
+                ..Default::default()
+            },
+            SearchMatch {
+                channel: Some(crate::models::SlackSearchChannel {
+                    id: Some("G123".to_string()),
+                    name: Some("mpdm-ada-grace-1".to_string()),
+                }),
+                text: Some("Group result".to_string()),
+                ..Default::default()
+            },
+        ];
+        let context = MessageHtmlContext {
+            user_names: HashMap::from([("U_AUTHOR".to_string(), "Linus Torvalds".to_string())]),
+            conversation_titles: HashMap::from([
+                ("D123".to_string(), "Ada Lovelace".to_string()),
+                ("G123".to_string(), "Ada Lovelace, Grace Hopper".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        let html = search_results_document(&results, &context);
+
+        assert!(html.contains("Ada Lovelace"));
+        assert!(html.contains("Ada Lovelace, Grace Hopper"));
+        assert!(html.contains("Linus Torvalds"));
+        assert!(!html.contains("#directmessage"));
+        assert!(!html.contains("#mpdm-ada-grace-1"));
+        assert!(!html.contains("legacy-name"));
+    }
+
+    #[test]
     fn search_results_omit_internal_link_without_a_complete_location() {
         let html = search_results_document(
             &[SearchMatch {
@@ -4450,7 +5022,7 @@ mod tests {
         assert!(!html.contains("const targetTs = \"1710000000"));
         assert!(html.contains("timeline.dataset.focusMessageTs"));
         assert!(html.contains("target.scrollIntoView"));
-        assert!(html.contains("target.focus"));
+        assert!(!html.contains("target.focus"));
     }
 
     #[test]
@@ -4486,6 +5058,10 @@ mod tests {
             conversation_document("C123", &[message("hello")], &MessageHtmlContext::default());
 
         assert!(html.contains("window.conduitApplyTimelinePatch"));
+        assert!(html.contains("preserveViewportAnchorDuringResize"));
+        assert!(html.contains("new ResizeObserver"));
+        assert!(html.contains("root.scrollTop += currentTop - viewportAnchorTop"));
+        assert!(html.contains("event.target.closest(\"[data-message-ts]\")"));
         assert!(html.contains("data-author-user-id=\"U123\""));
         for region in ["body", "attachments", "responses"] {
             assert!(html.contains(&format!("data-message-region=\"{region}\"")));
@@ -4564,5 +5140,63 @@ mod tests {
         assert!(html.contains("data-image-key=\"https://files.slack.com/image?&lt;unsafe&gt;\""));
         assert!(html.contains("data-image-alt="));
         assert!(html.contains("data-image-unavailable="));
+    }
+
+    #[test]
+    fn author_menu_and_profile_page_expose_person_actions_and_details() {
+        let context = MessageHtmlContext {
+            user_names: HashMap::from([("U123".into(), "Ada".into())]),
+            ..Default::default()
+        };
+        let html = conversation_document("C123", &[message("hello")], &context);
+        assert!(html.contains("conduit://user-message?user=U123"));
+        assert!(html.contains("conduit://user-profile?user=U123"));
+        assert!(!html.contains("document.addEventListener(\"contextmenu\""));
+
+        let profile = SlackUser {
+            id: Some("U123".into()),
+            real_name: Some("Ada Lovelace".into()),
+            tz_label: Some("Europe/Amsterdam".into()),
+            profile: Some(crate::models::SlackUserProfile {
+                display_name: Some("Ada :wave:".into()),
+                title: Some("Engineer :rocket:".into()),
+                email: Some("ada@example.test".into()),
+                about: Some("Builds useful things :coffee:".into()),
+                fields: HashMap::from([(
+                    "X123".into(),
+                    crate::models::SlackProfileField {
+                        label: Some("Office".into()),
+                        value: Some("Amsterdam".into()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let context = MessageHtmlContext {
+            custom_emojis: HashMap::from([(
+                "working".into(),
+                "https://emoji.slack-edge.com/T123/working.png".into(),
+            )]),
+            ..Default::default()
+        };
+        let mut profile = profile;
+        profile.profile.as_mut().unwrap().status_emoji = Some(":working:".into());
+        profile.profile.as_mut().unwrap().status_text = Some("Focused :coffee:".into());
+        let profile_html = user_profile_document(&profile, &context);
+        assert!(profile_html.contains("Ada Lovelace"));
+        assert!(profile_html.contains("Engineer"));
+        assert!(profile_html.contains("ada@example.test"));
+        assert!(profile_html.contains("Builds useful things"));
+        assert!(profile_html.contains("Europe/Amsterdam"));
+        assert!(profile_html.contains("Office"));
+        assert!(profile_html.contains("Amsterdam"));
+        assert!(profile_html.contains("title=\":working:\""));
+        assert!(profile_html.contains("https://emoji.slack-edge.com/T123/working.png"));
+        assert!(profile_html.contains("title=\":coffee:\""));
+        assert!(profile_html.contains("title=\":wave:\""));
+        assert!(profile_html.contains("title=\":rocket:\""));
+        assert!(!profile_html.contains(":working: Focused :coffee:"));
     }
 }
