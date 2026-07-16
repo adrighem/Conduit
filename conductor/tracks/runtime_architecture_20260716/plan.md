@@ -13,6 +13,7 @@
 - [x] Task: Initialize a safe tracing subscriber and bridge existing diagnostics ca201ae
 - [x] Task: Instrument runtime commands and asynchronous work with structured spans 9d0f4c5
 - [x] Task: Add observability regression tests and secret-redaction coverage 5d391d8
+- [x] Task: Preserve requested diagnostics across GTK activation f1494e5
 - [~] Task: Conductor - User Manual Verification 'Structured observability' (Protocol in workflow.md)
 
 ## Phase 3: Workspace lifecycle state
