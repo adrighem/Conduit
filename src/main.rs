@@ -54,6 +54,10 @@ use gtk::{gio, glib};
 use std::path::PathBuf;
 
 fn main() -> glib::ExitCode {
+    if let Err(error) = debug::init() {
+        eprintln!("Failed to initialize diagnostics: {error}");
+    }
+
     // Set up gettext translations
     let _ = setlocale(LocaleCategory::LcAll, "");
     bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
