@@ -1,12 +1,12 @@
 # Runtime Architecture Hardening Plan
 
-## Phase 1: Typed failure boundaries
+## Phase 1: Typed failure boundaries [checkpoint: 44964d4]
 
 - [x] Task: Document the typed-error and tracing stack choices before implementation 015ca08
 - [x] Task: Introduce typed Slack boundary errors with category coverage e26d6de
 - [x] Task: Introduce typed store boundary errors with category coverage 8c0279d
 - [x] Task: Carry structured runtime failures into operation-local UI recovery 792d61d
-- [~] Task: Conductor - User Manual Verification 'Typed failure boundaries' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Typed failure boundaries' (Protocol in workflow.md) 44964d4
 
 ## Phase 2: Structured observability
 
