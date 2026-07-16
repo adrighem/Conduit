@@ -19,6 +19,65 @@ use crate::models::{
 };
 use crate::thread_catalog::ThreadCatalog;
 
+/// Authoritative connection lifecycle for one workspace session.
+///
+/// This is intentionally separate from navigation and contains no presentation strings. Runtime
+/// events drive transitions; GTK renders the resulting state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WorkspaceLifecycle {
+    #[default]
+    Disconnected,
+    Connecting,
+    Syncing,
+    Ready,
+    Degraded,
+    AuthenticationRequired,
+    StartupFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceLifecycleEvent {
+    ConnectRequested,
+    Authenticated,
+    SyncCompleted,
+    RetryableFailure,
+    RecoveryStarted,
+    AuthenticationFailed,
+    StartupFailed,
+    SignedOut,
+}
+
+impl WorkspaceLifecycle {
+    pub(crate) fn transition(self, event: WorkspaceLifecycleEvent) -> Self {
+        use WorkspaceLifecycleEvent as Event;
+
+        if event == Event::SignedOut {
+            return Self::Disconnected;
+        }
+        if self == Self::StartupFailed {
+            return self;
+        }
+
+        match (self, event) {
+            (Self::Disconnected | Self::AuthenticationRequired, Event::ConnectRequested) => {
+                Self::Connecting
+            }
+            (Self::Disconnected, Event::StartupFailed) => Self::StartupFailed,
+            (Self::Connecting, Event::Authenticated) => Self::Syncing,
+            (
+                Self::Connecting | Self::Syncing | Self::Ready | Self::Degraded,
+                Event::AuthenticationFailed,
+            ) => Self::AuthenticationRequired,
+            (Self::Connecting | Self::Syncing | Self::Ready, Event::RetryableFailure) => {
+                Self::Degraded
+            }
+            (Self::Degraded, Event::RecoveryStarted) => Self::Syncing,
+            (Self::Syncing | Self::Degraded, Event::SyncCompleted) => Self::Ready,
+            _ => self,
+        }
+    }
+}
+
 /// Canonical workspace-domain state owned by the window controller.
 ///
 /// Keeping the catalogs and navigation state behind one owner makes session reset explicit and
@@ -1071,6 +1130,73 @@ mod tests {
         messages: Vec<SlackMessage>,
     ) -> HistoryApplyOutcome {
         state.apply_history(channel_id, messages, false, None, false, false)
+    }
+
+    #[test]
+    fn workspace_lifecycle_connects_syncs_and_becomes_ready() {
+        let lifecycle = WorkspaceLifecycle::default()
+            .transition(WorkspaceLifecycleEvent::ConnectRequested)
+            .transition(WorkspaceLifecycleEvent::Authenticated)
+            .transition(WorkspaceLifecycleEvent::SyncCompleted);
+
+        assert_eq!(lifecycle, WorkspaceLifecycle::Ready);
+    }
+
+    #[test]
+    fn workspace_lifecycle_recovers_from_degraded_through_sync() {
+        let degraded =
+            WorkspaceLifecycle::Ready.transition(WorkspaceLifecycleEvent::RetryableFailure);
+        assert_eq!(degraded, WorkspaceLifecycle::Degraded);
+
+        let recovered = degraded
+            .transition(WorkspaceLifecycleEvent::RecoveryStarted)
+            .transition(WorkspaceLifecycleEvent::SyncCompleted);
+        assert_eq!(recovered, WorkspaceLifecycle::Ready);
+    }
+
+    #[test]
+    fn workspace_lifecycle_handles_authentication_failure_and_reconnect() {
+        let authentication_required = WorkspaceLifecycle::Connecting
+            .transition(WorkspaceLifecycleEvent::AuthenticationFailed);
+        assert_eq!(
+            authentication_required,
+            WorkspaceLifecycle::AuthenticationRequired
+        );
+        assert_eq!(
+            authentication_required.transition(WorkspaceLifecycleEvent::ConnectRequested),
+            WorkspaceLifecycle::Connecting
+        );
+    }
+
+    #[test]
+    fn workspace_lifecycle_sign_out_resets_every_nonterminal_state() {
+        for lifecycle in [
+            WorkspaceLifecycle::Connecting,
+            WorkspaceLifecycle::Syncing,
+            WorkspaceLifecycle::Ready,
+            WorkspaceLifecycle::Degraded,
+            WorkspaceLifecycle::AuthenticationRequired,
+        ] {
+            assert_eq!(
+                lifecycle.transition(WorkspaceLifecycleEvent::SignedOut),
+                WorkspaceLifecycle::Disconnected
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_lifecycle_startup_failure_is_terminal_until_reset() {
+        let failed =
+            WorkspaceLifecycle::Disconnected.transition(WorkspaceLifecycleEvent::StartupFailed);
+        assert_eq!(failed, WorkspaceLifecycle::StartupFailed);
+        assert_eq!(
+            failed.transition(WorkspaceLifecycleEvent::ConnectRequested),
+            WorkspaceLifecycle::StartupFailed
+        );
+        assert_eq!(
+            failed.transition(WorkspaceLifecycleEvent::SignedOut),
+            WorkspaceLifecycle::Disconnected
+        );
     }
 
     #[test]
