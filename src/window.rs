@@ -71,8 +71,8 @@ use crate::thread_catalog::ThreadCatalog;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_state::{
     ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
-    ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceScrollBehavior, WorkspaceSessionState,
-    WorkspaceSnapshot,
+    ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle, WorkspaceLifecycleEvent,
+    WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
 };
 
 mod imp {
@@ -1046,6 +1046,66 @@ fn nearest_status_expiration(statuses: &HashMap<String, SlackUserStatus>, now: i
         .map(|status| status.expiration)
         .filter(|expiration| *expiration > now)
         .min()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceLifecycleSurface {
+    Connect,
+    Loading,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkspaceLifecyclePresentation {
+    surface: WorkspaceLifecycleSurface,
+    status: &'static str,
+}
+
+fn workspace_lifecycle_presentation(
+    lifecycle: WorkspaceLifecycle,
+    workspace_available: bool,
+) -> WorkspaceLifecyclePresentation {
+    use WorkspaceLifecycle as Lifecycle;
+    use WorkspaceLifecycleSurface as Surface;
+
+    match lifecycle {
+        Lifecycle::Disconnected => WorkspaceLifecyclePresentation {
+            surface: Surface::Connect,
+            status: "Choose a workspace to continue",
+        },
+        Lifecycle::Connecting => WorkspaceLifecyclePresentation {
+            surface: Surface::Loading,
+            status: "Connecting to Slack…",
+        },
+        Lifecycle::Syncing => WorkspaceLifecyclePresentation {
+            surface: if workspace_available {
+                Surface::Workspace
+            } else {
+                Surface::Loading
+            },
+            status: "Syncing workspace…",
+        },
+        Lifecycle::Ready => WorkspaceLifecyclePresentation {
+            surface: Surface::Workspace,
+            status: "",
+        },
+        Lifecycle::Degraded => WorkspaceLifecyclePresentation {
+            surface: if workspace_available {
+                Surface::Workspace
+            } else {
+                Surface::Connect
+            },
+            status: "Connection interrupted. Retrying…",
+        },
+        Lifecycle::AuthenticationRequired => WorkspaceLifecyclePresentation {
+            surface: Surface::Connect,
+            status: "Slack authentication failed. Sign in again.",
+        },
+        Lifecycle::StartupFailed => WorkspaceLifecyclePresentation {
+            surface: Surface::Connect,
+            status: "Conduit could not start.",
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2875,7 +2935,9 @@ impl ConduitWindow {
         }
 
         match kind {
-            RuntimeEventKind::WorkspaceLifecycle(_) => {}
+            RuntimeEventKind::WorkspaceLifecycle(event) => {
+                self.apply_workspace_lifecycle(event);
+            }
             RuntimeEventKind::Status(status) => {
                 if !self.imp().connect_requested.get() {
                     if status == "Loading conversations"
@@ -4415,23 +4477,26 @@ impl ConduitWindow {
     }
 
     fn show_loading(&self, status: &str) {
-        let imp = self.imp();
-        imp.status_label.set_label(status);
-        imp.connection_label.set_label(status);
-        imp.content_stack.set_visible_child_name("loading");
+        self.apply_workspace_lifecycle(WorkspaceLifecycleEvent::ConnectRequested);
+        self.imp().status_label.set_label(status);
     }
 
     fn show_login(&self, status: &str) {
         let imp = self.imp();
         self.reset_workspace_state();
-        imp.connect_button.set_sensitive(true);
-        imp.connection_label.set_label(status);
         imp.content_stack.set_visible_child_name("connect");
+        self.render_workspace_lifecycle();
+        if !status.is_empty() {
+            imp.connection_label.set_label(status);
+        }
     }
 
     pub(crate) fn show_connect_requested(&self) {
         self.send_session_command(RuntimeCommand::Disconnect);
         self.imp().connect_requested.set(true);
+        self.imp()
+            .workspace
+            .transition_lifecycle(WorkspaceLifecycleEvent::SignedOut);
         self.show_login("Choose a workspace to continue");
     }
 
@@ -4523,13 +4588,42 @@ impl ConduitWindow {
     fn set_status(&self, status: &str) {
         let imp = self.imp();
         imp.status_label.set_label(status);
-        imp.connection_label.set_label(status);
-        imp.workspace_status_label.set_label(status);
         imp.message_status_label.set_label(status);
     }
 
     fn restore_workspace_status(&self) {
-        self.set_status("");
+        self.imp().message_status_label.set_label("");
+        self.render_workspace_lifecycle();
+    }
+
+    fn apply_workspace_lifecycle(&self, event: WorkspaceLifecycleEvent) {
+        self.imp().workspace.transition_lifecycle(event);
+        self.render_workspace_lifecycle();
+    }
+
+    fn render_workspace_lifecycle(&self) {
+        let imp = self.imp();
+        let presentation = workspace_lifecycle_presentation(
+            imp.workspace.lifecycle(),
+            imp.workspace_id.borrow().is_some(),
+        );
+        let status = gettext(presentation.status);
+        imp.connection_label.set_label(&status);
+        imp.workspace_status_label.set_label(&status);
+        imp.connect_button
+            .set_sensitive(imp.workspace.lifecycle() != WorkspaceLifecycle::Connecting);
+        match presentation.surface {
+            WorkspaceLifecycleSurface::Connect => {
+                imp.content_stack.set_visible_child_name("connect")
+            }
+            WorkspaceLifecycleSurface::Loading => {
+                imp.status_label.set_label(&status);
+                imp.content_stack.set_visible_child_name("loading");
+            }
+            WorkspaceLifecycleSurface::Workspace => {
+                imp.content_stack.set_visible_child_name("workspace")
+            }
+        }
     }
 
     fn start_sidebar_loading(&self) {
@@ -6735,6 +6829,59 @@ impl ConduitWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_presentation_owns_connection_surface_and_status() {
+        let cases = [
+            (
+                WorkspaceLifecycle::Disconnected,
+                WorkspaceLifecycleSurface::Connect,
+                "Choose a workspace to continue",
+            ),
+            (
+                WorkspaceLifecycle::Connecting,
+                WorkspaceLifecycleSurface::Loading,
+                "Connecting to Slack…",
+            ),
+            (
+                WorkspaceLifecycle::Syncing,
+                WorkspaceLifecycleSurface::Workspace,
+                "Syncing workspace…",
+            ),
+            (
+                WorkspaceLifecycle::Ready,
+                WorkspaceLifecycleSurface::Workspace,
+                "",
+            ),
+            (
+                WorkspaceLifecycle::Degraded,
+                WorkspaceLifecycleSurface::Workspace,
+                "Connection interrupted. Retrying…",
+            ),
+            (
+                WorkspaceLifecycle::AuthenticationRequired,
+                WorkspaceLifecycleSurface::Connect,
+                "Slack authentication failed. Sign in again.",
+            ),
+            (
+                WorkspaceLifecycle::StartupFailed,
+                WorkspaceLifecycleSurface::Connect,
+                "Conduit could not start.",
+            ),
+        ];
+
+        for (lifecycle, surface, status) in cases {
+            assert_eq!(
+                workspace_lifecycle_presentation(lifecycle, true),
+                WorkspaceLifecyclePresentation { surface, status }
+            );
+        }
+
+        assert_eq!(
+            workspace_lifecycle_presentation(WorkspaceLifecycle::Degraded, false).surface,
+            WorkspaceLifecycleSurface::Connect
+        );
+    }
 
     #[test]
     fn repeated_ui_invalidations_require_only_one_scheduled_flush() {

@@ -10,7 +10,7 @@
 //! This module deliberately has no dependency on GTK, WebKit, or the runtime. Callers apply
 //! the returned outcomes to their views and translate request decisions into runtime commands.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::conversation_catalog::ConversationCatalog;
@@ -84,12 +84,26 @@ impl WorkspaceLifecycle {
 /// prevents the GTK layer from maintaining parallel conversation collections.
 #[derive(Debug, Default)]
 pub(crate) struct WorkspaceSessionState {
+    lifecycle: Cell<WorkspaceLifecycle>,
     pub(crate) conversations: RefCell<ConversationCatalog>,
     pub(crate) view: RefCell<WorkspaceViewState>,
     pub(crate) threads: RefCell<ThreadCatalog>,
 }
 
 impl WorkspaceSessionState {
+    pub(crate) fn lifecycle(&self) -> WorkspaceLifecycle {
+        self.lifecycle.get()
+    }
+
+    pub(crate) fn transition_lifecycle(
+        &self,
+        event: WorkspaceLifecycleEvent,
+    ) -> WorkspaceLifecycle {
+        let lifecycle = self.lifecycle.get().transition(event);
+        self.lifecycle.set(lifecycle);
+        lifecycle
+    }
+
     pub(crate) fn reset(&self) {
         *self.conversations.borrow_mut() = ConversationCatalog::default();
         self.view.borrow_mut().reset();
@@ -1140,6 +1154,18 @@ mod tests {
             .transition(WorkspaceLifecycleEvent::SyncCompleted);
 
         assert_eq!(lifecycle, WorkspaceLifecycle::Ready);
+    }
+
+    #[test]
+    fn workspace_session_owns_and_applies_lifecycle_transitions() {
+        let session = WorkspaceSessionState::default();
+        assert_eq!(session.lifecycle(), WorkspaceLifecycle::Disconnected);
+
+        assert_eq!(
+            session.transition_lifecycle(WorkspaceLifecycleEvent::ConnectRequested),
+            WorkspaceLifecycle::Connecting
+        );
+        assert_eq!(session.lifecycle(), WorkspaceLifecycle::Connecting);
     }
 
     #[test]
