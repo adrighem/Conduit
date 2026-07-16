@@ -21,7 +21,7 @@
 
 - [x] Task: Define and test pure workspace lifecycle transitions c32f890
 - [x] Task: Drive runtime lifecycle events from authentication, sync, disconnect, and recovery paths 74c1daa
-- [ ] Task: Render lifecycle-driven GTK status and recovery behavior
+- [x] Task: Render lifecycle-driven GTK status and recovery behavior c3703c6
 - [ ] Task: Conductor - User Manual Verification 'Workspace lifecycle state' (Protocol in workflow.md)
 
 ## Phase 4: Application service boundary
