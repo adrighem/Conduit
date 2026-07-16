@@ -36,7 +36,7 @@ pub(crate) enum WorkspaceLifecycle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceLifecycleEvent {
+pub enum WorkspaceLifecycleEvent {
     ConnectRequested,
     Authenticated,
     SyncCompleted,

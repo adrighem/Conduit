@@ -30,6 +30,7 @@ use crate::slack::{
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{StoreErrorCategory, WorkspaceStore};
 use crate::thread_catalog::ThreadRecord;
+use crate::workspace_state::WorkspaceLifecycleEvent;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
 const MAX_UNREAD_REFRESH_PASSES: usize = 3;
@@ -657,6 +658,7 @@ impl RuntimeFailure {
 #[derive(Debug)]
 pub enum RuntimeEventKind {
     Status(String),
+    WorkspaceLifecycle(WorkspaceLifecycleEvent),
     Error(RuntimeFailure),
     RuntimeStartFailed(RuntimeFailure),
     SignedOut,
@@ -875,6 +877,9 @@ impl RuntimeEventKind {
             }
             Self::RuntimeStartFailed(_) => {
                 OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace)
+            }
+            Self::WorkspaceLifecycle(_) => {
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
             }
             Self::Status(_)
             | Self::Error(_)
@@ -1521,16 +1526,20 @@ impl AppRuntime {
                         RuntimeEventKind::RuntimeStartFailed(RuntimeFailure::from_error(&error));
                     let context =
                         OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace);
+                    let meta = RuntimeEventMeta::new(
+                        RuntimeIdentity {
+                            session: SessionId::default().next(),
+                            request: RequestId::new(1),
+                        },
+                        context,
+                    );
                     let _ = events.send(RuntimeEvent {
-                        meta: RuntimeEventMeta::new(
-                            RuntimeIdentity {
-                                session: SessionId::default().next(),
-                                request: RequestId::new(1),
-                            },
-                            context,
+                        meta: meta.clone(),
+                        kind: RuntimeEventKind::WorkspaceLifecycle(
+                            WorkspaceLifecycleEvent::StartupFailed,
                         ),
-                        kind,
                     });
+                    let _ = events.send(RuntimeEvent { meta, kind });
                     return;
                 }
             };
@@ -1607,6 +1616,9 @@ fn dispatch_command(
 ) {
     match command {
         RuntimeCommand::LoadStoredToken => {
+            events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                WorkspaceLifecycleEvent::ConnectRequested,
+            ));
             events.send_status("Checking secure storage");
             let token = match TokenStore.load() {
                 Ok(Some(token)) => {
@@ -1622,17 +1634,20 @@ fn dispatch_command(
                     }
                     Ok(None) => None,
                     Err(error) => {
-                        events.send_failure(&error);
+                        send_lifecycle_failure(&events, &error);
                         return;
                     }
                 },
                 Err(error) => {
-                    events.send_failure(&error);
+                    send_lifecycle_failure(&events, &error);
                     return;
                 }
             };
 
             let Some(token) = token else {
+                events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                    WorkspaceLifecycleEvent::SignedOut,
+                ));
                 events.send_event(RuntimeEventKind::SignedOut);
                 return;
             };
@@ -1650,6 +1665,9 @@ fn dispatch_command(
             client_id,
             debug_auth,
         } => {
+            events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                WorkspaceLifecycleEvent::ConnectRequested,
+            ));
             events.send_status("Opening Slack authorization");
             let oauth = oauth.clone();
             spawn_authentication_task(state, identity, events, limits.clone(), async move {
@@ -1664,6 +1682,9 @@ fn dispatch_command(
             xoxd_token,
             user_agent,
         } => {
+            events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                WorkspaceLifecycleEvent::ConnectRequested,
+            ));
             events.send_status("Validating Slack browser session");
             let token = match browser_session_token_from_values(
                 Some(xoxc_token),
@@ -1672,13 +1693,15 @@ fn dispatch_command(
             ) {
                 Ok(Some(token)) => token,
                 Ok(None) => {
-                    events.send_event(RuntimeEventKind::Error(RuntimeFailure::validation(
-                        "Enter XOXC and XOXD tokens",
-                    )));
+                    let failure = RuntimeFailure::validation("Enter XOXC and XOXD tokens");
+                    events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                        lifecycle_failure_event(&failure),
+                    ));
+                    events.send_event(RuntimeEventKind::Error(failure));
                     return;
                 }
                 Err(error) => {
-                    events.send_failure(&error);
+                    send_lifecycle_failure(&events, &error);
                     return;
                 }
             };
@@ -1693,7 +1716,11 @@ fn dispatch_command(
         RuntimeCommand::SignOut => {
             finish_sign_out(&events, TokenStore.clear());
         }
-        RuntimeCommand::Disconnect => {}
+        RuntimeCommand::Disconnect => {
+            events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                WorkspaceLifecycleEvent::SignedOut,
+            ));
+        }
         command => {
             let connection = state
                 .lock()
@@ -1732,6 +1759,9 @@ fn finish_sign_out(events: &RuntimeEventSender, clear_result: Result<()>) {
     if let Err(error) = clear_result {
         events.send_failure(&error);
     }
+    events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+        WorkspaceLifecycleEvent::SignedOut,
+    ));
     events.send_event(RuntimeEventKind::SignedOut);
 }
 
@@ -1782,7 +1812,7 @@ fn spawn_authentication_task<F>(
                             return;
                         }
                         if let Err(error) = TokenStore.save(&token) {
-                            events.send_failure(&error);
+                            send_lifecycle_failure(&events, &error);
                             return;
                         }
                         let connection = RuntimeConnection {
@@ -1799,6 +1829,9 @@ fn spawn_authentication_task<F>(
                     };
 
                     let current_user_id = auth.user_id.clone();
+                    events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                        WorkspaceLifecycleEvent::Authenticated,
+                    ));
                     events.send_event(RuntimeEventKind::Authenticated(auth));
                     spawn_workspace_tasks(
                         &state_for_task,
@@ -1809,7 +1842,9 @@ fn spawn_authentication_task<F>(
                         current_user_id,
                     );
                 }
-                Err(error) => events.send_failure(&error),
+                Err(error) => {
+                    send_lifecycle_failure(&events, &error);
+                }
             }
         },
     );
@@ -2247,6 +2282,11 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         }
         RuntimeCommand::RefreshConversations => {
             crate::debug::log("runtime", "RefreshConversations");
+            context
+                .events
+                .send_event(RuntimeEventKind::WorkspaceLifecycle(
+                    WorkspaceLifecycleEvent::RecoveryStarted,
+                ));
             debug_assert_eq!(
                 conversation_refresh_mode(),
                 ConversationRefreshMode::Background
@@ -3022,6 +3062,9 @@ async fn load_conversations_with_api(
         &format!("ConversationsLoaded count={}", conversations.len()),
     );
     events.send_event(RuntimeEventKind::ConversationsLoaded(conversations.clone()));
+    events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+        WorkspaceLifecycleEvent::SyncCompleted,
+    ));
     Ok(conversations)
 }
 
@@ -3387,9 +3430,27 @@ fn handle_conversations_load_error(events: &RuntimeEventSender, error: anyhow::E
         "runtime",
         &format!("ConversationsLoadFailed error={error:#}"),
     );
-    events.send_event(RuntimeEventKind::ConversationsLoadFailed(
-        RuntimeFailure::from_error(&error),
+    let failure = RuntimeFailure::from_error(&error);
+    events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+        lifecycle_failure_event(&failure),
     ));
+    events.send_event(RuntimeEventKind::ConversationsLoadFailed(failure));
+}
+
+fn lifecycle_failure_event(failure: &RuntimeFailure) -> WorkspaceLifecycleEvent {
+    if failure.category == RuntimeFailureCategory::Authentication {
+        WorkspaceLifecycleEvent::AuthenticationFailed
+    } else {
+        WorkspaceLifecycleEvent::RetryableFailure
+    }
+}
+
+fn send_lifecycle_failure(events: &RuntimeEventSender, error: &anyhow::Error) {
+    let failure = RuntimeFailure::from_error(error);
+    events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+        lifecycle_failure_event(&failure),
+    ));
+    events.send_failure(error);
 }
 
 fn send_history_loaded(
@@ -4358,9 +4419,55 @@ mod tests {
             ));
             assert!(matches!(
                 events.recv().await.map(|event| event.kind),
+                Some(RuntimeEventKind::WorkspaceLifecycle(
+                    WorkspaceLifecycleEvent::SignedOut
+                ))
+            ));
+            assert!(matches!(
+                events.recv().await.map(|event| event.kind),
                 Some(RuntimeEventKind::SignedOut)
             ));
         });
+    }
+
+    #[test]
+    fn lifecycle_failure_event_distinguishes_authentication_from_retryable_failures() {
+        assert_eq!(
+            lifecycle_failure_event(&RuntimeFailure {
+                category: RuntimeFailureCategory::Authentication,
+                message: "safe".into(),
+            }),
+            WorkspaceLifecycleEvent::AuthenticationFailed
+        );
+        for category in [
+            RuntimeFailureCategory::Network,
+            RuntimeFailureCategory::RateLimited,
+            RuntimeFailureCategory::Storage,
+            RuntimeFailureCategory::Validation,
+            RuntimeFailureCategory::Internal,
+        ] {
+            assert_eq!(
+                lifecycle_failure_event(&RuntimeFailure {
+                    category,
+                    message: "safe".into(),
+                }),
+                WorkspaceLifecycleEvent::RetryableFailure
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_runtime_event_has_workspace_operation_context() {
+        let fallback = OperationContext::new(
+            RuntimeOperation::History,
+            RuntimeTarget::Channel("C1".into()),
+        );
+
+        assert_eq!(
+            RuntimeEventKind::WorkspaceLifecycle(WorkspaceLifecycleEvent::RecoveryStarted)
+                .operation_context(&fallback),
+            OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
+        );
     }
 
     #[test]

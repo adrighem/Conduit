@@ -2875,6 +2875,7 @@ impl ConduitWindow {
         }
 
         match kind {
+            RuntimeEventKind::WorkspaceLifecycle(_) => {}
             RuntimeEventKind::Status(status) => {
                 if !self.imp().connect_requested.get() {
                     if status == "Loading conversations"
