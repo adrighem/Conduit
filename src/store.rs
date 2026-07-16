@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use futures_util::lock::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,92 @@ const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 const SEEN_REALTIME_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
 const LOCAL_READ_TS_KEY: &str = "conduit_local_read_ts";
 const MAX_SEEN_REALTIME_MESSAGES: usize = 256;
+
+pub(crate) type Result<T> = std::result::Result<T, StoreError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StoreErrorCategory {
+    LocalIo,
+    TemporarilyUnavailable,
+    CorruptData,
+    IncompatibleSchema,
+    RejectedUpdate,
+    Unexpected,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StoreError {
+    #[error("{message}")]
+    RejectedUpdate { message: String },
+    #[error("workspace database schema {found} is newer than supported schema {supported}")]
+    IncompatibleSchema { found: u32, supported: u32 },
+    #[error(transparent)]
+    Database(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl StoreError {
+    fn rejected_update(message: impl Into<String>) -> Self {
+        Self::RejectedUpdate {
+            message: message.into(),
+        }
+    }
+
+    fn incompatible_schema(found: u32, supported: u32) -> Self {
+        Self::IncompatibleSchema { found, supported }
+    }
+
+    pub(crate) fn category(&self) -> StoreErrorCategory {
+        match self {
+            Self::RejectedUpdate { .. } => StoreErrorCategory::RejectedUpdate,
+            Self::IncompatibleSchema { .. } => StoreErrorCategory::IncompatibleSchema,
+            Self::Database(error) => classify_database_error(error),
+            Self::Io(_) => StoreErrorCategory::LocalIo,
+            Self::Json(_) => StoreErrorCategory::CorruptData,
+            Self::Other(error) => classify_wrapped_store_error(error),
+        }
+    }
+}
+
+fn classify_database_error(error: &rusqlite::Error) -> StoreErrorCategory {
+    let rusqlite::Error::SqliteFailure(details, _) = error else {
+        return StoreErrorCategory::Unexpected;
+    };
+    match details.code {
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+            StoreErrorCategory::TemporarilyUnavailable
+        }
+        rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+            StoreErrorCategory::CorruptData
+        }
+        rusqlite::ErrorCode::CannotOpen
+        | rusqlite::ErrorCode::DiskFull
+        | rusqlite::ErrorCode::PermissionDenied
+        | rusqlite::ErrorCode::ReadOnly
+        | rusqlite::ErrorCode::SystemIoFailure => StoreErrorCategory::LocalIo,
+        _ => StoreErrorCategory::Unexpected,
+    }
+}
+
+fn classify_wrapped_store_error(error: &anyhow::Error) -> StoreErrorCategory {
+    for source in error.chain() {
+        if let Some(database) = source.downcast_ref::<rusqlite::Error>() {
+            return classify_database_error(database);
+        }
+        if source.downcast_ref::<std::io::Error>().is_some() {
+            return StoreErrorCategory::LocalIo;
+        }
+        if source.downcast_ref::<serde_json::Error>().is_some() {
+            return StoreErrorCategory::CorruptData;
+        }
+    }
+    StoreErrorCategory::Unexpected
+}
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceStore {
@@ -89,7 +175,9 @@ impl WorkspaceStore {
         let _guard = self.update_lock.lock().await;
         let mut state = self.load_state_for_update().await?;
         if fresh.is_empty() && !state.conversations.is_empty() {
-            anyhow::bail!("Slack returned an unexpectedly empty conversation membership snapshot");
+            return Err(StoreError::rejected_update(
+                "Slack returned an unexpectedly empty conversation membership snapshot",
+            ));
         }
         let mut catalog =
             ConversationCatalog::from_cached(std::mem::take(&mut state.conversations));
@@ -579,13 +667,20 @@ impl WorkspaceStore {
         let directory = self.directory.clone();
         let workspace_key = self.workspace_key.clone();
         let workspace_id = self.workspace_id.clone();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let mut connection = open_database(&directory)?;
             migrate_legacy_workspace(&mut connection, &directory, &workspace_key, &workspace_id)?;
             load_sqlite_state(&connection, &workspace_key)
         })
         .await
-        .context("workspace cache reader stopped unexpectedly")?
+        .context("workspace cache reader stopped unexpectedly")?;
+        if let Err(error) = &result {
+            crate::debug::log(
+                "store",
+                &format!("WorkspaceCacheReadFailed category={:?}", error.category()),
+            );
+        }
+        result
     }
 
     async fn load_state_for_update(&self) -> Result<CachedWorkspaceState> {
@@ -738,9 +833,10 @@ fn open_database(directory: &Path) -> Result<Connection> {
     let schema_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
     if schema_version > DATABASE_SCHEMA_VERSION {
-        anyhow::bail!(
-            "workspace database schema {schema_version} is newer than supported schema {DATABASE_SCHEMA_VERSION}"
-        );
+        return Err(StoreError::incompatible_schema(
+            schema_version,
+            DATABASE_SCHEMA_VERSION,
+        ));
     }
     connection.execute_batch(&format!(
         "PRAGMA foreign_keys = ON;
@@ -1122,6 +1218,33 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn store_errors_classify_recovery_relevant_failures() {
+        let rejected = StoreError::rejected_update("empty membership snapshot");
+        let schema = StoreError::incompatible_schema(2, 1);
+        let corrupt = StoreError::from(serde_json::from_str::<serde_json::Value>("{").unwrap_err());
+        let local_io = StoreError::from(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cache is read-only",
+        ));
+
+        assert_eq!(rejected.category(), StoreErrorCategory::RejectedUpdate);
+        assert_eq!(schema.category(), StoreErrorCategory::IncompatibleSchema);
+        assert_eq!(corrupt.category(), StoreErrorCategory::CorruptData);
+        assert_eq!(local_io.category(), StoreErrorCategory::LocalIo);
+    }
+
+    #[test]
+    fn store_errors_preserve_database_sources() {
+        let error = StoreError::from(rusqlite::Error::InvalidQuery);
+
+        assert_eq!(error.category(), StoreErrorCategory::Unexpected);
+        assert!(matches!(
+            error,
+            StoreError::Database(rusqlite::Error::InvalidQuery)
+        ));
+    }
 
     fn temp_cache_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
