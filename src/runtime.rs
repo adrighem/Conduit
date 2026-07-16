@@ -23,10 +23,10 @@ use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
     SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, SlackUserStatus, StoredToken,
 };
-use crate::slack::{
-    DownloadedPreviewAsset, SlackApi, SlackErrorCategory, SlackMessagePage,
-    CHANNEL_HISTORY_PAGE_LIMIT,
+use crate::services::conversation_history::{
+    ConversationHistoryProgress, ConversationHistoryService,
 };
+use crate::slack::{DownloadedPreviewAsset, SlackApi, SlackErrorCategory, SlackMessagePage};
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{StoreErrorCategory, WorkspaceStore};
 use crate::thread_catalog::ThreadRecord;
@@ -2165,13 +2165,6 @@ fn cached_conversation_user_ids(
     user_ids
 }
 
-fn recent_history_preview(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
-    messages.sort_by(|left, right| right.ts.cmp(&left.ts));
-    messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
-    messages.truncate(CHANNEL_HISTORY_PAGE_LIMIT);
-    messages
-}
-
 #[derive(Debug, Clone)]
 struct ChannelHistoryPrefetchCandidate {
     id: String,
@@ -2402,9 +2395,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         RuntimeCommand::LoadHistory { channel_id } => {
             let api = require_slack(context.slack)?;
             crate::debug::log("runtime", &format!("LoadHistory channel_id={channel_id}"));
-            load_cached_history(context.events, context.workspace_store, &channel_id).await;
-            context.events.send_status("Loading conversation");
-            let page = api.history(&channel_id).await?;
+            let service = ConversationHistoryService::new(api, context.workspace_store.as_ref());
+            let page = service
+                .load(&channel_id, |progress| {
+                    apply_conversation_history_progress(context.events, &channel_id, progress)
+                })
+                .await?;
             observe_thread_history(
                 context.events,
                 context.workspace_store,
@@ -2412,7 +2408,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 &page.messages,
             )
             .await;
-            store_history(context.workspace_store, &channel_id, &page.messages).await;
             crate::debug::log(
                 "runtime",
                 &format!(
@@ -3810,38 +3805,37 @@ async fn store_user_names(
     }
 }
 
-async fn load_cached_history(
+fn apply_conversation_history_progress(
     events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
     channel_id: &str,
+    progress: ConversationHistoryProgress,
 ) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-
-    match store.load_history(channel_id).await {
-        Ok(Some(messages)) => {
-            let preview = recent_history_preview(messages);
+    match progress {
+        ConversationHistoryProgress::Cached(messages) => {
             crate::debug::log(
                 "runtime",
                 &format!(
                     "CachedHistoryLoaded channel_id={channel_id} messages={}",
-                    preview.len()
+                    messages.len()
                 ),
             );
             events.send_event(RuntimeEventKind::HistoryLoaded {
                 channel_id: channel_id.to_string(),
-                messages: preview,
+                messages,
                 has_more: false,
                 next_cursor: None,
                 append_older: false,
                 cached: true,
             });
         }
-        Ok(None) => {}
-        Err(error) => crate::debug::log(
+        ConversationHistoryProgress::Loading => events.send_status("Loading conversation"),
+        ConversationHistoryProgress::CacheReadFailed(category) => crate::debug::log(
             "runtime",
-            &format!("CachedHistoryLoadFailed channel_id={channel_id} error={error:#}"),
+            &format!("CachedHistoryLoadFailed channel_id={channel_id} category={category:?}"),
+        ),
+        ConversationHistoryProgress::CacheWriteFailed(category) => crate::debug::log(
+            "runtime",
+            &format!("CachedHistoryStoreFailed channel_id={channel_id} category={category:?}"),
         ),
     }
 }
@@ -4570,6 +4564,55 @@ mod tests {
     }
 
     #[test]
+    fn conversation_history_progress_preserves_cached_runtime_event_contract() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let (sender, mut events) = mpsc::unbounded_channel();
+            let event_sender = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(
+                    RuntimeOperation::History,
+                    RuntimeTarget::Channel("C1".into()),
+                ),
+            );
+            let messages = vec![SlackMessage {
+                ts: "1".into(),
+                ..SlackMessage::default()
+            }];
+
+            apply_conversation_history_progress(
+                &event_sender,
+                "C1",
+                ConversationHistoryProgress::Cached(messages.clone()),
+            );
+
+            let event = events.recv().await.expect("cached history event");
+            let RuntimeEventKind::HistoryLoaded {
+                channel_id,
+                messages: actual,
+                cached,
+                append_older,
+                ..
+            } = event.kind
+            else {
+                panic!("expected cached history event");
+            };
+            assert_eq!(channel_id, "C1");
+            assert_eq!(actual, messages);
+            assert!(cached);
+            assert!(!append_older);
+        });
+    }
+
+    #[test]
     fn realtime_persistence_worker_drains_events_in_session_scope() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5141,32 +5184,6 @@ mod tests {
             unread_count: Some(unread_count),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn recent_history_preview_keeps_latest_page_only() {
-        let count = CHANNEL_HISTORY_PAGE_LIMIT + 5;
-        let messages = (0..count)
-            .map(|index| SlackMessage {
-                ts: format!("1710000{index:03}.000000"),
-                text: Some(format!("message {index}")),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-
-        let preview = recent_history_preview(messages);
-        let first_ts = format!("1710000{:03}.000000", count - 1);
-        let last_ts = format!("1710000{:03}.000000", count - CHANNEL_HISTORY_PAGE_LIMIT);
-
-        assert_eq!(preview.len(), CHANNEL_HISTORY_PAGE_LIMIT);
-        assert_eq!(
-            preview.first().map(|message| message.ts.as_str()),
-            Some(first_ts.as_str())
-        );
-        assert_eq!(
-            preview.last().map(|message| message.ts.as_str()),
-            Some(last_ts.as_str())
-        );
     }
 
     #[test]

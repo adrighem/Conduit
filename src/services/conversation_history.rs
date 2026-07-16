@@ -1,6 +1,6 @@
 use crate::models::SlackMessage;
 use crate::slack::{SlackApi, SlackError, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
-use crate::store::{StoreError, WorkspaceStore};
+use crate::store::{StoreError, StoreErrorCategory, WorkspaceStore};
 
 pub(crate) trait ConversationHistorySlack {
     async fn load_history(&self, channel_id: &str) -> Result<SlackMessagePage, SlackError>;
@@ -44,8 +44,8 @@ impl ConversationHistoryStore for WorkspaceStore {
 pub(crate) enum ConversationHistoryProgress {
     Cached(Vec<SlackMessage>),
     Loading,
-    CacheReadFailed,
-    CacheWriteFailed,
+    CacheReadFailed(StoreErrorCategory),
+    CacheWriteFailed(StoreErrorCategory),
 }
 
 pub(crate) struct ConversationHistoryService<'a, Slack, Store> {
@@ -73,7 +73,9 @@ where
                     ConversationHistoryProgress::Cached(recent_history_preview(messages)),
                 ),
                 Ok(_) => {}
-                Err(_) => progress(ConversationHistoryProgress::CacheReadFailed),
+                Err(error) => progress(ConversationHistoryProgress::CacheReadFailed(
+                    error.category(),
+                )),
             }
         }
 
@@ -81,12 +83,10 @@ where
         let page = self.slack.load_history(channel_id).await?;
 
         if let Some(store) = self.store {
-            if store
-                .store_history(channel_id, &page.messages)
-                .await
-                .is_err()
-            {
-                progress(ConversationHistoryProgress::CacheWriteFailed);
+            if let Err(error) = store.store_history(channel_id, &page.messages).await {
+                progress(ConversationHistoryProgress::CacheWriteFailed(
+                    error.category(),
+                ));
             }
         }
 
@@ -244,9 +244,9 @@ mod tests {
             assert_eq!(
                 progress,
                 vec![
-                    ConversationHistoryProgress::CacheReadFailed,
+                    ConversationHistoryProgress::CacheReadFailed(StoreErrorCategory::LocalIo,),
                     ConversationHistoryProgress::Loading,
-                    ConversationHistoryProgress::CacheWriteFailed,
+                    ConversationHistoryProgress::CacheWriteFailed(StoreErrorCategory::LocalIo,),
                 ]
             );
         });
