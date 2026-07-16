@@ -4,7 +4,7 @@
 
 - [x] Task: Document the typed-error and tracing stack choices before implementation 015ca08
 - [x] Task: Introduce typed Slack boundary errors with category coverage e26d6de
-- [ ] Task: Introduce typed store boundary errors with category coverage
+- [x] Task: Introduce typed store boundary errors with category coverage 8c0279d
 - [ ] Task: Carry structured runtime failures into operation-local UI recovery
 - [ ] Task: Conductor - User Manual Verification 'Typed failure boundaries' (Protocol in workflow.md)
 
