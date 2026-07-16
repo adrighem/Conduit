@@ -23,10 +23,11 @@ use crate::models::{
     SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, SlackUserStatus, StoredToken,
 };
 use crate::slack::{
-    DownloadedPreviewAsset, SlackApi, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT,
+    DownloadedPreviewAsset, SlackApi, SlackErrorCategory, SlackMessagePage,
+    CHANNEL_HISTORY_PAGE_LIMIT,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
-use crate::store::WorkspaceStore;
+use crate::store::{StoreErrorCategory, WorkspaceStore};
 use crate::thread_catalog::ThreadRecord;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
@@ -505,15 +506,100 @@ fn message_context_operation_context(location: &SearchMessageLocation) -> Operat
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFailureCategory {
+    Authentication,
+    Network,
+    RateLimited,
+    Storage,
+    Validation,
+    Internal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeFailure {
+    pub category: RuntimeFailureCategory,
+    pub message: String,
+}
+
+impl RuntimeFailure {
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        for source in error.chain() {
+            if let Some(slack) = source.downcast_ref::<crate::slack::SlackError>() {
+                return Self::from_slack_category(slack.category());
+            }
+            if let Some(store) = source.downcast_ref::<crate::store::StoreError>() {
+                return Self::from_store_category(store.category());
+            }
+        }
+        Self::internal()
+    }
+
+    pub fn validation(message: impl Into<String>) -> Self {
+        Self {
+            category: RuntimeFailureCategory::Validation,
+            message: message.into(),
+        }
+    }
+
+    fn internal() -> Self {
+        Self {
+            category: RuntimeFailureCategory::Internal,
+            message: "Conduit encountered an unexpected error.".to_string(),
+        }
+    }
+
+    fn from_slack_category(category: SlackErrorCategory) -> Self {
+        match category {
+            SlackErrorCategory::Authentication => Self {
+                category: RuntimeFailureCategory::Authentication,
+                message: "Slack authentication failed. Sign in again.".to_string(),
+            },
+            SlackErrorCategory::Connectivity => Self {
+                category: RuntimeFailureCategory::Network,
+                message: "Could not reach Slack. Check your connection and try again.".to_string(),
+            },
+            SlackErrorCategory::RateLimited => Self {
+                category: RuntimeFailureCategory::RateLimited,
+                message: "Slack is rate limiting requests. Try again shortly.".to_string(),
+            },
+            SlackErrorCategory::LocalIo => Self::storage(),
+            SlackErrorCategory::Validation => Self {
+                category: RuntimeFailureCategory::Validation,
+                message: "Slack rejected invalid input.".to_string(),
+            },
+            SlackErrorCategory::Unexpected => Self::internal(),
+        }
+    }
+
+    fn from_store_category(category: StoreErrorCategory) -> Self {
+        match category {
+            StoreErrorCategory::RejectedUpdate => Self::internal(),
+            StoreErrorCategory::LocalIo
+            | StoreErrorCategory::TemporarilyUnavailable
+            | StoreErrorCategory::CorruptData
+            | StoreErrorCategory::IncompatibleSchema => Self::storage(),
+            StoreErrorCategory::Unexpected => Self::internal(),
+        }
+    }
+
+    fn storage() -> Self {
+        Self {
+            category: RuntimeFailureCategory::Storage,
+            message: "Conduit could not access its local data.".to_string(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum RuntimeEventKind {
     Status(String),
-    Error(String),
-    RuntimeStartFailed(String),
+    Error(RuntimeFailure),
+    RuntimeStartFailed(RuntimeFailure),
     SignedOut,
     Authenticated(AuthInfo),
     ConversationsLoaded(Vec<SlackConversation>),
-    ConversationsLoadFailed(String),
+    ConversationsLoadFailed(RuntimeFailure),
     ConversationChannelsDiscovered(Vec<SlackConversation>),
     ConversationPeopleDiscovered(Vec<SlackUser>),
     ConversationOpened(SlackConversation),
@@ -1362,9 +1448,10 @@ impl AppRuntime {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let kind = RuntimeEventKind::RuntimeStartFailed(format!(
-                        "Failed to start background runtime: {error}"
-                    ));
+                    crate::debug::log("runtime", &format!("RuntimeStartFailed error={error:#}"));
+                    let error = anyhow::Error::new(error);
+                    let kind =
+                        RuntimeEventKind::RuntimeStartFailed(RuntimeFailure::from_error(&error));
                     let context =
                         OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace);
                     let _ = events.send(RuntimeEvent {
@@ -1465,12 +1552,12 @@ fn dispatch_command(
                     }
                     Ok(None) => None,
                     Err(error) => {
-                        events.send_event(RuntimeEventKind::Error(error.to_string()));
+                        events.send_failure(&error);
                         return;
                     }
                 },
                 Err(error) => {
-                    events.send_event(RuntimeEventKind::Error(error.to_string()));
+                    events.send_failure(&error);
                     return;
                 }
             };
@@ -1515,13 +1602,13 @@ fn dispatch_command(
             ) {
                 Ok(Some(token)) => token,
                 Ok(None) => {
-                    events.send_event(RuntimeEventKind::Error(
-                        "Enter XOXC and XOXD tokens".to_string(),
-                    ));
+                    events.send_event(RuntimeEventKind::Error(RuntimeFailure::validation(
+                        "Enter XOXC and XOXD tokens",
+                    )));
                     return;
                 }
                 Err(error) => {
-                    events.send_event(RuntimeEventKind::Error(error.to_string()));
+                    events.send_failure(&error);
                     return;
                 }
             };
@@ -1544,9 +1631,9 @@ fn dispatch_command(
                 .connection
                 .clone();
             let Some(connection) = connection else {
-                events.send_event(RuntimeEventKind::Error(
-                    "No Slack workspace is available".to_string(),
-                ));
+                events.send_event(RuntimeEventKind::Error(RuntimeFailure::validation(
+                    "No Slack workspace is available",
+                )));
                 return;
             };
             let lane = command.task_lane();
@@ -1558,7 +1645,7 @@ fn dispatch_command(
                 if let Err(error) =
                     handle_connected_command(command, connection, &events, &image_cache).await
                 {
-                    events.send_event(RuntimeEventKind::Error(error.to_string()));
+                    events.send_failure(&error);
                 }
             });
         }
@@ -1573,7 +1660,7 @@ fn finish_sign_out(events: &RuntimeEventSender, clear_result: Result<()>) {
         );
     }
     if let Err(error) = clear_result {
-        events.send_event(RuntimeEventKind::Error(error.to_string()));
+        events.send_failure(&error);
     }
     events.send_event(RuntimeEventKind::SignedOut);
 }
@@ -1625,7 +1712,7 @@ fn spawn_authentication_task<F>(
                             return;
                         }
                         if let Err(error) = TokenStore.save(&token) {
-                            events.send_event(RuntimeEventKind::Error(error.to_string()));
+                            events.send_failure(&error);
                             return;
                         }
                         let connection = RuntimeConnection {
@@ -1652,7 +1739,7 @@ fn spawn_authentication_task<F>(
                         current_user_id,
                     );
                 }
-                Err(error) => events.send_event(RuntimeEventKind::Error(error.to_string())),
+                Err(error) => events.send_failure(&error),
             }
         },
     );
@@ -3230,7 +3317,9 @@ fn handle_conversations_load_error(events: &RuntimeEventSender, error: anyhow::E
         "runtime",
         &format!("ConversationsLoadFailed error={error:#}"),
     );
-    events.send_event(RuntimeEventKind::ConversationsLoadFailed(error.to_string()));
+    events.send_event(RuntimeEventKind::ConversationsLoadFailed(
+        RuntimeFailure::from_error(&error),
+    ));
 }
 
 fn send_history_loaded(
@@ -3625,6 +3714,7 @@ fn require_slack(slack: &Option<SlackApi>) -> Result<&SlackApi> {
 
 trait EventSenderExt {
     fn send_status(&self, status: &str);
+    fn send_failure(&self, error: &anyhow::Error);
     fn send_event(&self, event: RuntimeEventKind);
 }
 
@@ -3665,6 +3755,17 @@ impl EventSenderExt for RuntimeEventSender {
         self.send_event(RuntimeEventKind::Status(status.to_string()));
     }
 
+    fn send_failure(&self, error: &anyhow::Error) {
+        crate::debug::log(
+            "runtime",
+            &format!(
+                "RuntimeOperationFailed operation={:?} target={:?} error={error:#}",
+                self.fallback.operation, self.fallback.target
+            ),
+        );
+        self.send_event(RuntimeEventKind::Error(RuntimeFailure::from_error(error)));
+    }
+
     fn send_event(&self, kind: RuntimeEventKind) {
         let context = kind.operation_context(&self.fallback);
         let _ = self.sender.send(RuntimeEvent {
@@ -3685,6 +3786,45 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn runtime_failures_map_typed_boundary_categories_to_safe_messages() {
+        let auth = anyhow::Error::new(crate::slack::SlackError::Api {
+            method: "auth.test".to_string(),
+            code: "invalid_auth".to_string(),
+        });
+        let storage = anyhow::Error::new(crate::store::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "secret cache path",
+        )));
+
+        let auth = RuntimeFailure::from_error(&auth);
+        let storage = RuntimeFailure::from_error(&storage);
+
+        assert_eq!(auth.category, RuntimeFailureCategory::Authentication);
+        assert_eq!(auth.message, "Slack authentication failed. Sign in again.");
+        assert_eq!(storage.category, RuntimeFailureCategory::Storage);
+        assert_eq!(storage.message, "Conduit could not access its local data.");
+        assert!(!storage.message.contains("secret cache path"));
+    }
+
+    #[test]
+    fn runtime_failures_map_rate_limits_validation_and_unknown_errors() {
+        let rate_limit = anyhow::Error::new(crate::slack::SlackError::RateLimited {
+            method: "conversations.history".to_string(),
+        });
+        let validation = RuntimeFailure::validation("Enter both browser-session tokens");
+        let unknown = RuntimeFailure::from_error(&anyhow::anyhow!("sensitive internals"));
+
+        assert_eq!(
+            RuntimeFailure::from_error(&rate_limit).category,
+            RuntimeFailureCategory::RateLimited
+        );
+        assert_eq!(validation.category, RuntimeFailureCategory::Validation);
+        assert_eq!(validation.message, "Enter both browser-session tokens");
+        assert_eq!(unknown.category, RuntimeFailureCategory::Internal);
+        assert_eq!(unknown.message, "Conduit encountered an unexpected error.");
+    }
 
     struct CancellationSignal(Option<tokio::sync::oneshot::Sender<()>>);
 

@@ -54,7 +54,8 @@ use crate::models::{
 use crate::rendering;
 use crate::runtime::{
     AppRuntime, OperationContext, RequestId, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
-    RuntimeEventMeta, RuntimeIdentity, RuntimeOperation, RuntimeTarget, SessionId,
+    RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity, RuntimeOperation,
+    RuntimeTarget, SessionId,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
@@ -1008,6 +1009,17 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
             thread_ts: thread_ts.clone(),
         },
         _ => RuntimeFailureRecovery::NonDisruptive,
+    }
+}
+
+fn runtime_failure_recovery_for_failure(
+    context: &OperationContext,
+    failure: &RuntimeFailure,
+) -> RuntimeFailureRecovery {
+    if failure.category == RuntimeFailureCategory::Authentication {
+        RuntimeFailureRecovery::Session
+    } else {
+        runtime_failure_recovery(context)
     }
 }
 
@@ -2876,7 +2888,7 @@ impl ConduitWindow {
             RuntimeEventKind::Error(error) => {
                 self.handle_runtime_error(&meta.context, &error);
             }
-            RuntimeEventKind::RuntimeStartFailed(error) => self.show_session_error(&error),
+            RuntimeEventKind::RuntimeStartFailed(error) => self.show_session_error(&error.message),
             RuntimeEventKind::SignedOut => {
                 self.imp().connect_requested.set(false);
                 self.show_login("Choose a workspace to continue");
@@ -2895,7 +2907,7 @@ impl ConduitWindow {
             }
             RuntimeEventKind::ConversationsLoadFailed(error) => {
                 if !self.imp().connect_requested.get() {
-                    self.show_conversation_load_error(&error);
+                    self.show_conversation_load_error(&error.message);
                 }
             }
             RuntimeEventKind::ConversationChannelsDiscovered(channels) => {
@@ -4529,8 +4541,9 @@ impl ConduitWindow {
         }
     }
 
-    fn handle_runtime_error(&self, context: &OperationContext, error: &str) {
-        match runtime_failure_recovery(context) {
+    fn handle_runtime_error(&self, context: &OperationContext, failure: &RuntimeFailure) {
+        let error = failure.message.as_str();
+        match runtime_failure_recovery_for_failure(context, failure) {
             RuntimeFailureRecovery::Session => self.show_session_error(error),
             RuntimeFailureRecovery::Sidebar => self.show_conversation_load_error(error),
             RuntimeFailureRecovery::History(channel_id) => {
@@ -6913,7 +6926,9 @@ mod tests {
                 },
                 OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace),
             ),
-            kind: RuntimeEventKind::RuntimeStartFailed("runtime construction failed".to_string()),
+            kind: RuntimeEventKind::RuntimeStartFailed(RuntimeFailure::validation(
+                "runtime construction failed",
+            )),
         };
 
         assert!(runtime_event_is_start_failure(&event));
@@ -6926,9 +6941,26 @@ mod tests {
                 },
                 OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace),
             ),
-            kind: RuntimeEventKind::Error("stored token failed".to_string()),
+            kind: RuntimeEventKind::Error(RuntimeFailure::validation("stored token failed")),
         };
         assert!(!runtime_event_is_start_failure(&ordinary_error));
+    }
+
+    #[test]
+    fn authentication_failures_always_recover_at_the_session_surface() {
+        let failure = RuntimeFailure {
+            category: RuntimeFailureCategory::Authentication,
+            message: "Sign in again".to_string(),
+        };
+        let context = OperationContext::new(
+            RuntimeOperation::History,
+            RuntimeTarget::Channel("C123".to_string()),
+        );
+
+        assert_eq!(
+            runtime_failure_recovery_for_failure(&context, &failure),
+            RuntimeFailureRecovery::Session
+        );
     }
 
     #[test]
