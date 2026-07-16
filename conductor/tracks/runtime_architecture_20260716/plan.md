@@ -26,8 +26,7 @@
 
 ## Phase 4: Application service boundary
 
-- [ ] Task: Define narrow Slack and store ports for one conversation use case
-- [ ] Task: Extract and test the conversation use case in a headless application service
+- [x] Task: Define narrow Slack/store ports and extract a tested conversation history service 5715ae5
 - [ ] Task: Route the runtime and GTK shell through the extracted service
 - [ ] Task: Run full regression validation and synchronize approved architecture documentation
 - [ ] Task: Conductor - User Manual Verification 'Application service boundary' (Protocol in workflow.md)
