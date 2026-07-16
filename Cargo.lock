@@ -429,6 +429,7 @@ dependencies = [
  "sha2",
  "slack-blocks",
  "slack-morphism",
+ "thiserror",
  "tiny_http",
  "tokio",
  "tokio-tungstenite",

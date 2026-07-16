@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Context;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
@@ -37,6 +37,97 @@ const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
 const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
 const USERS_LIST_METHOD: &str = "users.list";
 const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
+
+pub type Result<T> = std::result::Result<T, SlackError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlackErrorCategory {
+    Authentication,
+    Connectivity,
+    RateLimited,
+    LocalIo,
+    Validation,
+    Unexpected,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SlackError {
+    #[error("Slack method {method} failed: {code}")]
+    Api { method: String, code: String },
+    #[error("Slack method {method} was rate limited; try again shortly")]
+    RateLimited { method: String },
+    #[error("{message}")]
+    Validation { message: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl SlackError {
+    fn api(method: impl Into<String>, code: impl Into<String>) -> Self {
+        Self::Api {
+            method: method.into(),
+            code: code.into(),
+        }
+    }
+
+    fn validation(message: impl Into<String>) -> Self {
+        Self::Validation {
+            message: message.into(),
+        }
+    }
+
+    pub fn category(&self) -> SlackErrorCategory {
+        match self {
+            Self::Api { code, .. } if slack_error_code_requires_authentication(code) => {
+                SlackErrorCategory::Authentication
+            }
+            Self::Api { code, .. } if slack_error_code_is_rate_limited(code) => {
+                SlackErrorCategory::RateLimited
+            }
+            Self::Api { .. } => SlackErrorCategory::Unexpected,
+            Self::RateLimited { .. } => SlackErrorCategory::RateLimited,
+            Self::Validation { .. } => SlackErrorCategory::Validation,
+            Self::Other(error) => classify_wrapped_slack_error(error),
+        }
+    }
+}
+
+fn slack_error_code_requires_authentication(code: &str) -> bool {
+    matches!(
+        code,
+        "account_inactive" | "invalid_auth" | "not_authed" | "token_expired" | "token_revoked"
+    )
+}
+
+fn slack_error_code_is_rate_limited(code: &str) -> bool {
+    matches!(code, "ratelimited" | "rate_limited")
+}
+
+fn classify_wrapped_slack_error(error: &anyhow::Error) -> SlackErrorCategory {
+    for source in error.chain() {
+        if let Some(request) = source.downcast_ref::<reqwest::Error>() {
+            if request.status().is_some_and(|status| {
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
+            }) {
+                return SlackErrorCategory::Authentication;
+            }
+            if request.is_timeout() || request.is_connect() || request.is_request() {
+                return SlackErrorCategory::Connectivity;
+            }
+        }
+        if let Some(io) = source.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut => SlackErrorCategory::Connectivity,
+                _ => SlackErrorCategory::LocalIo,
+            };
+        }
+    }
+    SlackErrorCategory::Unexpected
+}
 
 fn workspace_search_api_query(query: &str) -> String {
     let mut in_quoted_phrase = false;
@@ -348,7 +439,10 @@ impl SlackApi {
             }
             Err(error) => crate::debug::log(
                 "slack",
-                &format!("ConversationInfoUnreadFallback channel_id={channel_id} error={error:#}"),
+                &format!(
+                    "ConversationInfoUnreadFallback channel_id={channel_id} category={:?} error={error:#}",
+                    error.category()
+                ),
             ),
         }
 
@@ -536,7 +630,9 @@ impl SlackApi {
                     )
             })
             .ok_or_else(|| {
-                anyhow!("Slack attachment preview returned an unsupported content type")
+                SlackError::validation(
+                    "Slack attachment preview returned an unsupported content type",
+                )
             })?
             .to_string();
 
@@ -550,7 +646,9 @@ impl SlackApi {
             .content_length()
             .is_some_and(|length| length > max_bytes as u64)
         {
-            return Err(anyhow!("Slack attachment preview is too large"));
+            return Err(SlackError::validation(
+                "Slack attachment preview is too large",
+            ));
         }
 
         let initial_capacity = response
@@ -589,7 +687,7 @@ impl SlackApi {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(supported_media_mime_type)
-            .ok_or_else(|| anyhow!("Slack media has an unsupported content type"))?
+            .ok_or_else(|| SlackError::validation("Slack media has an unsupported content type"))?
             .to_string();
 
         ensure_media_size(response.content_length())?;
@@ -613,7 +711,7 @@ impl SlackApi {
             {
                 size = size
                     .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| anyhow!("Slack media is larger than 1 GiB"))?;
+                    .ok_or_else(|| SlackError::validation("Slack media is larger than 1 GiB"))?;
                 ensure_media_size(Some(size))?;
                 file.write_all(&chunk)
                     .await
@@ -626,7 +724,7 @@ impl SlackApi {
             tokio::fs::rename(&partial_path, destination)
                 .await
                 .context("failed to finalize the Slack media cache file")?;
-            Ok::<_, anyhow::Error>(size)
+            Ok::<_, SlackError>(size)
         }
         .await;
 
@@ -697,9 +795,9 @@ impl SlackApi {
                 .await
                 .context("failed to read Slack attachment bytes")?
             {
-                size = size
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| anyhow!("Slack attachment is larger than 1 GiB"))?;
+                size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    SlackError::validation("Slack attachment is larger than 1 GiB")
+                })?;
                 ensure_attachment_size(Some(size))?;
                 file.write_all(&chunk)
                     .await
@@ -719,7 +817,7 @@ impl SlackApi {
             tokio::fs::rename(&partial_path, destination)
                 .await
                 .context("failed to finalize the Slack attachment cache file")?;
-            Ok::<_, anyhow::Error>(size)
+            Ok::<_, SlackError>(size)
         }
         .await;
 
@@ -819,13 +917,16 @@ impl SlackApi {
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("file path has no valid filename"))?
+            .ok_or_else(|| SlackError::validation("file path has no valid filename"))?
             .to_string();
         let metadata = tokio::fs::metadata(path)
             .await
             .with_context(|| format!("failed to inspect {}", path.display()))?;
         if metadata.len() > MAX_UPLOAD_BYTES {
-            return Err(anyhow!("{} is larger than 1 GiB", path.display()));
+            return Err(SlackError::validation(format!(
+                "{} is larger than 1 GiB",
+                path.display()
+            )));
         }
 
         progress(UploadProgressUpdate::new(0.15, "Reading file"));
@@ -866,7 +967,7 @@ impl SlackApi {
             .files
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow!("Slack did not return uploaded file metadata"))
+            .ok_or_else(|| SlackError::validation("Slack did not return uploaded file metadata"))
     }
 
     async fn post_form<T>(&self, method: &str, params: &[(&str, String)]) -> Result<T>
@@ -893,9 +994,9 @@ impl SlackApi {
                         "slack",
                         &format!("Slack method {method} rate limited; not retrying automatically"),
                     );
-                    return Err(anyhow!(
-                        "Slack method {method} was rate limited; try again shortly"
-                    ));
+                    return Err(SlackError::RateLimited {
+                        method: method.to_string(),
+                    });
                 }
                 retries += 1;
                 crate::debug::log(
@@ -1212,7 +1313,9 @@ fn is_trusted_slack_download_url(url: &str) -> bool {
 
 fn ensure_trusted_slack_download_url(url: &str) -> Result<()> {
     if !is_trusted_slack_download_url(url) {
-        return Err(anyhow!("download URL is not a trusted Slack URL"));
+        return Err(SlackError::validation(
+            "download URL is not a trusted Slack URL",
+        ));
     }
     Ok(())
 }
@@ -1221,9 +1324,11 @@ fn append_bounded_preview_chunk(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: us
     let next_size = bytes
         .len()
         .checked_add(chunk.len())
-        .ok_or_else(|| anyhow!("Slack attachment preview is too large"))?;
+        .ok_or_else(|| SlackError::validation("Slack attachment preview is too large"))?;
     if next_size > max_bytes {
-        return Err(anyhow!("Slack attachment preview is too large"));
+        return Err(SlackError::validation(
+            "Slack attachment preview is too large",
+        ));
     }
     bytes.extend_from_slice(chunk);
     Ok(())
@@ -1241,14 +1346,16 @@ fn supported_media_mime_type(content_type: &str) -> Option<&str> {
 
 fn ensure_media_size(size: Option<u64>) -> Result<()> {
     if size.is_some_and(|size| size > MAX_MEDIA_DOWNLOAD_BYTES) {
-        return Err(anyhow!("Slack media is larger than 1 GiB"));
+        return Err(SlackError::validation("Slack media is larger than 1 GiB"));
     }
     Ok(())
 }
 
 fn ensure_attachment_size(size: Option<u64>) -> Result<()> {
     if size.is_some_and(|size| size > MAX_MEDIA_DOWNLOAD_BYTES) {
-        return Err(anyhow!("Slack attachment is larger than 1 GiB"));
+        return Err(SlackError::validation(
+            "Slack attachment is larger than 1 GiB",
+        ));
     }
     Ok(())
 }
@@ -1282,9 +1389,9 @@ trait SlackResponse: Sized {
         if self.ok() {
             Ok(self)
         } else {
-            Err(anyhow!(
-                "Slack method {method} failed: {}",
-                self.error().unwrap_or("unknown_error")
+            Err(SlackError::api(
+                method,
+                self.error().unwrap_or("unknown_error"),
             ))
         }
     }
@@ -1574,6 +1681,39 @@ fn thread_replies_in_history_order(mut messages: Vec<SlackMessage>) -> Vec<Slack
 mod tests {
     use super::*;
     use reqwest::header::{AUTHORIZATION, COOKIE, USER_AGENT};
+
+    #[test]
+    fn slack_errors_classify_api_failures_for_recovery() {
+        let auth = SlackError::api("auth.test", "invalid_auth");
+        let rate_limited = SlackError::api("conversations.history", "ratelimited");
+        let unexpected = SlackError::api("conversations.history", "fatal_error");
+
+        assert_eq!(auth.category(), SlackErrorCategory::Authentication);
+        assert_eq!(rate_limited.category(), SlackErrorCategory::RateLimited);
+        assert_eq!(unexpected.category(), SlackErrorCategory::Unexpected);
+    }
+
+    #[test]
+    fn slack_errors_classify_validation_and_wrapped_sources() {
+        let validation = SlackError::validation("download URL is not trusted");
+        let timeout = SlackError::from(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "request timed out",
+        )));
+        let local_io = SlackError::from(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cache is not writable",
+        )));
+
+        assert_eq!(validation.category(), SlackErrorCategory::Validation);
+        assert_eq!(timeout.category(), SlackErrorCategory::Connectivity);
+        assert_eq!(local_io.category(), SlackErrorCategory::LocalIo);
+        assert!(matches!(
+            &timeout,
+            SlackError::Other(source)
+                if source.downcast_ref::<std::io::Error>().is_some()
+        ));
+    }
 
     fn message(ts: &str) -> SlackMessage {
         SlackMessage {
