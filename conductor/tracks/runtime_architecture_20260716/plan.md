@@ -17,12 +17,12 @@
 - [x] Task: Route structured diagnostics to standard error 2e1f281
 - [x] Task: Conductor - User Manual Verification 'Structured observability' (Protocol in workflow.md) 9fbb739
 
-## Phase 3: Workspace lifecycle state
+## Phase 3: Workspace lifecycle state [checkpoint: 427bf42]
 
 - [x] Task: Define and test pure workspace lifecycle transitions c32f890
 - [x] Task: Drive runtime lifecycle events from authentication, sync, disconnect, and recovery paths 74c1daa
 - [x] Task: Render lifecycle-driven GTK status and recovery behavior c3703c6
-- [ ] Task: Conductor - User Manual Verification 'Workspace lifecycle state' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Workspace lifecycle state' (Protocol in workflow.md) 427bf42
 
 ## Phase 4: Application service boundary
 
