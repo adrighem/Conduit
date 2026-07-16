@@ -28,5 +28,5 @@
 
 - [x] Task: Define narrow Slack/store ports and extract a tested conversation history service 5715ae5
 - [x] Task: Route the runtime and GTK shell through the extracted service 92bd9c4
-- [ ] Task: Run full regression validation and synchronize approved architecture documentation
+- [x] Task: Run full regression validation and synchronize approved architecture documentation 7b0d152
 - [ ] Task: Conductor - User Manual Verification 'Application service boundary' (Protocol in workflow.md)
