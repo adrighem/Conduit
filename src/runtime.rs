@@ -3852,10 +3852,72 @@ impl EventSenderExt for RuntimeEventSender {
 #[cfg(test)]
 mod tests {
     use std::future;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[derive(Clone)]
+    struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace output lock poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runtime_trace_output_contains_correlation_fields_and_redacts_signed_urls() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let identity = RuntimeIdentity {
+            session: SessionId::default().next(),
+            request: RequestId::new(42),
+        };
+        let command = RuntimeCommand::LoadMedia {
+            url: "https://viewer:password@files.slack.com/file?token=signed-secret#preview"
+                .to_string(),
+            name: "private filename".to_string(),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = RuntimeTraceFields::for_command(identity, &command).span();
+            let _entered = span.enter();
+            tracing::debug!(target: "conduit::runtime", event = "scheduled");
+        });
+
+        let output = String::from_utf8(output.lock().expect("trace output lock poisoned").clone())
+            .expect("trace output should be UTF-8");
+        assert!(output.contains("runtime.command"));
+        assert!(output.contains("SessionId(1)"));
+        assert!(output.contains("RequestId(42)"));
+        assert!(output.contains("operation=Media"));
+        assert!(output.contains("media:https://files.slack.com/file"));
+        for secret in [
+            "viewer",
+            "password",
+            "signed-secret",
+            "preview",
+            "private filename",
+        ] {
+            assert!(!output.contains(secret), "trace leaked {secret}: {output}");
+        }
+    }
 
     #[test]
     fn runtime_trace_fields_include_identity_and_context_but_not_payloads() {

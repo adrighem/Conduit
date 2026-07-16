@@ -72,6 +72,8 @@ pub fn url_for_log(value: &str) -> String {
         return "data:<redacted>".to_string();
     }
 
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     url.set_query(None);
     url.set_fragment(None);
     truncate(url.as_str())
@@ -105,6 +107,20 @@ mod tests {
         assert_eq!(
             tracing_filter_spec(true, Some("conduit::runtime=trace")),
             "conduit=debug,conduit::runtime=trace"
+        );
+    }
+
+    #[test]
+    fn diagnostic_urls_remove_credentials_queries_fragments_and_data() {
+        assert_eq!(
+            url_for_log(
+                "https://viewer:password@files.slack.com/path/image.png?token=signed-secret#preview"
+            ),
+            "https://files.slack.com/path/image.png"
+        );
+        assert_eq!(
+            url_for_log("data:image/png;base64,sensitive"),
+            "data:<redacted>"
         );
     }
 }
