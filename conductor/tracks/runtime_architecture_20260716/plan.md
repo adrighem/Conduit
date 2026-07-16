@@ -14,6 +14,7 @@
 - [x] Task: Instrument runtime commands and asynchronous work with structured spans 9d0f4c5
 - [x] Task: Add observability regression tests and secret-redaction coverage 5d391d8
 - [x] Task: Preserve requested diagnostics across GTK activation f1494e5
+- [x] Task: Route structured diagnostics to standard error 2e1f281
 - [~] Task: Conductor - User Manual Verification 'Structured observability' (Protocol in workflow.md)
 
 ## Phase 3: Workspace lifecycle state
