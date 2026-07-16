@@ -8,14 +8,14 @@
 - [x] Task: Carry structured runtime failures into operation-local UI recovery 792d61d
 - [x] Task: Conductor - User Manual Verification 'Typed failure boundaries' (Protocol in workflow.md) 44964d4
 
-## Phase 2: Structured observability
+## Phase 2: Structured observability [checkpoint: 9fbb739]
 
 - [x] Task: Initialize a safe tracing subscriber and bridge existing diagnostics ca201ae
 - [x] Task: Instrument runtime commands and asynchronous work with structured spans 9d0f4c5
 - [x] Task: Add observability regression tests and secret-redaction coverage 5d391d8
 - [x] Task: Preserve requested diagnostics across GTK activation f1494e5
 - [x] Task: Route structured diagnostics to standard error 2e1f281
-- [~] Task: Conductor - User Manual Verification 'Structured observability' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Structured observability' (Protocol in workflow.md) 9fbb739
 
 ## Phase 3: Workspace lifecycle state
 
