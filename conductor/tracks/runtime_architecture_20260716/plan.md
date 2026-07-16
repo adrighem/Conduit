@@ -24,9 +24,9 @@
 - [x] Task: Render lifecycle-driven GTK status and recovery behavior c3703c6
 - [x] Task: Conductor - User Manual Verification 'Workspace lifecycle state' (Protocol in workflow.md) 427bf42
 
-## Phase 4: Application service boundary
+## Phase 4: Application service boundary [checkpoint: c5bc501]
 
 - [x] Task: Define narrow Slack/store ports and extract a tested conversation history service 5715ae5
 - [x] Task: Route the runtime and GTK shell through the extracted service 92bd9c4
 - [x] Task: Run full regression validation and synchronize approved architecture documentation 7b0d152
-- [ ] Task: Conductor - User Manual Verification 'Application service boundary' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Application service boundary' (Protocol in workflow.md) c5bc501
