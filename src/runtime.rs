@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tracing::Instrument;
 
 use crate::auth::{
     browser_session_token_from_env, browser_session_token_from_values, OAuthConfig,
@@ -228,6 +229,68 @@ pub enum RuntimeTarget {
 pub struct OperationContext {
     pub operation: RuntimeOperation,
     pub target: RuntimeTarget,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RuntimeTraceFields {
+    session: SessionId,
+    request: RequestId,
+    operation: RuntimeOperation,
+    target: String,
+}
+
+impl RuntimeTraceFields {
+    fn for_command(identity: RuntimeIdentity, command: &RuntimeCommand) -> Self {
+        let context = command.operation_context();
+        Self {
+            session: identity.session,
+            request: identity.request,
+            operation: context.operation,
+            target: runtime_target_for_trace(&context.target),
+        }
+    }
+
+    fn span(&self) -> tracing::Span {
+        tracing::debug_span!(
+            target: "conduit::runtime",
+            "runtime.command",
+            session = ?self.session,
+            request = ?self.request,
+            operation = ?self.operation,
+            target = %self.target,
+        )
+    }
+}
+
+fn runtime_target_for_trace(target: &RuntimeTarget) -> String {
+    match target {
+        RuntimeTarget::Workspace => "workspace".to_string(),
+        RuntimeTarget::Channel(channel_id) => format!("channel:{channel_id}"),
+        RuntimeTarget::Thread {
+            channel_id,
+            thread_ts,
+        } => format!("thread:{channel_id}:{thread_ts}"),
+        RuntimeTarget::User(user_id) => format!("user:{user_id}"),
+        RuntimeTarget::Image(key) => format!("image:{}", crate::debug::url_for_log(key)),
+        RuntimeTarget::Media(url) => format!("media:{}", crate::debug::url_for_log(url)),
+        RuntimeTarget::Attachment(url) => {
+            format!("attachment:{}", crate::debug::url_for_log(url))
+        }
+        RuntimeTarget::Message {
+            channel_id,
+            thread_ts,
+        } => format!(
+            "message:{channel_id}:{}",
+            thread_ts.as_deref().unwrap_or("main")
+        ),
+        RuntimeTarget::Upload {
+            channel_id,
+            thread_ts,
+        } => format!(
+            "upload:{channel_id}:{}",
+            thread_ts.as_deref().unwrap_or("main")
+        ),
+    }
 }
 
 impl OperationContext {
@@ -1150,16 +1213,20 @@ fn spawn_runtime_task<F>(
     let state_after_task = Arc::clone(state);
     let request_after_task = request.clone();
     let (start_task, task_started) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        if task_started.await.is_err() {
-            return;
+    let parent_span = tracing::Span::current();
+    let task = tokio::spawn(
+        async move {
+            if task_started.await.is_err() {
+                return;
+            }
+            future.await;
+            state_after_task
+                .lock()
+                .expect("runtime state lock poisoned")
+                .finish_task(task_id, request_after_task.as_ref());
         }
-        future.await;
-        state_after_task
-            .lock()
-            .expect("runtime state lock poisoned")
-            .finish_task(task_id, request_after_task.as_ref());
-    });
+        .instrument(parent_span),
+    );
     let registered = state
         .lock()
         .expect("runtime state lock poisoned")
@@ -1497,6 +1564,9 @@ async fn run_runtime(
 
     while let Some(request) = commands.recv().await {
         let RuntimeRequest { identity, command } = request;
+        let trace_fields = RuntimeTraceFields::for_command(identity, &command);
+        let span = trace_fields.span();
+        let _entered = span.enter();
         {
             let mut runtime_state = state.lock().expect("runtime state lock poisoned");
             if identity.session < runtime_state.active_session {
@@ -3786,6 +3856,27 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn runtime_trace_fields_include_identity_and_context_but_not_payloads() {
+        let identity = RuntimeIdentity {
+            session: SessionId::default().next(),
+            request: RequestId::new(42),
+        };
+        let command = RuntimeCommand::PostMessage {
+            channel_id: "C123".to_string(),
+            text: "do not trace this message".to_string(),
+            thread_ts: None,
+        };
+
+        let fields = RuntimeTraceFields::for_command(identity, &command);
+
+        assert_eq!(fields.session, identity.session);
+        assert_eq!(fields.request, identity.request);
+        assert_eq!(fields.operation, RuntimeOperation::PostMessage);
+        assert_eq!(fields.target, "message:C123:main");
+        assert!(!format!("{fields:?}").contains("do not trace this message"));
+    }
 
     #[test]
     fn runtime_failures_map_typed_boundary_categories_to_safe_messages() {
