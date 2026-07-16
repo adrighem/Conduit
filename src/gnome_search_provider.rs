@@ -565,6 +565,9 @@ mod tests {
         assert!(metadata.contains("BusName=eu.vanadrighem.conduit"));
         assert!(metadata.contains(&format!("ObjectPath={OBJECT_PATH}")));
         assert!(metadata.contains("Version=2"));
+
+        let desktop = include_str!("../data/eu.vanadrighem.conduit.desktop.in");
+        assert!(desktop.contains("DBusActivatable=true"));
     }
 
     #[test]

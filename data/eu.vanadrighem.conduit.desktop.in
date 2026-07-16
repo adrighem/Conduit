@@ -4,6 +4,7 @@ Exec=@bindir@/conduit
 Icon=eu.vanadrighem.conduit
 Terminal=false
 Type=Application
+DBusActivatable=true
 Categories=Network;Chat;InstantMessaging;GTK;
 Keywords=Slack;Chat;Messaging;GTK;
 StartupNotify=true
