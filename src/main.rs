@@ -33,6 +33,7 @@ mod models;
 mod rendering;
 mod runtime;
 mod search;
+mod services;
 mod shortcuts;
 mod sidebar;
 mod sidebar_widgets;
