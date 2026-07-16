@@ -241,6 +241,7 @@ mod imp {
             obj.setup_adaptive_layout();
             obj.setup_runtime();
             obj.setup_message_view();
+            obj.setup_reaction_picker_escape_fallback();
             obj.configure_accessibility();
             obj.configure_auth_ui();
             obj.setup_settings();
@@ -408,6 +409,12 @@ fn is_unmodified_paste_accelerator(key: gtk::gdk::Key, state: gtk::gdk::Modifier
 
 const COMPOSER_TARGETS: [ComposerTarget; 2] = [ComposerTarget::Message, ComposerTarget::Thread];
 const UI_EVENT_BATCH_LIMIT: usize = 8;
+const CANCEL_REACTION_PICKER_SCRIPT: &str = r#"(function () {
+  const picker = document.getElementById("emoji-picker");
+  if (!picker || !picker.open) return false;
+  picker.dispatchEvent(new Event("cancel", { cancelable: true }));
+  return true;
+})()"#;
 
 #[derive(Debug)]
 struct ComposerEmojiCompletion {
@@ -2215,6 +2222,37 @@ impl ConduitWindow {
         });
 
         web_view
+    }
+
+    fn setup_reaction_picker_escape_fallback(&self) {
+        // WebKitGTK does not consistently forward Escape to an open HTML
+        // dialog. Capture it at the application window and dispatch the
+        // dialog's existing cancellation path into both timeline WebViews.
+        let controller = gtk::EventControllerKey::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak_window = self.downgrade();
+        controller.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk::gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            let Some(window) = weak_window.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+
+            let main_view = window.imp().message_view.borrow().clone();
+            let thread_view = window.thread_pane().web_view();
+            for web_view in main_view.into_iter().chain([thread_view]) {
+                web_view.evaluate_javascript(
+                    CANCEL_REACTION_PICKER_SCRIPT,
+                    None,
+                    None,
+                    None::<&gio::Cancellable>,
+                    |_| {},
+                );
+            }
+            glib::Propagation::Proceed
+        });
+        self.add_controller(controller);
     }
 
     fn setup_callbacks(&self) {
@@ -6884,6 +6922,13 @@ impl ConduitWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaction_picker_escape_fallback_uses_the_shared_cancel_event() {
+        assert!(CANCEL_REACTION_PICKER_SCRIPT.contains("picker.open"));
+        assert!(CANCEL_REACTION_PICKER_SCRIPT
+            .contains("picker.dispatchEvent(new Event(\"cancel\", { cancelable: true }))"));
+    }
 
     #[test]
     fn lifecycle_presentation_owns_connection_surface_and_status() {
