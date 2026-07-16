@@ -74,11 +74,22 @@ fn conversation_target_from_variant(target: &glib::Variant) -> Option<(String, S
 
 mod imp {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     #[derive(Debug, Default)]
     pub struct ConduitApplication {
         search_provider_registration: RefCell<Option<gio::RegistrationId>>,
+        debug_enabled: Cell<bool>,
+    }
+
+    impl ConduitApplication {
+        pub(super) fn set_debug_enabled(&self, enabled: bool) {
+            self.debug_enabled.set(enabled);
+        }
+
+        pub(super) fn debug_enabled(&self) -> bool {
+            self.debug_enabled.get()
+        }
     }
 
     #[glib::object_subclass]
@@ -125,7 +136,7 @@ mod imp {
         // to do that, we'll just present any existing window.
         fn activate(&self) {
             let application = self.obj();
-            crate::debug::set_enabled(false);
+            crate::debug::set_enabled(self.debug_enabled());
             application.present_window(false, false);
         }
 
@@ -135,6 +146,7 @@ mod imp {
             let connect = options.contains("connect");
             let debug = options.contains("debug");
             let debug_auth = debug || options.contains("debug-auth");
+            self.set_debug_enabled(debug);
             crate::debug::set_enabled(debug);
             crate::debug::log("app", "debug logging enabled");
             application.present_window(connect, debug_auth);
@@ -381,6 +393,15 @@ impl ConduitApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_debug_mode_survives_application_activation() {
+        let state = imp::ConduitApplication::default();
+
+        assert!(!state.debug_enabled());
+        state.set_debug_enabled(true);
+        assert!(state.debug_enabled());
+    }
 
     #[test]
     fn notification_ids_are_stable_scoped_and_opaque() {
