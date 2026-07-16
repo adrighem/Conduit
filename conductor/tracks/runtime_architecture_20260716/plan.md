@@ -20,7 +20,7 @@
 ## Phase 3: Workspace lifecycle state
 
 - [x] Task: Define and test pure workspace lifecycle transitions c32f890
-- [ ] Task: Drive runtime lifecycle events from authentication, sync, disconnect, and recovery paths
+- [x] Task: Drive runtime lifecycle events from authentication, sync, disconnect, and recovery paths 74c1daa
 - [ ] Task: Render lifecycle-driven GTK status and recovery behavior
 - [ ] Task: Conductor - User Manual Verification 'Workspace lifecycle state' (Protocol in workflow.md)
 
