@@ -61,6 +61,8 @@ struct CachedSearchState {
     #[serde(default)]
     user_names: HashMap<String, String>,
     #[serde(default)]
+    user_full_names: HashMap<String, String>,
+    #[serde(default)]
     user_search_aliases: UserSearchAliases,
 }
 
@@ -196,6 +198,7 @@ fn search_states(
                     current_user_id,
                     &query,
                     Some(&state.user_search_aliases),
+                    Some(&state.user_full_names),
                     None,
                 )
                 .into_iter()
@@ -234,6 +237,7 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
             let current_user_id = current_user_id(&state.workspace_id).map(ToString::to_string);
             let workspace_id = state.workspace_id;
             let user_names = state.user_names;
+            let user_full_names = state.user_full_names;
             state
                 .conversations
                 .into_iter()
@@ -251,8 +255,11 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
                         encode_target(&target),
                         SearchResult {
                             id: encode_target(&target),
-                            name: conversation
-                                .display_name_with_users(&user_names, current_user_id.as_deref()),
+                            name: conversation.navigation_name_with_users(
+                                &user_names,
+                                &user_full_names,
+                                current_user_id.as_deref(),
+                            ),
                             description: kind.accessible_name(),
                             icon_name: kind.icon_name(),
                         },
@@ -288,6 +295,7 @@ fn cached_states(cache_dir: &Path) -> Vec<CachedSearchState> {
             workspace_id: state.workspace_id,
             conversations: state.conversations,
             user_names: state.user_names,
+            user_full_names: state.user_full_names,
             user_search_aliases: state.user_search_aliases,
         })
         .into_iter()
@@ -343,6 +351,13 @@ mod tests {
                     .unwrap_or_else(|| serde_json::json!({})),
             )
             .unwrap();
+            let user_full_names = serde_json::from_value::<HashMap<String, String>>(
+                state
+                    .get("user_full_names")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .unwrap();
             let user_aliases = serde_json::from_value::<HashMap<String, Vec<String>>>(
                 state
                     .get("user_search_aliases")
@@ -358,6 +373,7 @@ mod tests {
                 .block_on(async {
                     store.store_conversations(&conversations).await.unwrap();
                     store.store_user_names(&user_names).await.unwrap();
+                    store.store_user_full_names(&user_full_names).await.unwrap();
                     store
                         .store_user_search_aliases(&user_aliases)
                         .await
@@ -400,14 +416,15 @@ mod tests {
                     {"id": "C1", "name": "architecture", "is_channel": true},
                     {"id": "D1", "user": "U1", "is_im": true}
                 ],
-                "user_names": {"U1": "Žilvinas Kuusas"},
+                "user_names": {"U1": "zilvinas"},
+                "user_full_names": {"U1": "Žilvinas Kuusas"},
                 "user_search_aliases": {"U1": ["zilvinas", "kuusas"]}
             }),
         );
 
         let dm = search(&directory, &["Zilvinas".into(), "Kuu".into()]);
         assert_eq!(dm.len(), 1);
-        assert_eq!(dm[0].name, "Žilvinas Kuusas");
+        assert_eq!(dm[0].name, "Žilvinas Kuusas (zilvinas)");
         assert_eq!(dm[0].description, "Direct message");
 
         let channel = search(&directory, &["arch".into()]);

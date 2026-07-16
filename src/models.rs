@@ -228,6 +228,46 @@ impl SlackConversation {
         self.id.clone()
     }
 
+    pub fn navigation_name_with_users(
+        &self,
+        user_names: &HashMap<String, String>,
+        user_full_names: &HashMap<String, String>,
+        current_user_id: Option<&str>,
+    ) -> String {
+        if self.is_im.unwrap_or(false) {
+            if let Some(user_id) = self.user.as_deref() {
+                return direct_message_user_name(
+                    user_id,
+                    user_names.get(user_id).map(String::as_str),
+                    user_full_names.get(user_id).map(String::as_str),
+                );
+            }
+        }
+
+        if self.is_mpim.unwrap_or(false) {
+            let mut names = self
+                .group_direct_message_user_ids()
+                .into_iter()
+                .filter(|user_id| Some(user_id.as_str()) != current_user_id)
+                .map(|user_id| {
+                    user_full_names
+                        .get(&user_id)
+                        .or_else(|| user_names.get(&user_id))
+                        .map(|name| name.trim())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(user_id.as_str())
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            names.sort_by_key(|name| name.to_lowercase());
+            if !names.is_empty() {
+                return names.join(", ");
+            }
+        }
+
+        self.display_name_with_users(user_names, current_user_id)
+    }
+
     fn extra_bool(&self, key: &str) -> bool {
         self.extra
             .get(key)
@@ -704,6 +744,27 @@ impl SlackUser {
             .or_else(|| self.name.clone())
     }
 
+    pub fn full_name(&self) -> Option<String> {
+        self.profile
+            .as_ref()
+            .and_then(|profile| profile.real_name.clone())
+            .or_else(|| self.real_name.clone())
+            .filter(|name| !name.trim().is_empty())
+    }
+
+    pub fn direct_message_name(&self) -> Option<String> {
+        let display_name = self.display_name();
+        let full_name = self.full_name();
+        match (display_name.as_deref(), full_name.as_deref()) {
+            (None, None) => None,
+            (display_name, full_name) => Some(direct_message_user_name(
+                self.id.as_deref().unwrap_or_default(),
+                display_name,
+                full_name,
+            )),
+        }
+    }
+
     /// Every human-readable identity Slack exposes for this user.
     ///
     /// The preferred display name remains the presentation label, while the
@@ -735,6 +796,24 @@ impl SlackUser {
 
     pub fn status(&self) -> Option<SlackUserStatus> {
         self.profile.as_ref().and_then(SlackUserProfile::status)
+    }
+}
+
+fn direct_message_user_name(
+    user_id: &str,
+    display_name: Option<&str>,
+    full_name: Option<&str>,
+) -> String {
+    let display_name = display_name.map(str::trim).filter(|name| !name.is_empty());
+    let full_name = full_name.map(str::trim).filter(|name| !name.is_empty());
+
+    match (full_name, display_name) {
+        (Some(full_name), Some(display_name)) if !full_name.eq_ignore_ascii_case(display_name) => {
+            format!("{full_name} ({display_name})")
+        }
+        (Some(full_name), _) => full_name.to_string(),
+        (None, Some(display_name)) => display_name.to_string(),
+        (None, None) => format!("DM {user_id}"),
     }
 }
 
@@ -928,6 +1007,40 @@ mod tests {
         assert_eq!(
             conversation.display_name_with_users(&names, None),
             "Ada Lovelace"
+        );
+    }
+
+    #[test]
+    fn navigation_names_prefer_full_names_without_changing_display_names() {
+        let dm = SlackConversation {
+            id: "D123".to_string(),
+            user: Some("U1".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        let group: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "M123",
+            "is_mpim": true,
+            "members": ["U_SELF", "U1", "U2"]
+        }))
+        .expect("valid group DM");
+        let display_names = HashMap::from([
+            ("U1".to_string(), "ada".to_string()),
+            ("U2".to_string(), "Grace".to_string()),
+        ]);
+        let full_names = HashMap::from([
+            ("U1".to_string(), "Ada Lovelace".to_string()),
+            ("U2".to_string(), "Grace Hopper".to_string()),
+        ]);
+
+        assert_eq!(dm.display_name_with_users(&display_names, None), "ada");
+        assert_eq!(
+            dm.navigation_name_with_users(&display_names, &full_names, None),
+            "Ada Lovelace (ada)"
+        );
+        assert_eq!(
+            group.navigation_name_with_users(&display_names, &full_names, Some("U_SELF")),
+            "Ada Lovelace, Grace Hopper"
         );
     }
 

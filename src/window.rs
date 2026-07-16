@@ -183,6 +183,7 @@ mod imp {
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
         pub seen_realtime_messages: RefCell<HashSet<String>>,
         pub user_names: RefCell<HashMap<String, String>>,
+        pub user_full_names: RefCell<HashMap<String, String>>,
         pub user_search_aliases: RefCell<sidebar::UserSearchAliases>,
         pub user_statuses: RefCell<sidebar::UserStatuses>,
         pub status_expiry_generation: Cell<u64>,
@@ -516,6 +517,7 @@ fn picker_sections(
         user_names,
         current_user_id,
         known_user_search_aliases,
+        user_full_names,
         user_statuses,
     } = source;
     let channels = if include_discovery {
@@ -536,6 +538,7 @@ fn picker_sections(
             user_names,
             current_user_id,
             known_user_search_aliases,
+            user_full_names,
             user_statuses,
         },
         query,
@@ -3217,9 +3220,13 @@ impl ConduitWindow {
             RuntimeEventKind::UserLoaded {
                 user_id,
                 display_name,
+                full_name,
                 status,
             } => {
                 self.populate_user_names(HashMap::from([(user_id.clone(), display_name)]));
+                if let Some(full_name) = full_name {
+                    self.populate_user_full_names(HashMap::from([(user_id.clone(), full_name)]));
+                }
                 if let Some(status) = status {
                     self.populate_user_statuses(HashMap::from([(user_id, status)]));
                 }
@@ -3237,6 +3244,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::UserNamesLoaded(user_names) => self.populate_user_names(user_names),
+            RuntimeEventKind::UserFullNamesLoaded(names) => self.populate_user_full_names(names),
             RuntimeEventKind::UserSearchAliasesLoaded(aliases) => {
                 *self.imp().user_search_aliases.borrow_mut() = aliases;
                 self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::PICKER);
@@ -4525,6 +4533,7 @@ impl ConduitWindow {
         imp.discovered_users.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
+        imp.user_full_names.borrow_mut().clear();
         imp.user_search_aliases.borrow_mut().clear();
         imp.user_statuses.borrow_mut().clear();
         imp.status_expiry_generation
@@ -4943,6 +4952,24 @@ impl ConduitWindow {
         self.queue_ui_invalidations(UiInvalidations::PICKER | UiInvalidations::TITLE);
     }
 
+    fn populate_user_full_names(&self, names: HashMap<String, String>) {
+        if names.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut known = self.imp().user_full_names.borrow_mut();
+            let mut changed = false;
+            for (user_id, full_name) in names {
+                changed |= known.get(&user_id) != Some(&full_name);
+                known.insert(user_id, full_name);
+            }
+            changed
+        };
+        if changed {
+            self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::PICKER);
+        }
+    }
+
     fn populate_user_statuses(&self, statuses: HashMap<String, SlackUserStatus>) {
         if statuses.is_empty() {
             return;
@@ -5229,6 +5256,7 @@ impl ConduitWindow {
                 loading: imp.sidebar_loading.get(),
                 has_error: imp.sidebar_error.borrow().is_some(),
                 user_search_aliases: Some(&user_search_aliases),
+                user_full_names: Some(&imp.user_full_names.borrow()),
                 user_statuses: Some(&imp.user_statuses.borrow()),
             },
         );
@@ -5541,7 +5569,8 @@ impl ConduitWindow {
             sidebar_row_action_for_index(&self.imp().sidebar_row_actions.borrow(), row_index);
 
         if let Some(action) = action {
-            self.select_conversation(&action.channel_id, &action.title);
+            let title = self.conversation_title(&action.channel_id);
+            self.select_conversation(&action.channel_id, &title);
         }
     }
 
@@ -5553,7 +5582,8 @@ impl ConduitWindow {
             true,
             |window, action| match action.action {
                 ConversationPickerAction::OpenConversation => {
-                    window.select_conversation(&action.channel_id, &action.title)
+                    let title = window.conversation_title(&action.channel_id);
+                    window.select_conversation(&action.channel_id, &title)
                 }
                 ConversationPickerAction::JoinChannel => {
                     window.send_command(RuntimeCommand::JoinConversation {
@@ -5595,6 +5625,7 @@ impl ConduitWindow {
                 user_names: &user_names,
                 current_user_id: current_user_id.as_deref(),
                 known_user_search_aliases: &user_search_aliases,
+                user_full_names: &imp.user_full_names.borrow(),
                 user_statuses: &user_statuses,
             },
             "",
@@ -5712,6 +5743,7 @@ impl ConduitWindow {
                     user_names: &imp.user_names.borrow(),
                     current_user_id: imp.current_user_id.borrow().as_deref(),
                     known_user_search_aliases: &imp.user_search_aliases.borrow(),
+                    user_full_names: &imp.user_full_names.borrow(),
                     user_statuses: &imp.user_statuses.borrow(),
                 },
                 query.as_str(),
@@ -6147,6 +6179,9 @@ impl ConduitWindow {
                 if let Some(display_name) = user.display_name() {
                     self.populate_user_names(HashMap::from([(user_id.clone(), display_name)]));
                 }
+                if let Some(full_name) = user.full_name() {
+                    self.populate_user_full_names(HashMap::from([(user_id.clone(), full_name)]));
+                }
                 let mut statuses = self.imp().user_statuses.borrow().clone();
                 match user.status() {
                     Some(status) => {
@@ -6378,7 +6413,7 @@ impl ConduitWindow {
         if action == MessageNotificationAction::Notify {
             self.send_notification(
                 channel_id,
-                &self.conversation_title(channel_id),
+                &self.navigation_conversation_title(channel_id),
                 &message_notification_body(latest_message),
             );
         }
@@ -6478,6 +6513,25 @@ impl ConduitWindow {
             .get(channel_id)
             .map(|conversation| {
                 conversation.display_name_with_users(&user_names, current_user_id.as_deref())
+            })
+            .unwrap_or_else(|| "Slack".to_string())
+    }
+
+    fn navigation_conversation_title(&self, channel_id: &str) -> String {
+        let imp = self.imp();
+        let user_names = imp.user_names.borrow();
+        let user_full_names = imp.user_full_names.borrow();
+        let current_user_id = imp.current_user_id.borrow();
+        imp.workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .map(|conversation| {
+                conversation.navigation_name_with_users(
+                    &user_names,
+                    &user_full_names,
+                    current_user_id.as_deref(),
+                )
             })
             .unwrap_or_else(|| "Slack".to_string())
     }

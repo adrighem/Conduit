@@ -310,6 +310,7 @@ pub struct SidebarBuildOptions<'a> {
     pub loading: bool,
     pub has_error: bool,
     pub user_search_aliases: Option<&'a UserSearchAliases>,
+    pub user_full_names: Option<&'a HashMap<String, String>>,
     pub user_statuses: Option<&'a UserStatuses>,
 }
 
@@ -327,6 +328,7 @@ impl SidebarRowModel {
             current_user_id,
             None,
             None,
+            None,
         )
     }
 
@@ -336,9 +338,12 @@ impl SidebarRowModel {
         selected_channel: Option<&str>,
         current_user_id: Option<&str>,
         user_search_aliases: Option<&UserSearchAliases>,
+        user_full_names: Option<&HashMap<String, String>>,
         user_statuses: Option<&UserStatuses>,
     ) -> Self {
         let kind = conversation_kind(conversation);
+        let empty_full_names = HashMap::new();
+        let user_full_names = user_full_names.unwrap_or(&empty_full_names);
         let search_aliases = conversation_user_ids(conversation, current_user_id)
             .into_iter()
             .filter_map(|user_id| user_search_aliases?.get(&user_id))
@@ -347,7 +352,11 @@ impl SidebarRowModel {
             .collect();
         Self {
             id: conversation.id.clone(),
-            title: conversation.display_name_with_users(user_names, current_user_id),
+            title: conversation.navigation_name_with_users(
+                user_names,
+                user_full_names,
+                current_user_id,
+            ),
             kind,
             unread: conversation.has_unread_activity(),
             unread_count: conversation.unread_activity_count(),
@@ -454,6 +463,7 @@ pub fn build_sidebar_list(
                 options.selected_channel,
                 options.current_user_id,
                 options.user_search_aliases,
+                options.user_full_names,
                 options.user_statuses,
             )
         })
@@ -515,6 +525,7 @@ pub fn conversation_switcher_items(
         query,
         None,
         None,
+        None,
     )
 }
 
@@ -524,6 +535,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
     current_user_id: Option<&str>,
     query: &str,
     user_search_aliases: Option<&UserSearchAliases>,
+    user_full_names: Option<&HashMap<String, String>>,
     user_statuses: Option<&UserStatuses>,
 ) -> Vec<SidebarRowModel> {
     let query = SearchQuery::parse(query);
@@ -537,6 +549,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
                 None,
                 current_user_id,
                 user_search_aliases,
+                user_full_names,
                 user_statuses,
             )
         })
@@ -592,6 +605,7 @@ pub fn conversation_picker_sections_with_aliases(
             user_names,
             current_user_id,
             known_user_search_aliases,
+            user_full_names: &HashMap::new(),
             user_statuses: &HashMap::new(),
         },
         query,
@@ -605,6 +619,7 @@ pub struct ConversationPickerSource<'a> {
     pub user_names: &'a HashMap<String, String>,
     pub current_user_id: Option<&'a str>,
     pub known_user_search_aliases: &'a UserSearchAliases,
+    pub user_full_names: &'a HashMap<String, String>,
     pub user_statuses: &'a UserStatuses,
 }
 
@@ -619,6 +634,7 @@ pub fn conversation_picker_sections_with_statuses(
         user_names,
         current_user_id,
         known_user_search_aliases,
+        user_full_names,
         user_statuses,
     } = source;
     let search_query = SearchQuery::parse(query);
@@ -668,6 +684,7 @@ pub fn conversation_picker_sections_with_statuses(
         current_user_id,
         query,
         Some(&all_user_search_aliases),
+        Some(user_full_names),
         Some(user_statuses),
     )
     .into_iter()
@@ -703,7 +720,7 @@ pub fn conversation_picker_sections_with_statuses(
             {
                 return None;
             }
-            let title = user.display_name()?;
+            let title = user.direct_message_name()?;
             let row = SidebarRowModel {
                 id: id.to_string(),
                 title,
@@ -1609,6 +1626,57 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "D123");
         assert_eq!(items[0].title, "Ada Lovelace");
+    }
+
+    #[test]
+    fn sidebar_and_switcher_use_full_dm_names() {
+        let dm = dm("D1", "U1");
+        let display_names = HashMap::from([("U1".to_string(), "ada".to_string())]);
+        let full_names = HashMap::from([("U1".to_string(), "Ada Lovelace".to_string())]);
+
+        let sidebar_rows = list_rows(build_sidebar_list(
+            std::slice::from_ref(&dm),
+            &display_names,
+            SidebarBuildOptions {
+                selected_channel: Some("D1"),
+                query: "ada",
+                user_full_names: Some(&full_names),
+                ..Default::default()
+            },
+        ));
+        let switcher_rows = conversation_switcher_items_with_aliases(
+            std::slice::from_ref(&dm),
+            &display_names,
+            None,
+            "",
+            None,
+            Some(&full_names),
+            None,
+        );
+        let empty_conversations = Vec::new();
+        let empty_users = Vec::new();
+        let empty_aliases = HashMap::new();
+        let empty_statuses = HashMap::new();
+        let forward_picker = conversation_picker_sections_with_statuses(
+            ConversationPickerSource {
+                conversations: &[dm],
+                discovered_channels: &empty_conversations,
+                discovered_users: &empty_users,
+                user_names: &display_names,
+                current_user_id: None,
+                known_user_search_aliases: &empty_aliases,
+                user_full_names: &full_names,
+                user_statuses: &empty_statuses,
+            },
+            "",
+        );
+
+        assert_eq!(sidebar_rows[0].title, "Ada Lovelace (ada)");
+        assert_eq!(switcher_rows[0].title, "Ada Lovelace (ada)");
+        assert_eq!(
+            forward_picker.conversations[0].row.title,
+            "Ada Lovelace (ada)"
+        );
     }
 
     #[test]

@@ -406,6 +406,31 @@ impl WorkspaceStore {
         .await
     }
 
+    pub async fn load_user_full_names(&self) -> Result<HashMap<String, String>> {
+        Ok(self
+            .load_state()
+            .await?
+            .map(|state| state.user_full_names)
+            .unwrap_or_default())
+    }
+
+    pub async fn store_user_full_names(
+        &self,
+        user_full_names: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.update_state(|state| {
+            state.user_full_names.extend(
+                user_full_names
+                    .iter()
+                    .filter(|(user_id, full_name)| {
+                        !user_id.trim().is_empty() && !full_name.trim().is_empty()
+                    })
+                    .map(|(user_id, full_name)| (user_id.clone(), full_name.clone())),
+            );
+        })
+        .await
+    }
+
     pub async fn load_user_search_aliases(&self) -> Result<HashMap<String, Vec<String>>> {
         Ok(self
             .load_state()
@@ -733,6 +758,8 @@ struct CachedWorkspaceState {
     #[serde(default)]
     user_names: HashMap<String, String>,
     #[serde(default)]
+    user_full_names: HashMap<String, String>,
+    #[serde(default)]
     user_search_aliases: HashMap<String, Vec<String>>,
     #[serde(default)]
     user_statuses: HashMap<String, SlackUserStatus>,
@@ -755,6 +782,7 @@ impl CachedWorkspaceState {
             workspace_id: String::new(),
             conversations: Vec::new(),
             user_names: HashMap::new(),
+            user_full_names: HashMap::new(),
             user_search_aliases: HashMap::new(),
             user_statuses: HashMap::new(),
             channel_histories: HashMap::new(),
@@ -771,6 +799,7 @@ pub(crate) struct SearchProviderState {
     pub(crate) workspace_id: String,
     pub(crate) conversations: Vec<SlackConversation>,
     pub(crate) user_names: HashMap<String, String>,
+    pub(crate) user_full_names: HashMap<String, String>,
     pub(crate) user_search_aliases: HashMap<String, Vec<String>>,
 }
 
@@ -793,6 +822,7 @@ pub(crate) fn load_active_search_state(directory: &Path) -> Result<Option<Search
             workspace_id: state.workspace_id,
             conversations: state.conversations,
             user_names: state.user_names,
+            user_full_names: state.user_full_names,
             user_search_aliases: state.user_search_aliases,
         }),
     )
@@ -901,6 +931,12 @@ fn load_sqlite_state(
                 state.user_names.insert(
                     item_key,
                     serde_json::from_str(&payload).context("invalid cached user name")?,
+                );
+            }
+            "user_full_name" => {
+                state.user_full_names.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached user full name")?,
                 );
             }
             "user_aliases" => {
@@ -1026,6 +1062,9 @@ fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String),
     }
     for (key, value) in &state.user_names {
         insert_state_item(&mut items, "user_name", key.clone(), value)?;
+    }
+    for (key, value) in &state.user_full_names {
+        insert_state_item(&mut items, "user_full_name", key.clone(), value)?;
     }
     for (key, value) in &state.user_search_aliases {
         insert_state_item(&mut items, "user_aliases", key.clone(), value)?;
@@ -1913,6 +1952,23 @@ mod tests {
                     .get("U123")
                     .map(String::as_str),
                 Some("Ada Lovelace")
+            );
+
+            store
+                .store_user_full_names(&HashMap::from([(
+                    "U123".to_string(),
+                    "Augusta Ada King".to_string(),
+                )]))
+                .await
+                .expect("user full name store failed");
+            assert_eq!(
+                store
+                    .load_user_full_names()
+                    .await
+                    .expect("user full name load failed")
+                    .get("U123")
+                    .map(String::as_str),
+                Some("Augusta Ada King")
             );
 
             let aliases = HashMap::from([(
