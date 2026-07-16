@@ -42,7 +42,7 @@ impl SocketModeDisconnect {
 pub enum SocketModeEvent {
     Message(Box<SocketModeMessageEvent>),
     Reaction(SocketModeReactionEvent),
-    UserChanged(SlackUser),
+    UserChanged(Box<SlackUser>),
     RefreshConversations,
 }
 
@@ -194,6 +194,7 @@ pub fn socket_event_from_payload(payload: &Value) -> Option<SocketModeEvent> {
             .get("user")
             .cloned()
             .and_then(|user| serde_json::from_value(user).ok())
+            .map(Box::new)
             .map(SocketModeEvent::UserChanged),
         event_type if conversation_refresh_event(event_type) => {
             Some(SocketModeEvent::RefreshConversations)

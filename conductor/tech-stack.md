@@ -12,6 +12,7 @@
 - `anyhow` remains available at executable and orchestration boundaries for contextual aggregation when no typed recovery decision is needed.
 - A small workspace lifecycle model describes connection and synchronization state independently from navigation-oriented `WorkspaceViewState`.
 - Application services are extracted incrementally behind narrow ports only when a concrete use case and headless test require the seam.
+- `services::conversation_history` owns cached-preview and fresh-history orchestration behind focused Slack and store ports; the runtime adapts its progress into GTK-facing events.
 
 ## Observability
 - `tracing` provides structured asynchronous spans for runtime sessions, requests, operations, and non-sensitive targets.

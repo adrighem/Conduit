@@ -303,6 +303,16 @@ enum TimelineSurface {
     Thread,
 }
 
+struct RealtimeMessagePatch<'a> {
+    surface: TimelineSurface,
+    channel_id: &'a str,
+    message: &'a SlackMessage,
+    kind: RealtimeMessageKind,
+    unread_start: bool,
+    thread_ts: Option<&'a str>,
+    fallback: UiInvalidations,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct UiInvalidations(u8);
 
@@ -3478,43 +3488,34 @@ impl ConduitWindow {
         );
     }
 
-    fn apply_realtime_message_patch(
-        &self,
-        surface: TimelineSurface,
-        channel_id: &str,
-        message: &SlackMessage,
-        kind: RealtimeMessageKind,
-        unread_start: bool,
-        thread_ts: Option<&str>,
-        fallback: UiInvalidations,
-    ) {
-        let patch = match kind {
+    fn apply_realtime_message_patch(&self, request: RealtimeMessagePatch<'_>) {
+        let patch = match request.kind {
             RealtimeMessageKind::Posted => {
-                let mut context = self.message_patch_context(thread_ts, message);
-                if unread_start {
-                    context.first_unread_ts = Some(message.ts.clone());
+                let mut context = self.message_patch_context(request.thread_ts, request.message);
+                if request.unread_start {
+                    context.first_unread_ts = Some(request.message.ts.clone());
                 }
                 message_html::insert_message_patch(
-                    channel_id,
-                    message,
+                    request.channel_id,
+                    request.message,
                     &context,
                     TimelineInsertPosition::Append,
                 )
             }
             RealtimeMessageKind::Changed => message_html::replace_message_patch(
-                channel_id,
-                message,
-                &self.message_patch_context(thread_ts, message),
+                request.channel_id,
+                request.message,
+                &self.message_patch_context(request.thread_ts, request.message),
             ),
             // Slack retains a tombstone for deleted messages. Replacing the existing
             // article keeps the incremental path consistent with a complete render.
             RealtimeMessageKind::Deleted => message_html::replace_message_patch(
-                channel_id,
-                message,
-                &self.message_patch_context(thread_ts, message),
+                request.channel_id,
+                request.message,
+                &self.message_patch_context(request.thread_ts, request.message),
             ),
         };
-        self.apply_timeline_patch(surface, patch, fallback);
+        self.apply_timeline_patch(request.surface, patch, request.fallback);
     }
 
     fn configure_auth_ui(&self) {
@@ -6264,15 +6265,15 @@ impl ConduitWindow {
             {
                 self.queue_ui_invalidations(UiInvalidations::MAIN);
             } else if let Some(dom_kind) = channel_dom_kind {
-                self.apply_realtime_message_patch(
-                    TimelineSurface::Main,
-                    &channel_id,
-                    &message,
-                    dom_kind,
-                    became_unread,
-                    None,
-                    UiInvalidations::MAIN,
-                );
+                self.apply_realtime_message_patch(RealtimeMessagePatch {
+                    surface: TimelineSurface::Main,
+                    channel_id: &channel_id,
+                    message: &message,
+                    kind: dom_kind,
+                    unread_start: became_unread,
+                    thread_ts: None,
+                    fallback: UiInvalidations::MAIN,
+                });
             } else {
                 self.queue_ui_invalidations(UiInvalidations::MAIN);
             }
@@ -6289,15 +6290,15 @@ impl ConduitWindow {
                 {
                     self.queue_ui_invalidations(UiInvalidations::THREAD);
                 } else if let Some(dom_kind) = thread_dom_kind {
-                    self.apply_realtime_message_patch(
-                        TimelineSurface::Thread,
-                        &channel_id,
-                        &message,
-                        dom_kind,
-                        false,
-                        Some(&thread_ts),
-                        UiInvalidations::THREAD,
-                    );
+                    self.apply_realtime_message_patch(RealtimeMessagePatch {
+                        surface: TimelineSurface::Thread,
+                        channel_id: &channel_id,
+                        message: &message,
+                        kind: dom_kind,
+                        unread_start: false,
+                        thread_ts: Some(&thread_ts),
+                        fallback: UiInvalidations::THREAD,
+                    });
                 } else {
                     self.queue_ui_invalidations(UiInvalidations::THREAD);
                 }

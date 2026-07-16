@@ -717,7 +717,7 @@ pub enum RuntimeEventKind {
         full_name: Option<String>,
         status: Option<SlackUserStatus>,
     },
-    UserProfileLoaded(SlackUser),
+    UserProfileLoaded(Box<SlackUser>),
     UserNamesLoaded(HashMap<String, String>),
     UserFullNamesLoaded(HashMap<String, String>),
     UserSearchAliasesLoaded(HashMap<String, Vec<String>>),
@@ -2581,7 +2581,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             }
             context
                 .events
-                .send_event(RuntimeEventKind::UserProfileLoaded(user));
+                .send_event(RuntimeEventKind::UserProfileLoaded(Box::new(user)));
         }
         RuntimeCommand::LoadImageAsset { key, url } => {
             let api = require_slack(context.slack)?;
@@ -2879,7 +2879,7 @@ async fn run_socket_mode(
 
 #[derive(Debug)]
 enum RealtimePersistenceEvent {
-    UserChanged(SlackUser),
+    UserChanged(Box<SlackUser>),
     Message(Box<crate::socket_mode::SocketModeMessageEvent>),
 }
 
