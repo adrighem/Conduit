@@ -11,8 +11,8 @@
 ## Phase 2: Structured observability
 
 - [x] Task: Initialize a safe tracing subscriber and bridge existing diagnostics ca201ae
-- [ ] Task: Instrument runtime commands and asynchronous work with structured spans
-- [ ] Task: Add observability regression tests and secret-redaction coverage
+- [x] Task: Instrument runtime commands and asynchronous work with structured spans 9d0f4c5
+- [~] Task: Add observability regression tests and secret-redaction coverage
 - [ ] Task: Conductor - User Manual Verification 'Structured observability' (Protocol in workflow.md)
 
 ## Phase 3: Workspace lifecycle state
