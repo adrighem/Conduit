@@ -19,7 +19,8 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing_subscriber::fmt::layer()
                 .compact()
                 .with_ansi(false)
-                .with_target(false),
+                .with_target(false)
+                .with_writer(std::io::stderr),
         )
         .try_init()?;
     let _ = FILTER_HANDLE.set(filter_handle);
