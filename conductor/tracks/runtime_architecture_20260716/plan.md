@@ -2,7 +2,7 @@
 
 ## Phase 1: Typed failure boundaries
 
-- [ ] Task: Document the typed-error and tracing stack choices before implementation
+- [x] Task: Document the typed-error and tracing stack choices before implementation 015ca08
 - [ ] Task: Introduce typed Slack boundary errors with category coverage
 - [ ] Task: Introduce typed store boundary errors with category coverage
 - [ ] Task: Carry structured runtime failures into operation-local UI recovery
