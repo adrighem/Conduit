@@ -7,6 +7,17 @@
 - Request/session identities and operation targets prevent stale asynchronous work from changing the active workspace surface.
 - `WorkspaceViewState` owns navigation, loading, transient search context, and render-state transitions independently from GTK widgets.
 
+## Architecture and Errors
+- `thiserror` defines typed errors at Slack, persistence, authentication, and other boundaries where callers can make recovery decisions.
+- `anyhow` remains available at executable and orchestration boundaries for contextual aggregation when no typed recovery decision is needed.
+- A small workspace lifecycle model describes connection and synchronization state independently from navigation-oriented `WorkspaceViewState`.
+- Application services are extracted incrementally behind narrow ports only when a concrete use case and headless test require the seam.
+
+## Observability
+- `tracing` provides structured asynchronous spans for runtime sessions, requests, operations, and non-sensitive targets.
+- `tracing-subscriber` initializes human-readable diagnostics at the executable boundary and respects environment filtering.
+- Credentials, OAuth values, browser-session data, and message bodies are excluded from fields and events.
+
 ## Slack Integration
 - `reqwest` with rustls for Slack Web API requests.
 - Slack OAuth PKCE user-token flow through `oauth.v2.user.access`.
