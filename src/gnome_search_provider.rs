@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[cfg(test)]
@@ -149,28 +149,17 @@ pub(crate) fn register(
 }
 
 fn search(cache_dir: &Path, terms: &[String]) -> Vec<SearchResult> {
-    search_states(cached_states(cache_dir), terms, None)
+    search_states(cached_states(cache_dir), terms)
 }
 
-fn subsearch(cache_dir: &Path, previous_ids: &[String], terms: &[String]) -> Vec<SearchResult> {
-    let mut allowed = HashMap::<String, HashSet<String>>::new();
-    for target in previous_ids.iter().filter_map(|id| decode_target(id)) {
-        allowed
-            .entry(target.workspace_id)
-            .or_default()
-            .insert(target.channel_id);
-    }
-    if allowed.is_empty() {
-        return Vec::new();
-    }
-    search_states(cached_states(cache_dir), terms, Some(&allowed))
+fn subsearch(cache_dir: &Path, _previous_ids: &[String], terms: &[String]) -> Vec<SearchResult> {
+    // The broad previous query may have more matches than GNOME Shell asks us
+    // to return. Re-rank the complete catalog so a more specific query can
+    // surface an item that was outside the previous top 20.
+    search(cache_dir, terms)
 }
 
-fn search_states(
-    states: Vec<CachedSearchState>,
-    terms: &[String],
-    allowed: Option<&HashMap<String, HashSet<String>>>,
-) -> Vec<SearchResult> {
+fn search_states(states: Vec<CachedSearchState>, terms: &[String]) -> Vec<SearchResult> {
     let query = terms.join(" ");
     if query.trim().is_empty() {
         return Vec::new();
@@ -184,12 +173,6 @@ fn search_states(
                 !conversation.is_archived.unwrap_or(false)
                     && conversation_kind(conversation) != ConversationKind::Unknown
             });
-            if let Some(allowed) = allowed {
-                let ids = allowed.get(&state.workspace_id)?;
-                state
-                    .conversations
-                    .retain(|conversation| ids.contains(&conversation.id));
-            }
             let current_user_id = current_user_id(&state.workspace_id);
             Some(
                 conversation_switcher_items_with_aliases(
@@ -278,7 +261,7 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
                 ("name".to_string(), result.name.to_variant()),
                 ("description".to_string(), result.description.to_variant()),
                 (
-                    "gicon".to_string(),
+                    "icon".to_string(),
                     icon.serialize().expect("themed icon serializes"),
                 ),
             ])
@@ -462,44 +445,45 @@ mod tests {
     }
 
     #[test]
-    fn subsearch_only_refines_live_previous_results() {
+    fn subsearch_reranks_the_full_catalog_after_a_broad_query() {
         let directory = temp_dir();
+        let mut conversations = (0..21)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("C{index}"),
+                    "name": format!("alpha-{index:02}"),
+                    "is_channel": true
+                })
+            })
+            .collect::<Vec<_>>();
+        conversations.push(serde_json::json!({
+            "id": "C_ARCH",
+            "name": "architecture",
+            "is_channel": true
+        }));
         write_index(
             &directory,
             serde_json::json!({
                 "workspace_id": "T123:U0",
-                "conversations": [
-                    {"id": "D1", "user": "U1", "is_im": true},
-                    {"id": "D2", "user": "U2", "is_im": true}
-                ],
-                "user_names": {"U1": "Richard Adams", "U2": "Richard Brown"}
+                "conversations": conversations
             }),
         );
-        let first = search(&directory, &["rich".into()]);
-        assert_eq!(first.len(), 2);
-        let d1 = first
-            .iter()
-            .find(|result| decode_target(&result.id).unwrap().channel_id == "D1")
-            .unwrap()
-            .id
-            .clone();
 
-        let refined = subsearch(&directory, std::slice::from_ref(&d1), &["richard".into()]);
+        let first = search(&directory, &["a".into()]);
+        assert_eq!(first.len(), 20);
+        assert!(first.iter().all(|result| result.name != "#architecture"));
+
+        let previous_ids = first
+            .into_iter()
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        let refined = subsearch(&directory, &previous_ids, &["arc".into()]);
         assert_eq!(refined.len(), 1);
-        assert_eq!(refined[0].id, d1);
-        assert!(subsearch(&directory, &["invalid".into()], &["rich".into()]).is_empty());
+        assert_eq!(refined[0].name, "#architecture");
 
-        write_index(
-            &directory,
-            serde_json::json!({
-                "workspace_id": "T123:U0",
-                "conversations": [
-                    {"id": "D1", "user": "U1", "is_im": true, "is_archived": true}
-                ],
-                "user_names": {"U1": "Richard Adams"}
-            }),
-        );
-        assert!(subsearch(&directory, &[d1], &["rich".into()]).is_empty());
+        let refined_from_empty = subsearch(&directory, &[], &["architecture".into()]);
+        assert_eq!(refined_from_empty.len(), 1);
+        assert_eq!(refined_from_empty[0].name, "#architecture");
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -537,7 +521,8 @@ mod tests {
             metas[0]["description"].get::<String>().as_deref(),
             Some("Direct message")
         );
-        assert!(metas[0].contains_key("gicon"));
+        assert!(metas[0].contains_key("icon"));
+        assert!(!metas[0].contains_key("gicon"));
         let _ = fs::remove_dir_all(directory);
     }
 
