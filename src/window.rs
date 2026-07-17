@@ -184,6 +184,7 @@ mod imp {
         pub seen_realtime_messages: RefCell<HashSet<String>>,
         pub user_names: RefCell<HashMap<String, String>>,
         pub user_full_names: RefCell<HashMap<String, String>>,
+        pub user_avatar_urls: RefCell<HashMap<String, String>>,
         pub user_search_aliases: RefCell<sidebar::UserSearchAliases>,
         pub user_statuses: RefCell<sidebar::UserStatuses>,
         pub status_expiry_generation: Cell<u64>,
@@ -1240,6 +1241,33 @@ fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
         file.preview_url()?
     };
     Some((url.to_string(), url.to_string()))
+}
+
+fn message_image_asset_requests<'a>(
+    messages: impl IntoIterator<Item = &'a SlackMessage>,
+    avatar_urls: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut requests = Vec::new();
+    for message in messages {
+        requests.extend(
+            message
+                .files
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter_map(image_asset_request),
+        );
+        if let Some(url) = message
+            .user
+            .as_ref()
+            .and_then(|user_id| avatar_urls.get(user_id))
+        {
+            requests.push((url.clone(), url.clone()));
+        }
+    }
+    requests.sort_by(|left, right| left.0.cmp(&right.0));
+    requests.dedup_by(|left, right| left.0 == right.0);
+    requests
 }
 
 fn messages_use_image_asset(messages: &[SlackMessage], key: &str) -> bool {
@@ -3059,7 +3087,12 @@ impl ConduitWindow {
                     .iter()
                     .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
                     .collect::<HashMap<_, _>>();
+                let avatar_urls = users
+                    .iter()
+                    .filter_map(|user| Some((user.id.clone()?, user.avatar_url()?)))
+                    .collect::<HashMap<_, _>>();
                 self.populate_user_names(names);
+                self.populate_user_avatar_urls(avatar_urls);
                 self.replace_user_statuses(
                     users
                         .iter()
@@ -3295,11 +3328,15 @@ impl ConduitWindow {
                 user_id,
                 display_name,
                 full_name,
+                avatar_url,
                 status,
             } => {
                 self.populate_user_names(HashMap::from([(user_id.clone(), display_name)]));
                 if let Some(full_name) = full_name {
                     self.populate_user_full_names(HashMap::from([(user_id.clone(), full_name)]));
+                }
+                if let Some(avatar_url) = avatar_url {
+                    self.populate_user_avatar_urls(HashMap::from([(user_id.clone(), avatar_url)]));
                 }
                 if let Some(status) = status {
                     self.populate_user_statuses(HashMap::from([(user_id, status)]));
@@ -3319,6 +3356,7 @@ impl ConduitWindow {
             }
             RuntimeEventKind::UserNamesLoaded(user_names) => self.populate_user_names(user_names),
             RuntimeEventKind::UserFullNamesLoaded(names) => self.populate_user_full_names(names),
+            RuntimeEventKind::UserAvatarUrlsLoaded(urls) => self.populate_user_avatar_urls(urls),
             RuntimeEventKind::UserSearchAliasesLoaded(aliases) => {
                 *self.imp().user_search_aliases.borrow_mut() = aliases;
                 self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::PICKER);
@@ -4599,6 +4637,7 @@ impl ConduitWindow {
         imp.sidebar_row_actions.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
         imp.user_full_names.borrow_mut().clear();
+        imp.user_avatar_urls.borrow_mut().clear();
         imp.user_search_aliases.borrow_mut().clear();
         imp.user_statuses.borrow_mut().clear();
         imp.status_expiry_generation
@@ -4874,6 +4913,15 @@ impl ConduitWindow {
     }
 
     fn patch_image_asset(&self, key: &str, source: Option<String>) {
+        if self
+            .imp()
+            .user_avatar_urls
+            .borrow()
+            .values()
+            .any(|url| url == key)
+        {
+            self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
+        }
         let (main_view, main_uses_asset, thread_uses_asset) = {
             let state = self.imp().workspace.view.borrow();
             let main = state.visible_channel_id().is_some_and(|channel_id| {
@@ -5032,6 +5080,23 @@ impl ConduitWindow {
         };
         if changed {
             self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::PICKER);
+        }
+    }
+
+    fn populate_user_avatar_urls(&self, urls: HashMap<String, String>) {
+        if urls.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut known = self.imp().user_avatar_urls.borrow_mut();
+            urls.into_iter()
+                .filter(|(user_id, url)| !user_id.trim().is_empty() && !url.trim().is_empty())
+                .fold(false, |changed, (user_id, url)| {
+                    (known.insert(user_id, url.clone()).as_ref() != Some(&url)) || changed
+                })
+        };
+        if changed {
+            self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
         }
     }
 
@@ -6247,6 +6312,9 @@ impl ConduitWindow {
                 if let Some(full_name) = user.full_name() {
                     self.populate_user_full_names(HashMap::from([(user_id.clone(), full_name)]));
                 }
+                if let Some(avatar_url) = user.avatar_url() {
+                    self.populate_user_avatar_urls(HashMap::from([(user_id.clone(), avatar_url)]));
+                }
                 let mut statuses = self.imp().user_statuses.borrow().clone();
                 match user.status() {
                     Some(status) => {
@@ -6755,13 +6823,8 @@ impl ConduitWindow {
     }
 
     fn request_image_assets<'a>(&self, messages: impl IntoIterator<Item = &'a SlackMessage>) {
-        let mut requests = messages
-            .into_iter()
-            .flat_map(|message| message.files.as_ref().into_iter().flatten())
-            .filter_map(image_asset_request)
-            .collect::<Vec<_>>();
-        requests.sort_by(|left, right| left.0.cmp(&right.0));
-        requests.dedup_by(|left, right| left.0 == right.0);
+        let avatar_urls = self.imp().user_avatar_urls.borrow().clone();
+        let requests = message_image_asset_requests(messages, &avatar_urls);
 
         let known_assets = self.imp().image_assets.borrow().clone();
         let failed_assets = self.imp().failed_image_assets.borrow().clone();
@@ -6845,6 +6908,12 @@ impl ConduitWindow {
             .flatten()
             .filter_map(image_asset_request)
             .map(|(key, _)| key)
+            .chain(
+                message
+                    .user
+                    .as_ref()
+                    .and_then(|user_id| self.imp().user_avatar_urls.borrow().get(user_id).cloned()),
+            )
             .collect::<HashSet<_>>();
         self.message_html_context_with_image_keys(thread_ts, Some(&image_keys))
     }
@@ -6878,6 +6947,7 @@ impl ConduitWindow {
             .unwrap_or_default();
         MessageHtmlContext {
             user_names,
+            user_avatar_urls: imp.user_avatar_urls.borrow().clone(),
             conversation_titles,
             user_statuses: imp.user_statuses.borrow().clone(),
             user_group_names: imp.user_group_names.borrow().clone(),
@@ -8288,6 +8358,27 @@ mod tests {
             promoted_recent_reactions(["thumbsup", "heart"], "rocket"),
             vec!["rocket", "thumbsup", "heart"]
         );
+    }
+
+    #[test]
+    fn message_image_requests_include_each_cached_avatar_once() {
+        let messages = [
+            SlackMessage {
+                user: Some("U123".to_string()),
+                ..Default::default()
+            },
+            SlackMessage {
+                user: Some("U123".to_string()),
+                ..Default::default()
+            },
+        ];
+        let avatar_url = "https://avatars.slack-edge.com/ada.png".to_string();
+        let requests = message_image_asset_requests(
+            &messages,
+            &HashMap::from([("U123".to_string(), avatar_url.clone())]),
+        );
+
+        assert_eq!(requests, vec![(avatar_url.clone(), avatar_url)]);
     }
 
     #[test]

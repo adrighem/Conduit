@@ -67,6 +67,13 @@ pub struct SlackConversation {
 }
 
 impl SlackConversation {
+    pub fn is_user_deleted(&self) -> bool {
+        self.extra
+            .get("is_user_deleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
     pub fn last_read_ts(&self) -> Option<&str> {
         self.extra.get("last_read").and_then(Value::as_str)
     }
@@ -736,6 +743,18 @@ pub struct SlackUser {
 }
 
 impl SlackUser {
+    pub fn avatar_url(&self) -> Option<String> {
+        let profile = self.profile.as_ref()?;
+        profile
+            .image_72
+            .as_ref()
+            .or(profile.image_192.as_ref())
+            .or(profile.image_512.as_ref())
+            .or(profile.image_original.as_ref())
+            .filter(|url| !url.trim().is_empty())
+            .cloned()
+    }
+
     pub fn display_name(&self) -> Option<String> {
         self.profile
             .as_ref()
@@ -960,6 +979,30 @@ mod tests {
                 "zilvinas.kuusas",
             ]
         );
+    }
+
+    #[test]
+    fn user_prefers_small_avatar_and_conversation_exposes_deleted_user_state() {
+        let user = SlackUser {
+            profile: Some(SlackUserProfile {
+                image_72: Some("https://example.com/72.png".to_string()),
+                image_192: Some("https://example.com/192.png".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            user.avatar_url().as_deref(),
+            Some("https://example.com/72.png")
+        );
+
+        let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D123",
+            "is_im": true,
+            "is_user_deleted": true
+        }))
+        .unwrap();
+        assert!(conversation.is_user_deleted());
     }
 
     #[test]

@@ -431,6 +431,29 @@ impl WorkspaceStore {
         .await
     }
 
+    pub async fn load_user_avatar_urls(&self) -> Result<HashMap<String, String>> {
+        Ok(self
+            .load_state()
+            .await?
+            .map(|state| state.user_avatar_urls)
+            .unwrap_or_default())
+    }
+
+    pub async fn store_user_avatar_urls(
+        &self,
+        avatar_urls: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.update_state(|state| {
+            state.user_avatar_urls.extend(
+                avatar_urls
+                    .iter()
+                    .filter(|(user_id, url)| !user_id.trim().is_empty() && !url.trim().is_empty())
+                    .map(|(user_id, url)| (user_id.clone(), url.clone())),
+            );
+        })
+        .await
+    }
+
     pub async fn load_user_search_aliases(&self) -> Result<HashMap<String, Vec<String>>> {
         Ok(self
             .load_state()
@@ -760,6 +783,8 @@ struct CachedWorkspaceState {
     #[serde(default)]
     user_full_names: HashMap<String, String>,
     #[serde(default)]
+    user_avatar_urls: HashMap<String, String>,
+    #[serde(default)]
     user_search_aliases: HashMap<String, Vec<String>>,
     #[serde(default)]
     user_statuses: HashMap<String, SlackUserStatus>,
@@ -783,6 +808,7 @@ impl CachedWorkspaceState {
             conversations: Vec::new(),
             user_names: HashMap::new(),
             user_full_names: HashMap::new(),
+            user_avatar_urls: HashMap::new(),
             user_search_aliases: HashMap::new(),
             user_statuses: HashMap::new(),
             channel_histories: HashMap::new(),
@@ -939,6 +965,12 @@ fn load_sqlite_state(
                     serde_json::from_str(&payload).context("invalid cached user full name")?,
                 );
             }
+            "user_avatar_url" => {
+                state.user_avatar_urls.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached user avatar URL")?,
+                );
+            }
             "user_aliases" => {
                 state.user_search_aliases.insert(
                     item_key,
@@ -1065,6 +1097,9 @@ fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String),
     }
     for (key, value) in &state.user_full_names {
         insert_state_item(&mut items, "user_full_name", key.clone(), value)?;
+    }
+    for (key, value) in &state.user_avatar_urls {
+        insert_state_item(&mut items, "user_avatar_url", key.clone(), value)?;
     }
     for (key, value) in &state.user_search_aliases {
         insert_state_item(&mut items, "user_aliases", key.clone(), value)?;
@@ -1969,6 +2004,22 @@ mod tests {
                     .get("U123")
                     .map(String::as_str),
                 Some("Augusta Ada King")
+            );
+
+            let avatar_urls = HashMap::from([(
+                "U123".to_string(),
+                "https://avatars.slack-edge.com/ada.png".to_string(),
+            )]);
+            store
+                .store_user_avatar_urls(&avatar_urls)
+                .await
+                .expect("user avatar URL store failed");
+            assert_eq!(
+                store
+                    .load_user_avatar_urls()
+                    .await
+                    .expect("user avatar URL load failed"),
+                avatar_urls
             );
 
             let aliases = HashMap::from([(

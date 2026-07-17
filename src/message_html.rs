@@ -19,6 +19,7 @@ const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
     pub user_names: HashMap<String, String>,
+    pub user_avatar_urls: HashMap<String, String>,
     pub conversation_titles: HashMap<String, String>,
     pub user_statuses: HashMap<String, SlackUserStatus>,
     pub user_group_names: HashMap<String, String>,
@@ -1144,10 +1145,34 @@ a:hover {{
 .message {{
   position: relative;
   display: grid;
-  gap: 6px;
+  grid-template-columns: 36px minmax(0, 1fr);
+  column-gap: 10px;
+  row-gap: 6px;
   padding-block: 10px;
   padding-inline: 0;
   border-block-end: 1px solid var(--line);
+}}
+
+.message > :not(.message-avatar) {{
+  grid-column: 2;
+}}
+
+.message-avatar {{
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  inline-size: 36px;
+  block-size: 36px;
+  border-radius: 8px;
+  object-fit: cover;
+}}
+
+.message-avatar-fallback {{
+  display: grid;
+  place-items: center;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
 }}
 
 .message:focus-visible,
@@ -2312,10 +2337,12 @@ fn message_article(
 ) -> String {
     let author = author_label(message, context);
     let status = author_status_html(message, context);
+    let avatar = message_avatar_html(message, &author, context);
     let mut article = format!(
-        "<article class=\"message\"{}{}><header class=\"message-header\">{}{}</header><div data-message-region=\"body\"><div class=\"body\" dir=\"auto\">{}</div></div>",
+        "<article class=\"message\"{}{}>{}<header class=\"message-header\">{}{}</header><div data-message-region=\"body\"><div class=\"body\" dir=\"auto\">{}</div></div>",
         message_target_attributes(Some(&message.ts)),
         message_author_attribute(message),
+        avatar,
         author_identity_html(message, &author, &status),
         metadata_html(message),
         message_body_html(message, context)
@@ -2391,9 +2418,11 @@ fn message_group_article(
 
     let author = author_label(first_message, context);
     let status = author_status_html(first_message, context);
+    let avatar = message_avatar_html(first_message, &author, context);
     let mut article = format!(
-        "<article class=\"message message-group\"{}><header class=\"message-header\">{}{}</header><div class=\"message-stack\">",
+        "<article class=\"message message-group\"{}>{}<header class=\"message-header\">{}{}</header><div class=\"message-stack\">",
         message_author_attribute(first_message),
+        avatar,
         author_identity_html(first_message, &author, &status),
         metadata_html(first_message)
     );
@@ -2404,6 +2433,37 @@ fn message_group_article(
 
     article.push_str("</div></article>");
     article
+}
+
+fn message_avatar_html(
+    message: &SlackMessage,
+    author: &str,
+    context: &MessageHtmlContext,
+) -> String {
+    let source = message
+        .user
+        .as_ref()
+        .and_then(|user_id| context.user_avatar_urls.get(user_id))
+        .and_then(|url| context.image_assets.get(url))
+        .filter(|source| source.starts_with("data:image/"));
+    if let Some(source) = source {
+        return format!(
+            "<img class=\"message-avatar\" src=\"{}\" alt=\"\" aria-hidden=\"true\">",
+            escape_html(source)
+        );
+    }
+
+    let initial = author
+        .trim()
+        .chars()
+        .next()
+        .map(|character| character.to_uppercase().collect::<String>())
+        .filter(|initial| !initial.is_empty())
+        .unwrap_or_else(|| "?".to_string());
+    format!(
+        "<span class=\"message-avatar message-avatar-fallback\" aria-hidden=\"true\">{}</span>",
+        escape_html(&initial)
+    )
 }
 
 fn author_identity_html(message: &SlackMessage, author: &str, status: &str) -> String {
@@ -4104,6 +4164,43 @@ mod tests {
         assert!(html.contains("hello &lt;script&gt;alert(1)&lt;/script&gt; &amp; goodbye"));
         assert!(html.contains("&lt;bad author&gt;"));
         assert!(!html.contains("hello <script>"));
+    }
+
+    #[test]
+    fn message_groups_render_one_cached_avatar_with_an_initials_fallback() {
+        let avatar_url = "https://avatars.slack-edge.com/ada.png";
+        let context = MessageHtmlContext {
+            user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
+            user_avatar_urls: HashMap::from([("U123".to_string(), avatar_url.to_string())]),
+            image_assets: HashMap::from([(
+                avatar_url.to_string(),
+                "data:image/png;base64,YXZhdGFy".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let messages = [
+            message_at("U123", "second", "1710000001.000100"),
+            message_at("U123", "first", "1710000000.000100"),
+        ];
+
+        let html = conversation_document("C123", &messages, &context);
+        assert_eq!(html.matches("class=\"message-avatar\"").count(), 1);
+        assert!(html.contains("src=\"data:image/png;base64,YXZhdGFy\""));
+        assert!(html.contains("alt=\"\" aria-hidden=\"true\""));
+
+        let fallback = conversation_document(
+            "C123",
+            &[message("hello")],
+            &MessageHtmlContext {
+                user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
+                ..Default::default()
+            },
+        );
+        assert!(fallback.contains(
+            "class=\"message-avatar message-avatar-fallback\" aria-hidden=\"true\">A</span>"
+        ));
+        assert!(fallback.contains("grid-template-columns: 36px minmax(0, 1fr)"));
+        assert!(fallback.contains("grid-row: 1 / span 2"));
     }
 
     #[test]

@@ -715,11 +715,13 @@ pub enum RuntimeEventKind {
         user_id: String,
         display_name: String,
         full_name: Option<String>,
+        avatar_url: Option<String>,
         status: Option<SlackUserStatus>,
     },
     UserProfileLoaded(Box<SlackUser>),
     UserNamesLoaded(HashMap<String, String>),
     UserFullNamesLoaded(HashMap<String, String>),
+    UserAvatarUrlsLoaded(HashMap<String, String>),
     UserSearchAliasesLoaded(HashMap<String, Vec<String>>),
     UserStatusesLoaded(HashMap<String, SlackUserStatus>),
     UserGroupsLoaded {
@@ -854,6 +856,7 @@ impl RuntimeEventKind {
             ),
             Self::UserNamesLoaded(_)
             | Self::UserFullNamesLoaded(_)
+            | Self::UserAvatarUrlsLoaded(_)
             | Self::UserSearchAliasesLoaded(_)
             | Self::UserStatusesLoaded(_)
             | Self::UserGroupsLoaded { .. } => {
@@ -1876,6 +1879,8 @@ fn spawn_workspace_tasks(
         }
         load_cached_user_names_shared(&hydration_events, &hydration_connection).await;
         load_cached_user_full_names(&hydration_events, &hydration_connection.workspace_store).await;
+        load_cached_user_avatar_urls(&hydration_events, &hydration_connection.workspace_store)
+            .await;
         load_cached_user_search_aliases(&hydration_events, &hydration_connection.workspace_store)
             .await;
         load_cached_user_statuses(&hydration_events, &hydration_connection.workspace_store).await;
@@ -2042,6 +2047,25 @@ async fn load_cached_user_full_names(
     }
 }
 
+async fn load_cached_user_avatar_urls(
+    events: &RuntimeEventSender,
+    workspace_store: &Option<WorkspaceStore>,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+    match store.load_user_avatar_urls().await {
+        Ok(urls) if !urls.is_empty() => {
+            events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(urls));
+        }
+        Ok(_) => {}
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("CachedUserAvatarUrlsLoadFailed error={error:#}"),
+        ),
+    }
+}
+
 async fn load_cached_user_statuses(
     events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
@@ -2065,6 +2089,13 @@ fn user_statuses(users: &[SlackUser]) -> HashMap<String, SlackUserStatus> {
     users
         .iter()
         .filter_map(|user| Some((user.id.clone()?, user.status()?)))
+        .collect()
+}
+
+fn user_avatar_urls(users: &[SlackUser]) -> HashMap<String, String> {
+    users
+        .iter()
+        .filter_map(|user| Some((user.id.clone()?, user.avatar_url()?)))
         .collect()
 }
 
@@ -2318,10 +2349,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         }
         RuntimeCommand::DiscoverConversations => {
             let api = require_slack(context.slack)?;
-            let channels = api.discover_conversations().await?;
-            context
-                .events
-                .send_event(RuntimeEventKind::ConversationChannelsDiscovered(channels));
             let users = api.users().await?;
             let aliases = users
                 .iter()
@@ -2331,10 +2358,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .iter()
                 .filter_map(|user| Some((user.id.clone()?, user.full_name()?)))
                 .collect::<HashMap<_, _>>();
+            let avatar_urls = user_avatar_urls(&users);
             let statuses = user_statuses(&users);
             if let Some(store) = context.workspace_store.as_ref() {
                 store.store_user_search_aliases(&aliases).await?;
                 store.store_user_full_names(&full_names).await?;
+                store.store_user_avatar_urls(&avatar_urls).await?;
                 store.store_user_statuses(&statuses).await?;
             }
             context
@@ -2345,10 +2374,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .send_event(RuntimeEventKind::UserFullNamesLoaded(full_names));
             context
                 .events
+                .send_event(RuntimeEventKind::UserAvatarUrlsLoaded(avatar_urls));
+            context
+                .events
                 .send_event(RuntimeEventKind::UserStatusesLoaded(statuses));
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
+            let channels = api.discover_conversations().await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationChannelsDiscovered(channels));
         }
         RuntimeCommand::DiscoverChannels => {
             let api = require_slack(context.slack)?;
@@ -2536,6 +2572,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     user_id,
                     display_name,
                     full_name: None,
+                    avatar_url: None,
                     status: None,
                 });
             } else {
@@ -2543,6 +2580,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 let user = api.user(&user_id).await?;
                 let display_name = user.display_name().unwrap_or_else(|| user_id.clone());
                 let full_name = user.full_name();
+                let avatar_url = user.avatar_url();
                 let status = user.status();
                 context
                     .user_cache
@@ -2550,6 +2588,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 store_user_name(context.workspace_store, &user_id, &display_name).await;
                 if let Some(full_name) = full_name.as_deref() {
                     store_user_full_name(context.workspace_store, &user_id, full_name).await;
+                }
+                if let Some(avatar_url) = avatar_url.as_deref() {
+                    store_user_avatar_url(context.workspace_store, &user_id, avatar_url).await;
                 }
                 if let Some(store) = context.workspace_store.as_ref() {
                     if let Err(error) = store.store_user_status(&user_id, status.clone()).await {
@@ -2565,6 +2606,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     user_id,
                     display_name,
                     full_name,
+                    avatar_url,
                     status,
                 });
             }
@@ -2904,6 +2946,19 @@ async fn persist_realtime_events(
                             "store",
                             &format!(
                                 "RealtimeUserFullNameStoreFailed user_id={user_id} error={error:#}"
+                            ),
+                        );
+                    }
+                }
+                if let Some(avatar_url) = user.avatar_url() {
+                    if let Err(error) = store
+                        .store_user_avatar_urls(&HashMap::from([(user_id.to_string(), avatar_url)]))
+                        .await
+                    {
+                        crate::debug::log(
+                            "store",
+                            &format!(
+                                "RealtimeUserAvatarUrlStoreFailed user_id={user_id} error={error:#}"
                             ),
                         );
                     }
@@ -3449,11 +3504,15 @@ async fn refresh_cached_conversation_user_names(
 
     let mut refreshed = HashMap::new();
     let mut refreshed_full_names = HashMap::new();
+    let mut refreshed_avatar_urls = HashMap::new();
     for user_id in user_ids {
         match api.user(&user_id).await {
             Ok(user) => {
                 if let Some(full_name) = user.full_name() {
                     refreshed_full_names.insert(user_id.clone(), full_name);
+                }
+                if let Some(avatar_url) = user.avatar_url() {
+                    refreshed_avatar_urls.insert(user_id.clone(), avatar_url);
                 }
                 refreshed.insert(
                     user_id.clone(),
@@ -3476,6 +3535,19 @@ async fn refresh_cached_conversation_user_names(
     if !refreshed_full_names.is_empty() {
         store_user_full_names(workspace_store, &refreshed_full_names).await;
         events.send_event(RuntimeEventKind::UserFullNamesLoaded(refreshed_full_names));
+    }
+    if !refreshed_avatar_urls.is_empty() {
+        if let Some(store) = workspace_store.as_ref() {
+            if let Err(error) = store.store_user_avatar_urls(&refreshed_avatar_urls).await {
+                crate::debug::log(
+                    "store",
+                    &format!("UserAvatarUrlsStoreFailed error={error:#}"),
+                );
+            }
+        }
+        events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(
+            refreshed_avatar_urls,
+        ));
     }
 }
 
@@ -3764,6 +3836,28 @@ async fn store_user_full_name(
         crate::debug::log(
             "store",
             &format!("UserFullNameStoreFailed user_id={user_id} error={error:#}"),
+        );
+    }
+}
+
+async fn store_user_avatar_url(
+    workspace_store: &Option<WorkspaceStore>,
+    user_id: &str,
+    avatar_url: &str,
+) {
+    let Some(store) = workspace_store.as_ref() else {
+        return;
+    };
+    if let Err(error) = store
+        .store_user_avatar_urls(&HashMap::from([(
+            user_id.to_string(),
+            avatar_url.to_string(),
+        )]))
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!("UserAvatarUrlStoreFailed user_id={user_id} error={error:#}"),
         );
     }
 }

@@ -169,11 +169,12 @@ fn search_states(states: Vec<CachedSearchState>, terms: &[String]) -> Vec<Search
         .into_iter()
         .filter(|state| !state.workspace_id.trim().is_empty())
         .map(|mut state| {
+            add_virtual_direct_messages(&mut state);
             state.conversations.retain(|conversation| {
                 !conversation.is_archived.unwrap_or(false)
+                    && !conversation.is_user_deleted()
                     && conversation_kind(conversation) != ConversationKind::Unknown
             });
-            add_virtual_direct_messages(&mut state);
             let current_user_id = current_user_id(&state.workspace_id);
 
             conversation_switcher_items_with_aliases(
@@ -219,11 +220,12 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
         .flat_map(|mut state| {
             let current_user_id = current_user_id(&state.workspace_id).map(ToString::to_string);
             let workspace_id = state.workspace_id.clone();
+            add_virtual_direct_messages(&mut state);
             state.conversations.retain(|conversation| {
                 !conversation.is_archived.unwrap_or(false)
+                    && !conversation.is_user_deleted()
                     && conversation_kind(conversation) != ConversationKind::Unknown
             });
-            add_virtual_direct_messages(&mut state);
 
             let user_names = state.user_names;
             let user_full_names = state.user_full_names;
@@ -712,6 +714,52 @@ mod tests {
         assert_eq!(
             metas[0]["description"].get::<String>().unwrap(),
             "Direct message"
+        );
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn excludes_direct_messages_for_deleted_users() {
+        let directory = temp_dir();
+        write_index(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [
+                    {
+                        "id": "D_CURRENT",
+                        "user": "U_CURRENT",
+                        "is_im": true,
+                        "is_user_deleted": false
+                    },
+                    {
+                        "id": "D_DELETED",
+                        "user": "U_DELETED",
+                        "is_im": true,
+                        "is_user_deleted": true
+                    }
+                ],
+                "user_names": {
+                    "U_CURRENT": "csaba.karpati",
+                    "U_DELETED": "csakar"
+                },
+                "user_full_names": {
+                    "U_CURRENT": "Csaba Karpati",
+                    "U_DELETED": "Csaba Karpati"
+                },
+                "user_search_aliases": {
+                    "U_CURRENT": ["Csaba Karpati", "csaba.karpati"],
+                    "U_DELETED": ["Csaba Karpati", "csakar"]
+                }
+            }),
+        );
+
+        let results = search(&directory, &["Csaba".into()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            decode_target(&results[0].id).unwrap().channel_id,
+            "D_CURRENT"
         );
 
         let _ = fs::remove_dir_all(directory);
