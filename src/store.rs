@@ -843,15 +843,7 @@ pub(crate) fn load_active_search_state(directory: &Path) -> Result<Option<Search
     let Some(workspace_key) = workspace_key else {
         return Ok(None);
     };
-    Ok(
-        load_sqlite_state(&connection, &workspace_key)?.map(|state| SearchProviderState {
-            workspace_id: state.workspace_id,
-            conversations: state.conversations,
-            user_names: state.user_names,
-            user_full_names: state.user_full_names,
-            user_search_aliases: state.user_search_aliases,
-        }),
-    )
+    load_sqlite_search_state(&connection, &workspace_key)
 }
 
 pub(crate) fn clear_active_workspace(directory: &Path) -> Result<()> {
@@ -1006,6 +998,72 @@ fn load_sqlite_state(
                 );
             }
             _ => {}
+        }
+    }
+    Ok(Some(state))
+}
+
+fn load_sqlite_search_state(
+    connection: &Connection,
+    workspace_key: &str,
+) -> Result<Option<SearchProviderState>> {
+    let workspace_id = connection
+        .query_row(
+            "SELECT workspace_id FROM workspaces WHERE workspace_key = ?1",
+            [workspace_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(workspace_id) = workspace_id else {
+        return Ok(None);
+    };
+
+    let mut state = SearchProviderState {
+        workspace_id,
+        conversations: Vec::new(),
+        user_names: HashMap::new(),
+        user_full_names: HashMap::new(),
+        user_search_aliases: HashMap::new(),
+    };
+    let mut statement = connection.prepare(
+        "SELECT kind, item_key, payload_json
+         FROM workspace_items
+         WHERE workspace_key = ?1
+           AND kind IN ('conversation', 'user_name', 'user_full_name', 'user_aliases')
+         ORDER BY kind, item_key",
+    )?;
+    let rows = statement.query_map([workspace_key], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (kind, item_key, payload) = row?;
+        match kind.as_str() {
+            "conversation" => state
+                .conversations
+                .push(serde_json::from_str(&payload).context("invalid cached conversation")?),
+            "user_name" => {
+                state.user_names.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached user name")?,
+                );
+            }
+            "user_full_name" => {
+                state.user_full_names.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached user full name")?,
+                );
+            }
+            "user_aliases" => {
+                state.user_search_aliases.insert(
+                    item_key,
+                    serde_json::from_str(&payload).context("invalid cached user aliases")?,
+                );
+            }
+            _ => unreachable!("search-state query returned an unexpected item kind"),
         }
     }
     Ok(Some(state))
@@ -1501,6 +1559,16 @@ mod tests {
             )
             .unwrap();
         assert!(stored_private_body);
+
+        connection
+            .execute(
+                "UPDATE workspace_items SET payload_json = 'not valid JSON'
+                 WHERE workspace_key = ?1 AND kind = 'channel_history'",
+                [&store.workspace_key],
+            )
+            .unwrap();
+        let search_state = load_active_search_state(&directory).unwrap().unwrap();
+        assert_eq!(search_state.conversations[0].id, "C1");
         let _ = std::fs::remove_dir_all(directory);
     }
 

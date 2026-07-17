@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::fs;
@@ -15,13 +16,14 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::models::SlackConversation;
 use crate::sidebar::{
-    conversation_kind, conversation_switcher_items_with_aliases, ConversationKind,
-    UserSearchAliases,
+    conversation_kind, conversation_switcher_rows_with_aliases, filter_conversation_switcher_rows,
+    ConversationKind, SidebarRowModel, UserSearchAliases,
 };
 use crate::store::{self, CACHE_VERSION};
 use crate::ConduitApplication;
 
 const OBJECT_PATH: &str = "/eu/vanadrighem/conduit/SearchProvider";
+const CATALOG_CACHE_LIFETIME: Duration = Duration::from_secs(5);
 const INTERFACE_XML: &str = r#"
 <node>
   <interface name="org.gnome.Shell.SearchProvider2">
@@ -80,6 +82,34 @@ struct SearchResult {
     icon_name: &'static str,
 }
 
+#[derive(Debug)]
+struct PreparedSearchState {
+    workspace_id: String,
+    conversations: Vec<SlackConversation>,
+    user_names: HashMap<String, String>,
+    user_search_aliases: UserSearchAliases,
+    rows: Vec<SidebarRowModel>,
+}
+
+#[derive(Debug, Default)]
+struct SearchProviderCache {
+    loaded_at: Option<Instant>,
+    states: Vec<PreparedSearchState>,
+}
+
+impl SearchProviderCache {
+    fn states(&mut self, cache_dir: &Path) -> &[PreparedSearchState] {
+        let expired = self
+            .loaded_at
+            .is_none_or(|loaded_at| loaded_at.elapsed() >= CATALOG_CACHE_LIFETIME);
+        if expired {
+            self.states = prepare_states(cached_states(cache_dir));
+            self.loaded_at = Some(Instant::now());
+        }
+        &self.states
+    }
+}
+
 pub(crate) fn register(
     connection: &gio::DBusConnection,
     application: &ConduitApplication,
@@ -88,6 +118,7 @@ pub(crate) fn register(
         .lookup_interface("org.gnome.Shell.SearchProvider2")
         .expect("search provider interface missing from introspection XML");
     let application = application.downgrade();
+    let cache = std::cell::RefCell::new(SearchProviderCache::default());
 
     connection
         .register_object(OBJECT_PATH, &interface)
@@ -104,7 +135,8 @@ pub(crate) fn register(
                 match method {
                     "GetInitialResultSet" => {
                         let terms = parameters.child_get::<Vec<String>>(0);
-                        let ids = search(&config::state_cache_dir(), &terms)
+                        let cache_dir = config::state_cache_dir();
+                        let ids = search_prepared(cache.borrow_mut().states(&cache_dir), &terms)
                             .into_iter()
                             .map(|result| result.id)
                             .collect::<Vec<_>>();
@@ -113,15 +145,22 @@ pub(crate) fn register(
                     "GetSubsearchResultSet" => {
                         let previous_results = parameters.child_get::<Vec<String>>(0);
                         let terms = parameters.child_get::<Vec<String>>(1);
-                        let ids = subsearch(&config::state_cache_dir(), &previous_results, &terms)
-                            .into_iter()
-                            .map(|result| result.id)
-                            .collect::<Vec<_>>();
+                        let cache_dir = config::state_cache_dir();
+                        let ids = subsearch_prepared(
+                            cache.borrow_mut().states(&cache_dir),
+                            &previous_results,
+                            &terms,
+                        )
+                        .into_iter()
+                        .map(|result| result.id)
+                        .collect::<Vec<_>>();
                         call.return_value(Some(&(ids,).to_variant()));
                     }
                     "GetResultMetas" => {
                         let ids = parameters.child_get::<Vec<String>>(0);
-                        let metas = result_metas(&config::state_cache_dir(), &ids);
+                        let cache_dir = config::state_cache_dir();
+                        let metas =
+                            result_metas_from_states(cache.borrow_mut().states(&cache_dir), &ids);
                         call.return_value(Some(&(metas,).to_variant()));
                     }
                     "ActivateResult" => {
@@ -148,10 +187,12 @@ pub(crate) fn register(
         .build()
 }
 
+#[cfg(test)]
 fn search(cache_dir: &Path, terms: &[String]) -> Vec<SearchResult> {
-    search_states(cached_states(cache_dir), terms)
+    search_prepared(&prepare_states(cached_states(cache_dir)), terms)
 }
 
+#[cfg(test)]
 fn subsearch(cache_dir: &Path, _previous_ids: &[String], terms: &[String]) -> Vec<SearchResult> {
     // The broad previous query may have more matches than GNOME Shell asks us
     // to return. Re-rank the complete catalog so a more specific query can
@@ -159,13 +200,8 @@ fn subsearch(cache_dir: &Path, _previous_ids: &[String], terms: &[String]) -> Ve
     search(cache_dir, terms)
 }
 
-fn search_states(states: Vec<CachedSearchState>, terms: &[String]) -> Vec<SearchResult> {
-    let query = terms.join(" ");
-    if query.trim().is_empty() {
-        return Vec::new();
-    }
-
-    let mut per_workspace = states
+fn prepare_states(states: Vec<CachedSearchState>) -> Vec<PreparedSearchState> {
+    states
         .into_iter()
         .filter(|state| !state.workspace_id.trim().is_empty())
         .map(|mut state| {
@@ -176,15 +212,43 @@ fn search_states(states: Vec<CachedSearchState>, terms: &[String]) -> Vec<Search
                     && conversation_kind(conversation) != ConversationKind::Unknown
             });
             let current_user_id = current_user_id(&state.workspace_id);
+            let rows = conversation_switcher_rows_with_aliases(
+                &state.conversations,
+                &state.user_names,
+                current_user_id,
+                Some(&state.user_search_aliases),
+                Some(&state.user_full_names),
+                None,
+            );
+            PreparedSearchState {
+                workspace_id: state.workspace_id,
+                conversations: state.conversations,
+                user_names: state.user_names,
+                user_search_aliases: state.user_search_aliases,
+                rows,
+            }
+        })
+        .collect()
+}
 
-            conversation_switcher_items_with_aliases(
+fn search_prepared(states: &[PreparedSearchState], terms: &[String]) -> Vec<SearchResult> {
+    let query = terms.join(" ");
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut per_workspace = states
+        .iter()
+        .map(|state| {
+            let current_user_id = current_user_id(&state.workspace_id);
+
+            filter_conversation_switcher_rows(
+                &state.rows,
                 &state.conversations,
                 &state.user_names,
                 current_user_id,
                 &query,
                 Some(&state.user_search_aliases),
-                Some(&state.user_full_names),
-                None,
             )
             .into_iter()
             .map(|row| SearchResult {
@@ -196,15 +260,15 @@ fn search_states(states: Vec<CachedSearchState>, terms: &[String]) -> Vec<Search
                 description: row.kind.accessible_name(),
                 icon_name: row.kind.icon_name(),
             })
-            .collect::<Vec<_>>()
+            .collect::<VecDeque<_>>()
         })
         .collect::<Vec<_>>();
 
     let mut results = Vec::new();
     while results.len() < 20 && per_workspace.iter().any(|items| !items.is_empty()) {
         for items in &mut per_workspace {
-            if !items.is_empty() {
-                results.push(items.remove(0));
+            if let Some(result) = items.pop_front() {
+                results.push(result);
                 if results.len() == 20 {
                     break;
                 }
@@ -214,46 +278,42 @@ fn search_states(states: Vec<CachedSearchState>, terms: &[String]) -> Vec<Search
     results
 }
 
+fn subsearch_prepared(
+    states: &[PreparedSearchState],
+    _previous_ids: &[String],
+    terms: &[String],
+) -> Vec<SearchResult> {
+    search_prepared(states, terms)
+}
+
+#[cfg(test)]
 fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::Variant>> {
-    let results = cached_states(cache_dir)
-        .into_iter()
-        .flat_map(|mut state| {
-            let current_user_id = current_user_id(&state.workspace_id).map(ToString::to_string);
-            let workspace_id = state.workspace_id.clone();
-            add_virtual_direct_messages(&mut state);
-            state.conversations.retain(|conversation| {
-                !conversation.is_archived.unwrap_or(false)
-                    && !conversation.is_user_deleted()
-                    && conversation_kind(conversation) != ConversationKind::Unknown
-            });
+    result_metas_from_states(&prepare_states(cached_states(cache_dir)), ids)
+}
 
-            let user_names = state.user_names;
-            let user_full_names = state.user_full_names;
-
-            state
-                .conversations
-                .into_iter()
-                .map(move |conversation| {
-                    let kind = conversation_kind(&conversation);
-                    let target = ResultTarget {
-                        workspace_id: workspace_id.clone(),
-                        channel_id: conversation.id.clone(),
-                    };
-                    (
-                        encode_target(&target),
-                        SearchResult {
-                            id: encode_target(&target),
-                            name: conversation.navigation_name_with_users(
-                                &user_names,
-                                &user_full_names,
-                                current_user_id.as_deref(),
-                            ),
-                            description: kind.accessible_name(),
-                            icon_name: kind.icon_name(),
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
+fn result_metas_from_states(
+    states: &[PreparedSearchState],
+    ids: &[String],
+) -> Vec<HashMap<String, glib::Variant>> {
+    let results = states
+        .iter()
+        .flat_map(|state| {
+            state.rows.iter().map(|row| {
+                let target = ResultTarget {
+                    workspace_id: state.workspace_id.clone(),
+                    channel_id: row.id.clone(),
+                };
+                let id = encode_target(&target);
+                (
+                    id.clone(),
+                    SearchResult {
+                        id,
+                        name: row.title.clone(),
+                        description: row.kind.accessible_name(),
+                        icon_name: row.kind.icon_name(),
+                    },
+                )
+            })
         })
         .collect::<HashMap<_, _>>();
 
@@ -447,6 +507,38 @@ mod tests {
         let channel = search(&directory, &["arch".into()]);
         assert_eq!(channel.len(), 1);
         assert_eq!(channel[0].name, "#architecture");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn prepared_catalog_is_reused_during_typing_and_refreshed_after_expiry() {
+        let directory = temp_dir();
+        write_index(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [
+                    {"id": "C1", "name": "architecture", "is_channel": true}
+                ]
+            }),
+        );
+        let mut cache = SearchProviderCache::default();
+
+        assert_eq!(cache.states(&directory)[0].rows[0].title, "#architecture");
+
+        write_index(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [
+                    {"id": "C2", "name": "random", "is_channel": true}
+                ]
+            }),
+        );
+        assert_eq!(cache.states(&directory)[0].rows[0].title, "#architecture");
+
+        cache.loaded_at = Some(Instant::now() - CATALOG_CACHE_LIFETIME);
+        assert_eq!(cache.states(&directory)[0].rows[0].title, "#random");
         let _ = fs::remove_dir_all(directory);
     }
 

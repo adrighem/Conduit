@@ -538,8 +538,33 @@ pub(crate) fn conversation_switcher_items_with_aliases(
     user_full_names: Option<&HashMap<String, String>>,
     user_statuses: Option<&UserStatuses>,
 ) -> Vec<SidebarRowModel> {
-    let query = SearchQuery::parse(query);
-    let mut items = conversations
+    let rows = conversation_switcher_rows_with_aliases(
+        conversations,
+        user_names,
+        current_user_id,
+        user_search_aliases,
+        user_full_names,
+        user_statuses,
+    );
+    filter_conversation_switcher_rows(
+        &rows,
+        conversations,
+        user_names,
+        current_user_id,
+        query,
+        user_search_aliases,
+    )
+}
+
+pub(crate) fn conversation_switcher_rows_with_aliases(
+    conversations: &[SlackConversation],
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    user_search_aliases: Option<&UserSearchAliases>,
+    user_full_names: Option<&HashMap<String, String>>,
+    user_statuses: Option<&UserStatuses>,
+) -> Vec<SidebarRowModel> {
+    conversations
         .iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .map(|conversation| {
@@ -553,18 +578,52 @@ pub(crate) fn conversation_switcher_items_with_aliases(
                 user_statuses,
             )
         })
-        .filter(|item| item.match_score(&query).is_some())
+        .collect()
+}
+
+pub(crate) fn filter_conversation_switcher_rows(
+    rows: &[SidebarRowModel],
+    conversations: &[SlackConversation],
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    query: &str,
+    user_search_aliases: Option<&UserSearchAliases>,
+) -> Vec<SidebarRowModel> {
+    let query = SearchQuery::parse(query);
+    let mut items = rows
+        .iter()
+        .filter_map(|item| {
+            let score = item.match_score(&query)?;
+            let sort_key = title_sort_key(&item.title);
+            Some((item.clone(), score, sort_key))
+        })
         .collect::<Vec<_>>();
 
+    let matching_ids = items
+        .iter()
+        .map(|(item, _, _)| item.id.as_str())
+        .collect::<HashSet<_>>();
     let participant_coverage = conversation_participant_coverage(
-        conversations,
+        conversations
+            .iter()
+            .filter(|conversation| matching_ids.contains(conversation.id.as_str())),
         user_names,
         current_user_id,
         &query,
         user_search_aliases,
     );
-    sort_search_rows(&mut items, &query, &participant_coverage);
-    items
+    items.sort_by(
+        |(left, left_score, left_sort_key), (right, right_score, right_sort_key)| {
+            right_score
+                .band()
+                .cmp(&left_score.band())
+                .then_with(|| {
+                    compare_participant_coverage(left, right, Some(&participant_coverage))
+                })
+                .then_with(|| (left_sort_key, &left.id).cmp(&(right_sort_key, &right.id)))
+        },
+    );
+    items.into_iter().map(|(item, _, _)| item).collect()
 }
 
 #[cfg(test)]
@@ -886,15 +945,15 @@ struct ParticipantCoverage {
     total: usize,
 }
 
-fn conversation_participant_coverage(
-    conversations: &[SlackConversation],
+fn conversation_participant_coverage<'a>(
+    conversations: impl IntoIterator<Item = &'a SlackConversation>,
     user_names: &HashMap<String, String>,
     current_user_id: Option<&str>,
     query: &SearchQuery,
     user_search_aliases: Option<&UserSearchAliases>,
 ) -> HashMap<String, ParticipantCoverage> {
     conversations
-        .iter()
+        .into_iter()
         .filter_map(|conversation| {
             if conversation.is_im.unwrap_or(false) {
                 let user_id = conversation.user.as_deref()?;
