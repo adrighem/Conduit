@@ -704,6 +704,11 @@ fn profile_text_html(text: &str, context: &MessageHtmlContext) -> String {
     let mut output = String::new();
     let mut rest = text;
     while !rest.is_empty() {
+        if let Some((_, consumed)) = decode_html_entity_prefix(rest) {
+            output.push_str(&escape_html(&rest[..consumed]));
+            rest = &rest[consumed..];
+            continue;
+        }
         if let Some((html, consumed)) = render_emoji_shortcode(rest, context) {
             output.push_str(&html);
             rest = &rest[consumed..];
@@ -3571,6 +3576,11 @@ fn render_inline(text: &str, context: &MessageHtmlContext) -> String {
     let mut rest = text;
 
     while !rest.is_empty() {
+        if let Some((_, consumed)) = decode_html_entity_prefix(rest) {
+            output.push_str(&escape_html(&rest[..consumed]));
+            rest = &rest[consumed..];
+            continue;
+        }
         if rest.starts_with('`') {
             if let Some(end) = rest[1..].find('`') {
                 output.push_str("<code>");
@@ -3804,17 +3814,56 @@ fn requires_authenticated_image(value: &str) -> bool {
 
 fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
-    for character in text.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(character),
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some((character, consumed)) = decode_html_entity_prefix(rest) {
+            push_escaped_html_character(&mut escaped, character);
+            rest = &rest[consumed..];
+            continue;
         }
+
+        let character = rest.chars().next().expect("non-empty text has a character");
+        push_escaped_html_character(&mut escaped, character);
+        rest = &rest[character.len_utf8()..];
     }
     escaped
+}
+
+fn decode_html_entity_prefix(text: &str) -> Option<(char, usize)> {
+    if !text.starts_with('&') {
+        return None;
+    }
+    let end = text
+        .as_bytes()
+        .iter()
+        .take(16)
+        .position(|byte| *byte == b';')?;
+    let entity = &text[1..end];
+    let character = match entity {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{00a0}',
+        entity if entity.starts_with("#x") || entity.starts_with("#X") => {
+            char::from_u32(u32::from_str_radix(&entity[2..], 16).ok()?)?
+        }
+        entity if entity.starts_with('#') => char::from_u32(entity[1..].parse().ok()?)?,
+        _ => return None,
+    };
+    Some((character, end + 1))
+}
+
+fn push_escaped_html_character(output: &mut String, character: char) {
+    match character {
+        '&' => output.push_str("&amp;"),
+        '<' => output.push_str("&lt;"),
+        '>' => output.push_str("&gt;"),
+        '"' => output.push_str("&quot;"),
+        '\'' => output.push_str("&#39;"),
+        _ => output.push(character),
+    }
 }
 
 #[cfg(test)]
@@ -3929,6 +3978,58 @@ mod tests {
 
         assert!(html.contains("<title>Titel &amp; meer</title>"));
         assert!(html.contains("Runtime &lt;error&gt; &amp; details"));
+    }
+
+    #[test]
+    fn webkit_documents_decode_entities_once_before_safe_rendering() {
+        assert_eq!(
+            escape_html("&gt; &lt; &amp; &quot; &apos; &#62; &#x1F642;"),
+            "&gt; &lt; &amp; &quot; &#39; &gt; 🙂"
+        );
+        assert_eq!(
+            escape_html("&amp;lt;script&amp;gt;"),
+            "&amp;lt;script&amp;gt;"
+        );
+
+        let placeholder = placeholder_document("A &gt; B", "C &lt; D &amp; E");
+        assert!(placeholder.contains("<title>A &gt; B</title>"));
+        assert!(placeholder.contains("C &lt; D &amp; E"));
+        assert!(!placeholder.contains("&amp;gt;"));
+
+        let conversation = conversation_document(
+            "C123",
+            &[message("A &gt; B &amp; &lt;script&gt;")],
+            &MessageHtmlContext::default(),
+        );
+        assert!(conversation.contains("A &gt; B &amp; &lt;script&gt;"));
+        assert!(!conversation.contains("A &amp;gt; B"));
+
+        let search = search_results_document(
+            &[SearchMatch {
+                text: Some("Result &gt; threshold".into()),
+                ..Default::default()
+            }],
+            &MessageHtmlContext::default(),
+        );
+        assert!(search.contains("Result &gt; threshold"));
+        assert!(!search.contains("Result &amp;gt; threshold"));
+
+        let profile = user_profile_document(
+            &SlackUser {
+                real_name: Some("Ada &gt; Grace".into()),
+                ..Default::default()
+            },
+            &MessageHtmlContext::default(),
+        );
+        assert!(profile.contains("Ada &gt; Grace"));
+        assert!(!profile.contains("Ada &amp;gt; Grace"));
+
+        let files = files_document(&[SlackFile {
+            title: Some("Report &gt; draft".into()),
+            ..Default::default()
+        }]);
+        assert!(files.contains("Report &gt; draft"));
+        assert!(!files.contains("Report &amp;gt; draft"));
     }
 
     #[test]
