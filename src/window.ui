@@ -299,13 +299,26 @@
                               </object>
                             </child>
                             <child>
-                              <object class="GtkLabel" id="workspace_status_label">
-                                <property name="xalign">0</property>
-                                <property name="ellipsize">end</property>
-                                <style>
-                                  <class name="caption"/>
-                                  <class name="dim-label"/>
-                                </style>
+                              <object class="GtkBox">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">6</property>
+                                <child>
+                                  <object class="GtkLabel" id="workspace_status_label">
+                                    <property name="hexpand">True</property>
+                                    <property name="xalign">0</property>
+                                    <property name="ellipsize">end</property>
+                                    <style>
+                                      <class name="caption"/>
+                                      <class name="dim-label"/>
+                                    </style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkImage" id="connection_status_icon">
+                                    <property name="icon-name">network-wired-offline-symbolic</property>
+                                    <property name="tooltip-text">no</property>
+                                  </object>
+                                </child>
                               </object>
                             </child>
                           </object>

@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
 use crate::auth::{
-    browser_session_token_from_env, browser_session_token_from_values, OAuthConfig,
-    SlackOAuthClient, TokenStore,
+    browser_session_token_from_env, browser_session_token_from_values, configured_app_token,
+    OAuthConfig, SlackOAuthClient, TokenStore,
 };
 use crate::config;
 use crate::conversation_catalog::ConversationCatalog;
@@ -1978,7 +1978,28 @@ fn spawn_workspace_tasks(
         );
     });
 
-    if let Some(app_token) = config::slack_app_token() {
+    let credentials = match configured_app_token() {
+        Ok(Some(app_token)) => Some(socket_mode::SocketModeCredentials::AppToken(app_token)),
+        Ok(None) => {
+            if let Some(cookie) = connection.slack.browser_cookie_d() {
+                Some(socket_mode::SocketModeCredentials::BrowserSession {
+                    xoxc_token: connection.slack.access_token().to_string(),
+                    xoxd_token: cookie.to_string(),
+                    user_agent: connection.slack.user_agent().map(|ua| ua.to_string()),
+                })
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            crate::debug::log(
+                "socket",
+                &format!("SocketModeTokenLoadFailed error={error:#}"),
+            );
+            None
+        }
+    };
+    if let Some(credentials) = credentials {
         let socket_events = events.unsolicited(OperationContext::new(
             RuntimeOperation::SocketMode,
             RuntimeTarget::Workspace,
@@ -1987,7 +2008,7 @@ fn spawn_workspace_tasks(
             state,
             identity.session,
             run_socket_mode(
-                app_token,
+                credentials,
                 socket_events,
                 connection.workspace_store.clone(),
                 current_user_id,
@@ -2836,7 +2857,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
 }
 
 async fn run_socket_mode(
-    app_token: String,
+    credentials: socket_mode::SocketModeCredentials,
     events: RuntimeEventSender,
     workspace_store: Option<WorkspaceStore>,
     current_user_id: Option<String>,
@@ -2857,7 +2878,7 @@ async fn run_socket_mode(
             sender
         });
         let persistence_for_run = persistence_sender.clone();
-        let result = socket_mode::run_once(&app_token, move |event| {
+        let result = socket_mode::run_once(&credentials, move |event| {
             if let Some(sender) = persistence_for_run.as_ref() {
                 let persistence_event = match &event {
                     SocketModeEvent::UserChanged(user) => {

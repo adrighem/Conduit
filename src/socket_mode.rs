@@ -69,12 +69,60 @@ pub struct SocketModeReactionEvent {
     pub added: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketModeCredentials {
+    AppToken(String),
+    BrowserSession {
+        xoxc_token: String,
+        xoxd_token: String,
+        user_agent: Option<String>,
+    },
+}
+
+fn build_websocket_request(
+    url: &str,
+    credentials: &SocketModeCredentials,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let request = match credentials {
+        SocketModeCredentials::AppToken(_) => {
+            url.into_client_request().context("failed to build WebSocket request")?
+        }
+        SocketModeCredentials::BrowserSession { xoxc_token: _, xoxd_token, user_agent } => {
+            let mut req = url.into_client_request().context("failed to build WebSocket request")?;
+            let headers = req.headers_mut();
+
+            headers.insert(
+                "Cookie",
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("d={}", xoxd_token))
+                    .context("invalid Cookie header value")?
+            );
+
+            headers.insert(
+                "Origin",
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("https://app.slack.com")
+            );
+
+            if let Some(ua) = user_agent {
+                if let Ok(value) = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(ua) {
+                    headers.insert("User-Agent", value);
+                }
+            }
+            req
+        }
+    };
+    Ok(request)
+}
+
 pub async fn run_once(
-    app_token: &str,
+    credentials: &SocketModeCredentials,
     mut handle_event: impl FnMut(SocketModeEvent),
 ) -> Result<SocketModeDisconnect> {
-    let url = SocketModeApi::new(app_token).open_connection().await?;
-    let (mut socket, _) = tokio::time::timeout(WEBSOCKET_CONNECT_TIMEOUT, connect_async(&url))
+    let api = SocketModeApi::new(credentials.clone());
+    let url = api.open_connection().await?;
+    let request = build_websocket_request(&url, credentials)?;
+
+    let (mut socket, _) = tokio::time::timeout(WEBSOCKET_CONNECT_TIMEOUT, connect_async(request))
         .await
         .context("timed out connecting Slack Socket Mode WebSocket")?
         .context("failed to connect Slack Socket Mode WebSocket")?;
@@ -292,47 +340,99 @@ fn conversation_refresh_event(event_type: &str) -> bool {
 #[derive(Debug, Clone)]
 struct SocketModeApi {
     http: Client,
-    app_token: String,
+    credentials: SocketModeCredentials,
 }
 
 impl SocketModeApi {
-    fn new(app_token: &str) -> Self {
+    fn new(credentials: SocketModeCredentials) -> Self {
         Self {
             http: Client::builder()
                 .connect_timeout(HTTP_CONNECT_TIMEOUT)
                 .timeout(HTTP_REQUEST_TIMEOUT)
                 .build()
                 .expect("valid Socket Mode HTTP client configuration"),
-            app_token: app_token.to_string(),
+            credentials,
         }
     }
 
     async fn open_connection(&self) -> Result<String> {
-        let response = self
-            .http
-            .post(CONNECTIONS_OPEN_URL)
-            .bearer_auth(&self.app_token)
-            .send()
-            .await
-            .context("failed to call Slack apps.connections.open")?
-            .error_for_status()
-            .context("Slack apps.connections.open returned an HTTP error")?
-            .json::<AppsConnectionsOpenResponse>()
-            .await
-            .context("failed to parse Slack apps.connections.open response")?;
+        match &self.credentials {
+            SocketModeCredentials::AppToken(app_token) => {
+                let response = self
+                    .http
+                    .post(CONNECTIONS_OPEN_URL)
+                    .bearer_auth(app_token)
+                    .send()
+                    .await
+                    .context("failed to call Slack apps.connections.open")?
+                    .error_for_status()
+                    .context("Slack apps.connections.open returned an HTTP error")?
+                    .json::<AppsConnectionsOpenResponse>()
+                    .await
+                    .context("failed to parse Slack apps.connections.open response")?;
 
-        if response.ok {
-            response
-                .url
-                .filter(|url| url.starts_with("wss://"))
-                .ok_or_else(|| {
-                    anyhow!("Slack apps.connections.open did not return a WebSocket URL")
-                })
-        } else {
-            Err(anyhow!(
-                "Slack apps.connections.open failed: {}",
-                response.error.as_deref().unwrap_or("unknown_error")
-            ))
+                if response.ok {
+                    response
+                        .url
+                        .filter(|url| url.starts_with("wss://"))
+                        .ok_or_else(|| {
+                            anyhow!("Slack apps.connections.open did not return a WebSocket URL")
+                        })
+                } else {
+                    Err(anyhow!(
+                        "Slack apps.connections.open failed: {}",
+                        response.error.as_deref().unwrap_or("unknown_error")
+                    ))
+                }
+            }
+            SocketModeCredentials::BrowserSession { xoxc_token, xoxd_token, user_agent } => {
+                let mut request = self
+                    .http
+                    .post("https://slack.com/api/client.getWebSocketURL")
+                    .bearer_auth(xoxc_token)
+                    .header("Cookie", format!("d={}", xoxd_token));
+
+                if let Some(ua) = user_agent {
+                    request = request.header("User-Agent", ua);
+                }
+
+                let response = request
+                    .send()
+                    .await
+                    .context("failed to call Slack client.getWebSocketURL")?
+                    .error_for_status()
+                    .context("Slack client.getWebSocketURL returned an HTTP error")?
+                    .json::<ClientGetWebSocketUrlResponse>()
+                    .await
+                    .context("failed to parse Slack client.getWebSocketURL response")?;
+
+                if response.ok {
+                    let primary_url = response.primary_websocket_url.ok_or_else(|| {
+                        anyhow!("Slack client.getWebSocketURL did not return a primary WebSocket URL")
+                    })?;
+                    let routing_context = response.routing_context.ok_or_else(|| {
+                        anyhow!("Slack client.getWebSocketURL did not return a routing context")
+                    })?;
+
+                    let mut url = reqwest::Url::parse(&primary_url)?;
+                    url.query_pairs_mut()
+                        .append_pair("token", xoxc_token)
+                        .append_pair("sync_desync", "1")
+                        .append_pair("slack_client", "desktop")
+                        .append_pair("no_query_on_subscribe", "1")
+                        .append_pair("flannel", "3")
+                        .append_pair("lazy_channels", "1")
+                        .append_pair("gateway_server", &routing_context)
+                        .append_pair("batch_presence_aware", "1");
+
+                    Ok(url.to_string())
+                } else {
+                    Err(anyhow!(
+                        "Slack client.getWebSocketURL failed: {}",
+                        response.error.as_deref().unwrap_or("unknown_error")
+                    ))
+                }
+            }
         }
     }
 }
@@ -352,6 +452,14 @@ struct AppsConnectionsOpenResponse {
     ok: bool,
     error: Option<String>,
     url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientGetWebSocketUrlResponse {
+    ok: bool,
+    error: Option<String>,
+    primary_websocket_url: Option<String>,
+    routing_context: Option<String>,
 }
 
 #[cfg(test)]
@@ -489,5 +597,43 @@ mod tests {
             SocketModeDisconnect::from_reason(None),
             SocketModeDisconnect::ConnectionClosed
         );
+    }
+
+    #[test]
+    fn builds_correct_websocket_request_for_browser_session() {
+        let url = "wss://slack-primary.com/link";
+        let credentials = SocketModeCredentials::BrowserSession {
+            xoxc_token: "xoxc-browser-token".to_string(),
+            xoxd_token: "xoxd-cookie-value".to_string(),
+            user_agent: Some("custom-user-agent".to_string()),
+        };
+
+        let request = build_websocket_request(url, &credentials).unwrap();
+        let headers = request.headers();
+
+        assert_eq!(
+            headers.get("Cookie").and_then(|v| v.to_str().ok()),
+            Some("d=xoxd-cookie-value")
+        );
+        assert_eq!(
+            headers.get("Origin").and_then(|v| v.to_str().ok()),
+            Some("https://app.slack.com")
+        );
+        assert_eq!(
+            headers.get("User-Agent").and_then(|v| v.to_str().ok()),
+            Some("custom-user-agent")
+        );
+    }
+
+    #[test]
+    fn builds_websocket_request_for_app_token() {
+        let url = "wss://slack-primary.com/link";
+        let credentials = SocketModeCredentials::AppToken("xapp-app-token".to_string());
+
+        let request = build_websocket_request(url, &credentials).unwrap();
+        let headers = request.headers();
+
+        assert!(headers.get("Cookie").is_none());
+        assert!(headers.get("Origin").is_none());
     }
 }

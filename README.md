@@ -161,13 +161,15 @@ Browser-session credentials are highly sensitive and rely on an unofficial authe
 
 ## Optional realtime updates
 
-Enable Socket Mode in your Slack app, create an app-level token with `connections:write`, and subscribe to the message, reaction, and conversation events you want Conduit to receive. Then start Conduit with:
+Enable Socket Mode in your Slack app, create an app-level token with `connections:write`, and subscribe to the message, reaction, and conversation events you want Conduit to receive. Save the `xapp-` token under **Preferences → Realtime updates**, then restart Conduit. The token is stored in the system keyring.
+
+For development, the token can instead be supplied through the environment:
 
 ```sh
 export CONDUIT_SLACK_APP_TOKEN=xapp-...
 ```
 
-`SLACK_APP_TOKEN` is accepted as an alias. Socket Mode starts after authentication, stops on sign-out, and reconnects automatically after transient failures. Without it, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
+`SLACK_APP_TOKEN` is accepted as an alias. Environment values take precedence over the keyring. Socket Mode starts after authentication, stops on sign-out, and reconnects automatically after transient failures. Incoming posts produce ten-second desktop notifications unless the message is your own, duplicated, muted, system noise, or already visible in the active conversation. Without Socket Mode, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
 
 ## Keyboard shortcuts
 
@@ -199,7 +201,7 @@ Debug output can contain private workspace metadata such as channel names, user 
 
 ## Local data and security
 
-- OAuth tokens and imported browser-session credentials are stored through the system Secret Service/keyring.
+- OAuth tokens, imported browser-session credentials, and Socket Mode app tokens are stored through the system Secret Service/keyring.
 - Workspace metadata, resolved names and statuses, emoji information, and message and thread history are stored in `state/state.sqlite3` below Conduit's XDG cache directory. Downloaded attachments, image/media data, and WebKit data are cached in sibling directories. None has additional application-level encryption.
 - Drafts and preferences are stored through GSettings.
 - **Sign Out** removes the keyring credential and deactivates the workspace for desktop search. It does not currently erase cached workspace content or drafts, and credential environment variables remain available for re-import.

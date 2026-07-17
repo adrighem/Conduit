@@ -24,7 +24,10 @@ use gettextrs::gettext;
 use gtk::glib::variant::{StaticVariantType, ToVariant};
 use gtk::{gio, glib};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::time::Duration;
 
+use crate::auth::AppTokenStore;
 use crate::config::{self, VERSION};
 use crate::shortcuts::APP_SHORTCUTS;
 use crate::ConduitWindow;
@@ -32,6 +35,7 @@ use crate::ConduitWindow;
 const OPEN_CONVERSATION_ACTION: &str = "app.open-conversation";
 const ABOUT_ICON_NAME: &str = config::APPLICATION_ID;
 const ABOUT_LOGO_SIZE: i32 = 192;
+const NOTIFICATION_LIFETIME: Duration = Duration::from_secs(10);
 
 fn resize_about_logo(dialog: &adw::AboutDialog) -> bool {
     let mut widgets = vec![dialog.clone().upcast::<gtk::Widget>()];
@@ -80,6 +84,8 @@ mod imp {
     pub struct ConduitApplication {
         search_provider_registration: RefCell<Option<gio::RegistrationId>>,
         debug_enabled: Cell<bool>,
+        notification_generations: RefCell<HashMap<String, u64>>,
+        next_notification_generation: Cell<u64>,
     }
 
     impl ConduitApplication {
@@ -89,6 +95,28 @@ mod imp {
 
         pub(super) fn debug_enabled(&self) -> bool {
             self.debug_enabled.get()
+        }
+
+        pub(super) fn register_notification(&self, id: &str) -> u64 {
+            let generation = self.next_notification_generation.get().saturating_add(1);
+            self.next_notification_generation.set(generation);
+            self.notification_generations
+                .borrow_mut()
+                .insert(id.to_string(), generation);
+            generation
+        }
+
+        pub(super) fn forget_notification_if_current(&self, id: &str, generation: u64) -> bool {
+            let mut generations = self.notification_generations.borrow_mut();
+            if generations.get(id) != Some(&generation) {
+                return false;
+            }
+            generations.remove(id);
+            true
+        }
+
+        pub(super) fn forget_notification(&self, id: &str) {
+            self.notification_generations.borrow_mut().remove(id);
         }
     }
 
@@ -299,16 +327,31 @@ impl ConduitApplication {
     ) {
         let notification = gio::Notification::new(title);
         notification.set_body(Some(body));
+        notification.set_priority(gio::NotificationPriority::Normal);
         let target = conversation_target_variant(workspace_id, channel_id);
         notification.set_default_action_and_target_value(OPEN_CONVERSATION_ACTION, Some(&target));
-        self.send_notification(
-            Some(&conversation_notification_id(workspace_id, channel_id)),
-            &notification,
-        );
+        let id = conversation_notification_id(workspace_id, channel_id);
+        let generation = self.imp().register_notification(&id);
+        self.send_notification(Some(&id), &notification);
+
+        let application = self.downgrade();
+        glib::timeout_add_local_once(NOTIFICATION_LIFETIME, move || {
+            let Some(application) = application.upgrade() else {
+                return;
+            };
+            if application
+                .imp()
+                .forget_notification_if_current(&id, generation)
+            {
+                application.withdraw_notification(&id);
+            }
+        });
     }
 
     pub(crate) fn withdraw_conversation_notification(&self, workspace_id: &str, channel_id: &str) {
-        self.withdraw_notification(&conversation_notification_id(workspace_id, channel_id));
+        let id = conversation_notification_id(workspace_id, channel_id);
+        self.imp().forget_notification(&id);
+        self.withdraw_notification(&id);
     }
 
     fn configure_icon_theme(&self) {
@@ -352,15 +395,52 @@ impl ConduitApplication {
         let sidebar_group = adw::PreferencesGroup::builder().title("Sidebar").build();
         sidebar_group.add(&unreads_row);
 
+        let realtime_row = adw::PasswordEntryRow::builder()
+            .title("Socket Mode app token")
+            .show_apply_button(true)
+            .build();
+        let configured_by_environment = config::slack_app_token().is_some();
+        realtime_row.set_sensitive(!configured_by_environment);
+        let stored_token = AppTokenStore.load().ok().flatten().is_some();
+        let realtime_description = if configured_by_environment {
+            "Realtime updates are configured by the desktop environment."
+        } else if stored_token {
+            "Realtime updates are configured. Enter a new xapp- token to replace it."
+        } else {
+            "Enter an xapp- token with connections:write, then restart Conduit."
+        };
+        let realtime_group = adw::PreferencesGroup::builder()
+            .title("Realtime updates")
+            .description(realtime_description)
+            .build();
+        realtime_group.add(&realtime_row);
+
         let page = adw::PreferencesPage::builder()
             .title("Preferences")
             .icon_name("view-list-symbolic")
             .build();
         page.add(&sidebar_group);
+        page.add(&realtime_group);
 
         let dialog = adw::PreferencesDialog::builder()
             .title("Preferences")
             .build();
+        let weak_dialog = dialog.downgrade();
+        realtime_row.connect_apply(move |row| {
+            let result = AppTokenStore.save(row.text().as_str());
+            let Some(dialog) = weak_dialog.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(()) => {
+                    row.set_text("");
+                    dialog.add_toast(adw::Toast::new(
+                        "App token saved. Restart Conduit to enable realtime updates.",
+                    ));
+                }
+                Err(error) => dialog.add_toast(adw::Toast::new(&error.to_string())),
+            }
+        });
         dialog.add(&page);
         dialog.present(Some(&window));
     }
@@ -413,6 +493,17 @@ mod tests {
         assert!(id.starts_with("message:"));
         assert!(!id.contains("T123"));
         assert!(!id.contains("C123"));
+    }
+
+    #[test]
+    fn notification_expiry_does_not_withdraw_a_newer_replacement() {
+        let state = imp::ConduitApplication::default();
+        let first = state.register_notification("message:1");
+        let second = state.register_notification("message:1");
+
+        assert!(!state.forget_notification_if_current("message:1", first));
+        assert!(state.forget_notification_if_current("message:1", second));
+        assert!(!state.forget_notification_if_current("message:1", second));
     }
 
     #[test]

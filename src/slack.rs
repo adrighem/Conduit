@@ -237,6 +237,18 @@ pub struct SlackApi {
 }
 
 impl SlackApi {
+    pub fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
+    pub fn browser_cookie_d(&self) -> Option<&str> {
+        self.browser_cookie_d.as_deref()
+    }
+
+    pub fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
+    }
+
     pub fn new(token: StoredToken) -> Self {
         let scopes = token_scope_set(token.scope.as_deref());
         Self {

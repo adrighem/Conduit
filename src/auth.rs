@@ -18,6 +18,7 @@ use crate::{config, models::StoredToken};
 
 const KEYRING_SERVICE: &str = "eu.vanadrighem.conduit";
 const KEYRING_USER: &str = "slack-user-token";
+const KEYRING_APP_TOKEN_USER: &str = "slack-app-token";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OAUTH_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -111,6 +112,43 @@ impl TokenStore {
             Err(error) => Err(error).context("failed to delete Slack token from keyring"),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AppTokenStore;
+
+impl AppTokenStore {
+    pub fn load(&self) -> Result<Option<String>> {
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_APP_TOKEN_USER)?;
+        match entry.get_password() {
+            Ok(token) => normalize_app_token(&token).map(Some),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error).context("failed to read Slack app token from keyring"),
+        }
+    }
+
+    pub fn save(&self, token: &str) -> Result<()> {
+        let token = normalize_app_token(token)?;
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_APP_TOKEN_USER)?;
+        entry
+            .set_password(&token)
+            .context("failed to save Slack app token to keyring")
+    }
+}
+
+pub fn configured_app_token() -> Result<Option<String>> {
+    match config::slack_app_token() {
+        Some(token) => normalize_app_token(&token).map(Some),
+        None => AppTokenStore.load(),
+    }
+}
+
+fn normalize_app_token(token: &str) -> Result<String> {
+    let token = token.trim();
+    if !token.starts_with("xapp-") || token.len() <= "xapp-".len() {
+        return Err(anyhow!("Enter a Slack app token beginning with xapp-"));
+    }
+    Ok(token.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -742,5 +780,16 @@ mod tests {
 
         assert!(error.contains("XOXC"));
         assert!(error.contains("XOXD"));
+    }
+
+    #[test]
+    fn app_tokens_are_trimmed_and_require_the_xapp_prefix() {
+        assert_eq!(
+            normalize_app_token(" xapp-valid-token ").unwrap(),
+            "xapp-valid-token"
+        );
+        assert!(normalize_app_token("xoxp-user-token").is_err());
+        assert!(normalize_app_token("xapp-").is_err());
+        assert!(normalize_app_token("  ").is_err());
     }
 }

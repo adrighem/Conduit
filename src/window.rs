@@ -128,6 +128,8 @@ mod imp {
         #[template_child]
         pub workspace_status_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub connection_status_icon: TemplateChild<gtk::Image>,
+        #[template_child]
         pub message_status_label: TemplateChild<gtk::Label>,
         #[template_child]
         pub message_title: TemplateChild<adw::WindowTitle>,
@@ -727,6 +729,7 @@ struct MessageNotificationState<'a> {
     has_unread: bool,
     muted: bool,
     actively_reading: bool,
+    notification_worthy: bool,
     delivery: MessageNotificationDelivery,
 }
 
@@ -746,11 +749,49 @@ fn message_notification_action(state: MessageNotificationState<'_>) -> MessageNo
         && !state.muted
         && !state.actively_reading
         && !own_message
+        && state.notification_worthy
     {
         MessageNotificationAction::Notify
     } else {
         MessageNotificationAction::RecordOnly
     }
+}
+
+fn message_is_notification_worthy(message: &SlackMessage) -> bool {
+    if matches!(
+        message.subtype.as_deref(),
+        Some(
+            "channel_archive"
+                | "channel_join"
+                | "channel_leave"
+                | "channel_name"
+                | "channel_purpose"
+                | "channel_topic"
+                | "channel_unarchive"
+                | "group_archive"
+                | "group_join"
+                | "group_leave"
+                | "group_name"
+                | "group_purpose"
+                | "group_topic"
+                | "group_unarchive"
+        )
+    ) {
+        return false;
+    }
+
+    message
+        .text
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty())
+        || message
+            .files
+            .as_ref()
+            .is_some_and(|files| !files.is_empty())
+        || message
+            .blocks
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_null())
 }
 
 fn message_notification_body(message: Option<&SlackMessage>) -> String {
@@ -4723,6 +4764,28 @@ impl ConduitWindow {
         let status = gettext(presentation.status);
         imp.connection_label.set_label(&status);
         imp.workspace_status_label.set_label(&status);
+
+        let (icon_name, tooltip) = match imp.workspace.lifecycle() {
+            WorkspaceLifecycle::Ready => (
+                "network-wired-symbolic",
+                gettext("Realtime connection active"),
+            ),
+            WorkspaceLifecycle::Connecting | WorkspaceLifecycle::Syncing => (
+                "network-wireless-acquiring-symbolic",
+                gettext("Connecting to Slack..."),
+            ),
+            WorkspaceLifecycle::Disconnected | WorkspaceLifecycle::AuthenticationRequired => (
+                "network-wired-offline-symbolic",
+                gettext("Disconnected"),
+            ),
+            WorkspaceLifecycle::Degraded | WorkspaceLifecycle::StartupFailed => (
+                "dialog-warning-symbolic",
+                gettext("Connection degraded; retrying..."),
+            ),
+        };
+        imp.connection_status_icon.set_icon_name(Some(icon_name));
+        imp.connection_status_icon.set_tooltip_text(Some(&tooltip));
+
         imp.connect_button
             .set_sensitive(imp.workspace.lifecycle() != WorkspaceLifecycle::Connecting);
         match presentation.surface {
@@ -6540,6 +6603,7 @@ impl ConduitWindow {
             has_unread,
             muted,
             actively_reading,
+            notification_worthy: latest_message.is_some_and(message_is_notification_worthy),
             delivery,
         });
 
@@ -7711,6 +7775,7 @@ mod tests {
                 has_unread: true,
                 muted: false,
                 actively_reading: false,
+                notification_worthy: true,
                 delivery: MessageNotificationDelivery::Snapshot,
             }),
             MessageNotificationAction::Notify
@@ -7725,6 +7790,7 @@ mod tests {
                 has_unread: true,
                 muted: false,
                 actively_reading: false,
+                notification_worthy: true,
                 delivery: MessageNotificationDelivery::Realtime {
                     first_delivery: true,
                 },
@@ -7743,6 +7809,7 @@ mod tests {
             has_unread: true,
             muted: false,
             actively_reading: false,
+            notification_worthy: true,
             delivery: MessageNotificationDelivery::Snapshot,
         };
 
@@ -7791,6 +7858,31 @@ mod tests {
             }),
             MessageNotificationAction::RecordOnly
         );
+        assert_eq!(
+            message_notification_action(MessageNotificationState {
+                notification_worthy: false,
+                ..notifyable
+            }),
+            MessageNotificationAction::RecordOnly
+        );
+    }
+
+    #[test]
+    fn notification_content_filter_keeps_messages_and_drops_system_noise() {
+        let mut text_message = message("1710000200.000000", "Hello");
+        assert!(message_is_notification_worthy(&text_message));
+
+        text_message.subtype = Some("bot_message".into());
+        assert!(message_is_notification_worthy(&text_message));
+
+        text_message.subtype = Some("channel_join".into());
+        assert!(!message_is_notification_worthy(&text_message));
+
+        assert!(!message_is_notification_worthy(&SlackMessage {
+            ts: "1710000300.000000".into(),
+            text: Some("  ".into()),
+            ..Default::default()
+        }));
     }
 
     #[test]
@@ -7826,6 +7918,7 @@ mod tests {
                 has_unread: true,
                 muted: false,
                 actively_reading: false,
+                notification_worthy: true,
                 delivery: MessageNotificationDelivery::Snapshot,
             }),
             MessageNotificationAction::RecordOnly
