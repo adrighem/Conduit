@@ -4774,10 +4774,9 @@ impl ConduitWindow {
                 "network-wireless-acquiring-symbolic",
                 gettext("Connecting to Slack..."),
             ),
-            WorkspaceLifecycle::Disconnected | WorkspaceLifecycle::AuthenticationRequired => (
-                "network-wired-offline-symbolic",
-                gettext("Disconnected"),
-            ),
+            WorkspaceLifecycle::Disconnected | WorkspaceLifecycle::AuthenticationRequired => {
+                ("network-wired-offline-symbolic", gettext("Disconnected"))
+            }
             WorkspaceLifecycle::Degraded | WorkspaceLifecycle::StartupFailed => (
                 "dialog-warning-symbolic",
                 gettext("Connection degraded; retrying..."),
@@ -7872,7 +7871,7 @@ mod tests {
         let mut text_message = message("1710000200.000000", "Hello");
         assert!(message_is_notification_worthy(&text_message));
 
-        text_message.subtype = Some("bot_message".into());
+        text_message.subtype = Some("thread_broadcast".into());
         assert!(message_is_notification_worthy(&text_message));
 
         text_message.subtype = Some("channel_join".into());
@@ -7881,6 +7880,18 @@ mod tests {
         assert!(!message_is_notification_worthy(&SlackMessage {
             ts: "1710000300.000000".into(),
             text: Some("  ".into()),
+            ..Default::default()
+        }));
+
+        assert!(message_is_notification_worthy(&SlackMessage {
+            ts: "1710000400.000000".into(),
+            subtype: Some("file_share".into()),
+            files: Some(vec![Default::default()]),
+            ..Default::default()
+        }));
+        assert!(message_is_notification_worthy(&SlackMessage {
+            ts: "1710000500.000000".into(),
+            blocks: Some(serde_json::json!([])),
             ..Default::default()
         }));
     }

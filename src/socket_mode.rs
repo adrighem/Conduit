@@ -85,22 +85,33 @@ fn build_websocket_request(
 ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let request = match credentials {
-        SocketModeCredentials::AppToken(_) => {
-            url.into_client_request().context("failed to build WebSocket request")?
-        }
-        SocketModeCredentials::BrowserSession { xoxc_token: _, xoxd_token, user_agent } => {
-            let mut req = url.into_client_request().context("failed to build WebSocket request")?;
+        SocketModeCredentials::AppToken(_) => url
+            .into_client_request()
+            .context("failed to build WebSocket request")?,
+        SocketModeCredentials::BrowserSession {
+            xoxc_token: _,
+            xoxd_token,
+            user_agent,
+        } => {
+            let mut req = url
+                .into_client_request()
+                .context("failed to build WebSocket request")?;
             let headers = req.headers_mut();
 
             headers.insert(
                 "Cookie",
-                tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("d={}", xoxd_token))
-                    .context("invalid Cookie header value")?
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!(
+                    "d={}",
+                    xoxd_token
+                ))
+                .context("invalid Cookie header value")?,
             );
 
             headers.insert(
                 "Origin",
-                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("https://app.slack.com")
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static(
+                    "https://app.slack.com",
+                ),
             );
 
             if let Some(ua) = user_agent {
@@ -385,7 +396,11 @@ impl SocketModeApi {
                     ))
                 }
             }
-            SocketModeCredentials::BrowserSession { xoxc_token, xoxd_token, user_agent } => {
+            SocketModeCredentials::BrowserSession {
+                xoxc_token,
+                xoxd_token,
+                user_agent,
+            } => {
                 let mut request = self
                     .http
                     .post("https://slack.com/api/client.getWebSocketURL")
@@ -408,7 +423,9 @@ impl SocketModeApi {
 
                 if response.ok {
                     let primary_url = response.primary_websocket_url.ok_or_else(|| {
-                        anyhow!("Slack client.getWebSocketURL did not return a primary WebSocket URL")
+                        anyhow!(
+                            "Slack client.getWebSocketURL did not return a primary WebSocket URL"
+                        )
                     })?;
                     let routing_context = response.routing_context.ok_or_else(|| {
                         anyhow!("Slack client.getWebSocketURL did not return a routing context")

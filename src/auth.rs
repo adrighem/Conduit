@@ -145,7 +145,10 @@ pub fn configured_app_token() -> Result<Option<String>> {
 
 fn normalize_app_token(token: &str) -> Result<String> {
     let token = token.trim();
-    if !token.starts_with("xapp-") || token.len() <= "xapp-".len() {
+    if !token.starts_with("xapp-")
+        || token.len() <= "xapp-".len()
+        || token.chars().any(char::is_whitespace)
+    {
         return Err(anyhow!("Enter a Slack app token beginning with xapp-"));
     }
     Ok(token.to_string())
@@ -790,6 +793,7 @@ mod tests {
         );
         assert!(normalize_app_token("xoxp-user-token").is_err());
         assert!(normalize_app_token("xapp-").is_err());
+        assert!(normalize_app_token("xapp-invalid token").is_err());
         assert!(normalize_app_token("  ").is_err());
     }
 }

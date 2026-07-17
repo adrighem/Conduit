@@ -501,9 +501,14 @@ mod tests {
         let first = state.register_notification("message:1");
         let second = state.register_notification("message:1");
 
+        assert_eq!(NOTIFICATION_LIFETIME, Duration::from_secs(10));
         assert!(!state.forget_notification_if_current("message:1", first));
         assert!(state.forget_notification_if_current("message:1", second));
         assert!(!state.forget_notification_if_current("message:1", second));
+
+        let manually_withdrawn = state.register_notification("message:2");
+        state.forget_notification("message:2");
+        assert!(!state.forget_notification_if_current("message:2", manually_withdrawn));
     }
 
     #[test]
