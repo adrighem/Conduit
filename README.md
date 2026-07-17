@@ -22,7 +22,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state.
 - Sections for Messages, Unreads, observed threads, Files, and Later.
 - Fast conversation switcher with discovery of channels and people.
-- GNOME Shell search-provider integration for opening cached channels and direct messages straight from the desktop overview. It reads only conversation and name metadata for the active workspace and never indexes message history.
+- GNOME Shell search-provider integration for opening cached channels, existing direct messages, and new direct messages with cached workspace members straight from the desktop overview. It reads only conversation and name metadata for the active workspace and never indexes message history.
 - Transactional SQLite caching for conversations, names, histories, threads, unread state, statuses, and custom emoji, with automatic migration from the earlier JSON cache.
 - Unread badges, muted and external-conversation indicators, read markers, and desktop notifications for incoming realtime events.
 - Slack status emoji and hover text for people in direct messages, shown consistently in navigation, switchers, titles, and message authors.
