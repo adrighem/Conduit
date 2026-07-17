@@ -781,6 +781,12 @@ enum NotificationTargetResolution {
     RejectWorkspace,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConversationTargetAction {
+    SelectConversation(String),
+    OpenDirectMessage(String),
+}
+
 fn notification_target_resolution(
     current_workspace_id: Option<&str>,
     workspace_ready: bool,
@@ -794,6 +800,26 @@ fn notification_target_resolution(
         Some(_) if !workspace_ready => NotificationTargetResolution::Wait,
         Some(_) => NotificationTargetResolution::Open,
     }
+}
+
+fn conversation_target_action(
+    channel_or_user_id: &str,
+    conversations: &[SlackConversation],
+) -> ConversationTargetAction {
+    if channel_or_user_id.starts_with('U') || channel_or_user_id.starts_with('W') {
+        if let Some(channel_id) = conversations
+            .iter()
+            .find(|conversation| {
+                conversation.is_im.unwrap_or(false)
+                    && conversation.user.as_deref() == Some(channel_or_user_id)
+            })
+            .map(|conversation| conversation.id.clone())
+        {
+            return ConversationTargetAction::SelectConversation(channel_id);
+        }
+        return ConversationTargetAction::OpenDirectMessage(channel_or_user_id.to_string());
+    }
+    ConversationTargetAction::SelectConversation(channel_or_user_id.to_string())
 }
 
 fn workspace_identity(auth: &AuthInfo) -> Option<String> {
@@ -6506,19 +6532,16 @@ impl ConduitWindow {
         workspace_id: String,
         channel_id: String,
     ) -> bool {
-        let expected_channel_id = channel_id.clone();
         *self.imp().pending_notification_target.borrow_mut() = Some(NotificationTarget {
             workspace_id,
             channel_id,
         });
-        self.activate_pending_notification_target();
-        self.imp().pending_notification_target.borrow().is_none()
-            && self.visible_channel_id().as_deref() == Some(expected_channel_id.as_str())
+        self.activate_pending_notification_target()
     }
 
-    fn activate_pending_notification_target(&self) {
+    fn activate_pending_notification_target(&self) -> bool {
         let Some(target) = self.imp().pending_notification_target.borrow().clone() else {
-            return;
+            return false;
         };
         let current_workspace_id = self.imp().workspace_id.borrow().clone();
         match notification_target_resolution(
@@ -6526,18 +6549,30 @@ impl ConduitWindow {
             self.imp().workspace_ready.get(),
             &target,
         ) {
-            NotificationTargetResolution::Wait => {}
+            NotificationTargetResolution::Wait => false,
             NotificationTargetResolution::RejectWorkspace => {
                 self.imp().pending_notification_target.borrow_mut().take();
                 self.set_status(&gettext(
                     "This notification belongs to a different workspace.",
                 ));
+                false
             }
             NotificationTargetResolution::Open => {
                 self.imp().pending_notification_target.borrow_mut().take();
-                let title = self.conversation_title(&target.channel_id);
-                self.select_conversation(&target.channel_id, &title);
+                let conversations = self.imp().workspace.conversations.borrow().conversations();
+                let opened = match conversation_target_action(&target.channel_id, &conversations) {
+                    ConversationTargetAction::SelectConversation(channel_id) => {
+                        let title = self.conversation_title(&channel_id);
+                        self.select_conversation(&channel_id, &title);
+                        self.visible_channel_id().as_deref() == Some(channel_id.as_str())
+                    }
+                    ConversationTargetAction::OpenDirectMessage(user_id) => {
+                        self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
+                        true
+                    }
+                };
                 self.present();
+                opened
             }
         }
     }
@@ -7749,6 +7784,29 @@ mod tests {
         assert_eq!(
             notification_target_resolution(Some("T999"), true, &target),
             NotificationTargetResolution::RejectWorkspace
+        );
+    }
+
+    #[test]
+    fn conversation_targets_select_known_channels_and_open_prospective_dms() {
+        let conversations = vec![SlackConversation {
+            id: "D123".into(),
+            user: Some("U123".into()),
+            is_im: Some(true),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            conversation_target_action("C123", &conversations),
+            ConversationTargetAction::SelectConversation("C123".into())
+        );
+        assert_eq!(
+            conversation_target_action("U123", &conversations),
+            ConversationTargetAction::SelectConversation("D123".into())
+        );
+        assert_eq!(
+            conversation_target_action("U456", &conversations),
+            ConversationTargetAction::OpenDirectMessage("U456".into())
         );
     }
 

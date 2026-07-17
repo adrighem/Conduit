@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[cfg(test)]
@@ -168,34 +168,34 @@ fn search_states(states: Vec<CachedSearchState>, terms: &[String]) -> Vec<Search
     let mut per_workspace = states
         .into_iter()
         .filter(|state| !state.workspace_id.trim().is_empty())
-        .filter_map(|mut state| {
+        .map(|mut state| {
             state.conversations.retain(|conversation| {
                 !conversation.is_archived.unwrap_or(false)
                     && conversation_kind(conversation) != ConversationKind::Unknown
             });
+            add_virtual_direct_messages(&mut state);
             let current_user_id = current_user_id(&state.workspace_id);
-            Some(
-                conversation_switcher_items_with_aliases(
-                    &state.conversations,
-                    &state.user_names,
-                    current_user_id,
-                    &query,
-                    Some(&state.user_search_aliases),
-                    Some(&state.user_full_names),
-                    None,
-                )
-                .into_iter()
-                .map(|row| SearchResult {
-                    id: encode_target(&ResultTarget {
-                        workspace_id: state.workspace_id.clone(),
-                        channel_id: row.id,
-                    }),
-                    name: row.title,
-                    description: row.kind.accessible_name(),
-                    icon_name: row.kind.icon_name(),
-                })
-                .collect::<Vec<_>>(),
+
+            conversation_switcher_items_with_aliases(
+                &state.conversations,
+                &state.user_names,
+                current_user_id,
+                &query,
+                Some(&state.user_search_aliases),
+                Some(&state.user_full_names),
+                None,
             )
+            .into_iter()
+            .map(|row| SearchResult {
+                id: encode_target(&ResultTarget {
+                    workspace_id: state.workspace_id.clone(),
+                    channel_id: row.id,
+                }),
+                name: row.title,
+                description: row.kind.accessible_name(),
+                icon_name: row.kind.icon_name(),
+            })
+            .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
 
@@ -216,18 +216,21 @@ fn search_states(states: Vec<CachedSearchState>, terms: &[String]) -> Vec<Search
 fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::Variant>> {
     let results = cached_states(cache_dir)
         .into_iter()
-        .flat_map(|state| {
+        .flat_map(|mut state| {
             let current_user_id = current_user_id(&state.workspace_id).map(ToString::to_string);
-            let workspace_id = state.workspace_id;
+            let workspace_id = state.workspace_id.clone();
+            state.conversations.retain(|conversation| {
+                !conversation.is_archived.unwrap_or(false)
+                    && conversation_kind(conversation) != ConversationKind::Unknown
+            });
+            add_virtual_direct_messages(&mut state);
+
             let user_names = state.user_names;
             let user_full_names = state.user_full_names;
+
             state
                 .conversations
                 .into_iter()
-                .filter(|conversation| {
-                    !conversation.is_archived.unwrap_or(false)
-                        && conversation_kind(conversation) != ConversationKind::Unknown
-                })
                 .map(move |conversation| {
                     let kind = conversation_kind(&conversation);
                     let target = ResultTarget {
@@ -267,6 +270,35 @@ fn result_metas(cache_dir: &Path, ids: &[String]) -> Vec<HashMap<String, glib::V
             ])
         })
         .collect()
+}
+
+fn add_virtual_direct_messages(state: &mut CachedSearchState) {
+    let current_user_id = current_user_id(&state.workspace_id);
+    let existing_im_users = state
+        .conversations
+        .iter()
+        .filter(|conversation| conversation.is_im.unwrap_or(false))
+        .filter_map(|conversation| conversation.user.as_ref().map(ToString::to_string))
+        .collect::<HashSet<_>>();
+
+    for user_id in state.user_names.keys() {
+        if Some(user_id.as_str()) == current_user_id || existing_im_users.contains(user_id) {
+            continue;
+        }
+        state.conversations.push(SlackConversation {
+            id: user_id.clone(),
+            name: None,
+            user: Some(user_id.clone()),
+            is_channel: Some(false),
+            is_group: Some(false),
+            is_im: Some(true),
+            is_mpim: Some(false),
+            is_private: Some(true),
+            is_archived: Some(false),
+            unread_count: None,
+            extra: HashMap::new(),
+        });
+    }
 }
 
 fn cached_states(cache_dir: &Path) -> Vec<CachedSearchState> {
@@ -645,6 +677,43 @@ mod tests {
 
         assert!(search(&directory, &[" ".into()]).is_empty());
         assert!(search(&directory, &["general".into()]).is_empty());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn searches_virtual_direct_messages_for_workspace_users_without_active_dm() {
+        let directory = temp_dir();
+        write_index(
+            &directory,
+            serde_json::json!({
+                "workspace_id": "T123:U0",
+                "conversations": [
+                    {"id": "C1", "name": "architecture", "is_channel": true}
+                ],
+                "user_names": {"U_TESSI": "tessi"},
+                "user_full_names": {"U_TESSI": "Tessier Smith"},
+                "user_search_aliases": {"U_TESSI": ["tessi", "tessier"]}
+            }),
+        );
+
+        let results = search(&directory, &["tessi".into()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Tessier Smith (tessi)");
+        assert_eq!(results[0].description, "Direct message");
+        assert_eq!(decode_target(&results[0].id).unwrap().channel_id, "U_TESSI");
+
+        let metas = result_metas(&directory, &[results[0].id.clone()]);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0]["id"].get::<String>().unwrap(), results[0].id);
+        assert_eq!(
+            metas[0]["name"].get::<String>().unwrap(),
+            "Tessier Smith (tessi)"
+        );
+        assert_eq!(
+            metas[0]["description"].get::<String>().unwrap(),
+            "Direct message"
+        );
+
         let _ = fs::remove_dir_all(directory);
     }
 }
