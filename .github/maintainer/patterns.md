@@ -77,6 +77,7 @@
 - Issue footers are traceability, not proof of acceptance. Audit each acceptance list before closure, especially for lifecycle cleanup, interaction scope, and claims of shared architecture.
 - Stable-Clippy drift continues to make local parity important; broad feature batches should run the exact CI lint before push or pin a reviewed Rust toolchain.
 - Desktop integrations need an installed-session smoke test in addition to pure model tests because metadata discovery and D-Bus activation can fail outside unit-test coverage.
+- Live search-provider diagnostics must serialize application startup and provider calls around ownership of `eu.vanadrighem.conduit`. Starting Conduit directly while GNOME Shell activates the provider can race for the bus name and create a misleading failed-registration journal entry. Routine tests should remain isolated from the desktop session.
 
 ## 2026-07-14 Acceptance-Gap Follow-up
 

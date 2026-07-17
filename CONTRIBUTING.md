@@ -31,6 +31,12 @@ cargo test
 
 Running the app expects the compiled GResource from the Meson build or an installed build.
 
+### Live GNOME Search Provider Testing
+
+Do not start Conduit directly while GNOME Shell may be activating its D-Bus search provider. The two processes can race to own `eu.vanadrighem.conduit`, producing a harmless but noisy failed registration.
+
+For live-session diagnostics, stop Conduit and wait until the application bus name has no owner. Start the diagnostic Conduit process, wait until it owns the bus name, and only then query the search provider. Prefer the Meson `GNOME search provider` test for routine validation because it runs in an isolated D-Bus session.
+
 ## Slack App Setup
 
 For local Slack testing, create a Slack app as described in `README.md`. Use the localhost redirect URL documented there and keep client IDs, tokens, and authorization codes out of commits and issue comments.
