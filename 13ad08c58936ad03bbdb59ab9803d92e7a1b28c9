@@ -1,0 +1,7 @@
+Track: Native Slack huddles
+
+Summary: Converted the deep research report into a production-safe Conductor specification and sequential implementation plan covering official discovery, deterministic state/runtime contracts, isolated signalling, GStreamer/PipeWire media, portal sharing, GNOME UI, privacy, fallback, packaging, and validation.
+
+Modified: conductor/tracks.md and conductor/tracks/native_huddles_20260718/{spec.md,plan.md,metadata.json}
+
+Rationale: Slack does not document first-party huddle join/bootstrap, so the track separates the complete native media path from a capability-checked Slack adapter and explicit external fallback.
