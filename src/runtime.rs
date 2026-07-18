@@ -2983,7 +2983,8 @@ async fn run_socket_mode(
         let result = socket_mode::run_once(&credentials, move |event| {
             if let Some(sender) = persistence_for_run.as_ref() {
                 let persistence_event = match &event {
-                    SocketModeEvent::UserChanged(user) => {
+                    SocketModeEvent::UserChanged(user)
+                    | SocketModeEvent::UserHuddleChanged(user) => {
                         Some(RealtimePersistenceEvent::UserChanged(user.clone()))
                     }
                     SocketModeEvent::Message(message) => {

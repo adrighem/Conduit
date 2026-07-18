@@ -807,40 +807,7 @@ fn message_notification_action(state: MessageNotificationState<'_>) -> MessageNo
 }
 
 fn message_is_notification_worthy(message: &SlackMessage) -> bool {
-    if matches!(
-        message.subtype.as_deref(),
-        Some(
-            "channel_archive"
-                | "channel_join"
-                | "channel_leave"
-                | "channel_name"
-                | "channel_purpose"
-                | "channel_topic"
-                | "channel_unarchive"
-                | "group_archive"
-                | "group_join"
-                | "group_leave"
-                | "group_name"
-                | "group_purpose"
-                | "group_topic"
-                | "group_unarchive"
-        )
-    ) {
-        return false;
-    }
-
-    message
-        .text
-        .as_deref()
-        .is_some_and(|text| !text.trim().is_empty())
-        || message
-            .files
-            .as_ref()
-            .is_some_and(|files| !files.is_empty())
-        || message
-            .blocks
-            .as_ref()
-            .is_some_and(|blocks| !blocks.is_null())
+    message.is_notification_worthy()
 }
 
 fn message_notification_body(message: Option<&SlackMessage>) -> String {
@@ -6754,7 +6721,7 @@ impl ConduitWindow {
         match event {
             SocketModeEvent::Message(event) => self.apply_socket_message(*event),
             SocketModeEvent::Reaction(event) => self.apply_socket_reaction(event),
-            SocketModeEvent::UserChanged(user) => {
+            SocketModeEvent::UserChanged(user) | SocketModeEvent::UserHuddleChanged(user) => {
                 let Some(user_id) = user.id.clone() else {
                     return;
                 };
@@ -8426,6 +8393,14 @@ mod tests {
         assert!(message_is_notification_worthy(&SlackMessage {
             ts: "1710000500.000000".into(),
             blocks: Some(serde_json::json!([])),
+            ..Default::default()
+        }));
+
+        assert!(!message_is_notification_worthy(&SlackMessage {
+            ts: "1710000600.000000".into(),
+            subtype: Some("huddle_thread".into()),
+            text: Some("A huddle happened".into()),
+            no_notifications: Some(true),
             ..Default::default()
         }));
     }

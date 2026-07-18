@@ -43,7 +43,23 @@ pub enum SocketModeEvent {
     Message(Box<SocketModeMessageEvent>),
     Reaction(SocketModeReactionEvent),
     UserChanged(Box<SlackUser>),
+    UserHuddleChanged(Box<SlackUser>),
     RefreshConversations,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealtimeProtocol {
+    SocketMode,
+    BrowserRtm,
+}
+
+impl RealtimeProtocol {
+    fn from_credentials(credentials: &SocketModeCredentials) -> Self {
+        match credentials {
+            SocketModeCredentials::AppToken(_) => Self::SocketMode,
+            SocketModeCredentials::BrowserSession { .. } => Self::BrowserRtm,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +145,7 @@ pub async fn run_once(
     credentials: &SocketModeCredentials,
     mut handle_event: impl FnMut(SocketModeEvent),
 ) -> Result<SocketModeDisconnect> {
+    let protocol = RealtimeProtocol::from_credentials(credentials);
     let api = SocketModeApi::new(credentials.clone());
     let url = api.open_connection().await?;
     let request = build_websocket_request(&url, credentials)?;
@@ -149,7 +166,7 @@ pub async fn run_once(
             Message::Text(text) => {
                 if let Some(disconnect) = tokio::time::timeout(
                     WEBSOCKET_WRITE_TIMEOUT,
-                    handle_text_message(text.as_str(), &mut socket, &mut handle_event),
+                    handle_text_message(text.as_str(), protocol, &mut socket, &mut handle_event),
                 )
                 .await
                 .context("timed out acknowledging Slack Socket Mode message")??
@@ -161,7 +178,7 @@ pub async fn run_once(
                 if let Ok(text) = std::str::from_utf8(&bytes) {
                     if let Some(disconnect) = tokio::time::timeout(
                         WEBSOCKET_WRITE_TIMEOUT,
-                        handle_text_message(text, &mut socket, &mut handle_event),
+                        handle_text_message(text, protocol, &mut socket, &mut handle_event),
                     )
                     .await
                     .context("timed out acknowledging Slack Socket Mode message")??
@@ -186,6 +203,7 @@ pub async fn run_once(
 
 async fn handle_text_message<S>(
     text: &str,
+    protocol: RealtimeProtocol,
     socket: &mut S,
     handle_event: &mut impl FnMut(SocketModeEvent),
 ) -> Result<Option<SocketModeDisconnect>>
@@ -193,6 +211,18 @@ where
     S: Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
+    if protocol == RealtimeProtocol::BrowserRtm {
+        let event: Value =
+            serde_json::from_str(text).context("failed to parse Slack browser RTM event")?;
+        if event.get("type").and_then(Value::as_str) == Some("goodbye") {
+            return Ok(Some(SocketModeDisconnect::ConnectionClosed));
+        }
+        if let Some(event) = socket_event_from_rtm(&event) {
+            handle_event(event);
+        }
+        return Ok(None);
+    }
+
     let envelope: SocketModeEnvelope =
         serde_json::from_str(text).context("failed to parse Slack Socket Mode envelope")?;
 
@@ -243,6 +273,14 @@ where
 
 pub fn socket_event_from_payload(payload: &Value) -> Option<SocketModeEvent> {
     let event = payload.get("event")?;
+    socket_event_from_event(event)
+}
+
+pub fn socket_event_from_rtm(event: &Value) -> Option<SocketModeEvent> {
+    socket_event_from_event(event)
+}
+
+fn socket_event_from_event(event: &Value) -> Option<SocketModeEvent> {
     let event_type = event.get("type").and_then(Value::as_str)?;
 
     match event_type {
@@ -255,6 +293,12 @@ pub fn socket_event_from_payload(payload: &Value) -> Option<SocketModeEvent> {
             .and_then(|user| serde_json::from_value(user).ok())
             .map(Box::new)
             .map(SocketModeEvent::UserChanged),
+        "user_huddle_changed" => event
+            .get("user")
+            .cloned()
+            .and_then(|user| serde_json::from_value(user).ok())
+            .map(Box::new)
+            .map(SocketModeEvent::UserHuddleChanged),
         event_type if conversation_refresh_event(event_type) => {
             Some(SocketModeEvent::RefreshConversations)
         }
@@ -598,6 +642,66 @@ mod tests {
                 if user.id.as_deref() == Some("U123")
                     && user.status().is_some_and(|status| status.expiration == 200)
         ));
+    }
+
+    #[test]
+    fn parses_official_user_huddle_changed_events() {
+        let event = socket_event_from_payload(&payload(serde_json::json!({
+            "type": "user_huddle_changed",
+            "user": {
+                "id": "U123",
+                "profile": {
+                    "huddle_state": "in_a_huddle",
+                    "huddle_state_call_id": "R123",
+                    "huddle_state_channel_id": "C123",
+                    "huddle_state_expiration_ts": 200
+                }
+            }
+        })));
+
+        assert!(matches!(
+            event,
+            Some(SocketModeEvent::UserHuddleChanged(user))
+                if user.id.as_deref() == Some("U123")
+                    && user.profile.as_ref().is_some_and(|profile| {
+                        profile.huddle_state_call_id.as_deref() == Some("R123")
+                    })
+        ));
+    }
+
+    #[test]
+    fn browser_rtm_decodes_raw_events_without_socket_mode_envelope() {
+        let event = socket_event_from_rtm(&serde_json::json!({
+            "type": "user_huddle_changed",
+            "user": {
+                "id": "U123",
+                "profile": {
+                    "huddle_state": "in_a_huddle",
+                    "huddle_state_call_id": "R123"
+                }
+            }
+        }));
+
+        assert!(matches!(
+            event,
+            Some(SocketModeEvent::UserHuddleChanged(user))
+                if user.id.as_deref() == Some("U123")
+        ));
+    }
+
+    #[test]
+    fn browser_rtm_rejects_socket_mode_envelopes_and_malformed_huddle_events() {
+        assert!(socket_event_from_rtm(&serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "must-not-be-acked",
+            "payload": { "event": { "type": "user_huddle_changed" } }
+        }))
+        .is_none());
+        assert!(socket_event_from_rtm(&serde_json::json!({
+            "type": "user_huddle_changed",
+            "user": "invalid"
+        }))
+        .is_none());
     }
 
     #[test]

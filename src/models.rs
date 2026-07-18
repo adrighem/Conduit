@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::huddles::model::{SlackHuddleRoom, SlackHuddleState};
+
 const CONVERSATION_MEMBER_KEYS: [&str; 2] = ["members", "users"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,13 @@ pub struct SlackConversation {
 }
 
 impl SlackConversation {
+    pub fn has_huddle_metadata(&self) -> bool {
+        self.extra
+            .get("properties")
+            .and_then(|properties| properties.get("huddles"))
+            .is_some_and(|huddles| !huddles.is_null())
+    }
+
     pub fn is_user_deleted(&self) -> bool {
         self.extra
             .get("is_user_deleted")
@@ -598,6 +607,10 @@ pub struct SlackMessage {
     pub reactions: Option<Vec<SlackReaction>>,
     pub files: Option<Vec<SlackFile>>,
     pub blocks: Option<Value>,
+    #[serde(default)]
+    pub no_notifications: Option<bool>,
+    #[serde(default, skip_serializing)]
+    pub room: Option<SlackHuddleRoom>,
 }
 
 impl SlackMessage {
@@ -614,6 +627,39 @@ impl SlackMessage {
 
     pub fn has_thread(&self) -> bool {
         self.reply_count.unwrap_or_default() > 0
+    }
+
+    pub fn is_notification_worthy(&self) -> bool {
+        if self.no_notifications.unwrap_or(false)
+            || matches!(
+                self.subtype.as_deref(),
+                Some(
+                    "channel_archive"
+                        | "channel_join"
+                        | "channel_leave"
+                        | "channel_name"
+                        | "channel_purpose"
+                        | "channel_topic"
+                        | "channel_unarchive"
+                        | "group_archive"
+                        | "group_join"
+                        | "group_leave"
+                        | "group_name"
+                        | "group_purpose"
+                        | "group_topic"
+                        | "group_unarchive"
+                        | "huddle_thread"
+                )
+            )
+        {
+            return false;
+        }
+
+        self.text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+            || self.files.as_ref().is_some_and(|files| !files.is_empty())
+            || self.blocks.as_ref().is_some_and(|blocks| !blocks.is_null())
     }
 
     pub fn latest_ts<'a>(messages: impl Iterator<Item = &'a SlackMessage>) -> Option<String> {
@@ -906,6 +952,11 @@ pub struct SlackUserProfile {
     pub image_192: Option<String>,
     pub image_512: Option<String>,
     pub image_original: Option<String>,
+    #[serde(default)]
+    pub huddle_state: SlackHuddleState,
+    pub huddle_state_call_id: Option<String>,
+    pub huddle_state_channel_id: Option<String>,
+    pub huddle_state_expiration_ts: Option<i64>,
     #[serde(default)]
     pub fields: HashMap<String, SlackProfileField>,
 }

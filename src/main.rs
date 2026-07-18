@@ -28,6 +28,7 @@ mod debug;
 mod drafts;
 mod emoji;
 mod gnome_search_provider;
+mod huddles;
 mod message_html;
 mod models;
 mod rendering;
