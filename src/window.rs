@@ -19,7 +19,7 @@
  */
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -64,6 +64,10 @@ use crate::sidebar::{
     SidebarRowModel,
 };
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
+use crate::slack_link::{
+    resolve_slack_uri, slack_app_web_fallback, SlackFileAction, SlackUri, SlackUriResolution,
+    SlackUriTarget,
+};
 use crate::socket_mode::{
     SocketModeEvent, SocketModeMessageEvent, SocketModeMessageKind, SocketModeReactionEvent,
 };
@@ -197,10 +201,12 @@ mod imp {
         pub pending_user_ids: RefCell<HashSet<String>>,
         pub pending_profile_user_id: RefCell<Option<String>>,
         pub workspace_id: RefCell<Option<String>>,
+        pub workspace_team_id: RefCell<Option<String>>,
         pub workspace_name: RefCell<Option<String>>,
         pub workspace_url: RefCell<Option<String>>,
         pub workspace_ready: Cell<bool>,
         pub(super) pending_notification_target: RefCell<Option<NotificationTarget>>,
+        pub(super) pending_slack_uris: RefCell<VecDeque<SlackUri>>,
         pub drafts: RefCell<Drafts>,
         pub draft_save_generation: Cell<u64>,
         pub pending_sent_drafts: RefCell<HashMap<DraftKey, String>>,
@@ -417,6 +423,7 @@ fn is_unmodified_paste_accelerator(key: gtk::gdk::Key, state: gtk::gdk::Modifier
 
 const COMPOSER_TARGETS: [ComposerTarget; 2] = [ComposerTarget::Message, ComposerTarget::Thread];
 const UI_EVENT_BATCH_LIMIT: usize = 8;
+const MAX_PENDING_SLACK_URIS: usize = 16;
 const CANCEL_REACTION_PICKER_SCRIPT: &str = r#"(function () {
   const picker = document.getElementById("emoji-picker");
   if (!picker || !picker.open) return false;
@@ -1084,7 +1091,9 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
             thread_ts: thread_ts.clone(),
         },
         (RuntimeOperation::Search, RuntimeTarget::Workspace) => RuntimeFailureRecovery::Search,
-        (RuntimeOperation::Files, RuntimeTarget::Workspace) => RuntimeFailureRecovery::Files,
+        (RuntimeOperation::Files, RuntimeTarget::Workspace | RuntimeTarget::File(_)) => {
+            RuntimeFailureRecovery::Files
+        }
         (RuntimeOperation::SavedItems, RuntimeTarget::Workspace) => {
             RuntimeFailureRecovery::SavedItems
         }
@@ -3412,6 +3421,24 @@ impl ConduitWindow {
                     self.populate_files(files);
                 }
             }
+            RuntimeEventKind::FileLoaded {
+                file,
+                share_requested,
+            } => {
+                let visible = self
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow_mut()
+                    .apply_files(vec![file]);
+                if visible {
+                    let files = self.imp().workspace.view.borrow().files().to_vec();
+                    self.populate_files(files);
+                    if share_requested {
+                        self.set_status(&gettext("Sharing existing files is not supported yet."));
+                    }
+                }
+            }
             RuntimeEventKind::SavedItemsLoaded(items) => {
                 let visible = self.imp().workspace.view.borrow_mut().apply_saved(items);
                 if visible {
@@ -3923,6 +3950,19 @@ impl ConduitWindow {
     }
 
     fn show_files(&self) {
+        self.start_files_surface(&gettext("Loading files"));
+        self.send_command(RuntimeCommand::LoadFiles);
+    }
+
+    fn show_slack_file(&self, file_id: &str, share_requested: bool) {
+        self.start_files_surface(&gettext("Loading file"));
+        self.send_command(RuntimeCommand::LoadFile {
+            file_id: file_id.to_string(),
+            share_requested,
+        });
+    }
+
+    fn start_files_surface(&self, loading_message: &str) {
         self.record_navigation(&MainNavigationTarget::Files);
         self.flush_current_drafts();
         let title = gettext("Files");
@@ -3930,11 +3970,7 @@ impl ConduitWindow {
         self.render_closed_thread();
         self.imp().message_title.set_title(&title);
         self.render_conversations();
-        self.load_message_html(&message_html::placeholder_document(
-            &title,
-            &gettext("Loading files"),
-        ));
-        self.send_command(RuntimeCommand::LoadFiles);
+        self.load_message_html(&message_html::placeholder_document(&title, loading_message));
         self.imp().workspace_split.set_show_content(true);
     }
 
@@ -4811,6 +4847,7 @@ impl ConduitWindow {
         self.sync_back_button();
         *imp.current_user_id.borrow_mut() = None;
         *imp.workspace_id.borrow_mut() = None;
+        *imp.workspace_team_id.borrow_mut() = None;
         imp.workspace_ready.set(false);
         imp.latest_message_ts_by_channel.borrow_mut().clear();
         imp.local_read_ts_by_channel.borrow_mut().clear();
@@ -4866,6 +4903,7 @@ impl ConduitWindow {
         *self.imp().workspace_id.borrow_mut() = workspace_identity(&auth);
         self.imp().workspace_ready.set(false);
         *self.imp().current_user_id.borrow_mut() = auth.user_id.clone();
+        *self.imp().workspace_team_id.borrow_mut() = auth.team_id.clone();
         *self.imp().workspace_url.borrow_mut() = auth.url.clone();
         self.imp().connect_button.set_sensitive(true);
         let workspace_name = auth
@@ -4882,6 +4920,7 @@ impl ConduitWindow {
             self.start_sidebar_loading();
         }
         self.activate_pending_notification_target();
+        self.activate_pending_slack_uris();
     }
 
     fn set_status(&self, status: &str) {
@@ -5220,6 +5259,7 @@ impl ConduitWindow {
         }
         self.imp().workspace_ready.set(true);
         self.activate_pending_notification_target();
+        self.activate_pending_slack_uris();
         self.refresh_open_conversation_picker();
     }
 
@@ -7020,6 +7060,73 @@ impl ConduitWindow {
         self.activate_pending_notification_target()
     }
 
+    pub(crate) fn open_slack_uri(&self, uri: SlackUri) -> bool {
+        {
+            let mut pending = self.imp().pending_slack_uris.borrow_mut();
+            if pending.len() == MAX_PENDING_SLACK_URIS {
+                pending.pop_front();
+            }
+            pending.push_back(uri);
+        }
+        let opened = self.activate_pending_slack_uris();
+        self.present();
+        opened
+    }
+
+    fn activate_pending_slack_uris(&self) -> bool {
+        let mut opened = false;
+        loop {
+            let Some(uri) = self.imp().pending_slack_uris.borrow().front().cloned() else {
+                break;
+            };
+            let current_team_id = self.imp().workspace_team_id.borrow().clone();
+            match resolve_slack_uri(
+                current_team_id.as_deref(),
+                self.imp().workspace_ready.get(),
+                &uri,
+            ) {
+                SlackUriResolution::Wait => break,
+                SlackUriResolution::RejectWorkspace => {
+                    self.imp().pending_slack_uris.borrow_mut().pop_front();
+                    self.set_status(&gettext(
+                        "This Slack link belongs to a different workspace.",
+                    ));
+                }
+                SlackUriResolution::Open => {
+                    self.imp().pending_slack_uris.borrow_mut().pop_front();
+                    self.activate_slack_uri(uri);
+                    opened = true;
+                }
+            }
+        }
+        opened
+    }
+
+    fn activate_slack_uri(&self, uri: SlackUri) {
+        match uri.target().clone() {
+            SlackUriTarget::Open => self.present(),
+            SlackUriTarget::Channel(channel_id) => {
+                if channel_id.starts_with('D') {
+                    let title = self.conversation_title(&channel_id);
+                    self.select_conversation(&channel_id, &title);
+                } else {
+                    self.open_channel_reference(&channel_id);
+                }
+            }
+            SlackUriTarget::User(user_id) => {
+                self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
+            }
+            SlackUriTarget::File { file_id, action } => {
+                self.show_slack_file(&file_id, action == SlackFileAction::Share);
+            }
+            SlackUriTarget::App { app_id, .. } => {
+                if let Some(team_id) = uri.team_id() {
+                    self.open_external_link(&slack_app_web_fallback(team_id, &app_id));
+                }
+            }
+        }
+    }
+
     fn activate_pending_notification_target(&self) -> bool {
         let Some(target) = self.imp().pending_notification_target.borrow().clone() else {
             return false;
@@ -7877,6 +7984,11 @@ mod tests {
             (
                 RuntimeOperation::Files,
                 RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::Files,
+            ),
+            (
+                RuntimeOperation::Files,
+                RuntimeTarget::File("F123".to_string()),
                 RuntimeFailureRecovery::Files,
             ),
             (

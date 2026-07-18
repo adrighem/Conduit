@@ -637,6 +637,17 @@ impl SlackApi {
         Ok(response.files)
     }
 
+    pub async fn file(&self, file_id: &str) -> Result<SlackFile> {
+        let response: FileInfoResponse = self
+            .post_form("files.info", &Self::file_info_params(file_id))
+            .await?;
+        Ok(response.file)
+    }
+
+    fn file_info_params(file_id: &str) -> Vec<(&'static str, String)> {
+        vec![("file", file_id.to_string())]
+    }
+
     pub async fn user_display_name(&self, user_id: &str) -> Result<String> {
         Ok(self
             .user(user_id)
@@ -1733,6 +1744,14 @@ struct FilesListResponse {
 impl_slack_response!(FilesListResponse);
 
 #[derive(Debug, Deserialize)]
+struct FileInfoResponse {
+    ok: bool,
+    error: Option<String>,
+    file: SlackFile,
+}
+impl_slack_response!(FileInfoResponse);
+
+#[derive(Debug, Deserialize)]
 struct UserInfoResponse {
     ok: bool,
     error: Option<String>,
@@ -2426,5 +2445,28 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Browser User Agent")
         );
+    }
+
+    #[test]
+    fn file_info_request_targets_one_file() {
+        assert_eq!(
+            SlackApi::file_info_params("F123"),
+            vec![("file", "F123".to_string())]
+        );
+    }
+
+    #[test]
+    fn file_info_response_uses_the_existing_file_model() {
+        let response: FileInfoResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "file": {
+                "id": "F123",
+                "title": "Design"
+            }
+        }))
+        .expect("file info response should parse");
+
+        assert_eq!(response.file.id.as_deref(), Some("F123"));
+        assert_eq!(response.file.display_title(), "Design");
     }
 }

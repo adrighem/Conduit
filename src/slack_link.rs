@@ -31,6 +31,12 @@ pub enum SlackUriTarget {
     },
 }
 
+impl SlackUriTarget {
+    fn needs_ready_workspace(&self) -> bool {
+        !matches!(self, Self::Open | Self::App { .. })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlackAppTab {
     Home,
@@ -50,6 +56,43 @@ pub enum SlackUriParseError {
     Invalid,
     #[error("unsupported external URI")]
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlackUriResolution {
+    Wait,
+    Open,
+    RejectWorkspace,
+}
+
+pub fn resolve_slack_uri(
+    current_team_id: Option<&str>,
+    workspace_ready: bool,
+    uri: &SlackUri,
+) -> SlackUriResolution {
+    if let Some(target_team_id) = uri.team_id() {
+        match current_team_id {
+            None => return SlackUriResolution::Wait,
+            Some(current_team_id) if current_team_id != target_team_id => {
+                return SlackUriResolution::RejectWorkspace;
+            }
+            Some(_) => {}
+        }
+    }
+    if uri.target().needs_ready_workspace() && !workspace_ready {
+        SlackUriResolution::Wait
+    } else {
+        SlackUriResolution::Open
+    }
+}
+
+pub fn slack_app_web_fallback(team_id: &str, app_id: &str) -> String {
+    let mut url = url::Url::parse("https://slack.com/app_redirect")
+        .expect("Slack app redirect base URL should be valid");
+    url.query_pairs_mut()
+        .append_pair("app", app_id)
+        .append_pair("team", team_id);
+    url.into()
 }
 
 pub fn parse_slack_uri(value: &str) -> Result<SlackUri, SlackUriParseError> {
@@ -350,6 +393,52 @@ mod tests {
         assert_eq!(
             parse_slack_uri(&oversized),
             Err(SlackUriParseError::Invalid)
+        );
+    }
+
+    #[test]
+    fn resolution_waits_for_workspace_and_rejects_the_wrong_team() {
+        let channel = parse("slack://channel?team=T123&id=C456");
+
+        assert_eq!(
+            resolve_slack_uri(None, false, &channel),
+            SlackUriResolution::Wait
+        );
+        assert_eq!(
+            resolve_slack_uri(Some("T123"), false, &channel),
+            SlackUriResolution::Wait
+        );
+        assert_eq!(
+            resolve_slack_uri(Some("T999"), true, &channel),
+            SlackUriResolution::RejectWorkspace
+        );
+        assert_eq!(
+            resolve_slack_uri(Some("T123"), true, &channel),
+            SlackUriResolution::Open
+        );
+    }
+
+    #[test]
+    fn open_and_app_targets_do_not_wait_for_conversation_loading() {
+        assert_eq!(
+            resolve_slack_uri(None, false, &parse("slack://open")),
+            SlackUriResolution::Open
+        );
+        assert_eq!(
+            resolve_slack_uri(Some("T123"), false, &parse("slack://app?team=T123&id=A456")),
+            SlackUriResolution::Open
+        );
+        assert_eq!(
+            resolve_slack_uri(None, false, &parse("slack://app?team=T123&id=A456")),
+            SlackUriResolution::Wait
+        );
+    }
+
+    #[test]
+    fn app_fallback_uses_https_and_preserves_validated_ids() {
+        assert_eq!(
+            slack_app_web_fallback("T123", "A456"),
+            "https://slack.com/app_redirect?app=A456&team=T123"
         );
     }
 }

@@ -106,6 +106,10 @@ pub enum RuntimeCommand {
         query: String,
     },
     LoadFiles,
+    LoadFile {
+        file_id: String,
+        share_requested: bool,
+    },
     LoadSavedItems,
     LoadUser {
         user_id: String,
@@ -224,6 +228,7 @@ pub enum RuntimeTarget {
         thread_ts: String,
     },
     User(String),
+    File(String),
     Image(String),
     Media(String),
     Attachment(String),
@@ -283,6 +288,7 @@ fn runtime_target_for_trace(target: &RuntimeTarget) -> String {
             thread_ts,
         } => format!("thread:{channel_id}:{thread_ts}"),
         RuntimeTarget::User(user_id) => format!("user:{user_id}"),
+        RuntimeTarget::File(file_id) => format!("file:{file_id}"),
         RuntimeTarget::Image(key) => format!("image:{}", crate::debug::url_for_log(key)),
         RuntimeTarget::Media(url) => format!("media:{}", crate::debug::url_for_log(url)),
         RuntimeTarget::Attachment(url) => {
@@ -450,6 +456,13 @@ impl RuntimeCommand {
             ),
             Self::LoadFiles => RuntimeCommandDescriptor::navigation(
                 workspace(RuntimeOperation::Files),
+                NavigationSlot::Main,
+            ),
+            Self::LoadFile { file_id, .. } => RuntimeCommandDescriptor::navigation(
+                OperationContext::new(
+                    RuntimeOperation::Files,
+                    RuntimeTarget::File(file_id.clone()),
+                ),
                 NavigationSlot::Main,
             ),
             Self::LoadSavedItems => RuntimeCommandDescriptor::navigation(
@@ -737,6 +750,10 @@ pub enum RuntimeEventKind {
     },
     SearchLoaded(Vec<SearchMatch>),
     FilesLoaded(Vec<SlackFile>),
+    FileLoaded {
+        file: SlackFile,
+        share_requested: bool,
+    },
     SavedItemsLoaded(Vec<SavedItem>),
     UserLoaded {
         user_id: String,
@@ -873,6 +890,10 @@ impl RuntimeEventKind {
             Self::FilesLoaded(_) => {
                 OperationContext::new(RuntimeOperation::Files, RuntimeTarget::Workspace)
             }
+            Self::FileLoaded { file, .. } => OperationContext::new(
+                RuntimeOperation::Files,
+                RuntimeTarget::File(file.id.clone().unwrap_or_default()),
+            ),
             Self::SavedItemsLoaded(_) => {
                 OperationContext::new(RuntimeOperation::SavedItems, RuntimeTarget::Workspace)
             }
@@ -2649,6 +2670,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context
                 .events
                 .send_event(RuntimeEventKind::FilesLoaded(files));
+        }
+        RuntimeCommand::LoadFile {
+            file_id,
+            share_requested,
+        } => {
+            let api = require_slack(context.slack)?;
+            let file = api.file(&file_id).await?;
+            context.events.send_event(RuntimeEventKind::FileLoaded {
+                file,
+                share_requested,
+            });
         }
         RuntimeCommand::LoadSavedItems => {
             let api = require_slack(context.slack)?;
@@ -5097,6 +5129,17 @@ mod tests {
                 RuntimeTarget::User("U123".to_string()),
             )
         );
+        assert_eq!(
+            RuntimeCommand::LoadFile {
+                file_id: "F123".to_string(),
+                share_requested: false,
+            }
+            .operation_context(),
+            OperationContext::new(
+                RuntimeOperation::Files,
+                RuntimeTarget::File("F123".to_string()),
+            )
+        );
 
         let channel_context = RuntimeCommand::LoadMessageContext(
             SearchMessageLocation::new("C123", "1710000000.000100", None).unwrap(),
@@ -5139,6 +5182,14 @@ mod tests {
         assert_eq!(main_navigation.lane, RuntimeTaskLane::Navigation);
         assert_eq!(main_navigation.navigation_slot, Some(NavigationSlot::Main));
         assert!(main_navigation.supersedes_previous);
+
+        let file_navigation = RuntimeCommand::LoadFile {
+            file_id: "F123".to_string(),
+            share_requested: false,
+        }
+        .descriptor();
+        assert_eq!(file_navigation.lane, RuntimeTaskLane::Navigation);
+        assert_eq!(file_navigation.navigation_slot, Some(NavigationSlot::Main));
 
         let background = RuntimeCommand::DiscoverConversations.descriptor();
         assert_eq!(background.lane, RuntimeTaskLane::Background);
@@ -5225,6 +5276,21 @@ mod tests {
             OperationContext::new(
                 RuntimeOperation::History,
                 RuntimeTarget::Channel("C123".to_string()),
+            )
+        );
+
+        let event = RuntimeEventKind::FileLoaded {
+            file: SlackFile {
+                id: Some("F123".to_string()),
+                ..Default::default()
+            },
+            share_requested: false,
+        };
+        assert_eq!(
+            event.operation_context(&fallback),
+            OperationContext::new(
+                RuntimeOperation::Files,
+                RuntimeTarget::File("F123".to_string()),
             )
         );
 
