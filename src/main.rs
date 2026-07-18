@@ -38,6 +38,7 @@ mod shortcuts;
 mod sidebar;
 mod sidebar_widgets;
 mod slack;
+mod slack_link;
 mod socket_mode;
 mod store;
 mod thread_catalog;
