@@ -1,0 +1,8 @@
+{
+  "track_id": "external_slack_links_20260718",
+  "type": "feature",
+  "status": "in_progress",
+  "created_at": "2026-07-18T08:06:15Z",
+  "updated_at": "2026-07-18T08:06:15Z",
+  "description": "Open supported external Slack links in Conduit through secure desktop URI handling and a scoped Firefox/Chromium browser handoff."
+}

@@ -41,3 +41,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [x] Track: Runtime architecture hardening
 *Link: [./conductor/tracks/runtime_architecture_20260716/](./conductor/tracks/runtime_architecture_20260716/)*
+
+---
+
+## [~] Track: External Slack link integration
+*Link: [./conductor/tracks/external_slack_links_20260718/](./conductor/tracks/external_slack_links_20260718/)*
