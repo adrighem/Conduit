@@ -44,7 +44,7 @@ use crate::emoji::{
     EmojiPickerModel, EmojiPickerMove, EmojiValue,
 };
 use crate::huddles::fallback::external_huddle_url;
-use crate::huddles::presentation::{present_huddle, HuddlePrimaryAction};
+use crate::huddles::presentation::{present_huddle, HuddlePresentation, HuddlePrimaryAction};
 use crate::huddles::state::{
     HuddleCommand, HuddleDevice, HuddleDeviceKind, HuddleEvent, HuddlePhase,
     HuddleScreenShareState, HuddleSnapshot,
@@ -308,36 +308,42 @@ mod imp {
             obj.setup_settings();
             obj.setup_callbacks();
             if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
+                let huddle_test = std::env::var_os("CONDUIT_TEST_HUDDLE").is_some();
+                let test_channel_id = if huddle_test { "CTEST" } else { "C_TEST" };
                 obj.show_workspace(AuthInfo {
                     team: Some("Test Workspace".to_string()),
-                    team_id: Some("TTEST".to_string()),
-                    user_id: Some("UTEST".to_string()),
+                    team_id: huddle_test.then(|| "TTEST".to_string()),
+                    user_id: huddle_test.then(|| "UTEST".to_string()),
                     ..AuthInfo::default()
                 });
                 obj.populate_conversations(vec![SlackConversation {
-                    id: "C_TEST".to_string(),
+                    id: test_channel_id.to_string(),
                     name: Some("general".to_string()),
                     is_channel: Some(true),
                     ..SlackConversation::default()
                 }]);
-                obj.select_conversation("C_TEST", "#general");
-                if std::env::var_os("CONDUIT_TEST_HUDDLE").is_some() {
+                obj.select_conversation(test_channel_id, "#general");
+                if huddle_test {
+                    let huddle = crate::huddles::model::ActiveHuddle {
+                        team_id: "TTEST".to_string(),
+                        channel_id: test_channel_id.to_string(),
+                        call_id: "RTEST".to_string(),
+                        name: Some("Test huddle".to_string()),
+                        participant_ids: vec!["UTEST".to_string()],
+                        started_at: None,
+                        huddle_link: None,
+                    };
                     obj.handle_huddle_event(HuddleEvent::Snapshot(HuddleSnapshot {
                         phase: HuddlePhase::Discovered,
-                        huddle: Some(crate::huddles::model::ActiveHuddle {
-                            team_id: "TTEST".to_string(),
-                            channel_id: "C_TEST".to_string(),
-                            call_id: "RTEST".to_string(),
-                            name: Some("Test huddle".to_string()),
-                            participant_ids: vec!["UTEST".to_string()],
-                            started_at: None,
-                            huddle_link: None,
-                        }),
+                        huddle: Some(huddle.clone()),
                         participants: vec![crate::huddles::state::HuddleParticipant::from_user_id(
                             "UTEST".to_string(),
                         )],
                         ..Default::default()
                     }));
+                    if std::env::var_os("CONDUIT_TEST_HUDDLE_EXTERNAL_URI_FILE").is_some() {
+                        obj.handle_huddle_event(HuddleEvent::OpenExternalRequested(huddle));
+                    }
                 }
                 if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
                     obj.imp().thread_split.set_show_sidebar(true);
@@ -4756,6 +4762,10 @@ impl ConduitWindow {
     }
 
     fn open_external_link(&self, uri: &str) {
+        if let Some(path) = std::env::var_os("CONDUIT_TEST_HUDDLE_EXTERNAL_URI_FILE") {
+            let _ = std::fs::write(path, uri);
+            return;
+        }
         if let Err(error) = open::that(uri) {
             self.set_status(&format!("Failed to open link: {error}"));
         }
@@ -7090,6 +7100,7 @@ impl ConduitWindow {
         let snapshot = imp.huddle_snapshot.borrow().clone();
         let presentation = present_huddle(&snapshot, self.visible_channel_id().as_deref());
         imp.huddle_revealer.set_reveal_child(presentation.visible);
+        record_test_huddle_surface(&presentation);
         if !presentation.visible {
             return;
         }
@@ -8069,6 +8080,23 @@ fn set_huddle_button_state(button: &gtk::Button, icon_name: &str, label: &str) {
     button.set_icon_name(icon_name);
     button.set_tooltip_text(Some(label));
     button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
+fn record_test_huddle_surface(presentation: &HuddlePresentation) {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_HUDDLE_UI_FILE") else {
+        return;
+    };
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({
+            "visible": presentation.visible,
+            "title": presentation.title,
+            "primary_label": presentation.primary_label,
+            "camera_enabled": presentation.camera_enabled,
+            "screen_share_active": presentation.screen_share_active,
+        })
+        .to_string(),
+    );
 }
 
 fn huddle_device_row(label: &str, dropdown: &gtk::DropDown) -> gtk::Box {

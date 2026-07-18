@@ -50,6 +50,12 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Internal image and video viewer with galleries, zoom, fullscreen, context actions, and Save As.
 - Unsupported Slack attachments download through authenticated, size-bounded local caching and open in the system's default application; old cache entries are evicted automatically.
 
+### Huddles
+
+- Active huddles are discovered from supported Slack conversation and presence data and shown only in the matching workspace and conversation.
+- A camera-off preflight shows the available media choices without starting capture, and privacy-safe desktop notifications open the matching conversation.
+- Until a verified Slack/Amazon Chime join bridge is available, Conduit opens the exact huddle in Slack over HTTPS. The optional native media stack is a generic WebRTC engine and synthetic harness, not a production Slack join implementation.
+
 ### Sync and resilience
 
 - Network and cache work runs away from the GTK UI thread, with short connection, request, and Socket Mode liveness deadlines.
@@ -69,7 +75,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Slack's public API cannot enumerate every historical subscribed thread. Conduit retains and reconciles every thread it discovers, but a fresh installation builds its thread catalog progressively as history and replies are fetched.
 - Threads and Unreads reflect the conversations and activity Conduit has observed; they are not complete Slack-wide activity aggregators.
 - File and workspace-search views currently load a bounded result set rather than every page.
-- Rich composer formatting, autocomplete beyond emoji, message editing/deletion controls, typing indicators, live presence, avatars, calls, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
+- Rich composer formatting, autocomplete beyond emoji, message editing/deletion controls, typing indicators, general live presence, avatars, native production huddle joining, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
 - The Flatpak manifest is intended for development; Conduit is not yet published on Flathub and does not currently provide official binary releases.
 - Signing out removes the stored credential and clears the active-workspace selection, but it does not currently purge cached workspace data or saved drafts from local storage.
 
@@ -105,9 +111,11 @@ Useful Rust-only checks while developing:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
+
+Native huddle media is optional. It requires GStreamer 1.24 or newer; portal-based screen sharing additionally uses PipeWire and `xdg-desktop-portal`. See [Slack huddles](docs/huddles.md) for Debian packages, Meson feature flags, the synthetic test command, privacy guarantees, and the current Slack/Amazon Chime interoperability boundary.
 
 ## Open Slack links with Conduit
 
@@ -221,6 +229,7 @@ Debug output can contain private workspace metadata such as channel names, user 
 - OAuth tokens, imported browser-session credentials, and Socket Mode app tokens are stored through the system Secret Service/keyring.
 - Workspace metadata, resolved names and statuses, emoji information, and message and thread history are stored in `state/state.sqlite3` below Conduit's XDG cache directory. Downloaded attachments, image/media data, and WebKit data are cached in sibling directories. None has additional application-level encryption.
 - Drafts and preferences are stored through GSettings.
+- Huddle media, portal sessions, SDP, ICE candidates, and TURN credentials are ephemeral and are not stored in Conduit's cache or settings.
 - **Sign Out** removes the keyring credential and deactivates the workspace for desktop search. It does not currently erase cached workspace content or drafts, and credential environment variables remain available for re-import.
 - Authenticated preview, media, and attachment downloads accept only trusted Slack HTTPS URLs and enforce size bounds. Conduit also restricts message navigation to supported internal actions and HTTP(S) links and disables file-URL access and several unused WebKit capabilities. This is not a claim of a formal security audit.
 
@@ -233,6 +242,7 @@ Never share tokens, cookies, private messages, or unredacted debug logs. See [SE
 - If credentials cannot be stored, confirm that a Secret Service-compatible keyring is installed and unlocked.
 - If realtime updates are absent, verify Socket Mode, event subscriptions, and the `xapp-` token. Core Web API workflows remain available without Socket Mode.
 - If a `slack://` link opens another client, check `xdg-mime query default x-scheme-handler/slack`, install Conduit's desktop entry, and select it as described above. Browser external-protocol prompts may need separate approval.
+- If huddle discovery is available but native joining is not, use **Open in Slack**. This is the expected safe fallback until Conduit has both a verified Slack bootstrap adapter and a compatible Amazon Chime bridge.
 - Use `--debug-auth` for OAuth problems and `--debug` for wider diagnostics, then redact output before sharing it.
 
 ## Project direction

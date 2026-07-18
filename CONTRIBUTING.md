@@ -25,9 +25,31 @@ Rust-only checks are also useful while iterating:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
+
+### Native Huddle Development
+
+The default build intentionally excludes native media dependencies. Changes to huddle media or screen sharing must also pass the full feature matrix:
+
+```sh
+meson setup _build-huddles \
+  -Dnative_media=enabled \
+  -Dscreen_share=enabled
+meson compile -C _build-huddles
+meson test -C _build-huddles --print-errorlogs
+
+cargo clippy --locked --all-targets \
+  --features native-media,screen-share,huddle-harness \
+  -- -D warnings
+cargo test --locked \
+  --features native-media,screen-share,huddle-harness
+```
+
+Automated media tests must use synthetic sources, fake sinks, and fake portal adapters. They must not require Slack credentials, private endpoints, a desktop chooser, or access to the developer's microphone, camera, or screen. Never put raw huddle payloads, SDP, ICE candidates, TURN credentials, browser-session values, or captured media in fixtures or diagnostics.
+
+See [Slack huddles](docs/huddles.md) for Debian dependencies and the boundary between supported discovery, the generic media harness, and production Slack/Amazon Chime joining.
 
 Running the app expects the compiled GResource from the Meson build or an installed build.
 
@@ -56,8 +78,8 @@ Before opening a pull request, run:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 meson compile -C _build
 meson test -C _build
 ```

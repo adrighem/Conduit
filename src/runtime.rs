@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::ErrorKind;
@@ -2368,10 +2368,23 @@ struct ChannelHistoryPrefetchCandidate {
     title: String,
 }
 
+#[cfg(test)]
 fn channel_history_prefetch_candidates(conversations: &[SlackConversation]) -> Vec<String> {
+    channel_history_prefetch_candidates_with_huddles(conversations, &HashSet::new())
+}
+
+fn channel_history_prefetch_candidates_with_huddles(
+    conversations: &[SlackConversation],
+    current_huddle_channels: &HashSet<String>,
+) -> Vec<String> {
     let mut candidates = conversations
         .iter()
-        .filter_map(channel_history_prefetch_candidate)
+        .filter_map(|conversation| {
+            channel_history_prefetch_candidate(
+                conversation,
+                current_huddle_channels.contains(&conversation.id),
+            )
+        })
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
@@ -2435,6 +2448,7 @@ fn conversation_unread_refresh_candidates(conversations: &[SlackConversation]) -
 
 fn channel_history_prefetch_candidate(
     conversation: &SlackConversation,
+    current_huddle: bool,
 ) -> Option<ChannelHistoryPrefetchCandidate> {
     if conversation.is_archived.unwrap_or(false) {
         return None;
@@ -2445,16 +2459,18 @@ fn channel_history_prefetch_candidate(
         || conversation.is_private.unwrap_or(false)
         || conversation.is_im.unwrap_or(false)
         || conversation.is_mpim.unwrap_or(false);
+    let huddle_metadata = current_huddle || conversation.has_huddle_metadata();
     if !is_channel
         || ((conversation.is_im.unwrap_or(false) || conversation.is_mpim.unwrap_or(false))
-            && !conversation.has_unread_activity())
+            && !conversation.has_unread_activity()
+            && !huddle_metadata)
     {
         return None;
     }
 
     Some(ChannelHistoryPrefetchCandidate {
         id: conversation.id.clone(),
-        huddle_metadata: conversation.has_huddle_metadata(),
+        huddle_metadata,
         unread: conversation.has_unread_activity(),
         direct_message: conversation.is_im.unwrap_or(false)
             || conversation.is_mpim.unwrap_or(false),
@@ -3654,6 +3670,11 @@ async fn load_conversations_best_effort_with_api(
 ) -> Result<()> {
     match load_conversations_with_api(events, api, workspace_store).await {
         Ok(conversations) => {
+            let current_huddle_channels = conversations
+                .iter()
+                .filter(|conversation| conversation.has_huddle_metadata())
+                .map(|conversation| conversation.id.clone())
+                .collect::<HashSet<_>>();
             let unread_refresh_candidates = conversation_unread_refresh_candidates(&conversations);
             refresh_conversation_unread_states_best_effort(
                 events,
@@ -3682,6 +3703,7 @@ async fn load_conversations_best_effort_with_api(
                 api,
                 workspace_store,
                 &refreshed_conversations,
+                &current_huddle_channels,
                 team_id,
                 huddles,
             )
@@ -3836,6 +3858,7 @@ async fn prefetch_channel_histories_best_effort(
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     conversations: &[SlackConversation],
+    current_huddle_channels: &HashSet<String>,
     team_id: Option<&str>,
     huddles: &HuddleActorHandle,
 ) {
@@ -3843,7 +3866,8 @@ async fn prefetch_channel_histories_best_effort(
         return;
     };
 
-    let channel_ids = channel_history_prefetch_candidates(conversations);
+    let channel_ids =
+        channel_history_prefetch_candidates_with_huddles(conversations, current_huddle_channels);
     if channel_ids.is_empty() {
         return;
     }
@@ -6022,6 +6046,22 @@ mod tests {
 
         assert_eq!(candidates.first().map(String::as_str), Some("C-huddle"));
         assert!(candidates.contains(&"C-huddle".to_string()));
+    }
+
+    #[test]
+    fn channel_history_prefetch_keeps_current_huddles_after_cache_redaction() {
+        let conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
+            .map(|index| channel(&format!("C{index}"), (index + 10) as u64, None))
+            .chain([channel("C-huddle", 0, None)])
+            .collect::<Vec<_>>();
+        let current_huddle_channels = HashSet::from(["C-huddle".to_string()]);
+
+        let candidates = channel_history_prefetch_candidates_with_huddles(
+            &conversations,
+            &current_huddle_channels,
+        );
+
+        assert_eq!(candidates.first().map(String::as_str), Some("C-huddle"));
     }
 
     #[test]

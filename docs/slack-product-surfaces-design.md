@@ -4,7 +4,9 @@
 
 Most Slack product surfaces should not be implemented natively in Conduit.
 
-Canvases, lists, workflows, huddles, clips, and similar surfaces are large Slack products with their own permissions, collaboration models, editors, realtime behavior, and enterprise policy. A lightweight GNOME desktop client should expose references to those surfaces clearly and open Slack for advanced interaction.
+Canvases, lists, workflows, clips, and similar surfaces are large Slack products with their own permissions, collaboration models, editors, realtime behavior, and enterprise policy. A lightweight GNOME desktop client should expose references to those surfaces clearly and open Slack for advanced interaction.
+
+Huddles use a narrower hybrid boundary. Conduit can safely provide supported discovery, presence, preflight, notifications, native media infrastructure, and an exact external handoff. Production participation remains external until both Slack's unpublished bootstrap and the Amazon Chime bridge are verified compatible.
 
 ## Current Slice
 
@@ -20,6 +22,8 @@ This helps messages that contain workflow buttons, canvas/list links, or other S
 
 Conduit should natively render references and summaries when Slack includes them in messages. It should not natively create, edit, administer, or run advanced Slack product surfaces.
 
+For huddles, Conduit may render supported active-room metadata and maintain a generic, capability-gated media engine. That engine and its synthetic harness are not evidence of Slack huddle interoperability. See [Slack huddles](huddles.md) for the current boundary.
+
 ## Deferred
 
 The following remains out of scope unless Slack provides stable lightweight APIs that fit Conduit:
@@ -27,7 +31,7 @@ The following remains out of scope unless Slack provides stable lightweight APIs
 - Native canvas editor.
 - Native list/project-management UI.
 - Native workflow builder.
-- Native huddle audio/video/screen sharing.
+- Starting huddles or enabling native production participation without verified Slack and Amazon Chime adapters.
 - Slack AI authoring, recaps, or summaries.
 - Admin-only Slack Connect or product-surface policy management.
 
@@ -38,3 +42,4 @@ The implementation should keep unit coverage for:
 - Block Kit action URL rendering.
 - Existing non-URL action labels.
 - External link safety checks.
+- Huddle discovery scoping, capability gating, and exact HTTPS fallback construction.

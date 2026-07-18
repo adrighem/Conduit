@@ -10,12 +10,39 @@ gnome.compile_resources('conduit',
 
 cargo_bin  = find_program('cargo')
 cargo_release_arg = ''
+cargo_features = []
 cargo_env  = [
   'CARGO_HOME=' + meson.project_build_root()  / 'cargo-home',
   'CONDUIT_LOCALEDIR=' + get_option('prefix') / get_option('localedir'),
   'CONDUIT_PKGDATADIR=' + pkgdatadir,
   'CONDUIT_SLACK_CLIENT_ID=' + get_option('slack_client_id'),
 ]
+
+native_media_option = get_option('native_media')
+native_media_dependencies = [
+  dependency('gstreamer-1.0', version: '>= 1.24', required: native_media_option),
+  dependency('gstreamer-sdp-1.0', version: '>= 1.24', required: native_media_option),
+  dependency('gstreamer-webrtc-1.0', version: '>= 1.24', required: native_media_option),
+]
+native_media_enabled = native_media_dependencies[0].found() and \
+                       native_media_dependencies[1].found() and \
+                       native_media_dependencies[2].found()
+
+if native_media_enabled
+  cargo_features += ['native-media']
+endif
+
+screen_share_option = get_option('screen_share')
+if screen_share_option.enabled() and not native_media_enabled
+  error('screen_share requires native_media and its GStreamer dependencies')
+endif
+
+screen_share_enabled = native_media_enabled and not screen_share_option.disabled()
+if screen_share_enabled
+  cargo_features += ['screen-share']
+endif
+
+cargo_features_arg = ','.join(cargo_features)
 
 if get_option('buildtype') == 'release'
   cargo_release_arg = '--release'
@@ -34,7 +61,7 @@ cargo_build = custom_target(
   install_dir: get_option('bindir'),
   command: [
     'bash', '-c',
-    'release_arg="$7"; if [[ -n "$release_arg" ]]; then env "$1" "$2" "$3" "$4" "$5" build --manifest-path "$6" --target-dir "$8" "$release_arg"; else env "$1" "$2" "$3" "$4" "$5" build --manifest-path "$6" --target-dir "$8"; fi && cp "$8/$9/${10}" "${11}"',
+    'args=(build --locked --manifest-path "$6" --target-dir "$9"); [[ -n "$7" ]] && args+=("$7"); [[ -n "$8" ]] && args+=(--features "$8"); env "$1" "$2" "$3" "$4" "$5" "${args[@]}" && cp "$9/${10}/${11}" "${12}"',
     'cargo-build',
     cargo_env[0],
     cargo_env[1],
@@ -43,6 +70,7 @@ cargo_build = custom_target(
     cargo_bin.full_path(),
     meson.project_source_root() / 'Cargo.toml',
     cargo_release_arg,
+    cargo_features_arg,
     meson.project_build_root() / 'src',
     rust_target,
     meson.project_name(),
@@ -50,13 +78,19 @@ cargo_build = custom_target(
   ]
 )
 
+cargo_test_args = [
+  'test',
+  '--locked',
+  '--manifest-path', meson.project_source_root() / 'Cargo.toml',
+  '--target-dir', meson.project_build_root() / 'src',
+]
+if cargo_features_arg != ''
+  cargo_test_args += ['--features', cargo_features_arg]
+endif
+
 test('Cargo tests',
   cargo_bin,
-  args: [
-    'test',
-    '--manifest-path', meson.project_source_root() / 'Cargo.toml',
-    '--target-dir', meson.project_build_root() / 'src',
-  ],
+  args: cargo_test_args,
   env: cargo_env,
   timeout: 300,
   depends: cargo_build,

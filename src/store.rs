@@ -1143,11 +1143,12 @@ fn sync_state_items(
 fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String), String>> {
     let mut items = HashMap::new();
     for conversation in &state.conversations {
+        let conversation = conversation_for_cache(conversation);
         insert_state_item(
             &mut items,
             "conversation",
             conversation.id.clone(),
-            conversation,
+            &conversation,
         )?;
     }
     for (key, value) in &state.user_names {
@@ -1186,6 +1187,22 @@ fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String),
         insert_state_item(&mut items, "custom_emoji", key.clone(), value)?;
     }
     Ok(items)
+}
+
+fn conversation_for_cache(conversation: &SlackConversation) -> SlackConversation {
+    let mut cached = conversation.clone();
+    let remove_empty_properties = cached
+        .extra
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+        .is_some_and(|properties| {
+            properties.remove("huddles");
+            properties.is_empty()
+        });
+    if remove_empty_properties {
+        cached.extra.remove("properties");
+    }
+    cached
 }
 
 fn insert_state_item<T: Serialize + ?Sized>(
@@ -1483,6 +1500,63 @@ mod tests {
                 store.load_custom_emojis().await.expect("emoji load failed"),
                 emojis
             );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_does_not_persist_ephemeral_huddle_metadata() {
+        let directory = temp_cache_dir("workspace-huddle-privacy");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+
+        runtime().block_on(async {
+            let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+                "id": "C123",
+                "name": "general",
+                "properties": {
+                    "huddles": {
+                        "id": "R_PRIVATE",
+                        "participants": ["U_PRIVATE"]
+                    },
+                    "canvas": { "enabled": true }
+                }
+            }))
+            .unwrap();
+            assert!(conversation.has_huddle_metadata());
+
+            store
+                .store_conversations(&[conversation])
+                .await
+                .expect("conversation store failed");
+
+            let cached = store
+                .load_conversations()
+                .await
+                .expect("conversation load failed")
+                .expect("missing cached conversation");
+            assert!(!cached[0].has_huddle_metadata());
+            assert_eq!(
+                cached[0]
+                    .extra
+                    .get("properties")
+                    .and_then(|value| value.get("canvas"))
+                    .and_then(|value| value.get("enabled"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+
+            let connection = Connection::open(store.database_path()).unwrap();
+            let payload: String = connection
+                .query_row(
+                    "SELECT payload_json FROM workspace_items
+                     WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = 'C123'",
+                    [&store.workspace_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!payload.contains("R_PRIVATE"));
+            assert!(!payload.contains("U_PRIVATE"));
         });
 
         let _ = std::fs::remove_dir_all(directory);

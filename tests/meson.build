@@ -63,6 +63,30 @@ if xvfb_run.found() and xfwm4.found()
     depends: [cargo_build],
     timeout: 90,
   )
+
+  if xdotool.found()
+    test(
+      'Huddle UI smoke',
+      python,
+      args: [
+        files('run_headless.py'),
+        files('test_huddle_ui.py'),
+      ],
+      env: [
+        'CONDUIT_TEST_BINARY=' + meson.project_build_root() / 'src' / meson.project_name(),
+        'CONDUIT_TEST_RESOURCE=' + meson.project_build_root() / 'src' / 'conduit.gresource',
+        'CONDUIT_TEST_SCHEMA=' + meson.project_source_root() / 'data' / 'eu.vanadrighem.conduit.gschema.xml',
+        'GSETTINGS_BACKEND=memory',
+        'GDK_DEBUG=no-portals',
+        'GDK_BACKEND=x11',
+        'GSK_RENDERER=cairo',
+        'GTK_A11Y=none',
+        'XDG_SESSION_TYPE=x11',
+      ],
+      depends: [cargo_build],
+      timeout: 90,
+    )
+  endif
 endif
 
 if xvfb_run.found() and xdotool.found() and xclip.found() and xfwm4.found()

@@ -27,11 +27,20 @@ jobs:
             gettext \
             libadwaita-1-dev \
             libdbus-1-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer1.0-dev \
             libgtk-4-dev \
             libwebkitgtk-6.0-dev \
             meson \
             ninja-build \
             pkg-config \
+            gstreamer1.0-libav \
+            gstreamer1.0-nice \
+            gstreamer1.0-pipewire \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
             xclip \
             xdotool \
             xfwm4 \
@@ -41,13 +50,25 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Lint native huddle stack
+        run: cargo clippy --locked --all-targets --features native-media,screen-share,huddle-harness -- -D warnings
+
+      - name: Test native huddle stack
+        run: cargo test --locked --features native-media,screen-share,huddle-harness
 
       - name: Meson build
         run: |
           meson setup _build
           meson compile -C _build
           meson test -C _build --print-errorlogs
+
+      - name: Meson native huddle build
+        run: |
+          meson setup _build-huddles -Dnative_media=enabled -Dscreen_share=enabled
+          meson compile -C _build-huddles
+          meson test -C _build-huddles --print-errorlogs

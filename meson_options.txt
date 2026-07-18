@@ -4,3 +4,17 @@ option(
   value: '',
   description: 'Slack OAuth client ID for packaged builds',
 )
+
+option(
+  'native_media',
+  type: 'feature',
+  value: 'disabled',
+  description: 'Build the optional GStreamer WebRTC huddle media engine',
+)
+
+option(
+  'screen_share',
+  type: 'feature',
+  value: 'disabled',
+  description: 'Build portal-based huddle screen sharing (requires native_media)',
+)
