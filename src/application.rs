@@ -415,12 +415,24 @@ impl ConduitApplication {
             .build();
         realtime_group.add(&realtime_row);
 
+        let sign_out_row = adw::ActionRow::builder()
+            .title("Sign out")
+            .subtitle("Remove the stored Slack session from this device.")
+            .build();
+        let sign_out_button = gtk::Button::with_label("Sign out");
+        sign_out_button.add_css_class("destructive-action");
+        sign_out_button.set_valign(gtk::Align::Center);
+        sign_out_row.add_suffix(&sign_out_button);
+        let account_group = adw::PreferencesGroup::builder().title("Account").build();
+        account_group.add(&sign_out_row);
+
         let page = adw::PreferencesPage::builder()
             .title("Preferences")
             .icon_name("view-list-symbolic")
             .build();
         page.add(&sidebar_group);
         page.add(&realtime_group);
+        page.add(&account_group);
 
         let dialog = adw::PreferencesDialog::builder()
             .title("Preferences")
@@ -439,6 +451,16 @@ impl ConduitApplication {
                     ));
                 }
                 Err(error) => dialog.add_toast(adw::Toast::new(&error.to_string())),
+            }
+        });
+        let weak_dialog = dialog.downgrade();
+        let weak_window = window.downgrade();
+        sign_out_button.connect_clicked(move |_| {
+            if let Some(dialog) = weak_dialog.upgrade() {
+                dialog.close();
+            }
+            if let Some(window) = weak_window.upgrade() {
+                let _ = window.activate_action("win.sign-out", None);
             }
         });
         dialog.add(&page);

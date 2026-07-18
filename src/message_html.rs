@@ -19,6 +19,7 @@ const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
     pub user_names: HashMap<String, String>,
+    pub user_full_names: HashMap<String, String>,
     pub user_avatar_urls: HashMap<String, String>,
     pub conversation_titles: HashMap<String, String>,
     pub user_statuses: HashMap<String, SlackUserStatus>,
@@ -564,19 +565,45 @@ fn author_actions_script() -> &'static str {
     });
   }
 
+  function closeMentionMenus(except) {
+    document.querySelectorAll(".mention-actions > button[aria-expanded='true']").forEach(function (button) {
+      if (button === except) return;
+      button.setAttribute("aria-expanded", "false");
+      button.nextElementSibling.hidden = true;
+    });
+  }
+
   document.addEventListener("click", function (event) {
-    const menu = event.target.closest("details.author-actions");
-    if (!menu) closeAuthorMenus(null);
+    const mention = event.target.closest(".mention-actions > button");
+    if (mention) {
+      const opening = mention.getAttribute("aria-expanded") !== "true";
+      closeAuthorMenus(null);
+      closeMentionMenus(mention);
+      mention.setAttribute("aria-expanded", opening ? "true" : "false");
+      mention.nextElementSibling.hidden = !opening;
+      return;
+    }
+    const author = event.target.closest("details.author-actions");
+    if (!author) closeAuthorMenus(null);
+    if (!event.target.closest(".mention-actions")) closeMentionMenus(null);
   });
 
   document.addEventListener("keydown", function (event) {
     if (event.key !== "Escape" && event.key !== "Esc") return;
-    const menu = document.querySelector("details.author-actions[open]");
-    if (!menu) return;
+    const authorMenu = document.querySelector("details.author-actions[open]");
+    const mention = document.querySelector(".mention-actions > button[aria-expanded='true']");
+    if (!authorMenu && !mention) return;
     event.preventDefault();
-    menu.open = false;
-    const author = menu.querySelector("summary");
-    if (author) author.focus();
+    if (authorMenu) {
+      authorMenu.open = false;
+      const author = authorMenu.querySelector("summary");
+      if (author) author.focus();
+    }
+    if (mention) {
+      mention.setAttribute("aria-expanded", "false");
+      mention.nextElementSibling.hidden = true;
+      mention.focus();
+    }
   }, true);
 })();"#
 }
@@ -987,7 +1014,8 @@ fn html_document_with_language(
     language: &str,
 ) -> String {
     let has_message_actions = body.contains("class=\"quick-actions\"");
-    let has_author_actions = body.contains("class=\"author-actions\"");
+    let has_author_actions =
+        body.contains("class=\"author-actions\"") || body.contains("class=\"mention-actions\"");
     let scripts = [
         script.filter(|script| !script.trim().is_empty()),
         has_message_actions.then_some(emoji_picker_script()),
@@ -1187,7 +1215,8 @@ a:hover {{
   gap: 8px;
 }}
 
-.author-actions {{
+.author-actions,
+.mention-actions {{
   position: relative;
   display: inline-block;
 }}
@@ -1236,6 +1265,17 @@ a:hover {{
 .author-menu a:hover {{
   background: var(--soft);
   text-decoration: none;
+}}
+
+.mention-actions > button {{
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}}
+
+.mention-actions > .author-menu[hidden] {{
+  display: none;
 }}
 
 .message-part {{
@@ -1329,6 +1369,10 @@ pre code {{
   padding-inline: 4px;
   border-radius: 4px;
   background: var(--accent-soft);
+  font-weight: 700;
+}}
+
+.channel-reference {{
   font-weight: 700;
 }}
 
@@ -2482,6 +2526,21 @@ fn author_identity_html(message: &SlackMessage, author: &str, status: &str) -> S
     )
 }
 
+fn mention_actions_html(user_id: &str, name: &str, tooltip: &str) -> String {
+    let label = format!("@{name}");
+    format!(
+        "<span class=\"mention-actions\"><button type=\"button\" class=\"mention\" title=\"{}\" data-mention-user-id=\"{}\" aria-haspopup=\"menu\" aria-expanded=\"false\">{}</button><span class=\"author-menu\" role=\"menu\" aria-label=\"{}\" hidden><a href=\"{}\">{}</a><a href=\"{}\">{}</a></span></span>",
+        escape_html(tooltip),
+        escape_html(user_id),
+        escape_html(&label),
+        escape_html(&gettext("Person actions")),
+        escape_html(&user_message_action_url(user_id)),
+        escape_html(&gettext("Message")),
+        escape_html(&user_profile_action_url(user_id)),
+        escape_html(&gettext("Profile")),
+    )
+}
+
 fn message_part_html(
     channel_id: Option<&str>,
     message: &SlackMessage,
@@ -3504,6 +3563,10 @@ pub fn user_message_action_url(user_id: &str) -> String {
     format!("conduit://user-message?user={}", encode_query(user_id))
 }
 
+pub fn channel_action_url(channel_id: &str) -> String {
+    format!("conduit://channel?channel={}", encode_query(channel_id))
+}
+
 pub fn user_profile_action_url(user_id: &str) -> String {
     format!("conduit://user-profile?user={}", encode_query(user_id))
 }
@@ -3657,6 +3720,12 @@ fn render_inline(text: &str, context: &MessageHtmlContext) -> String {
             continue;
         }
 
+        if let Some((html, consumed)) = render_bare_channel_reference(rest, context) {
+            output.push_str(&html);
+            rest = &rest[consumed..];
+            continue;
+        }
+
         if let Some((html, consumed)) = render_emoji_shortcode(rest, context) {
             output.push_str(&html);
             rest = &rest[consumed..];
@@ -3706,19 +3775,26 @@ fn render_slack_entity(text: &str, context: &MessageHtmlContext) -> Option<(Stri
             .get(user_id)
             .cloned()
             .unwrap_or_else(|| user_id.to_string());
-        format!(
-            "<span class=\"mention\" data-mention-user-id=\"{}\">@{}</span>",
-            escape_html(user_id),
-            escape_html(&name)
-        )
+        let tooltip = context
+            .user_full_names
+            .get(user_id)
+            .map(String::as_str)
+            .unwrap_or(&name);
+        mention_actions_html(user_id, &name, tooltip)
     } else if raw.starts_with("!subteam^") {
         user_group_mention_html(raw, context)
     } else if let Some(channel) = raw.strip_prefix('#') {
-        let display = channel
+        let (channel_id, fallback) = channel
             .split_once('|')
-            .map(|(_, label)| format!("#{label}"))
-            .unwrap_or_else(|| format!("#{channel}"));
-        escape_html(&display)
+            .map_or((channel, None), |(channel_id, label)| {
+                (channel_id, Some(label))
+            });
+        let display = context
+            .conversation_titles
+            .get(channel_id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", fallback.unwrap_or(channel_id)));
+        channel_reference_html(channel_id, &display)
     } else if let Some((url, label)) = raw.split_once('|') {
         if is_http_url(url) {
             external_link_html(url, label)
@@ -3734,6 +3810,31 @@ fn render_slack_entity(text: &str, context: &MessageHtmlContext) -> Option<(Stri
     };
 
     Some((rendered, end + 1))
+}
+
+fn render_bare_channel_reference(
+    text: &str,
+    context: &MessageHtmlContext,
+) -> Option<(String, usize)> {
+    let candidate = text.strip_prefix('#')?;
+    let id_length = candidate
+        .bytes()
+        .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        .count();
+    if id_length == 0 {
+        return None;
+    }
+    let channel_id = &candidate[..id_length];
+    let title = context.conversation_titles.get(channel_id)?;
+    Some((channel_reference_html(channel_id, title), id_length + 1))
+}
+
+fn channel_reference_html(channel_id: &str, label: &str) -> String {
+    format!(
+        "<a class=\"channel-reference\" href=\"{}\">{}</a>",
+        escape_html(&channel_action_url(channel_id)),
+        escape_html(label)
+    )
 }
 
 fn user_group_mention_html(raw: &str, context: &MessageHtmlContext) -> String {
@@ -4233,6 +4334,14 @@ mod tests {
     fn resolves_mentions_channels_and_slack_links() {
         let context = MessageHtmlContext {
             user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
+            user_full_names: HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]),
+            conversation_titles: HashMap::from([
+                ("C999".to_string(), "#general-renamed".to_string()),
+                (
+                    "C0BHX4E4TRT".to_string(),
+                    "#warroom-servinform-data-breach".to_string(),
+                ),
+            ]),
             current_user_id: None,
             ..Default::default()
         };
@@ -4244,10 +4353,23 @@ mod tests {
             &context,
         );
 
-        assert!(html.contains("<span class=\"mention\" data-mention-user-id=\"U123\">@Ada</span>"));
-        assert!(html.contains("#general"));
+        assert!(html.contains(
+            "<button type=\"button\" class=\"mention\" title=\"Ada Lovelace\" data-mention-user-id=\"U123\" aria-haspopup=\"menu\" aria-expanded=\"false\">@Ada</button>"
+        ));
+        assert!(html.contains("conduit://user-message?user=U123"));
+        assert!(html.contains("conduit://user-profile?user=U123"));
+        assert!(html.contains("href=\"conduit://channel?channel=C999\">#general-renamed</a>"));
         assert!(html.contains("href=\"https://example.com\""));
         assert!(html.contains(">docs</a>"));
+
+        assert_eq!(
+            mrkdwn_to_html("FYI we are here\n#C0BHX4E4TRT", &context),
+            "FYI we are here<br><a class=\"channel-reference\" href=\"conduit://channel?channel=C0BHX4E4TRT\">#warroom-servinform-data-breach</a>"
+        );
+        assert_eq!(
+            mrkdwn_to_html("`#C0BHX4E4TRT` ```#C0BHX4E4TRT```", &context),
+            "<code>#C0BHX4E4TRT</code> <pre><code>#C0BHX4E4TRT</code></pre>"
+        );
     }
 
     #[test]

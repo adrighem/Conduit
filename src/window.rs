@@ -134,6 +134,8 @@ mod imp {
         #[template_child]
         pub message_title: TemplateChild<adw::WindowTitle>,
         #[template_child]
+        pub navigation_back_button: TemplateChild<gtk::Button>,
+        #[template_child]
         pub message_pane: TemplateChild<gtk::Box>,
         #[template_child]
         pub message_view_box: TemplateChild<gtk::Box>,
@@ -220,6 +222,9 @@ mod imp {
         pub(super) sidebar_rows: RefCell<HashMap<SidebarItemKey, gtk::ListBoxRow>>,
         pub(super) sidebar_filter_generation: Cell<u64>,
         pub(super) picker_filter_generation: Cell<u64>,
+        pub(super) navigation_history: RefCell<Vec<MainNavigationTarget>>,
+        pub(super) restoring_navigation: Cell<bool>,
+        pub(super) profile_visible: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -576,6 +581,17 @@ fn picker_sections_empty(sections: &ConversationPickerSections) -> bool {
     )
 }
 
+fn valid_channel_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.len() <= 80
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_')
+        })
+}
+
 fn media_gallery_items(messages: &[SlackMessage]) -> Vec<MediaGalleryItem> {
     messages
         .iter()
@@ -631,6 +647,32 @@ enum WorkspaceNavigationSelection {
     Threads,
     Files,
     Saved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MainNavigationTarget {
+    Conversation(String),
+    Unreads,
+    Threads,
+    Search,
+    Files,
+    Saved,
+}
+
+const MAX_NAVIGATION_HISTORY: usize = 100;
+
+fn remember_navigation(
+    history: &mut Vec<MainNavigationTarget>,
+    current: MainNavigationTarget,
+    target: &MainNavigationTarget,
+) {
+    if &current == target || history.last() == Some(&current) {
+        return;
+    }
+    history.push(current);
+    if history.len() > MAX_NAVIGATION_HISTORY {
+        history.remove(0);
+    }
 }
 
 fn workspace_navigation_selection(
@@ -2721,6 +2763,9 @@ impl ConduitWindow {
         self.add_window_action("switch-conversation", |window| {
             window.show_conversation_switcher()
         });
+        self.add_window_action("new-message", |window| window.show_new_message_picker());
+        self.add_window_action("new-channel", |window| window.show_new_channel_dialog());
+        self.add_window_action("go-back", |window| window.go_back());
         self.add_window_action("search-workspace", |window| window.focus_workspace_search());
         self.add_window_action("show-messages", |window| window.show_messages());
         self.add_window_action("show-unreads", |window| window.show_unreads());
@@ -3159,6 +3204,16 @@ impl ConduitWindow {
                     .insert(channel_id.clone());
                 self.sync_conversations_from_catalog();
                 self.select_conversation(&channel_id, &title);
+            }
+            RuntimeEventKind::ConversationUpdated(conversation) => {
+                self.imp()
+                    .workspace
+                    .conversations
+                    .borrow_mut()
+                    .upsert_metadata(conversation);
+                self.sync_conversations_from_catalog();
+                self.refresh_current_conversation_title();
+                self.set_status(&gettext("People added"));
             }
             RuntimeEventKind::ConversationLeft { channel_id } => {
                 self.apply_conversation_left(&channel_id);
@@ -3761,6 +3816,77 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::RefreshConversations);
     }
 
+    fn current_navigation_target(&self) -> Option<MainNavigationTarget> {
+        let view = self.imp().workspace.view.borrow();
+        match view.main_view() {
+            MainMessageView::Conversation => view
+                .visible_channel_id()
+                .map(|channel_id| MainNavigationTarget::Conversation(channel_id.to_string())),
+            MainMessageView::Unreads => Some(MainNavigationTarget::Unreads),
+            MainMessageView::Threads => Some(MainNavigationTarget::Threads),
+            MainMessageView::Search => Some(MainNavigationTarget::Search),
+            MainMessageView::Files => Some(MainNavigationTarget::Files),
+            MainMessageView::Saved => Some(MainNavigationTarget::Saved),
+            MainMessageView::Placeholder => None,
+        }
+    }
+
+    fn record_navigation(&self, target: &MainNavigationTarget) {
+        let imp = self.imp();
+        imp.profile_visible.set(false);
+        if imp.restoring_navigation.get() {
+            return;
+        }
+        let Some(current) = self.current_navigation_target() else {
+            return;
+        };
+        let mut history = imp.navigation_history.borrow_mut();
+        remember_navigation(&mut history, current, target);
+        drop(history);
+        self.sync_back_button();
+    }
+
+    fn sync_back_button(&self) {
+        let imp = self.imp();
+        imp.navigation_back_button.set_sensitive(
+            imp.profile_visible.get() || !imp.navigation_history.borrow().is_empty(),
+        );
+    }
+
+    fn go_back(&self) {
+        let imp = self.imp();
+        if imp.profile_visible.replace(false) {
+            imp.pending_profile_user_id.borrow_mut().take();
+            self.queue_ui_invalidations(UiInvalidations::MAIN);
+            self.sync_back_button();
+            return;
+        }
+        let Some(target) = imp.navigation_history.borrow_mut().pop() else {
+            self.sync_back_button();
+            return;
+        };
+        imp.restoring_navigation.set(true);
+        match target {
+            MainNavigationTarget::Conversation(channel_id) => {
+                let title = self.conversation_title(&channel_id);
+                self.select_conversation(&channel_id, &title);
+            }
+            MainNavigationTarget::Unreads => self.show_unreads(),
+            MainNavigationTarget::Threads => self.show_threads(),
+            MainNavigationTarget::Search => {
+                imp.workspace.view.borrow_mut().show_search();
+                self.render_closed_thread();
+                self.render_conversations();
+                self.rerender_current_main_messages();
+                imp.workspace_split.set_show_content(true);
+            }
+            MainNavigationTarget::Files => self.show_files(),
+            MainNavigationTarget::Saved => self.show_later(),
+        }
+        imp.restoring_navigation.set(false);
+        self.sync_back_button();
+    }
+
     fn show_messages(&self) {
         self.flush_current_drafts();
         if let Some(channel_id) = self.selected_channel_id() {
@@ -3778,6 +3904,7 @@ impl ConduitWindow {
     }
 
     fn show_unreads(&self) {
+        self.record_navigation(&MainNavigationTarget::Unreads);
         self.flush_current_drafts();
         self.imp().workspace.view.borrow_mut().show_unreads();
         self.render_closed_thread();
@@ -3787,6 +3914,7 @@ impl ConduitWindow {
     }
 
     fn show_threads(&self) {
+        self.record_navigation(&MainNavigationTarget::Threads);
         self.flush_current_drafts();
         self.imp().workspace.view.borrow_mut().show_threads();
         self.render_closed_thread();
@@ -3795,6 +3923,7 @@ impl ConduitWindow {
     }
 
     fn show_files(&self) {
+        self.record_navigation(&MainNavigationTarget::Files);
         self.flush_current_drafts();
         let title = gettext("Files");
         self.imp().workspace.view.borrow_mut().start_files();
@@ -3810,6 +3939,7 @@ impl ConduitWindow {
     }
 
     fn show_later(&self) {
+        self.record_navigation(&MainNavigationTarget::Saved);
         self.flush_current_drafts();
         let title = gettext("Later");
         self.imp().workspace.view.borrow_mut().start_saved();
@@ -3830,6 +3960,7 @@ impl ConduitWindow {
             self.set_status("Enter a message search query");
             return;
         }
+        self.record_navigation(&MainNavigationTarget::Search);
         self.flush_current_drafts();
         self.imp().workspace.view.borrow_mut().start_search();
         let title = gettext("Search results");
@@ -4310,6 +4441,12 @@ impl ConduitWindow {
                 }
                 true
             }
+            Some("channel") => {
+                if let Some(channel_id) = query_param(url, "channel") {
+                    self.open_channel_reference(&channel_id);
+                }
+                true
+            }
             Some("user-message") => {
                 if let Some(user_id) = query_param(url, "user") {
                     self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
@@ -4318,6 +4455,8 @@ impl ConduitWindow {
             }
             Some("user-profile") => {
                 if let Some(user_id) = query_param(url, "user") {
+                    self.imp().profile_visible.set(true);
+                    self.sync_back_button();
                     *self.imp().pending_profile_user_id.borrow_mut() = Some(user_id.clone());
                     self.imp().message_title.set_title(&gettext("Profile"));
                     self.load_message_html(&message_html::placeholder_document(
@@ -4329,8 +4468,10 @@ impl ConduitWindow {
                 true
             }
             Some("profile-close") => {
+                self.imp().profile_visible.set(false);
                 self.imp().pending_profile_user_id.borrow_mut().take();
                 self.queue_ui_invalidations(UiInvalidations::MAIN);
+                self.sync_back_button();
                 true
             }
             Some("message") => {
@@ -4664,6 +4805,10 @@ impl ConduitWindow {
         self.close_media_viewer();
         let imp = self.imp();
         imp.workspace.reset();
+        imp.navigation_history.borrow_mut().clear();
+        imp.restoring_navigation.set(false);
+        imp.profile_visible.set(false);
+        self.sync_back_button();
         *imp.current_user_id.borrow_mut() = None;
         *imp.workspace_id.borrow_mut() = None;
         imp.workspace_ready.set(false);
@@ -5141,7 +5286,9 @@ impl ConduitWindow {
             changed
         };
         if changed {
-            self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::PICKER);
+            self.queue_ui_invalidations(
+                UiInvalidations::MAIN | UiInvalidations::SIDEBAR | UiInvalidations::PICKER,
+            );
         }
     }
 
@@ -5531,6 +5678,20 @@ impl ConduitWindow {
                 .borrow()
                 .get(&channel_id)
                 .cloned();
+            if let Some(conversation) = conversation.as_ref() {
+                let add_people_button = gtk::Button::with_label(&gettext("Add people"));
+                add_people_button.add_css_class("flat");
+                let conversation = conversation.clone();
+                let weak_window = window.downgrade();
+                let popover_for_people = popover.clone();
+                add_people_button.connect_clicked(move |_| {
+                    popover_for_people.popdown();
+                    if let Some(window) = weak_window.upgrade() {
+                        window.show_add_people_picker(&conversation);
+                    }
+                });
+                menu.append(&add_people_button);
+            }
             if let Some(conversation) = conversation.filter(sidebar_conversation_can_leave) {
                 let leave_button = gtk::Button::with_label(&gettext("Leave channel"));
                 leave_button.add_css_class("flat");
@@ -5789,6 +5950,193 @@ impl ConduitWindow {
                 }
             },
         );
+    }
+
+    fn show_new_message_picker(&self) {
+        self.show_people_picker(
+            "New message",
+            "Start conversation",
+            &[],
+            |window, user_ids| {
+                if user_ids.len() == 1 {
+                    window.send_command(RuntimeCommand::OpenDirectMessage {
+                        user_id: user_ids[0].clone(),
+                    });
+                } else {
+                    window.send_command(RuntimeCommand::OpenGroupDirectMessage { user_ids });
+                }
+            },
+        );
+    }
+
+    fn show_add_people_picker(&self, conversation: &SlackConversation) {
+        let excluded = conversation.display_user_ids();
+        let conversation = conversation.clone();
+        self.show_people_picker(
+            "Add people",
+            "Add",
+            &excluded,
+            move |window, mut user_ids| {
+                if conversation.is_im.unwrap_or(false) || conversation.is_mpim.unwrap_or(false) {
+                    user_ids.extend(conversation.display_user_ids());
+                    user_ids.sort();
+                    user_ids.dedup();
+                    window.send_command(RuntimeCommand::OpenGroupDirectMessage { user_ids });
+                } else {
+                    window.send_command(RuntimeCommand::InviteToChannel {
+                        channel_id: conversation.id.clone(),
+                        user_ids,
+                    });
+                }
+            },
+        );
+    }
+
+    fn show_people_picker<F>(
+        &self,
+        title: &str,
+        confirm_label: &str,
+        excluded_user_ids: &[String],
+        on_submit: F,
+    ) where
+        F: Fn(&Self, Vec<String>) + 'static,
+    {
+        let excluded = excluded_user_ids.iter().collect::<HashSet<_>>();
+        let current_user_id = self.imp().current_user_id.borrow().clone();
+        let mut people = self
+            .imp()
+            .discovered_users
+            .borrow()
+            .iter()
+            .filter(|user| !user.deleted.unwrap_or(false) && !user.is_bot.unwrap_or(false))
+            .filter_map(|user| {
+                let id = user.id.as_ref()?.trim();
+                let name = user.direct_message_name()?;
+                (!id.is_empty()
+                    && Some(id) != current_user_id.as_deref()
+                    && !excluded.contains(&id.to_string()))
+                .then(|| (id.to_string(), name))
+            })
+            .collect::<Vec<_>>();
+        people.sort_by_key(|(_, name)| name.to_lowercase());
+        if people.is_empty() {
+            self.set_status(&gettext("No people available"));
+            return;
+        }
+
+        let dialog = gtk::Window::builder()
+            .title(title)
+            .transient_for(self)
+            .modal(true)
+            .default_width(480)
+            .default_height(560)
+            .build();
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        container.set_margin_top(12);
+        container.set_margin_bottom(12);
+        container.set_margin_start(12);
+        container.set_margin_end(12);
+        dialog.set_child(Some(&container));
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some(&gettext("Search people")));
+        container.append(&search);
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        let rows = people
+            .into_iter()
+            .map(|(id, name)| {
+                let check = gtk::CheckButton::with_label(&name);
+                check.set_margin_top(6);
+                check.set_margin_bottom(6);
+                check.set_margin_start(9);
+                check.set_margin_end(9);
+                let row = gtk::ListBoxRow::new();
+                row.set_child(Some(&check));
+                list.append(&row);
+                (id, name.to_lowercase(), check, row)
+            })
+            .collect::<Vec<_>>();
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_vexpand(true);
+        scroller.set_child(Some(&list));
+        container.append(&scroller);
+        let confirm = gtk::Button::with_label(confirm_label);
+        confirm.add_css_class("suggested-action");
+        confirm.set_sensitive(false);
+        container.append(&confirm);
+        let rows = Rc::new(rows);
+        for (_, _, check, _) in rows.iter() {
+            let rows = rows.clone();
+            let confirm = confirm.clone();
+            check.connect_toggled(move |_| {
+                confirm.set_sensitive(rows.iter().any(|(_, _, check, _)| check.is_active()));
+            });
+        }
+        let rows_for_search = rows.clone();
+        search.connect_search_changed(move |search| {
+            let query = search.text().trim().to_lowercase();
+            for (_, name, _, row) in rows_for_search.iter() {
+                row.set_visible(query.is_empty() || name.contains(&query));
+            }
+        });
+        let weak_window = self.downgrade();
+        let dialog_for_submit = dialog.clone();
+        let on_submit = Rc::new(on_submit);
+        confirm.connect_clicked(move |_| {
+            let user_ids = rows
+                .iter()
+                .filter(|(_, _, check, _)| check.is_active())
+                .map(|(id, _, _, _)| id.clone())
+                .collect::<Vec<_>>();
+            if let Some(window) = weak_window.upgrade() {
+                on_submit(&window, user_ids);
+                dialog_for_submit.close();
+            }
+        });
+        dialog.present();
+        search.grab_focus();
+    }
+
+    fn show_new_channel_dialog(&self) {
+        let dialog = gtk::Window::builder()
+            .title(gettext("New channel"))
+            .transient_for(self)
+            .modal(true)
+            .default_width(440)
+            .build();
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        container.set_margin_top(18);
+        container.set_margin_bottom(18);
+        container.set_margin_start(18);
+        container.set_margin_end(18);
+        dialog.set_child(Some(&container));
+        let name = gtk::Entry::new();
+        name.set_placeholder_text(Some(&gettext("channel-name")));
+        container.append(&name);
+        let private = gtk::CheckButton::with_label(&gettext("Private channel"));
+        container.append(&private);
+        let create = gtk::Button::with_label(&gettext("Create channel"));
+        create.add_css_class("suggested-action");
+        create.set_sensitive(false);
+        container.append(&create);
+        let create_for_name = create.clone();
+        name.connect_changed(move |name| {
+            create_for_name.set_sensitive(valid_channel_name(name.text().as_str()));
+        });
+        let weak_window = self.downgrade();
+        let dialog_for_create = dialog.clone();
+        let name_for_create = name.clone();
+        create.connect_clicked(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.send_command(RuntimeCommand::CreateChannel {
+                    name: name_for_create.text().trim().to_string(),
+                    is_private: private.is_active(),
+                });
+                dialog_for_create.close();
+            }
+        });
+        dialog.present();
+        name.grab_focus();
     }
 
     fn show_conversation_picker<F>(
@@ -6060,6 +6408,7 @@ impl ConduitWindow {
 
     fn sync_workspace_chrome(&self) {
         let imp = self.imp();
+        self.sync_back_button();
         let main_view = imp.workspace.view.borrow().main_view();
         let selection = workspace_navigation_selection(main_view);
         imp.messages_button
@@ -6083,6 +6432,7 @@ impl ConduitWindow {
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
+        self.record_navigation(&MainNavigationTarget::Conversation(channel_id.to_string()));
         self.flush_current_drafts();
         crate::debug::log(
             "ui",
@@ -6722,6 +7072,24 @@ impl ConduitWindow {
             .unwrap_or_else(|| "Slack".to_string())
     }
 
+    fn open_channel_reference(&self, channel_id: &str) {
+        if self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .is_some()
+        {
+            let title = self.conversation_title(channel_id);
+            self.select_conversation(channel_id, &title);
+        } else {
+            self.send_command(RuntimeCommand::JoinConversation {
+                channel_id: channel_id.to_string(),
+            });
+        }
+    }
+
     fn navigation_conversation_title(&self, channel_id: &str) -> String {
         let imp = self.imp();
         let user_names = imp.user_names.borrow();
@@ -6989,18 +7357,28 @@ impl ConduitWindow {
         let imp = self.imp();
         let user_names = imp.user_names.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
-        let conversation_titles = imp
-            .workspace
-            .conversations
+        let mut conversation_titles = imp
+            .discovered_channels
             .borrow()
-            .conversations()
-            .into_iter()
+            .iter()
             .map(|conversation| {
                 let title =
                     conversation.display_name_with_users(&user_names, current_user_id.as_deref());
-                (conversation.id, title)
+                (conversation.id.clone(), title)
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
+        conversation_titles.extend(
+            imp.workspace
+                .conversations
+                .borrow()
+                .conversations()
+                .into_iter()
+                .map(|conversation| {
+                    let title = conversation
+                        .display_name_with_users(&user_names, current_user_id.as_deref());
+                    (conversation.id, title)
+                }),
+        );
         let recent_reactions = imp
             .settings
             .borrow()
@@ -7010,6 +7388,7 @@ impl ConduitWindow {
             .unwrap_or_default();
         MessageHtmlContext {
             user_names,
+            user_full_names: imp.user_full_names.borrow().clone(),
             user_avatar_urls: imp.user_avatar_urls.borrow().clone(),
             conversation_titles,
             user_statuses: imp.user_statuses.borrow().clone(),
@@ -7090,6 +7469,49 @@ impl ConduitWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_history_keeps_distinct_bounded_visits() {
+        let mut history = Vec::new();
+        let unreads = MainNavigationTarget::Unreads;
+        remember_navigation(
+            &mut history,
+            MainNavigationTarget::Conversation("C1".into()),
+            &unreads,
+        );
+        remember_navigation(
+            &mut history,
+            MainNavigationTarget::Conversation("C1".into()),
+            &unreads,
+        );
+        assert_eq!(
+            history,
+            vec![MainNavigationTarget::Conversation("C1".into())]
+        );
+
+        for index in 0..=MAX_NAVIGATION_HISTORY {
+            remember_navigation(
+                &mut history,
+                MainNavigationTarget::Conversation(format!("C{index}")),
+                &unreads,
+            );
+        }
+        assert_eq!(history.len(), MAX_NAVIGATION_HISTORY);
+        assert_eq!(
+            history.last(),
+            Some(&MainNavigationTarget::Conversation("C100".into()))
+        );
+    }
+
+    #[test]
+    fn channel_names_follow_slack_creation_rules() {
+        assert!(valid_channel_name("project_alpha-2"));
+        assert!(valid_channel_name("  general  "));
+        assert!(!valid_channel_name(""));
+        assert!(!valid_channel_name("Project Alpha"));
+        assert!(!valid_channel_name("127.0.0.1"));
+        assert!(!valid_channel_name(&"a".repeat(81)));
+    }
 
     #[test]
     fn reaction_picker_escape_fallback_uses_the_shared_cancel_event() {
@@ -8263,6 +8685,10 @@ mod tests {
             "<property name=\"enable-show-gesture\">False</property>",
             "GtkLabel\" id=\"message_status_label",
             "<property name=\"accessible-role\">status</property>",
+            "GtkButton\" id=\"navigation_back_button",
+            "<property name=\"action-name\">win.go-back</property>",
+            "<attribute name=\"action\">win.new-message</attribute>",
+            "<attribute name=\"action\">win.new-channel</attribute>",
         ] {
             assert!(
                 template.contains(required),
@@ -8278,6 +8704,7 @@ mod tests {
         assert!(!template.contains("<property name=\"width-request\">460</property>"));
         assert!(!template.contains("<property name=\"width-request\">280</property>"));
         assert!(!template.contains("<property name=\"width-request\">220</property>"));
+        assert!(!template.contains("<attribute name=\"action\">win.sign-out</attribute>"));
     }
 
     #[test]

@@ -74,6 +74,17 @@ pub enum RuntimeCommand {
     OpenDirectMessage {
         user_id: String,
     },
+    OpenGroupDirectMessage {
+        user_ids: Vec<String>,
+    },
+    CreateChannel {
+        name: String,
+        is_private: bool,
+    },
+    InviteToChannel {
+        channel_id: String,
+        user_ids: Vec<String>,
+    },
     LoadHistory {
         channel_id: String,
     },
@@ -399,6 +410,16 @@ impl RuntimeCommand {
                 ),
                 RuntimeTaskLane::Interactive,
             ),
+            Self::OpenGroupDirectMessage { .. } | Self::CreateChannel { .. } => {
+                RuntimeCommandDescriptor::mutation(
+                    workspace(RuntimeOperation::OpenConversation),
+                    RuntimeTaskLane::Interactive,
+                )
+            }
+            Self::InviteToChannel { channel_id, .. } => RuntimeCommandDescriptor::mutation(
+                channel(RuntimeOperation::OpenConversation, channel_id),
+                RuntimeTaskLane::Interactive,
+            ),
             Self::LoadHistory { channel_id } => RuntimeCommandDescriptor::navigation(
                 channel(RuntimeOperation::History, channel_id),
                 NavigationSlot::Main,
@@ -590,6 +611,11 @@ impl RuntimeFailure {
     pub fn from_error(error: &anyhow::Error) -> Self {
         for source in error.chain() {
             if let Some(slack) = source.downcast_ref::<crate::slack::SlackError>() {
+                if slack.is_permission_denied() {
+                    return Self::validation(
+                        "Slack does not allow this action for this conversation.",
+                    );
+                }
                 return Self::from_slack_category(slack.category());
             }
             if let Some(store) = source.downcast_ref::<crate::store::StoreError>() {
@@ -668,6 +694,7 @@ pub enum RuntimeEventKind {
     ConversationChannelsDiscovered(Vec<SlackConversation>),
     ConversationPeopleDiscovered(Vec<SlackUser>),
     ConversationOpened(SlackConversation),
+    ConversationUpdated(SlackConversation),
     ConversationLeft {
         channel_id: String,
     },
@@ -799,10 +826,12 @@ impl RuntimeEventKind {
                     RuntimeTarget::Workspace,
                 )
             }
-            Self::ConversationOpened(conversation) => OperationContext::new(
-                RuntimeOperation::OpenConversation,
-                RuntimeTarget::Channel(conversation.id.clone()),
-            ),
+            Self::ConversationOpened(conversation) | Self::ConversationUpdated(conversation) => {
+                OperationContext::new(
+                    RuntimeOperation::OpenConversation,
+                    RuntimeTarget::Channel(conversation.id.clone()),
+                )
+            }
             Self::ConversationLeft { channel_id } => OperationContext::new(
                 RuntimeOperation::LeaveConversation,
                 RuntimeTarget::Channel(channel_id.clone()),
@@ -2448,6 +2477,47 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
+        }
+        RuntimeCommand::OpenGroupDirectMessage { user_ids } => {
+            let api = require_slack(context.slack)?;
+            context.events.send_status("Opening group DM");
+            let mut conversation = api.open_direct_message_with_users(&user_ids).await?;
+            if conversation.group_direct_message_user_ids().is_empty() {
+                conversation
+                    .extra
+                    .insert("users".to_string(), serde_json::json!(user_ids));
+            }
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.store_conversation(&conversation).await?;
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationOpened(conversation));
+        }
+        RuntimeCommand::CreateChannel { name, is_private } => {
+            let api = require_slack(context.slack)?;
+            context.events.send_status("Creating channel");
+            let conversation = api.create_channel(&name, is_private).await?;
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.store_conversation(&conversation).await?;
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationOpened(conversation));
+        }
+        RuntimeCommand::InviteToChannel {
+            channel_id,
+            user_ids,
+        } => {
+            let api = require_slack(context.slack)?;
+            context.events.send_status("Adding people");
+            let conversation = api.invite_to_channel(&channel_id, &user_ids).await?;
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.store_conversation(&conversation).await?;
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationUpdated(conversation));
         }
         RuntimeCommand::LoadHistory { channel_id } => {
             let api = require_slack(context.slack)?;
@@ -4219,15 +4289,25 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "secret cache path",
         )));
+        let permission = anyhow::Error::new(crate::slack::SlackError::Api {
+            method: "conversations.invite".to_string(),
+            code: "no_permission".to_string(),
+        });
 
         let auth = RuntimeFailure::from_error(&auth);
         let storage = RuntimeFailure::from_error(&storage);
+        let permission = RuntimeFailure::from_error(&permission);
 
         assert_eq!(auth.category, RuntimeFailureCategory::Authentication);
         assert_eq!(auth.message, "Slack authentication failed. Sign in again.");
         assert_eq!(storage.category, RuntimeFailureCategory::Storage);
         assert_eq!(storage.message, "Conduit could not access its local data.");
         assert!(!storage.message.contains("secret cache path"));
+        assert_eq!(permission.category, RuntimeFailureCategory::Validation);
+        assert_eq!(
+            permission.message,
+            "Slack does not allow this action for this conversation."
+        );
     }
 
     #[test]

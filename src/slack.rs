@@ -90,6 +90,25 @@ impl SlackError {
             Self::Other(error) => classify_wrapped_slack_error(error),
         }
     }
+
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(
+            self,
+            Self::Api { code, .. }
+                if matches!(
+                    code.as_str(),
+                    "access_denied"
+                        | "cant_invite"
+                        | "invitee_cant_see_channel"
+                        | "missing_scope"
+                        | "no_external_invite_permission"
+                        | "no_permission"
+                        | "not_in_channel"
+                        | "restricted_action"
+                        | "user_is_restricted"
+                )
+        )
+    }
 }
 
 fn slack_error_code_requires_authentication(code: &str) -> bool {
@@ -382,8 +401,43 @@ impl SlackApi {
     }
 
     pub async fn open_direct_message(&self, user_id: &str) -> Result<SlackConversation> {
+        self.open_direct_message_with_users(&[user_id.to_string()])
+            .await
+    }
+
+    pub async fn open_direct_message_with_users(
+        &self,
+        user_ids: &[String],
+    ) -> Result<SlackConversation> {
+        let users = conversation_user_ids_param(user_ids, 8)?;
         let response: ConversationOpenResponse = self
-            .post_form("conversations.open", &[("users", user_id.to_string())])
+            .post_form("conversations.open", &[("users", users)])
+            .await?;
+        Ok(response.channel)
+    }
+
+    pub async fn create_channel(&self, name: &str, is_private: bool) -> Result<SlackConversation> {
+        let params = channel_creation_params(name, is_private)?;
+        let response: ConversationJoinResponse =
+            self.post_form("conversations.create", &params).await?;
+        Ok(response.channel)
+    }
+
+    pub async fn invite_to_channel(
+        &self,
+        channel_id: &str,
+        user_ids: &[String],
+    ) -> Result<SlackConversation> {
+        let users = conversation_user_ids_param(user_ids, 100)?;
+        let response: ConversationJoinResponse = self
+            .post_form(
+                "conversations.invite",
+                &[
+                    ("channel", channel_id.to_string()),
+                    ("users", users),
+                    ("force", "true".to_string()),
+                ],
+            )
             .await?;
         Ok(response.channel)
     }
@@ -1084,6 +1138,45 @@ fn complete_upload_params(
     params
 }
 
+fn conversation_user_ids_param(user_ids: &[String], maximum: usize) -> Result<String> {
+    let mut user_ids = user_ids
+        .iter()
+        .map(|user_id| user_id.trim())
+        .filter(|user_id| !user_id.is_empty())
+        .collect::<Vec<_>>();
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    if user_ids.is_empty() {
+        return Err(SlackError::validation("select at least one person"));
+    }
+    if user_ids.len() > maximum {
+        return Err(SlackError::validation(format!(
+            "select no more than {maximum} people"
+        )));
+    }
+    Ok(user_ids.join(","))
+}
+
+fn channel_creation_params(name: &str, is_private: bool) -> Result<Vec<(&'static str, String)>> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > 80
+        || !name.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_')
+        })
+    {
+        return Err(SlackError::validation(
+            "channel names must use lowercase letters, numbers, hyphens, or underscores",
+        ));
+    }
+    Ok(vec![
+        ("name", name.to_string()),
+        ("is_private", is_private.to_string()),
+    ])
+}
+
 fn paginated_list_params(
     cursor: Option<&str>,
     include_channel_types: bool,
@@ -1747,6 +1840,30 @@ mod tests {
             SlackError::Other(source)
                 if source.downcast_ref::<std::io::Error>().is_some()
         ));
+    }
+
+    #[test]
+    fn conversation_mutation_params_validate_and_normalize_input() {
+        assert_eq!(
+            conversation_user_ids_param(
+                &[" U2 ".to_string(), "U1".to_string(), "U2".to_string()],
+                8,
+            )
+            .unwrap(),
+            "U1,U2"
+        );
+        assert!(conversation_user_ids_param(&[], 8).is_err());
+        let distinct = (0..9).map(|index| format!("U{index}")).collect::<Vec<_>>();
+        assert!(conversation_user_ids_param(&distinct, 8).is_err());
+        assert_eq!(
+            channel_creation_params("project_alpha-2", true).unwrap(),
+            vec![
+                ("name", "project_alpha-2".to_string()),
+                ("is_private", "true".to_string())
+            ]
+        );
+        assert!(channel_creation_params("Invalid channel", false).is_err());
+        assert!(channel_creation_params(&"a".repeat(81), false).is_err());
     }
 
     fn message(ts: &str) -> SlackMessage {
