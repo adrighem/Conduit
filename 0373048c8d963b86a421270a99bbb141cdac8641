@@ -1,0 +1,11 @@
+Task: Parse official Slack URI targets with TDD coverage
+
+Summary: Added a typed parser for open, channel, user, file, share-file, and app slack:// targets with strict identifier, authority, query, path, fragment, control-character, and size validation.
+
+Modified: src/slack_link.rs, src/main.rs
+
+Tests: cargo test slack_link::tests; cargo check
+
+Coverage: cargo-llvm-cov is not installed in this workspace.
+
+Rationale: Keep untrusted URI parsing pure and independently testable before adding GTK/GIO routing.
