@@ -1,0 +1,9 @@
+Task: Implement the isolated Slack/Chime capability boundary and deterministic synthetic session harness
+
+Summary: Added independent Slack bootstrap and Amazon Chime bridge capabilities, a two-gate join boundary, redacted zero-on-drop ephemeral credentials, production-safe unavailable adapters, runtime capability reporting, and a feature-testable synthetic lifecycle harness.
+
+Modified: Cargo.toml; src/huddles/signaling.rs; src/huddles/harness.rs; src/huddles/coordinator.rs; src/huddles/state.rs; src/huddles/mod.rs; src/runtime.rs
+
+Validation: cargo test --no-fail-fast passed 454 tests; cargo check --features huddle-harness passed without warnings; git diff --check passed.
+
+Rationale: Prevent unsupported private API or generic WebRTC claims while keeping the full lifecycle testable and ready for a future verified Slack bootstrap plus Chime bridge.
