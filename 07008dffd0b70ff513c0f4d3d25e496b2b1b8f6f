@@ -1,0 +1,7 @@
+Task: Define and document the secure URI and WebExtension architecture
+
+Summary: Added the external Slack link Conductor track, security and UX acceptance criteria, sequential implementation plan, and the approved GIO/WebExtension stack choices.
+
+Modified: conductor/tracks.md, conductor/tracks/external_slack_links_20260718/*, conductor/tech-stack.md
+
+Rationale: Establish the source of truth and document the new browser integration stack before implementation.
