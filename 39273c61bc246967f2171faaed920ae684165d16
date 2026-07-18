@@ -1,0 +1,7 @@
+Conductor Task 8: completed native huddle packaging, validation, privacy, and documentation.
+
+Implemented Meson feature switches for native media and screen sharing, default/full CI matrices, Flatpak PulseAudio permission and feature configuration, deterministic headless huddle UI plus exact HTTPS handoff coverage, ephemeral conversation huddle metadata cache redaction with runtime-only discovery priority, and Debian/Flatpak/privacy/release documentation.
+
+Validation: cargo fmt and diff checks passed; cargo test --locked passed 485 tests; full native-media,screen-share,huddle-harness suite passed 486 tests; default and full-feature Meson suites each passed 9/9 tests. Local cargo-clippy is unavailable; CI installs and runs strict clippy in both matrices.
+
+Decisions: media features remain opt-in for normal builds; production native Slack joining stays capability-gated until both private Slack bootstrap and Amazon Chime adapters are verified; external handoff uses only validated canonical HTTPS and never a generated slack:// huddle URI; raw huddle room metadata is not persisted.
