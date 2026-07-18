@@ -44,5 +44,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: External Slack link integration
+## [x] Track: External Slack link integration
 *Link: [./conductor/tracks/external_slack_links_20260718/](./conductor/tracks/external_slack_links_20260718/)*

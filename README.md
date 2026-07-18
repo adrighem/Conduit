@@ -46,6 +46,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Relevance-ranked multi-term results while retaining Slack's own result order for close matches.
 - Files and saved-item views with navigation back to their source messages.
 - Slack message permalinks for the connected workspace open directly inside Conduit.
+- Official `slack://` links can activate Conduit from the desktop or a browser and open channels, direct messages, and files in the connected workspace.
 - Internal image and video viewer with galleries, zoom, fullscreen, context actions, and Save As.
 - Unsupported Slack attachments download through authenticated, size-bounded local caching and open in the system's default application; old cache entries are evicted automatically.
 
@@ -107,6 +108,21 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+## Open Slack links with Conduit
+
+An installed Conduit desktop entry advertises support for Slack's official `slack://` scheme. Conduit does not change the current default handler during installation. To inspect the current choice and select Conduit explicitly:
+
+```sh
+xdg-mime query default x-scheme-handler/slack
+xdg-mime default eu.vanadrighem.conduit.desktop x-scheme-handler/slack
+```
+
+Save the first command's output if you may want to restore the previous handler later. Run the second command again with that desktop ID to restore it.
+
+Conduit accepts Slack's `open`, `channel`, `user`, `file`, `share-file`, and `app` URI forms. Channels, direct messages, and files use native Conduit surfaces. App links use Slack's HTTPS App Home fallback, and `share-file` opens the file but reports that sharing an existing file is not yet supported. Workspace-scoped links must match the currently connected Slack team; Conduit will not open a same-shaped target from another workspace.
+
+Firefox, Chromium, and other browsers normally show an external-protocol confirmation before handing a `slack://` URI to the selected desktop application. Conduit does not install a browser extension and does not claim `http` or `https`, so an ordinary Slack web link remains in the browser unless Slack itself turns it into a `slack://` request.
 
 ## Connect a Slack workspace
 
@@ -216,6 +232,7 @@ Never share tokens, cookies, private messages, or unredacted debug logs. See [SE
 - If a development build cannot find `conduit.gresource`, run it from the Meson build tree or set `CONDUIT_RESOURCE_PATH` to the generated resource bundle.
 - If credentials cannot be stored, confirm that a Secret Service-compatible keyring is installed and unlocked.
 - If realtime updates are absent, verify Socket Mode, event subscriptions, and the `xapp-` token. Core Web API workflows remain available without Socket Mode.
+- If a `slack://` link opens another client, check `xdg-mime query default x-scheme-handler/slack`, install Conduit's desktop entry, and select it as described above. Browser external-protocol prompts may need separate approval.
 - Use `--debug-auth` for OAuth problems and `--debug` for wider diagnostics, then redact output before sharing it.
 
 ## Project direction
