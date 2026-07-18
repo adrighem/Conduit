@@ -1,0 +1,9 @@
+Task: Run full regression validation and complete user documentation
+
+Summary: Documented explicit Slack handler selection, supported native targets, browser external-protocol behavior, HTTPS non-interception, workspace isolation, fallbacks, troubleshooting, and release checks; marked the Conductor track complete.
+
+Modified: README.md, conductor/product.md, docs/release-checklist.md, conductor/tracks.md, conductor/tracks/external_slack_links_20260718/metadata.json
+
+Tests: cargo fmt --all --check; cargo test (436 passed); Meson reconfigure and compile; meson test (8 passed, including desktop-file, AppStream, schema, URI activation, search-provider, and UI smoke validation). Strict Clippy could not run because cargo-clippy and clippy-driver are not installed in the system Rust toolchain.
+
+Rationale: Make the opt-in desktop/browser behavior and its deliberate HTTPS boundary clear before release.
