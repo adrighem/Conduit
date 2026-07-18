@@ -1,0 +1,7 @@
+Task: Revise the track to use only Slack's official custom URI scheme
+
+Summary: Removed the WebExtension and custom Conduit browser bridge from the architecture, plan, and acceptance criteria. The feature now handles only slack:// through GIO and XDG.
+
+Modified: conductor/tech-stack.md, conductor/tracks/external_slack_links_20260718/{spec.md,plan.md,metadata.json}
+
+Rationale: Follow the user's requested desktop-only integration and leave ordinary HTTPS navigation in the browser.
