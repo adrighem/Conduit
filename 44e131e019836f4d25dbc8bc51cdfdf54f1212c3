@@ -1,0 +1,27 @@
+Task: Implement user-initiated ScreenCast portal and PipeWire sharing
+
+Summary:
+- Added an ashpd 0.11.1 ScreenCast backend with explicit CreateSession, SelectSources, Start, OpenPipeWireRemote, Closed monitoring, cancellation, and close semantics.
+- Added restricted PipeWire FD/node attachment to the GStreamer video graph with teardown-before-session-close ordering.
+- Added requesting/active/failed screen-share coordinator states so capture is never shown active before portal/media success.
+- Extended the synthetic end-to-end harness through SDP/ICE, media controls, portal share start/stop, and teardown.
+
+Files:
+- Cargo.toml
+- Cargo.lock
+- src/huddles/coordinator.rs
+- src/huddles/harness.rs
+- src/huddles/media.rs
+- src/huddles/mod.rs
+- src/huddles/portal.rs
+- src/huddles/state.rs
+
+Validation:
+- cargo test --locked (468 passed)
+- cargo test --locked --features screen-share,huddle-harness (469 passed)
+- portal cancellation, invalid response, attach failure, and close-order tests passed
+
+Decisions:
+- Portal permission is requested only by an explicit StartScreenShare effect.
+- Exactly one nonzero portal node is accepted; no restore token is persisted.
+- The original portal FD remains owned by the lease while media holds a duplicate; media stops before session close and FD release.
