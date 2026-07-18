@@ -40,8 +40,7 @@
 - Generated message documents use semantic HTML, logical responsive CSS, locale-aware timestamps, RTL direction, and keyboard-focusable message targets.
 - Desktop notifications use stable workspace/user/channel IDs and typed application actions so activation can survive a cold start.
 
-## External Link Integration
-- GIO `Application::open`, command-line forwarding, and XDG desktop scheme handlers deliver `slack://` and dedicated `conduit-slack://` URIs to the existing single-instance GTK application.
-- A pure Rust parser validates Slack HTTPS and custom-scheme links before the GTK layer resolves them against the active workspace.
-- A Manifest V3 WebExtension with packaged JavaScript hands supported Slack HTTPS routes from Firefox and Chromium to `conduit-slack://`; it runs only on Slack hosts, reads no page content, and contains no remote code.
-- Node's built-in test runner validates the extension's route classification and handoff URL construction when Node is available; Meson keeps this test optional for build environments without Node.
+## External Slack URI Integration
+- GIO `Application::open`, command-line forwarding, and the XDG desktop scheme handler deliver `slack://` URIs to the existing single-instance GTK application.
+- A pure Rust parser validates official Slack custom-scheme links before the GTK layer resolves them against the active workspace.
+- Conduit does not claim HTTP or HTTPS and does not install a browser extension; normal Slack web links remain in the browser unless Slack explicitly invokes its custom scheme.
