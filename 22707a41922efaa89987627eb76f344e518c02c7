@@ -1,0 +1,9 @@
+Task: Add the huddle coordinator and runtime command/event contract with TDD coverage
+
+Summary: Added deterministic huddle lifecycle, control, device, roster, statistics, failure, reconnect, and external-handoff state; introduced runtime command/event descriptors and a session-scoped coordinator actor; routed realtime room and user presence observations into the actor.
+
+Modified: src/huddles/coordinator.rs; src/huddles/state.rs; src/huddles/mod.rs; src/runtime.rs; src/window.rs
+
+Validation: cargo test --no-fail-fast passed 450 tests; git diff --check passed.
+
+Rationale: Centralize lifecycle and privacy rules off GTK's main thread so signalling, media, portal, and UI integrations consume one consistent contract.
