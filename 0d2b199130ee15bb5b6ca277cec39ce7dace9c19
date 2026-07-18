@@ -1,0 +1,23 @@
+Task: Implement the GStreamer WebRTC media engine, devices, controls, and statistics
+
+Summary:
+- Added an optional GLib-compatible GStreamer 0.23 WebRTC engine with Opus/VP8 send and dynamic receive paths.
+- Added hashed GstDeviceMonitor inventory, selection/reconfiguration, mute/camera privacy controls, safe teardown, and bounded statistics conversion.
+- Added zeroed/redacted SDP and ICE values plus deterministic synthetic media coverage.
+
+Files:
+- Cargo.toml
+- Cargo.lock
+- src/huddles/mod.rs
+- src/huddles/devices.rs
+- src/huddles/media.rs
+
+Validation:
+- cargo test --locked (461 passed)
+- cargo test --locked --features native-media,huddle-harness (462 passed)
+- native synthetic GStreamer pipeline smoke test passed with camera disabled until explicit enable
+
+Decisions:
+- Generic WebRTC media remains capability-gated and is not claimed as Slack/Chime interoperability.
+- Camera sources are locked in NULL before PLAYING and return to NULL when disabled.
+- Device identifiers are SHA-256 scoped hashes; SDP/ICE are redacted and zeroed on drop.
