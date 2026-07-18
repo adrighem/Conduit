@@ -7,4 +7,4 @@
 - [x] Task: Implement the GStreamer WebRTC media engine, devices, controls, and statistics (0d2b199)
 - [x] Task: Implement user-initiated ScreenCast portal and PipeWire sharing (44e131e)
 - [x] Task: Build the adaptive huddle UI, preflight, notifications, and external Slack fallback (9c36309)
-- [~] Task: Run full regression validation and complete build, privacy, and user documentation
+- [x] Task: Run full regression validation and complete build, privacy, and user documentation (39273c6)

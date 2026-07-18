@@ -49,5 +49,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Native Slack huddles
+## [x] Track: Native Slack huddles
 *Link: [./conductor/tracks/native_huddles_20260718/](./conductor/tracks/native_huddles_20260718/)*
