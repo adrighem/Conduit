@@ -1,0 +1,7 @@
+Task: Record native huddle architecture, dependency, privacy, and packaging decisions
+
+Summary: Documented compatible GStreamer and ashpd versions, optional native-media packaging, portal privacy boundaries, official Slack discovery, Amazon Chime interoperability constraints, and safe external fallback.
+
+Modified: conductor/tech-stack.md; conductor/product-guidelines.md; conductor/tracks/native_huddles_20260718/spec.md; conductor/tracks/native_huddles_20260718/plan.md
+
+Rationale: Keep implementation honest and testable while isolating Slack private bootstrap and Chime signalling from the supported discovery and generic native media layers.
