@@ -1,0 +1,9 @@
+Task: Model official Slack huddle metadata and realtime presence with TDD coverage
+
+Summary: Added typed huddle room and user presence models, participant correlation, opaque conversation metadata detection, non-persistent private room payloads, user_huddle_changed events, raw browser RTM decoding, and huddle-thread notification suppression.
+
+Modified: src/huddles/model.rs; src/huddles/mod.rs; src/models.rs; src/socket_mode.rs; src/runtime.rs; src/window.rs; src/main.rs
+
+Validation: cargo test --no-fail-fast passed 444 tests. cargo clippy was unavailable because the Clippy component is not installed.
+
+Rationale: Use Slack's supported discovery contracts while keeping undocumented room details ephemeral and separating browser RTM from Socket Mode framing.
