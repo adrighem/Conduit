@@ -46,3 +46,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [x] Track: External Slack link integration
 *Link: [./conductor/tracks/external_slack_links_20260718/](./conductor/tracks/external_slack_links_20260718/)*
+
+---
+
+## [~] Track: Native Slack huddles
+*Link: [./conductor/tracks/native_huddles_20260718/](./conductor/tracks/native_huddles_20260718/)*
