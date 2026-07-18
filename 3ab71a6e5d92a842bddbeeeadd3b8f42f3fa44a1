@@ -1,0 +1,11 @@
+Task: Route typed link targets through native Conduit surfaces with TDD coverage
+
+Summary: Added workspace-safe pending Slack URI resolution, native channel and DM routing, exact files.info loading for file targets, safe HTTPS fallback for App Home, and clear share-file degradation.
+
+Modified: src/slack_link.rs, src/slack.rs, src/runtime.rs, src/window.rs
+
+Tests: cargo test (432 passed), targeted parser/runtime/window/file-info tests, cargo check
+
+Coverage: cargo-llvm-cov is not installed in this workspace.
+
+Rationale: Preserve single-workspace isolation and reuse Conduit's existing navigation/runtime boundaries.
