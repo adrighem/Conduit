@@ -6,7 +6,14 @@ use std::sync::{Arc, Mutex};
 use crate::huddles::coordinator::{
     CoordinatorInput, HuddleCoordinator, HuddleEffect, HuddleTransitionError,
 };
+use crate::huddles::media::{
+    IceCandidate, MediaDescription, MediaEngine, MediaError, MediaSessionConfig, MediaSinkMode,
+    MediaSourceMode, SyntheticMediaEngine,
+};
 use crate::huddles::model::ActiveHuddle;
+use crate::huddles::portal::{
+    request_screen_cast, PortalError, ScreenCastLease, SyntheticScreenCastBackend,
+};
 use crate::huddles::signaling::{
     ChimeBridgeCapability, ChimeMediaBridge, NativeJoinGate, SignalingError,
     SlackBootstrapCapability, SlackHuddleBootstrap, SlackJoinSession,
@@ -21,6 +28,10 @@ pub struct SyntheticHuddleTrace {
     pub bridge_disconnects: usize,
     pub control_updates: usize,
     pub reconnects: usize,
+    pub media_starts: usize,
+    pub media_stops: usize,
+    pub screen_share_starts: usize,
+    pub screen_share_stops: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +40,12 @@ pub enum SyntheticHarnessError {
     Transition(#[from] HuddleTransitionError),
     #[error(transparent)]
     Signaling(#[from] SignalingError),
+    #[error(transparent)]
+    Media(#[from] MediaError),
+    #[error(transparent)]
+    Portal(#[from] PortalError),
+    #[error(transparent)]
+    Runtime(#[from] std::io::Error),
     #[error("the synthetic coordinator did not request a native join")]
     JoinNotRequested,
 }
@@ -36,6 +53,9 @@ pub enum SyntheticHarnessError {
 pub struct SyntheticHuddleHarness {
     coordinator: HuddleCoordinator,
     gate: NativeJoinGate<SyntheticSlackBootstrap, SyntheticChimeBridge>,
+    media: SyntheticMediaEngine,
+    screen_cast: Option<ScreenCastLease<SyntheticScreenCastBackend>>,
+    screen_cast_backend: Arc<SyntheticScreenCastBackend>,
     trace: Arc<Mutex<SyntheticHuddleTrace>>,
 }
 
@@ -52,6 +72,9 @@ impl SyntheticHuddleHarness {
                     trace: Arc::clone(&trace),
                 },
             ),
+            media: SyntheticMediaEngine::default(),
+            screen_cast: None,
+            screen_cast_backend: Arc::new(SyntheticScreenCastBackend),
             trace,
         }
     }
@@ -83,6 +106,28 @@ impl SyntheticHuddleHarness {
         });
         let huddle = huddle.ok_or(SyntheticHarnessError::JoinNotRequested)?;
         self.gate.begin_join(&huddle)?;
+        self.media.start(MediaSessionConfig {
+            source_mode: MediaSourceMode::Synthetic,
+            sink_mode: MediaSinkMode::Fake,
+            ..Default::default()
+        })?;
+        self.media.create_offer()?;
+        if !self.media.drain_events().iter().any(|event| {
+            matches!(
+                event,
+                crate::huddles::media::MediaEvent::LocalDescription(_)
+            )
+        }) {
+            return Err(SyntheticHarnessError::JoinNotRequested);
+        }
+        self.media
+            .set_remote_description(MediaDescription::answer("v=0\r\n")?)?;
+        self.media
+            .add_remote_ice_candidate(IceCandidate::new(0, "candidate:synthetic")?)?;
+        self.trace
+            .lock()
+            .expect("synthetic huddle trace lock poisoned")
+            .media_starts += 1;
         self.coordinator.apply(CoordinatorInput::MediaConnected)?;
         Ok(())
     }
@@ -91,20 +136,62 @@ impl SyntheticHuddleHarness {
         let effects = self
             .coordinator
             .apply(CoordinatorInput::MutedChanged(muted))?;
-        self.record_control_effects(&effects);
-        Ok(())
+        self.apply_control_effects(&effects)
     }
 
     pub fn set_camera_enabled(&mut self, enabled: bool) -> Result<(), SyntheticHarnessError> {
         let effects = self
             .coordinator
             .apply(CoordinatorInput::CameraChanged(enabled))?;
-        self.record_control_effects(&effects);
+        self.apply_control_effects(&effects)
+    }
+
+    pub fn start_screen_share(&mut self) -> Result<(), SyntheticHarnessError> {
+        let effects = self
+            .coordinator
+            .apply(CoordinatorInput::ScreenShareChanged(true))?;
+        if !effects.contains(&HuddleEffect::StartScreenShare) {
+            return Ok(());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (_cancel, receiver) = tokio::sync::watch::channel(false);
+        let lease = runtime.block_on(request_screen_cast(
+            Arc::clone(&self.screen_cast_backend),
+            None,
+            receiver,
+        ))?;
+        self.media
+            .attach_screen_share(lease.duplicate_remote_fd()?, lease.node_id())?;
+        self.screen_cast = Some(lease);
+        self.coordinator
+            .apply(CoordinatorInput::ScreenShareStarted)?;
+        self.trace
+            .lock()
+            .expect("synthetic huddle trace lock poisoned")
+            .screen_share_starts += 1;
+        Ok(())
+    }
+
+    pub fn stop_screen_share(&mut self) -> Result<(), SyntheticHarnessError> {
+        let effects = self
+            .coordinator
+            .apply(CoordinatorInput::ScreenShareChanged(false))?;
+        if effects.contains(&HuddleEffect::StopScreenShare) {
+            self.stop_screen_share_resources()?;
+            self.coordinator
+                .apply(CoordinatorInput::ScreenShareStopped)?;
+        }
         Ok(())
     }
 
     pub fn reconnect(&mut self) -> Result<(), SyntheticHarnessError> {
-        self.coordinator.apply(CoordinatorInput::ConnectionLost)?;
+        let effects = self.coordinator.apply(CoordinatorInput::ConnectionLost)?;
+        self.apply_control_effects(&effects)?;
+        if effects.contains(&HuddleEffect::StopScreenShare) {
+            self.stop_screen_share_resources()?;
+        }
         self.trace
             .lock()
             .expect("synthetic huddle trace lock poisoned")
@@ -125,22 +212,49 @@ impl SyntheticHuddleHarness {
     pub fn leave(&mut self) -> Result<(), SyntheticHarnessError> {
         let effects = self.coordinator.apply(CoordinatorInput::LeaveRequested)?;
         if effects.contains(&HuddleEffect::StopSession) {
+            self.stop_screen_share_resources()?;
+            self.media.stop()?;
+            self.trace
+                .lock()
+                .expect("synthetic huddle trace lock poisoned")
+                .media_stops += 1;
             self.gate.stop()?;
             self.coordinator.apply(CoordinatorInput::MediaStopped)?;
         }
         Ok(())
     }
 
-    fn record_control_effects(&self, effects: &[HuddleEffect]) {
-        if effects
-            .iter()
-            .any(|effect| matches!(effect, HuddleEffect::ApplyControls(_)))
-        {
+    fn apply_control_effects(
+        &mut self,
+        effects: &[HuddleEffect],
+    ) -> Result<(), SyntheticHarnessError> {
+        for effect in effects {
+            if let HuddleEffect::ApplyControls(controls) = effect {
+                self.media.apply_controls(controls.clone())?;
+                self.trace
+                    .lock()
+                    .expect("synthetic huddle trace lock poisoned")
+                    .control_updates += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_screen_share_resources(&mut self) -> Result<(), SyntheticHarnessError> {
+        if self.media.screen_share_active() {
+            self.media.detach_screen_share()?;
             self.trace
                 .lock()
                 .expect("synthetic huddle trace lock poisoned")
-                .control_updates += 1;
+                .screen_share_stops += 1;
         }
+        if let Some(lease) = self.screen_cast.take() {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(lease.close())?;
+        }
+        Ok(())
     }
 }
 
@@ -233,6 +347,10 @@ mod tests {
 
         harness.set_muted(true).unwrap();
         harness.set_camera_enabled(true).unwrap();
+        harness.start_screen_share().unwrap();
+        assert!(harness.snapshot().controls.screen_share_enabled);
+        harness.stop_screen_share().unwrap();
+        assert!(!harness.snapshot().controls.screen_share_enabled);
         harness.reconnect().unwrap();
         assert_eq!(harness.snapshot().phase, HuddlePhase::Connected);
         assert!(harness.snapshot().controls.microphone_muted);
@@ -257,6 +375,10 @@ mod tests {
         assert_eq!(trace.bridge_disconnects, 1);
         assert_eq!(trace.bootstrap_leaves, 1);
         assert_eq!(trace.reconnects, 1);
+        assert_eq!(trace.media_starts, 1);
+        assert_eq!(trace.media_stops, 1);
+        assert_eq!(trace.screen_share_starts, 1);
+        assert_eq!(trace.screen_share_stops, 1);
     }
 
     fn huddle() -> ActiveHuddle {

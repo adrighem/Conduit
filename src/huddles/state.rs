@@ -61,6 +61,15 @@ pub struct HuddleControls {
     pub screen_share_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HuddleScreenShareState {
+    #[default]
+    Off,
+    Requesting,
+    Active,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HuddleParticipant {
     pub user_id: String,
@@ -185,6 +194,8 @@ pub struct HuddleSnapshot {
     pub participants: Vec<HuddleParticipant>,
     pub statistics: Option<HuddleSessionStatistics>,
     pub failure: Option<HuddleFailure>,
+    pub screen_share_state: HuddleScreenShareState,
+    pub screen_share_failure: Option<HuddleFailure>,
     pub native_join_available: bool,
 }
 

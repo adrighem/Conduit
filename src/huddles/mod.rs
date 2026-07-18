@@ -4,5 +4,6 @@ pub mod devices;
 pub mod harness;
 pub mod media;
 pub mod model;
+pub mod portal;
 pub mod signaling;
 pub mod state;

@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::fmt;
+use std::os::fd::OwnedFd;
 
 use crate::huddles::state::{
     HuddleControls, HuddleDeviceKind, HuddleDeviceSelection, HuddleSessionStatistics,
@@ -46,7 +47,7 @@ impl MediaGraphPlan {
         Self {
             audio_enabled: true,
             camera_capture_enabled: config.controls.camera_enabled,
-            screen_capture_enabled: config.controls.screen_share_enabled,
+            screen_capture_enabled: false,
             echo_cancellation_enabled: uses_system_devices,
             uses_system_devices,
         }
@@ -196,6 +197,9 @@ pub trait MediaEngine {
     fn add_remote_ice_candidate(&mut self, candidate: IceCandidate) -> Result<(), MediaError>;
     fn apply_controls(&mut self, controls: HuddleControls) -> Result<(), MediaError>;
     fn select_device(&mut self, kind: HuddleDeviceKind, id: &str) -> Result<(), MediaError>;
+    fn attach_screen_share(&mut self, remote_fd: OwnedFd, node_id: u32) -> Result<(), MediaError>;
+    fn detach_screen_share(&mut self) -> Result<(), MediaError>;
+    fn screen_share_active(&self) -> bool;
     fn request_statistics(&mut self) -> Result<(), MediaError>;
     fn drain_events(&mut self) -> Vec<MediaEvent>;
     fn stop(&mut self) -> Result<(), MediaError>;
@@ -207,6 +211,7 @@ pub struct SyntheticMediaEngine {
     config: Option<MediaSessionConfig>,
     remote_description_set: bool,
     remote_candidates: usize,
+    screen_share_remote: Option<OwnedFd>,
     events: Vec<MediaEvent>,
 }
 
@@ -214,6 +219,9 @@ impl MediaEngine for SyntheticMediaEngine {
     fn start(&mut self, config: MediaSessionConfig) -> Result<(), MediaError> {
         if self.config.is_some() {
             return Err(MediaError::AlreadyRunning);
+        }
+        if config.controls.screen_share_enabled {
+            return Err(MediaError::OperationFailed);
         }
         self.config = Some(config);
         self.remote_description_set = false;
@@ -270,6 +278,31 @@ impl MediaEngine for SyntheticMediaEngine {
         Ok(())
     }
 
+    fn attach_screen_share(&mut self, remote_fd: OwnedFd, node_id: u32) -> Result<(), MediaError> {
+        self.require_running()?;
+        if self.screen_share_remote.is_some() || node_id == 0 {
+            return Err(MediaError::OperationFailed);
+        }
+        self.screen_share_remote = Some(remote_fd);
+        if let Some(config) = self.config.as_mut() {
+            config.controls.screen_share_enabled = true;
+        }
+        Ok(())
+    }
+
+    fn detach_screen_share(&mut self) -> Result<(), MediaError> {
+        self.require_running()?;
+        self.screen_share_remote = None;
+        if let Some(config) = self.config.as_mut() {
+            config.controls.screen_share_enabled = false;
+        }
+        Ok(())
+    }
+
+    fn screen_share_active(&self) -> bool {
+        self.screen_share_remote.is_some()
+    }
+
     fn drain_events(&mut self) -> Vec<MediaEvent> {
         std::mem::take(&mut self.events)
     }
@@ -279,6 +312,7 @@ impl MediaEngine for SyntheticMediaEngine {
         self.config = None;
         self.remote_description_set = false;
         self.remote_candidates = 0;
+        self.screen_share_remote = None;
         self.events.clear();
         Ok(())
     }
@@ -337,6 +371,7 @@ fn finite_rate(value: Option<f64>) -> u64 {
 
 #[cfg(feature = "native-media")]
 mod native {
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::sync::mpsc::{self, Receiver, Sender};
 
     use gst::glib;
@@ -368,6 +403,15 @@ mod native {
         camera_source: gst::Element,
         camera_valve: gst::Element,
         controls: HuddleControls,
+        #[cfg(feature = "screen-share")]
+        screen_share: Option<ScreenShareBranch>,
+    }
+
+    #[cfg(feature = "screen-share")]
+    struct ScreenShareBranch {
+        elements: Vec<gst::Element>,
+        peer_pad: gst::Pad,
+        remote_fd: OwnedFd,
     }
 
     impl GStreamerMediaEngine {
@@ -395,6 +439,9 @@ mod native {
         }
 
         fn build_session(&self, config: &MediaSessionConfig) -> Result<NativeSession, MediaError> {
+            if config.controls.screen_share_enabled {
+                return Err(MediaError::OperationFailed);
+            }
             let pipeline = gst::Pipeline::with_name("conduit-huddle-media");
             let peer = make("webrtcbin", "huddle-webrtc")?;
             peer.set_property_from_str("bundle-policy", "max-bundle");
@@ -433,6 +480,8 @@ mod native {
                 camera_source,
                 camera_valve,
                 controls: config.controls.clone(),
+                #[cfg(feature = "screen-share")]
+                screen_share: None,
             })
         }
 
@@ -478,7 +527,7 @@ mod native {
             }
             elements.extend([valve.clone(), encoder, payloader, capsfilter, queue]);
             add_and_link(pipeline, &elements)?;
-            link_to_peer(peer, elements.last().expect("audio queue"))?;
+            let _ = link_to_peer(peer, elements.last().expect("audio queue"))?;
             Ok((source, valve))
         }
 
@@ -541,7 +590,7 @@ mod native {
                 send_queue,
             ];
             add_and_link(pipeline, &elements)?;
-            link_to_peer(peer, elements.last().expect("video queue"))?;
+            let _ = link_to_peer(peer, elements.last().expect("video queue"))?;
             Ok((source, valve))
         }
 
@@ -676,7 +725,7 @@ mod native {
         }
 
         fn apply_controls(&mut self, controls: HuddleControls) -> Result<(), MediaError> {
-            if controls.screen_share_enabled {
+            if controls.screen_share_enabled && !self.screen_share_active() {
                 return Err(MediaError::OperationFailed);
             }
             let session = self.session_mut()?;
@@ -709,6 +758,126 @@ mod native {
                 set_camera_capture(&session.camera_source, &session.camera_valve, true)?;
             }
             result
+        }
+
+        fn attach_screen_share(
+            &mut self,
+            remote_fd: OwnedFd,
+            node_id: u32,
+        ) -> Result<(), MediaError> {
+            #[cfg(not(feature = "screen-share"))]
+            {
+                let _ = (remote_fd, node_id);
+                Err(MediaError::ComponentsUnavailable)
+            }
+            #[cfg(feature = "screen-share")]
+            {
+                if node_id == 0 {
+                    return Err(MediaError::InvalidSessionData);
+                }
+                let session = self.session_mut()?;
+                if session.screen_share.is_some() {
+                    return Err(MediaError::AlreadyRunning);
+                }
+                let source = make("pipewiresrc", "huddle-screen-source")?;
+                source.set_property("fd", remote_fd.as_raw_fd());
+                source.set_property("target-object", node_id.to_string());
+                let queue = make("queue", "huddle-screen-source-queue")?;
+                let convert = make("videoconvert", "huddle-screen-convert")?;
+                let scale = make("videoscale", "huddle-screen-scale")?;
+                let raw_caps = make("capsfilter", "huddle-screen-raw-caps")?;
+                raw_caps.set_property(
+                    "caps",
+                    gst::Caps::builder("video/x-raw")
+                        .field("width", 1920i32)
+                        .field("height", 1080i32)
+                        .field("framerate", gst::Fraction::new(30, 1))
+                        .build(),
+                );
+                let encoder = make("vp8enc", "huddle-screen-vp8-encoder")?;
+                encoder.set_property("deadline", 1i64);
+                let payloader = make("rtpvp8pay", "huddle-screen-vp8-payloader")?;
+                let rtp_caps = make("capsfilter", "huddle-screen-rtp-caps")?;
+                rtp_caps.set_property(
+                    "caps",
+                    gst::Caps::builder("application/x-rtp")
+                        .field("media", "video")
+                        .field("encoding-name", "VP8")
+                        .field("payload", 98i32)
+                        .build(),
+                );
+                let send_queue = make("queue", "huddle-screen-send-queue")?;
+                let elements = vec![
+                    source, queue, convert, scale, raw_caps, encoder, payloader, rtp_caps,
+                    send_queue,
+                ];
+                add_and_link(&session.pipeline, &elements)?;
+                let peer_pad =
+                    match link_to_peer(&session.peer, elements.last().expect("screen queue")) {
+                        Ok(peer_pad) => peer_pad,
+                        Err(error) => {
+                            let _ = session.pipeline.remove_many(&elements);
+                            return Err(error);
+                        }
+                    };
+                for element in &elements {
+                    if element.sync_state_with_parent().is_err() {
+                        for element in &elements {
+                            let _ = element.set_state(gst::State::Null);
+                        }
+                        session.peer.release_request_pad(&peer_pad);
+                        let _ = session.pipeline.remove_many(&elements);
+                        return Err(MediaError::OperationFailed);
+                    }
+                }
+                session.controls.screen_share_enabled = true;
+                session.screen_share = Some(ScreenShareBranch {
+                    elements,
+                    peer_pad,
+                    remote_fd,
+                });
+                Ok(())
+            }
+        }
+
+        fn detach_screen_share(&mut self) -> Result<(), MediaError> {
+            #[cfg(not(feature = "screen-share"))]
+            {
+                self.session()?;
+                Err(MediaError::ComponentsUnavailable)
+            }
+            #[cfg(feature = "screen-share")]
+            {
+                let session = self.session_mut()?;
+                let Some(branch) = session.screen_share.take() else {
+                    session.controls.screen_share_enabled = false;
+                    return Ok(());
+                };
+                for element in &branch.elements {
+                    let _ = element.set_state(gst::State::Null);
+                }
+                session.peer.release_request_pad(&branch.peer_pad);
+                session
+                    .pipeline
+                    .remove_many(&branch.elements)
+                    .map_err(|_| MediaError::OperationFailed)?;
+                session.controls.screen_share_enabled = false;
+                drop(branch.remote_fd);
+                Ok(())
+            }
+        }
+
+        fn screen_share_active(&self) -> bool {
+            #[cfg(not(feature = "screen-share"))]
+            {
+                false
+            }
+            #[cfg(feature = "screen-share")]
+            {
+                self.session
+                    .as_ref()
+                    .is_some_and(|session| session.screen_share.is_some())
+            }
         }
 
         fn request_statistics(&mut self) -> Result<(), MediaError> {
@@ -798,7 +967,7 @@ mod native {
         gst::Element::link_many(elements).map_err(|_| MediaError::OperationFailed)
     }
 
-    fn link_to_peer(peer: &gst::Element, element: &gst::Element) -> Result<(), MediaError> {
+    fn link_to_peer(peer: &gst::Element, element: &gst::Element) -> Result<gst::Pad, MediaError> {
         let source_pad = element
             .static_pad("src")
             .ok_or(MediaError::OperationFailed)?;
@@ -807,8 +976,8 @@ mod native {
             .ok_or(MediaError::OperationFailed)?;
         source_pad
             .link(&sink_pad)
-            .map(|_| ())
-            .map_err(|_| MediaError::OperationFailed)
+            .map_err(|_| MediaError::OperationFailed)?;
+        Ok(sink_pad)
     }
 
     fn set_camera_capture(
@@ -1079,6 +1248,11 @@ mod tests {
         engine
             .select_device(HuddleDeviceKind::Camera, "camera:synthetic")
             .unwrap();
+        let (remote, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        engine.attach_screen_share(remote.into(), 42).unwrap();
+        assert!(engine.screen_share_active());
+        engine.detach_screen_share().unwrap();
+        assert!(!engine.screen_share_active());
         engine.request_statistics().unwrap();
 
         assert!(matches!(

@@ -11,9 +11,11 @@ native-media = [
   "dep:gstreamer-sdp",
   "dep:gstreamer-webrtc",
 ]
+screen-share = ["native-media", "dep:ashpd"]
 
 [dependencies]
 anyhow = "1.0"
+ashpd = { version = "=0.11.1", optional = true, default-features = false, features = ["tokio", "gtk4"] }
 base64 = "0.22"
 emojis = "0.9"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

@@ -1,7 +1,7 @@
 use crate::huddles::model::{ActiveHuddle, HuddlePresence};
 use crate::huddles::state::{
     HuddleControls, HuddleDeviceKind, HuddleDeviceSelection, HuddleFailure, HuddleParticipant,
-    HuddlePhase, HuddleSessionStatistics, HuddleSnapshot,
+    HuddlePhase, HuddleScreenShareState, HuddleSessionStatistics, HuddleSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,10 @@ pub enum CoordinatorInput {
     MutedChanged(bool),
     CameraChanged(bool),
     ScreenShareChanged(bool),
+    ScreenShareStarted,
+    ScreenShareStopped,
+    #[allow(dead_code)] // Produced by the capability-gated production portal actor.
+    ScreenShareFailed(HuddleFailure),
     DeviceSelected {
         kind: HuddleDeviceKind,
         id: String,
@@ -107,6 +111,9 @@ impl HuddleCoordinator {
             CoordinatorInput::MutedChanged(muted) => self.set_muted(muted),
             CoordinatorInput::CameraChanged(enabled) => self.set_camera(enabled),
             CoordinatorInput::ScreenShareChanged(enabled) => self.set_screen_share(enabled),
+            CoordinatorInput::ScreenShareStarted => self.screen_share_started(),
+            CoordinatorInput::ScreenShareStopped => self.screen_share_stopped(),
+            CoordinatorInput::ScreenShareFailed(failure) => self.screen_share_failed(failure),
             CoordinatorInput::DeviceSelected { kind, id } => self.select_device(kind, id),
             CoordinatorInput::MediaConnected => self.media_connected(false),
             CoordinatorInput::ConnectionLost => self.connection_lost(),
@@ -321,17 +328,70 @@ impl HuddleCoordinator {
         enabled: bool,
     ) -> Result<Vec<HuddleEffect>, HuddleTransitionError> {
         self.require_phase(&[HuddlePhase::Connected], "change screen share")?;
-        if self.snapshot.controls.screen_share_enabled == enabled {
-            return Ok(Vec::new());
+        if enabled {
+            if matches!(
+                self.snapshot.screen_share_state,
+                HuddleScreenShareState::Requesting | HuddleScreenShareState::Active
+            ) {
+                return Ok(Vec::new());
+            }
+            self.snapshot.screen_share_state = HuddleScreenShareState::Requesting;
+            self.snapshot.screen_share_failure = None;
+            self.snapshot.controls.screen_share_enabled = false;
+            Ok(vec![
+                HuddleEffect::Publish(self.snapshot.clone()),
+                HuddleEffect::StartScreenShare,
+            ])
+        } else {
+            if self.snapshot.screen_share_state == HuddleScreenShareState::Off {
+                return Ok(Vec::new());
+            }
+            self.snapshot.screen_share_state = HuddleScreenShareState::Off;
+            self.snapshot.screen_share_failure = None;
+            self.snapshot.controls.screen_share_enabled = false;
+            Ok(vec![
+                HuddleEffect::Publish(self.snapshot.clone()),
+                HuddleEffect::StopScreenShare,
+            ])
         }
-        self.snapshot.controls.screen_share_enabled = enabled;
+    }
+
+    fn screen_share_started(&mut self) -> Result<Vec<HuddleEffect>, HuddleTransitionError> {
+        self.require_phase(&[HuddlePhase::Connected], "start screen share")?;
+        if self.snapshot.screen_share_state != HuddleScreenShareState::Requesting {
+            return Err(self.invalid("start unrequested screen share"));
+        }
+        self.snapshot.screen_share_state = HuddleScreenShareState::Active;
+        self.snapshot.screen_share_failure = None;
+        self.snapshot.controls.screen_share_enabled = true;
+        Ok(self.publish())
+    }
+
+    fn screen_share_stopped(&mut self) -> Result<Vec<HuddleEffect>, HuddleTransitionError> {
+        self.require_phase(
+            &[HuddlePhase::Connected, HuddlePhase::Reconnecting],
+            "stop screen share",
+        )?;
+        let changed = self.snapshot.screen_share_state != HuddleScreenShareState::Off
+            || self.snapshot.controls.screen_share_enabled
+            || self.snapshot.screen_share_failure.is_some();
+        self.snapshot.screen_share_state = HuddleScreenShareState::Off;
+        self.snapshot.screen_share_failure = None;
+        self.snapshot.controls.screen_share_enabled = false;
+        Ok(if changed { self.publish() } else { Vec::new() })
+    }
+
+    fn screen_share_failed(
+        &mut self,
+        failure: HuddleFailure,
+    ) -> Result<Vec<HuddleEffect>, HuddleTransitionError> {
+        self.require_phase(&[HuddlePhase::Connected], "fail screen share")?;
+        self.snapshot.screen_share_state = HuddleScreenShareState::Failed;
+        self.snapshot.screen_share_failure = Some(failure);
+        self.snapshot.controls.screen_share_enabled = false;
         Ok(vec![
             HuddleEffect::Publish(self.snapshot.clone()),
-            if enabled {
-                HuddleEffect::StartScreenShare
-            } else {
-                HuddleEffect::StopScreenShare
-            },
+            HuddleEffect::StopScreenShare,
         ])
     }
 
@@ -377,7 +437,7 @@ impl HuddleCoordinator {
 
     fn connection_lost(&mut self) -> Result<Vec<HuddleEffect>, HuddleTransitionError> {
         self.require_phase(&[HuddlePhase::Connected], "lose connection")?;
-        let was_sharing = self.snapshot.controls.screen_share_enabled;
+        let was_sharing = self.snapshot.screen_share_state != HuddleScreenShareState::Off;
         self.snapshot.phase = HuddlePhase::Reconnecting;
         self.disable_visual_capture();
         let mut effects = vec![
@@ -461,6 +521,8 @@ impl HuddleCoordinator {
     fn disable_visual_capture(&mut self) {
         self.snapshot.controls.camera_enabled = false;
         self.snapshot.controls.screen_share_enabled = false;
+        self.snapshot.screen_share_state = HuddleScreenShareState::Off;
+        self.snapshot.screen_share_failure = None;
         self.snapshot.statistics = None;
     }
 
@@ -650,6 +712,67 @@ mod tests {
         assert_eq!(coordinator.snapshot().phase, HuddlePhase::Connected);
         assert!(!coordinator.snapshot().controls.camera_enabled);
         assert!(!coordinator.snapshot().controls.screen_share_enabled);
+    }
+
+    #[test]
+    fn screen_share_is_only_active_after_portal_media_attachment() {
+        let mut coordinator = connected_coordinator();
+        let effects = coordinator
+            .apply(CoordinatorInput::ScreenShareChanged(true))
+            .unwrap();
+        assert_eq!(
+            coordinator.snapshot().screen_share_state,
+            crate::huddles::state::HuddleScreenShareState::Requesting
+        );
+        assert!(!coordinator.snapshot().controls.screen_share_enabled);
+        assert!(effects.contains(&HuddleEffect::StartScreenShare));
+
+        coordinator
+            .apply(CoordinatorInput::ScreenShareStarted)
+            .unwrap();
+        assert_eq!(
+            coordinator.snapshot().screen_share_state,
+            crate::huddles::state::HuddleScreenShareState::Active
+        );
+        assert!(coordinator.snapshot().controls.screen_share_enabled);
+
+        coordinator
+            .apply(CoordinatorInput::ScreenShareStopped)
+            .unwrap();
+        assert_eq!(
+            coordinator.snapshot().screen_share_state,
+            crate::huddles::state::HuddleScreenShareState::Off
+        );
+        assert!(!coordinator.snapshot().controls.screen_share_enabled);
+    }
+
+    #[test]
+    fn screen_share_failure_rolls_back_capture_without_ending_the_call() {
+        let mut coordinator = connected_coordinator();
+        coordinator
+            .apply(CoordinatorInput::ScreenShareChanged(true))
+            .unwrap();
+
+        let effects = coordinator
+            .apply(CoordinatorInput::ScreenShareFailed(
+                HuddleFailure::permission_denied(),
+            ))
+            .unwrap();
+        assert_eq!(coordinator.snapshot().phase, HuddlePhase::Connected);
+        assert_eq!(
+            coordinator.snapshot().screen_share_state,
+            crate::huddles::state::HuddleScreenShareState::Failed
+        );
+        assert!(!coordinator.snapshot().controls.screen_share_enabled);
+        assert_eq!(
+            coordinator
+                .snapshot()
+                .screen_share_failure
+                .as_ref()
+                .map(|failure| failure.kind),
+            Some(crate::huddles::state::HuddleFailureKind::PermissionDenied)
+        );
+        assert!(effects.contains(&HuddleEffect::StopScreenShare));
     }
 
     #[test]
