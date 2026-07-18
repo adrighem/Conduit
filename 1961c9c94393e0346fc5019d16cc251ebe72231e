@@ -1,0 +1,9 @@
+Task: Clarify the Slack app URI fallback after final review
+
+Summary: Corrected the README to state that Slack app_redirect opens an app or bot conversation and does not preserve an App Home tab.
+
+Modified: README.md
+
+Validation: git diff --check; verified against Slack official deep-linking documentation.
+
+Rationale: Avoid describing the safe HTTPS fallback as equivalent to native App Home navigation.
