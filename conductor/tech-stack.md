@@ -44,3 +44,20 @@
 - GIO `Application::open`, command-line forwarding, and the XDG desktop scheme handler deliver `slack://` URIs to the existing single-instance GTK application.
 - A pure Rust parser validates official Slack custom-scheme links before the GTK layer resolves them against the active workspace.
 - Conduit does not claim HTTP or HTTPS and does not install a browser extension; normal Slack web links remain in the browser unless Slack explicitly invokes its custom scheme.
+
+## Native Huddles
+- Pure huddle models, coordinator transitions, media intents, signalling capabilities, and fake adapters are always compiled and tested without Slack credentials or capture devices.
+- Native media is isolated behind the Cargo `native-media` feature and a Meson feature option so builds without WebRTC development headers retain official discovery, UI state, and external Slack fallback.
+- The native media stack uses `gstreamer` 0.23.7, `gstreamer-sdp` 0.23.5, and `gstreamer-webrtc` 0.23.5 with their GStreamer 1.24 API features. This generation shares Conduit's existing GLib 0.20 type universe; the newer 0.25 bindings require a different GLib generation.
+- `ashpd` 0.11.1 with GTK4 integration owns user-initiated ScreenCast portal sessions. The portal-provided restricted PipeWire file descriptor and selected stream node remain ephemeral and are released when sharing stops.
+- One session-owned huddle actor serializes signalling and media commands and exclusively owns GStreamer pipelines, portal sessions, ephemeral negotiation state, and teardown.
+- GStreamer `webrtcbin` provides the generic native WebRTC transport used by the deterministic harness; `webrtcdsp` and `webrtcechoprobe` provide the packaged echo-cancellation path; PipeWire/GStreamer plugins provide local audio, camera, and screen-share streams.
+- Slack huddles are Amazon Chime meetings. Generic SDP/ICE exchange through `webrtcbin` is not by itself compatible with Chime's signalling contract and must never be presented as a production Slack join path.
+- Slack-supported conversation metadata and `user_huddle_changed` events provide discovery and presence. First-party `rooms.join` bootstrap and a Chime-compatible media bridge remain behind replaceable, independently capability-checked adapters because Slack does not publish a huddle join API. Enabling `native-media` alone never enables private Slack joining.
+- A future production Chime bridge may wrap Amazon's Apache-licensed C++ signalling SDK, but it must remain disabled until Conduit has a verified, redacted Slack bootstrap contract and a tested media integration for the packaged platform.
+- A deterministic synthetic signalling/media harness exercises negotiation, controls, reconnect, statistics, and teardown. Production protocol drift degrades to an explicit external Slack handoff.
+
+## Native Huddle Packaging
+- Native compilation requires GStreamer core, base, and bad-plugin development metadata at version 1.24 or newer. Runtime packages must provide `webrtcbin`, ICE/libnice, Opus, camera/video codecs, PipeWire, and audio source/sink plugins.
+- CI validates both the default build and `--features native-media`; synthetic sources and sinks replace real devices and portals in automated tests.
+- Flatpak enables the Meson native-media option, uses the GNOME Platform media stack, and grants only the standard PulseAudio socket for microphone/speaker access in addition to existing network, display, and DRI access. Screen sharing uses the portal's restricted PipeWire remote without broad device, filesystem, or session-bus permissions.
