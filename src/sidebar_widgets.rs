@@ -124,6 +124,13 @@ pub fn sidebar_row_widget(
         content.append(&external);
     }
 
+    if model.huddle_active {
+        let huddle = gtk::Image::from_icon_name("call-start-symbolic");
+        huddle.set_tooltip_text(Some("Huddle active"));
+        huddle.update_property(&[gtk::accessible::Property::Label("Huddle active")]);
+        content.append(&huddle);
+    }
+
     row.set_child(Some(&content));
     row
 }

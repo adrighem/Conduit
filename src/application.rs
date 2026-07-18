@@ -106,6 +106,18 @@ fn conversation_notification_id(workspace_id: &str, channel_id: &str) -> String 
     format!("message:{:x}", digest.finalize())
 }
 
+fn huddle_notification_id(workspace_id: &str, call_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(workspace_id.as_bytes());
+    digest.update([0]);
+    digest.update(call_id.as_bytes());
+    format!("huddle:{:x}", digest.finalize())
+}
+
+fn huddle_notification_content() -> (&'static str, &'static str) {
+    ("Slack huddle available", "Open Conduit to view details.")
+}
+
 fn conversation_target_variant(workspace_id: &str, channel_id: &str) -> glib::Variant {
     (workspace_id, channel_id).to_variant()
 }
@@ -406,6 +418,29 @@ impl ConduitApplication {
         self.withdraw_notification(&id);
     }
 
+    pub(crate) fn send_huddle_notification(
+        &self,
+        workspace_id: &str,
+        channel_id: &str,
+        call_id: &str,
+    ) {
+        let (title, body) = huddle_notification_content();
+        let notification = gio::Notification::new(&gettext(title));
+        notification.set_body(Some(&gettext(body)));
+        notification.set_priority(gio::NotificationPriority::Normal);
+        let target = conversation_target_variant(workspace_id, channel_id);
+        notification.set_default_action_and_target_value(OPEN_CONVERSATION_ACTION, Some(&target));
+        let id = huddle_notification_id(workspace_id, call_id);
+        self.imp().register_notification(&id);
+        self.send_notification(Some(&id), &notification);
+    }
+
+    pub(crate) fn withdraw_huddle_notification(&self, workspace_id: &str, call_id: &str) {
+        let id = huddle_notification_id(workspace_id, call_id);
+        self.imp().forget_notification(&id);
+        self.withdraw_notification(&id);
+    }
+
     fn configure_icon_theme(&self) {
         let Some(display) = gtk::gdk::Display::default() else {
             return;
@@ -567,6 +602,21 @@ mod tests {
         assert!(id.starts_with("message:"));
         assert!(!id.contains("T123"));
         assert!(!id.contains("C123"));
+    }
+
+    #[test]
+    fn huddle_notification_ids_and_content_do_not_expose_private_details() {
+        let id = huddle_notification_id("T123:U123", "R456");
+        let (title, body) = huddle_notification_content();
+
+        assert_eq!(id, huddle_notification_id("T123:U123", "R456"));
+        assert_ne!(id, huddle_notification_id("T123:U123", "R999"));
+        assert!(id.starts_with("huddle:"));
+        assert!(!id.contains("T123"));
+        assert!(!id.contains("R456"));
+        assert_eq!(title, "Slack huddle available");
+        assert_eq!(body, "Open Conduit to view details.");
+        assert!(!body.contains("participant"));
     }
 
     #[test]

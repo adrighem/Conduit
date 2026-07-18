@@ -388,7 +388,7 @@ mod native {
     use crate::huddles::state::{HuddleControls, HuddleDevice, HuddleDeviceKind};
 
     pub struct GStreamerMediaEngine {
-        catalog: NativeDeviceCatalog,
+        catalog: Option<NativeDeviceCatalog>,
         session: Option<NativeSession>,
         event_sender: Sender<MediaEvent>,
         event_receiver: Receiver<MediaEvent>,
@@ -418,10 +418,9 @@ mod native {
         pub fn new() -> Result<Self, MediaError> {
             gst::init().map_err(|_| MediaError::ComponentsUnavailable)?;
             ensure_factories()?;
-            let catalog = NativeDeviceCatalog::scan()?;
             let (event_sender, event_receiver) = mpsc::channel();
             Ok(Self {
-                catalog,
+                catalog: None,
                 session: None,
                 event_sender,
                 event_receiver,
@@ -429,7 +428,15 @@ mod native {
         }
 
         pub fn devices(&self) -> &[HuddleDevice] {
-            self.catalog.descriptions()
+            self.catalog
+                .as_ref()
+                .map(NativeDeviceCatalog::descriptions)
+                .unwrap_or_default()
+        }
+
+        pub fn refresh_devices(&mut self) -> Result<&[HuddleDevice], MediaError> {
+            self.catalog = Some(NativeDeviceCatalog::scan()?);
+            Ok(self.devices())
         }
 
         pub fn camera_capture_active(&self) -> bool {
@@ -638,7 +645,11 @@ mod native {
             name: &str,
         ) -> Result<gst::Element, MediaError> {
             match selected_id {
-                Some(id) => self.catalog.create_element(kind, id, name),
+                Some(id) => self
+                    .catalog
+                    .as_ref()
+                    .ok_or(MediaError::DeviceUnavailable)?
+                    .create_element(kind, id, name),
                 None => make(automatic_factory, name),
             }
         }
@@ -753,7 +764,11 @@ mod native {
             if kind == HuddleDeviceKind::Camera {
                 set_camera_capture(&session.camera_source, &session.camera_valve, false)?;
             }
-            let result = self.catalog.reconfigure_element(kind, id, element);
+            let result = self
+                .catalog
+                .as_ref()
+                .ok_or(MediaError::DeviceUnavailable)?
+                .reconfigure_element(kind, id, element);
             if kind == HuddleDeviceKind::Camera && camera_was_enabled {
                 set_camera_capture(&session.camera_source, &session.camera_valve, true)?;
             }
@@ -1288,6 +1303,7 @@ mod tests {
     #[test]
     fn native_synthetic_pipeline_keeps_camera_off_until_explicitly_enabled() {
         let mut engine = GStreamerMediaEngine::new().unwrap();
+        assert!(engine.devices().is_empty());
         engine
             .start(MediaSessionConfig {
                 source_mode: MediaSourceMode::Synthetic,

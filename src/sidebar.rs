@@ -71,6 +71,7 @@ pub struct SidebarRowModel {
     pub private: bool,
     pub muted: bool,
     pub external: bool,
+    pub huddle_active: bool,
     pub search_aliases: Vec<String>,
     pub status: Option<SlackUserStatus>,
 }
@@ -122,6 +123,9 @@ impl SidebarRowModel {
         }
         if self.external {
             label.push_str(", external");
+        }
+        if self.huddle_active {
+            label.push_str(", huddle active");
         }
         if let Some(status) = self.status.as_ref() {
             label.push_str(&format!(", status: {}", status.accessible_text()));
@@ -303,6 +307,7 @@ pub fn diff_keyed_sidebar_items(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SidebarBuildOptions<'a> {
     pub selected_channel: Option<&'a str>,
+    pub active_huddle_channel_id: Option<&'a str>,
     pub current_user_id: Option<&'a str>,
     pub query: &'a str,
     pub unread_only: bool,
@@ -329,6 +334,7 @@ impl SidebarRowModel {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -337,6 +343,7 @@ impl SidebarRowModel {
         user_names: &HashMap<String, String>,
         selected_channel: Option<&str>,
         current_user_id: Option<&str>,
+        active_huddle_channel_id: Option<&str>,
         user_search_aliases: Option<&UserSearchAliases>,
         user_full_names: Option<&HashMap<String, String>>,
         user_statuses: Option<&UserStatuses>,
@@ -366,6 +373,7 @@ impl SidebarRowModel {
                 || matches!(kind, ConversationKind::PrivateChannel),
             muted: conversation.is_muted_conversation(),
             external: conversation.is_external_conversation(),
+            huddle_active: active_huddle_channel_id == Some(conversation.id.as_str()),
             search_aliases,
             status: (kind == ConversationKind::DirectMessage)
                 .then_some(conversation.user.as_deref())
@@ -462,6 +470,7 @@ pub fn build_sidebar_list(
                 user_names,
                 options.selected_channel,
                 options.current_user_id,
+                options.active_huddle_channel_id,
                 options.user_search_aliases,
                 options.user_full_names,
                 options.user_statuses,
@@ -573,6 +582,7 @@ pub(crate) fn conversation_switcher_rows_with_aliases(
                 user_names,
                 None,
                 current_user_id,
+                None,
                 user_search_aliases,
                 user_full_names,
                 user_statuses,
@@ -790,6 +800,7 @@ pub fn conversation_picker_sections_with_statuses(
                 private: true,
                 muted: false,
                 external: false,
+                huddle_active: false,
                 search_aliases: user.search_aliases(),
                 status: user
                     .status()
@@ -1172,6 +1183,7 @@ mod tests {
             private: false,
             muted: false,
             external: false,
+            huddle_active: false,
             search_aliases: Vec::new(),
             status: None,
         }
@@ -1195,6 +1207,35 @@ mod tests {
             conversation_kind(&mpim("M1", "project-chat")),
             ConversationKind::GroupDirectMessage
         );
+    }
+
+    #[test]
+    fn active_huddle_marks_only_the_matching_sidebar_conversation() {
+        let model = build_sidebar_list(
+            &[channel("C1", "general"), channel("C2", "random")],
+            &HashMap::new(),
+            SidebarBuildOptions {
+                active_huddle_channel_id: Some("C2"),
+                ..Default::default()
+            },
+        );
+        let rows = model
+            .keyed_items()
+            .into_iter()
+            .filter_map(|item| match item.model {
+                SidebarItemModel::Conversation(row) => Some(row),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(rows.iter().any(|row| row.id == "C2" && row.huddle_active));
+        assert!(rows
+            .iter()
+            .find(|row| row.id == "C2")
+            .unwrap()
+            .accessible_label()
+            .contains("huddle active"));
+        assert!(rows.iter().all(|row| row.id == "C2" || !row.huddle_active));
     }
 
     #[test]

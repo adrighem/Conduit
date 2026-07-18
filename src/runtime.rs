@@ -2068,6 +2068,8 @@ fn spawn_workspace_tasks(
                     &refresh_connection.slack,
                     &refresh_connection.workspace_store,
                     cached_user_names,
+                    refresh_connection.team_id.as_deref(),
+                    &refresh_connection.huddles,
                 )
                 .await
                 {
@@ -2298,6 +2300,8 @@ async fn handle_connected_command(
         workspace_store: &mut workspace_store,
         user_cache: &mut user_cache,
         read_marks: &mut read_marks,
+        team_id: connection.team_id.as_deref(),
+        huddles: &connection.huddles,
     };
 
     let result = handle_command(command, &mut context).await;
@@ -2326,6 +2330,8 @@ struct RuntimeContext<'a> {
     workspace_store: &'a mut Option<WorkspaceStore>,
     user_cache: &'a mut HashMap<String, String>,
     read_marks: &'a mut HashMap<String, String>,
+    team_id: Option<&'a str>,
+    huddles: &'a HuddleActorHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2354,6 +2360,7 @@ fn cached_conversation_user_ids(
 #[derive(Debug, Clone)]
 struct ChannelHistoryPrefetchCandidate {
     id: String,
+    huddle_metadata: bool,
     unread: bool,
     direct_message: bool,
     unread_count: u64,
@@ -2369,19 +2376,25 @@ fn channel_history_prefetch_candidates(conversations: &[SlackConversation]) -> V
 
     candidates.sort_by(|left, right| {
         right
-            .unread
-            .cmp(&left.unread)
+            .huddle_metadata
+            .cmp(&left.huddle_metadata)
+            .then_with(|| right.unread.cmp(&left.unread))
             .then_with(|| right.unread_count.cmp(&left.unread_count))
             .then_with(|| right.activity_score.total_cmp(&left.activity_score))
             .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.id.cmp(&right.id))
     });
-    let (urgent_direct_messages, mut remaining): (Vec<_>, Vec<_>) = candidates
+    let (mut huddle_candidates, remaining): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|candidate| candidate.huddle_metadata);
+    let (urgent_direct_messages, mut remaining): (Vec<_>, Vec<_>) = remaining
         .into_iter()
         .partition(|candidate| candidate.unread && candidate.direct_message);
-    remaining.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
-    urgent_direct_messages
+    huddle_candidates.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
+    remaining.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT.saturating_sub(huddle_candidates.len()));
+    huddle_candidates
         .into_iter()
+        .chain(urgent_direct_messages)
         .chain(remaining)
         .map(|candidate| candidate.id)
         .collect()
@@ -2394,6 +2407,7 @@ fn conversation_unread_refresh_candidates(conversations: &[SlackConversation]) -
         .filter(|conversation| !conversation.id.trim().is_empty())
         .map(|conversation| ChannelHistoryPrefetchCandidate {
             id: conversation.id.clone(),
+            huddle_metadata: false,
             unread: conversation.has_unread_activity(),
             direct_message: conversation.is_im.unwrap_or(false)
                 || conversation.is_mpim.unwrap_or(false),
@@ -2440,6 +2454,7 @@ fn channel_history_prefetch_candidate(
 
     Some(ChannelHistoryPrefetchCandidate {
         id: conversation.id.clone(),
+        huddle_metadata: conversation.has_huddle_metadata(),
         unread: conversation.has_unread_activity(),
         direct_message: conversation.is_im.unwrap_or(false)
             || conversation.is_mpim.unwrap_or(false),
@@ -2502,6 +2517,8 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 &api,
                 &workspace_store,
                 cached_user_names,
+                context.team_id,
+                context.huddles,
             )
             .await?;
         }
@@ -2631,11 +2648,27 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             crate::debug::log("runtime", &format!("LoadHistory channel_id={channel_id}"));
             let service = ConversationHistoryService::new(api, context.workspace_store.as_ref());
+            let huddles = context.huddles.clone();
+            let team_id = context.team_id.map(str::to_string);
             let page = service
                 .load(&channel_id, |progress| {
+                    if let ConversationHistoryProgress::Cached(messages) = &progress {
+                        observe_huddle_messages(
+                            &huddles,
+                            team_id.as_deref(),
+                            &channel_id,
+                            messages,
+                        );
+                    }
                     apply_conversation_history_progress(context.events, &channel_id, progress)
                 })
                 .await?;
+            observe_huddle_messages(
+                context.huddles,
+                context.team_id,
+                &channel_id,
+                &page.messages,
+            );
             observe_thread_history(
                 context.events,
                 context.workspace_store,
@@ -2662,6 +2695,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             );
             context.events.send_status("Loading older messages");
             let page = api.history_page(&channel_id, Some(&cursor)).await?;
+            observe_huddle_messages(
+                context.huddles,
+                context.team_id,
+                &channel_id,
+                &page.messages,
+            );
             observe_thread_history(
                 context.events,
                 context.workspace_store,
@@ -3184,6 +3223,59 @@ fn observe_huddle_socket_event(
     }
 }
 
+fn observe_huddle_messages(
+    huddles: &HuddleActorHandle,
+    team_id: Option<&str>,
+    channel_id: &str,
+    messages: &[SlackMessage],
+) {
+    let Some(team_id) = team_id.map(str::trim).filter(|team_id| !team_id.is_empty()) else {
+        return;
+    };
+    let channel_id = channel_id.trim();
+    if channel_id.is_empty() {
+        return;
+    }
+
+    let mut room_messages = messages
+        .iter()
+        .filter(|message| message.room.is_some())
+        .collect::<Vec<_>>();
+    room_messages.sort_by(|left, right| left.ts.cmp(&right.ts));
+
+    for message in room_messages {
+        let room = message.room.as_ref().expect("room message was filtered");
+        if !room.channels.is_empty()
+            && !room
+                .channels
+                .iter()
+                .any(|candidate| candidate.trim() == channel_id)
+        {
+            continue;
+        }
+        let result = if room.has_ended() {
+            room.id
+                .as_deref()
+                .map(str::trim)
+                .filter(|call_id| !call_id.is_empty())
+                .map(|call_id| {
+                    huddles.input(CoordinatorInput::HuddleEnded {
+                        call_id: call_id.to_string(),
+                    })
+                })
+                .unwrap_or(Ok(()))
+        } else {
+            room.active_huddle(team_id, channel_id)
+                .map(|huddle| huddles.observe_huddle(huddle))
+                .unwrap_or(Ok(()))
+        };
+        if result.is_err() {
+            crate::debug::log("huddle", "HuddleHistoryObservationDropped");
+            return;
+        }
+    }
+}
+
 fn observe_huddle_user(huddles: &HuddleActorHandle, user: &SlackUser) -> Result<()> {
     let Some(user_id) = user
         .id
@@ -3557,6 +3649,8 @@ async fn load_conversations_best_effort_with_api(
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     cached_user_names: HashMap<String, String>,
+    team_id: Option<&str>,
+    huddles: &HuddleActorHandle,
 ) -> Result<()> {
     match load_conversations_with_api(events, api, workspace_store).await {
         Ok(conversations) => {
@@ -3588,6 +3682,8 @@ async fn load_conversations_best_effort_with_api(
                 api,
                 workspace_store,
                 &refreshed_conversations,
+                team_id,
+                huddles,
             )
             .await;
             refresh_cached_conversation_user_names(
@@ -3740,6 +3836,8 @@ async fn prefetch_channel_histories_best_effort(
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     conversations: &[SlackConversation],
+    team_id: Option<&str>,
+    huddles: &HuddleActorHandle,
 ) {
     let Some(store) = workspace_store.as_ref() else {
         return;
@@ -3777,6 +3875,7 @@ async fn prefetch_channel_histories_best_effort(
 
         match api.history(&channel_id).await {
             Ok(page) => {
+                observe_huddle_messages(huddles, team_id, &channel_id, &page.messages);
                 if store_conversation_unread_state(
                     workspace_store,
                     &channel_id,
@@ -5579,6 +5678,79 @@ mod tests {
     }
 
     #[test]
+    fn history_huddle_observation_is_chronological_and_workspace_scoped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender: event_sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Huddle,
+                    RuntimeTarget::Huddle("active".to_string()),
+                ),
+            };
+            let (handle, receiver) = huddle_actor_channel();
+            let actor = tokio::spawn(run_huddle_actor(
+                receiver,
+                events,
+                production_native_join_capability(false),
+            ));
+            let messages = serde_json::from_value::<Vec<SlackMessage>>(serde_json::json!([
+                {
+                    "ts": "2.0",
+                    "room": {"id": "R123", "date_end": 2, "channels": ["C123"]}
+                },
+                {
+                    "ts": "1.0",
+                    "room": {
+                        "id": "R123",
+                        "date_start": 1,
+                        "channels": ["C123"],
+                        "participants": ["U123"]
+                    }
+                },
+                {
+                    "ts": "3.0",
+                    "room": {"id": "R999", "channels": ["C999"]}
+                }
+            ]))
+            .unwrap();
+
+            observe_huddle_messages(&handle, Some("T123"), "C123", &messages);
+
+            let discovered = event_receiver.recv().await.unwrap();
+            assert!(matches!(
+                discovered.kind,
+                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(
+                    crate::huddles::state::HuddleSnapshot {
+                        phase: HuddlePhase::Discovered,
+                        ..
+                    }
+                ))
+            ));
+            let ended = event_receiver.recv().await.unwrap();
+            assert!(matches!(
+                ended.kind,
+                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(
+                    crate::huddles::state::HuddleSnapshot {
+                        phase: HuddlePhase::Idle,
+                        ..
+                    }
+                ))
+            ));
+            assert!(event_receiver.try_recv().is_err());
+
+            drop(handle);
+            actor.await.unwrap();
+        });
+    }
+
+    #[test]
     fn runtime_event_context_uses_loaded_resource_target() {
         let fallback = OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace);
         for event in [
@@ -5832,6 +6004,24 @@ mod tests {
 
         assert_eq!(candidates.first().map(String::as_str), Some("D-urgent"));
         assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT + 1);
+    }
+
+    #[test]
+    fn channel_history_prefetch_always_includes_huddle_metadata() {
+        let mut conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
+            .map(|index| channel(&format!("C{index}"), (index + 10) as u64, None))
+            .collect::<Vec<_>>();
+        let mut huddle = channel("C-huddle", 0, None);
+        huddle.extra.insert(
+            "properties".to_string(),
+            serde_json::json!({"huddles": [{"id": "R123"}]}),
+        );
+        conversations.push(huddle);
+
+        let candidates = channel_history_prefetch_candidates(&conversations);
+
+        assert_eq!(candidates.first().map(String::as_str), Some("C-huddle"));
+        assert!(candidates.contains(&"C-huddle".to_string()));
     }
 
     #[test]

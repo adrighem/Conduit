@@ -43,6 +43,12 @@ use crate::emoji::{
     emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
     EmojiPickerModel, EmojiPickerMove, EmojiValue,
 };
+use crate::huddles::fallback::external_huddle_url;
+use crate::huddles::presentation::{present_huddle, HuddlePrimaryAction};
+use crate::huddles::state::{
+    HuddleCommand, HuddleDevice, HuddleDeviceKind, HuddleEvent, HuddlePhase,
+    HuddleScreenShareState, HuddleSnapshot,
+};
 use crate::message_html::{
     self, MessageHtmlContext, TimelineDomPatch, TimelineInsertPosition, TimelineMessageRegion,
     TimelineScrollBehavior,
@@ -78,6 +84,21 @@ use crate::workspace_state::{
     ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle, WorkspaceLifecycleEvent,
     WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
 };
+
+#[derive(Debug, Clone)]
+struct HuddleDevicePicker {
+    dropdown: gtk::DropDown,
+    ids: Rc<RefCell<Vec<String>>>,
+    updating: Rc<Cell<bool>>,
+}
+
+#[derive(Debug, Clone)]
+struct HuddlePreflightDialog {
+    dialog: adw::AlertDialog,
+    microphone: HuddleDevicePicker,
+    speaker: HuddleDevicePicker,
+    camera: HuddleDevicePicker,
+}
 
 mod imp {
     use super::*;
@@ -164,6 +185,28 @@ mod imp {
         #[template_child]
         pub message_search_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
+        pub huddle_revealer: TemplateChild<gtk::Revealer>,
+        #[template_child]
+        pub huddle_title_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub huddle_detail_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub huddle_primary_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub huddle_external_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub huddle_controls_box: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub huddle_mute_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub huddle_camera_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub huddle_share_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub huddle_leave_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub huddle_dismiss_button: TemplateChild<gtk::Button>,
+        #[template_child]
         pub thread_title: TemplateChild<adw::WindowTitle>,
         #[template_child]
         pub thread_pane: TemplateChild<gtk::Box>,
@@ -207,6 +250,10 @@ mod imp {
         pub workspace_ready: Cell<bool>,
         pub(super) pending_notification_target: RefCell<Option<NotificationTarget>>,
         pub(super) pending_slack_uris: RefCell<VecDeque<SlackUri>>,
+        pub(super) huddle_snapshot: RefCell<HuddleSnapshot>,
+        pub(super) huddle_devices: RefCell<Vec<HuddleDevice>>,
+        pub(super) huddle_preflight_dialog: RefCell<Option<HuddlePreflightDialog>>,
+        pub(super) notified_huddle_call_id: RefCell<Option<String>>,
         pub drafts: RefCell<Drafts>,
         pub draft_save_generation: Cell<u64>,
         pub pending_sent_drafts: RefCell<HashMap<DraftKey, String>>,
@@ -263,6 +310,8 @@ mod imp {
             if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
                 obj.show_workspace(AuthInfo {
                     team: Some("Test Workspace".to_string()),
+                    team_id: Some("TTEST".to_string()),
+                    user_id: Some("UTEST".to_string()),
                     ..AuthInfo::default()
                 });
                 obj.populate_conversations(vec![SlackConversation {
@@ -272,6 +321,24 @@ mod imp {
                     ..SlackConversation::default()
                 }]);
                 obj.select_conversation("C_TEST", "#general");
+                if std::env::var_os("CONDUIT_TEST_HUDDLE").is_some() {
+                    obj.handle_huddle_event(HuddleEvent::Snapshot(HuddleSnapshot {
+                        phase: HuddlePhase::Discovered,
+                        huddle: Some(crate::huddles::model::ActiveHuddle {
+                            team_id: "TTEST".to_string(),
+                            channel_id: "C_TEST".to_string(),
+                            call_id: "RTEST".to_string(),
+                            name: Some("Test huddle".to_string()),
+                            participant_ids: vec!["UTEST".to_string()],
+                            started_at: None,
+                            huddle_link: None,
+                        }),
+                        participants: vec![crate::huddles::state::HuddleParticipant::from_user_id(
+                            "UTEST".to_string(),
+                        )],
+                        ..Default::default()
+                    }));
+                }
                 if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
                     obj.imp().thread_split.set_show_sidebar(true);
                 }
@@ -1719,6 +1786,20 @@ impl ConduitWindow {
             .update_property(&[gtk::accessible::Property::Label(
                 "Search workspace messages",
             )]);
+        imp.huddle_revealer
+            .update_property(&[gtk::accessible::Property::Label("Slack huddle controls")]);
+
+        for (button, label) in [
+            (&imp.huddle_primary_button, "Huddle action"),
+            (&imp.huddle_external_button, "Open huddle in Slack"),
+            (&imp.huddle_mute_button, "Mute microphone"),
+            (&imp.huddle_camera_button, "Turn camera on"),
+            (&imp.huddle_share_button, "Share screen"),
+            (&imp.huddle_leave_button, "Leave huddle"),
+            (&imp.huddle_dismiss_button, "Dismiss huddle"),
+        ] {
+            button.update_property(&[gtk::accessible::Property::Label(label)]);
+        }
 
         for (button, label) in [
             (
@@ -2397,6 +2478,27 @@ impl ConduitWindow {
         });
         self.connect_widget(&imp.close_thread_button.get(), |window| {
             window.close_thread()
+        });
+        self.connect_widget(&imp.huddle_primary_button.get(), |window| {
+            window.activate_huddle_primary_action()
+        });
+        self.connect_widget(&imp.huddle_external_button.get(), |window| {
+            window.open_active_huddle_externally()
+        });
+        self.connect_widget(&imp.huddle_mute_button.get(), |window| {
+            window.toggle_huddle_mute()
+        });
+        self.connect_widget(&imp.huddle_camera_button.get(), |window| {
+            window.toggle_huddle_camera()
+        });
+        self.connect_widget(&imp.huddle_share_button.get(), |window| {
+            window.toggle_huddle_screen_share()
+        });
+        self.connect_widget(&imp.huddle_leave_button.get(), |window| {
+            window.send_command(RuntimeCommand::Huddle(HuddleCommand::Leave))
+        });
+        self.connect_widget(&imp.huddle_dismiss_button.get(), |window| {
+            window.dismiss_huddle()
         });
 
         for target in COMPOSER_TARGETS {
@@ -3414,7 +3516,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::SocketModeEvent(event) => self.handle_socket_mode_event(event),
-            RuntimeEventKind::Huddle(_) => {}
+            RuntimeEventKind::Huddle(event) => self.handle_huddle_event(event),
             RuntimeEventKind::UserLoaded {
                 user_id,
                 display_name,
@@ -4807,7 +4909,14 @@ impl ConduitWindow {
     fn reset_workspace_state(&self) {
         self.flush_current_drafts();
         self.close_media_viewer();
+        self.withdraw_huddle_notification();
         let imp = self.imp();
+        *imp.huddle_snapshot.borrow_mut() = HuddleSnapshot::default();
+        imp.huddle_devices.borrow_mut().clear();
+        if let Some(preflight) = imp.huddle_preflight_dialog.borrow_mut().take() {
+            preflight.dialog.force_close();
+        }
+        imp.huddle_revealer.set_reveal_child(false);
         imp.workspace.reset();
         imp.navigation_history.borrow_mut().clear();
         imp.restoring_navigation.set(false);
@@ -5277,6 +5386,7 @@ impl ConduitWindow {
         for user_id in &changed_user_ids {
             self.patch_user_on_timelines(user_id);
         }
+        self.update_huddle_surface();
         self.queue_ui_invalidations(UiInvalidations::PICKER | UiInvalidations::TITLE);
     }
 
@@ -5591,11 +5701,18 @@ impl ConduitWindow {
         let user_names = imp.user_names.borrow().clone();
         let user_search_aliases = imp.user_search_aliases.borrow();
         let selected_channel = self.visible_channel_id();
+        let active_huddle_channel_id = imp
+            .huddle_snapshot
+            .borrow()
+            .huddle
+            .as_ref()
+            .map(|huddle| huddle.channel_id.clone());
         let model = sidebar::build_sidebar_list(
             &conversations,
             &user_names,
             sidebar::SidebarBuildOptions {
                 selected_channel: selected_channel.as_deref(),
+                active_huddle_channel_id: active_huddle_channel_id.as_deref(),
                 current_user_id: imp.current_user_id.borrow().as_deref(),
                 query: imp.sidebar_filter_entry.text().as_str(),
                 unread_only: imp.sidebar_unread_filter_button.is_active(),
@@ -6437,6 +6554,7 @@ impl ConduitWindow {
             imp.message_title
                 .update_property(&[gtk::accessible::Property::Description("")]);
         }
+        self.update_huddle_surface();
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
@@ -6920,6 +7038,412 @@ impl ConduitWindow {
                 self.apply_timeline_patch(TimelineSurface::Thread, patch, UiInvalidations::THREAD);
             }
         }
+    }
+
+    fn handle_huddle_event(&self, event: HuddleEvent) {
+        match event {
+            HuddleEvent::Snapshot(snapshot) => {
+                let previous_phase = self.imp().huddle_snapshot.borrow().phase;
+                self.request_user_ids(
+                    snapshot
+                        .participants
+                        .iter()
+                        .map(|participant| participant.user_id.clone())
+                        .collect(),
+                );
+                *self.imp().huddle_snapshot.borrow_mut() = snapshot.clone();
+
+                if snapshot.phase != HuddlePhase::Preflight {
+                    if let Some(preflight) = self.imp().huddle_preflight_dialog.borrow_mut().take()
+                    {
+                        preflight.dialog.force_close();
+                    }
+                }
+                self.sync_huddle_notification(&snapshot);
+                self.update_huddle_surface();
+                self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+
+                if snapshot.phase == HuddlePhase::Preflight
+                    && previous_phase != HuddlePhase::Preflight
+                {
+                    self.show_huddle_preflight();
+                } else if snapshot.phase == HuddlePhase::Preflight {
+                    self.refresh_huddle_preflight_devices();
+                }
+            }
+            HuddleEvent::DevicesAvailable(devices) => {
+                *self.imp().huddle_devices.borrow_mut() = devices;
+                self.refresh_huddle_preflight_devices();
+            }
+            HuddleEvent::OpenExternalRequested(huddle) => match external_huddle_url(&huddle) {
+                Ok(uri) => {
+                    self.open_external_link(&uri);
+                    self.set_status(&gettext("Opened huddle in Slack"));
+                }
+                Err(_) => self.set_status(&gettext("Slack returned an invalid huddle link.")),
+            },
+        }
+    }
+
+    fn update_huddle_surface(&self) {
+        let imp = self.imp();
+        let snapshot = imp.huddle_snapshot.borrow().clone();
+        let presentation = present_huddle(&snapshot, self.visible_channel_id().as_deref());
+        imp.huddle_revealer.set_reveal_child(presentation.visible);
+        if !presentation.visible {
+            return;
+        }
+
+        imp.huddle_title_label
+            .set_label(&gettext(presentation.title));
+        imp.huddle_detail_label
+            .set_label(&self.huddle_detail(&snapshot));
+        imp.huddle_primary_button
+            .set_visible(presentation.primary_label.is_some());
+        if let Some(label) = presentation.primary_label {
+            imp.huddle_primary_button.set_label(&gettext(label));
+        }
+        imp.huddle_external_button
+            .set_visible(presentation.show_external);
+        imp.huddle_controls_box
+            .set_visible(presentation.show_controls);
+        imp.huddle_mute_button
+            .set_sensitive(presentation.controls_sensitive);
+        imp.huddle_camera_button
+            .set_sensitive(presentation.controls_sensitive);
+        imp.huddle_share_button.set_sensitive(
+            presentation.controls_sensitive && !presentation.screen_share_requesting,
+        );
+        imp.huddle_leave_button.set_visible(presentation.show_leave);
+        imp.huddle_dismiss_button
+            .set_visible(presentation.show_dismiss);
+
+        let (mute_icon, mute_label) = if presentation.microphone_muted {
+            ("microphone-disabled-symbolic", gettext("Unmute microphone"))
+        } else {
+            (
+                "microphone-sensitivity-high-symbolic",
+                gettext("Mute microphone"),
+            )
+        };
+        set_huddle_button_state(&imp.huddle_mute_button, mute_icon, &mute_label);
+
+        let (camera_icon, camera_label) = if presentation.camera_enabled {
+            ("camera-video-symbolic", gettext("Turn camera off"))
+        } else {
+            ("camera-video-symbolic", gettext("Turn camera on"))
+        };
+        set_huddle_button_state(&imp.huddle_camera_button, camera_icon, &camera_label);
+
+        let (share_icon, share_label) = if presentation.screen_share_requesting {
+            (
+                "video-display-symbolic",
+                gettext("Waiting for screen sharing permission"),
+            )
+        } else if presentation.screen_share_active {
+            ("video-display-symbolic", gettext("Stop sharing screen"))
+        } else {
+            ("video-display-symbolic", gettext("Share screen"))
+        };
+        set_huddle_button_state(&imp.huddle_share_button, share_icon, &share_label);
+    }
+
+    fn huddle_detail(&self, snapshot: &HuddleSnapshot) -> String {
+        if let Some(failure) = snapshot.failure.as_ref() {
+            return gettext(&failure.message);
+        }
+        if let Some(failure) = snapshot.screen_share_failure.as_ref() {
+            return gettext(&failure.message);
+        }
+
+        let names = self.imp().user_names.borrow();
+        let mut participant_names = snapshot
+            .participants
+            .iter()
+            .filter_map(|participant| names.get(&participant.user_id).cloned())
+            .collect::<Vec<_>>();
+        participant_names.sort();
+        participant_names.dedup();
+        let participant_text = if participant_names.is_empty() {
+            match snapshot.participants.len() {
+                0 => gettext("No participant details"),
+                1 => gettext("1 participant"),
+                count => format!("{count} {}", gettext("participants")),
+            }
+        } else {
+            participant_names
+                .into_iter()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let mut indicators = Vec::new();
+        if snapshot.phase == HuddlePhase::Connected {
+            indicators.push(if snapshot.controls.microphone_muted {
+                gettext("mic muted")
+            } else {
+                gettext("mic on")
+            });
+            indicators.push(if snapshot.controls.camera_enabled {
+                gettext("camera on")
+            } else {
+                gettext("camera off")
+            });
+            if snapshot.screen_share_state == HuddleScreenShareState::Active {
+                indicators.push(gettext("sharing screen"));
+            }
+        }
+        if indicators.is_empty() {
+            participant_text
+        } else {
+            format!("{participant_text} · {}", indicators.join(" · "))
+        }
+    }
+
+    fn activate_huddle_primary_action(&self) {
+        let snapshot = self.imp().huddle_snapshot.borrow().clone();
+        let presentation = present_huddle(&snapshot, self.visible_channel_id().as_deref());
+        let Some(call_id) = snapshot.call_id().map(str::to_string) else {
+            return;
+        };
+        let command = match presentation.primary_action {
+            HuddlePrimaryAction::None => return,
+            HuddlePrimaryAction::OpenPreflight => HuddleCommand::OpenPreflight { call_id },
+            HuddlePrimaryAction::Join => HuddleCommand::Join { call_id },
+            HuddlePrimaryAction::OpenExternal => HuddleCommand::OpenExternally { call_id },
+        };
+        self.send_command(RuntimeCommand::Huddle(command));
+    }
+
+    fn open_active_huddle_externally(&self) {
+        let Some(call_id) = self
+            .imp()
+            .huddle_snapshot
+            .borrow()
+            .call_id()
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.send_command(RuntimeCommand::Huddle(HuddleCommand::OpenExternally {
+            call_id,
+        }));
+    }
+
+    fn toggle_huddle_mute(&self) {
+        let muted = self
+            .imp()
+            .huddle_snapshot
+            .borrow()
+            .controls
+            .microphone_muted;
+        self.send_command(RuntimeCommand::Huddle(HuddleCommand::SetMuted(!muted)));
+    }
+
+    fn toggle_huddle_camera(&self) {
+        let enabled = self.imp().huddle_snapshot.borrow().controls.camera_enabled;
+        self.send_command(RuntimeCommand::Huddle(HuddleCommand::SetCameraEnabled(
+            !enabled,
+        )));
+    }
+
+    fn toggle_huddle_screen_share(&self) {
+        let enabled = self
+            .imp()
+            .huddle_snapshot
+            .borrow()
+            .controls
+            .screen_share_enabled;
+        self.send_command(RuntimeCommand::Huddle(
+            HuddleCommand::SetScreenShareEnabled(!enabled),
+        ));
+    }
+
+    fn dismiss_huddle(&self) {
+        self.send_command(RuntimeCommand::Huddle(HuddleCommand::Dismiss));
+    }
+
+    fn show_huddle_preflight(&self) {
+        if self.imp().huddle_preflight_dialog.borrow().is_some() {
+            return;
+        }
+        let snapshot = self.imp().huddle_snapshot.borrow().clone();
+        if snapshot.phase != HuddlePhase::Preflight || snapshot.huddle.is_none() {
+            return;
+        }
+
+        let microphone = self.huddle_device_picker(HuddleDeviceKind::Microphone);
+        let speaker = self.huddle_device_picker(HuddleDeviceKind::Speaker);
+        let camera = self.huddle_device_picker(HuddleDeviceKind::Camera);
+        let choices = gtk::Box::new(gtk::Orientation::Vertical, 9);
+        choices.append(&huddle_device_row(
+            &gettext("Microphone"),
+            &microphone.dropdown,
+        ));
+        choices.append(&huddle_device_row(&gettext("Speaker"), &speaker.dropdown));
+        choices.append(&huddle_device_row(&gettext("Camera"), &camera.dropdown));
+        let privacy = gtk::Label::new(Some(&gettext(
+            "Camera and screen sharing stay off until you turn them on.",
+        )));
+        privacy.set_wrap(true);
+        privacy.set_xalign(0.0);
+        privacy.add_css_class("caption");
+        privacy.add_css_class("dim-label");
+        choices.append(&privacy);
+
+        let primary_label = if snapshot.native_join_available {
+            gettext("Join")
+        } else {
+            gettext("Open in Slack")
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading(gettext("Join Slack huddle"))
+            .body(if snapshot.native_join_available {
+                gettext("Choose devices before joining. Capture starts only after you join.")
+            } else {
+                gettext(
+                    "Native joining is unavailable for this Slack session. Review the devices, then continue in Slack.",
+                )
+            })
+            .extra_child(&choices)
+            .default_response("primary")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", &gettext("Cancel"));
+        dialog.add_response("primary", &primary_label);
+        dialog.set_response_appearance("primary", adw::ResponseAppearance::Suggested);
+
+        let weak_window = self.downgrade();
+        dialog.connect_response(None, move |_, response| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            window.imp().huddle_preflight_dialog.borrow_mut().take();
+            if response == "primary" {
+                window.activate_huddle_primary_action();
+            } else if window.imp().huddle_snapshot.borrow().phase == HuddlePhase::Preflight {
+                window.dismiss_huddle();
+            }
+        });
+
+        self.imp()
+            .huddle_preflight_dialog
+            .borrow_mut()
+            .replace(HuddlePreflightDialog {
+                dialog: dialog.clone(),
+                microphone,
+                speaker,
+                camera,
+            });
+        self.refresh_huddle_preflight_devices();
+        dialog.present(Some(self));
+    }
+
+    fn huddle_device_picker(&self, kind: HuddleDeviceKind) -> HuddleDevicePicker {
+        let dropdown = gtk::DropDown::from_strings(&[&gettext("System default")]);
+        dropdown.set_hexpand(true);
+        dropdown.set_enable_search(true);
+        let ids = Rc::new(RefCell::new(Vec::<String>::new()));
+        let updating = Rc::new(Cell::new(false));
+        let weak_window = self.downgrade();
+        let ids_for_selection = Rc::clone(&ids);
+        let updating_for_selection = Rc::clone(&updating);
+        dropdown.connect_selected_notify(move |dropdown| {
+            if updating_for_selection.get() {
+                return;
+            }
+            let Some(id) = ids_for_selection
+                .borrow()
+                .get(dropdown.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            if let Some(window) = weak_window.upgrade() {
+                window.send_command(RuntimeCommand::Huddle(HuddleCommand::SelectDevice {
+                    kind,
+                    id,
+                }));
+            }
+        });
+        HuddleDevicePicker {
+            dropdown,
+            ids,
+            updating,
+        }
+    }
+
+    fn refresh_huddle_preflight_devices(&self) {
+        let Some(preflight) = self.imp().huddle_preflight_dialog.borrow().clone() else {
+            return;
+        };
+        let devices = self.imp().huddle_devices.borrow().clone();
+        let selection = self.imp().huddle_snapshot.borrow().devices.clone();
+        for (picker, kind) in [
+            (&preflight.microphone, HuddleDeviceKind::Microphone),
+            (&preflight.speaker, HuddleDeviceKind::Speaker),
+            (&preflight.camera, HuddleDeviceKind::Camera),
+        ] {
+            update_huddle_device_picker(picker, kind, &devices, selection.selected(kind));
+        }
+    }
+
+    fn sync_huddle_notification(&self, snapshot: &HuddleSnapshot) {
+        if snapshot.phase == HuddlePhase::Discovered {
+            let Some(huddle) = snapshot.huddle.as_ref() else {
+                return;
+            };
+            if self.imp().notified_huddle_call_id.borrow().as_deref()
+                == Some(huddle.call_id.as_str())
+            {
+                return;
+            }
+            self.withdraw_huddle_notification();
+            let Some(workspace_id) = self.imp().workspace_id.borrow().clone() else {
+                return;
+            };
+            let Some(application) = self
+                .application()
+                .and_then(|application| application.downcast::<crate::ConduitApplication>().ok())
+            else {
+                return;
+            };
+            application.send_huddle_notification(
+                &workspace_id,
+                &huddle.channel_id,
+                &huddle.call_id,
+            );
+            self.imp()
+                .notified_huddle_call_id
+                .borrow_mut()
+                .replace(huddle.call_id.clone());
+        } else if matches!(
+            snapshot.phase,
+            HuddlePhase::Idle
+                | HuddlePhase::Preflight
+                | HuddlePhase::Joining
+                | HuddlePhase::Connected
+                | HuddlePhase::ExternallyHandedOff
+        ) {
+            self.withdraw_huddle_notification();
+        }
+    }
+
+    fn withdraw_huddle_notification(&self) {
+        let Some(call_id) = self.imp().notified_huddle_call_id.borrow_mut().take() else {
+            return;
+        };
+        let Some(workspace_id) = self.imp().workspace_id.borrow().clone() else {
+            return;
+        };
+        let Some(application) = self
+            .application()
+            .and_then(|application| application.downcast::<crate::ConduitApplication>().ok())
+        else {
+            return;
+        };
+        application.withdraw_huddle_notification(&workspace_id, &call_id);
     }
 
     fn notify_if_new_messages(
@@ -7541,6 +8065,56 @@ impl ConduitWindow {
     }
 }
 
+fn set_huddle_button_state(button: &gtk::Button, icon_name: &str, label: &str) {
+    button.set_icon_name(icon_name);
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
+fn huddle_device_row(label: &str, dropdown: &gtk::DropDown) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let label = gtk::Label::new(Some(label));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    row.append(&label);
+    row.append(dropdown);
+    row
+}
+
+fn update_huddle_device_picker(
+    picker: &HuddleDevicePicker,
+    kind: HuddleDeviceKind,
+    devices: &[HuddleDevice],
+    selected_id: Option<&str>,
+) {
+    let matching = devices
+        .iter()
+        .filter(|device| device.kind == kind)
+        .collect::<Vec<_>>();
+    let labels = if matching.is_empty() {
+        vec![gettext("System default")]
+    } else {
+        matching.iter().map(|device| device.label.clone()).collect()
+    };
+    let ids = matching
+        .iter()
+        .map(|device| device.id.clone())
+        .collect::<Vec<_>>();
+    let selected = matching
+        .iter()
+        .position(|device| selected_id == Some(device.id.as_str()))
+        .or_else(|| matching.iter().position(|device| device.is_default))
+        .unwrap_or_default() as u32;
+    let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+    let model = gtk::StringList::new(&label_refs);
+
+    picker.updating.set(true);
+    *picker.ids.borrow_mut() = ids;
+    picker.dropdown.set_model(Some(&model));
+    picker.dropdown.set_selected(selected);
+    picker.updating.set(false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7752,6 +8326,7 @@ mod tests {
             private: true,
             muted: false,
             external: false,
+            huddle_active: false,
             search_aliases: Vec::new(),
             status: None,
         }
@@ -8774,6 +9349,15 @@ mod tests {
             "GtkLabel\" id=\"message_status_label",
             "<property name=\"accessible-role\">status</property>",
             "GtkButton\" id=\"navigation_back_button",
+            "GtkRevealer\" id=\"huddle_revealer",
+            "GtkLabel\" id=\"huddle_title_label",
+            "GtkButton\" id=\"huddle_primary_button",
+            "GtkButton\" id=\"huddle_external_button",
+            "GtkBox\" id=\"huddle_controls_box",
+            "GtkButton\" id=\"huddle_mute_button",
+            "GtkButton\" id=\"huddle_camera_button",
+            "GtkButton\" id=\"huddle_share_button",
+            "GtkButton\" id=\"huddle_leave_button",
             "<property name=\"action-name\">win.go-back</property>",
             "<attribute name=\"action\">win.new-message</attribute>",
             "<attribute name=\"action\">win.new-channel</attribute>",
@@ -8793,6 +9377,7 @@ mod tests {
         assert!(!template.contains("<property name=\"width-request\">280</property>"));
         assert!(!template.contains("<property name=\"width-request\">220</property>"));
         assert!(!template.contains("<attribute name=\"action\">win.sign-out</attribute>"));
+        assert!(!template.contains("slack://"));
     }
 
     #[test]

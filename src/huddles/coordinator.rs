@@ -5,6 +5,7 @@ use crate::huddles::state::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Native media callbacks are feature-gated until Slack/Chime compatibility is verified.
 pub enum CoordinatorInput {
     HuddleDiscovered(ActiveHuddle),
     HuddleEnded {
