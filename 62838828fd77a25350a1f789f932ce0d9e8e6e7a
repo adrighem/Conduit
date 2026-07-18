@@ -1,0 +1,9 @@
+Task: Add GApplication and desktop URI ingress with metadata and activation tests
+
+Summary: Enabled HANDLES_OPEN alongside command-line handling, routed valid bounded Slack URI batches through the active Conduit window, registered x-scheme-handler/slack with %U, and added a headless launch/D-Bus activation smoke test.
+
+Modified: src/application.rs, src/main.rs, data/eu.vanadrighem.conduit.desktop.in, tests/meson.build, tests/test_search_provider_metadata.py, tests/test_slack_uri_activation.py
+
+Tests: cargo test (436 passed); Meson Search provider metadata and External Slack URI activation tests (2 passed)
+
+Rationale: Support official slack:// dispatch from desktop environments without claiming HTTP, HTTPS, or Conduit internal action URLs.
