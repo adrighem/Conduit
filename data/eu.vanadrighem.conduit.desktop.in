@@ -1,9 +1,10 @@
 [Desktop Entry]
 Name=Conduit
-Exec=@bindir@/conduit
+Exec=@bindir@/conduit %U
 Icon=eu.vanadrighem.conduit
 Terminal=false
 Type=Application
+MimeType=x-scheme-handler/slack;
 DBusActivatable=true
 Categories=Network;Chat;InstantMessaging;GTK;
 Keywords=Slack;Chat;Messaging;GTK;

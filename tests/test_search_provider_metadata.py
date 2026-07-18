@@ -33,6 +33,9 @@ def main() -> None:
     assert desktop["Type"] == "Application"
     assert desktop["Icon"] == "eu.vanadrighem.conduit"
     assert desktop["X-GNOME-UsesNotifications"] == "true"
+    assert desktop["Exec"].endswith("/conduit %U")
+    handlers = {value for value in desktop["MimeType"].split(";") if value}
+    assert handlers == {"x-scheme-handler/slack"}
 
     meson = (data / "meson.build").read_text(encoding="utf-8")
     assert "eu.vanadrighem.conduit.search-provider.ini" in meson

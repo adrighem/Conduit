@@ -25,17 +25,59 @@ use gtk::glib::variant::{StaticVariantType, ToVariant};
 use gtk::{gio, glib};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::Write;
 use std::time::Duration;
 
 use crate::auth::AppTokenStore;
 use crate::config::{self, VERSION};
 use crate::shortcuts::APP_SHORTCUTS;
+use crate::slack_link::{parse_slack_uri, SlackUri};
 use crate::ConduitWindow;
 
 const OPEN_CONVERSATION_ACTION: &str = "app.open-conversation";
 const ABOUT_ICON_NAME: &str = config::APPLICATION_ID;
 const ABOUT_LOGO_SIZE: i32 = 192;
 const NOTIFICATION_LIFETIME: Duration = Duration::from_secs(10);
+const MAX_EXTERNAL_SLACK_URIS: usize = 16;
+
+fn application_flags() -> gio::ApplicationFlags {
+    gio::ApplicationFlags::HANDLES_COMMAND_LINE | gio::ApplicationFlags::HANDLES_OPEN
+}
+
+fn parse_external_slack_uris<I>(values: I) -> Vec<SlackUri>
+where
+    I: IntoIterator<Item = String>,
+{
+    values
+        .into_iter()
+        .filter_map(|value| parse_slack_uri(&value).ok())
+        .take(MAX_EXTERNAL_SLACK_URIS)
+        .collect()
+}
+
+fn command_line_slack_uris(arguments: Vec<OsString>) -> Vec<SlackUri> {
+    parse_external_slack_uris(
+        arguments
+            .into_iter()
+            .skip(1)
+            .filter_map(|argument| argument.into_string().ok()),
+    )
+}
+
+fn record_test_slack_uri_opened() {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_OPEN_SLACK_URI_FILE") else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "opened");
+}
 
 fn resize_about_logo(dialog: &adw::AboutDialog) -> bool {
     let mut widgets = vec![dialog.clone().upcast::<gtk::Widget>()];
@@ -177,8 +219,18 @@ mod imp {
             self.set_debug_enabled(debug);
             crate::debug::set_enabled(debug);
             crate::debug::log("app", "debug logging enabled");
-            application.present_window(connect, debug_auth);
+            application.present_slack_uris(
+                connect,
+                debug_auth,
+                command_line_slack_uris(command_line.arguments()),
+            );
             0.into()
+        }
+
+        fn open(&self, files: &[gio::File], _hint: &str) {
+            let uris =
+                parse_external_slack_uris(files.iter().map(|file| file.uri().as_str().to_string()));
+            self.obj().present_slack_uris(false, false, uris);
         }
 
         fn shutdown(&self) {
@@ -198,10 +250,10 @@ glib::wrapper! {
 }
 
 impl ConduitApplication {
-    pub fn new(application_id: &str, flags: &gio::ApplicationFlags) -> Self {
+    pub fn new(application_id: &str) -> Self {
         glib::Object::builder()
             .property("application-id", application_id)
-            .property("flags", flags)
+            .property("flags", application_flags())
             .property("resource-base-path", "/eu/vanadrighem/conduit")
             .build()
     }
@@ -269,22 +321,28 @@ impl ConduitApplication {
         );
     }
 
-    fn present_window(&self, connect: bool, debug_auth: bool) {
+    fn present_window(&self, connect: bool, debug_auth: bool) -> ConduitWindow {
         self.configure_icon_theme();
 
-        let window = self.active_window().unwrap_or_else(|| {
-            let window = ConduitWindow::new(self);
-            window.upcast()
-        });
+        let window = self
+            .active_window()
+            .and_then(|window| window.downcast::<ConduitWindow>().ok())
+            .unwrap_or_else(|| ConduitWindow::new(self));
+        window.set_auth_debug(debug_auth);
+        if connect {
+            window.show_connect_requested();
+        }
+        window.present();
+        window
+    }
 
-        if let Ok(conduit_window) = window.clone().downcast::<ConduitWindow>() {
-            conduit_window.set_auth_debug(debug_auth);
-            if connect {
-                conduit_window.show_connect_requested();
+    fn present_slack_uris(&self, connect: bool, debug_auth: bool, uris: Vec<SlackUri>) {
+        let window = self.present_window(connect, debug_auth);
+        for uri in uris {
+            if window.open_slack_uri(uri) {
+                record_test_slack_uri_opened();
             }
         }
-
-        window.present();
     }
 
     fn flush_active_window_drafts(&self) {
@@ -297,13 +355,7 @@ impl ConduitApplication {
     }
 
     fn present_conversation_target(&self, workspace_id: String, channel_id: String) {
-        self.present_window(false, false);
-        let Some(window) = self
-            .active_window()
-            .and_then(|window| window.downcast::<ConduitWindow>().ok())
-        else {
-            return;
-        };
+        let window = self.present_window(false, false);
         if window.open_notification_target(workspace_id.clone(), channel_id.clone()) {
             if let Some(path) = std::env::var_os("CONDUIT_TEST_OPEN_TARGET_FILE") {
                 let _ = std::fs::write(
@@ -556,6 +608,46 @@ mod tests {
         assert_eq!(
             conversation_target_from_variant(&conversation_target_variant("T123", "  ")),
             None
+        );
+    }
+
+    #[test]
+    fn command_line_extracts_only_valid_slack_uris() {
+        let uris = command_line_slack_uris(vec![
+            OsString::from("conduit"),
+            OsString::from("--debug"),
+            OsString::from("https://example.slack.com/archives/C456"),
+            OsString::from("slack://channel?team=T123&id=C456"),
+            OsString::from("slack://channel?team=T123"),
+            OsString::from("slack://user?team=T123&id=U456"),
+        ]);
+
+        assert_eq!(
+            uris,
+            vec![
+                crate::slack_link::parse_slack_uri("slack://channel?team=T123&id=C456").unwrap(),
+                crate::slack_link::parse_slack_uri("slack://user?team=T123&id=U456").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn application_accepts_command_line_and_dbus_open_requests() {
+        let flags = application_flags();
+
+        assert!(flags.contains(gio::ApplicationFlags::HANDLES_COMMAND_LINE));
+        assert!(flags.contains(gio::ApplicationFlags::HANDLES_OPEN));
+    }
+
+    #[test]
+    fn external_slack_uri_batches_are_bounded() {
+        let arguments = std::iter::once(OsString::from("conduit"))
+            .chain((0..20).map(|_| OsString::from("slack://open")))
+            .collect();
+
+        assert_eq!(
+            command_line_slack_uris(arguments).len(),
+            MAX_EXTERNAL_SLACK_URIS
         );
     }
 }
