@@ -19,6 +19,9 @@ use crate::auth::{
 };
 use crate::config;
 use crate::conversation_catalog::ConversationCatalog;
+use crate::huddles::coordinator::{CoordinatorInput, HuddleCoordinator, HuddleEffect};
+use crate::huddles::model::{ActiveHuddle, HuddlePresence};
+use crate::huddles::state::{HuddleCommand, HuddleEvent, HuddleFailure, HuddlePhase};
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
     SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, SlackUserStatus, StoredToken,
@@ -163,6 +166,7 @@ pub enum RuntimeCommand {
         initial_comment: Option<String>,
         remove_after_upload: bool,
     },
+    Huddle(HuddleCommand),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -217,6 +221,7 @@ pub enum RuntimeOperation {
     Saved,
     FileUpload,
     SocketMode,
+    Huddle,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -240,6 +245,7 @@ pub enum RuntimeTarget {
         channel_id: String,
         thread_ts: Option<String>,
     },
+    Huddle(String),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -308,6 +314,7 @@ fn runtime_target_for_trace(target: &RuntimeTarget) -> String {
             "upload:{channel_id}:{}",
             thread_ts.as_deref().unwrap_or("main")
         ),
+        RuntimeTarget::Huddle(call_id) => format!("huddle:{call_id}"),
     }
 }
 
@@ -564,6 +571,13 @@ impl RuntimeCommand {
                 ),
                 RuntimeTaskLane::Upload,
             ),
+            Self::Huddle(command) => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::Huddle,
+                    RuntimeTarget::Huddle(command.call_id().unwrap_or("active").to_string()),
+                ),
+                RuntimeTaskLane::Interactive,
+            ),
         }
     }
 
@@ -809,6 +823,7 @@ pub enum RuntimeEventKind {
         thread_ts: Option<String>,
     },
     SocketModeEvent(SocketModeEvent),
+    Huddle(HuddleEvent),
     FileUploadProgress {
         fraction: f64,
         label: String,
@@ -931,6 +946,10 @@ impl RuntimeEventKind {
             Self::SocketModeEvent(_) => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
+            Self::Huddle(event) => OperationContext::new(
+                RuntimeOperation::Huddle,
+                RuntimeTarget::Huddle(event.call_id().unwrap_or("active").to_string()),
+            ),
             Self::RuntimeStartFailed(_) => {
                 OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace)
             }
@@ -1040,6 +1059,45 @@ struct RuntimeConnection {
     workspace_store: Option<WorkspaceStore>,
     user_cache: Arc<Mutex<HashMap<String, String>>>,
     read_marks: Arc<Mutex<HashMap<String, String>>>,
+    team_id: Option<String>,
+    huddles: HuddleActorHandle,
+}
+
+#[derive(Clone, Debug)]
+struct HuddleActorHandle {
+    sender: mpsc::UnboundedSender<HuddleActorMessage>,
+}
+
+#[derive(Debug)]
+enum HuddleActorMessage {
+    Command(HuddleCommand),
+    Input(CoordinatorInput),
+}
+
+impl HuddleActorHandle {
+    fn command(&self, command: HuddleCommand) -> Result<()> {
+        self.sender
+            .send(HuddleActorMessage::Command(command))
+            .map_err(|_| anyhow!("huddle coordinator is not available"))
+    }
+
+    fn input(&self, input: CoordinatorInput) -> Result<()> {
+        self.sender
+            .send(HuddleActorMessage::Input(input))
+            .map_err(|_| anyhow!("huddle coordinator is not available"))
+    }
+
+    fn observe_huddle(&self, huddle: ActiveHuddle) -> Result<()> {
+        self.input(CoordinatorInput::HuddleDiscovered(huddle))
+    }
+}
+
+fn huddle_actor_channel() -> (
+    HuddleActorHandle,
+    mpsc::UnboundedReceiver<HuddleActorMessage>,
+) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    (HuddleActorHandle { sender }, receiver)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1861,6 +1919,7 @@ fn spawn_authentication_task<F>(
             let result = future.await;
             match result {
                 Ok((token, api, auth)) => {
+                    let (huddles, huddle_receiver) = huddle_actor_channel();
                     let connection = {
                         let mut runtime_state =
                             state_for_task.lock().expect("runtime state lock poisoned");
@@ -1879,6 +1938,8 @@ fn spawn_authentication_task<F>(
                             )),
                             user_cache: Arc::new(Mutex::new(HashMap::new())),
                             read_marks: Arc::new(Mutex::new(HashMap::new())),
+                            team_id: auth.team_id.clone(),
+                            huddles,
                         };
                         runtime_state.connection = Some(connection.clone());
                         connection
@@ -1896,6 +1957,7 @@ fn spawn_authentication_task<F>(
                         connection,
                         limits,
                         current_user_id,
+                        huddle_receiver,
                     );
                 }
                 Err(error) => {
@@ -1913,7 +1975,18 @@ fn spawn_workspace_tasks(
     connection: RuntimeConnection,
     limits: RuntimeTaskLimits,
     current_user_id: Option<String>,
+    huddle_receiver: mpsc::UnboundedReceiver<HuddleActorMessage>,
 ) {
+    let huddle_events = events.unsolicited(OperationContext::new(
+        RuntimeOperation::Huddle,
+        RuntimeTarget::Huddle("active".to_string()),
+    ));
+    spawn_session_task(
+        state,
+        identity.session,
+        run_huddle_actor(huddle_receiver, huddle_events),
+    );
+
     let state_after_hydration = Arc::clone(state);
     let hydration_events = events.clone();
     let hydration_connection = connection.clone();
@@ -2062,6 +2135,8 @@ fn spawn_workspace_tasks(
                 socket_events,
                 connection.workspace_store.clone(),
                 current_user_id,
+                connection.team_id.clone(),
+                connection.huddles.clone(),
             ),
         );
     }
@@ -2195,6 +2270,10 @@ async fn handle_connected_command(
     events: &RuntimeEventSender,
     image_cache: &ImageAssetCache,
 ) -> Result<()> {
+    let command = match command {
+        RuntimeCommand::Huddle(command) => return connection.huddles.command(command),
+        command => command,
+    };
     let mut slack = Some(connection.slack.clone());
     let mut workspace_store = connection.workspace_store.clone();
     let mut user_cache = connection
@@ -2395,6 +2474,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         | RuntimeCommand::SignOut
         | RuntimeCommand::Disconnect => {
             return Err(anyhow!("session command reached connected task handler"));
+        }
+        RuntimeCommand::Huddle(_) => {
+            return Err(anyhow!("huddle command reached generic task handler"));
         }
         RuntimeCommand::RefreshConversations => {
             crate::debug::log("runtime", "RefreshConversations");
@@ -2963,6 +3045,8 @@ async fn run_socket_mode(
     events: RuntimeEventSender,
     workspace_store: Option<WorkspaceStore>,
     current_user_id: Option<String>,
+    team_id: Option<String>,
+    huddles: HuddleActorHandle,
 ) {
     let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
 
@@ -2980,7 +3064,10 @@ async fn run_socket_mode(
             sender
         });
         let persistence_for_run = persistence_sender.clone();
+        let huddles_for_run = huddles.clone();
+        let team_id_for_run = team_id.clone();
         let result = socket_mode::run_once(&credentials, move |event| {
+            observe_huddle_socket_event(&huddles_for_run, team_id_for_run.as_deref(), &event);
             if let Some(sender) = persistence_for_run.as_ref() {
                 let persistence_event = match &event {
                     SocketModeEvent::UserChanged(user)
@@ -3040,6 +3127,142 @@ async fn run_socket_mode(
 
         reconnect_delay = timing.next_backoff;
         tokio::time::sleep(timing.sleep).await;
+    }
+}
+
+fn observe_huddle_socket_event(
+    huddles: &HuddleActorHandle,
+    team_id: Option<&str>,
+    event: &SocketModeEvent,
+) {
+    let result = match event {
+        SocketModeEvent::Message(event) => {
+            let Some(room) = event.message.room.as_ref() else {
+                return;
+            };
+            if room.has_ended() {
+                room.id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|call_id| !call_id.is_empty())
+                    .map(|call_id| {
+                        huddles.input(CoordinatorInput::HuddleEnded {
+                            call_id: call_id.to_string(),
+                        })
+                    })
+                    .unwrap_or(Ok(()))
+            } else {
+                team_id
+                    .and_then(|team_id| room.active_huddle(team_id, &event.channel_id))
+                    .map(|huddle| huddles.observe_huddle(huddle))
+                    .unwrap_or(Ok(()))
+            }
+        }
+        SocketModeEvent::UserHuddleChanged(user) => observe_huddle_user(huddles, user),
+        SocketModeEvent::UserChanged(user)
+            if user.profile.as_ref().is_some_and(|profile| {
+                profile.huddle_state_call_id.is_some()
+                    || profile.huddle_state_channel_id.is_some()
+                    || profile.huddle_state_expiration_ts.is_some()
+                    || profile.huddle_state != crate::huddles::model::SlackHuddleState::DefaultUnset
+            }) =>
+        {
+            observe_huddle_user(huddles, user)
+        }
+        SocketModeEvent::UserChanged(_)
+        | SocketModeEvent::Reaction(_)
+        | SocketModeEvent::RefreshConversations => Ok(()),
+    };
+
+    if result.is_err() {
+        crate::debug::log("huddle", "HuddleRealtimeObservationDropped");
+    }
+}
+
+fn observe_huddle_user(huddles: &HuddleActorHandle, user: &SlackUser) -> Result<()> {
+    let Some(user_id) = user
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(());
+    };
+    huddles.input(CoordinatorInput::PresenceChanged {
+        user_id: user_id.to_string(),
+        presence: HuddlePresence::from_user(user),
+    })
+}
+
+async fn run_huddle_actor(
+    mut receiver: mpsc::UnboundedReceiver<HuddleActorMessage>,
+    events: RuntimeEventSender,
+) {
+    let mut coordinator = HuddleCoordinator::default();
+    while let Some(message) = receiver.recv().await {
+        let input = match message {
+            HuddleActorMessage::Command(command) => huddle_input_from_command(command),
+            HuddleActorMessage::Input(input) => input,
+        };
+        match coordinator.apply(input) {
+            Ok(effects) => apply_huddle_effects(&mut coordinator, effects, &events),
+            Err(error) => {
+                crate::debug::log("huddle", &format!("HuddleTransitionRejected error={error}"))
+            }
+        }
+    }
+
+    let _ = coordinator.apply(CoordinatorInput::Reset);
+}
+
+fn huddle_input_from_command(command: HuddleCommand) -> CoordinatorInput {
+    match command {
+        HuddleCommand::OpenPreflight { call_id } => CoordinatorInput::OpenPreflight { call_id },
+        HuddleCommand::Join { call_id } => CoordinatorInput::JoinRequested { call_id },
+        HuddleCommand::OpenExternally { call_id } => CoordinatorInput::OpenExternally { call_id },
+        HuddleCommand::Leave => CoordinatorInput::LeaveRequested,
+        HuddleCommand::Dismiss => CoordinatorInput::Dismissed,
+        HuddleCommand::SetMuted(muted) => CoordinatorInput::MutedChanged(muted),
+        HuddleCommand::SetCameraEnabled(enabled) => CoordinatorInput::CameraChanged(enabled),
+        HuddleCommand::SetScreenShareEnabled(enabled) => {
+            CoordinatorInput::ScreenShareChanged(enabled)
+        }
+        HuddleCommand::SelectDevice { kind, id } => CoordinatorInput::DeviceSelected { kind, id },
+    }
+}
+
+fn apply_huddle_effects(
+    coordinator: &mut HuddleCoordinator,
+    effects: Vec<HuddleEffect>,
+    events: &RuntimeEventSender,
+) {
+    let mut pending = std::collections::VecDeque::from(effects);
+    while let Some(effect) = pending.pop_front() {
+        match effect {
+            HuddleEffect::Publish(snapshot) => {
+                events.send_event(RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot)));
+            }
+            HuddleEffect::BeginNativeJoin { .. } => {
+                if let Ok(effects) =
+                    coordinator.apply(CoordinatorInput::Failed(HuddleFailure::unsupported()))
+                {
+                    pending.extend(effects);
+                }
+            }
+            HuddleEffect::StopSession if coordinator.snapshot().phase == HuddlePhase::Leaving => {
+                if let Ok(effects) = coordinator.apply(CoordinatorInput::MediaStopped) {
+                    pending.extend(effects);
+                }
+            }
+            HuddleEffect::OpenExternal(huddle) => events.send_event(RuntimeEventKind::Huddle(
+                HuddleEvent::OpenExternalRequested(huddle),
+            )),
+            HuddleEffect::ApplyControls(_)
+            | HuddleEffect::ApplyDeviceSelection(_)
+            | HuddleEffect::StartScreenShare
+            | HuddleEffect::StopScreenShare
+            | HuddleEffect::StopSession => {}
+        }
     }
 }
 
@@ -5141,6 +5364,16 @@ mod tests {
                 RuntimeTarget::File("F123".to_string()),
             )
         );
+        assert_eq!(
+            RuntimeCommand::Huddle(crate::huddles::state::HuddleCommand::OpenPreflight {
+                call_id: "R123".to_string(),
+            })
+            .operation_context(),
+            OperationContext::new(
+                RuntimeOperation::Huddle,
+                RuntimeTarget::Huddle("R123".to_string()),
+            )
+        );
 
         let channel_context = RuntimeCommand::LoadMessageContext(
             SearchMessageLocation::new("C123", "1710000000.000100", None).unwrap(),
@@ -5245,6 +5478,80 @@ mod tests {
                 RuntimeTarget::Channel("C123".to_string()),
             )
         );
+
+        let huddle = RuntimeCommand::Huddle(crate::huddles::state::HuddleCommand::SetMuted(true))
+            .descriptor();
+        assert_eq!(huddle.lane, RuntimeTaskLane::Interactive);
+        assert!(!huddle.supersedes_previous);
+        assert_eq!(
+            huddle.context,
+            OperationContext::new(
+                RuntimeOperation::Huddle,
+                RuntimeTarget::Huddle("active".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn huddle_actor_serializes_observation_and_user_commands() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender: event_sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Huddle,
+                    RuntimeTarget::Huddle("active".to_string()),
+                ),
+            };
+            let (handle, receiver) = huddle_actor_channel();
+            let actor = tokio::spawn(run_huddle_actor(receiver, events));
+            let huddle = crate::huddles::model::ActiveHuddle {
+                team_id: "T123".to_string(),
+                channel_id: "C123".to_string(),
+                call_id: "R123".to_string(),
+                name: None,
+                participant_ids: Vec::new(),
+                started_at: None,
+                huddle_link: None,
+            };
+
+            handle.observe_huddle(huddle).unwrap();
+            let discovered = event_receiver.recv().await.unwrap();
+            assert!(matches!(
+                discovered.kind,
+                RuntimeEventKind::Huddle(crate::huddles::state::HuddleEvent::Snapshot(
+                    crate::huddles::state::HuddleSnapshot {
+                        phase: crate::huddles::state::HuddlePhase::Discovered,
+                        ..
+                    }
+                ))
+            ));
+
+            handle
+                .command(crate::huddles::state::HuddleCommand::OpenPreflight {
+                    call_id: "R123".to_string(),
+                })
+                .unwrap();
+            let preflight = event_receiver.recv().await.unwrap();
+            assert!(matches!(
+                preflight.kind,
+                RuntimeEventKind::Huddle(crate::huddles::state::HuddleEvent::Snapshot(
+                    crate::huddles::state::HuddleSnapshot {
+                        phase: crate::huddles::state::HuddlePhase::Preflight,
+                        ..
+                    }
+                ))
+            ));
+
+            drop(handle);
+            actor.await.unwrap();
+        });
     }
 
     #[test]

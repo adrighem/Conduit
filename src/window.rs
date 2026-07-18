@@ -3414,6 +3414,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::SocketModeEvent(event) => self.handle_socket_mode_event(event),
+            RuntimeEventKind::Huddle(_) => {}
             RuntimeEventKind::UserLoaded {
                 user_id,
                 display_name,
