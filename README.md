@@ -120,7 +120,7 @@ xdg-mime default eu.vanadrighem.conduit.desktop x-scheme-handler/slack
 
 Save the first command's output if you may want to restore the previous handler later. Run the second command again with that desktop ID to restore it.
 
-Conduit accepts Slack's `open`, `channel`, `user`, `file`, `share-file`, and `app` URI forms. Channels, direct messages, and files use native Conduit surfaces. App links use Slack's HTTPS App Home fallback, and `share-file` opens the file but reports that sharing an existing file is not yet supported. Workspace-scoped links must match the currently connected Slack team; Conduit will not open a same-shaped target from another workspace.
+Conduit accepts Slack's `open`, `channel`, `user`, `file`, `share-file`, and `app` URI forms. Channels, direct messages, and files use native Conduit surfaces. App links use Slack's official HTTPS `app_redirect` fallback, which opens the app or bot conversation and cannot preserve a requested App Home tab. The `share-file` form opens the file but reports that sharing an existing file is not yet supported. Workspace-scoped links must match the currently connected Slack team; Conduit will not open a same-shaped target from another workspace.
 
 Firefox, Chromium, and other browsers normally show an external-protocol confirmation before handing a `slack://` URI to the selected desktop application. Conduit does not install a browser extension and does not claim `http` or `https`, so an ordinary Slack web link remains in the browser unless Slack itself turns it into a `slack://` request.
 
