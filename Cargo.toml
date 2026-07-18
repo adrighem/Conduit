@@ -6,6 +6,11 @@ edition = "2021"
 [features]
 default = []
 huddle-harness = []
+native-media = [
+  "dep:gstreamer",
+  "dep:gstreamer-sdp",
+  "dep:gstreamer-webrtc",
+]
 
 [dependencies]
 anyhow = "1.0"
@@ -13,6 +18,9 @@ base64 = "0.22"
 emojis = "0.9"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 gdk-pixbuf = "0.20"
+gstreamer = { version = "0.23.7", optional = true, features = ["v1_24"] }
+gstreamer-sdp = { version = "0.23.5", optional = true, features = ["v1_24"] }
+gstreamer-webrtc = { version = "0.23.5", optional = true, features = ["v1_24"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 gtk = { version = "0.9", package = "gtk4", features = ["gnome_46"] }
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
