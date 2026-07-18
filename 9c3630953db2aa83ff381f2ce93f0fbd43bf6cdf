@@ -1,0 +1,19 @@
+Task: Build the adaptive huddle UI, preflight, notifications, and external Slack fallback
+
+Summary:
+- Discovered active huddles from cached, fresh, older, prefetched, and realtime Slack room metadata.
+- Added a matching-channel huddle bar, sidebar indicator, camera-off preflight, device choices, persistent controls, roster summaries, and privacy-safe notifications.
+- Added strict canonical HTTPS fallback validation and explicit Open in Slack handoff without generating slack:// loops.
+- Made native device enumeration explicit/lazy so synthetic tests do not touch or disclose local hardware.
+
+Validation:
+- cargo test --locked (483 passed)
+- focused native synthetic pipeline test with screen-share,huddle-harness
+- Xvfb injected-huddle keyboard/UI smoke passed
+- cargo fmt --all -- --check passed
+- clippy unavailable in the host cargo installation
+
+Decisions:
+- Passive discovery is visible only in the matching conversation; an initiated session stays globally visible.
+- Native join remains unavailable unless both private Slack bootstrap and Chime capabilities are verified.
+- External handoff always uses exact https://app.slack.com/huddle/TEAM/CHANNEL.
