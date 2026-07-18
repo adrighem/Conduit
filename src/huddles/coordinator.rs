@@ -37,6 +37,7 @@ pub enum CoordinatorInput {
     MediaReconnected,
     MediaStopped,
     StatisticsUpdated(HuddleSessionStatistics),
+    JoinCapabilityChanged(bool),
     Failed(HuddleFailure),
     Reset,
 }
@@ -112,6 +113,9 @@ impl HuddleCoordinator {
             CoordinatorInput::MediaReconnected => self.media_connected(true),
             CoordinatorInput::MediaStopped => self.media_stopped(),
             CoordinatorInput::StatisticsUpdated(statistics) => self.update_statistics(statistics),
+            CoordinatorInput::JoinCapabilityChanged(available) => {
+                Ok(self.update_join_capability(available))
+            }
             CoordinatorInput::Failed(failure) => self.fail(failure),
             CoordinatorInput::Reset => self.reset(),
         }
@@ -145,6 +149,7 @@ impl HuddleCoordinator {
             return Ok(Vec::new());
         }
 
+        let native_join_available = self.snapshot.native_join_available;
         self.snapshot = HuddleSnapshot {
             phase: HuddlePhase::Discovered,
             participants: huddle
@@ -154,6 +159,7 @@ impl HuddleCoordinator {
                 .map(HuddleParticipant::from_user_id)
                 .collect(),
             huddle: Some(huddle),
+            native_join_available,
             ..Default::default()
         };
         Ok(self.publish())
@@ -403,6 +409,18 @@ impl HuddleCoordinator {
         }
         self.snapshot.statistics = Some(statistics);
         Ok(self.publish())
+    }
+
+    fn update_join_capability(&mut self, available: bool) -> Vec<HuddleEffect> {
+        if self.snapshot.native_join_available == available {
+            return Vec::new();
+        }
+        self.snapshot.native_join_available = available;
+        if self.snapshot.huddle.is_some() {
+            self.publish()
+        } else {
+            Vec::new()
+        }
     }
 
     fn fail(&mut self, failure: HuddleFailure) -> Result<Vec<HuddleEffect>, HuddleTransitionError> {

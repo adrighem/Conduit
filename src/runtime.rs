@@ -21,6 +21,7 @@ use crate::config;
 use crate::conversation_catalog::ConversationCatalog;
 use crate::huddles::coordinator::{CoordinatorInput, HuddleCoordinator, HuddleEffect};
 use crate::huddles::model::{ActiveHuddle, HuddlePresence};
+use crate::huddles::signaling::{production_native_join_capability, NativeJoinCapability};
 use crate::huddles::state::{HuddleCommand, HuddleEvent, HuddleFailure, HuddlePhase};
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
@@ -1984,7 +1985,11 @@ fn spawn_workspace_tasks(
     spawn_session_task(
         state,
         identity.session,
-        run_huddle_actor(huddle_receiver, huddle_events),
+        run_huddle_actor(
+            huddle_receiver,
+            huddle_events,
+            production_native_join_capability(connection.slack.browser_cookie_d().is_some()),
+        ),
     );
 
     let state_after_hydration = Arc::clone(state);
@@ -3188,24 +3193,36 @@ fn observe_huddle_user(huddles: &HuddleActorHandle, user: &SlackUser) -> Result<
     else {
         return Ok(());
     };
+    let unix_seconds = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    let presence =
+        HuddlePresence::from_user(user).filter(|presence| presence.is_active_at(unix_seconds));
     huddles.input(CoordinatorInput::PresenceChanged {
         user_id: user_id.to_string(),
-        presence: HuddlePresence::from_user(user),
+        presence,
     })
 }
 
 async fn run_huddle_actor(
     mut receiver: mpsc::UnboundedReceiver<HuddleActorMessage>,
     events: RuntimeEventSender,
+    join_capability: NativeJoinCapability,
 ) {
     let mut coordinator = HuddleCoordinator::default();
+    let _ = coordinator.apply(CoordinatorInput::JoinCapabilityChanged(
+        join_capability.is_available(),
+    ));
     while let Some(message) = receiver.recv().await {
         let input = match message {
             HuddleActorMessage::Command(command) => huddle_input_from_command(command),
             HuddleActorMessage::Input(input) => input,
         };
         match coordinator.apply(input) {
-            Ok(effects) => apply_huddle_effects(&mut coordinator, effects, &events),
+            Ok(effects) => {
+                apply_huddle_effects(&mut coordinator, effects, &events, join_capability)
+            }
             Err(error) => {
                 crate::debug::log("huddle", &format!("HuddleTransitionRejected error={error}"))
             }
@@ -3235,6 +3252,7 @@ fn apply_huddle_effects(
     coordinator: &mut HuddleCoordinator,
     effects: Vec<HuddleEffect>,
     events: &RuntimeEventSender,
+    join_capability: NativeJoinCapability,
 ) {
     let mut pending = std::collections::VecDeque::from(effects);
     while let Some(effect) = pending.pop_front() {
@@ -3243,9 +3261,11 @@ fn apply_huddle_effects(
                 events.send_event(RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot)));
             }
             HuddleEffect::BeginNativeJoin { .. } => {
-                if let Ok(effects) =
-                    coordinator.apply(CoordinatorInput::Failed(HuddleFailure::unsupported()))
-                {
+                let failure = match join_capability {
+                    NativeJoinCapability::Unavailable(reason) => reason.failure(),
+                    NativeJoinCapability::Available { .. } => HuddleFailure::protocol_changed(),
+                };
+                if let Ok(effects) = coordinator.apply(CoordinatorInput::Failed(failure)) {
                     pending.extend(effects);
                 }
             }
@@ -5510,7 +5530,11 @@ mod tests {
                 ),
             };
             let (handle, receiver) = huddle_actor_channel();
-            let actor = tokio::spawn(run_huddle_actor(receiver, events));
+            let actor = tokio::spawn(run_huddle_actor(
+                receiver,
+                events,
+                production_native_join_capability(false),
+            ));
             let huddle = crate::huddles::model::ActiveHuddle {
                 team_id: "T123".to_string(),
                 channel_id: "C123".to_string(),

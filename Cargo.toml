@@ -3,6 +3,10 @@ name = "conduit"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+huddle-harness = []
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

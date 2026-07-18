@@ -185,6 +185,7 @@ pub struct HuddleSnapshot {
     pub participants: Vec<HuddleParticipant>,
     pub statistics: Option<HuddleSessionStatistics>,
     pub failure: Option<HuddleFailure>,
+    pub native_join_available: bool,
 }
 
 impl HuddleSnapshot {
