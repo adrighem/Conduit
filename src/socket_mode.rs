@@ -9,6 +9,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::models::{SlackMessage, SlackUser};
+use crate::realtime::RealtimeTransport;
 
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -95,6 +96,15 @@ pub enum SocketModeCredentials {
     },
 }
 
+impl SocketModeCredentials {
+    pub(crate) fn transport(&self) -> RealtimeTransport {
+        match self {
+            Self::AppToken(_) => RealtimeTransport::SocketMode,
+            Self::BrowserSession { .. } => RealtimeTransport::BrowserSession,
+        }
+    }
+}
+
 fn build_websocket_request(
     url: &str,
     credentials: &SocketModeCredentials,
@@ -143,6 +153,7 @@ fn build_websocket_request(
 
 pub async fn run_once(
     credentials: &SocketModeCredentials,
+    on_connected: impl FnOnce(),
     mut handle_event: impl FnMut(SocketModeEvent),
 ) -> Result<SocketModeDisconnect> {
     let protocol = RealtimeProtocol::from_credentials(credentials);
@@ -154,6 +165,7 @@ pub async fn run_once(
         .await
         .context("timed out connecting Slack Socket Mode WebSocket")?
         .context("failed to connect Slack Socket Mode WebSocket")?;
+    on_connected();
 
     loop {
         let message = tokio::time::timeout(WEBSOCKET_IDLE_TIMEOUT, socket.next())

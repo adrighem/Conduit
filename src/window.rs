@@ -22,6 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -57,6 +58,7 @@ use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
     SlackMessage, SlackUnreadState, SlackUser, SlackUserStatus,
 };
+use crate::realtime::{RealtimePhase, RealtimeStatus};
 use crate::rendering;
 use crate::runtime::{
     AppRuntime, OperationContext, RequestId, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
@@ -268,6 +270,7 @@ mod imp {
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
         pub custom_emojis: RefCell<HashMap<String, String>>,
+        pub realtime_status: Cell<RealtimeStatus>,
         pub(super) message_emoji_completion: RefCell<Option<ComposerEmojiCompletion>>,
         pub(super) thread_emoji_completion: RefCell<Option<ComposerEmojiCompletion>>,
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
@@ -296,6 +299,13 @@ mod imp {
     }
 
     impl ObjectImpl for ConduitWindow {
+        fn signals() -> &'static [glib::subclass::Signal] {
+            static SIGNALS: LazyLock<Vec<glib::subclass::Signal>> = LazyLock::new(|| {
+                vec![glib::subclass::Signal::builder("realtime-status-changed").build()]
+            });
+            SIGNALS.as_ref()
+        }
+
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
@@ -1673,6 +1683,31 @@ impl ConduitWindow {
             .build()
     }
 
+    pub(crate) fn realtime_status(&self) -> RealtimeStatus {
+        self.imp().realtime_status.get()
+    }
+
+    pub(crate) fn connect_realtime_status_changed(
+        &self,
+        callback: impl Fn(&Self) + 'static,
+    ) -> glib::SignalHandlerId {
+        self.connect_local("realtime-status-changed", false, move |values| {
+            let window = values[0]
+                .get::<Self>()
+                .expect("realtime status signal emitted by ConduitWindow");
+            callback(&window);
+            None
+        })
+    }
+
+    fn set_realtime_status(&self, status: RealtimeStatus) {
+        if self.imp().realtime_status.replace(status) == status {
+            return;
+        }
+        self.render_workspace_lifecycle();
+        self.emit_by_name::<()>("realtime-status-changed", &[]);
+    }
+
     fn setup_adaptive_layout(&self) {
         let imp = self.imp();
 
@@ -2461,7 +2496,7 @@ impl ConduitWindow {
         clear_stale_upload_staging();
         self.setup_window_actions();
         self.connect_close_request(|window| {
-            window.flush_drafts();
+            window.flush_persistent_state();
             glib::Propagation::Proceed
         });
         self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
@@ -2599,6 +2634,7 @@ impl ConduitWindow {
 
     fn setup_settings(&self) {
         let settings = gio::Settings::new(config::APPLICATION_ID);
+        self.restore_window_state(&settings);
         *self.imp().drafts.borrow_mut() = DraftSettings::new(settings.clone()).load();
         let weak_window = self.downgrade();
         settings.connect_changed(
@@ -2610,6 +2646,32 @@ impl ConduitWindow {
             },
         );
         *self.imp().settings.borrow_mut() = Some(settings);
+    }
+
+    fn restore_window_state(&self, settings: &gio::Settings) {
+        self.set_default_size(
+            settings.int(config::WINDOW_WIDTH_KEY),
+            settings.int(config::WINDOW_HEIGHT_KEY),
+        );
+        if settings.boolean(config::WINDOW_MAXIMIZED_KEY) {
+            self.maximize();
+        }
+    }
+
+    fn save_window_state(&self) {
+        let Some(settings) = self.imp().settings.borrow().as_ref().cloned() else {
+            return;
+        };
+        let (width, height) = self.default_size();
+        for result in [
+            settings.set_int(config::WINDOW_WIDTH_KEY, width),
+            settings.set_int(config::WINDOW_HEIGHT_KEY, height),
+            settings.set_boolean(config::WINDOW_MAXIMIZED_KEY, self.is_maximized()),
+        ] {
+            if let Err(error) = result {
+                crate::debug::log("settings", &format!("WindowStateSaveFailed error={error}"));
+            }
+        }
     }
 
     fn draft_key(&self, channel_id: &str, thread_ts: Option<&str>) -> Option<DraftKey> {
@@ -2668,8 +2730,9 @@ impl ConduitWindow {
         self.save_current_drafts();
     }
 
-    pub(crate) fn flush_drafts(&self) {
+    pub(crate) fn flush_persistent_state(&self) {
         self.flush_current_drafts();
+        self.save_window_state();
     }
 
     fn save_current_drafts(&self) {
@@ -3528,6 +3591,7 @@ impl ConduitWindow {
                     self.populate_saved_items(items);
                 }
             }
+            RuntimeEventKind::RealtimeStatusChanged(status) => self.set_realtime_status(status),
             RuntimeEventKind::SocketModeEvent(event) => self.handle_socket_mode_event(event),
             RuntimeEventKind::Huddle(event) => self.handle_huddle_event(event),
             RuntimeEventKind::UserLoaded {
@@ -4925,6 +4989,7 @@ impl ConduitWindow {
         }
         imp.huddle_revealer.set_reveal_child(false);
         imp.workspace.reset();
+        self.set_realtime_status(RealtimeStatus::default());
         imp.navigation_history.borrow_mut().clear();
         imp.restoring_navigation.set(false);
         imp.profile_visible.set(false);
@@ -5035,8 +5100,21 @@ impl ConduitWindow {
 
         let (icon_name, tooltip) = match imp.workspace.lifecycle() {
             WorkspaceLifecycle::Ready => (
-                "network-wired-symbolic",
-                gettext("Realtime connection active"),
+                match imp.realtime_status.get().phase {
+                    RealtimePhase::Online => "network-wired-symbolic",
+                    RealtimePhase::Connecting => "network-wireless-acquiring-symbolic",
+                    RealtimePhase::Reconnecting | RealtimePhase::NotConfigured => {
+                        "network-wired-offline-symbolic"
+                    }
+                    RealtimePhase::ConfigurationError => "dialog-warning-symbolic",
+                },
+                gettext(match imp.realtime_status.get().phase {
+                    RealtimePhase::Online => "Realtime updates online",
+                    RealtimePhase::Connecting => "Connecting realtime updates...",
+                    RealtimePhase::Reconnecting => "Realtime connection interrupted; retrying...",
+                    RealtimePhase::NotConfigured => "Realtime updates are not configured",
+                    RealtimePhase::ConfigurationError => "Realtime updates could not be configured",
+                }),
             ),
             WorkspaceLifecycle::Connecting | WorkspaceLifecycle::Syncing => (
                 "network-wireless-acquiring-symbolic",

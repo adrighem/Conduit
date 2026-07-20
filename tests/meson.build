@@ -3,6 +3,7 @@ xvfb_run = find_program('xvfb-run', required: false)
 xdotool = find_program('xdotool', required: false)
 xclip = find_program('xclip', required: false)
 xfwm4 = find_program('xfwm4', required: false)
+xprop = find_program('xprop', required: false)
 
 test_service_conf = configuration_data()
 test_service_conf.set('bindir', meson.project_build_root() / 'src')
@@ -102,7 +103,29 @@ if xvfb_run.found() and xfwm4.found()
     timeout: 90,
   )
 
-  if xdotool.found()
+  if xdotool.found() and xprop.found()
+    test(
+      'Window state persistence',
+      python,
+      args: [
+        files('run_headless.py'),
+        files('test_window_state.py'),
+      ],
+      env: [
+        'CONDUIT_TEST_BINARY=' + meson.project_build_root() / 'src' / meson.project_name(),
+        'CONDUIT_TEST_RESOURCE=' + meson.project_build_root() / 'src' / 'conduit.gresource',
+        'CONDUIT_TEST_SCHEMA=' + meson.project_source_root() / 'data' / 'eu.vanadrighem.conduit.gschema.xml',
+        'GSETTINGS_BACKEND=keyfile',
+        'GDK_DEBUG=no-portals',
+        'GDK_BACKEND=x11',
+        'GSK_RENDERER=cairo',
+        'GTK_A11Y=none',
+        'XDG_SESSION_TYPE=x11',
+      ],
+      depends: [cargo_build],
+      timeout: 90,
+    )
+
     test(
       'Huddle UI smoke',
       python,

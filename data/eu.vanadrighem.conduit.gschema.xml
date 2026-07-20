@@ -16,5 +16,20 @@
 			<summary>Recently used message reactions</summary>
 			<description>The three most recently used emoji reaction names shown in message quick actions.</description>
 		</key>
+		<key name="window-width" type="i">
+			<default>1120</default>
+			<summary>Main window width</summary>
+			<description>The last non-maximized width of the main window.</description>
+		</key>
+		<key name="window-height" type="i">
+			<default>720</default>
+			<summary>Main window height</summary>
+			<description>The last non-maximized height of the main window.</description>
+		</key>
+		<key name="window-maximized" type="b">
+			<default>false</default>
+			<summary>Main window maximized state</summary>
+			<description>Whether the main window was maximized when Conduit last closed.</description>
+		</key>
 	</schema>
 </schemalist>

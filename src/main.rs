@@ -31,6 +31,7 @@ mod gnome_search_provider;
 mod huddles;
 mod message_html;
 mod models;
+mod realtime;
 mod rendering;
 mod runtime;
 mod search;

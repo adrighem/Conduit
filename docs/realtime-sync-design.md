@@ -10,11 +10,11 @@ The official Slack Events API and Socket Mode model requires app-level Slack con
 
 ## Current Slice
 
-Conduit implements optional live Socket Mode ingestion.
+Conduit implements optional live ingestion through either official Socket Mode or Slack's browser-session WebSocket.
 
-Socket Mode is enabled only when an app-level token is provided through `CONDUIT_SLACK_APP_TOKEN` or `SLACK_APP_TOKEN`. The default user-token authentication path remains unchanged, and the app continues to work with manual refresh and direct Web API calls when no app token is configured.
+OAuth workspaces use Socket Mode when an app-level token is stored or provided through `CONDUIT_SLACK_APP_TOKEN` or `SLACK_APP_TOKEN`. Imported XOXC/XOXD workspaces instead use the browser-session WebSocket automatically and do not need an app token. The app continues to work with manual refresh and direct Web API calls when no realtime transport is configured.
 
-The runtime starts a single Socket Mode connection after workspace authentication and aborts it on sign-out or reconnect. It calls `apps.connections.open`, connects to the temporary WebSocket URL, acknowledges every envelope with its `envelope_id`, and reconnects after Slack disconnect or refresh requests. If Slack reports `link_disabled` because Socket Mode is disabled in the app settings, Conduit keeps retrying with capped backoff so the running client reconnects automatically once the Slack app is enabled again.
+The runtime starts one realtime connection after workspace authentication and aborts it on sign-out or reconnect. Socket Mode calls `apps.connections.open` and acknowledges every envelope with its `envelope_id`; browser sessions call `client.getWebSocketURL` and consume browser RTM events. Both transports reconnect with capped backoff after disconnects. If Slack reports `link_disabled`, Conduit keeps retrying so the running client reconnects once the link is enabled again.
 
 The first reducer set covers:
 
@@ -30,7 +30,6 @@ Unsupported envelopes are acknowledged and ignored.
 
 Future Socket Mode work should add:
 
-- A native app-token setup and secure storage path, separate from the user token.
 - Realtime reducers for direct-message and group-DM activity that Slack does not deliver as plain message payloads.
 - User/profile update reducers.
 - Read-marker reducers once the read-state model exists.
@@ -46,12 +45,12 @@ Realtime should be invisible when unavailable. The app should keep working with:
 - Cached conversations and histories.
 - Direct Web API calls.
 
-When Socket Mode is configured, connection state is logged through debug output. It should not add persistent sidebar noise.
+Preferences shows the live handshake state. Browser-session workspaces show an XOXC/XOXD status row and hide the irrelevant app-token editor; OAuth workspaces retain the Socket Mode token editor.
 
 ## Security And Packaging
 
 - Do not request bot scopes in the default PKCE flow.
-- Do not store app tokens in cache files. The current implementation reads them from the environment only.
+- Do not store app tokens or browser-session credentials in cache files. App tokens and imported sessions use the system keyring; environment configuration remains available for development and packaging.
 - Do not require Socket Mode for Flatpak packaging or normal user setup.
 - Keep logs free of access tokens, app tokens, authorization codes, and Socket Mode URLs.
 
@@ -59,7 +58,6 @@ When Socket Mode is configured, connection state is logged through debug output.
 
 Expand live Socket Mode after:
 
-1. A secure app-token setup path exists.
-2. Read-marker reducers exist.
-3. Runtime state updates can apply additional targeted message/conversation deltas.
-4. Activity can represent mention, reply, and reaction notifications beyond conversation unread counts.
+1. Read-marker reducers exist.
+2. Runtime state updates can apply additional targeted message/conversation deltas.
+3. Activity can represent mention, reply, and reaction notifications beyond conversation unread counts.

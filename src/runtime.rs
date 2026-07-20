@@ -27,6 +27,7 @@ use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
     SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, SlackUserStatus, StoredToken,
 };
+use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::{
     ConversationHistoryProgress, ConversationHistoryService,
 };
@@ -823,6 +824,7 @@ pub enum RuntimeEventKind {
         saved: bool,
         thread_ts: Option<String>,
     },
+    RealtimeStatusChanged(RealtimeStatus),
     SocketModeEvent(SocketModeEvent),
     Huddle(HuddleEvent),
     FileUploadProgress {
@@ -944,7 +946,7 @@ impl RuntimeEventKind {
                 RuntimeOperation::AttachmentDownload,
                 RuntimeTarget::Attachment(url.clone()),
             ),
-            Self::SocketModeEvent(_) => {
+            Self::RealtimeStatusChanged(_) | Self::SocketModeEvent(_) => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
             Self::Huddle(event) => OperationContext::new(
@@ -2108,44 +2110,60 @@ fn spawn_workspace_tasks(
         );
     });
 
-    let credentials = match configured_app_token() {
-        Ok(Some(app_token)) => Some(socket_mode::SocketModeCredentials::AppToken(app_token)),
-        Ok(None) => {
-            if let Some(cookie) = connection.slack.browser_cookie_d() {
-                Some(socket_mode::SocketModeCredentials::BrowserSession {
-                    xoxc_token: connection.slack.access_token().to_string(),
-                    xoxd_token: cookie.to_string(),
-                    user_agent: connection.slack.user_agent().map(|ua| ua.to_string()),
-                })
-            } else {
-                None
-            }
+    let socket_events = events.unsolicited(OperationContext::new(
+        RuntimeOperation::SocketMode,
+        RuntimeTarget::Workspace,
+    ));
+    let browser_credentials = connection.slack.browser_cookie_d().map(|cookie| {
+        socket_mode::SocketModeCredentials::BrowserSession {
+            xoxc_token: connection.slack.access_token().to_string(),
+            xoxd_token: cookie.to_string(),
+            user_agent: connection.slack.user_agent().map(str::to_string),
         }
+    });
+    let credentials = select_realtime_credentials(browser_credentials, configured_app_token);
+    match credentials {
+        Ok(Some(credentials)) => {
+            socket_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
+                RealtimeStatus::connecting(credentials.transport()),
+            ));
+            spawn_session_task(
+                state,
+                identity.session,
+                run_socket_mode(
+                    credentials,
+                    socket_events,
+                    connection.workspace_store.clone(),
+                    current_user_id,
+                    connection.team_id.clone(),
+                    connection.huddles.clone(),
+                ),
+            );
+        }
+        Ok(None) => socket_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
+            RealtimeStatus::default(),
+        )),
         Err(error) => {
             crate::debug::log(
                 "socket",
                 &format!("SocketModeTokenLoadFailed error={error:#}"),
             );
-            None
+            socket_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
+                RealtimeStatus::configuration_error(),
+            ));
         }
-    };
-    if let Some(credentials) = credentials {
-        let socket_events = events.unsolicited(OperationContext::new(
-            RuntimeOperation::SocketMode,
-            RuntimeTarget::Workspace,
-        ));
-        spawn_session_task(
-            state,
-            identity.session,
-            run_socket_mode(
-                credentials,
-                socket_events,
-                connection.workspace_store.clone(),
-                current_user_id,
-                connection.team_id.clone(),
-                connection.huddles.clone(),
-            ),
-        );
+    }
+}
+
+fn select_realtime_credentials(
+    browser_credentials: Option<socket_mode::SocketModeCredentials>,
+    load_app_token: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<socket_mode::SocketModeCredentials>> {
+    match browser_credentials {
+        Some(credentials) => Ok(Some(credentials)),
+        None => {
+            load_app_token().map(|token| token.map(socket_mode::SocketModeCredentials::AppToken))
+        }
     }
 }
 
@@ -3109,9 +3127,11 @@ async fn run_socket_mode(
     huddles: HuddleActorHandle,
 ) {
     let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
+    let transport = credentials.transport();
 
     loop {
         let events_for_run = events.clone();
+        let connected_events = events.clone();
         let mut persistence_tasks = tokio::task::JoinSet::new();
         let persistence_sender = workspace_store.clone().map(|store| {
             let (sender, receiver) = mpsc::channel(SOCKET_MODE_PERSISTENCE_QUEUE_CAPACITY);
@@ -3126,31 +3146,44 @@ async fn run_socket_mode(
         let persistence_for_run = persistence_sender.clone();
         let huddles_for_run = huddles.clone();
         let team_id_for_run = team_id.clone();
-        let result = socket_mode::run_once(&credentials, move |event| {
-            observe_huddle_socket_event(&huddles_for_run, team_id_for_run.as_deref(), &event);
-            if let Some(sender) = persistence_for_run.as_ref() {
-                let persistence_event = match &event {
-                    SocketModeEvent::UserChanged(user)
-                    | SocketModeEvent::UserHuddleChanged(user) => {
-                        Some(RealtimePersistenceEvent::UserChanged(user.clone()))
-                    }
-                    SocketModeEvent::Message(message) => {
-                        Some(RealtimePersistenceEvent::Message(message.clone()))
-                    }
-                    SocketModeEvent::Reaction(_) | SocketModeEvent::RefreshConversations => None,
-                };
-                if let Some(persistence_event) = persistence_event {
-                    if let Err(error) = sender.try_send(persistence_event) {
-                        crate::debug::log(
-                            "store",
-                            &format!("RealtimePersistenceQueueRejected error={error}"),
-                        );
+        let result = socket_mode::run_once(
+            &credentials,
+            move || {
+                connected_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
+                    RealtimeStatus::online(transport),
+                ));
+            },
+            move |event| {
+                observe_huddle_socket_event(&huddles_for_run, team_id_for_run.as_deref(), &event);
+                if let Some(sender) = persistence_for_run.as_ref() {
+                    let persistence_event = match &event {
+                        SocketModeEvent::UserChanged(user)
+                        | SocketModeEvent::UserHuddleChanged(user) => {
+                            Some(RealtimePersistenceEvent::UserChanged(user.clone()))
+                        }
+                        SocketModeEvent::Message(message) => {
+                            Some(RealtimePersistenceEvent::Message(message.clone()))
+                        }
+                        SocketModeEvent::Reaction(_) | SocketModeEvent::RefreshConversations => {
+                            None
+                        }
+                    };
+                    if let Some(persistence_event) = persistence_event {
+                        if let Err(error) = sender.try_send(persistence_event) {
+                            crate::debug::log(
+                                "store",
+                                &format!("RealtimePersistenceQueueRejected error={error}"),
+                            );
+                        }
                     }
                 }
-            }
-            events_for_run.send_event(RuntimeEventKind::SocketModeEvent(event));
-        })
+                events_for_run.send_event(RuntimeEventKind::SocketModeEvent(event));
+            },
+        )
         .await;
+        events.send_event(RuntimeEventKind::RealtimeStatusChanged(
+            RealtimeStatus::reconnecting(transport),
+        ));
         drop(persistence_sender);
         while let Some(join_result) = persistence_tasks.join_next().await {
             if let Err(error) = join_result {
@@ -4604,12 +4637,50 @@ impl EventSenderExt for RuntimeEventSender {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::future;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn browser_session_realtime_takes_precedence_without_loading_an_app_token() {
+        let app_token_loaded = Cell::new(false);
+        let browser = socket_mode::SocketModeCredentials::BrowserSession {
+            xoxc_token: "xoxc-browser".into(),
+            xoxd_token: "xoxd-browser".into(),
+            user_agent: None,
+        };
+
+        let selected = select_realtime_credentials(Some(browser.clone()), || {
+            app_token_loaded.set(true);
+            Ok(Some("xapp-unused".into()))
+        })
+        .expect("browser realtime selection should succeed");
+
+        assert_eq!(selected, Some(browser));
+        assert!(!app_token_loaded.get());
+    }
+
+    #[test]
+    fn app_token_realtime_remains_the_oauth_fallback() {
+        let selected = select_realtime_credentials(None, || Ok(Some("xapp-fallback".into())))
+            .expect("app-token realtime selection should succeed");
+
+        assert_eq!(
+            selected,
+            Some(socket_mode::SocketModeCredentials::AppToken(
+                "xapp-fallback".into()
+            ))
+        );
+        assert_eq!(
+            select_realtime_credentials(None, || Ok(None))
+                .expect("missing realtime credentials are valid"),
+            None
+        );
+    }
 
     #[derive(Clone)]
     struct TraceWriter(Arc<Mutex<Vec<u8>>>);

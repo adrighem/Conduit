@@ -184,6 +184,8 @@ The aliases `SLACK_MCP_XOXC_TOKEN`, `SLACK_MCP_XOXD_TOKEN`, and `SLACK_MCP_USER_
 
 Browser-session credentials are highly sensitive and rely on an unofficial authentication path. Keep them out of shell history, logs, commits, screenshots, and issue reports. Unset the variables after import if you do not want Conduit to import them again after sign-out.
 
+An imported browser session also supplies realtime updates through Slack's browser WebSocket. No `xapp-` token is needed for that workspace; **Preferences → Realtime updates** shows whether the XOXC/XOXD connection is online or retrying.
+
 ## Optional realtime updates
 
 Enable Socket Mode in your Slack app, create an app-level token with `connections:write`, and subscribe to the message, reaction, and conversation events you want Conduit to receive. Save the `xapp-` token under **Preferences → Realtime updates**, then restart Conduit. The token is stored in the system keyring.
@@ -194,7 +196,7 @@ For development, the token can instead be supplied through the environment:
 export CONDUIT_SLACK_APP_TOKEN=xapp-...
 ```
 
-`SLACK_APP_TOKEN` is accepted as an alias. Environment values take precedence over the keyring. Socket Mode starts after authentication, stops on sign-out, and reconnects automatically after transient failures. Incoming posts produce ten-second desktop notifications unless the message is your own, duplicated, muted, system noise, or already visible in the active conversation. Without Socket Mode, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
+`SLACK_APP_TOKEN` is accepted as an alias. Environment values take precedence over the keyring. Socket Mode starts after OAuth authentication, stops on sign-out, and reconnects automatically after transient failures. Browser-session workspaces use their XOXC/XOXD WebSocket instead. Incoming posts produce ten-second desktop notifications unless the message is your own, duplicated, muted, system noise, or already visible in the active conversation. Without a realtime connection, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
 
 ## Keyboard shortcuts
 
@@ -240,7 +242,7 @@ Never share tokens, cookies, private messages, or unredacted debug logs. See [SE
 - If a feature reports missing permissions, sign out, update the Slack app's user scopes, and reconnect to obtain a fresh grant.
 - If a development build cannot find `conduit.gresource`, run it from the Meson build tree or set `CONDUIT_RESOURCE_PATH` to the generated resource bundle.
 - If credentials cannot be stored, confirm that a Secret Service-compatible keyring is installed and unlocked.
-- If realtime updates are absent, verify Socket Mode, event subscriptions, and the `xapp-` token. Core Web API workflows remain available without Socket Mode.
+- If realtime updates are absent, check **Preferences → Realtime updates**. For OAuth workspaces, verify Socket Mode, event subscriptions, and the `xapp-` token. For browser-session workspaces, re-import valid XOXC/XOXD credentials. Core Web API workflows remain available without realtime updates.
 - If a `slack://` link opens another client, check `xdg-mime query default x-scheme-handler/slack`, install Conduit's desktop entry, and select it as described above. Browser external-protocol prompts may need separate approval.
 - If huddle discovery is available but native joining is not, use **Open in Slack**. This is the expected safe fallback until Conduit has both a verified Slack bootstrap adapter and a compatible Amazon Chime bridge.
 - Use `--debug-auth` for OAuth problems and `--debug` for wider diagnostics, then redact output before sharing it.

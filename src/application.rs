@@ -24,13 +24,16 @@ use gettextrs::gettext;
 use gtk::glib::variant::{StaticVariantType, ToVariant};
 use gtk::{gio, glib};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
+use std::rc::Rc;
 use std::time::Duration;
 
 use crate::auth::AppTokenStore;
 use crate::config::{self, VERSION};
+use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::shortcuts::APP_SHORTCUTS;
 use crate::slack_link::{parse_slack_uri, SlackUri};
 use crate::ConduitWindow;
@@ -40,6 +43,124 @@ const ABOUT_ICON_NAME: &str = config::APPLICATION_ID;
 const ABOUT_LOGO_SIZE: i32 = 192;
 const NOTIFICATION_LIFETIME: Duration = Duration::from_secs(10);
 const MAX_EXTERNAL_SLACK_URIS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RealtimePreferencePresentation {
+    subtitle: &'static str,
+    status_label: &'static str,
+    icon_name: &'static str,
+    status_css_class: Option<&'static str>,
+    show_app_token_row: bool,
+}
+
+fn realtime_preference_presentation(status: RealtimeStatus) -> RealtimePreferencePresentation {
+    let browser_session = status.transport == Some(RealtimeTransport::BrowserSession);
+    let (subtitle, status_label, icon_name, status_css_class) = match status.phase {
+        RealtimePhase::Online if browser_session => (
+            "Online using XOXC/XOXD",
+            "Online",
+            "network-wired-symbolic",
+            Some("success"),
+        ),
+        RealtimePhase::Connecting if browser_session => (
+            "Connecting using XOXC/XOXD...",
+            "Connecting",
+            "network-wireless-acquiring-symbolic",
+            None,
+        ),
+        RealtimePhase::Reconnecting if browser_session => (
+            "XOXC/XOXD connection interrupted; retrying...",
+            "Offline",
+            "network-wired-offline-symbolic",
+            Some("warning"),
+        ),
+        RealtimePhase::Online => (
+            "Online using Socket Mode",
+            "Online",
+            "network-wired-symbolic",
+            Some("success"),
+        ),
+        RealtimePhase::Connecting => (
+            "Connecting using Socket Mode...",
+            "Connecting",
+            "network-wireless-acquiring-symbolic",
+            None,
+        ),
+        RealtimePhase::Reconnecting => (
+            "Socket Mode connection interrupted; retrying...",
+            "Offline",
+            "network-wired-offline-symbolic",
+            Some("warning"),
+        ),
+        RealtimePhase::ConfigurationError => (
+            "Realtime configuration could not be loaded",
+            "Unavailable",
+            "dialog-warning-symbolic",
+            Some("warning"),
+        ),
+        RealtimePhase::NotConfigured => (
+            "No realtime connection is configured",
+            "Not configured",
+            "network-wired-offline-symbolic",
+            None,
+        ),
+    };
+
+    RealtimePreferencePresentation {
+        subtitle,
+        status_label,
+        icon_name,
+        status_css_class,
+        show_app_token_row: !browser_session,
+    }
+}
+
+fn realtime_group_description(
+    status: RealtimeStatus,
+    configured_by_environment: bool,
+    stored_token: bool,
+) -> &'static str {
+    if status.transport == Some(RealtimeTransport::BrowserSession) {
+        "Uses the imported Slack browser session; no app token is needed."
+    } else if status.phase == RealtimePhase::ConfigurationError {
+        "Socket Mode configuration could not be loaded. Check the app token and keyring."
+    } else if configured_by_environment {
+        "Socket Mode is configured by the desktop environment."
+    } else if stored_token {
+        "Socket Mode is configured. Enter a new xapp- token to replace it."
+    } else {
+        "Enter an xapp- token with connections:write, then restart Conduit."
+    }
+}
+
+fn update_realtime_preferences(
+    window: &ConduitWindow,
+    group: &adw::PreferencesGroup,
+    status_row: &adw::ActionRow,
+    status_label: &gtk::Label,
+    status_icon: &gtk::Image,
+    app_token_row: &adw::PasswordEntryRow,
+    configured_by_environment: bool,
+    stored_token: bool,
+) {
+    let status = window.realtime_status();
+    let presentation = realtime_preference_presentation(status);
+    status_row.set_subtitle(&gettext(presentation.subtitle));
+    status_label.set_label(&gettext(presentation.status_label));
+    status_icon.set_icon_name(Some(presentation.icon_name));
+    for class in ["success", "warning", "error"] {
+        status_label.remove_css_class(class);
+    }
+    if let Some(class) = presentation.status_css_class {
+        status_label.add_css_class(class);
+    }
+    app_token_row.set_visible(presentation.show_app_token_row);
+    group.set_description(Some(&gettext(realtime_group_description(
+        status,
+        configured_by_environment,
+        stored_token,
+    ))));
+}
 
 fn application_flags() -> gio::ApplicationFlags {
     gio::ApplicationFlags::HANDLES_COMMAND_LINE | gio::ApplicationFlags::HANDLES_OPEN
@@ -246,7 +367,7 @@ mod imp {
         }
 
         fn shutdown(&self) {
-            self.obj().flush_active_window_drafts();
+            self.obj().flush_active_window_state();
             self.parent_shutdown();
         }
     }
@@ -357,12 +478,12 @@ impl ConduitApplication {
         }
     }
 
-    fn flush_active_window_drafts(&self) {
+    fn flush_active_window_state(&self) {
         if let Some(window) = self
             .active_window()
             .and_then(|window| window.downcast::<ConduitWindow>().ok())
         {
-            window.flush_drafts();
+            window.flush_persistent_state();
         }
     }
 
@@ -461,7 +582,10 @@ impl ConduitApplication {
     }
 
     fn show_preferences(&self) {
-        let Some(window) = self.active_window() else {
+        let Some(window) = self
+            .active_window()
+            .and_then(|window| window.downcast::<ConduitWindow>().ok())
+        else {
             return;
         };
 
@@ -488,19 +612,34 @@ impl ConduitApplication {
             .build();
         let configured_by_environment = config::slack_app_token().is_some();
         realtime_row.set_sensitive(!configured_by_environment);
-        let stored_token = AppTokenStore.load().ok().flatten().is_some();
-        let realtime_description = if configured_by_environment {
-            "Realtime updates are configured by the desktop environment."
-        } else if stored_token {
-            "Realtime updates are configured. Enter a new xapp- token to replace it."
-        } else {
-            "Enter an xapp- token with connections:write, then restart Conduit."
-        };
+        let stored_token = (window.realtime_status().transport
+            != Some(RealtimeTransport::BrowserSession))
+            && AppTokenStore.load().ok().flatten().is_some();
+        let realtime_status_row = adw::ActionRow::builder().title("Connection").build();
+        let realtime_status_label = gtk::Label::new(None);
+        realtime_status_label.set_valign(gtk::Align::Center);
+        let realtime_status_icon = gtk::Image::new();
+        let realtime_status_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        realtime_status_box.set_valign(gtk::Align::Center);
+        realtime_status_box.append(&realtime_status_label);
+        realtime_status_box.append(&realtime_status_icon);
+        realtime_status_row.add_suffix(&realtime_status_box);
+
         let realtime_group = adw::PreferencesGroup::builder()
             .title("Realtime updates")
-            .description(realtime_description)
             .build();
+        realtime_group.add(&realtime_status_row);
         realtime_group.add(&realtime_row);
+        update_realtime_preferences(
+            &window,
+            &realtime_group,
+            &realtime_status_row,
+            &realtime_status_label,
+            &realtime_status_icon,
+            &realtime_row,
+            configured_by_environment,
+            stored_token,
+        );
 
         let sign_out_row = adw::ActionRow::builder()
             .title("Sign out")
@@ -524,6 +663,35 @@ impl ConduitApplication {
         let dialog = adw::PreferencesDialog::builder()
             .title("Preferences")
             .build();
+        let realtime_group_for_status = realtime_group.clone();
+        let realtime_status_row_for_status = realtime_status_row.clone();
+        let realtime_status_label_for_status = realtime_status_label.clone();
+        let realtime_status_icon_for_status = realtime_status_icon.clone();
+        let realtime_row_for_status = realtime_row.clone();
+        let status_handler = Rc::new(RefCell::new(Some(window.connect_realtime_status_changed(
+            move |window| {
+                update_realtime_preferences(
+                    window,
+                    &realtime_group_for_status,
+                    &realtime_status_row_for_status,
+                    &realtime_status_label_for_status,
+                    &realtime_status_icon_for_status,
+                    &realtime_row_for_status,
+                    configured_by_environment,
+                    stored_token,
+                );
+            },
+        ))));
+        let weak_status_window = window.downgrade();
+        let status_handler_on_close = Rc::clone(&status_handler);
+        dialog.connect_closed(move |_| {
+            if let (Some(window), Some(handler)) = (
+                weak_status_window.upgrade(),
+                status_handler_on_close.borrow_mut().take(),
+            ) {
+                window.disconnect(handler);
+            }
+        });
         let weak_dialog = dialog.downgrade();
         realtime_row.connect_apply(move |row| {
             let result = AppTokenStore.save(row.text().as_str());
@@ -547,7 +715,7 @@ impl ConduitApplication {
                 dialog.close();
             }
             if let Some(window) = weak_window.upgrade() {
-                let _ = window.activate_action("win.sign-out", None);
+                let _ = gtk::prelude::WidgetExt::activate_action(&window, "win.sign-out", None);
             }
         });
         dialog.add(&page);
@@ -582,6 +750,46 @@ impl ConduitApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_session_realtime_status_hides_the_app_token_editor() {
+        for phase in [
+            RealtimePhase::Connecting,
+            RealtimePhase::Online,
+            RealtimePhase::Reconnecting,
+        ] {
+            let presentation = realtime_preference_presentation(RealtimeStatus {
+                transport: Some(RealtimeTransport::BrowserSession),
+                phase,
+            });
+            assert!(!presentation.show_app_token_row);
+        }
+
+        let online = realtime_preference_presentation(RealtimeStatus::online(
+            RealtimeTransport::BrowserSession,
+        ));
+        assert_eq!(online.status_label, "Online");
+        assert_eq!(online.subtitle, "Online using XOXC/XOXD");
+
+        let reconnecting = realtime_preference_presentation(RealtimeStatus::reconnecting(
+            RealtimeTransport::BrowserSession,
+        ));
+        assert_eq!(reconnecting.status_label, "Offline");
+        assert!(reconnecting.subtitle.contains("retrying"));
+    }
+
+    #[test]
+    fn socket_mode_and_unconfigured_realtime_keep_the_app_token_editor() {
+        assert!(realtime_preference_presentation(RealtimeStatus::default()).show_app_token_row);
+        assert!(
+            realtime_preference_presentation(RealtimeStatus::online(RealtimeTransport::SocketMode))
+                .show_app_token_row
+        );
+        assert!(
+            realtime_group_description(RealtimeStatus::configuration_error(), true, false)
+                .contains("could not be loaded")
+        );
+    }
 
     #[test]
     fn requested_debug_mode_survives_application_activation() {
