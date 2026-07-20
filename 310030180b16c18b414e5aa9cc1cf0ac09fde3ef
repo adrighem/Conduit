@@ -1,0 +1,9 @@
+Task: Complete native Debian and Fedora package validation
+
+Summary: Added the runtime GStreamer plugin sets required by release-profile media tests, including the libnice provider needed when webrtcbin enters Playing state.
+
+Modified files: release workflow, Debian Build-Depends, RPM BuildRequires, and release contract tests.
+
+Rationale: Native package builds compile media support and run its synthetic pipeline during package checks, so development headers alone are insufficient.
+
+Verification: Debian 13 binary package built with 507 tests passing and no Lintian errors; Fedora 44 provider checks resolved and inspected all required media factories; actionlint and release contract tests passed.
