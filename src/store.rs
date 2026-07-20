@@ -15,7 +15,7 @@ use crate::models::{SlackConversation, SlackMessage, SlackUnreadState, SlackUser
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 
 pub(crate) const CACHE_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: u32 = 1;
+const DATABASE_SCHEMA_VERSION: u32 = 2;
 const DATABASE_FILENAME: &str = "state.sqlite3";
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 const SEEN_REALTIME_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
@@ -40,6 +40,8 @@ pub(crate) enum StoreError {
     RejectedUpdate { message: String },
     #[error("workspace database schema {found} is newer than supported schema {supported}")]
     IncompatibleSchema { found: u32, supported: u32 },
+    #[error("derived workspace cache is invalid: {message}")]
+    InvalidDerivedCache { message: String },
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -61,10 +63,17 @@ impl StoreError {
         Self::IncompatibleSchema { found, supported }
     }
 
+    fn invalid_derived_cache(message: impl Into<String>) -> Self {
+        Self::InvalidDerivedCache {
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn category(&self) -> StoreErrorCategory {
         match self {
             Self::RejectedUpdate { .. } => StoreErrorCategory::RejectedUpdate,
             Self::IncompatibleSchema { .. } => StoreErrorCategory::IncompatibleSchema,
+            Self::InvalidDerivedCache { .. } => StoreErrorCategory::CorruptData,
             Self::Database(error) => classify_database_error(error),
             Self::Io(_) => StoreErrorCategory::LocalIo,
             Self::Json(_) => StoreErrorCategory::CorruptData,
@@ -757,7 +766,15 @@ impl WorkspaceStore {
         let result = tokio::task::spawn_blocking(move || {
             let mut connection = open_database(&directory)?;
             migrate_legacy_workspace(&mut connection, &directory, &workspace_key, &workspace_id)?;
-            load_sqlite_state(&connection, &workspace_key)
+            match load_sqlite_state(&connection, &workspace_key) {
+                Err(error) if error.category() == StoreErrorCategory::CorruptData => {
+                    drop(connection);
+                    recreate_derived_cache(&directory)?;
+                    let _ = open_database(&directory)?;
+                    Ok(None)
+                }
+                result => result,
+            }
         })
         .await
         .context("workspace cache reader stopped unexpectedly")?;
@@ -882,7 +899,15 @@ pub(crate) fn load_active_search_state(directory: &Path) -> Result<Option<Search
     let Some(workspace_key) = workspace_key else {
         return Ok(None);
     };
-    load_sqlite_search_state(&connection, &workspace_key)
+    match load_sqlite_search_state(&connection, &workspace_key) {
+        Err(error) if error.category() == StoreErrorCategory::CorruptData => {
+            drop(connection);
+            recreate_derived_cache(directory)?;
+            let _ = open_database(directory)?;
+            Ok(None)
+        }
+        result => result,
+    }
 }
 
 pub(crate) fn clear_active_workspace(directory: &Path) -> Result<()> {
@@ -910,6 +935,16 @@ fn open_database(directory: &Path) -> Result<Connection> {
             directory.display()
         )
     })?;
+    match open_database_once(directory) {
+        Err(error) if error.category() == StoreErrorCategory::CorruptData => {
+            recreate_derived_cache(directory)?;
+            open_database_once(directory)
+        }
+        result => result,
+    }
+}
+
+fn open_database_once(directory: &Path) -> Result<Connection> {
     let connection = Connection::open(database_path(directory)).with_context(|| {
         format!(
             "failed to open workspace database in {}",
@@ -925,7 +960,7 @@ fn open_database(directory: &Path) -> Result<Connection> {
             DATABASE_SCHEMA_VERSION,
         ));
     }
-    connection.execute_batch(&format!(
+    if let Err(error) = connection.execute_batch(&format!(
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
@@ -945,9 +980,69 @@ fn open_database(directory: &Path) -> Result<Connection> {
              payload_json TEXT NOT NULL,
              PRIMARY KEY (workspace_key, kind, item_key)
          ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS sync_metadata (
+             workspace_key TEXT NOT NULL REFERENCES workspaces(workspace_key) ON DELETE CASCADE,
+             operation TEXT NOT NULL,
+             target TEXT NOT NULL,
+             refreshed_at_ms INTEGER,
+             retry_count INTEGER NOT NULL DEFAULT 0,
+             retry_after_ms INTEGER,
+             PRIMARY KEY (workspace_key, operation, target)
+         ) WITHOUT ROWID;
          PRAGMA user_version = {DATABASE_SCHEMA_VERSION};"
-    ))?;
+    )) {
+        if schema_version < DATABASE_SCHEMA_VERSION {
+            return Err(StoreError::invalid_derived_cache(format!(
+                "schema migration from v{schema_version} failed: {error}"
+            )));
+        }
+        return Err(error.into());
+    }
+    validate_schema_v2(&connection)?;
     Ok(connection)
+}
+
+fn validate_schema_v2(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(sync_metadata)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected = [
+        "workspace_key",
+        "operation",
+        "target",
+        "refreshed_at_ms",
+        "retry_count",
+        "retry_after_ms",
+    ];
+    if columns.iter().map(String::as_str).ne(expected) {
+        return Err(StoreError::invalid_derived_cache(
+            "schema-v2 sync metadata columns do not match",
+        ));
+    }
+    Ok(())
+}
+
+fn recreate_derived_cache(directory: &Path) -> Result<()> {
+    let database = database_path(directory);
+    for path in [
+        database.clone(),
+        sqlite_sidecar_path(&database, "-wal"),
+        sqlite_sidecar_path(&database, "-shm"),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 fn load_sqlite_state(
@@ -1605,6 +1700,181 @@ mod tests {
             );
         });
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn schema_v1_migrates_to_v2_without_losing_keyed_payloads() {
+        let directory = temp_cache_dir("workspace-schema-v2-migration");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let connection = Connection::open(store.database_path()).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 1;
+                 CREATE TABLE workspaces (
+                     workspace_key TEXT PRIMARY KEY,
+                     workspace_id TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE app_state (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     active_workspace_key TEXT REFERENCES workspaces(workspace_key)
+                 );
+                 INSERT INTO app_state(singleton, active_workspace_key) VALUES (1, NULL);
+                 CREATE TABLE workspace_items (
+                     workspace_key TEXT NOT NULL REFERENCES workspaces(workspace_key) ON DELETE CASCADE,
+                     kind TEXT NOT NULL,
+                     item_key TEXT NOT NULL,
+                     payload_json TEXT NOT NULL,
+                     PRIMARY KEY (workspace_key, kind, item_key)
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces(workspace_key, workspace_id) VALUES (?1, 'T123:U123')",
+                [&store.workspace_key],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
+                 VALUES (?1, 'conversation', 'C1', ?2)",
+                params![
+                    &store.workspace_key,
+                    serde_json::to_string(&SlackConversation {
+                        id: "C1".into(),
+                        name: Some("general".into()),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let conversations = runtime()
+            .block_on(store.load_conversations())
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversations[0].id, "C1");
+
+        let connection = Connection::open(store.database_path()).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let metadata_columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(sync_metadata)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            metadata_columns,
+            [
+                "workspace_key",
+                "operation",
+                "target",
+                "refreshed_at_ms",
+                "retry_count",
+                "retry_after_ms"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn corrupt_database_is_recreated_as_an_empty_v2_cache() {
+        let directory = temp_cache_dir("workspace-corrupt-database-reset");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        std::fs::write(store.database_path(), b"not a sqlite database").unwrap();
+
+        assert!(runtime()
+            .block_on(store.load_conversations())
+            .unwrap()
+            .is_none());
+        let connection = Connection::open(store.database_path()).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_v1_metadata_migration_recreates_only_the_derived_cache() {
+        let directory = temp_cache_dir("workspace-failed-v1-migration-reset");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let connection = Connection::open(store.database_path()).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 1;
+                 CREATE TABLE sync_metadata (broken TEXT);",
+            )
+            .unwrap();
+        drop(connection);
+        let credentials_sentinel = directory.join("credentials-are-external");
+        let drafts_sentinel = directory.join("drafts-are-external");
+        std::fs::write(&credentials_sentinel, "preserve").unwrap();
+        std::fs::write(&drafts_sentinel, "preserve").unwrap();
+
+        assert!(runtime()
+            .block_on(store.load_conversations())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::read_to_string(credentials_sentinel).unwrap(),
+            "preserve"
+        );
+        assert_eq!(
+            std::fs::read_to_string(drafts_sentinel).unwrap(),
+            "preserve"
+        );
+        let connection = Connection::open(store.database_path()).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn malformed_keyed_payload_resets_the_workspace_cache() {
+        let directory = temp_cache_dir("workspace-malformed-payload-reset");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+        });
+        let connection = Connection::open(store.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE workspace_items SET payload_json = '{broken'
+                 WHERE workspace_key = ?1 AND kind = 'conversation'",
+                [&store.workspace_key],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(runtime()
+            .block_on(store.load_conversations())
+            .unwrap()
+            .is_none());
+        let remaining: u32 = Connection::open(store.database_path())
+            .unwrap()
+            .query_row("SELECT count(*) FROM workspace_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
         let _ = std::fs::remove_dir_all(directory);
     }
 
