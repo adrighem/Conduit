@@ -2,7 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +29,8 @@ const MAX_SEEN_REALTIME_MESSAGES: usize = 256;
 const STORE_WRITER_QUEUE_CAPACITY: usize = 64;
 const STORE_READER_QUEUE_CAPACITY: usize = 32;
 const STORE_READER_COUNT: usize = 2;
+const STORE_MAINTENANCE_BATCH_LIMIT: usize = 50;
+const STORE_MAINTENANCE_BATCH_WINDOW: Duration = Duration::from_millis(50);
 
 pub(crate) type Result<T> = std::result::Result<T, StoreError>;
 
@@ -96,12 +98,20 @@ impl StoreError {
 type StoreWorkerValue = Box<dyn Any + Send>;
 type StoreWorkerTask =
     Box<dyn FnOnce(&mut Connection) -> Result<StoreWorkerValue> + Send + 'static>;
+type StoreMaintenanceTask =
+    Box<dyn FnOnce(&Transaction<'_>) -> Result<StoreWorkerValue> + Send + 'static>;
+
+struct StoreMaintenanceRequest {
+    task: StoreMaintenanceTask,
+    response: tokio::sync::oneshot::Sender<Result<StoreWorkerValue>>,
+}
 
 enum StoreWorkerRequest {
     Task {
         task: StoreWorkerTask,
         response: tokio::sync::oneshot::Sender<Result<StoreWorkerValue>>,
     },
+    Maintenance(StoreMaintenanceRequest),
     Shutdown {
         response: tokio::sync::oneshot::Sender<()>,
     },
@@ -114,6 +124,26 @@ struct StoreHubInner {
     closed: AtomicBool,
     admission: tokio::sync::Mutex<()>,
     workers: std::sync::Mutex<Vec<std::thread::JoinHandle<Result<()>>>>,
+    metrics: Arc<StoreMetrics>,
+}
+
+#[derive(Default)]
+struct StoreMetrics {
+    connections: AtomicU64,
+    transactions: AtomicU64,
+    changed_rows: AtomicU64,
+    skipped_rows: AtomicU64,
+    rolled_back_batches: AtomicU64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StoreMetricsSnapshot {
+    pub(crate) connections: u64,
+    transactions: u64,
+    changed_rows: u64,
+    skipped_rows: u64,
+    pub(crate) rolled_back_batches: u64,
 }
 
 /// Owns the bounded, persistent SQLite connections for one derived cache.
@@ -129,10 +159,12 @@ pub(crate) struct StoreHub {
 #[allow(dead_code)]
 impl StoreHub {
     pub(crate) async fn open(directory: PathBuf) -> Result<Self> {
+        let metrics = Arc::new(StoreMetrics::default());
         let (writer, writer_startup, writer_worker) = spawn_store_worker(
             directory.clone(),
             StoreConnectionKind::Writer,
             STORE_WRITER_QUEUE_CAPACITY,
+            Arc::clone(&metrics),
         );
         writer_startup.await.map_err(|_| StoreError::HubClosed)??;
 
@@ -143,6 +175,7 @@ impl StoreHub {
                 directory.clone(),
                 StoreConnectionKind::QueryOnly,
                 STORE_READER_QUEUE_CAPACITY,
+                Arc::clone(&metrics),
             );
             startup.await.map_err(|_| StoreError::HubClosed)??;
             readers.push(reader);
@@ -157,6 +190,7 @@ impl StoreHub {
                 closed: AtomicBool::new(false),
                 admission: tokio::sync::Mutex::new(()),
                 workers: std::sync::Mutex::new(workers),
+                metrics,
             }),
         })
     }
@@ -178,6 +212,34 @@ impl StoreHub {
             self.inner.next_reader.fetch_add(1, Ordering::Relaxed) % self.inner.readers.len();
         self.dispatch(self.inner.readers[reader].clone(), task)
             .await
+    }
+
+    pub(crate) async fn write_maintenance<T, F>(&self, task: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
+    {
+        let admission = self.inner.admission.lock().await;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(StoreError::HubClosed);
+        }
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.inner
+            .writer
+            .send(StoreWorkerRequest::Maintenance(StoreMaintenanceRequest {
+                task: Box::new(move |transaction| {
+                    task(transaction).map(|value| Box::new(value) as StoreWorkerValue)
+                }),
+                response,
+            }))
+            .await
+            .map_err(|_| StoreError::HubClosed)?;
+        drop(admission);
+
+        let value = result.await.map_err(|_| StoreError::HubClosed)??;
+        value.downcast::<T>().map(|value| *value).map_err(|_| {
+            StoreError::invalid_derived_cache("store worker returned an unexpected value type")
+        })
     }
 
     pub(crate) async fn barrier(&self) -> Result<()> {
@@ -257,9 +319,23 @@ impl StoreHub {
             std::array::from_fn(|index| self.inner.readers[index].max_capacity()),
         )
     }
+
+    pub(crate) fn metrics(&self) -> StoreMetricsSnapshot {
+        StoreMetricsSnapshot {
+            connections: self.inner.metrics.connections.load(Ordering::Relaxed),
+            transactions: self.inner.metrics.transactions.load(Ordering::Relaxed),
+            changed_rows: self.inner.metrics.changed_rows.load(Ordering::Relaxed),
+            skipped_rows: self.inner.metrics.skipped_rows.load(Ordering::Relaxed),
+            rolled_back_batches: self
+                .inner
+                .metrics
+                .rolled_back_batches
+                .load(Ordering::Relaxed),
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum StoreConnectionKind {
     Writer,
     QueryOnly,
@@ -269,6 +345,7 @@ fn spawn_store_worker(
     directory: PathBuf,
     kind: StoreConnectionKind,
     capacity: usize,
+    metrics: Arc<StoreMetrics>,
 ) -> (
     tokio::sync::mpsc::Sender<StoreWorkerRequest>,
     tokio::sync::oneshot::Receiver<Result<()>>,
@@ -285,6 +362,7 @@ fn spawn_store_worker(
             };
             let mut connection = match connection {
                 Ok(connection) => {
+                    metrics.connections.fetch_add(1, Ordering::Relaxed);
                     let _ = startup.send(Ok(()));
                     connection
                 }
@@ -294,10 +372,29 @@ fn spawn_store_worker(
                 }
             };
 
-            while let Some(request) = receiver.blocking_recv() {
+            let mut pending = None;
+            loop {
+                let request = match pending.take().or_else(|| receiver.blocking_recv()) {
+                    Some(request) => request,
+                    None => break,
+                };
                 match request {
                     StoreWorkerRequest::Task { task, response } => {
-                        let _ = response.send(task(&mut connection));
+                        let result = task(&mut connection);
+                        if kind == StoreConnectionKind::Writer {
+                            let changed = connection.changes();
+                            record_store_work(
+                                &metrics,
+                                u64::from(changed > 0),
+                                changed,
+                                u64::from(changed == 0),
+                            );
+                        }
+                        let _ = response.send(result);
+                    }
+                    StoreWorkerRequest::Maintenance(first) => {
+                        pending =
+                            run_maintenance_batch(&mut connection, first, &mut receiver, &metrics);
                     }
                     StoreWorkerRequest::Shutdown { response } => {
                         let _ = response.send(());
@@ -309,6 +406,143 @@ fn spawn_store_worker(
         })
         .expect("failed to spawn workspace store worker");
     (sender, started, worker)
+}
+
+fn run_maintenance_batch(
+    connection: &mut Connection,
+    first: StoreMaintenanceRequest,
+    receiver: &mut tokio::sync::mpsc::Receiver<StoreWorkerRequest>,
+    metrics: &StoreMetrics,
+) -> Option<StoreWorkerRequest> {
+    let deadline = std::time::Instant::now() + STORE_MAINTENANCE_BATCH_WINDOW;
+    let mut batch = std::collections::VecDeque::from([first]);
+    let mut pending = None;
+    while batch.len() < STORE_MAINTENANCE_BATCH_LIMIT {
+        match receiver.try_recv() {
+            Ok(StoreWorkerRequest::Maintenance(request)) => batch.push_back(request),
+            Ok(request) => {
+                pending = Some(request);
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    let batch_len = batch.len() as u64;
+    let before = connection.total_changes();
+    let transaction = match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            reject_maintenance_batch(batch, error.into());
+            metrics.rolled_back_batches.fetch_add(1, Ordering::Relaxed);
+            return pending;
+        }
+    };
+    let mut completed = Vec::with_capacity(batch.len());
+    while let Some(request) = batch.pop_front() {
+        match (request.task)(&transaction) {
+            Ok(value) => completed.push((request.response, value)),
+            Err(error) => {
+                let _ = transaction.rollback();
+                let _ = request.response.send(Err(error));
+                reject_completed_maintenance(completed);
+                reject_maintenance_batch(
+                    batch,
+                    StoreError::rejected_update("store batch rolled back"),
+                );
+                metrics.rolled_back_batches.fetch_add(1, Ordering::Relaxed);
+                tracing::trace!(
+                    target: "conduit::store",
+                    event = "store_batch",
+                    outcome = "rolled_back",
+                    mutations = batch_len
+                );
+                return pending;
+            }
+        }
+    }
+
+    let changed = transaction.total_changes().saturating_sub(before);
+    if changed == 0 {
+        let _ = transaction.rollback();
+        metrics.skipped_rows.fetch_add(batch_len, Ordering::Relaxed);
+        for (response, value) in completed {
+            let _ = response.send(Ok(value));
+        }
+        tracing::trace!(
+            target: "conduit::store",
+            event = "store_batch",
+            outcome = "unchanged",
+            mutations = batch_len
+        );
+        return pending;
+    }
+
+    match transaction.commit() {
+        Ok(()) => {
+            record_store_work(metrics, 1, changed, 0);
+            for (response, value) in completed {
+                let _ = response.send(Ok(value));
+            }
+        }
+        Err(error) => {
+            let mut completed = completed.into_iter();
+            if let Some((response, _)) = completed.next() {
+                let _ = response.send(Err(error.into()));
+            }
+            reject_completed_maintenance(completed.collect());
+            metrics.rolled_back_batches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pending
+}
+
+fn reject_maintenance_batch(
+    batch: std::collections::VecDeque<StoreMaintenanceRequest>,
+    error: StoreError,
+) {
+    let mut batch = batch.into_iter();
+    if let Some(request) = batch.next() {
+        let _ = request.response.send(Err(error));
+    }
+    for request in batch {
+        let _ = request
+            .response
+            .send(Err(StoreError::rejected_update("store batch rolled back")));
+    }
+}
+
+fn reject_completed_maintenance(
+    completed: Vec<(
+        tokio::sync::oneshot::Sender<Result<StoreWorkerValue>>,
+        StoreWorkerValue,
+    )>,
+) {
+    for (response, _) in completed {
+        let _ = response.send(Err(StoreError::rejected_update("store batch rolled back")));
+    }
+}
+
+fn record_store_work(metrics: &StoreMetrics, transactions: u64, changed: u64, skipped: u64) {
+    metrics
+        .transactions
+        .fetch_add(transactions, Ordering::Relaxed);
+    metrics.changed_rows.fetch_add(changed, Ordering::Relaxed);
+    metrics.skipped_rows.fetch_add(skipped, Ordering::Relaxed);
+    tracing::trace!(
+        target: "conduit::store",
+        event = "store_batch",
+        outcome = "committed",
+        transactions,
+        changed_rows = changed,
+        skipped_rows = skipped
+    );
 }
 
 fn classify_database_error(error: &rusqlite::Error) -> StoreErrorCategory {
@@ -454,15 +688,19 @@ impl WorkspaceStore {
             .write(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
-                if replace {
-                    sync_sqlite_kind(&transaction, &workspace_key, kind, values)?;
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                changed |= if replace {
+                    sync_sqlite_kind(&transaction, &workspace_key, kind, values)?
                 } else {
+                    let mut changed = false;
                     for (key, value) in values {
-                        upsert_sqlite_item(&transaction, &workspace_key, kind, &key, &value)?;
+                        changed |=
+                            upsert_sqlite_item(&transaction, &workspace_key, kind, &key, &value)?;
                     }
-                }
-                transaction.commit()?;
+                    changed
+                };
+                finish_sqlite_transaction(transaction, changed)?;
                 Ok(())
             })
             .await
@@ -479,13 +717,14 @@ impl WorkspaceStore {
             .write(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
                 let records =
                     load_sqlite_kind_values(&transaction, &workspace_key, "thread_record")?;
                 let mut catalog = ThreadCatalog::from_records(records);
                 update(&mut catalog);
                 let records = catalog.into_records();
-                sync_sqlite_kind(
+                changed |= sync_sqlite_kind(
                     &transaction,
                     &workspace_key,
                     "thread_record",
@@ -496,7 +735,7 @@ impl WorkspaceStore {
                         )
                     }),
                 )?;
-                transaction.commit()?;
+                finish_sqlite_transaction(transaction, changed)?;
                 Ok(records)
             })
             .await
@@ -560,8 +799,9 @@ impl WorkspaceStore {
             .write(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
-                transaction.execute(
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                changed |= transaction.execute(
                     "INSERT INTO sync_metadata(
                          workspace_key, operation, target,
                          refreshed_at_ms, retry_count, retry_after_ms
@@ -569,7 +809,10 @@ impl WorkspaceStore {
                      ON CONFLICT(workspace_key, operation, target) DO UPDATE SET
                          refreshed_at_ms = excluded.refreshed_at_ms,
                          retry_count = excluded.retry_count,
-                         retry_after_ms = excluded.retry_after_ms",
+                         retry_after_ms = excluded.retry_after_ms
+                     WHERE sync_metadata.refreshed_at_ms IS NOT excluded.refreshed_at_ms
+                        OR sync_metadata.retry_count IS NOT excluded.retry_count
+                        OR sync_metadata.retry_after_ms IS NOT excluded.retry_after_ms",
                     params![
                         workspace_key,
                         operation,
@@ -578,8 +821,8 @@ impl WorkspaceStore {
                         freshness.retry_count,
                         freshness.retry_after_ms
                     ],
-                )?;
-                transaction.commit()?;
+                )? > 0;
+                finish_sqlite_transaction(transaction, changed)?;
                 Ok(())
             })
             .await
@@ -605,8 +848,9 @@ impl WorkspaceStore {
             .write(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, true)?;
-                transaction.commit()?;
+                let changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, true)?;
+                finish_sqlite_transaction(transaction, changed)?;
                 Ok(())
             })
             .await
@@ -676,8 +920,9 @@ impl WorkspaceStore {
                 }
                 catalog.commit_membership_snapshot(snapshot);
                 let conversations = catalog.conversations();
-                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
-                sync_sqlite_kind(
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                changed |= sync_sqlite_kind(
                     &transaction,
                     &workspace_key,
                     "conversation",
@@ -686,7 +931,7 @@ impl WorkspaceStore {
                         .map(conversation_for_cache)
                         .map(|conversation| (conversation.id.clone(), conversation)),
                 )?;
-                transaction.commit()?;
+                finish_sqlite_transaction(transaction, changed)?;
                 Ok(conversations)
             })
             .await
@@ -971,8 +1216,9 @@ impl WorkspaceStore {
             .write(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
-                match status {
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                changed |= match status {
                     Some(status) => upsert_sqlite_item(
                         &transaction,
                         &workspace_key,
@@ -985,10 +1231,10 @@ impl WorkspaceStore {
                             "DELETE FROM workspace_items
                              WHERE workspace_key = ?1 AND kind = 'user_status' AND item_key = ?2",
                             params![workspace_key, user_id],
-                        )?;
+                        )? > 0
                     }
-                }
-                transaction.commit()?;
+                };
+                finish_sqlite_transaction(transaction, changed)?;
                 Ok(())
             })
             .await
@@ -1050,15 +1296,16 @@ impl WorkspaceStore {
                 )?
                 .unwrap_or_default();
                 let merged = merge_channel_history_pages(&existing, &messages);
-                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
-                upsert_sqlite_item(
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                changed |= upsert_sqlite_item(
                     &transaction,
                     &workspace_key,
                     "channel_history",
                     &channel_id,
                     &merged,
                 )?;
-                transaction.commit()?;
+                finish_sqlite_transaction(transaction, changed)?;
                 Ok(())
             })
             .await
@@ -1118,15 +1365,16 @@ impl WorkspaceStore {
                 )?
                 .unwrap_or_default();
                 let merged = merge_history_pages(&existing, &messages);
-                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
-                upsert_sqlite_item(
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                changed |= upsert_sqlite_item(
                     &transaction,
                     &workspace_key,
                     "thread_replies",
                     &key,
                     &merged,
                 )?;
-                transaction.commit()?;
+                finish_sqlite_transaction(transaction, changed)?;
                 Ok(merged)
             })
             .await
@@ -1261,22 +1509,22 @@ impl WorkspaceStore {
                         Ok(result)
                     }
                     ConversationRowMutation::Upsert(conversation, result) => {
-                        upsert_sqlite_conversation(
+                        let changed = upsert_sqlite_conversation(
                             &transaction,
                             &workspace_key,
                             &workspace_id,
                             &conversation,
                         )?;
-                        transaction.commit()?;
+                        finish_sqlite_transaction(transaction, changed)?;
                         Ok(result)
                     }
                     ConversationRowMutation::Delete(result) => {
-                        transaction.execute(
+                        let changed = transaction.execute(
                             "DELETE FROM workspace_items
                              WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = ?2",
                             params![workspace_key, channel_id],
-                        )?;
-                        transaction.commit()?;
+                        )? > 0;
+                        finish_sqlite_transaction(transaction, changed)?;
                         Ok(result)
                     }
                 }
@@ -1764,23 +2012,25 @@ fn upsert_sqlite_conversation(
     workspace_key: &str,
     workspace_id: &str,
     conversation: &SlackConversation,
-) -> Result<()> {
-    transaction.execute(
+) -> Result<bool> {
+    let mut changed = transaction.execute(
         "INSERT INTO workspaces(workspace_key, workspace_id) VALUES (?1, ?2)
-         ON CONFLICT(workspace_key) DO UPDATE SET workspace_id = excluded.workspace_id",
+         ON CONFLICT(workspace_key) DO UPDATE SET workspace_id = excluded.workspace_id
+         WHERE workspaces.workspace_id IS NOT excluded.workspace_id",
         params![workspace_key, workspace_id],
-    )?;
+    )? > 0;
     let conversation = conversation_for_cache(conversation);
     let payload = serde_json::to_string(&conversation)
         .context("failed to serialize cached workspace item")?;
-    transaction.execute(
+    changed |= transaction.execute(
         "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
          VALUES (?1, 'conversation', ?2, ?3)
          ON CONFLICT(workspace_key, kind, item_key)
-         DO UPDATE SET payload_json = excluded.payload_json",
+         DO UPDATE SET payload_json = excluded.payload_json
+         WHERE workspace_items.payload_json IS NOT excluded.payload_json",
         params![workspace_key, conversation.id, payload],
-    )?;
-    Ok(())
+    )? > 0;
+    Ok(changed)
 }
 
 fn load_sqlite_search_state(
@@ -1868,19 +2118,30 @@ fn ensure_sqlite_workspace(
     workspace_key: &str,
     workspace_id: &str,
     activate: bool,
-) -> Result<()> {
-    transaction.execute(
+) -> Result<bool> {
+    let mut changed = transaction.execute(
         "INSERT INTO workspaces(workspace_key, workspace_id) VALUES (?1, ?2)
          ON CONFLICT(workspace_key) DO UPDATE SET workspace_id = excluded.workspace_id",
         params![workspace_key, workspace_id],
-    )?;
+    )? > 0;
     if activate {
-        transaction.execute(
-            "UPDATE app_state SET active_workspace_key = ?1 WHERE singleton = 1",
+        changed |= transaction.execute(
+            "UPDATE app_state SET active_workspace_key = ?1
+             WHERE singleton = 1 AND active_workspace_key IS NOT ?1",
             [workspace_key],
-        )?;
+        )? > 0;
     }
-    Ok(())
+    Ok(changed)
+}
+
+fn finish_sqlite_transaction(transaction: Transaction<'_>, changed: bool) -> Result<bool> {
+    if !changed {
+        transaction.rollback()?;
+        Ok(false)
+    } else {
+        transaction.commit()?;
+        Ok(true)
+    }
 }
 
 fn reset_sqlite_workspace(connection: &mut Connection, workspace_key: &str) -> Result<()> {
@@ -1951,17 +2212,17 @@ fn upsert_sqlite_item<T: Serialize>(
     kind: &str,
     item_key: &str,
     value: &T,
-) -> Result<()> {
+) -> Result<bool> {
     let payload = serde_json::to_string(value).context("failed to serialize cached item")?;
-    transaction.execute(
+    let changed = transaction.execute(
         "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(workspace_key, kind, item_key)
          DO UPDATE SET payload_json = excluded.payload_json
-         WHERE payload_json IS NOT excluded.payload_json",
+         WHERE workspace_items.payload_json IS NOT excluded.payload_json",
         params![workspace_key, kind, item_key, payload],
-    )?;
-    Ok(())
+    )? > 0;
+    Ok(changed)
 }
 
 fn sync_sqlite_kind<T: Serialize>(
@@ -1969,7 +2230,7 @@ fn sync_sqlite_kind<T: Serialize>(
     workspace_key: &str,
     kind: &str,
     values: impl IntoIterator<Item = (String, T)>,
-) -> Result<()> {
+) -> Result<bool> {
     let desired = values
         .into_iter()
         .map(|(key, value)| {
@@ -1993,26 +2254,27 @@ fn sync_sqlite_kind<T: Serialize>(
             current.insert(key, payload);
         }
     }
+    let mut changed = false;
     for key in current.keys().filter(|key| !desired.contains_key(*key)) {
-        transaction.execute(
+        changed |= transaction.execute(
             "DELETE FROM workspace_items
              WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
             params![workspace_key, kind, key],
-        )?;
+        )? > 0;
     }
     for (key, payload) in desired {
         if current.get(&key) == Some(&payload) {
             continue;
         }
-        transaction.execute(
+        changed |= transaction.execute(
             "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(workspace_key, kind, item_key)
              DO UPDATE SET payload_json = excluded.payload_json",
             params![workspace_key, kind, key, payload],
-        )?;
+        )? > 0;
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String), String>> {
@@ -2834,6 +3096,144 @@ mod tests {
                 store.load_sync_freshness("history", "C1").await.unwrap(),
                 None
             );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn store_hub_batches_fifty_maintenance_mutations_in_one_transaction() {
+        let directory = temp_cache_dir("store-hub-maintenance-batch");
+        runtime().block_on(async {
+            let hub = StoreHub::open(directory.clone()).await.unwrap();
+            hub.write(|connection| {
+                connection.execute(
+                    "CREATE TABLE maintenance_probe (value INTEGER PRIMARY KEY)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let baseline = hub.metrics();
+
+            let mut writes = tokio::task::JoinSet::new();
+            for value in 0..50_i64 {
+                let hub = hub.clone();
+                writes.spawn(async move {
+                    hub.write_maintenance(move |transaction| {
+                        transaction
+                            .execute("INSERT INTO maintenance_probe(value) VALUES (?1)", [value])?;
+                        Ok(())
+                    })
+                    .await
+                });
+            }
+            while let Some(result) = writes.join_next().await {
+                result.unwrap().unwrap();
+            }
+
+            let metrics = hub.metrics();
+            assert_eq!(metrics.transactions - baseline.transactions, 1);
+            assert_eq!(metrics.changed_rows - baseline.changed_rows, 50);
+            hub.shutdown().await.unwrap();
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn store_hub_rolls_back_failed_batches_and_suppresses_unchanged_commits() {
+        let directory = temp_cache_dir("store-hub-maintenance-rollback");
+        runtime().block_on(async {
+            let hub = StoreHub::open(directory.clone()).await.unwrap();
+            hub.write(|connection| {
+                connection.execute(
+                    "CREATE TABLE maintenance_probe (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            hub.write_maintenance(|transaction| {
+                transaction.execute(
+                    "INSERT INTO maintenance_probe(key, value) VALUES ('stable', 'same')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let after_insert = hub.metrics();
+            hub.write_maintenance(|transaction| {
+                transaction.execute(
+                    "INSERT INTO maintenance_probe(key, value) VALUES ('stable', 'same')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                     WHERE maintenance_probe.value IS NOT excluded.value",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let after_unchanged = hub.metrics();
+            assert_eq!(after_unchanged.transactions, after_insert.transactions);
+            assert_eq!(after_unchanged.skipped_rows, after_insert.skipped_rows + 1);
+
+            let first = {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    hub.write_maintenance(|transaction| {
+                        transaction.execute(
+                            "INSERT INTO maintenance_probe(key, value) VALUES ('rollback', 'yes')",
+                            [],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                })
+            };
+            let second = {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    hub.write_maintenance(|transaction| {
+                        transaction.execute("INSERT INTO missing_table(value) VALUES (1)", [])?;
+                        Ok(())
+                    })
+                    .await
+                })
+            };
+            assert!(first.await.unwrap().is_err());
+            assert!(second.await.unwrap().is_err());
+            hub.barrier().await.unwrap();
+            let exists: bool = hub
+                .query(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM maintenance_probe WHERE key = 'rollback')",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert!(!exists);
+            hub.shutdown().await.unwrap();
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn focused_repository_suppresses_identical_write_commits() {
+        let directory = temp_cache_dir("workspace-identical-write");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let names = HashMap::from([("U1".to_string(), "Ada".to_string())]);
+            store.store_user_names(&names).await.unwrap();
+            let after_insert = store.hub().await.unwrap().metrics();
+            store.store_user_names(&names).await.unwrap();
+            let after_identical = store.hub().await.unwrap().metrics();
+            assert_eq!(after_identical.transactions, after_insert.transactions);
+            assert!(after_identical.skipped_rows > after_insert.skipped_rows);
         });
         let _ = std::fs::remove_dir_all(directory);
     }
