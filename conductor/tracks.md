@@ -51,3 +51,13 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [x] Track: Native Slack huddles
 *Link: [./conductor/tracks/native_huddles_20260718/](./conductor/tracks/native_huddles_20260718/)*
+
+---
+
+## [~] Track: Automated releases and Linux packages
+*Link: [./conductor/tracks/release_automation_20260720/](./conductor/tracks/release_automation_20260720/)*
+
+---
+
+## [~] Track: Immediate conversation switcher with lazy population
+*Link: [./conductor/tracks/conversation_switcher_perf_20260720/](./conductor/tracks/conversation_switcher_perf_20260720/)*

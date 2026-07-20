@@ -30,6 +30,12 @@
 - Meson/Ninja for GNOME build integration and resources.
 - `cargo test` and `meson test -C _build` are supported validation commands.
 
+## Releases and Distribution
+- Release Please v4 maintains conventional-commit release pull requests, the changelog, synchronized Cargo/Meson/AppStream versions, `v<semver>` tags, and GitHub Releases.
+- Release jobs build the complete Meson installation in Debian 13 and Fedora 44 containers, then create architecture-native `.deb` and `.rpm` assets with explicit runtime dependencies.
+- The official Flatpak GitHub Actions builder produces an offline Cargo build against the GNOME 50 runtime and attaches an installable single-file bundle to each GitHub Release.
+- GitHub Release bundles are the supported Flatpak distribution path. Flathub onboarding remains a separate human-owned process subject to Flathub policy and review.
+
 ## Local State
 - XDG cache paths under the application ID for WebKit data, image assets, and Slack state caches.
 - Workspace cache mutations are serialized across store clones before read-modify-write updates.
