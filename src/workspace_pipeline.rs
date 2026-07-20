@@ -156,7 +156,7 @@ pub(crate) enum TimelineTarget {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MessageChange {
-    Upsert(SlackMessage),
+    Upsert(Box<SlackMessage>),
     Remove { message_ts: String },
 }
 
@@ -793,7 +793,7 @@ impl WorkspaceCoordinator {
                     },
                 );
                 timeline.tombstones.remove(message_ts);
-                changes.push(MessageChange::Upsert(message.clone()));
+                changes.push(MessageChange::Upsert(Box::new(message.clone())));
             }
         }
         if page.complete {
@@ -883,7 +883,7 @@ impl WorkspaceCoordinator {
                 MessageMutationKind::Deleted => MessageChange::Remove {
                     message_ts: message.ts.clone(),
                 },
-                _ => MessageChange::Upsert(message.clone()),
+                _ => MessageChange::Upsert(Box::new(message.clone())),
             };
             patch_changes.push(WorkspaceChange::TimelineChanged {
                 target: target.clone(),
