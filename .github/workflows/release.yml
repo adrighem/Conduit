@@ -60,6 +60,8 @@ jobs:
             desktop-file-utils gettext libadwaita-1-dev libdbus-1-dev \
             libgdk-pixbuf-2.0-dev libgstreamer-plugins-bad1.0-dev \
             libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
+            gstreamer1.0-nice gstreamer1.0-plugins-bad gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
             libgtk-4-dev libwebkitgtk-6.0-dev lintian meson ninja-build \
             pkgconf python3 rustup
           rustup toolchain install "$RUST_VERSION" --profile minimal
@@ -142,6 +144,9 @@ jobs:
             --disablerepo=fedora-cisco-openh264 \
             appstream cargo cmake dbus-devel desktop-file-utils gcc gettext \
             gdk-pixbuf2-devel gstreamer1-devel \
+            libnice-gstreamer1 \
+            gstreamer1-plugins-bad-free gstreamer1-plugins-base \
+            gstreamer1-plugins-good \
             gstreamer1-plugins-bad-free-devel gstreamer1-plugins-base-devel \
             gtk4-devel libadwaita-devel meson ninja-build pkgconf-pkg-config \
             rpm-build rpmlint rust webkitgtk6.0-devel

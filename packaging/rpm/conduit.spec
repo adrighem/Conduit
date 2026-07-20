@@ -23,6 +23,10 @@ BuildRequires:  pkgconfig(gstreamer-webrtc-1.0) >= 1.24
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(webkitgtk-6.0)
+BuildRequires:  gstreamer1(element-nicesrc)
+BuildRequires:  gstreamer1-plugins-bad-free
+BuildRequires:  gstreamer1-plugins-base
+BuildRequires:  gstreamer1-plugins-good
 BuildRequires:  rust >= 1.88
 
 Requires:       ca-certificates

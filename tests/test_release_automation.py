@@ -57,6 +57,11 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert "needs.release-please.outputs.release_created == 'true'" in workflow
     assert "debian:trixie" in workflow
     assert "fedora:44" in workflow
+    assert "gstreamer1.0-nice gstreamer1.0-plugins-bad" in workflow
+    assert "gstreamer1.0-plugins-good" in workflow
+    assert "libnice-gstreamer1" in workflow
+    assert "gstreamer1-plugins-bad-free gstreamer1-plugins-base" in workflow
+    assert "gstreamer1-plugins-good" in workflow
     assert 'CARGO_NET_RETRY: "10"' in workflow
     assert "RUSTUP_HOME: /opt/rustup" in workflow
     assert "RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}" in workflow
@@ -73,11 +78,20 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
 
 def test_release_build_tests_reuse_the_release_profile() -> None:
     source_build = read("src/meson.build")
+    debian_control = read("packaging/debian/control")
     rpm_spec = read("packaging/rpm/conduit.spec")
     rpm_check = rpm_spec.split("%check", maxsplit=1)[1].split("%files", maxsplit=1)[0]
 
     assert "cargo_test_args += [cargo_release_arg]" in source_build
+    assert "gstreamer1.0-nice," in debian_control
+    assert "gstreamer1.0-plugins-bad," in debian_control
+    assert "gstreamer1.0-plugins-base," in debian_control
+    assert "gstreamer1.0-plugins-good," in debian_control
     assert "%meson_test" in rpm_check
+    assert "BuildRequires:  gstreamer1(element-nicesrc)" in rpm_spec
+    assert "BuildRequires:  gstreamer1-plugins-bad-free" in rpm_spec
+    assert "BuildRequires:  gstreamer1-plugins-base" in rpm_spec
+    assert "BuildRequires:  gstreamer1-plugins-good" in rpm_spec
 
 
 def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
