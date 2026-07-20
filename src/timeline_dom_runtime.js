@@ -55,6 +55,7 @@
   let restoringViewportAnchor = false;
   let viewportPinnedToBottom = isNearBottom();
   let rememberViewportAnchorFrame = 0;
+  let resizeCorrectionFrame = 0;
   let scrollMutationGeneration = 0;
 
   function finishViewportRestore() {
@@ -116,12 +117,19 @@
     finishViewportRestore();
   }
 
+  function preserveViewportAnchorAfterResize() {
+    preserveViewportAnchorDuringResize();
+    if (resizeCorrectionFrame) return;
+    resizeCorrectionFrame = requestAnimationFrame(function () {
+      resizeCorrectionFrame = 0;
+      preserveViewportAnchorDuringResize();
+    });
+  }
+
   window.addEventListener("scroll", scheduleRememberViewportAnchor, { passive: true });
-  window.addEventListener("resize", preserveViewportAnchorDuringResize, { passive: true });
+  window.addEventListener("resize", preserveViewportAnchorAfterResize, { passive: true });
   if ("ResizeObserver" in window) {
-    const timelineResizeObserver = new ResizeObserver(preserveViewportAnchorDuringResize);
-    timelineResizeObserver.observe(document.documentElement);
-    if (document.body) timelineResizeObserver.observe(document.body);
+    const timelineResizeObserver = new ResizeObserver(preserveViewportAnchorAfterResize);
     const timeline = document.querySelector(".timeline");
     if (timeline) timelineResizeObserver.observe(timeline);
   }

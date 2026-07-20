@@ -22,21 +22,35 @@ START_PROBE = r"""
 (() => {
   (async () => {
     const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+    const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
     const root = document.scrollingElement || document.documentElement;
     const bottomGap = () => root.scrollHeight - root.scrollTop - root.clientHeight;
+    const waitForBottom = async (force) => {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (force) {
+          root.scrollTop = root.scrollHeight;
+          await nextFrame();
+          await nextFrame();
+          window.dispatchEvent(new Event("scroll"));
+        }
+        await nextFrame();
+        if (Math.abs(bottomGap()) <= 2) {
+          await nextFrame();
+          return;
+        }
+      }
+    };
 
-    root.scrollTop = root.scrollHeight;
-    await wait(80);
+    await waitForBottom(true);
     const initialGap = bottomGap();
 
     document.querySelector(".timeline").style.width = "260px";
-    await wait(160);
+    await waitForBottom(false);
     const reflowGap = bottomGap();
 
-    root.scrollTop = root.scrollHeight;
-    await wait(80);
+    await waitForBottom(true);
     document.getElementById("delayed").style.height = "700px";
-    await wait(160);
+    await waitForBottom(false);
     const delayedExpansionGap = bottomGap();
 
     const anchor = document.querySelector('[data-message-ts="10"]');
