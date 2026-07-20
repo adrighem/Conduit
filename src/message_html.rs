@@ -5289,7 +5289,9 @@ mod tests {
         assert!(html.contains("window.conduitApplyTimelinePatch"));
         assert!(html.contains("preserveViewportAnchorDuringResize"));
         assert!(html.contains("new ResizeObserver"));
-        assert!(html.contains("root.scrollTop += currentTop - viewportAnchorTop"));
+        assert!(html.contains("const offset = currentTop - viewportAnchorTop"));
+        assert!(html.contains("if (Math.abs(offset) <= 0.5) return"));
+        assert!(html.contains("root.scrollTop += offset"));
         assert!(html.contains("event.target.closest(\"[data-message-ts]\")"));
         assert!(html.contains("data-author-user-id=\"U123\""));
         for region in ["body", "attachments", "responses"] {

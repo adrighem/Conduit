@@ -109,8 +109,10 @@
 
     const root = timelineRoot();
     const currentTop = viewportAnchor.getBoundingClientRect().top;
+    const offset = currentTop - viewportAnchorTop;
+    if (Math.abs(offset) <= 0.5) return;
     restoringViewportAnchor = true;
-    root.scrollTop += currentTop - viewportAnchorTop;
+    root.scrollTop += offset;
     finishViewportRestore();
   }
 
