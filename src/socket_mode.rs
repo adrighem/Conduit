@@ -2,16 +2,18 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{Sink, SinkExt, StreamExt};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::auth::browser_session_cookie_header;
 use crate::models::{SlackMessage, SlackUser};
 use crate::realtime::RealtimeTransport;
 
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
+const CLIENT_WEBSOCKET_URL: &str = "https://slack.com/api/client.getWebSocketURL";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -126,10 +128,9 @@ fn build_websocket_request(
 
             headers.insert(
                 "Cookie",
-                tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!(
-                    "d={}",
-                    xoxd_token
-                ))
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_str(
+                    &browser_session_cookie_header(xoxd_token),
+                )
                 .context("invalid Cookie header value")?,
             );
 
@@ -422,6 +423,25 @@ impl SocketModeApi {
         }
     }
 
+    fn browser_session_connection_request(
+        &self,
+        xoxc_token: &str,
+        xoxd_token: &str,
+        user_agent: Option<&str>,
+    ) -> RequestBuilder {
+        let mut request = self
+            .http
+            .post(CLIENT_WEBSOCKET_URL)
+            .bearer_auth(xoxc_token)
+            .header("Cookie", browser_session_cookie_header(xoxd_token))
+            .form(&[("token", xoxc_token)]);
+
+        if let Some(user_agent) = user_agent {
+            request = request.header("User-Agent", user_agent);
+        }
+        request
+    }
+
     async fn open_connection(&self) -> Result<String> {
         match &self.credentials {
             SocketModeCredentials::AppToken(app_token) => {
@@ -457,17 +477,12 @@ impl SocketModeApi {
                 xoxd_token,
                 user_agent,
             } => {
-                let mut request = self
-                    .http
-                    .post("https://slack.com/api/client.getWebSocketURL")
-                    .bearer_auth(xoxc_token)
-                    .header("Cookie", format!("d={}", xoxd_token));
-
-                if let Some(ua) = user_agent {
-                    request = request.header("User-Agent", ua);
-                }
-
-                let response = request
+                let response = self
+                    .browser_session_connection_request(
+                        xoxc_token,
+                        xoxd_token,
+                        user_agent.as_deref(),
+                    )
                     .send()
                     .await
                     .context("failed to call Slack client.getWebSocketURL")?
@@ -744,10 +759,11 @@ mod tests {
         let request = build_websocket_request(url, &credentials).unwrap();
         let headers = request.headers();
 
-        assert_eq!(
-            headers.get("Cookie").and_then(|v| v.to_str().ok()),
-            Some("d=xoxd-cookie-value")
-        );
+        let cookie = headers
+            .get("Cookie")
+            .and_then(|value| value.to_str().ok())
+            .expect("browser-session cookie should be present");
+        assert!(cookie.starts_with("d=xoxd-cookie-value; d-s="));
         assert_eq!(
             headers.get("Origin").and_then(|v| v.to_str().ok()),
             Some("https://app.slack.com")
@@ -755,6 +771,57 @@ mod tests {
         assert_eq!(
             headers.get("User-Agent").and_then(|v| v.to_str().ok()),
             Some("custom-user-agent")
+        );
+    }
+
+    #[test]
+    fn builds_browser_session_websocket_url_request_with_upstream_auth_shape() {
+        let api = SocketModeApi::new(SocketModeCredentials::BrowserSession {
+            xoxc_token: "xoxc-browser-token".to_string(),
+            xoxd_token: "xoxd-cookie-value".to_string(),
+            user_agent: Some("exact-browser-user-agent".to_string()),
+        });
+        let request = api
+            .browser_session_connection_request(
+                "xoxc-browser-token",
+                "xoxd-cookie-value",
+                Some("exact-browser-user-agent"),
+            )
+            .build()
+            .expect("browser-session request should build");
+
+        assert_eq!(request.url().as_str(), CLIENT_WEBSOCKET_URL);
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer xoxc-browser-token")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("User-Agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("exact-browser-user-agent")
+        );
+        let cookie = request
+            .headers()
+            .get("Cookie")
+            .and_then(|value| value.to_str().ok())
+            .expect("browser-session cookie should be present");
+        assert!(cookie.starts_with("d=xoxd-cookie-value; d-s="));
+        let form = url::form_urlencoded::parse(
+            request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .expect("form body should be buffered"),
+        )
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            form.get("token").map(String::as_str),
+            Some("xoxc-browser-token")
         );
     }
 

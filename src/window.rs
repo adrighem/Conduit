@@ -3992,8 +3992,9 @@ impl ConduitWindow {
                 "Paste browser-session credentials. They will be stored in the system keyring.",
             );
             imp.setup_hint_label.set_visible(true);
-            imp.setup_hint_label
-                .set_label("Paste your Slack browser xoxc token and xoxd cookie.");
+            imp.setup_hint_label.set_label(
+                "Paste xoxc and xoxd from the same browser. Enterprise Slack may require its exact navigator.userAgent; if that still fails, use OAuth because Conduit cannot imitate browser TLS.",
+            );
             imp.connect_button.set_label("Import Browser Session");
         } else {
             imp.auth_intro_label.set_label(
@@ -9615,6 +9616,8 @@ mod tests {
             "AdwEntryRow\" id=\"client_id_entry",
             "AdwPasswordEntryRow\" id=\"xoxc_token_entry",
             "AdwPasswordEntryRow\" id=\"xoxd_token_entry",
+            "AdwEntryRow\" id=\"user_agent_entry",
+            "Browser User-Agent (Enterprise)",
             "<property name=\"label\" translatable=\"yes\">Message</property>",
             "<property name=\"label\" translatable=\"yes\">Reply</property>",
             "GtkToggleButton\" id=\"messages_button",

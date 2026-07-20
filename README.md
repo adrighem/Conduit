@@ -194,10 +194,12 @@ Conduit can import `xoxc-*` and `xoxd-*` browser-session credentials. Enable **U
 ```sh
 export CONDUIT_SLACK_XOXC_TOKEN=xoxc-...
 export CONDUIT_SLACK_XOXD_TOKEN=xoxd-...
-export CONDUIT_SLACK_USER_AGENT="Mozilla/5.0 ..." # optional
+export CONDUIT_SLACK_USER_AGENT="Mozilla/5.0 ..." # exact source-browser value for Enterprise Slack
 ```
 
 The aliases `SLACK_MCP_XOXC_TOKEN`, `SLACK_MCP_XOXD_TOKEN`, and `SLACK_MCP_USER_AGENT` are also accepted.
+
+For Enterprise Slack, copy `navigator.userAgent` from the same signed-in browser where you obtained the `xoxc` token and `xoxd` cookie. The [upstream Slack MCP guidance](https://github.com/korotovsky/slack-mcp-server/blob/master/docs/03-configuration-and-usage.md) notes that some higher-security environments additionally require a browser-compatible TLS handshake. Conduit does not impersonate a browser TLS fingerprint; if the exact User-Agent is still rejected, use the supported OAuth flow instead.
 
 Browser-session credentials are highly sensitive and rely on an unofficial authentication path. Keep them out of shell history, logs, commits, screenshots, and issue reports. Unset the variables after import if you do not want Conduit to import them again after sign-out.
 

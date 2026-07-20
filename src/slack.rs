@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 
+use crate::auth::browser_session_cookie_header;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
     SlackUser, SlackUserGroup, SlackUserProfile, StoredToken,
@@ -22,7 +23,7 @@ const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
 const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PREVIEW_VIDEO_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 1;
@@ -36,6 +37,7 @@ const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROP
 const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
 const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
 const USERS_LIST_METHOD: &str = "users.list";
+const SLACK_API_BASE_URL: &str = "https://slack.com/api";
 const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
 
 pub type Result<T> = std::result::Result<T, SlackError>;
@@ -249,6 +251,7 @@ fn filter_workspace_search_matches(query: &str, matches: Vec<SearchMatch>) -> Ve
 #[derive(Clone)]
 pub struct SlackApi {
     http: Client,
+    api_base_url: String,
     access_token: String,
     scopes: HashSet<String>,
     browser_cookie_d: Option<String>,
@@ -276,6 +279,7 @@ impl SlackApi {
                 .read_timeout(HTTP_READ_TIMEOUT)
                 .build()
                 .expect("valid Slack HTTP client configuration"),
+            api_base_url: SLACK_API_BASE_URL.to_string(),
             access_token: token.access_token,
             scopes,
             browser_cookie_d: token.browser_cookie_d,
@@ -1058,14 +1062,18 @@ impl SlackApi {
     where
         T: for<'de> Deserialize<'de> + SlackResponse,
     {
-        let url = format!("https://slack.com/api/{method}");
+        let url = format!("{}/{method}", self.api_base_url.trim_end_matches('/'));
+        let mut form = params.to_vec();
+        if self.browser_cookie_d.is_some() && !form.iter().any(|(key, _)| *key == "token") {
+            form.push(("token", self.access_token.clone()));
+        }
         let mut retries = 0;
 
         loop {
             let response = self
                 .authenticated_request(Method::POST, &url)
                 .timeout(API_REQUEST_TIMEOUT)
-                .form(params)
+                .form(&form)
                 .send()
                 .await
                 .with_context(|| format!("failed to call Slack method {method}"))?;
@@ -1117,7 +1125,7 @@ impl SlackApi {
             .map(str::trim)
             .filter(|cookie| !cookie.is_empty())
         {
-            request = request.header(COOKIE, format!("d={cookie}"));
+            request = request.header(COOKIE, browser_session_cookie_header(cookie));
         }
 
         if let Some(user_agent) = self
@@ -1825,8 +1833,12 @@ fn thread_replies_in_history_order(mut messages: Vec<SlackMessage>) -> Vec<Slack
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::thread;
+
     use super::*;
     use reqwest::header::{AUTHORIZATION, COOKIE, USER_AGENT};
+    use tiny_http::{Header, Response, Server};
 
     #[test]
     fn slack_errors_classify_api_failures_for_recovery() {
@@ -2431,19 +2443,102 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer xoxc-browser-token")
         );
-        assert_eq!(
-            request
-                .headers()
-                .get(COOKIE)
-                .and_then(|value| value.to_str().ok()),
-            Some("d=xoxd-cookie-value")
-        );
+        let cookie = request
+            .headers()
+            .get(COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("browser-session cookie should be present");
+        assert!(cookie.starts_with("d=xoxd-cookie-value; d-s="));
         assert_eq!(
             request
                 .headers()
                 .get(USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
             Some("Browser User Agent")
+        );
+    }
+
+    #[test]
+    fn browser_session_auth_test_sends_upstream_form_and_cookie_shape() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let headers = request
+                .headers()
+                .iter()
+                .map(|header| {
+                    (
+                        header.field.as_str().to_ascii_lowercase().to_string(),
+                        header.value.as_str().to_string(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"team":"Example","team_id":"T1","user":"Vincent","user_id":"U1","url":"https://example.slack.com/"}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, headers, body)
+        });
+
+        let token = StoredToken {
+            access_token: "xoxc-browser-token".to_string(),
+            token_type: Some("browser_session".to_string()),
+            scope: None,
+            refresh_token: None,
+            expires_in: None,
+            expires_at: None,
+            team_id: None,
+            team_name: None,
+            user_id: None,
+            client_id: None,
+            browser_cookie_d: Some("xoxd-cookie-value".to_string()),
+            user_agent: Some("Exact Browser User Agent".to_string()),
+        };
+        let mut api = SlackApi::new(token);
+        api.api_base_url = format!("http://{address}/api");
+        let auth = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.auth_test())
+            .expect("browser-session auth.test should succeed");
+        assert_eq!(auth.team_id.as_deref(), Some("T1"));
+
+        let (path, headers, body) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/auth.test");
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer xoxc-browser-token")
+        );
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("Exact Browser User Agent")
+        );
+        let cookie = headers
+            .get("cookie")
+            .expect("browser-session cookie should be sent");
+        assert!(cookie.starts_with("d=xoxd-cookie-value; d-s="));
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            form.get("token").map(String::as_str),
+            Some("xoxc-browser-token")
         );
     }
 

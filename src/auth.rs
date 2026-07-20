@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -23,6 +23,8 @@ const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OAUTH_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const OAUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const LEGACY_DEFAULT_BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8934;
 pub const DEFAULT_USER_SCOPES: &[&str] = &[
@@ -53,9 +55,6 @@ pub const DEFAULT_USER_SCOPES: &[&str] = &[
     "files:read",
     "files:write",
 ];
-const DEFAULT_BROWSER_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
     pub client_id: String,
@@ -88,8 +87,9 @@ impl TokenStore {
         let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
         match entry.get_password() {
             Ok(serialized) => {
-                let token =
+                let mut token: StoredToken =
                     serde_json::from_str(&serialized).context("stored Slack token is invalid")?;
+                discard_legacy_browser_user_agent(&mut token);
                 Ok(Some(token))
             }
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -111,6 +111,14 @@ impl TokenStore {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(error).context("failed to delete Slack token from keyring"),
         }
+    }
+}
+
+fn discard_legacy_browser_user_agent(token: &mut StoredToken) {
+    if token.browser_cookie_d.is_some()
+        && token.user_agent.as_deref() == Some(LEGACY_DEFAULT_BROWSER_USER_AGENT)
+    {
+        token.user_agent = None;
     }
 }
 
@@ -300,8 +308,7 @@ pub fn browser_session_token_from_values(
 ) -> Result<Option<StoredToken>> {
     let xoxc_token = trimmed_value(xoxc_token);
     let xoxd_token = trimmed_value(xoxd_token);
-    let user_agent =
-        trimmed_value(user_agent).or_else(|| Some(DEFAULT_BROWSER_USER_AGENT.to_string()));
+    let user_agent = trimmed_value(user_agent);
 
     match (xoxc_token, xoxd_token) {
         (None, None) => Ok(None),
@@ -332,6 +339,25 @@ pub fn browser_session_token_from_values(
             }))
         }
     }
+}
+
+pub(crate) fn browser_session_cookie_header(browser_cookie_d: &str) -> String {
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    browser_session_cookie_header_at(browser_cookie_d, unix_seconds)
+}
+
+fn browser_session_cookie_header_at(browser_cookie_d: &str, unix_seconds: u64) -> String {
+    let cookie = if browser_cookie_d.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'%')
+    }) {
+        browser_cookie_d.to_string()
+    } else {
+        urlencoding::encode(browser_cookie_d).into_owned()
+    };
+    format!("d={cookie}; d-s={}", unix_seconds.saturating_sub(10))
 }
 
 fn trimmed_value(value: Option<String>) -> Option<String> {
@@ -754,11 +780,35 @@ mod tests {
         assert_eq!(token.access_token, "xoxc-browser-token");
         assert_eq!(token.token_type.as_deref(), Some("browser_session"));
         assert_eq!(token.browser_cookie_d.as_deref(), Some("xoxd-cookie-value"));
-        assert_eq!(
-            token.user_agent.as_deref(),
-            Some(DEFAULT_BROWSER_USER_AGENT)
-        );
+        assert_eq!(token.user_agent, None);
         assert!(!token.should_refresh());
+    }
+
+    #[test]
+    fn browser_session_cookie_matches_upstream_shape() {
+        assert_eq!(
+            browser_session_cookie_header_at("xoxd-cookie/value", 1_720_000_010),
+            "d=xoxd-cookie%2Fvalue; d-s=1720000000"
+        );
+        assert_eq!(
+            browser_session_cookie_header_at("xoxd-already%2Fencoded", 1_720_000_010),
+            "d=xoxd-already%2Fencoded; d-s=1720000000"
+        );
+    }
+
+    #[test]
+    fn stored_browser_sessions_discard_the_legacy_synthetic_user_agent() {
+        let mut token = browser_session_token_from_values(
+            Some("xoxc-browser-token".to_string()),
+            Some("xoxd-cookie-value".to_string()),
+            Some(LEGACY_DEFAULT_BROWSER_USER_AGENT.to_string()),
+        )
+        .unwrap()
+        .expect("token should be created");
+
+        discard_legacy_browser_user_agent(&mut token);
+
+        assert_eq!(token.user_agent, None);
     }
 
     #[test]

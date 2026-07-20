@@ -130,7 +130,7 @@
                                 </child>
                                 <child>
                                   <object class="AdwEntryRow" id="user_agent_entry">
-                                    <property name="title" translatable="yes">User-Agent (optional)</property>
+                                    <property name="title" translatable="yes">Browser User-Agent (Enterprise)</property>
                                     <property name="visible">False</property>
                                   </object>
                                 </child>

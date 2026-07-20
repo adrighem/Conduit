@@ -710,6 +710,36 @@ impl RuntimeFailure {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthenticationFailureContext {
+    Default,
+    BrowserSession,
+}
+
+fn authentication_failure(
+    context: AuthenticationFailureContext,
+    error: &anyhow::Error,
+) -> RuntimeFailure {
+    let failure = RuntimeFailure::from_error(error);
+    if context != AuthenticationFailureContext::BrowserSession {
+        return failure;
+    }
+
+    match failure.category {
+        RuntimeFailureCategory::Authentication => RuntimeFailure {
+            category: failure.category,
+            message: "Slack rejected the XOXC/XOXD browser session. Recopy both values from the same signed-in browser and try again."
+                .to_string(),
+        },
+        RuntimeFailureCategory::Network => RuntimeFailure {
+            category: failure.category,
+            message: "Could not validate XOXC/XOXD. Check the connection and, for Enterprise Slack, paste the exact User-Agent from the same browser. If that still fails, use OAuth because Conduit cannot reproduce the browser's TLS fingerprint."
+                .to_string(),
+        },
+        _ => failure,
+    }
+}
+
 #[derive(Debug)]
 pub enum RuntimeEventKind {
     Status(String),
@@ -1768,15 +1798,27 @@ fn dispatch_command(
                 events.send_event(RuntimeEventKind::SignedOut);
                 return;
             };
+            let failure_context = if token.browser_cookie_d.is_some() {
+                AuthenticationFailureContext::BrowserSession
+            } else {
+                AuthenticationFailureContext::Default
+            };
             let oauth = oauth.clone();
-            spawn_authentication_task(state, identity, events, limits.clone(), async move {
-                let token = if token.should_refresh() {
-                    oauth.refresh(&token).await?
-                } else {
-                    token
-                };
-                authenticate_token(token).await
-            });
+            spawn_authentication_task(
+                state,
+                identity,
+                events,
+                limits.clone(),
+                failure_context,
+                async move {
+                    let token = if token.should_refresh() {
+                        oauth.refresh(&token).await?
+                    } else {
+                        token
+                    };
+                    authenticate_token(token).await
+                },
+            );
         }
         RuntimeCommand::StartOAuth {
             client_id,
@@ -1787,12 +1829,19 @@ fn dispatch_command(
             ));
             events.send_status("Opening Slack authorization");
             let oauth = oauth.clone();
-            spawn_authentication_task(state, identity, events, limits.clone(), async move {
-                let token = oauth
-                    .authenticate(OAuthConfig::new(client_id), debug_auth)
-                    .await?;
-                authenticate_token(token).await
-            });
+            spawn_authentication_task(
+                state,
+                identity,
+                events,
+                limits.clone(),
+                AuthenticationFailureContext::Default,
+                async move {
+                    let token = oauth
+                        .authenticate(OAuthConfig::new(client_id), debug_auth)
+                        .await?;
+                    authenticate_token(token).await
+                },
+            );
         }
         RuntimeCommand::StartBrowserSession {
             xoxc_token,
@@ -1818,7 +1867,8 @@ fn dispatch_command(
                     return;
                 }
                 Err(error) => {
-                    send_lifecycle_failure(&events, &error);
+                    let failure = RuntimeFailure::validation(error.to_string());
+                    send_lifecycle_failure_with(&events, &error, failure);
                     return;
                 }
             };
@@ -1827,6 +1877,7 @@ fn dispatch_command(
                 identity,
                 events,
                 limits.clone(),
+                AuthenticationFailureContext::BrowserSession,
                 authenticate_token(token),
             );
         }
@@ -1907,6 +1958,7 @@ fn spawn_authentication_task<F>(
     identity: RuntimeIdentity,
     events: RuntimeEventSender,
     limits: RuntimeTaskLimits,
+    failure_context: AuthenticationFailureContext,
     future: F,
 ) where
     F: Future<Output = Result<(StoredToken, SlackApi, AuthInfo)>> + Send + 'static,
@@ -1964,7 +2016,8 @@ fn spawn_authentication_task<F>(
                     );
                 }
                 Err(error) => {
-                    send_lifecycle_failure(&events, &error);
+                    let failure = authentication_failure(failure_context, &error);
+                    send_lifecycle_failure_with(&events, &error, failure);
                 }
             }
         },
@@ -4111,10 +4164,18 @@ fn lifecycle_failure_event(failure: &RuntimeFailure) -> WorkspaceLifecycleEvent 
 
 fn send_lifecycle_failure(events: &RuntimeEventSender, error: &anyhow::Error) {
     let failure = RuntimeFailure::from_error(error);
+    send_lifecycle_failure_with(events, error, failure);
+}
+
+fn send_lifecycle_failure_with(
+    events: &RuntimeEventSender,
+    error: &anyhow::Error,
+    failure: RuntimeFailure,
+) {
     events.send_event(RuntimeEventKind::WorkspaceLifecycle(
         lifecycle_failure_event(&failure),
     ));
-    events.send_failure(error);
+    events.send_failure_with(error, failure);
 }
 
 fn send_history_loaded(
@@ -4604,6 +4665,17 @@ impl RuntimeEventSender {
             fallback: context,
         }
     }
+
+    fn send_failure_with(&self, error: &anyhow::Error, failure: RuntimeFailure) {
+        crate::debug::log(
+            "runtime",
+            &format!(
+                "RuntimeOperationFailed operation={:?} target={:?} category={:?} error={error:#}",
+                self.fallback.operation, self.fallback.target, failure.category
+            ),
+        );
+        self.send_event(RuntimeEventKind::Error(failure));
+    }
 }
 
 impl EventSenderExt for RuntimeEventSender {
@@ -4612,14 +4684,7 @@ impl EventSenderExt for RuntimeEventSender {
     }
 
     fn send_failure(&self, error: &anyhow::Error) {
-        crate::debug::log(
-            "runtime",
-            &format!(
-                "RuntimeOperationFailed operation={:?} target={:?} error={error:#}",
-                self.fallback.operation, self.fallback.target
-            ),
-        );
-        self.send_event(RuntimeEventKind::Error(RuntimeFailure::from_error(error)));
+        self.send_failure_with(error, RuntimeFailure::from_error(error));
     }
 
     fn send_event(&self, kind: RuntimeEventKind) {
@@ -4811,6 +4876,23 @@ mod tests {
         assert_eq!(validation.message, "Enter both browser-session tokens");
         assert_eq!(unknown.category, RuntimeFailureCategory::Internal);
         assert_eq!(unknown.message, "Conduit encountered an unexpected error.");
+    }
+
+    #[test]
+    fn browser_session_connectivity_failure_explains_user_agent_recovery() {
+        let timeout = anyhow::Error::new(crate::slack::SlackError::from(anyhow::Error::new(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "request timed out"),
+        )));
+
+        let failure =
+            authentication_failure(AuthenticationFailureContext::BrowserSession, &timeout);
+
+        assert_eq!(failure.category, RuntimeFailureCategory::Network);
+        assert!(failure.message.contains("exact User-Agent"));
+        assert!(failure.message.contains("XOXC/XOXD"));
+        assert!(failure.message.contains("use OAuth"));
+        assert!(failure.message.contains("TLS fingerprint"));
+        assert!(!failure.message.contains("request timed out"));
     }
 
     struct CancellationSignal(Option<tokio::sync::oneshot::Sender<()>>);

@@ -10,3 +10,11 @@
   - [x] Sub-task: Add UI controls and mode toggle
   - [x] Sub-task: Wire UI input through runtime validation and keyring storage
 - [x] Task: Conductor - User Manual Verification 'XOXC/XOXD Browser Session Authentication' (Protocol in workflow.md) b3c064d
+
+## Phase 2: Browser-session import compatibility
+- [~] Task: Align browser-session requests and recovery guidance with the upstream workaround
+  - [ ] Sub-task: Add request-level coverage for XOXC form authentication and browser cookies
+  - [ ] Sub-task: Stop substituting an unrelated browser User-Agent
+  - [ ] Sub-task: Surface actionable browser-session import failures without exposing credentials
+  - [ ] Sub-task: Document Enterprise User-Agent and TLS-fingerprint requirements
+- [ ] Task: Conductor - User Manual Verification 'Browser-session import compatibility' (Protocol in workflow.md)
