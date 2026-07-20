@@ -11,12 +11,16 @@ gnome.compile_resources('conduit',
 cargo_bin  = find_program('cargo')
 cargo_release_arg = ''
 cargo_features = []
-cargo_env  = [
-  'CARGO_HOME=' + meson.project_build_root()  / 'cargo-home',
-  'CONDUIT_LOCALEDIR=' + get_option('prefix') / get_option('localedir'),
-  'CONDUIT_PKGDATADIR=' + pkgdatadir,
-  'CONDUIT_SLACK_CLIENT_ID=' + get_option('slack_client_id'),
-]
+cargo_env = environment()
+cargo_env.set('CARGO_HOME', meson.project_build_root() / 'cargo-home')
+cargo_env.set('CONDUIT_LOCALEDIR', get_option('prefix') / get_option('localedir'))
+cargo_env.set('CONDUIT_PKGDATADIR', pkgdatadir)
+cargo_env.set('CONDUIT_SLACK_CLIENT_ID', get_option('slack_client_id'))
+
+pkg_config_paths = get_option('pkg_config_path')
+if pkg_config_paths.length() > 0
+  cargo_env.prepend('PKG_CONFIG_PATH', ':'.join(pkg_config_paths), separator: ':')
+endif
 
 native_media_option = get_option('native_media')
 native_media_dependencies = [
@@ -61,12 +65,8 @@ cargo_build = custom_target(
   install_dir: get_option('bindir'),
   command: [
     'bash', '-c',
-    'args=(build --locked --manifest-path "$6" --target-dir "$9"); [[ -n "$7" ]] && args+=("$7"); [[ -n "$8" ]] && args+=(--features "$8"); env "$1" "$2" "$3" "$4" "$5" "${args[@]}" && cp "$9/${10}/${11}" "${12}"',
+    'args=(build --locked --manifest-path "$2" --target-dir "$5"); [[ -n "$3" ]] && args+=("$3"); [[ -n "$4" ]] && args+=(--features "$4"); "$1" "${args[@]}" && cp "$5/$6/$7" "$8"',
     'cargo-build',
-    cargo_env[0],
-    cargo_env[1],
-    cargo_env[2],
-    cargo_env[3],
     cargo_bin.full_path(),
     meson.project_source_root() / 'Cargo.toml',
     cargo_release_arg,
@@ -75,7 +75,8 @@ cargo_build = custom_target(
     rust_target,
     meson.project_name(),
     '@OUTPUT@',
-  ]
+  ],
+  env: cargo_env,
 )
 
 cargo_test_args = [
