@@ -1,0 +1,9 @@
+Task: Move bootstrap, conversation, user, history, thread, and freshness access onto focused repository operations
+
+Summary: Lazily attached WorkspaceStore to one StoreHub, added one cached bootstrap projection, routed startup hydration through it, moved keyed domain reads and serialized writes onto focused operations, and added freshness/retry access.
+
+Modified: src/store.rs, src/runtime.rs
+
+Verification: cargo check; cargo test (516 passed); cargo fmt --check. Strict Clippy and coverage tooling are unavailable in this environment.
+
+Rationale: Retire repeated full-cache startup scans and per-operation SQLite connections while retaining compatibility runtime events.
