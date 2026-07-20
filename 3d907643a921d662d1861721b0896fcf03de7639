@@ -1,0 +1,8 @@
+CI follow-up: Boxed SlackMessage payloads in MessageChange to satisfy strict large-enum-variant lint without suppressing the warning.
+
+Verification:
+- cargo fmt -- --check
+- git diff --check
+- cargo test workspace_pipeline::tests (8 passed)
+- cargo check
+- Local clippy component unavailable; remote CI is authoritative.
