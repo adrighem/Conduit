@@ -1,0 +1,9 @@
+Task: Build and attach a Flatpak bundle and release checksums
+
+Summary: Removed the unsupported artifact-name input from the pinned Flatpak builder v6 action and added a release workflow regression assertion.
+
+Modified files: .github/workflows/release.yml, tests/test_release_automation.py.
+
+Rationale: Avoid an ignored-input warning while retaining the action's bundle-derived artifact name and matching download pattern.
+
+Verification: actionlint, release contract tests, and diff checks passed.
