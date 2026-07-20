@@ -1,0 +1,9 @@
+Task: Introduce StoreHub with bounded writer/readers, commit barriers, and clean shutdown
+
+Summary: Added a workspace StoreHub with one persistent writer, two round-robin query-only readers, bounded admission queues, generic typed tasks, commit barriers, and shutdown draining.
+
+Modified: src/store.rs
+
+Verification: cargo check; cargo test (513 passed); cargo fmt --check. Strict Clippy and coverage tooling are unavailable in this environment.
+
+Rationale: Establish a compatibility seam that focused repository operations can adopt without changing callers all at once.
