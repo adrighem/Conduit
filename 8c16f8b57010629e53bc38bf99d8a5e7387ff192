@@ -1,0 +1,7 @@
+Task: Record the investigation baseline and coordinator/store architecture in Conductor documentation
+
+Summary: Created the workspace pipeline rearchitecture track with the approved architecture, phased implementation plan, acceptance criteria, and documented stack decisions.
+
+Modified: conductor/tracks.md, conductor/tech-stack.md, conductor/tracks/workspace_pipeline_rearchitecture_20260720/*
+
+Rationale: Establish the Conductor source of truth and record deliberate architecture choices before implementation.
