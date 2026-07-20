@@ -1,0 +1,9 @@
+Tasks: picker lifecycle tests; immediate picker shell; cancellable batched population; headless Ctrl+K validation
+
+Summary: Presents the conversation picker before catalog work, then appends bounded idle-time result batches with generation-based cancellation.
+
+Modified files: src/window.rs, src/sidebar.rs, tests/test_keyboard_shortcuts.py.
+
+Rationale: Make Ctrl+K responsive in large workspaces without changing ranking, actions, or section ordering.
+
+Verification: cargo formatting passed and all 13 Meson tests, including Rust unit and headless keyboard coverage, passed.
