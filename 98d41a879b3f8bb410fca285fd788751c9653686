@@ -1,0 +1,7 @@
+Task: Fix XOXC/XOXD browser-session import compatibility
+
+Summary: Matched Slack browser-session requests with token form authentication and d/d-s cookies, stopped forging a stale User-Agent, migrated prior stored defaults, and added credential-safe Enterprise recovery guidance.
+
+Modified files: authentication and runtime handling, Slack Web API and realtime request construction, connect UI, README, Conductor XOXC track, and request-level regression tests.
+
+Verification: 14 targeted browser-session tests passed; all 506 Rust tests passed through Meson; auth review found no remaining blocker or secrets-safety regression.
