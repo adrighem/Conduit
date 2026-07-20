@@ -4,8 +4,8 @@
 
 - [x] Task: Record the investigation baseline and coordinator/store architecture in Conductor documentation 8c16f8b
 - [x] Task: Add schema-v2 freshness metadata and derived-cache recovery coverage 4e306e2
-- [~] Task: Introduce StoreHub with bounded writer/readers, commit barriers, and clean shutdown
-- [ ] Task: Move bootstrap, conversation, user, history, thread, and freshness access onto focused repository operations
+- [x] Task: Introduce StoreHub with bounded writer/readers, commit barriers, and clean shutdown 9e4b31a
+- [~] Task: Move bootstrap, conversation, user, history, thread, and freshness access onto focused repository operations
 - [ ] Task: Add write batching, immediate user flushes, unchanged suppression, and store tracing counters
 - [ ] Task: Conductor - User Manual Verification 'Guardrails and persistent storage' (Protocol in workflow.md)
 
