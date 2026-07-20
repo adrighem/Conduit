@@ -25,6 +25,12 @@ test(
   args: [files('test_release_automation.py'), meson.project_source_root()],
 )
 
+test(
+  'Branding assets',
+  python,
+  args: [files('test_branding_assets.py'), meson.project_source_root()],
+)
+
 if xvfb_run.found() and xfwm4.found()
   test(
     'External Slack URI activation',

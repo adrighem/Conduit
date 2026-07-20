@@ -1,7 +1,7 @@
 # Conduit
 
 <p align="center">
-  <img src="data/branding/conduit-logo-big.png" alt="Conduit logo" width="420">
+  <img src="data/branding/conduit.png" alt="Conduit logo" width="280">
 </p>
 
 <p align="center">

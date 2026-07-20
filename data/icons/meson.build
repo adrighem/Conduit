@@ -18,9 +18,3 @@ foreach icon_size : app_icon_sizes
     install_dir: get_option('datadir') / 'icons' / icon_dir
   )
 endforeach
-
-scalable_icon_dir = 'hicolor' / 'scalable' / 'apps'
-install_data(
-  scalable_icon_dir / ('@0@.svg').format(application_id),
-  install_dir: get_option('datadir') / 'icons' / scalable_icon_dir
-)

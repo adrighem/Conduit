@@ -113,7 +113,7 @@ jobs:
             /usr/share/dbus-1/services/eu.vanadrighem.conduit.service \
             /usr/share/glib-2.0/schemas/eu.vanadrighem.conduit.gschema.xml \
             /usr/share/gnome-shell/search-providers/eu.vanadrighem.conduit.search-provider.ini \
-            /usr/share/icons/hicolor/scalable/apps/eu.vanadrighem.conduit.svg \
+            /usr/share/icons/hicolor/512x512/apps/eu.vanadrighem.conduit.png \
             /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml; do
             test -e "$path"
           done
@@ -203,7 +203,7 @@ jobs:
             /usr/share/dbus-1/services/eu.vanadrighem.conduit.service \
             /usr/share/glib-2.0/schemas/eu.vanadrighem.conduit.gschema.xml \
             /usr/share/gnome-shell/search-providers/eu.vanadrighem.conduit.search-provider.ini \
-            /usr/share/icons/hicolor/scalable/apps/eu.vanadrighem.conduit.svg \
+            /usr/share/icons/hicolor/512x512/apps/eu.vanadrighem.conduit.png \
             /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml; do
             test -e "$path"
           done
