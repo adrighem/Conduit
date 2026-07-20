@@ -1,0 +1,4 @@
+Phase: Guardrails and persistent storage
+Track: workspace_pipeline_rearchitecture_20260720
+Automated verification: cargo test (520 passed); cargo check; meson compile -C _build; meson test -C _build --print-errorlogs (14 passed).
+Manual verification: user confirmed startup, cached bootstrap, refresh behavior, persistence, and settled-idle store commits pass after bf14d09.
