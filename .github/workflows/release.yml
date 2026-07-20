@@ -228,7 +228,6 @@ jobs:
           bundle: conduit-${{ needs.release-please.outputs.version }}-x86_64.flatpak
           manifest-path: packaging/flatpak/eu.vanadrighem.conduit.json
           cache-key: flatpak-builder-${{ needs.release-please.outputs.sha }}
-          artifact-name: conduit-${{ needs.release-please.outputs.version }}-flatpak
 
   publish-assets:
     needs:

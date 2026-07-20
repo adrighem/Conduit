@@ -64,6 +64,7 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert "/usr/share/conduit/conduit.gresource" in workflow
     assert "flatpak/flatpak-github-actions/flatpak-builder@v6" in workflow
     assert f"packaging/flatpak/{APP_ID}.json" in workflow
+    assert "artifact-name:" not in workflow
     assert "SHA256SUMS" in workflow
     assert "gh release upload" in workflow
 
