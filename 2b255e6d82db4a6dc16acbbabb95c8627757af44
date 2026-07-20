@@ -1,0 +1,9 @@
+Task: Add write batching, immediate user flushes, unchanged suppression, and store tracing counters
+
+Summary: Added 50-mutation/50ms maintenance batching, immediate-write preemption, atomic rollback, unchanged rollback suppression, and structured store connection/transaction/row counters.
+
+Modified: src/store.rs
+
+Verification: cargo check; cargo test (519 passed); cargo fmt --check. Strict Clippy and coverage tooling are unavailable in this environment.
+
+Rationale: Bound background persistence overhead and guarantee idle or identical state produces no SQLite commit.
