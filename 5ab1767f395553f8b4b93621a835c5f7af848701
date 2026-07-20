@@ -1,0 +1,22 @@
+Task: Extract WorkspaceCoordinator and its pure reducer from runtime
+
+Summary:
+- Added a canonical WorkspaceCoordinator owning revisioned conversations, users, histories, threads, unread overlays, and tombstones.
+- Reduced every supported mutation into one shared-revision WorkspacePatch and StoreBatch while suppressing no-op changes.
+- Preserved newer realtime/local overlays across stale snapshots and prevented deleted messages from being resurrected.
+- Added focused reducer tests and equality support for SlackConversation.
+
+Files:
+- src/workspace_pipeline.rs
+- src/models.rs
+
+Rationale:
+Centralizes workspace-domain merge rules behind a pure reducer before adapting runtime input paths.
+
+Verification:
+- cargo fmt -- --check
+- git diff --check
+- cargo test (528 passed)
+- cargo check
+- meson compile -C _build
+- meson test -C _build --print-errorlogs (14 passed)
