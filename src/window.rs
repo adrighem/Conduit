@@ -278,6 +278,7 @@ mod imp {
         pub(super) sidebar_rows: RefCell<HashMap<SidebarItemKey, gtk::ListBoxRow>>,
         pub(super) sidebar_filter_generation: Cell<u64>,
         pub(super) picker_filter_generation: Cell<u64>,
+        pub(super) picker_population_generation: Cell<u64>,
         pub(super) navigation_history: RefCell<Vec<MainNavigationTarget>>,
         pub(super) restoring_navigation: Cell<bool>,
         pub(super) profile_visible: Cell<bool>,
@@ -507,6 +508,7 @@ fn is_unmodified_paste_accelerator(key: gtk::gdk::Key, state: gtk::gdk::Modifier
 const COMPOSER_TARGETS: [ComposerTarget; 2] = [ComposerTarget::Message, ComposerTarget::Thread];
 const UI_EVENT_BATCH_LIMIT: usize = 8;
 const MAX_PENDING_SLACK_URIS: usize = 16;
+const PICKER_POPULATION_BATCH_SIZE: usize = 24;
 const CANCEL_REACTION_PICKER_SCRIPT: &str = r#"(function () {
   const picker = document.getElementById("emoji-picker");
   if (!picker || !picker.open) return false;
@@ -559,6 +561,44 @@ struct ConversationPickerView {
     search: gtk::SearchEntry,
     actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
     include_discovery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConversationPickerListEntry {
+    Header(String),
+    Item(ConversationPickerItem),
+    Placeholder(String),
+}
+
+#[derive(Debug)]
+struct ConversationPickerPopulation {
+    generation: u64,
+    entries: VecDeque<ConversationPickerListEntry>,
+}
+
+impl ConversationPickerPopulation {
+    fn new(generation: u64, entries: VecDeque<ConversationPickerListEntry>) -> Self {
+        Self {
+            generation,
+            entries,
+        }
+    }
+
+    fn next_batch(&mut self, current_generation: u64) -> Option<Vec<ConversationPickerListEntry>> {
+        if self.generation != current_generation {
+            self.entries.clear();
+            return None;
+        }
+        if self.entries.is_empty() {
+            return None;
+        }
+        let batch_size = self.entries.len().min(PICKER_POPULATION_BATCH_SIZE);
+        Some(self.entries.drain(..batch_size).collect())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,15 +700,36 @@ fn picker_sections(
     )
 }
 
-fn picker_sections_empty(sections: &ConversationPickerSections) -> bool {
-    sections.search_results.as_ref().map_or_else(
-        || {
-            sections.conversations.is_empty()
-                && sections.channels.is_empty()
-                && sections.people.is_empty()
-        },
-        Vec::is_empty,
-    )
+fn conversation_picker_population_entries(
+    sections: &ConversationPickerSections,
+) -> VecDeque<ConversationPickerListEntry> {
+    let mut entries = VecDeque::new();
+    if let Some(results) = sections.search_results.as_deref() {
+        entries.extend(
+            results
+                .iter()
+                .cloned()
+                .map(ConversationPickerListEntry::Item),
+        );
+    } else {
+        for (title, items) in [
+            ("Conversations", sections.conversations.as_slice()),
+            ("Channels you can join", sections.channels.as_slice()),
+            ("People", sections.people.as_slice()),
+        ] {
+            if items.is_empty() {
+                continue;
+            }
+            entries.push_back(ConversationPickerListEntry::Header(title.to_string()));
+            entries.extend(items.iter().cloned().map(ConversationPickerListEntry::Item));
+        }
+    }
+    if entries.is_empty() {
+        entries.push_back(ConversationPickerListEntry::Placeholder(gettext(
+            "No matching conversations",
+        )));
+    }
+    entries
 }
 
 fn valid_channel_name(name: &str) -> bool {
@@ -6138,7 +6199,6 @@ impl ConduitWindow {
     }
 
     fn show_conversation_switcher(&self) {
-        self.send_command(RuntimeCommand::DiscoverChannels);
         self.show_conversation_picker(
             "Switch conversation",
             "Search conversations",
@@ -6160,6 +6220,7 @@ impl ConduitWindow {
                 }
             },
         );
+        self.send_command(RuntimeCommand::DiscoverChannels);
     }
 
     fn show_new_message_picker(&self) {
@@ -6358,30 +6419,8 @@ impl ConduitWindow {
     ) where
         F: Fn(&Self, SidebarRowAction) + 'static,
     {
-        let imp = self.imp();
-        let conversations = imp.workspace.conversations.borrow().conversations();
-        let user_names = imp.user_names.borrow().clone();
-        let discovered_channels = imp.discovered_channels.borrow().clone();
-        let discovered_users = imp.discovered_users.borrow().clone();
-        let current_user_id = imp.current_user_id.borrow().clone();
-        let user_search_aliases = imp.user_search_aliases.borrow().clone();
-        let user_statuses = imp.user_statuses.borrow().clone();
-        let sections = picker_sections(
-            include_discovery,
-            sidebar::ConversationPickerSource {
-                conversations: &conversations,
-                discovered_channels: &discovered_channels,
-                discovered_users: &discovered_users,
-                user_names: &user_names,
-                current_user_id: current_user_id.as_deref(),
-                known_user_search_aliases: &user_search_aliases,
-                user_full_names: &imp.user_full_names.borrow(),
-                user_statuses: &user_statuses,
-            },
-            "",
-        );
-        if picker_sections_empty(&sections) && !include_discovery {
-            self.set_status("No conversations loaded");
+        if !include_discovery && self.imp().workspace.conversations.borrow().is_empty() {
+            self.set_status(&gettext("No conversations loaded"));
             return;
         }
 
@@ -6429,7 +6468,7 @@ impl ConduitWindow {
 
         let actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>> =
             Rc::new(RefCell::new(HashMap::new()));
-        self.populate_conversation_picker_list(&list, &actions, &sections);
+        self.append_placeholder(&list, &gettext("Loading conversations…"));
 
         *self.imp().conversation_picker_view.borrow_mut() = Some(ConversationPickerView {
             list: list.clone(),
@@ -6441,6 +6480,7 @@ impl ConduitWindow {
         let weak_window = self.downgrade();
         search.connect_search_changed(move |_| {
             if let Some(window) = weak_window.upgrade() {
+                window.cancel_conversation_picker_population();
                 window.schedule_picker_filter();
             }
         });
@@ -6449,12 +6489,26 @@ impl ConduitWindow {
         let list_for_close = list.clone();
         dialog.connect_close_request(move |_| {
             if let Some(window) = weak_window.upgrade() {
-                let mut active = window.imp().conversation_picker_view.borrow_mut();
-                if active
-                    .as_ref()
-                    .is_some_and(|view| view.list == list_for_close)
-                {
-                    active.take();
+                let closed_active_picker = {
+                    let mut active = window.imp().conversation_picker_view.borrow_mut();
+                    if active
+                        .as_ref()
+                        .is_some_and(|view| view.list == list_for_close)
+                    {
+                        active.take();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if closed_active_picker {
+                    window.cancel_conversation_picker_population();
+                    let generation = window
+                        .imp()
+                        .picker_filter_generation
+                        .get()
+                        .saturating_add(1);
+                    window.imp().picker_filter_generation.set(generation);
                 }
             }
             glib::Propagation::Proceed
@@ -6474,6 +6528,21 @@ impl ConduitWindow {
 
         dialog.present();
         search.grab_focus();
+        let weak_window = self.downgrade();
+        let list_for_initial_population = list.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(window) = weak_window.upgrade() {
+                let picker_is_active = window
+                    .imp()
+                    .conversation_picker_view
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|view| view.list == list_for_initial_population);
+                if picker_is_active {
+                    window.refresh_open_conversation_picker();
+                }
+            }
+        });
     }
 
     fn refresh_open_conversation_picker(&self) {
@@ -6508,32 +6577,83 @@ impl ConduitWindow {
         actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
         sections: &ConversationPickerSections,
     ) {
+        let generation = self.cancel_conversation_picker_population();
         self.clear_list(list);
         actions.borrow_mut().clear();
-
-        if picker_sections_empty(sections) {
-            self.append_placeholder(list, "No matching conversations");
+        let mut population = ConversationPickerPopulation::new(
+            generation,
+            conversation_picker_population_entries(sections),
+        );
+        if let Some(batch) = population.next_batch(generation) {
+            self.append_conversation_picker_batch(list, actions, batch);
+        }
+        if population.is_empty() {
             return;
         }
 
-        if let Some(results) = sections.search_results.as_deref() {
-            for item in results {
-                self.append_conversation_picker_row(list, actions, item);
+        let weak_window = self.downgrade();
+        let list = list.clone();
+        let actions = actions.clone();
+        glib::idle_add_local(move || {
+            let Some(window) = weak_window.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !window.conversation_picker_population_is_active(&list, generation) {
+                return glib::ControlFlow::Break;
             }
-            return;
-        }
+            let Some(batch) = population.next_batch(generation) else {
+                return glib::ControlFlow::Break;
+            };
+            window.append_conversation_picker_batch(&list, &actions, batch);
+            if population.is_empty() {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
 
-        for (title, items) in [
-            ("Conversations", sections.conversations.as_slice()),
-            ("Channels you can join", sections.channels.as_slice()),
-            ("People", sections.people.as_slice()),
-        ] {
-            if items.is_empty() {
-                continue;
-            }
-            self.append_picker_section_header(list, title);
-            for item in items {
-                self.append_conversation_picker_row(list, actions, item);
+    fn cancel_conversation_picker_population(&self) -> u64 {
+        let generation = self
+            .imp()
+            .picker_population_generation
+            .get()
+            .saturating_add(1);
+        self.imp().picker_population_generation.set(generation);
+        generation
+    }
+
+    fn conversation_picker_population_is_active(
+        &self,
+        list: &gtk::ListBox,
+        generation: u64,
+    ) -> bool {
+        self.imp().picker_population_generation.get() == generation
+            && self
+                .imp()
+                .conversation_picker_view
+                .borrow()
+                .as_ref()
+                .is_some_and(|view| view.list == *list)
+    }
+
+    fn append_conversation_picker_batch(
+        &self,
+        list: &gtk::ListBox,
+        actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
+        batch: Vec<ConversationPickerListEntry>,
+    ) {
+        for entry in batch {
+            match entry {
+                ConversationPickerListEntry::Header(title) => {
+                    self.append_picker_section_header(list, &title)
+                }
+                ConversationPickerListEntry::Item(item) => {
+                    self.append_conversation_picker_row(list, actions, &item)
+                }
+                ConversationPickerListEntry::Placeholder(text) => {
+                    self.append_placeholder(list, &text)
+                }
             }
         }
     }
@@ -8435,6 +8555,61 @@ mod tests {
             search_aliases: Vec::new(),
             status: None,
         }
+    }
+
+    fn picker_item(id: &str, title: &str) -> ConversationPickerItem {
+        ConversationPickerItem {
+            row: sidebar_row(id, title),
+            action: ConversationPickerAction::OpenConversation,
+        }
+    }
+
+    #[test]
+    fn picker_population_flattens_sections_and_preserves_bounded_order() {
+        let sections = ConversationPickerSections {
+            conversations: (0..30)
+                .map(|index| picker_item(&format!("C{index}"), &format!("Channel {index}")))
+                .collect(),
+            channels: vec![picker_item("C_JOIN", "Join me")],
+            people: vec![picker_item("U1", "Ada")],
+            search_results: None,
+        };
+        let entries = conversation_picker_population_entries(&sections);
+        assert!(matches!(
+            entries.front(),
+            Some(ConversationPickerListEntry::Header(title)) if title == "Conversations"
+        ));
+        assert!(entries.iter().any(
+            |entry| matches!(entry, ConversationPickerListEntry::Header(title) if title == "Channels you can join")
+        ));
+        assert!(entries.iter().any(
+            |entry| matches!(entry, ConversationPickerListEntry::Header(title) if title == "People")
+        ));
+
+        let expected = entries.iter().cloned().collect::<Vec<_>>();
+        let mut population = ConversationPickerPopulation::new(7, entries);
+        let mut actual = Vec::new();
+        while let Some(batch) = population.next_batch(7) {
+            assert!(batch.len() <= PICKER_POPULATION_BATCH_SIZE);
+            actual.extend(batch);
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn picker_population_rejects_stale_generation_without_appending() {
+        let sections = ConversationPickerSections {
+            search_results: Some(vec![picker_item("C1", "General")]),
+            ..Default::default()
+        };
+        let entries = conversation_picker_population_entries(&sections);
+        assert!(entries
+            .iter()
+            .all(|entry| matches!(entry, ConversationPickerListEntry::Item(_))));
+
+        let mut population = ConversationPickerPopulation::new(4, entries);
+        assert_eq!(population.next_batch(5), None);
+        assert!(population.is_empty());
     }
 
     #[test]

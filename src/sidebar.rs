@@ -609,19 +609,23 @@ pub(crate) fn filter_conversation_switcher_rows(
         })
         .collect::<Vec<_>>();
 
-    let matching_ids = items
-        .iter()
-        .map(|(item, _, _)| item.id.as_str())
-        .collect::<HashSet<_>>();
-    let participant_coverage = conversation_participant_coverage(
-        conversations
+    let participant_coverage = if query.is_empty() {
+        HashMap::new()
+    } else {
+        let matching_ids = items
             .iter()
-            .filter(|conversation| matching_ids.contains(conversation.id.as_str())),
-        user_names,
-        current_user_id,
-        &query,
-        user_search_aliases,
-    );
+            .map(|(item, _, _)| item.id.as_str())
+            .collect::<HashSet<_>>();
+        conversation_participant_coverage(
+            conversations
+                .iter()
+                .filter(|conversation| matching_ids.contains(conversation.id.as_str())),
+            user_names,
+            current_user_id,
+            &query,
+            user_search_aliases,
+        )
+    };
     items.sort_by(
         |(left, left_score, left_sort_key), (right, right_score, right_sort_key)| {
             right_score
@@ -709,33 +713,39 @@ pub fn conversation_picker_sections_with_statuses(
     let search_query = SearchQuery::parse(query);
     let mut all_user_search_aliases = known_user_search_aliases.clone();
     all_user_search_aliases.extend(user_search_aliases(discovered_users));
-    let mut participant_coverage = conversation_participant_coverage(
-        conversations,
-        user_names,
-        current_user_id,
-        &search_query,
-        Some(&all_user_search_aliases),
-    );
-    for user in discovered_users {
-        let Some(user_id) = user
-            .id
-            .as_deref()
-            .filter(|user_id| !user_id.trim().is_empty())
-        else {
-            continue;
-        };
-        participant_coverage.insert(
-            user_id.to_string(),
-            ParticipantCoverage {
-                matched: usize::from(user_matches_query(
-                    user_id,
-                    user_names,
-                    Some(&all_user_search_aliases),
-                    &search_query,
-                )),
-                total: 1,
-            },
-        );
+    let mut participant_coverage = if search_query.is_empty() {
+        HashMap::new()
+    } else {
+        conversation_participant_coverage(
+            conversations,
+            user_names,
+            current_user_id,
+            &search_query,
+            Some(&all_user_search_aliases),
+        )
+    };
+    if !search_query.is_empty() {
+        for user in discovered_users {
+            let Some(user_id) = user
+                .id
+                .as_deref()
+                .filter(|user_id| !user_id.trim().is_empty())
+            else {
+                continue;
+            };
+            participant_coverage.insert(
+                user_id.to_string(),
+                ParticipantCoverage {
+                    matched: usize::from(user_matches_query(
+                        user_id,
+                        user_names,
+                        Some(&all_user_search_aliases),
+                        &search_query,
+                    )),
+                    total: 1,
+                },
+            );
+        }
     }
     let conversation_ids = conversations
         .iter()

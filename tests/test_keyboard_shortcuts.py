@@ -209,6 +209,18 @@ def main() -> None:
                         ["xdotool", "windowactivate", "--sync", switcher_id],
                         check=True,
                     )
+                    type_text("general")
+                    press("Escape")
+                    wait_until(
+                        lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0
+                    )
+
+                    # Reopening immediately exercises cancellation of the queued
+                    # population from the first picker.
+                    press("ctrl+k")
+                    wait_until(
+                        lambda: next(iter(visible_window_ids(SWITCHER_TITLE)), None)
+                    )
                     press("Escape")
                     wait_until(
                         lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0
