@@ -13,8 +13,8 @@
 
 - [x] Task: Define and test workspace mutations, patches, store batches, revisions, and snapshot envelopes 918ae95
 - [x] Task: Extract WorkspaceCoordinator and its pure reducer from the runtime 5ab1767
-- [~] Task: Route cache, Web API, local actions, and realtime transports through the reducer adapter
-- [ ] Task: Preserve read overlays and deduplicate message/send/echo identities with timeline invariants
+- [x] Task: Route cache, Web API, local actions, and realtime transports through the reducer adapter 67c3a5a
+- [~] Task: Preserve read overlays and deduplicate message/send/echo identities with timeline invariants
 - [ ] Task: Conductor - User Manual Verification 'Canonical reducer pipeline' (Protocol in workflow.md)
 
 ## Phase 3: Bounded synchronization and backpressure
