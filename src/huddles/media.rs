@@ -1060,7 +1060,7 @@ mod native {
                     .current_caps()
                     .unwrap_or_else(|| decoded_pad.query_caps(None));
                 let media_type = caps.structure(0).map(|structure| structure.name());
-                let target = match media_type.as_deref() {
+                let target = match media_type {
                     Some(name) if name.starts_with("audio/") => &audio_target,
                     Some(name) if name.starts_with("video/") => &video_target,
                     _ => return,
