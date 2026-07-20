@@ -1,0 +1,3 @@
+Pipeline follow-up for CI run 29761481396.
+Use one deferred resize correction, observe only the timeline root, and make the WebKit regression probe synchronize with animation frames rather than fixed wall-clock delays.
+Verification: timeline scroll test repeated 10 times concurrently (10 passed); cargo test (520 passed); cargo check; meson compile -C _build; meson test -C _build --print-errorlogs (14 passed).
