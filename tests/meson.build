@@ -19,6 +19,12 @@ test(
   args: [files('test_search_provider_metadata.py'), meson.project_source_root() / 'data'],
 )
 
+test(
+  'Release automation metadata',
+  python,
+  args: [files('test_release_automation.py'), meson.project_source_root()],
+)
+
 if xvfb_run.found() and xfwm4.found()
   test(
     'External Slack URI activation',

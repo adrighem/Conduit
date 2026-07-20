@@ -76,8 +76,25 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Threads and Unreads reflect the conversations and activity Conduit has observed; they are not complete Slack-wide activity aggregators.
 - File and workspace-search views currently load a bounded result set rather than every page.
 - Rich composer formatting, autocomplete beyond emoji, message editing/deletion controls, typing indicators, general live presence, avatars, native production huddle joining, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
-- The Flatpak manifest is intended for development; Conduit is not yet published on Flathub and does not currently provide official binary releases.
+- Release bundles currently target x86_64 Debian 13, Fedora 44, and Flatpak. Other distributions and architectures still require a source build.
 - Signing out removes the stored credential and clears the active-workspace selection, but it does not currently purge cached workspace data or saved drafts from local storage.
+
+## Install a release
+
+Each [GitHub Release](https://github.com/adrighem/Conduit/releases) includes packages for Debian 13 (Trixie), Fedora 44, and a GNOME 50 Flatpak bundle, plus `SHA256SUMS`. Download one package and install it with the matching system tool:
+
+```sh
+# Debian 13
+sudo apt install ./conduit_VERSION-1_amd64.deb
+
+# Fedora 44
+sudo dnf install ./conduit-VERSION-1.fc44.x86_64.rpm
+
+# Any Flatpak host with the Flathub runtime remote
+flatpak install --user ./conduit-VERSION-x86_64.flatpak
+```
+
+The single-file Flatpak bundle is installable but does not provide automatic updates. Conduit is not currently published on Flathub. See [the release guide](docs/releases.md) for release maintenance, verification, and the current Flathub boundary.
 
 ## Build and run
 

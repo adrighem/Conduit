@@ -34,14 +34,10 @@
   </branding>
 
   <releases>
-    <release version="0.1.0" date="2026-06-16">
-      <url type="details">https://github.com/adrighem/Conduit</url>
+    <release version="0.1.0" date="2026-06-16"> <!-- x-release-please-version-date -->
+      <url type="details">https://github.com/adrighem/Conduit/releases/tag/v0.1.0</url> <!-- x-release-please-version -->
       <description translate="no">
-        <p>Initial development release.</p>
-        <ul>
-          <li>Added Slack OAuth PKCE connection flow.</li>
-          <li>Added native conversation, message, thread, search, saved item, and upload UI.</li>
-        </ul>
+        <p>See the linked release notes for the changes in this version.</p>
       </description>
     </release>
   </releases>

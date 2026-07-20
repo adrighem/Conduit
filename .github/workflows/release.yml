@@ -1,0 +1,259 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please-main
+  cancel-in-progress: false
+
+env:
+  CARGO_HTTP_TIMEOUT: "120"
+  CARGO_NET_RETRY: "10"
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Create or update release
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-deb:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+      - name: Install Debian build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            appstream build-essential ca-certificates cmake debhelper \
+            desktop-file-utils gettext libadwaita-1-dev libdbus-1-dev \
+            libgdk-pixbuf-2.0-dev libgstreamer-plugins-bad1.0-dev \
+            libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
+            libgtk-4-dev libwebkitgtk-6.0-dev lintian meson ninja-build \
+            pkgconf python3 rustup
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Build Debian package
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          cp -a packaging/debian debian
+          mv debian/changelog.in debian/changelog
+          release_date=$(date -R)
+          sed -i "s/@VERSION@/${VERSION}/g; s/@DATE@/${release_date}/g" debian/changelog
+          dpkg-buildpackage --build=binary --no-sign
+          mkdir -p dist
+          mv "../conduit_${VERSION}-1_amd64.deb" dist/
+          lintian --fail-on error "dist/conduit_${VERSION}-1_amd64.deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conduit-${{ needs.release-please.outputs.version }}-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  validate-deb:
+    needs: [release-please, build-deb]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-${{ needs.release-please.outputs.version }}-deb
+          path: dist
+      - name: Install and validate Debian package
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            appstream binutils desktop-file-utils gstreamer1.0-tools libglib2.0-bin
+          apt-get install -y ./dist/*.deb
+          dpkg-deb --info ./dist/*.deb
+          dpkg-deb --contents ./dist/*.deb
+          test "$(dpkg-query --showformat='${Version}' --show conduit)" = "${VERSION}-1"
+          for path in \
+            /usr/bin/conduit \
+            /usr/share/applications/eu.vanadrighem.conduit.desktop \
+            /usr/share/conduit/conduit.gresource \
+            /usr/share/dbus-1/services/eu.vanadrighem.conduit.service \
+            /usr/share/glib-2.0/schemas/eu.vanadrighem.conduit.gschema.xml \
+            /usr/share/gnome-shell/search-providers/eu.vanadrighem.conduit.search-provider.ini \
+            /usr/share/icons/hicolor/scalable/apps/eu.vanadrighem.conduit.svg \
+            /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml; do
+            test -e "$path"
+          done
+          grep -Fq "release version=\"${VERSION}\"" \
+            /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml
+          if ldd /usr/bin/conduit | grep -q 'not found'; then exit 1; fi
+          if readelf -d /usr/bin/conduit | grep -Eq '(RPATH|RUNPATH)'; then exit 1; fi
+          glib-compile-schemas --strict --dry-run /usr/share/glib-2.0/schemas
+          desktop-file-validate /usr/share/applications/eu.vanadrighem.conduit.desktop
+          appstreamcli validate --no-net /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml
+          for element in webrtcbin webrtcdsp webrtcechoprobe nicesrc opusenc vp8enc pipewiresrc; do
+            gst-inspect-1.0 "$element" >/dev/null
+          done
+
+  build-rpm:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+          fetch-depth: 0
+      - name: Install Fedora build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            --disablerepo=fedora-cisco-openh264 \
+            appstream cargo cmake dbus-devel desktop-file-utils gcc gettext \
+            gdk-pixbuf2-devel gstreamer1-devel \
+            gstreamer1-plugins-bad-free-devel gstreamer1-plugins-base-devel \
+            gtk4-devel libadwaita-devel meson ninja-build pkgconf-pkg-config \
+            rpm-build rpmlint rust webkitgtk6.0-devel
+      - name: Build RPM package
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+          RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
+        run: |
+          rpm_root="${RUNNER_TEMP}/rpmbuild"
+          mkdir -p "$rpm_root"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          git archive --format=tar.gz --prefix="conduit-${VERSION}/" \
+            --output="$rpm_root/SOURCES/conduit-${VERSION}.tar.gz" "$RELEASE_SHA"
+          rpmbuild -bb \
+            --define "_topdir $rpm_root" \
+            --define "conduit_version $VERSION" \
+            packaging/rpm/conduit.spec
+          mkdir -p dist
+          find "$rpm_root/RPMS" -name "conduit-${VERSION}-1.fc44.x86_64.rpm" \
+            -exec cp -v {} dist/ \;
+          test -f "dist/conduit-${VERSION}-1.fc44.x86_64.rpm"
+          rpmlint "dist/conduit-${VERSION}-1.fc44.x86_64.rpm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conduit-${{ needs.release-please.outputs.version }}-rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  validate-rpm:
+    needs: [release-please, build-rpm]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conduit-${{ needs.release-please.outputs.version }}-rpm
+          path: dist
+      - name: Install and validate RPM package
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            --disablerepo=fedora-cisco-openh264 \
+            appstream binutils desktop-file-utils glib2 gstreamer1 rpmlint
+          dnf install -y ./dist/*.rpm
+          rpm -qip ./dist/*.rpm
+          rpm -qlp ./dist/*.rpm
+          rpmlint ./dist/*.rpm
+          test "$(rpm -q --qf '%{VERSION}-%{RELEASE}' conduit)" = "${VERSION}-1.fc44"
+          for path in \
+            /usr/bin/conduit \
+            /usr/share/applications/eu.vanadrighem.conduit.desktop \
+            /usr/share/conduit/conduit.gresource \
+            /usr/share/dbus-1/services/eu.vanadrighem.conduit.service \
+            /usr/share/glib-2.0/schemas/eu.vanadrighem.conduit.gschema.xml \
+            /usr/share/gnome-shell/search-providers/eu.vanadrighem.conduit.search-provider.ini \
+            /usr/share/icons/hicolor/scalable/apps/eu.vanadrighem.conduit.svg \
+            /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml; do
+            test -e "$path"
+          done
+          grep -Fq "release version=\"${VERSION}\"" \
+            /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml
+          if ldd /usr/bin/conduit | grep -q 'not found'; then exit 1; fi
+          if readelf -d /usr/bin/conduit | grep -Eq '(RPATH|RUNPATH)'; then exit 1; fi
+          glib-compile-schemas --strict --dry-run /usr/share/glib-2.0/schemas
+          desktop-file-validate /usr/share/applications/eu.vanadrighem.conduit.desktop
+          appstreamcli validate --no-net /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml
+          for element in webrtcbin webrtcdsp webrtcechoprobe nicesrc opusenc vp8enc pipewiresrc; do
+            gst-inspect-1.0 "$element" >/dev/null
+          done
+
+  build-flatpak:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: conduit-${{ needs.release-please.outputs.version }}-x86_64.flatpak
+          manifest-path: packaging/flatpak/eu.vanadrighem.conduit.json
+          cache-key: flatpak-builder-${{ needs.release-please.outputs.sha }}
+          artifact-name: conduit-${{ needs.release-please.outputs.version }}-flatpak
+
+  publish-assets:
+    needs:
+      - release-please
+      - build-deb
+      - validate-deb
+      - build-rpm
+      - validate-rpm
+      - build-flatpak
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: conduit-${{ needs.release-please.outputs.version }}-*
+          path: dist
+          merge-multiple: true
+      - name: Publish verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          cd dist
+          sha256sum -- *.deb *.rpm *.flatpak > SHA256SUMS
+          gh release upload "$TAG_NAME" --clobber -- *.deb *.rpm *.flatpak SHA256SUMS
+          gh release edit "$TAG_NAME" --draft=false --latest

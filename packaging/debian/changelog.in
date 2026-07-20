@@ -1,0 +1,5 @@
+conduit (@VERSION@-1) trixie; urgency=medium
+
+  * Build the Conduit @VERSION@ GitHub release.
+
+ -- Vincent van Adrighem <vincent@vanadrighem.eu>  @DATE@

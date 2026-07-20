@@ -2,6 +2,11 @@
 name = "conduit"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
+description = "A focused, native Slack client for the GNOME desktop"
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/adrighem/Conduit"
+repository = "https://github.com/adrighem/Conduit"
 
 [features]
 default = []

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "d634d8bebffda092c30470f4de257ddc21a9360f",
+  "release-type": "rust",
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "include-v-in-release-name": true,
+  "bump-minor-pre-major": true,
+  "draft": true,
+  "packages": {
+    ".": {
+      "component": "conduit",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "meson.build"
+        },
+        {
+          "type": "generic",
+          "path": "data/eu.vanadrighem.conduit.metainfo.xml.in"
+        }
+      ]
+    }
+  }
+}

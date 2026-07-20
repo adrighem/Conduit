@@ -1,0 +1,45 @@
+Source: conduit
+Section: net
+Priority: optional
+Maintainer: Vincent van Adrighem <vincent@vanadrighem.eu>
+Rules-Requires-Root: no
+Build-Depends:
+ debhelper-compat (= 13),
+ appstream,
+ desktop-file-utils,
+ gettext,
+ libadwaita-1-dev,
+ libdbus-1-dev,
+ libgdk-pixbuf-2.0-dev,
+ libgstreamer-plugins-bad1.0-dev,
+ libgstreamer-plugins-base1.0-dev,
+ libgstreamer1.0-dev,
+ libgtk-4-dev,
+ libwebkitgtk-6.0-dev,
+ meson,
+ ninja-build,
+ pkgconf,
+ rustup
+Standards-Version: 4.7.2
+Homepage: https://github.com/adrighem/Conduit
+Vcs-Git: https://github.com/adrighem/Conduit.git
+Vcs-Browser: https://github.com/adrighem/Conduit
+
+Package: conduit
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ ca-certificates,
+ gstreamer1.0-nice,
+ gstreamer1.0-pipewire,
+ gstreamer1.0-plugins-bad,
+ gstreamer1.0-plugins-base,
+ gstreamer1.0-plugins-good,
+ gstreamer1.0-pulseaudio,
+ xdg-desktop-portal,
+ xdg-utils
+Recommends: gstreamer1.0-libav
+Description: focused native Slack client for GNOME
+ Conduit is a Rust, GTK4, libadwaita, and WebKitGTK desktop client for
+ everyday Slack conversations, threads, search, files, and huddles.
