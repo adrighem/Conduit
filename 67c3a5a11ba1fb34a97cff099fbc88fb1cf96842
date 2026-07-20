@@ -1,0 +1,23 @@
+Task: Route cache, Web API, local actions, and realtime transports through the reducer adapter
+
+Summary:
+- Added one shared WorkspaceReducerAdapter to each authenticated runtime connection.
+- Routed cached bootstrap/history/thread data, membership and user snapshots, conversation actions, unread enrichment, history/thread responses, local sends/read marks, and realtime message/user events through WorkspaceCoordinator.
+- Captured snapshot base revisions before network awaits so realtime/local mutations cannot be rolled back by delayed responses.
+- Preserved existing RuntimeEvent compatibility delivery while presentation migration is pending.
+- Added adapter ordering, no-op, and realtime socket mapping tests.
+
+Files:
+- src/runtime.rs
+
+Rationale:
+Establishes one canonical revision stream incrementally without changing GTK behavior or external APIs. StoreBatch persistence cutover remains a separate planned task.
+
+Verification:
+- cargo fmt -- --check
+- git diff --check
+- cargo test (530 passed)
+- cargo check
+- meson compile -C _build
+- meson test -C _build --print-errorlogs (14 passed)
+- Local clippy unavailable; remote CI is authoritative.
