@@ -42,6 +42,26 @@ if xvfb_run.found() and xfwm4.found()
   )
 
   test(
+    'Localized message timestamps',
+    python,
+    args: [
+      files('run_headless.py'),
+      files('test_timestamp_localization.py'),
+      meson.project_source_root() / 'src' / 'timestamp_localization.js',
+      meson.project_source_root() / 'src' / 'timeline_dom_runtime.js',
+    ],
+    env: [
+      'GDK_DEBUG=no-portals',
+      'GDK_BACKEND=x11',
+      'GSK_RENDERER=cairo',
+      'GTK_A11Y=none',
+      'TZ=Europe/Amsterdam',
+      'XDG_SESSION_TYPE=x11',
+    ],
+    timeout: 90,
+  )
+
+  test(
     'GNOME search provider',
     python,
     args: [

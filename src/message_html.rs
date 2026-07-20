@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use gettextrs::gettext;
 use serde::Serialize;
@@ -15,6 +16,8 @@ use crate::models::{
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
 const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
+const TIMESTAMP_LOCALIZATION_SCRIPT: &str = include_str!("timestamp_localization.js");
+static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
@@ -230,7 +233,8 @@ fn normalize_language_tag(locale: &str) -> Option<String> {
             (locale, Some(modifier.to_ascii_lowercase()))
         });
     let locale = locale.split('.').next().unwrap_or_default();
-    if locale.is_empty() || matches!(locale, "C" | "POSIX") {
+    if locale.is_empty() || locale.eq_ignore_ascii_case("C") || locale.eq_ignore_ascii_case("POSIX")
+    {
         return None;
     }
 
@@ -287,8 +291,17 @@ fn normalize_language_tag(locale: &str) -> Option<String> {
         .collect::<Vec<_>>();
 
     let modifier_script = match modifier.as_deref() {
-        Some("latin") => Some("Latn"),
-        Some("cyrillic") => Some("Cyrl"),
+        Some("arabic") => Some("Arab"),
+        Some("cyrillic" | "cyrl") => Some("Cyrl"),
+        Some("devanagari") => Some("Deva"),
+        Some("hebrew") => Some("Hebr"),
+        Some("ijekavianlatin" | "iqtelif" | "latin" | "latn") => Some("Latn"),
+        Some("shaw") => Some("Shaw"),
+        _ => None,
+    };
+    let modifier_variant = match modifier.as_deref() {
+        Some("ije" | "ijekavian" | "ijekavianlatin") => Some("ijekavsk"),
+        Some("valencia") => Some("valencia"),
         _ => None,
     };
     let has_script = normalized.iter().skip(1).any(|subtag| {
@@ -300,6 +313,13 @@ fn normalize_language_tag(locale: &str) -> Option<String> {
     if let Some(script) = modifier_script.filter(|_| !has_script) {
         normalized.insert(1, script.to_string());
     }
+    if let Some(variant) = modifier_variant.filter(|variant| {
+        !normalized
+            .iter()
+            .any(|subtag| subtag.eq_ignore_ascii_case(variant))
+    }) {
+        normalized.push(variant.to_string());
+    }
 
     Some(normalized.join("-"))
 }
@@ -309,6 +329,38 @@ fn document_language() -> String {
         .iter()
         .find_map(|language| normalize_language_tag(language.as_str()))
         .unwrap_or_else(|| DEFAULT_DOCUMENT_LANGUAGE.to_string())
+}
+
+pub(crate) fn initialize_time_format_locale(locale: Option<&[u8]>) {
+    let _ = TIME_FORMAT_LOCALE.set(normalize_time_format_locale(locale));
+}
+
+fn normalize_time_format_locale(locale: Option<&[u8]>) -> Option<String> {
+    locale
+        .and_then(|locale| std::str::from_utf8(locale).ok())
+        .and_then(normalize_language_tag)
+}
+
+fn configured_time_locale() -> Option<&'static str> {
+    TIME_FORMAT_LOCALE
+        .get_or_init(time_format_locale_from_environment)
+        .as_deref()
+}
+
+fn time_format_locale_from_environment() -> Option<String> {
+    let lc_all = std::env::var("LC_ALL").ok();
+    let lc_time = std::env::var("LC_TIME").ok();
+    let lang = std::env::var("LANG").ok();
+    preferred_time_locale([lc_all.as_deref(), lc_time.as_deref(), lang.as_deref()])
+}
+
+fn preferred_time_locale<'a>(locales: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    for locale in locales.into_iter().flatten() {
+        if !locale.trim().is_empty() {
+            return normalize_language_tag(locale);
+        }
+    }
+    None
 }
 
 fn document_heading(title: &str) -> String {
@@ -1004,19 +1056,28 @@ fn html_document(title: &str, body: &str) -> String {
 }
 
 fn html_document_with_script(title: &str, body: &str, script: Option<&str>) -> String {
-    html_document_with_language(title, body, script, &document_language())
+    html_document_with_locales(
+        title,
+        body,
+        script,
+        &document_language(),
+        configured_time_locale(),
+    )
 }
 
-fn html_document_with_language(
+fn html_document_with_locales(
     title: &str,
     body: &str,
     script: Option<&str>,
     language: &str,
+    time_locale: Option<&str>,
 ) -> String {
     let has_message_actions = body.contains("class=\"quick-actions\"");
     let has_author_actions =
         body.contains("class=\"author-actions\"") || body.contains("class=\"mention-actions\"");
+    let needs_timestamp_localizer = body.contains("<time") || script.is_some();
     let scripts = [
+        needs_timestamp_localizer.then_some(TIMESTAMP_LOCALIZATION_SCRIPT),
         script.filter(|script| !script.trim().is_empty()),
         has_message_actions.then_some(emoji_picker_script()),
         has_author_actions.then_some(author_actions_script()),
@@ -1030,9 +1091,12 @@ fn html_document_with_language(
     } else {
         format!("\n<script>\n{scripts}\n</script>")
     };
+    let time_locale_attributes = time_locale
+        .map(|locale| format!(" data-time-locale=\"{}\"", escape_html(locale)))
+        .unwrap_or_default();
     format!(
         r#"<!doctype html>
-<html lang="{}" dir="{}">
+<html lang="{}" dir="{}"{}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1896,6 +1960,7 @@ pre code {{
 </html>"#,
         escape_html(language),
         document_direction(language),
+        time_locale_attributes,
         escape_html(title),
         body,
         script_tag
@@ -2055,238 +2120,7 @@ fn timeline_scroll_identity(channel_id: &str, thread_ts: Option<&str>) -> String
 }
 
 fn timeline_dom_runtime_script() -> &'static str {
-    r#"(function () {
-  function timelineRoot() {
-    return document.scrollingElement || document.documentElement;
-  }
-
-  function messageElement(messageTs) {
-    return Array.from(document.querySelectorAll("[data-message-ts]")).find(function (element) {
-      return element.dataset.messageTs === messageTs;
-    }) || null;
-  }
-
-  function imageElements(assetKey) {
-    return Array.from(document.querySelectorAll("[data-image-key]")).filter(function (element) {
-      return element.dataset.imageKey === assetKey;
-    });
-  }
-
-  function authorElements(userId) {
-    return Array.from(document.querySelectorAll("[data-author-user-id]")).filter(function (element) {
-      return element.dataset.authorUserId === userId;
-    });
-  }
-
-  function mentionElements(userId) {
-    return Array.from(document.querySelectorAll("[data-mention-user-id]")).filter(function (element) {
-      return element.dataset.mentionUserId === userId;
-    });
-  }
-
-  function fragment(html) {
-    const template = document.createElement("template");
-    template.innerHTML = html;
-    return template.content;
-  }
-
-  function visibleAnchor() {
-    return Array.from(document.querySelectorAll("[data-message-ts]")).find(function (element) {
-      const rect = element.getBoundingClientRect();
-      return rect.bottom >= 0 && rect.top <= window.innerHeight;
-    }) || null;
-  }
-
-  let viewportAnchor = null;
-  let viewportAnchorTop = 0;
-  let viewportWidth = window.innerWidth;
-  let restoringViewportAnchor = false;
-  let rememberViewportAnchorFrame = 0;
-
-  function rememberViewportAnchor() {
-    if (restoringViewportAnchor) return;
-    const anchor = visibleAnchor();
-    if (!anchor) return;
-    viewportAnchor = anchor;
-    viewportAnchorTop = anchor.getBoundingClientRect().top;
-  }
-
-  function scheduleRememberViewportAnchor() {
-    if (restoringViewportAnchor || rememberViewportAnchorFrame) return;
-    rememberViewportAnchorFrame = requestAnimationFrame(function () {
-      rememberViewportAnchorFrame = 0;
-      rememberViewportAnchor();
-    });
-  }
-
-  document.addEventListener("click", function (event) {
-    const message = event.target && event.target.closest
-      ? event.target.closest("[data-message-ts]")
-      : null;
-    if (!message) return;
-    viewportAnchor = message;
-    viewportAnchorTop = message.getBoundingClientRect().top;
-  }, true);
-
-  function preserveViewportAnchorDuringResize() {
-    const nextWidth = window.innerWidth;
-    if (Math.abs(nextWidth - viewportWidth) < 0.5) {
-      scheduleRememberViewportAnchor();
-      return;
-    }
-    viewportWidth = nextWidth;
-    if (!viewportAnchor || !viewportAnchor.isConnected) {
-      rememberViewportAnchor();
-      return;
-    }
-
-    const root = timelineRoot();
-    const currentTop = viewportAnchor.getBoundingClientRect().top;
-    root.scrollTop += currentTop - viewportAnchorTop;
-    restoringViewportAnchor = true;
-    requestAnimationFrame(function () {
-      restoringViewportAnchor = false;
-    });
-  }
-
-  window.addEventListener("scroll", scheduleRememberViewportAnchor, { passive: true });
-  window.addEventListener("resize", preserveViewportAnchorDuringResize, { passive: true });
-  if ("ResizeObserver" in window) {
-    new ResizeObserver(preserveViewportAnchorDuringResize).observe(document.documentElement);
-  }
-  requestAnimationFrame(rememberViewportAnchor);
-
-  function withPreservedScroll(mutate) {
-    const root = timelineRoot();
-    const wasAtBottom = root.scrollHeight - root.scrollTop - root.clientHeight <= 48;
-    const anchor = visibleAnchor();
-    const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
-    const oldScrollTop = root.scrollTop;
-    const changed = mutate();
-    if (!changed) return false;
-    function restore() {
-      if (wasAtBottom) {
-        root.scrollTop = root.scrollHeight;
-      } else if (anchor && anchor.isConnected) {
-        root.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
-      } else {
-        root.scrollTop = oldScrollTop;
-      }
-    }
-    restore();
-    requestAnimationFrame(restore);
-    requestAnimationFrame(function () { requestAnimationFrame(restore); });
-    return true;
-  }
-
-  window.conduitApplyTimelinePatch = function (patch) {
-    if (!patch || typeof patch.type !== "string") return false;
-    return withPreservedScroll(function () {
-      if (patch.type === "insert-message") {
-        const list = document.querySelector(".message-list");
-        if (!list || typeof patch.html !== "string") return false;
-        if (patch.position === "prepend") list.prepend(fragment(patch.html));
-        else list.append(fragment(patch.html));
-        return true;
-      }
-
-      if (patch.type === "replace-message") {
-        const target = messageElement(patch.message_ts);
-        if (!target || typeof patch.html !== "string") return false;
-        const html = target.classList.contains("message-part") ? patch.part_html : patch.html;
-        if (typeof html !== "string") return false;
-        target.replaceWith(fragment(html));
-        return true;
-      }
-
-      if (patch.type === "remove-message") {
-        const target = messageElement(patch.message_ts);
-        if (!target) return false;
-        const item = target.closest(".message-list-item");
-        const stack = target.closest(".message-stack");
-        target.remove();
-        if (item && (!stack || stack.querySelectorAll("[data-message-ts]").length === 0)) item.remove();
-        return true;
-      }
-
-      if (patch.type === "replace-region") {
-        const target = messageElement(patch.message_ts);
-        if (!target || typeof patch.html !== "string") return false;
-        const region = target.querySelector('[data-message-region="' + patch.region + '"]');
-        if (!region) return false;
-        region.replaceChildren(fragment(patch.html));
-        return true;
-      }
-
-      if (patch.type === "update-image") {
-        const targets = imageElements(patch.asset_key);
-        if (targets.length === 0) return false;
-        targets.forEach(function (target) {
-          if (typeof patch.source === "string") {
-            const isVideo = patch.source.startsWith("data:video/");
-            if ((isVideo && target.matches("video")) || (!isVideo && target.matches("img"))) {
-              target.src = patch.source;
-            } else if (isVideo) {
-              const video = document.createElement("video");
-              video.preload = "metadata";
-              video.muted = true;
-              video.playsInline = true;
-              video.src = patch.source;
-              video.setAttribute("aria-label", target.dataset.imageAlt || "");
-              video.dataset.imageKey = patch.asset_key;
-              video.dataset.imageAlt = target.dataset.imageAlt || "";
-              video.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
-              target.replaceWith(video);
-            } else {
-              const image = document.createElement("img");
-              image.loading = "lazy";
-              image.decoding = "async";
-              image.src = patch.source;
-              image.alt = target.dataset.imageAlt || "";
-              image.dataset.imageKey = patch.asset_key;
-              image.dataset.imageAlt = image.alt;
-              image.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
-              target.replaceWith(image);
-            }
-          } else {
-            const placeholder = document.createElement("div");
-            placeholder.className = "image-placeholder";
-            placeholder.dataset.imageKey = patch.asset_key;
-            placeholder.dataset.imageAlt = target.dataset.imageAlt || "";
-            placeholder.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
-            placeholder.textContent = placeholder.dataset.imageUnavailable;
-            target.replaceWith(placeholder);
-          }
-        });
-        return true;
-      }
-
-      if (patch.type === "update-user") {
-        const targets = authorElements(patch.user_id);
-        const mentions = mentionElements(patch.user_id);
-        if (targets.length === 0 && mentions.length === 0) return false;
-        mentions.forEach(function (mention) {
-          mention.textContent = "@" + patch.name;
-        });
-        targets.forEach(function (target) {
-          const author = target.querySelector(".author-label");
-          if (author) author.textContent = patch.name;
-          const header = target.querySelector(".message-header");
-          if (!header) return;
-          const oldStatus = header.querySelector(".user-status");
-          if (oldStatus) oldStatus.remove();
-          if (patch.status_html) {
-            const status = fragment(patch.status_html);
-            const identity = author && (author.closest(".author-actions") || author);
-            if (identity) identity.after(status);
-          }
-        });
-        return true;
-      }
-      return false;
-    });
-  };
-})();"#
+    include_str!("timeline_dom_runtime.js")
 }
 
 fn message_focus_script() -> &'static str {
@@ -4082,6 +3916,22 @@ mod tests {
             Some("sr-Cyrl-RS".into())
         );
         assert_eq!(
+            normalize_language_tag("ks_IN@devanagari"),
+            Some("ks-Deva-IN".into())
+        );
+        assert_eq!(
+            normalize_language_tag("tt_RU@iqtelif"),
+            Some("tt-Latn-RU".into())
+        );
+        assert_eq!(
+            normalize_language_tag("ca_ES@valencia"),
+            Some("ca-ES-valencia".into())
+        );
+        assert_eq!(
+            normalize_language_tag("sr_RS@ijekavianlatin"),
+            Some("sr-Latn-RS-ijekavsk".into())
+        );
+        assert_eq!(
             normalize_language_tag("sr_Latn_RS@latin"),
             Some("sr-Latn-RS".into())
         );
@@ -4090,32 +3940,53 @@ mod tests {
             Some("sr-Latn-RS".into())
         );
         assert_eq!(normalize_language_tag("C"), None);
+        assert_eq!(normalize_language_tag("c.UTF-8"), None);
         assert_eq!(normalize_language_tag("POSIX"), None);
+        assert_eq!(normalize_language_tag("posix.utf8"), None);
         assert_eq!(normalize_language_tag("en\"><script>"), None);
+        assert_eq!(
+            normalize_time_format_locale(Some(b"nl_NL.UTF-8")),
+            Some("nl-NL".into())
+        );
+        assert_eq!(normalize_time_format_locale(Some(&[0xff, 0xfe])), None);
+        assert_eq!(
+            preferred_time_locale([None, Some("nl_NL.UTF-8"), Some("en_US.UTF-8")]),
+            Some("nl-NL".into())
+        );
+        assert_eq!(
+            preferred_time_locale([Some(""), Some("nl_NL.UTF-8"), Some("en_US.UTF-8")]),
+            Some("nl-NL".into())
+        );
+        assert_eq!(
+            preferred_time_locale([Some("C.UTF-8"), Some("nl_NL.UTF-8")]),
+            None
+        );
 
-        let html = html_document_with_language(
+        let html = html_document_with_locales(
             "Messages",
             "<main></main>",
             None,
             "en\"><script>alert(1)</script>",
+            Some("nl-NL\"><script>alert(2)</script>"),
         );
         assert!(html.contains(
-            "<html lang=\"en&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\" dir=\"ltr\">"
+            "<html lang=\"en&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\" dir=\"ltr\" data-time-locale=\"nl-NL&quot;&gt;&lt;script&gt;alert(2)&lt;/script&gt;\">"
         ));
         assert!(!html.contains("<html lang=\"en\"><script>"));
+        assert!(!html.contains("<script>alert(2)</script>"));
     }
 
     #[test]
     fn document_root_direction_follows_the_normalized_primary_language() {
         for language in ["ar", "ar-EG", "he-IL"] {
-            let html = html_document_with_language("Title", "<main></main>", None, language);
+            let html = html_document_with_locales("Title", "<main></main>", None, language, None);
             assert!(
                 html.contains(&format!("<html lang=\"{language}\" dir=\"rtl\">")),
                 "{language}"
             );
         }
 
-        let html = html_document_with_language("Title", "<main></main>", None, "en-GB");
+        let html = html_document_with_locales("Title", "<main></main>", None, "en-GB", None);
         assert!(html.contains("<html lang=\"en-GB\" dir=\"ltr\">"));
     }
 
@@ -4465,6 +4336,43 @@ mod tests {
         assert!(html.contains("datetime=\""));
         assert!(html.contains("title=\""));
         assert!(html.contains("</time>"));
+    }
+
+    #[test]
+    fn timestamp_documents_install_the_webkit_intl_localizer() {
+        let body = r#"<time class="metadata" datetime="2026-07-10T13:00:00+02:00" title="fallback title">jul 10, 13:00</time>"#;
+        let html = html_document_with_locales("Messages", body, None, "en", Some("nl-NL"));
+
+        assert!(html.contains("data-time-locale=\"nl-NL\""));
+        assert!(html.contains("new Intl.DateTimeFormat"));
+        assert!(html.contains("new Intl.RelativeTimeFormat"));
+        assert!(html.contains("Intl.DateTimeFormat.supportedLocalesOf"));
+        assert!(html.contains("window.conduitLocalizeTimestamps = localizeTimestamps"));
+        assert!(html.contains("localizeTimestamps(document)"));
+        assert_eq!(
+            html.matches("window.conduitLocalizeTimestamps = localizeTimestamps")
+                .count(),
+            1
+        );
+        assert!(html.contains(body));
+
+        let without_timestamp =
+            html_document_with_locales("Messages", "<main></main>", None, "en", Some("nl-NL"));
+        assert!(!without_timestamp.contains("new Intl.DateTimeFormat"));
+
+        let c_locale = html_document_with_locales("Messages", body, None, "en", None);
+        assert!(!c_locale.contains("data-time-locale"));
+        assert!(c_locale.contains("if (!locale) return;"));
+        assert!(c_locale.contains(body));
+
+        let patchable_without_timestamp = html_document_with_locales(
+            "Messages",
+            "<main></main>",
+            Some("window.conduitApplyTimelinePatch = function () {};"),
+            "en",
+            Some("nl-NL"),
+        );
+        assert!(patchable_without_timestamp.contains("new Intl.DateTimeFormat"));
     }
 
     #[test]
@@ -5390,6 +5298,7 @@ mod tests {
         assert!(html.contains("anchor.getBoundingClientRect().top - anchorTop"));
         assert!(html.contains("patch.source.startsWith(\"data:video/\")"));
         assert!(html.contains("document.createElement(\"video\")"));
+        assert!(html.contains("window.conduitLocalizeTimestamps(template.content)"));
     }
 
     #[test]
@@ -5432,6 +5341,7 @@ mod tests {
         assert!(html.starts_with("<li class=\"message-list-item\"><article"));
         assert!(html.contains("Ada &lt;Admin&gt;"));
         assert!(html.contains("Hello &lt;everyone&gt;"));
+        assert!(html.contains("<time class=\"metadata\""));
 
         let reactions =
             message_region_patch("C123", &message, &context, TimelineMessageRegion::Responses);

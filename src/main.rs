@@ -63,6 +63,8 @@ fn main() -> glib::ExitCode {
 
     // Set up gettext translations
     let _ = setlocale(LocaleCategory::LcAll, "");
+    let time_locale = setlocale(LocaleCategory::LcTime, "");
+    message_html::initialize_time_format_locale(time_locale.as_deref());
     bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
     bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8")
         .expect("Unable to set the text domain encoding");
