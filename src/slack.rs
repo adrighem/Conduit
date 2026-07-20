@@ -1,12 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::auth::browser_session_cookie_header;
@@ -39,6 +42,39 @@ const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
 const USERS_LIST_METHOD: &str = "users.list";
 const SLACK_API_BASE_URL: &str = "https://slack.com/api";
 const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
+static NEXT_CLIENT_MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_client_message_id() -> String {
+    let counter = NEXT_CLIENT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let digest = Sha256::digest(format!("{}:{now}:{counter}", std::process::id()).as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
 
 pub type Result<T> = std::result::Result<T, SlackError>;
 
@@ -930,16 +966,20 @@ impl SlackApi {
         text: &str,
         thread_ts: Option<&str>,
     ) -> Result<SlackMessage> {
+        let client_msg_id = next_client_message_id();
         let mut params = vec![
             ("channel", channel_id.to_string()),
             ("text", text.to_string()),
+            ("client_msg_id", client_msg_id.clone()),
         ];
         if let Some(thread_ts) = thread_ts {
             params.push(("thread_ts", thread_ts.to_string()));
         }
 
         let response: PostMessageResponse = self.post_form("chat.postMessage", &params).await?;
-        Ok(response.message)
+        let mut message = response.message;
+        message.client_msg_id.get_or_insert(client_msg_id);
+        Ok(message)
     }
 
     pub async fn set_reaction(
@@ -1839,6 +1879,21 @@ mod tests {
     use super::*;
     use reqwest::header::{AUTHORIZATION, COOKIE, USER_AGENT};
     use tiny_http::{Header, Response, Server};
+
+    #[test]
+    fn generated_client_message_ids_are_unique_uuid_values() {
+        let first = next_client_message_id();
+        let second = next_client_message_id();
+
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 36);
+        assert_eq!(first.as_bytes()[14], b'4');
+        assert!(matches!(first.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+        assert_eq!(
+            first.chars().filter(|character| *character == '-').count(),
+            4
+        );
+    }
 
     #[test]
     fn slack_errors_classify_api_failures_for_recovery() {

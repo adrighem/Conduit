@@ -590,6 +590,8 @@ pub struct SlackMessage {
     pub username: Option<String>,
     pub text: Option<String>,
     pub ts: String,
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
     pub thread_ts: Option<String>,
     pub reply_count: Option<u64>,
     #[serde(default)]
@@ -1032,6 +1034,20 @@ impl SlackUserProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slack_message_preserves_client_message_identity() {
+        let message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000000.000100",
+            "client_msg_id": "5dbb1f7d-cb70-4f65-b0f7-458c98ec2f24"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            message.client_msg_id.as_deref(),
+            Some("5dbb1f7d-cb70-4f65-b0f7-458c98ec2f24")
+        );
+    }
 
     #[test]
     fn user_search_aliases_preserve_display_real_normalized_and_username_names() {

@@ -4050,6 +4050,7 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
     for pass in 0..MAX_UNREAD_REFRESH_PASSES {
         let mut failed = Vec::new();
         for channel_id in std::mem::take(&mut pending) {
+            let unread_base_revision = workspace.revision();
             match api.conversation_with_unread_state(&channel_id).await {
                 Ok((details, unread_state)) => {
                     let server_last_read = details.as_ref().and_then(|details| {
@@ -4087,7 +4088,17 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
                             unread_state.known, unread_state.has_unread, unread_state.display_count
                         ),
                     );
-                    if unread_state.known
+                    let unread_accepted = unread_state.known
+                        && workspace.apply(
+                            MutationOrigin::WebApi,
+                            WorkspaceMutation::UnreadChanged {
+                                channel_id: channel_id.clone(),
+                                state: unread_state,
+                                server_last_read: server_last_read.clone(),
+                                base_revision: unread_base_revision,
+                            },
+                        );
+                    if unread_accepted
                         && store_conversation_unread_state(
                             workspace_store,
                             &channel_id,
@@ -4150,16 +4161,6 @@ fn send_conversation_patch_batch(
         workspace.apply(
             MutationOrigin::WebApi,
             WorkspaceMutation::ConversationUpsert(conversation),
-        );
-    }
-    for (channel_id, state, server_last_read) in unread_states.iter().cloned() {
-        workspace.apply(
-            MutationOrigin::WebApi,
-            WorkspaceMutation::UnreadChanged {
-                channel_id,
-                state,
-                server_last_read,
-            },
         );
     }
     events.send_event(RuntimeEventKind::ConversationsPatched {
@@ -4230,22 +4231,24 @@ async fn prefetch_channel_histories_best_effort(
                     },
                 );
                 observe_huddle_messages(huddles, team_id, &channel_id, &page.messages);
-                if store_conversation_unread_state(
-                    workspace.store,
-                    &channel_id,
-                    page.unread_state,
-                    None,
-                )
-                .await
+                let unread_accepted = workspace.reducer.apply(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::UnreadChanged {
+                        channel_id: channel_id.clone(),
+                        state: page.unread_state,
+                        server_last_read: None,
+                        base_revision,
+                    },
+                );
+                if unread_accepted
+                    && store_conversation_unread_state(
+                        workspace.store,
+                        &channel_id,
+                        page.unread_state,
+                        None,
+                    )
+                    .await
                 {
-                    workspace.reducer.apply(
-                        MutationOrigin::WebApi,
-                        WorkspaceMutation::UnreadChanged {
-                            channel_id: channel_id.clone(),
-                            state: page.unread_state,
-                            server_last_read: None,
-                        },
-                    );
                     send_conversation_unread_update(events, &channel_id, page.unread_state);
                 }
                 send_conversation_notification_candidate(events, &channel_id, &page.messages);
