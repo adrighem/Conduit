@@ -1,0 +1,9 @@
+Task: Add schema-v2 freshness metadata and derived-cache recovery coverage
+
+Summary: Migrated the keyed SQLite cache to schema v2 with sync freshness/retry metadata, validated the schema, and recreated only derived database files after migration or corruption failures.
+
+Modified: src/store.rs
+
+Verification: cargo check; cargo test (510 passed); cargo fmt --check. Strict Clippy and coverage were unavailable because the clippy/coverage tooling is not installed.
+
+Rationale: Cache failures must not block startup or affect keyring credentials and GSettings drafts.
