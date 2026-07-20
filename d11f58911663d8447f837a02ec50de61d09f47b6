@@ -1,0 +1,7 @@
+Task: Lower sustained CPU usage during live unread refresh
+
+Summary: Replaced whole-workspace cache round trips for single-conversation metadata, unread/read, realtime, and removal mutations with row-scoped SQLite transactions.
+
+Rationale: A 1,430-conversation workspace performed roughly 2,860 full cache serializations during startup enrichment, keeping one Tokio worker at 94-99% CPU.
+
+Verification: cargo test --locked passed (500); all 13 Meson tests passed; installed app was gracefully restarted and all threads sampled at 0.0% while 1,389 unread refresh items remained queued.
