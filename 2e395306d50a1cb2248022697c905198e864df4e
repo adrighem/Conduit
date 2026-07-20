@@ -1,0 +1,5 @@
+Task: Harden row-scoped conversation cache updates
+
+Summary: Ignore mismatched conversation payload IDs so mutations cannot escape the addressed SQLite row; metadata and realtime updates self-heal only that row.
+
+Verification: cargo test --locked (501 passed); meson test -C _build (13 passed).
