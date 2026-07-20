@@ -3,6 +3,6 @@
   "type": "feature",
   "status": "in_progress",
   "created_at": "2026-07-20T14:00:28Z",
-  "updated_at": "2026-07-20T14:00:28Z",
+  "updated_at": "2026-07-20T14:04:00Z",
   "description": "Replace competing cache, runtime, and presentation update paths with one revisioned workspace coordinator."
 }
