@@ -1,0 +1,3 @@
+Track: workspace_pipeline_rearchitecture_20260720
+Phase 1 manual verification follow-up: bound startup unread/enrichment work to 30 prioritized conversations, cap legacy pending work, suppress unchanged workspace identity upserts, and report zero-transaction writes as unchanged.
+Verification: cargo test (520 passed); cargo check; meson compile -C _build; meson test -C _build --print-errorlogs (14 passed).
