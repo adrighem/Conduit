@@ -243,7 +243,7 @@ impl HuddleCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HuddleEvent {
-    Snapshot(HuddleSnapshot),
+    Snapshot(Box<HuddleSnapshot>),
     DevicesAvailable(Vec<HuddleDevice>),
     OpenExternalRequested(ActiveHuddle),
 }

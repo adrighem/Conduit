@@ -344,14 +344,14 @@ mod imp {
                         started_at: None,
                         huddle_link: None,
                     };
-                    obj.handle_huddle_event(HuddleEvent::Snapshot(HuddleSnapshot {
+                    obj.handle_huddle_event(HuddleEvent::Snapshot(Box::new(HuddleSnapshot {
                         phase: HuddlePhase::Discovered,
                         huddle: Some(huddle.clone()),
                         participants: vec![crate::huddles::state::HuddleParticipant::from_user_id(
                             "UTEST".to_string(),
                         )],
                         ..Default::default()
-                    }));
+                    })));
                     if std::env::var_os("CONDUIT_TEST_HUDDLE_EXTERNAL_URI_FILE").is_some() {
                         obj.handle_huddle_event(HuddleEvent::OpenExternalRequested(huddle));
                     }
@@ -3636,7 +3636,7 @@ impl ConduitWindow {
                     .workspace
                     .view
                     .borrow_mut()
-                    .apply_files(vec![file]);
+                    .apply_files(vec![*file]);
                 if visible {
                     let files = self.imp().workspace.view.borrow().files().to_vec();
                     self.populate_files(files);
@@ -7259,7 +7259,7 @@ impl ConduitWindow {
                         .map(|participant| participant.user_id.clone())
                         .collect(),
                 );
-                *self.imp().huddle_snapshot.borrow_mut() = snapshot.clone();
+                *self.imp().huddle_snapshot.borrow_mut() = (*snapshot).clone();
 
                 if snapshot.phase != HuddlePhase::Preflight {
                     if let Some(preflight) = self.imp().huddle_preflight_dialog.borrow_mut().take()

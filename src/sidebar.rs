@@ -319,6 +319,16 @@ pub struct SidebarBuildOptions<'a> {
     pub user_statuses: Option<&'a UserStatuses>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SidebarRowOptions<'a> {
+    selected_channel: Option<&'a str>,
+    current_user_id: Option<&'a str>,
+    active_huddle_channel_id: Option<&'a str>,
+    user_search_aliases: Option<&'a UserSearchAliases>,
+    user_full_names: Option<&'a HashMap<String, String>>,
+    user_statuses: Option<&'a UserStatuses>,
+}
+
 impl SidebarRowModel {
     pub fn from_conversation(
         conversation: &SlackConversation,
@@ -329,31 +339,25 @@ impl SidebarRowModel {
         Self::from_conversation_with_aliases(
             conversation,
             user_names,
-            selected_channel,
-            current_user_id,
-            None,
-            None,
-            None,
-            None,
+            SidebarRowOptions {
+                selected_channel,
+                current_user_id,
+                ..Default::default()
+            },
         )
     }
 
     fn from_conversation_with_aliases(
         conversation: &SlackConversation,
         user_names: &HashMap<String, String>,
-        selected_channel: Option<&str>,
-        current_user_id: Option<&str>,
-        active_huddle_channel_id: Option<&str>,
-        user_search_aliases: Option<&UserSearchAliases>,
-        user_full_names: Option<&HashMap<String, String>>,
-        user_statuses: Option<&UserStatuses>,
+        options: SidebarRowOptions<'_>,
     ) -> Self {
         let kind = conversation_kind(conversation);
         let empty_full_names = HashMap::new();
-        let user_full_names = user_full_names.unwrap_or(&empty_full_names);
-        let search_aliases = conversation_user_ids(conversation, current_user_id)
+        let user_full_names = options.user_full_names.unwrap_or(&empty_full_names);
+        let search_aliases = conversation_user_ids(conversation, options.current_user_id)
             .into_iter()
-            .filter_map(|user_id| user_search_aliases?.get(&user_id))
+            .filter_map(|user_id| options.user_search_aliases?.get(&user_id))
             .flatten()
             .cloned()
             .collect();
@@ -362,23 +366,23 @@ impl SidebarRowModel {
             title: conversation.navigation_name_with_users(
                 user_names,
                 user_full_names,
-                current_user_id,
+                options.current_user_id,
             ),
             kind,
             unread: conversation.has_unread_activity(),
             unread_count: conversation.unread_activity_count(),
-            selected: selected_channel == Some(conversation.id.as_str()),
+            selected: options.selected_channel == Some(conversation.id.as_str()),
             private: conversation.is_private.unwrap_or(false)
                 || conversation.is_group.unwrap_or(false)
                 || matches!(kind, ConversationKind::PrivateChannel),
             muted: conversation.is_muted_conversation(),
             external: conversation.is_external_conversation(),
-            huddle_active: active_huddle_channel_id == Some(conversation.id.as_str()),
+            huddle_active: options.active_huddle_channel_id == Some(conversation.id.as_str()),
             search_aliases,
             status: (kind == ConversationKind::DirectMessage)
                 .then_some(conversation.user.as_deref())
                 .flatten()
-                .and_then(|user_id| active_user_status(user_statuses, user_id)),
+                .and_then(|user_id| active_user_status(options.user_statuses, user_id)),
         }
     }
 
@@ -468,12 +472,14 @@ pub fn build_sidebar_list(
             SidebarRowModel::from_conversation_with_aliases(
                 conversation,
                 user_names,
-                options.selected_channel,
-                options.current_user_id,
-                options.active_huddle_channel_id,
-                options.user_search_aliases,
-                options.user_full_names,
-                options.user_statuses,
+                SidebarRowOptions {
+                    selected_channel: options.selected_channel,
+                    current_user_id: options.current_user_id,
+                    active_huddle_channel_id: options.active_huddle_channel_id,
+                    user_search_aliases: options.user_search_aliases,
+                    user_full_names: options.user_full_names,
+                    user_statuses: options.user_statuses,
+                },
             )
         })
         .filter(|row| row.match_score(&query).is_some() && (!options.unread_only || row.unread))
@@ -580,12 +586,13 @@ pub(crate) fn conversation_switcher_rows_with_aliases(
             SidebarRowModel::from_conversation_with_aliases(
                 conversation,
                 user_names,
-                None,
-                current_user_id,
-                None,
-                user_search_aliases,
-                user_full_names,
-                user_statuses,
+                SidebarRowOptions {
+                    current_user_id,
+                    user_search_aliases,
+                    user_full_names,
+                    user_statuses,
+                    ..Default::default()
+                },
             )
         })
         .collect()

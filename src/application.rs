@@ -133,33 +133,52 @@ fn realtime_group_description(
     }
 }
 
-fn update_realtime_preferences(
-    window: &ConduitWindow,
-    group: &adw::PreferencesGroup,
-    status_row: &adw::ActionRow,
-    status_label: &gtk::Label,
-    status_icon: &gtk::Image,
-    app_token_row: &adw::PasswordEntryRow,
+struct RealtimePreferenceWidgets<'a> {
+    group: &'a adw::PreferencesGroup,
+    status_row: &'a adw::ActionRow,
+    status_label: &'a gtk::Label,
+    status_icon: &'a gtk::Image,
+    app_token_row: &'a adw::PasswordEntryRow,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealtimePreferenceConfiguration {
     configured_by_environment: bool,
     stored_token: bool,
+}
+
+fn update_realtime_preferences(
+    window: &ConduitWindow,
+    widgets: RealtimePreferenceWidgets<'_>,
+    configuration: RealtimePreferenceConfiguration,
 ) {
     let status = window.realtime_status();
     let presentation = realtime_preference_presentation(status);
-    status_row.set_subtitle(&gettext(presentation.subtitle));
-    status_label.set_label(&gettext(presentation.status_label));
-    status_icon.set_icon_name(Some(presentation.icon_name));
+    widgets
+        .status_row
+        .set_subtitle(&gettext(presentation.subtitle));
+    widgets
+        .status_label
+        .set_label(&gettext(presentation.status_label));
+    widgets
+        .status_icon
+        .set_icon_name(Some(presentation.icon_name));
     for class in ["success", "warning", "error"] {
-        status_label.remove_css_class(class);
+        widgets.status_label.remove_css_class(class);
     }
     if let Some(class) = presentation.status_css_class {
-        status_label.add_css_class(class);
+        widgets.status_label.add_css_class(class);
     }
-    app_token_row.set_visible(presentation.show_app_token_row);
-    group.set_description(Some(&gettext(realtime_group_description(
-        status,
-        configured_by_environment,
-        stored_token,
-    ))));
+    widgets
+        .app_token_row
+        .set_visible(presentation.show_app_token_row);
+    widgets
+        .group
+        .set_description(Some(&gettext(realtime_group_description(
+            status,
+            configuration.configured_by_environment,
+            configuration.stored_token,
+        ))));
 }
 
 fn application_flags() -> gio::ApplicationFlags {
@@ -632,13 +651,17 @@ impl ConduitApplication {
         realtime_group.add(&realtime_row);
         update_realtime_preferences(
             &window,
-            &realtime_group,
-            &realtime_status_row,
-            &realtime_status_label,
-            &realtime_status_icon,
-            &realtime_row,
-            configured_by_environment,
-            stored_token,
+            RealtimePreferenceWidgets {
+                group: &realtime_group,
+                status_row: &realtime_status_row,
+                status_label: &realtime_status_label,
+                status_icon: &realtime_status_icon,
+                app_token_row: &realtime_row,
+            },
+            RealtimePreferenceConfiguration {
+                configured_by_environment,
+                stored_token,
+            },
         );
 
         let sign_out_row = adw::ActionRow::builder()
@@ -672,13 +695,17 @@ impl ConduitApplication {
             move |window| {
                 update_realtime_preferences(
                     window,
-                    &realtime_group_for_status,
-                    &realtime_status_row_for_status,
-                    &realtime_status_label_for_status,
-                    &realtime_status_icon_for_status,
-                    &realtime_row_for_status,
-                    configured_by_environment,
-                    stored_token,
+                    RealtimePreferenceWidgets {
+                        group: &realtime_group_for_status,
+                        status_row: &realtime_status_row_for_status,
+                        status_label: &realtime_status_label_for_status,
+                        status_icon: &realtime_status_icon_for_status,
+                        app_token_row: &realtime_row_for_status,
+                    },
+                    RealtimePreferenceConfiguration {
+                        configured_by_environment,
+                        stored_token,
+                    },
                 );
             },
         ))));

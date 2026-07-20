@@ -798,7 +798,7 @@ pub enum RuntimeEventKind {
     SearchLoaded(Vec<SearchMatch>),
     FilesLoaded(Vec<SlackFile>),
     FileLoaded {
-        file: SlackFile,
+        file: Box<SlackFile>,
         share_requested: bool,
     },
     SavedItemsLoaded(Vec<SavedItem>),
@@ -2847,7 +2847,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             let file = api.file(&file_id).await?;
             context.events.send_event(RuntimeEventKind::FileLoaded {
-                file,
+                file: Box::new(file),
                 share_requested,
             });
         }
@@ -3408,7 +3408,9 @@ fn apply_huddle_effects(
     while let Some(effect) = pending.pop_front() {
         match effect {
             HuddleEffect::Publish(snapshot) => {
-                events.send_event(RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot)));
+                events.send_event(RuntimeEventKind::Huddle(HuddleEvent::Snapshot(Box::new(
+                    snapshot,
+                ))));
             }
             HuddleEffect::BeginNativeJoin { .. } => {
                 let failure = match join_capability {
@@ -5766,12 +5768,8 @@ mod tests {
             let discovered = event_receiver.recv().await.unwrap();
             assert!(matches!(
                 discovered.kind,
-                RuntimeEventKind::Huddle(crate::huddles::state::HuddleEvent::Snapshot(
-                    crate::huddles::state::HuddleSnapshot {
-                        phase: crate::huddles::state::HuddlePhase::Discovered,
-                        ..
-                    }
-                ))
+                RuntimeEventKind::Huddle(crate::huddles::state::HuddleEvent::Snapshot(snapshot))
+                    if snapshot.phase == crate::huddles::state::HuddlePhase::Discovered
             ));
 
             handle
@@ -5782,12 +5780,8 @@ mod tests {
             let preflight = event_receiver.recv().await.unwrap();
             assert!(matches!(
                 preflight.kind,
-                RuntimeEventKind::Huddle(crate::huddles::state::HuddleEvent::Snapshot(
-                    crate::huddles::state::HuddleSnapshot {
-                        phase: crate::huddles::state::HuddlePhase::Preflight,
-                        ..
-                    }
-                ))
+                RuntimeEventKind::Huddle(crate::huddles::state::HuddleEvent::Snapshot(snapshot))
+                    if snapshot.phase == crate::huddles::state::HuddlePhase::Preflight
             ));
 
             drop(handle);
@@ -5844,22 +5838,14 @@ mod tests {
             let discovered = event_receiver.recv().await.unwrap();
             assert!(matches!(
                 discovered.kind,
-                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(
-                    crate::huddles::state::HuddleSnapshot {
-                        phase: HuddlePhase::Discovered,
-                        ..
-                    }
-                ))
+                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot))
+                    if snapshot.phase == HuddlePhase::Discovered
             ));
             let ended = event_receiver.recv().await.unwrap();
             assert!(matches!(
                 ended.kind,
-                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(
-                    crate::huddles::state::HuddleSnapshot {
-                        phase: HuddlePhase::Idle,
-                        ..
-                    }
-                ))
+                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot))
+                    if snapshot.phase == HuddlePhase::Idle
             ));
             assert!(event_receiver.try_recv().is_err());
 
@@ -5902,10 +5888,10 @@ mod tests {
         );
 
         let event = RuntimeEventKind::FileLoaded {
-            file: SlackFile {
+            file: Box::new(SlackFile {
                 id: Some("F123".to_string()),
                 ..Default::default()
-            },
+            }),
             share_requested: false,
         };
         assert_eq!(

@@ -6,19 +6,19 @@ const SLACK_HUDDLE_ORIGIN: &str = "https://app.slack.com";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HuddleFallbackError {
     #[error("invalid Slack workspace identifier")]
-    InvalidTeamId,
+    TeamId,
     #[error("invalid Slack conversation identifier")]
-    InvalidChannelId,
+    ChannelId,
     #[error("invalid Slack huddle link")]
-    InvalidSuppliedLink,
+    SuppliedLink,
 }
 
 pub fn external_huddle_url(huddle: &ActiveHuddle) -> Result<String, HuddleFallbackError> {
     if !valid_slack_id(&huddle.team_id, &['T']) {
-        return Err(HuddleFallbackError::InvalidTeamId);
+        return Err(HuddleFallbackError::TeamId);
     }
     if !valid_slack_id(&huddle.channel_id, &['C', 'G', 'D']) {
-        return Err(HuddleFallbackError::InvalidChannelId);
+        return Err(HuddleFallbackError::ChannelId);
     }
 
     let canonical = format!(
@@ -28,7 +28,7 @@ pub fn external_huddle_url(huddle: &ActiveHuddle) -> Result<String, HuddleFallba
     if huddle.huddle_link.as_deref().is_some_and(|supplied| {
         !valid_supplied_link(supplied, &huddle.team_id, &huddle.channel_id, &canonical)
     }) {
-        return Err(HuddleFallbackError::InvalidSuppliedLink);
+        return Err(HuddleFallbackError::SuppliedLink);
     }
 
     Ok(canonical)
@@ -113,7 +113,7 @@ mod tests {
         ] {
             assert_eq!(
                 external_huddle_url(&huddle(Some(link))),
-                Err(HuddleFallbackError::InvalidSuppliedLink),
+                Err(HuddleFallbackError::SuppliedLink),
                 "accepted {link}"
             );
         }
@@ -130,7 +130,7 @@ mod tests {
         ] {
             assert_eq!(
                 external_huddle_url(&huddle(Some(link))),
-                Err(HuddleFallbackError::InvalidSuppliedLink),
+                Err(HuddleFallbackError::SuppliedLink),
                 "accepted {link}"
             );
         }
@@ -154,7 +154,7 @@ mod tests {
         ] {
             assert_eq!(
                 external_huddle_url(&huddle(Some(link))),
-                Err(HuddleFallbackError::InvalidSuppliedLink),
+                Err(HuddleFallbackError::SuppliedLink),
                 "accepted {link}"
             );
         }
@@ -172,7 +172,7 @@ mod tests {
         ] {
             assert_eq!(
                 external_huddle_url(&huddle(Some(link))),
-                Err(HuddleFallbackError::InvalidSuppliedLink),
+                Err(HuddleFallbackError::SuppliedLink),
                 "accepted {link}"
             );
         }
@@ -185,7 +185,7 @@ mod tests {
             candidate.team_id = team_id.to_string();
             assert_eq!(
                 external_huddle_url(&candidate),
-                Err(HuddleFallbackError::InvalidTeamId),
+                Err(HuddleFallbackError::TeamId),
                 "accepted team id {team_id:?}"
             );
         }
@@ -193,7 +193,7 @@ mod tests {
         oversized_team.team_id = format!("T{}", "1".repeat(64));
         assert_eq!(
             external_huddle_url(&oversized_team),
-            Err(HuddleFallbackError::InvalidTeamId)
+            Err(HuddleFallbackError::TeamId)
         );
 
         for channel_id in ["", "C", "U456", "C-456", " C456", "C456 "] {
@@ -201,7 +201,7 @@ mod tests {
             candidate.channel_id = channel_id.to_string();
             assert_eq!(
                 external_huddle_url(&candidate),
-                Err(HuddleFallbackError::InvalidChannelId),
+                Err(HuddleFallbackError::ChannelId),
                 "accepted conversation id {channel_id:?}"
             );
         }
@@ -209,7 +209,7 @@ mod tests {
         oversized_channel.channel_id = format!("C{}", "1".repeat(64));
         assert_eq!(
             external_huddle_url(&oversized_channel),
-            Err(HuddleFallbackError::InvalidChannelId)
+            Err(HuddleFallbackError::ChannelId)
         );
     }
 
