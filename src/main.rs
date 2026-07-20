@@ -46,6 +46,7 @@ mod store;
 mod thread_catalog;
 mod thread_pane;
 mod window;
+mod workspace_pipeline;
 mod workspace_state;
 
 use self::application::ConduitApplication;
