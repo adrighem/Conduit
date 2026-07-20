@@ -58,7 +58,9 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert "debian:trixie" in workflow
     assert "fedora:44" in workflow
     assert 'CARGO_NET_RETRY: "10"' in workflow
-    assert 'rustup default "$RUST_VERSION"' in workflow
+    assert "RUSTUP_HOME: /opt/rustup" in workflow
+    assert "RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}" in workflow
+    assert 'rustup default "$RUST_VERSION"' not in workflow
     assert "dpkg-query --showformat='${Version}'" in workflow
     assert "rpm -q --qf '%{VERSION}-%{RELEASE}'" in workflow
     assert "/usr/share/conduit/conduit.gresource" in workflow
@@ -67,6 +69,15 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert "artifact-name:" not in workflow
     assert "SHA256SUMS" in workflow
     assert "gh release upload" in workflow
+
+
+def test_release_build_tests_reuse_the_release_profile() -> None:
+    source_build = read("src/meson.build")
+    rpm_spec = read("packaging/rpm/conduit.spec")
+    rpm_check = rpm_spec.split("%check", maxsplit=1)[1].split("%files", maxsplit=1)[0]
+
+    assert "cargo_test_args += [cargo_release_arg]" in source_build
+    assert "%meson_test" in rpm_check
 
 
 def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
@@ -119,6 +130,7 @@ def main() -> None:
     tests = [
         test_release_versions_are_synchronized,
         test_release_workflow_builds_and_publishes_all_assets,
+        test_release_build_tests_reuse_the_release_profile,
         test_release_flatpak_uses_current_checkout_without_debug_logging,
         test_flatpak_cargo_sources_match_the_lockfile,
     ]

@@ -85,6 +85,9 @@ cargo_test_args = [
   '--manifest-path', meson.project_source_root() / 'Cargo.toml',
   '--target-dir', meson.project_build_root() / 'src',
 ]
+if cargo_release_arg != ''
+  cargo_test_args += [cargo_release_arg]
+endif
 if cargo_features_arg != ''
   cargo_test_args += ['--features', cargo_features_arg]
 endif
