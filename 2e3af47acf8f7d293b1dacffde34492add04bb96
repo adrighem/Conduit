@@ -1,0 +1,3 @@
+Pipeline follow-up for CI run 29761011158.
+Removed an unnecessary Option::as_deref in the native-media pad classifier.
+Verification: cargo fmt -- --check. Native feature check is unavailable locally because gstreamer-webrtc-1.0 development metadata is not installed; CI provides native lint and test verification.
