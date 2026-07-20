@@ -62,6 +62,24 @@ if xvfb_run.found() and xfwm4.found()
   )
 
   test(
+    'Timeline scroll anchoring',
+    python,
+    args: [
+      files('run_headless.py'),
+      files('test_timeline_scroll.py'),
+      meson.project_source_root() / 'src' / 'timeline_dom_runtime.js',
+    ],
+    env: [
+      'GDK_DEBUG=no-portals',
+      'GDK_BACKEND=x11',
+      'GSK_RENDERER=cairo',
+      'GTK_A11Y=none',
+      'XDG_SESSION_TYPE=x11',
+    ],
+    timeout: 90,
+  )
+
+  test(
     'GNOME search provider',
     python,
     args: [

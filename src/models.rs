@@ -614,6 +614,35 @@ pub struct SlackMessage {
 }
 
 impl SlackMessage {
+    /// Returns the root timestamp when this message is a reply in a thread.
+    ///
+    /// Slack may set `thread_ts` to the message's own timestamp for a thread
+    /// root, so only a different non-empty timestamp identifies a reply.
+    pub fn thread_root_ts(&self) -> Option<&str> {
+        self.thread_ts
+            .as_deref()
+            .filter(|thread_ts| !thread_ts.is_empty() && *thread_ts != self.ts)
+    }
+
+    pub fn is_thread_reply(&self) -> bool {
+        self.thread_root_ts().is_some()
+    }
+
+    /// Normal replies stay in their thread. Slack's explicit
+    /// `thread_broadcast` subtype is the exception and is also shown in the
+    /// channel timeline.
+    pub fn belongs_in_channel_timeline(&self) -> bool {
+        !self.is_thread_reply()
+            || matches!(
+                self.subtype.as_deref(),
+                Some("thread_broadcast" | "reply_broadcast")
+            )
+    }
+
+    pub fn belongs_to_thread(&self, thread_ts: &str) -> bool {
+        self.ts == thread_ts || self.thread_root_ts() == Some(thread_ts)
+    }
+
     pub fn author_label(&self) -> String {
         self.username
             .clone()
@@ -1523,6 +1552,34 @@ mod tests {
             ..reply
         };
         assert_eq!(parent.message_location().unwrap().thread_ts(), None);
+    }
+
+    #[test]
+    fn message_thread_membership_distinguishes_roots_replies_and_broadcasts() {
+        let root = SlackMessage {
+            ts: "1".into(),
+            thread_ts: Some("1".into()),
+            ..Default::default()
+        };
+        let reply = SlackMessage {
+            ts: "2".into(),
+            thread_ts: Some("1".into()),
+            ..Default::default()
+        };
+        let mut broadcast = reply.clone();
+        broadcast.subtype = Some("thread_broadcast".into());
+        let mut legacy_broadcast = reply.clone();
+        legacy_broadcast.subtype = Some("reply_broadcast".into());
+
+        assert!(!root.is_thread_reply());
+        assert!(root.belongs_in_channel_timeline());
+        assert!(root.belongs_to_thread("1"));
+        assert!(reply.is_thread_reply());
+        assert_eq!(reply.thread_root_ts(), Some("1"));
+        assert!(!reply.belongs_in_channel_timeline());
+        assert!(reply.belongs_to_thread("1"));
+        assert!(broadcast.belongs_in_channel_timeline());
+        assert!(legacy_broadcast.belongs_in_channel_timeline());
     }
 
     #[test]

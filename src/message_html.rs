@@ -1968,10 +1968,6 @@ pre code {{
 }
 
 fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) -> Option<String> {
-    if behavior == TimelineScrollBehavior::Preserve {
-        return None;
-    }
-
     let sticky_key = serde_json::to_string(&format!("conduit:timeline-at-bottom:{channel_id}"))
         .unwrap_or_else(|_| "\"conduit:timeline-at-bottom:\"".to_string());
     let anchor_key = serde_json::to_string(&format!("conduit:timeline-anchor:{channel_id}"))
@@ -1982,7 +1978,7 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
   const mode = {mode};
   const stickyKey = {sticky_key};
   const anchorKey = {anchor_key};
-  const threshold = 48;
+  const threshold = 96;
 
   function root() {{
     return document.scrollingElement || document.documentElement;
@@ -2040,7 +2036,12 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
     }}
   }}
 
-  function restorePrependAnchor() {{
+  function rememberViewport() {{
+    rememberPosition();
+    rememberAnchor();
+  }}
+
+  function restoreAnchor() {{
     let payload = null;
     try {{
       payload = JSON.parse(sessionStorage.getItem(anchorKey) || "null");
@@ -2065,13 +2066,13 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
     ) {{
       scrollRoot.scrollTop = payload.scrollTop + scrollRoot.scrollHeight - payload.scrollHeight;
     }}
-    rememberPosition();
+    rememberViewport();
   }}
 
   function scrollToBottom() {{
     const scrollRoot = root();
     scrollRoot.scrollTop = scrollRoot.scrollHeight;
-    rememberPosition();
+    rememberViewport();
   }}
 
   const shouldStick = wasAtBottom();
@@ -2079,7 +2080,7 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
     if (shouldStick) {{
       scrollToBottom();
     }} else {{
-      rememberPosition();
+      restoreAnchor();
     }}
   }}
 
@@ -2088,21 +2089,21 @@ fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) ->
       ? event.target.closest("a[href^='conduit://load-older']")
       : null;
     if (target) {{
-      rememberAnchor();
+      rememberViewport();
     }}
   }}, true);
 
   if (mode === "preserve-prepend") {{
-    window.addEventListener("scroll", rememberPosition, {{ passive: true }});
-    window.addEventListener("load", restorePrependAnchor, {{ once: true }});
-    requestAnimationFrame(restorePrependAnchor);
+    window.addEventListener("scroll", rememberViewport, {{ passive: true }});
+    window.addEventListener("load", restoreAnchor, {{ once: true }});
+    requestAnimationFrame(restoreAnchor);
     requestAnimationFrame(function () {{
-      requestAnimationFrame(restorePrependAnchor);
+      requestAnimationFrame(restoreAnchor);
     }});
     return;
   }}
 
-  window.addEventListener("scroll", rememberPosition, {{ passive: true }});
+  window.addEventListener("scroll", rememberViewport, {{ passive: true }});
   window.addEventListener("load", applyScroll, {{ once: true }});
   requestAnimationFrame(applyScroll);
   requestAnimationFrame(function () {{
@@ -5295,7 +5296,11 @@ mod tests {
             assert!(html.contains(&format!("data-message-region=\"{region}\"")));
         }
         assert!(html.contains("withPreservedScroll"));
-        assert!(html.contains("anchor.getBoundingClientRect().top - anchorTop"));
+        assert!(html.contains("stableAnchor.getBoundingClientRect().top - anchorTop"));
+        assert!(html.contains("viewportPinnedToBottom"));
+        assert!(html.contains("bottomThreshold = 96"));
+        assert!(html.contains("mode = \"preserve\""));
+        assert!(html.contains("window.addEventListener(\"scroll\", rememberViewport"));
         assert!(html.contains("patch.source.startsWith(\"data:video/\")"));
         assert!(html.contains("document.createElement(\"video\")"));
         assert!(html.contains("window.conduitLocalizeTimestamps(template.content)"));

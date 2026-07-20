@@ -81,8 +81,8 @@ use crate::thread_catalog::ThreadCatalog;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_state::{
     ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
-    ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle, WorkspaceLifecycleEvent,
-    WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
+    RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle,
+    WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -3376,29 +3376,34 @@ impl ConduitWindow {
                     cached,
                 );
                 if outcome.visible {
-                    let rendered_messages = self
-                        .imp()
-                        .workspace
-                        .view
-                        .borrow()
-                        .snapshot()
-                        .channel_messages;
+                    let rendered_messages =
+                        (outcome.render || outcome.notify_new_messages).then(|| {
+                            self.imp()
+                                .workspace
+                                .view
+                                .borrow()
+                                .snapshot()
+                                .channel_messages
+                        });
                     if outcome.notify_new_messages {
                         self.notify_if_new_messages(
                             &channel_id,
-                            &rendered_messages,
+                            rendered_messages.as_deref().unwrap_or(&[]),
                             MessageNotificationDelivery::Snapshot,
                         );
                     }
-                    self.populate_history_with_scroll(
-                        &channel_id,
-                        rendered_messages,
-                        timeline_scroll_behavior(
-                            outcome
-                                .scroll
-                                .unwrap_or(WorkspaceScrollBehavior::StickToBottom),
-                        ),
-                    );
+                    if outcome.render {
+                        let rendered_messages = rendered_messages.unwrap_or_default();
+                        self.populate_history_with_scroll(
+                            &channel_id,
+                            rendered_messages,
+                            timeline_scroll_behavior(
+                                outcome
+                                    .scroll
+                                    .unwrap_or(WorkspaceScrollBehavior::StickToBottom),
+                            ),
+                        );
+                    }
                     if !cached {
                         self.restore_workspace_status();
                     }
@@ -3420,21 +3425,23 @@ impl ConduitWindow {
                     next_cursor,
                     append_older,
                 );
-                if let ThreadApplyOutcome::Applied { scroll } = outcome {
-                    let rendered_messages = self
-                        .imp()
-                        .workspace
-                        .view
-                        .borrow()
-                        .snapshot()
-                        .thread_messages;
-                    self.request_user_names(&rendered_messages);
-                    self.populate_thread(
-                        &channel_id,
-                        &ts,
-                        rendered_messages,
-                        timeline_scroll_behavior(scroll),
-                    );
+                if let ThreadApplyOutcome::Applied { scroll, render } = outcome {
+                    if render {
+                        let rendered_messages = self
+                            .imp()
+                            .workspace
+                            .view
+                            .borrow()
+                            .snapshot()
+                            .thread_messages;
+                        self.request_user_names(&rendered_messages);
+                        self.populate_thread(
+                            &channel_id,
+                            &ts,
+                            rendered_messages,
+                            timeline_scroll_behavior(scroll),
+                        );
+                    }
                     self.restore_workspace_status();
                 }
             }
@@ -3631,15 +3638,27 @@ impl ConduitWindow {
             } => {
                 self.set_status("Message sent");
                 let thread_ts = posted_message_thread_ts(&meta.context, &channel_id, &message);
-                self.complete_submitted_draft(&channel_id, thread_ts.as_deref());
+                let mut message = *message;
                 if let Some(thread_ts) = thread_ts.as_deref() {
+                    message.thread_ts = Some(thread_ts.to_string());
+                }
+                self.complete_submitted_draft(&channel_id, thread_ts.as_deref());
+                if thread_ts.is_some() {
                     self.imp().thread_send_button.set_sensitive(true);
-                    self.note_thread_reply_posted(&channel_id, thread_ts);
                 } else {
                     self.imp().send_button.set_sensitive(true);
-                    self.force_next_channel_bottom_render(&channel_id);
                 }
-                self.reload_after_message(&channel_id, thread_ts.as_deref());
+                let outcome = self.apply_timeline_message(
+                    &channel_id,
+                    &message,
+                    RealtimeMessageKind::Posted,
+                    false,
+                );
+                if outcome.refresh_unreads {
+                    self.populate_unreads(self.unread_items());
+                } else {
+                    self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+                }
             }
             RuntimeEventKind::ReactionUpdated {
                 channel_id,
@@ -4839,28 +4858,6 @@ impl ConduitWindow {
             .view
             .borrow()
             .find_message(channel_id, ts)
-    }
-
-    fn note_thread_reply_posted(&self, channel_id: &str, thread_ts: &str) {
-        let should_render = {
-            let mut state = self.imp().workspace.view.borrow_mut();
-            state.increment_thread_reply(channel_id, thread_ts)
-                && state.visible_channel_id() == Some(channel_id)
-        };
-        if should_render {
-            let messages = self
-                .imp()
-                .workspace
-                .view
-                .borrow()
-                .channel_messages(channel_id)
-                .to_vec();
-            self.populate_history_with_scroll(
-                channel_id,
-                messages,
-                TimelineScrollBehavior::Preserve,
-            );
-        }
     }
 
     fn reload_after_message(&self, channel_id: &str, thread_ts: Option<&str>) {
@@ -6643,14 +6640,6 @@ impl ConduitWindow {
         });
     }
 
-    fn force_next_channel_bottom_render(&self, channel_id: &str) {
-        self.imp()
-            .workspace
-            .view
-            .borrow_mut()
-            .force_next_bottom(channel_id);
-    }
-
     fn populate_history(&self, channel_id: &str, messages: Vec<SlackMessage>) {
         self.populate_history_with_scroll(
             channel_id,
@@ -6914,16 +6903,38 @@ impl ConduitWindow {
             SocketModeMessageKind::Changed => RealtimeMessageKind::Changed,
             SocketModeMessageKind::Deleted => RealtimeMessageKind::Deleted,
         };
+        let outcome = self.apply_timeline_message(&channel_id, &message, kind, became_unread);
+
+        if event.kind == SocketModeMessageKind::Posted {
+            self.notify_if_new_messages(
+                &channel_id,
+                std::slice::from_ref(&message),
+                MessageNotificationDelivery::Realtime { first_delivery },
+            );
+        }
+
+        if outcome.refresh_unreads {
+            self.populate_unreads(self.unread_items());
+        } else {
+            self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+        }
+    }
+
+    fn apply_timeline_message(
+        &self,
+        channel_id: &str,
+        message: &SlackMessage,
+        kind: RealtimeMessageKind,
+        unread_start: bool,
+    ) -> RealtimeMessageOutcome {
         let (channel_dom_kind, thread_dom_kind) = {
             let state = self.imp().workspace.view.borrow();
             let channel_kind =
-                realtime_dom_patch_kind(kind, state.channel_messages(&channel_id), &message);
+                realtime_dom_patch_kind(kind, state.channel_messages(channel_id), message);
             let thread_kind = state
                 .selected_thread_ts()
-                .filter(|thread_ts| {
-                    message.thread_ts.as_deref() == Some(*thread_ts) && message.ts != **thread_ts
-                })
-                .map(|_| realtime_dom_patch_kind(kind, state.current_thread_messages(), &message))
+                .filter(|thread_ts| message.belongs_to_thread(thread_ts))
+                .map(|_| realtime_dom_patch_kind(kind, state.current_thread_messages(), message))
                 .unwrap_or(Some(kind));
             (channel_kind, thread_kind)
         };
@@ -6933,7 +6944,7 @@ impl ConduitWindow {
             .workspace
             .view
             .borrow_mut()
-            .apply_realtime_message(&channel_id, message.clone(), kind);
+            .apply_realtime_message(channel_id, message.clone(), kind);
 
         if outcome.render_channel {
             if self
@@ -6941,16 +6952,16 @@ impl ConduitWindow {
                 .workspace
                 .view
                 .borrow()
-                .has_channel_context(&channel_id)
+                .has_channel_context(channel_id)
             {
                 self.queue_ui_invalidations(UiInvalidations::MAIN);
             } else if let Some(dom_kind) = channel_dom_kind {
                 self.apply_realtime_message_patch(RealtimeMessagePatch {
                     surface: TimelineSurface::Main,
-                    channel_id: &channel_id,
-                    message: &message,
+                    channel_id,
+                    message,
                     kind: dom_kind,
-                    unread_start: became_unread,
+                    unread_start,
                     thread_ts: None,
                     fallback: UiInvalidations::MAIN,
                 });
@@ -6966,14 +6977,14 @@ impl ConduitWindow {
                     .workspace
                     .view
                     .borrow()
-                    .has_thread_context(&channel_id, &thread_ts)
+                    .has_thread_context(channel_id, &thread_ts)
                 {
                     self.queue_ui_invalidations(UiInvalidations::THREAD);
                 } else if let Some(dom_kind) = thread_dom_kind {
                     self.apply_realtime_message_patch(RealtimeMessagePatch {
                         surface: TimelineSurface::Thread,
-                        channel_id: &channel_id,
-                        message: &message,
+                        channel_id,
+                        message,
                         kind: dom_kind,
                         unread_start: false,
                         thread_ts: Some(&thread_ts),
@@ -6985,21 +6996,9 @@ impl ConduitWindow {
             }
         }
 
-        if event.kind == SocketModeMessageKind::Posted {
-            self.notify_if_new_messages(
-                &channel_id,
-                std::slice::from_ref(&message),
-                MessageNotificationDelivery::Realtime { first_delivery },
-            );
-        }
-        self.request_user_names(std::slice::from_ref(&message));
-        self.request_image_assets(std::iter::once(&message));
-
-        if outcome.refresh_unreads {
-            self.populate_unreads(self.unread_items());
-        } else {
-            self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-        }
+        self.request_user_names(std::slice::from_ref(message));
+        self.request_image_assets(std::iter::once(message));
+        outcome
     }
 
     fn apply_socket_reaction(&self, event: SocketModeReactionEvent) {

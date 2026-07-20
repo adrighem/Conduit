@@ -43,14 +43,37 @@
     }) || null;
   }
 
+  const bottomThreshold = 96;
+
+  function isNearBottom() {
+    const root = timelineRoot();
+    return root.scrollHeight - root.scrollTop - root.clientHeight <= bottomThreshold;
+  }
+
   let viewportAnchor = null;
   let viewportAnchorTop = 0;
-  let viewportWidth = window.innerWidth;
   let restoringViewportAnchor = false;
+  let viewportPinnedToBottom = isNearBottom();
   let rememberViewportAnchorFrame = 0;
+  let scrollMutationGeneration = 0;
+
+  function finishViewportRestore() {
+    requestAnimationFrame(function () {
+      restoringViewportAnchor = false;
+    });
+  }
+
+  function scrollToPinnedBottom() {
+    restoringViewportAnchor = true;
+    viewportPinnedToBottom = true;
+    const root = timelineRoot();
+    root.scrollTop = root.scrollHeight;
+    finishViewportRestore();
+  }
 
   function rememberViewportAnchor() {
     if (restoringViewportAnchor) return;
+    viewportPinnedToBottom = isNearBottom();
     const anchor = visibleAnchor();
     if (!anchor) return;
     viewportAnchor = anchor;
@@ -75,12 +98,10 @@
   }, true);
 
   function preserveViewportAnchorDuringResize() {
-    const nextWidth = window.innerWidth;
-    if (Math.abs(nextWidth - viewportWidth) < 0.5) {
-      scheduleRememberViewportAnchor();
+    if (viewportPinnedToBottom) {
+      scrollToPinnedBottom();
       return;
     }
-    viewportWidth = nextWidth;
     if (!viewportAnchor || !viewportAnchor.isConnected) {
       rememberViewportAnchor();
       return;
@@ -88,35 +109,47 @@
 
     const root = timelineRoot();
     const currentTop = viewportAnchor.getBoundingClientRect().top;
-    root.scrollTop += currentTop - viewportAnchorTop;
     restoringViewportAnchor = true;
-    requestAnimationFrame(function () {
-      restoringViewportAnchor = false;
-    });
+    root.scrollTop += currentTop - viewportAnchorTop;
+    finishViewportRestore();
   }
 
   window.addEventListener("scroll", scheduleRememberViewportAnchor, { passive: true });
   window.addEventListener("resize", preserveViewportAnchorDuringResize, { passive: true });
   if ("ResizeObserver" in window) {
-    new ResizeObserver(preserveViewportAnchorDuringResize).observe(document.documentElement);
+    const timelineResizeObserver = new ResizeObserver(preserveViewportAnchorDuringResize);
+    timelineResizeObserver.observe(document.documentElement);
+    if (document.body) timelineResizeObserver.observe(document.body);
+    const timeline = document.querySelector(".timeline");
+    if (timeline) timelineResizeObserver.observe(timeline);
   }
   requestAnimationFrame(rememberViewportAnchor);
 
   function withPreservedScroll(mutate) {
     const root = timelineRoot();
-    const wasAtBottom = root.scrollHeight - root.scrollTop - root.clientHeight <= 48;
+    const wasAtBottom = viewportPinnedToBottom || isNearBottom();
     const anchor = visibleAnchor();
+    const anchorTs = anchor ? anchor.dataset.messageTs : null;
     const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
     const oldScrollTop = root.scrollTop;
     const changed = mutate();
     if (!changed) return false;
+    const generation = ++scrollMutationGeneration;
     function restore() {
+      if (generation !== scrollMutationGeneration) return;
       if (wasAtBottom) {
-        root.scrollTop = root.scrollHeight;
-      } else if (anchor && anchor.isConnected) {
-        root.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+        scrollToPinnedBottom();
       } else {
-        root.scrollTop = oldScrollTop;
+        const stableAnchor = anchor && anchor.isConnected
+          ? anchor
+          : (anchorTs ? messageElement(anchorTs) : null);
+        if (stableAnchor) {
+          restoringViewportAnchor = true;
+          root.scrollTop += stableAnchor.getBoundingClientRect().top - anchorTop;
+          finishViewportRestore();
+        } else {
+          root.scrollTop = oldScrollTop;
+        }
       }
     }
     restore();

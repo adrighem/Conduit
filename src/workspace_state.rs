@@ -155,6 +155,7 @@ pub(crate) struct ConversationSelectionOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HistoryApplyOutcome {
     pub(crate) visible: bool,
+    pub(crate) render: bool,
     pub(crate) notify_new_messages: bool,
     pub(crate) scroll: Option<WorkspaceScrollBehavior>,
 }
@@ -176,7 +177,10 @@ pub(crate) enum ThreadOpenOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadApplyOutcome {
     Ignored,
-    Applied { scroll: WorkspaceScrollBehavior },
+    Applied {
+        scroll: WorkspaceScrollBehavior,
+        render: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -555,11 +559,15 @@ impl WorkspaceViewState {
         append_older: bool,
         cached: bool,
     ) -> HistoryApplyOutcome {
+        let visible = self.visible_channel_id() == Some(channel_id);
         let history = self.channels.entry(channel_id.to_string()).or_default();
+        let was_loaded = history.loaded;
+        let previous_messages = history.messages.clone();
+        let had_context = history.context_messages.is_some();
         history.messages = if append_older {
-            merge_message_pages(&history.messages, &messages)
+            merge_channel_message_pages(&history.messages, &messages)
         } else {
-            normalize_messages(messages)
+            merge_channel_message_refresh(&history.messages, &messages)
         };
         history.loaded = true;
         if !cached {
@@ -568,11 +576,15 @@ impl WorkspaceViewState {
             history.context_messages = None;
         }
 
-        let visible = self.visible_channel_id() == Some(channel_id);
+        let render = visible
+            && (!was_loaded
+                || history.messages != previous_messages
+                || (had_context && !cached && !append_older));
         let notify_new_messages = visible && !cached && !append_older;
         let scroll = visible.then(|| self.take_channel_scroll(channel_id, append_older));
         HistoryApplyOutcome {
             visible,
+            render,
             notify_new_messages,
             scroll,
         }
@@ -582,13 +594,6 @@ impl WorkspaceViewState {
         self.channels
             .get(channel_id)
             .and_then(|history| history.next_cursor.as_deref())
-    }
-
-    pub(crate) fn force_next_bottom(&mut self, channel_id: &str) {
-        self.channels
-            .entry(channel_id.to_string())
-            .or_default()
-            .force_bottom = true;
     }
 
     pub(crate) fn open_thread(&mut self, channel_id: &str, ts: &str) -> ThreadOpenOutcome {
@@ -810,10 +815,13 @@ impl WorkspaceViewState {
             return ThreadApplyOutcome::Ignored;
         }
 
+        let was_ready = thread.status == ThreadLoadStatus::Ready;
+        let previous_messages = thread.messages.clone();
+        let had_context = thread.context_messages.is_some();
         thread.messages = if append_older {
             merge_message_pages(&thread.messages, &messages)
         } else {
-            normalize_messages(messages)
+            merge_message_refresh(&thread.messages, &messages)
         };
         thread.status = ThreadLoadStatus::Ready;
         thread.context_messages = None;
@@ -824,6 +832,7 @@ impl WorkspaceViewState {
             } else {
                 WorkspaceScrollBehavior::StickToBottom
             },
+            render: !was_ready || had_context || thread.messages != previous_messages,
         }
     }
 
@@ -831,21 +840,6 @@ impl WorkspaceViewState {
         self.thread
             .as_ref()
             .and_then(|thread| thread.next_cursor.as_deref())
-    }
-
-    pub(crate) fn increment_thread_reply(&mut self, channel_id: &str, thread_ts: &str) -> bool {
-        let Some(history) = self.channels.get_mut(channel_id) else {
-            return false;
-        };
-        let Some(parent) = history
-            .messages
-            .iter_mut()
-            .find(|message| message.ts == thread_ts)
-        else {
-            return false;
-        };
-        parent.reply_count = Some(parent.reply_count.unwrap_or_default().saturating_add(1));
-        true
     }
 
     pub(crate) fn apply_realtime_message(
@@ -857,30 +851,29 @@ impl WorkspaceViewState {
         let visible = self.visible_channel_id() == Some(channel_id);
         let history = self.channels.entry(channel_id.to_string()).or_default();
         let channel_changed = {
-            let base_changed = if history.loaded {
-                history.messages = merge_realtime_message(&history.messages, &message);
-                true
-            } else if kind == RealtimeMessageKind::Posted
-                && message
-                    .thread_ts
-                    .as_deref()
-                    .is_none_or(|thread_ts| thread_ts == message.ts)
-            {
-                history.messages = merge_realtime_message(&history.messages, &message);
+            let existing = std::mem::take(&mut history.messages);
+            let normalized = normalize_channel_messages(existing.clone());
+            let removed_misrouted_replies = normalized != existing;
+            history.messages = normalized;
+            let already_in_channel = history.messages.iter().any(|item| item.ts == message.ts);
+            let affects_channel = message.belongs_in_channel_timeline()
+                || (kind != RealtimeMessageKind::Posted && already_in_channel);
+            let base_changed = if affects_channel && history.loaded {
+                apply_realtime_message_to(&mut history.messages, &message, kind)
+                    || removed_misrouted_replies
+            } else if affects_channel && kind == RealtimeMessageKind::Posted {
+                let changed = apply_realtime_message_to(&mut history.messages, &message, kind);
                 history.loaded = true;
                 history.loading = false;
-                true
+                changed || removed_misrouted_replies
             } else {
-                false
+                removed_misrouted_replies
             };
             let context_changed = history
                 .context_messages
                 .as_mut()
                 .filter(|messages| messages.iter().any(|item| item.ts == message.ts))
-                .is_some_and(|messages| {
-                    *messages = merge_realtime_message(messages, &message);
-                    true
-                });
+                .is_some_and(|messages| apply_realtime_message_to(messages, &message, kind));
             base_changed || context_changed
         };
         let render_channel = visible && channel_changed;
@@ -889,14 +882,13 @@ impl WorkspaceViewState {
             .thread
             .as_mut()
             .filter(|thread| {
-                thread.channel_id == channel_id
-                    && message.thread_ts.as_deref() == Some(thread.ts.as_str())
-                    && message.ts != thread.ts
+                thread.channel_id == channel_id && message.belongs_to_thread(&thread.ts)
             })
             .is_some_and(|thread| {
-                let base_changed = if thread.status == ThreadLoadStatus::Ready {
-                    thread.messages = merge_realtime_message(&thread.messages, &message);
-                    true
+                let base_changed = if thread.status == ThreadLoadStatus::Ready
+                    || kind == RealtimeMessageKind::Posted
+                {
+                    apply_realtime_message_to(&mut thread.messages, &message, kind)
                 } else {
                     false
                 };
@@ -904,10 +896,7 @@ impl WorkspaceViewState {
                     .context_messages
                     .as_mut()
                     .filter(|messages| messages.iter().any(|item| item.ts == message.ts))
-                    .is_some_and(|messages| {
-                        *messages = merge_realtime_message(messages, &message);
-                        true
-                    });
+                    .is_some_and(|messages| apply_realtime_message_to(messages, &message, kind));
                 base_changed || context_changed
             });
 
@@ -916,11 +905,13 @@ impl WorkspaceViewState {
             render_channel,
             render_thread,
             refresh_unreads: self.main_view == MainMessageView::Unreads,
-            channel_scroll: render_channel.then_some(if kind == RealtimeMessageKind::Posted {
-                WorkspaceScrollBehavior::StickToBottom
-            } else {
-                WorkspaceScrollBehavior::Preserve
-            }),
+            channel_scroll: render_channel.then_some(
+                if kind == RealtimeMessageKind::Posted && message.belongs_in_channel_timeline() {
+                    WorkspaceScrollBehavior::StickToBottom
+                } else {
+                    WorkspaceScrollBehavior::Preserve
+                },
+            ),
         }
     }
 
@@ -1048,20 +1039,69 @@ fn normalize_messages(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
     messages
 }
 
+fn normalize_channel_messages(messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+    normalize_messages(
+        messages
+            .into_iter()
+            .filter(SlackMessage::belongs_in_channel_timeline)
+            .collect(),
+    )
+}
+
 fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
     let mut messages = existing.to_vec();
     messages.extend(page.iter().cloned());
     normalize_messages(messages)
 }
 
-fn merge_realtime_message(existing: &[SlackMessage], message: &SlackMessage) -> Vec<SlackMessage> {
+fn merge_message_refresh(
+    existing: &[SlackMessage],
+    snapshot: &[SlackMessage],
+) -> Vec<SlackMessage> {
+    // A send response or realtime event can arrive while the request that
+    // produced this snapshot is still in flight. Snapshot entries are
+    // authoritative for duplicates, while newer locally observed entries must
+    // not disappear until a later response includes them.
+    let mut messages = snapshot.to_vec();
+    messages.extend(existing.iter().cloned());
+    normalize_messages(messages)
+}
+
+fn merge_channel_message_pages(
+    existing: &[SlackMessage],
+    page: &[SlackMessage],
+) -> Vec<SlackMessage> {
+    normalize_channel_messages(existing.iter().chain(page).cloned().collect::<Vec<_>>())
+}
+
+fn merge_channel_message_refresh(
+    existing: &[SlackMessage],
+    snapshot: &[SlackMessage],
+) -> Vec<SlackMessage> {
+    normalize_channel_messages(snapshot.iter().chain(existing).cloned().collect::<Vec<_>>())
+}
+
+fn apply_realtime_message_to(
+    existing: &mut Vec<SlackMessage>,
+    message: &SlackMessage,
+    kind: RealtimeMessageKind,
+) -> bool {
+    let current = existing.iter().find(|item| item.ts == message.ts);
+    if current == Some(message) {
+        return false;
+    }
+    if current.is_none() && kind != RealtimeMessageKind::Posted {
+        return false;
+    }
+
     let mut messages = existing
         .iter()
         .filter(|existing_message| existing_message.ts != message.ts)
         .cloned()
         .collect::<Vec<_>>();
     messages.push(message.clone());
-    normalize_messages(messages)
+    *existing = normalize_messages(messages);
+    true
 }
 
 fn apply_reaction_to_messages(messages: &mut [SlackMessage], update: &ReactionUpdate) -> bool {
@@ -1250,7 +1290,6 @@ mod tests {
             state.select_conversation("C1").decision,
             ConversationSelectionDecision::RequestFresh
         );
-        state.force_next_bottom("C1");
         state.apply_history(
             "C1",
             vec![message("2", "new")],
@@ -1720,23 +1759,13 @@ mod tests {
     }
 
     #[test]
-    fn forced_bottom_is_one_shot_and_prepend_always_wins() {
+    fn channel_selection_forces_bottom_only_once() {
         let mut state = WorkspaceViewState::default();
         state.select_conversation("C1");
         let first = apply_fresh(&mut state, "C1", vec![message("3", "three")]);
         assert_eq!(first.scroll, Some(WorkspaceScrollBehavior::Bottom));
         let second = apply_fresh(&mut state, "C1", vec![message("3", "three")]);
         assert_eq!(second.scroll, Some(WorkspaceScrollBehavior::StickToBottom));
-
-        state.force_next_bottom("C1");
-        let prepend =
-            state.apply_history("C1", vec![message("2", "two")], false, None, true, false);
-        assert_eq!(
-            prepend.scroll,
-            Some(WorkspaceScrollBehavior::PreservePrepend)
-        );
-        let after = apply_fresh(&mut state, "C1", vec![message("3", "three")]);
-        assert_eq!(after.scroll, Some(WorkspaceScrollBehavior::StickToBottom));
     }
 
     #[test]
@@ -1788,7 +1817,8 @@ mod tests {
         assert_eq!(
             current,
             ThreadApplyOutcome::Applied {
-                scroll: WorkspaceScrollBehavior::StickToBottom
+                scroll: WorkspaceScrollBehavior::StickToBottom,
+                render: true,
             }
         );
         assert_eq!(state.thread_cursor(), Some("older"));
@@ -1822,7 +1852,8 @@ mod tests {
         assert_eq!(
             outcome,
             ThreadApplyOutcome::Applied {
-                scroll: WorkspaceScrollBehavior::PreservePrepend
+                scroll: WorkspaceScrollBehavior::PreservePrepend,
+                render: true,
             }
         );
         assert_eq!(
@@ -1851,24 +1882,24 @@ mod tests {
         );
         assert!(changed.channel_changed);
         assert!(changed.render_channel);
-        assert!(!changed.render_thread);
+        assert!(changed.render_thread);
         assert_eq!(
             changed.channel_scroll,
             Some(WorkspaceScrollBehavior::Preserve)
         );
         assert_eq!(state.channel_messages("C1")[0].body_text(), "edited");
+        assert_eq!(state.current_thread_messages()[0].body_text(), "edited");
 
         let reply = state.apply_realtime_message(
             "C1",
             thread_message("4", "3", "reply"),
             RealtimeMessageKind::Posted,
         );
-        assert!(reply.render_channel);
+        assert!(!reply.channel_changed);
+        assert!(!reply.render_channel);
         assert!(reply.render_thread);
-        assert_eq!(
-            reply.channel_scroll,
-            Some(WorkspaceScrollBehavior::StickToBottom)
-        );
+        assert_eq!(reply.channel_scroll, None);
+        assert_eq!(state.channel_messages("C1").len(), 1);
         assert_eq!(state.current_thread_messages()[0].ts, "4");
 
         state.show_unreads();
@@ -1895,10 +1926,10 @@ mod tests {
             RealtimeMessageKind::Posted,
         );
 
-        assert!(outcome.channel_changed);
-        assert!(outcome.render_channel);
+        assert!(!outcome.channel_changed);
+        assert!(!outcome.render_channel);
         assert!(outcome.render_thread);
-        assert_eq!(state.channel_messages("C1")[0].body_text(), "first reply");
+        assert!(state.channel_messages("C1").is_empty());
         assert_eq!(
             state.current_thread_messages()[0].body_text(),
             "first reply"
@@ -1907,6 +1938,115 @@ mod tests {
             state.open_thread("C1", "1"),
             ThreadOpenOutcome::RenderCurrent
         );
+    }
+
+    #[test]
+    fn thread_broadcasts_render_in_both_channel_and_thread() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("3", "parent")]);
+        state.open_thread("C1", "3");
+        state.apply_thread("C1", "3", vec![message("3", "parent")], false, None, false);
+        let mut broadcast = thread_message("4", "3", "broadcast reply");
+        broadcast.subtype = Some("thread_broadcast".into());
+
+        let outcome =
+            state.apply_realtime_message("C1", broadcast.clone(), RealtimeMessageKind::Posted);
+
+        assert!(outcome.render_channel);
+        assert!(outcome.render_thread);
+        assert_eq!(
+            outcome.channel_scroll,
+            Some(WorkspaceScrollBehavior::StickToBottom)
+        );
+        assert_eq!(state.channel_messages("C1")[0], broadcast);
+        assert_eq!(state.current_thread_messages()[0].ts, "4");
+    }
+
+    #[test]
+    fn confirmed_messages_survive_stale_channel_and_thread_snapshots() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("3", "parent")]);
+        state.open_thread("C1", "3");
+        state.apply_thread("C1", "3", vec![message("3", "parent")], false, None, false);
+
+        state.apply_realtime_message(
+            "C1",
+            message("5", "confirmed channel post"),
+            RealtimeMessageKind::Posted,
+        );
+        state.apply_realtime_message(
+            "C1",
+            thread_message("4", "3", "confirmed reply"),
+            RealtimeMessageKind::Posted,
+        );
+
+        apply_fresh(&mut state, "C1", vec![message("3", "stale parent")]);
+        state.apply_thread(
+            "C1",
+            "3",
+            vec![message("3", "stale parent")],
+            false,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            state
+                .channel_messages("C1")
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5", "3"]
+        );
+        assert_eq!(
+            state
+                .current_thread_messages()
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>(),
+            vec!["4", "3"]
+        );
+    }
+
+    #[test]
+    fn identical_snapshots_do_not_require_full_timeline_renders() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        let messages = vec![message("1", "parent")];
+        assert!(apply_fresh(&mut state, "C1", messages.clone()).render);
+        assert!(!apply_fresh(&mut state, "C1", messages.clone()).render);
+
+        state.open_thread("C1", "1");
+        assert!(matches!(
+            state.apply_thread("C1", "1", messages.clone(), false, None, false),
+            ThreadApplyOutcome::Applied { render: true, .. }
+        ));
+        assert!(matches!(
+            state.apply_thread("C1", "1", messages, false, None, false),
+            ThreadApplyOutcome::Applied { render: false, .. }
+        ));
+    }
+
+    #[test]
+    fn identical_realtime_redelivery_is_a_noop() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(&mut state, "C1", vec![message("1", "existing")]);
+        let posted = message("2", "once");
+        assert!(
+            state
+                .apply_realtime_message("C1", posted.clone(), RealtimeMessageKind::Posted)
+                .render_channel
+        );
+
+        let duplicate = state.apply_realtime_message("C1", posted, RealtimeMessageKind::Posted);
+
+        assert!(!duplicate.channel_changed);
+        assert!(!duplicate.render_channel);
+        assert_eq!(duplicate.channel_scroll, None);
+        assert_eq!(state.channel_messages("C1").len(), 2);
     }
 
     #[test]
@@ -2015,13 +2155,10 @@ mod tests {
     }
 
     #[test]
-    fn increment_thread_reply_and_find_message_use_authoritative_state() {
+    fn find_message_uses_authoritative_state() {
         let mut state = WorkspaceViewState::default();
         state.select_conversation("C1");
         apply_fresh(&mut state, "C1", vec![message("1", "parent")]);
-        assert!(state.increment_thread_reply("C1", "1"));
-        assert_eq!(state.channel_messages("C1")[0].reply_count, Some(1));
-        assert!(!state.increment_thread_reply("C1", "missing"));
         assert_eq!(state.find_message("C1", "1").unwrap().body_text(), "parent");
 
         state.apply_saved(vec![SavedItem {

@@ -529,6 +529,7 @@ impl WorkspaceStore {
             .load_state()
             .await?
             .and_then(|state| state.channel_histories.get(channel_id).cloned())
+            .map(channel_timeline_messages)
             .filter(|messages| !messages.is_empty()))
     }
 
@@ -541,7 +542,7 @@ impl WorkspaceStore {
                 .unwrap_or_default();
             state.channel_histories.insert(
                 channel_id.to_string(),
-                merge_history_pages(&existing, messages),
+                merge_channel_history_pages(&existing, messages),
             );
         })
         .await
@@ -560,7 +561,7 @@ impl WorkspaceStore {
                 .unwrap_or_default();
             state.channel_histories.insert(
                 channel_id.to_string(),
-                merge_history_pages(&existing, messages),
+                merge_channel_history_pages(&existing, messages),
             );
         })
         .await
@@ -586,9 +587,11 @@ impl WorkspaceStore {
         messages: &[SlackMessage],
     ) -> Result<()> {
         self.update_state(|state| {
+            let key = thread_key(channel_id, thread_ts);
+            let existing = state.thread_replies.get(&key).cloned().unwrap_or_default();
             state
                 .thread_replies
-                .insert(thread_key(channel_id, thread_ts), messages.to_vec());
+                .insert(key, merge_history_pages(&existing, messages));
         })
         .await
     }
@@ -1353,6 +1356,22 @@ fn merge_history_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<
     let mut messages = page.to_vec();
     messages.extend(existing.iter().cloned());
     pruned_history(messages)
+}
+
+fn merge_channel_history_pages(
+    existing: &[SlackMessage],
+    page: &[SlackMessage],
+) -> Vec<SlackMessage> {
+    channel_timeline_messages(merge_history_pages(existing, page))
+}
+
+fn channel_timeline_messages(messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+    pruned_history(
+        messages
+            .into_iter()
+            .filter(SlackMessage::belongs_in_channel_timeline)
+            .collect(),
+    )
 }
 
 fn pruned_history(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
@@ -2414,6 +2433,117 @@ mod tests {
                     .map(|message| message.ts.as_str())
                     .collect::<Vec<_>>(),
                 vec!["5.0", "4.0"]
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn channel_history_filters_thread_replies_but_keeps_broadcasts() {
+        let directory = temp_cache_dir("workspace-store-thread-routing");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let root = SlackMessage {
+                ts: "1.0".into(),
+                thread_ts: Some("1.0".into()),
+                ..Default::default()
+            };
+            let reply = SlackMessage {
+                ts: "2.0".into(),
+                thread_ts: Some("1.0".into()),
+                ..Default::default()
+            };
+            let mut broadcast = reply.clone();
+            broadcast.ts = "3.0".into();
+            broadcast.subtype = Some("thread_broadcast".into());
+
+            store
+                .store_merged_history("C1", &[root.clone(), reply.clone(), broadcast.clone()])
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .load_history("C1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["3.0", "1.0"]
+            );
+
+            // Loading also sanitizes caches written by older Conduit versions.
+            store
+                .update_state(|state| {
+                    state
+                        .channel_histories
+                        .insert("C2".into(), vec![root, reply, broadcast]);
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .load_history("C2")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["3.0", "1.0"]
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stale_thread_snapshot_keeps_newer_realtime_reply() {
+        let directory = temp_cache_dir("workspace-store-realtime-thread-race");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_merged_thread(
+                    "C1",
+                    "1.0",
+                    &[SlackMessage {
+                        ts: "2.0".into(),
+                        thread_ts: Some("1.0".into()),
+                        text: Some("realtime reply".into()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+            store
+                .store_thread(
+                    "C1",
+                    "1.0",
+                    &[SlackMessage {
+                        ts: "1.0".into(),
+                        text: Some("stale parent".into()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .load_thread("C1", "1.0")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["2.0", "1.0"]
             );
         });
 

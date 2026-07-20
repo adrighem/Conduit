@@ -3474,16 +3474,31 @@ async fn persist_realtime_message(
             );
         }
     }
-    if let Err(error) = store
-        .store_merged_history(&channel_id, std::slice::from_ref(&message))
-        .await
-    {
-        crate::debug::log(
-            "store",
-            &format!(
-                "ConversationRealtimeHistoryStoreFailed channel_id={channel_id} error={error:#}"
-            ),
-        );
+    if let Some(thread_ts) = message.thread_root_ts() {
+        if let Err(error) = store
+            .store_merged_thread(&channel_id, thread_ts, std::slice::from_ref(&message))
+            .await
+        {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "ThreadRealtimeHistoryStoreFailed channel_id={channel_id} thread_ts={thread_ts} error={error:#}"
+                ),
+            );
+        }
+    }
+    if message.belongs_in_channel_timeline() {
+        if let Err(error) = store
+            .store_merged_history(&channel_id, std::slice::from_ref(&message))
+            .await
+        {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "ConversationRealtimeHistoryStoreFailed channel_id={channel_id} error={error:#}"
+                ),
+            );
+        }
     }
     if let Err(error) = store
         .observe_thread_realtime(&channel_id, &message, current_user_id.as_deref())
@@ -5239,7 +5254,7 @@ mod tests {
                 },
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
             );
-            let (sender, receiver) = mpsc::channel(2);
+            let (sender, receiver) = mpsc::channel(3);
             let worker = tokio::spawn(persist_realtime_events(
                 receiver,
                 store.clone(),
@@ -5263,13 +5278,32 @@ mod tests {
                     .await
                     .unwrap();
             }
+            sender
+                .send(RealtimePersistenceEvent::Message(Box::new(
+                    crate::socket_mode::SocketModeMessageEvent {
+                        channel_id: "C1".into(),
+                        message: SlackMessage {
+                            ts: "3.0".into(),
+                            thread_ts: Some("1.0".into()),
+                            user: Some("U_OTHER".into()),
+                            text: Some("thread reply".into()),
+                            ..Default::default()
+                        },
+                        kind: SocketModeMessageKind::Posted,
+                    },
+                )))
+                .await
+                .unwrap();
             drop(sender);
             worker.await.unwrap();
 
             let history = store.load_history("C1").await.unwrap().unwrap();
             assert_eq!(history.len(), 2);
+            let thread = store.load_thread("C1", "1.0").await.unwrap().unwrap();
+            assert_eq!(thread.len(), 1);
+            assert_eq!(thread[0].ts, "3.0");
             let conversation = store.load_conversations().await.unwrap().unwrap().remove(0);
-            assert_eq!(conversation.unread_activity_count(), 2);
+            assert_eq!(conversation.unread_activity_count(), 3);
             let _ = std::fs::remove_dir_all(directory);
         });
     }
