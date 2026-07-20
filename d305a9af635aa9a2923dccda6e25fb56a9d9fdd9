@@ -1,0 +1,9 @@
+Tasks: release metadata tests; Release Please version synchronization; Debian/Fedora packages; Flatpak bundle and checksums; release documentation; regression validation
+
+Summary: Added manifest-mode Release Please automation and gated GitHub release jobs for Debian 13, Fedora 44, and GNOME 50 Flatpak assets.
+
+Modified files: release workflow/configuration, Cargo/Meson/AppStream metadata, Debian/RPM/Flatpak packaging, release documentation, and release contract tests.
+
+Rationale: Produce validated installable Linux artifacts from the exact release commit while keeping failed builds in draft state.
+
+Verification: actionlint passed; release contract tests passed; Flatpak built and bundled; all 13 Meson tests passed. Native target package validation was still running when the commit was created.
