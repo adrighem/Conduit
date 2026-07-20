@@ -35,6 +35,10 @@ use crate::slack::{DownloadedPreviewAsset, SlackApi, SlackErrorCategory, SlackMe
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore};
 use crate::thread_catalog::ThreadRecord;
+use crate::workspace_pipeline::{
+    MessageMutationKind, MutationOrigin, SnapshotEnvelope, WorkspaceBootstrapData,
+    WorkspaceCoordinator, WorkspaceMutation, WorkspaceRevision,
+};
 use crate::workspace_state::WorkspaceLifecycleEvent;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
@@ -1091,10 +1095,47 @@ impl RuntimeTaskLimits {
 struct RuntimeConnection {
     slack: SlackApi,
     workspace_store: Option<WorkspaceStore>,
+    workspace: WorkspaceReducerAdapter,
     user_cache: Arc<Mutex<HashMap<String, String>>>,
     read_marks: Arc<Mutex<HashMap<String, String>>>,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WorkspaceReducerAdapter {
+    coordinator: Arc<Mutex<WorkspaceCoordinator>>,
+}
+
+impl WorkspaceReducerAdapter {
+    fn revision(&self) -> WorkspaceRevision {
+        self.coordinator
+            .lock()
+            .expect("workspace coordinator lock poisoned")
+            .revision()
+    }
+
+    fn apply(&self, origin: MutationOrigin, mutation: WorkspaceMutation) -> bool {
+        let reduction = self
+            .coordinator
+            .lock()
+            .expect("workspace coordinator lock poisoned")
+            .apply(mutation);
+        if let Some(reduction) = reduction.as_ref() {
+            crate::debug::log(
+                "workspace",
+                &format!(
+                    "WorkspaceMutationApplied origin={origin:?} revision={} patch_changes={} store_changes={}",
+                    reduction.patch().revision().value(),
+                    reduction.patch().changes().len(),
+                    reduction
+                        .store_batch()
+                        .map_or(0, |batch| batch.changes().len())
+                ),
+            );
+        }
+        reduction.is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1992,6 +2033,7 @@ fn spawn_authentication_task<F>(
                                 config::state_cache_dir(),
                                 &workspace_store_id(&auth),
                             )),
+                            workspace: WorkspaceReducerAdapter::default(),
                             user_cache: Arc::new(Mutex::new(HashMap::new())),
                             read_marks: Arc::new(Mutex::new(HashMap::new())),
                             team_id: auth.team_id.clone(),
@@ -2114,6 +2156,7 @@ fn spawn_workspace_tasks(
                     &refresh_events,
                     &refresh_connection.slack,
                     &refresh_connection.workspace_store,
+                    &refresh_connection.workspace,
                     cached_user_names,
                     refresh_connection.team_id.as_deref(),
                     &refresh_connection.huddles,
@@ -2179,6 +2222,7 @@ fn spawn_workspace_tasks(
                     credentials,
                     socket_events,
                     connection.workspace_store.clone(),
+                    connection.workspace.clone(),
                     current_user_id,
                     connection.team_id.clone(),
                     connection.huddles.clone(),
@@ -2237,6 +2281,14 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             user_names.len(),
             thread_catalog.len()
         ),
+    );
+    connection.workspace.apply(
+        MutationOrigin::Cache,
+        WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: conversations.clone(),
+            threads: thread_catalog.clone(),
+            ..Default::default()
+        }),
     );
     if !user_names.is_empty() {
         connection
@@ -2324,6 +2376,7 @@ async fn handle_connected_command(
         image_cache,
         slack: &mut slack,
         workspace_store: &mut workspace_store,
+        workspace: &connection.workspace,
         user_cache: &mut user_cache,
         read_marks: &mut read_marks,
         team_id: connection.team_id.as_deref(),
@@ -2354,10 +2407,17 @@ struct RuntimeContext<'a> {
     image_cache: &'a ImageAssetCache,
     slack: &'a mut Option<SlackApi>,
     workspace_store: &'a mut Option<WorkspaceStore>,
+    workspace: &'a WorkspaceReducerAdapter,
     user_cache: &'a mut HashMap<String, String>,
     read_marks: &'a mut HashMap<String, String>,
     team_id: Option<&'a str>,
     huddles: &'a HuddleActorHandle,
+}
+
+#[derive(Clone, Copy)]
+struct WorkspacePipelineContext<'a> {
+    store: &'a Option<WorkspaceStore>,
+    reducer: &'a WorkspaceReducerAdapter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2559,6 +2619,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 context.events,
                 &api,
                 &workspace_store,
+                context.workspace,
                 cached_user_names,
                 context.team_id,
                 context.huddles,
@@ -2567,7 +2628,15 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         }
         RuntimeCommand::DiscoverConversations => {
             let api = require_slack(context.slack)?;
+            let users_base_revision = context.workspace.revision();
             let users = api.users().await?;
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    users_base_revision,
+                    users.clone(),
+                )),
+            );
             let aliases = users
                 .iter()
                 .filter_map(|user| Some((user.id.clone()?, user.search_aliases())))
@@ -2618,6 +2687,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             if let Some(store) = context.workspace_store.as_ref() {
                 store.store_conversation(&conversation).await?;
             }
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ConversationUpsert(conversation.clone()),
+            );
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -2629,6 +2702,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             if let Some(store) = context.workspace_store.as_ref() {
                 store.remove_conversation(&channel_id).await?;
             }
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ConversationRemove {
+                    channel_id: channel_id.clone(),
+                },
+            );
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationLeft { channel_id });
@@ -2642,6 +2721,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             if let Some(store) = context.workspace_store.as_ref() {
                 store.store_conversation(&conversation).await?;
             }
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ConversationUpsert(conversation.clone()),
+            );
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -2658,6 +2741,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             if let Some(store) = context.workspace_store.as_ref() {
                 store.store_conversation(&conversation).await?;
             }
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ConversationUpsert(conversation.clone()),
+            );
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -2669,6 +2756,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             if let Some(store) = context.workspace_store.as_ref() {
                 store.store_conversation(&conversation).await?;
             }
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ConversationUpsert(conversation.clone()),
+            );
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -2683,12 +2774,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             if let Some(store) = context.workspace_store.as_ref() {
                 store.store_conversation(&conversation).await?;
             }
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ConversationUpsert(conversation.clone()),
+            );
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationUpdated(conversation));
         }
         RuntimeCommand::LoadHistory { channel_id } => {
             let api = require_slack(context.slack)?;
+            let base_revision = context.workspace.revision();
             crate::debug::log("runtime", &format!("LoadHistory channel_id={channel_id}"));
             let service = ConversationHistoryService::new(api, context.workspace_store.as_ref());
             let huddles = context.huddles.clone();
@@ -2696,6 +2792,20 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let page = service
                 .load(&channel_id, |progress| {
                     if let ConversationHistoryProgress::Cached(messages) = &progress {
+                        context.workspace.apply(
+                            MutationOrigin::Cache,
+                            WorkspaceMutation::HistorySnapshot {
+                                channel_id: channel_id.clone(),
+                                snapshot: SnapshotEnvelope::new(
+                                    WorkspaceRevision::INITIAL,
+                                    crate::workspace_pipeline::MessagePage {
+                                        messages: messages.clone(),
+                                        next_cursor: None,
+                                        complete: true,
+                                    },
+                                ),
+                            },
+                        );
                         observe_huddle_messages(
                             &huddles,
                             team_id.as_deref(),
@@ -2715,6 +2825,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             observe_thread_history(
                 context.events,
                 context.workspace_store,
+                context.workspace,
                 &channel_id,
                 &page.messages,
             )
@@ -2728,10 +2839,25 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     page.next_cursor.is_some()
                 ),
             );
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: channel_id.clone(),
+                    snapshot: SnapshotEnvelope::new(
+                        base_revision,
+                        crate::workspace_pipeline::MessagePage {
+                            messages: page.messages.clone(),
+                            next_cursor: page.next_cursor.clone(),
+                            complete: !page.has_more && page.next_cursor.is_none(),
+                        },
+                    ),
+                },
+            );
             send_history_loaded(context.events, channel_id, page, false);
         }
         RuntimeCommand::LoadOlderHistory { channel_id, cursor } => {
             let api = require_slack(context.slack)?;
+            let base_revision = context.workspace.revision();
             crate::debug::log(
                 "runtime",
                 &format!("LoadOlderHistory channel_id={channel_id}"),
@@ -2747,21 +2873,45 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             observe_thread_history(
                 context.events,
                 context.workspace_store,
+                context.workspace,
                 &channel_id,
                 &page.messages,
             )
             .await;
             store_merged_history(context.workspace_store, &channel_id, &page.messages).await;
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: channel_id.clone(),
+                    snapshot: SnapshotEnvelope::new(
+                        base_revision,
+                        crate::workspace_pipeline::MessagePage {
+                            messages: page.messages.clone(),
+                            next_cursor: page.next_cursor.clone(),
+                            complete: false,
+                        },
+                    ),
+                },
+            );
             send_history_loaded(context.events, channel_id, page, true);
         }
         RuntimeCommand::LoadThread { channel_id, ts } => {
             let api = require_slack(context.slack)?;
-            load_cached_thread(context.events, context.workspace_store, &channel_id, &ts).await;
+            load_cached_thread(
+                context.events,
+                context.workspace_store,
+                context.workspace,
+                &channel_id,
+                &ts,
+            )
+            .await;
             context.events.send_status("Loading thread");
+            let base_revision = context.workspace.revision();
             let page = api.thread_replies(&channel_id, &ts).await?;
             observe_thread_page(
                 context.events,
                 context.workspace_store,
+                context.workspace,
                 &channel_id,
                 &ts,
                 &page.messages,
@@ -2769,6 +2919,21 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             )
             .await;
             store_thread(context.workspace_store, &channel_id, &ts, &page.messages).await;
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ThreadSnapshot {
+                    channel_id: channel_id.clone(),
+                    thread_ts: ts.clone(),
+                    snapshot: SnapshotEnvelope::new(
+                        base_revision,
+                        crate::workspace_pipeline::MessagePage {
+                            messages: page.messages.clone(),
+                            next_cursor: page.next_cursor.clone(),
+                            complete: !page.has_more && page.next_cursor.is_none(),
+                        },
+                    ),
+                },
+            );
             send_thread_loaded(context.events, channel_id, ts, page, false);
         }
         RuntimeCommand::LoadOlderThread {
@@ -2777,6 +2942,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             cursor,
         } => {
             let api = require_slack(context.slack)?;
+            let base_revision = context.workspace.revision();
             crate::debug::log(
                 "runtime",
                 &format!("LoadOlderThread channel_id={channel_id} ts={ts}"),
@@ -2799,12 +2965,28 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             observe_thread_page(
                 context.events,
                 context.workspace_store,
+                context.workspace,
                 &channel_id,
                 &ts,
                 &page.messages,
                 !page.has_more && page.next_cursor.is_none(),
             )
             .await;
+            context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ThreadSnapshot {
+                    channel_id: channel_id.clone(),
+                    thread_ts: ts.clone(),
+                    snapshot: SnapshotEnvelope::new(
+                        base_revision,
+                        crate::workspace_pipeline::MessagePage {
+                            messages: page.messages.clone(),
+                            next_cursor: page.next_cursor.clone(),
+                            complete: false,
+                        },
+                    ),
+                },
+            );
             send_thread_loaded(context.events, channel_id, ts, page, true);
         }
         RuntimeCommand::LoadMessageContext(location) => {
@@ -3023,6 +3205,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 context.events,
                 context.read_marks,
                 context.workspace_store,
+                context.workspace,
                 &channel_id,
                 &ts,
             )
@@ -3035,7 +3218,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         } => {
             if let Some(store) = context.workspace_store.as_ref() {
                 store.mark_thread_read(&channel_id, &thread_ts, &ts).await?;
-                load_cached_thread_catalog(context.events, context.workspace_store).await;
+                load_cached_thread_catalog(
+                    context.events,
+                    context.workspace_store,
+                    context.workspace,
+                )
+                .await;
             }
         }
         RuntimeCommand::PostMessage {
@@ -3047,6 +3235,15 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let message = api
                 .post_message(&channel_id, &text, thread_ts.as_deref())
                 .await?;
+            context.workspace.apply(
+                MutationOrigin::Local,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: channel_id.clone(),
+                    message: message.clone(),
+                    kind: MessageMutationKind::Posted,
+                    origin: MutationOrigin::Local,
+                },
+            );
             context.events.send_event(RuntimeEventKind::MessagePosted {
                 channel_id,
                 message: Box::new(message),
@@ -3131,6 +3328,7 @@ async fn run_socket_mode(
     credentials: socket_mode::SocketModeCredentials,
     events: RuntimeEventSender,
     workspace_store: Option<WorkspaceStore>,
+    workspace: WorkspaceReducerAdapter,
     current_user_id: Option<String>,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
@@ -3153,6 +3351,7 @@ async fn run_socket_mode(
             sender
         });
         let persistence_for_run = persistence_sender.clone();
+        let workspace_for_run = workspace.clone();
         let huddles_for_run = huddles.clone();
         let team_id_for_run = team_id.clone();
         let result = socket_mode::run_once(
@@ -3164,6 +3363,7 @@ async fn run_socket_mode(
             },
             move |event| {
                 observe_huddle_socket_event(&huddles_for_run, team_id_for_run.as_deref(), &event);
+                apply_realtime_workspace_event(&workspace_for_run, &event);
                 if let Some(sender) = persistence_for_run.as_ref() {
                     let persistence_event = match &event {
                         SocketModeEvent::UserChanged(user)
@@ -3229,6 +3429,28 @@ async fn run_socket_mode(
 
         reconnect_delay = timing.next_backoff;
         tokio::time::sleep(timing.sleep).await;
+    }
+}
+
+fn apply_realtime_workspace_event(workspace: &WorkspaceReducerAdapter, event: &SocketModeEvent) {
+    let mutation = match event {
+        SocketModeEvent::Message(event) => Some(WorkspaceMutation::MessageChanged {
+            channel_id: event.channel_id.clone(),
+            message: event.message.clone(),
+            kind: match event.kind {
+                SocketModeMessageKind::Posted => MessageMutationKind::Posted,
+                SocketModeMessageKind::Changed => MessageMutationKind::Changed,
+                SocketModeMessageKind::Deleted => MessageMutationKind::Deleted,
+            },
+            origin: MutationOrigin::Realtime,
+        }),
+        SocketModeEvent::UserChanged(user) | SocketModeEvent::UserHuddleChanged(user) => {
+            Some(WorkspaceMutation::UserUpsert((**user).clone()))
+        }
+        SocketModeEvent::Reaction(_) | SocketModeEvent::RefreshConversations => None,
+    };
+    if let Some(mutation) = mutation {
+        workspace.apply(MutationOrigin::Realtime, mutation);
     }
 }
 
@@ -3681,8 +3903,10 @@ async fn load_conversations_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
 ) -> Result<Vec<SlackConversation>> {
     events.send_status("Loading conversations");
+    let base_revision = workspace.revision();
     let fresh = api.conversations().await?;
     let conversations = if let Some(store) = workspace_store.as_ref() {
         store.reconcile_conversations(fresh).await?
@@ -3692,6 +3916,13 @@ async fn load_conversations_with_api(
     crate::debug::log(
         "runtime",
         &format!("ConversationsLoaded count={}", conversations.len()),
+    );
+    workspace.apply(
+        MutationOrigin::WebApi,
+        WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
+            base_revision,
+            conversations.clone(),
+        )),
     );
     events.send_event(RuntimeEventKind::ConversationsLoaded(conversations.clone()));
     events.send_event(RuntimeEventKind::WorkspaceLifecycle(
@@ -3723,11 +3954,12 @@ async fn load_conversations_best_effort_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
     cached_user_names: HashMap<String, String>,
     team_id: Option<&str>,
     huddles: &HuddleActorHandle,
 ) -> Result<()> {
-    match load_conversations_with_api(events, api, workspace_store).await {
+    match load_conversations_with_api(events, api, workspace_store, workspace).await {
         Ok(conversations) => {
             let current_huddle_channels = conversations
                 .iter()
@@ -3739,6 +3971,7 @@ async fn load_conversations_best_effort_with_api(
                 events,
                 api,
                 workspace_store,
+                workspace,
                 unread_refresh_candidates.iter(),
             )
             .await;
@@ -3760,7 +3993,10 @@ async fn load_conversations_best_effort_with_api(
             prefetch_channel_histories_best_effort(
                 events,
                 api,
-                workspace_store,
+                WorkspacePipelineContext {
+                    store: workspace_store,
+                    reducer: workspace,
+                },
                 &refreshed_conversations,
                 &current_huddle_channels,
                 team_id,
@@ -3785,6 +4021,7 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
     events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
     channel_ids: impl IntoIterator<Item = &'a String>,
 ) {
     let mut pending = channel_ids.into_iter().cloned().collect::<Vec<_>>();
@@ -3866,6 +4103,7 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
                     if enriched_batch.len() + unread_batch.len() >= CONVERSATION_PATCH_BATCH_SIZE {
                         send_conversation_patch_batch(
                             events,
+                            workspace,
                             &mut enriched_batch,
                             &mut unread_batch,
                         );
@@ -3896,16 +4134,33 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
             );
         }
     }
-    send_conversation_patch_batch(events, &mut enriched_batch, &mut unread_batch);
+    send_conversation_patch_batch(events, workspace, &mut enriched_batch, &mut unread_batch);
 }
 
 fn send_conversation_patch_batch(
     events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
     conversations: &mut Vec<SlackConversation>,
     unread_states: &mut Vec<(String, SlackUnreadState, Option<String>)>,
 ) {
     if conversations.is_empty() && unread_states.is_empty() {
         return;
+    }
+    for conversation in conversations.iter().cloned() {
+        workspace.apply(
+            MutationOrigin::WebApi,
+            WorkspaceMutation::ConversationUpsert(conversation),
+        );
+    }
+    for (channel_id, state, server_last_read) in unread_states.iter().cloned() {
+        workspace.apply(
+            MutationOrigin::WebApi,
+            WorkspaceMutation::UnreadChanged {
+                channel_id,
+                state,
+                server_last_read,
+            },
+        );
     }
     events.send_event(RuntimeEventKind::ConversationsPatched {
         conversations: std::mem::take(conversations),
@@ -3916,13 +4171,13 @@ fn send_conversation_patch_batch(
 async fn prefetch_channel_histories_best_effort(
     events: &RuntimeEventSender,
     api: &SlackApi,
-    workspace_store: &Option<WorkspaceStore>,
+    workspace: WorkspacePipelineContext<'_>,
     conversations: &[SlackConversation],
     current_huddle_channels: &HashSet<String>,
     team_id: Option<&str>,
     huddles: &HuddleActorHandle,
 ) {
-    let Some(store) = workspace_store.as_ref() else {
+    let Some(store) = workspace.store.as_ref() else {
         return;
     };
 
@@ -3957,17 +4212,40 @@ async fn prefetch_channel_histories_best_effort(
             }
         }
 
+        let base_revision = workspace.reducer.revision();
         match api.history(&channel_id).await {
             Ok(page) => {
+                workspace.reducer.apply(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::HistorySnapshot {
+                        channel_id: channel_id.clone(),
+                        snapshot: SnapshotEnvelope::new(
+                            base_revision,
+                            crate::workspace_pipeline::MessagePage {
+                                messages: page.messages.clone(),
+                                next_cursor: None,
+                                complete: true,
+                            },
+                        ),
+                    },
+                );
                 observe_huddle_messages(huddles, team_id, &channel_id, &page.messages);
                 if store_conversation_unread_state(
-                    workspace_store,
+                    workspace.store,
                     &channel_id,
                     page.unread_state,
                     None,
                 )
                 .await
                 {
+                    workspace.reducer.apply(
+                        MutationOrigin::WebApi,
+                        WorkspaceMutation::UnreadChanged {
+                            channel_id: channel_id.clone(),
+                            state: page.unread_state,
+                            server_last_read: None,
+                        },
+                    );
                     send_conversation_unread_update(events, &channel_id, page.unread_state);
                 }
                 send_conversation_notification_candidate(events, &channel_id, &page.messages);
@@ -3978,7 +4256,7 @@ async fn prefetch_channel_histories_best_effort(
                         page.messages.len()
                     ),
                 );
-                store_history(workspace_store, &channel_id, &page.messages).await;
+                store_history(workspace.store, &channel_id, &page.messages).await;
             }
             Err(error) => crate::debug::log(
                 "runtime",
@@ -4149,6 +4427,7 @@ async fn mark_conversation_read_best_effort(
     events: &RuntimeEventSender,
     read_marks: &mut HashMap<String, String>,
     workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
     channel_id: &str,
     latest_ts: &str,
 ) {
@@ -4161,6 +4440,14 @@ async fn mark_conversation_read_best_effort(
         .is_some_and(|marked_ts| marked_ts.as_str() >= latest_ts)
     {
         clear_cached_conversation_unread(workspace_store, channel_id, latest_ts).await;
+        workspace.apply(
+            MutationOrigin::Local,
+            WorkspaceMutation::ReadAdvanced {
+                channel_id: channel_id.to_string(),
+                ts: latest_ts.to_string(),
+                remaining_unread: 0,
+            },
+        );
         events.send_event(RuntimeEventKind::ConversationMarkedRead {
             channel_id: channel_id.to_string(),
             ts: latest_ts.to_string(),
@@ -4188,6 +4475,14 @@ async fn mark_conversation_read_best_effort(
 
     read_marks.insert(channel_id.to_string(), latest_ts.to_string());
     clear_cached_conversation_unread(workspace_store, channel_id, latest_ts).await;
+    workspace.apply(
+        MutationOrigin::Local,
+        WorkspaceMutation::ReadAdvanced {
+            channel_id: channel_id.to_string(),
+            ts: latest_ts.to_string(),
+            remaining_unread: 0,
+        },
+    );
     events.send_event(RuntimeEventKind::ConversationMarkedRead {
         channel_id: channel_id.to_string(),
         ts: latest_ts.to_string(),
@@ -4239,6 +4534,7 @@ async fn store_conversation_unread_state(
 async fn observe_thread_history(
     events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
     channel_id: &str,
     messages: &[SlackMessage],
 ) {
@@ -4252,12 +4548,13 @@ async fn observe_thread_history(
         );
         return;
     }
-    load_cached_thread_catalog(events, workspace_store).await;
+    load_cached_thread_catalog(events, workspace_store, workspace).await;
 }
 
 async fn observe_thread_page(
     events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
     channel_id: &str,
     root_ts: &str,
     messages: &[SlackMessage],
@@ -4276,7 +4573,7 @@ async fn observe_thread_page(
         );
         return;
     }
-    load_cached_thread_catalog(events, workspace_store).await;
+    load_cached_thread_catalog(events, workspace_store, workspace).await;
 }
 
 fn workspace_store_id(auth: &AuthInfo) -> String {
@@ -4293,12 +4590,17 @@ fn workspace_store_id(auth: &AuthInfo) -> String {
 async fn load_cached_thread_catalog(
     events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
 ) {
     let Some(store) = workspace_store.as_ref() else {
         return;
     };
     match store.load_thread_catalog().await {
         Ok(records) if !records.is_empty() => {
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::ThreadCatalogChanged(records.clone()),
+            );
             events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records));
         }
         Ok(_) => {}
@@ -4479,6 +4781,7 @@ async fn store_merged_history(
 async fn load_cached_thread(
     events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
     channel_id: &str,
     thread_ts: &str,
 ) {
@@ -4494,6 +4797,21 @@ async fn load_cached_thread(
                     "CachedThreadLoaded channel_id={channel_id} ts={thread_ts} messages={}",
                     messages.len()
                 ),
+            );
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::ThreadSnapshot {
+                    channel_id: channel_id.to_string(),
+                    thread_ts: thread_ts.to_string(),
+                    snapshot: SnapshotEnvelope::new(
+                        WorkspaceRevision::INITIAL,
+                        crate::workspace_pipeline::MessagePage {
+                            messages: messages.clone(),
+                            next_cursor: None,
+                            complete: true,
+                        },
+                    ),
+                },
             );
             events.send_event(RuntimeEventKind::ThreadLoaded {
                 channel_id: channel_id.to_string(),
@@ -4618,6 +4936,111 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn workspace_adapter_orders_cache_web_local_and_realtime_mutations() {
+        let workspace = WorkspaceReducerAdapter::default();
+        let conversation = SlackConversation {
+            id: "C1".into(),
+            name: Some("general".into()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        assert!(workspace.apply(
+            MutationOrigin::Cache,
+            WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                conversations: vec![conversation.clone()],
+                ..Default::default()
+            }),
+        ));
+
+        let base_revision = workspace.revision();
+        let mut renamed = conversation;
+        renamed.name = Some("announcements".into());
+        assert!(workspace.apply(
+            MutationOrigin::WebApi,
+            WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
+                base_revision,
+                vec![renamed],
+            )),
+        ));
+
+        let posted = SlackMessage {
+            ts: "1.000".into(),
+            text: Some("sent".into()),
+            ..Default::default()
+        };
+        assert!(workspace.apply(
+            MutationOrigin::Local,
+            WorkspaceMutation::MessageChanged {
+                channel_id: "C1".into(),
+                message: posted.clone(),
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Local,
+            },
+        ));
+
+        let mut edited = posted;
+        edited.text = Some("edited".into());
+        assert!(workspace.apply(
+            MutationOrigin::Realtime,
+            WorkspaceMutation::MessageChanged {
+                channel_id: "C1".into(),
+                message: edited.clone(),
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            },
+        ));
+        assert_eq!(workspace.revision().value(), 4);
+        assert!(!workspace.apply(
+            MutationOrigin::Realtime,
+            WorkspaceMutation::MessageChanged {
+                channel_id: "C1".into(),
+                message: edited,
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            },
+        ));
+        assert_eq!(workspace.revision().value(), 4);
+    }
+
+    #[test]
+    fn realtime_socket_events_enter_the_workspace_adapter_once() {
+        let workspace = WorkspaceReducerAdapter::default();
+        apply_realtime_workspace_event(
+            &workspace,
+            &SocketModeEvent::Message(Box::new(socket_mode::SocketModeMessageEvent {
+                channel_id: "C1".into(),
+                message: SlackMessage {
+                    ts: "1.000".into(),
+                    text: Some("hello".into()),
+                    ..Default::default()
+                },
+                kind: SocketModeMessageKind::Posted,
+            })),
+        );
+        apply_realtime_workspace_event(
+            &workspace,
+            &SocketModeEvent::UserChanged(Box::new(SlackUser {
+                id: Some("U1".into()),
+                name: Some("person".into()),
+                ..Default::default()
+            })),
+        );
+        assert_eq!(workspace.revision().value(), 2);
+
+        apply_realtime_workspace_event(
+            &workspace,
+            &SocketModeEvent::Reaction(socket_mode::SocketModeReactionEvent {
+                channel_id: "C1".into(),
+                ts: "1.000".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            }),
+        );
+        assert_eq!(workspace.revision().value(), 2);
+    }
 
     #[test]
     fn browser_session_realtime_takes_precedence_without_loading_an_app_token() {
