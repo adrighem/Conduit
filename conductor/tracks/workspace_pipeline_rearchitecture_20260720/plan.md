@@ -11,7 +11,7 @@
 
 ## Phase 2: Canonical reducer pipeline
 
-- [ ] Task: Define and test workspace mutations, patches, store batches, revisions, and snapshot envelopes
+- [~] Task: Define and test workspace mutations, patches, store batches, revisions, and snapshot envelopes
 - [ ] Task: Extract WorkspaceCoordinator and its pure reducer from the runtime
 - [ ] Task: Route cache, Web API, local actions, and realtime transports through the reducer adapter
 - [ ] Task: Preserve read overlays and deduplicate message/send/echo identities with timeline invariants
