@@ -1,12 +1,16 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use futures_util::lock::Mutex;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -21,6 +25,9 @@ const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 const SEEN_REALTIME_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
 const LOCAL_READ_TS_KEY: &str = "conduit_local_read_ts";
 const MAX_SEEN_REALTIME_MESSAGES: usize = 256;
+const STORE_WRITER_QUEUE_CAPACITY: usize = 64;
+const STORE_READER_QUEUE_CAPACITY: usize = 32;
+const STORE_READER_COUNT: usize = 2;
 
 pub(crate) type Result<T> = std::result::Result<T, StoreError>;
 
@@ -42,6 +49,8 @@ pub(crate) enum StoreError {
     IncompatibleSchema { found: u32, supported: u32 },
     #[error("derived workspace cache is invalid: {message}")]
     InvalidDerivedCache { message: String },
+    #[error("workspace store hub is closed")]
+    HubClosed,
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -74,12 +83,222 @@ impl StoreError {
             Self::RejectedUpdate { .. } => StoreErrorCategory::RejectedUpdate,
             Self::IncompatibleSchema { .. } => StoreErrorCategory::IncompatibleSchema,
             Self::InvalidDerivedCache { .. } => StoreErrorCategory::CorruptData,
+            Self::HubClosed => StoreErrorCategory::TemporarilyUnavailable,
             Self::Database(error) => classify_database_error(error),
             Self::Io(_) => StoreErrorCategory::LocalIo,
             Self::Json(_) => StoreErrorCategory::CorruptData,
             Self::Other(error) => classify_wrapped_store_error(error),
         }
     }
+}
+
+type StoreWorkerValue = Box<dyn Any + Send>;
+type StoreWorkerTask =
+    Box<dyn FnOnce(&mut Connection) -> Result<StoreWorkerValue> + Send + 'static>;
+
+enum StoreWorkerRequest {
+    Task {
+        task: StoreWorkerTask,
+        response: tokio::sync::oneshot::Sender<Result<StoreWorkerValue>>,
+    },
+    Shutdown {
+        response: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+struct StoreHubInner {
+    writer: tokio::sync::mpsc::Sender<StoreWorkerRequest>,
+    readers: Vec<tokio::sync::mpsc::Sender<StoreWorkerRequest>>,
+    next_reader: AtomicUsize,
+    closed: AtomicBool,
+    admission: tokio::sync::Mutex<()>,
+    workers: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<Result<()>>>>,
+}
+
+/// Owns the bounded, persistent SQLite connections for one derived cache.
+///
+/// `WorkspaceStore` is migrated onto this compatibility seam incrementally so
+/// callers can keep their focused APIs while per-operation connections retire.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct StoreHub {
+    inner: Arc<StoreHubInner>,
+}
+
+#[allow(dead_code)]
+impl StoreHub {
+    pub(crate) async fn open(directory: PathBuf) -> Result<Self> {
+        let (writer, writer_startup, writer_worker) = spawn_store_worker(
+            directory.clone(),
+            StoreConnectionKind::Writer,
+            STORE_WRITER_QUEUE_CAPACITY,
+        );
+        writer_startup.await.map_err(|_| StoreError::HubClosed)??;
+
+        let mut readers = Vec::with_capacity(STORE_READER_COUNT);
+        let mut workers = vec![writer_worker];
+        for _ in 0..STORE_READER_COUNT {
+            let (reader, startup, worker) = spawn_store_worker(
+                directory.clone(),
+                StoreConnectionKind::QueryOnly,
+                STORE_READER_QUEUE_CAPACITY,
+            );
+            startup.await.map_err(|_| StoreError::HubClosed)??;
+            readers.push(reader);
+            workers.push(worker);
+        }
+
+        Ok(Self {
+            inner: Arc::new(StoreHubInner {
+                writer,
+                readers,
+                next_reader: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
+                admission: tokio::sync::Mutex::new(()),
+                workers: tokio::sync::Mutex::new(workers),
+            }),
+        })
+    }
+
+    pub(crate) async fn write<T, F>(&self, task: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        self.dispatch(self.inner.writer.clone(), task).await
+    }
+
+    pub(crate) async fn query<T, F>(&self, task: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let reader =
+            self.inner.next_reader.fetch_add(1, Ordering::Relaxed) % self.inner.readers.len();
+        self.dispatch(self.inner.readers[reader].clone(), task)
+            .await
+    }
+
+    pub(crate) async fn barrier(&self) -> Result<()> {
+        self.write(|_| Ok(())).await
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        let admission = self.inner.admission.lock().await;
+        if self.inner.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let mut shutdowns = Vec::with_capacity(1 + self.inner.readers.len());
+        for worker in std::iter::once(&self.inner.writer).chain(self.inner.readers.iter()) {
+            let (response, shutdown) = tokio::sync::oneshot::channel();
+            worker
+                .send(StoreWorkerRequest::Shutdown { response })
+                .await
+                .map_err(|_| StoreError::HubClosed)?;
+            shutdowns.push(shutdown);
+        }
+        drop(admission);
+
+        for shutdown in shutdowns {
+            shutdown.await.map_err(|_| StoreError::HubClosed)?;
+        }
+        let workers = std::mem::take(&mut *self.inner.workers.lock().await);
+        for worker in workers {
+            worker
+                .await
+                .context("workspace store worker stopped unexpectedly")??;
+        }
+        Ok(())
+    }
+
+    async fn dispatch<T, F>(
+        &self,
+        worker: tokio::sync::mpsc::Sender<StoreWorkerRequest>,
+        task: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let admission = self.inner.admission.lock().await;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(StoreError::HubClosed);
+        }
+        let (response, result) = tokio::sync::oneshot::channel();
+        worker
+            .send(StoreWorkerRequest::Task {
+                task: Box::new(move |connection| {
+                    task(connection).map(|value| Box::new(value) as StoreWorkerValue)
+                }),
+                response,
+            })
+            .await
+            .map_err(|_| StoreError::HubClosed)?;
+        drop(admission);
+
+        let value = result.await.map_err(|_| StoreError::HubClosed)??;
+        value.downcast::<T>().map(|value| *value).map_err(|_| {
+            StoreError::invalid_derived_cache("store worker returned an unexpected value type")
+        })
+    }
+
+    #[cfg(test)]
+    fn queue_capacities(&self) -> (usize, [usize; STORE_READER_COUNT]) {
+        (
+            self.inner.writer.max_capacity(),
+            std::array::from_fn(|index| self.inner.readers[index].max_capacity()),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StoreConnectionKind {
+    Writer,
+    QueryOnly,
+}
+
+fn spawn_store_worker(
+    directory: PathBuf,
+    kind: StoreConnectionKind,
+    capacity: usize,
+) -> (
+    tokio::sync::mpsc::Sender<StoreWorkerRequest>,
+    tokio::sync::oneshot::Receiver<Result<()>>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(capacity);
+    let (startup, started) = tokio::sync::oneshot::channel();
+    let worker = tokio::task::spawn_blocking(move || {
+        let connection = match kind {
+            StoreConnectionKind::Writer => open_database(&directory),
+            StoreConnectionKind::QueryOnly => open_query_database(&directory),
+        };
+        let mut connection = match connection {
+            Ok(connection) => {
+                let _ = startup.send(Ok(()));
+                connection
+            }
+            Err(error) => {
+                let _ = startup.send(Err(error));
+                return Ok(());
+            }
+        };
+
+        while let Some(request) = receiver.blocking_recv() {
+            match request {
+                StoreWorkerRequest::Task { task, response } => {
+                    let _ = response.send(task(&mut connection));
+                }
+                StoreWorkerRequest::Shutdown { response } => {
+                    let _ = response.send(());
+                    break;
+                }
+            }
+        }
+        Ok(())
+    });
+    (sender, started, worker)
 }
 
 fn classify_database_error(error: &rusqlite::Error) -> StoreErrorCategory {
@@ -1002,6 +1221,16 @@ fn open_database_once(directory: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+fn open_query_database(directory: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        database_path(directory),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+    connection.pragma_update(None, "query_only", true)?;
+    Ok(connection)
+}
+
 fn validate_schema_v2(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(sync_metadata)")?;
     let columns = statement
@@ -1875,6 +2104,141 @@ mod tests {
             .query_row("SELECT count(*) FROM workspace_items", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn store_hub_reuses_one_writer_and_two_query_only_readers() {
+        let directory = temp_cache_dir("store-hub-connections");
+        runtime().block_on(async {
+            let hub = StoreHub::open(directory.clone()).await.unwrap();
+            assert_eq!(hub.queue_capacities(), (64, [32, 32]));
+
+            let first_writer = hub
+                .write(|connection| Ok(connection as *const Connection as usize))
+                .await
+                .unwrap();
+            let second_writer = hub
+                .write(|connection| Ok(connection as *const Connection as usize))
+                .await
+                .unwrap();
+            assert_eq!(first_writer, second_writer);
+
+            let mut readers = Vec::new();
+            for _ in 0..4 {
+                readers.push(
+                    hub.query(|connection| {
+                        let query_only: bool =
+                            connection.query_row("PRAGMA query_only", [], |row| row.get(0))?;
+                        Ok((connection as *const Connection as usize, query_only))
+                    })
+                    .await
+                    .unwrap(),
+                );
+            }
+            assert!(readers.iter().all(|(_, query_only)| *query_only));
+            assert_eq!(readers[0].0, readers[2].0);
+            assert_eq!(readers[1].0, readers[3].0);
+            assert_ne!(readers[0].0, readers[1].0);
+            assert_ne!(first_writer, readers[0].0);
+            assert_ne!(first_writer, readers[1].0);
+
+            hub.shutdown().await.unwrap();
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn store_hub_commit_barrier_makes_writer_changes_visible_to_readers() {
+        let directory = temp_cache_dir("store-hub-barrier");
+        runtime().block_on(async {
+            let hub = StoreHub::open(directory.clone()).await.unwrap();
+            hub.write(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE barrier_probe (value INTEGER NOT NULL);
+                     INSERT INTO barrier_probe(value) VALUES (42);",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            hub.barrier().await.unwrap();
+
+            for _ in 0..2 {
+                let value: i64 = hub
+                    .query(|connection| {
+                        Ok(connection
+                            .query_row("SELECT value FROM barrier_probe", [], |row| row.get(0))?)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(value, 42);
+            }
+            hub.shutdown().await.unwrap();
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn store_hub_shutdown_drains_queued_writes_and_rejects_new_work() {
+        let directory = temp_cache_dir("store-hub-shutdown");
+        runtime().block_on(async {
+            let hub = StoreHub::open(directory.clone()).await.unwrap();
+            let (started, wait_for_start) = std::sync::mpsc::channel();
+            let (release, wait_for_release) = std::sync::mpsc::channel();
+            let active = {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    hub.write(move |connection| {
+                        started.send(()).unwrap();
+                        wait_for_release.recv().unwrap();
+                        connection.execute_batch(
+                            "CREATE TABLE shutdown_probe (value INTEGER NOT NULL);
+                             INSERT INTO shutdown_probe(value) VALUES (7);",
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                })
+            };
+            tokio::task::spawn_blocking(move || wait_for_start.recv().unwrap())
+                .await
+                .unwrap();
+            let queued = {
+                let hub = hub.clone();
+                tokio::spawn(async move {
+                    hub.write(|connection| {
+                        connection.execute("INSERT INTO shutdown_probe(value) VALUES (8)", [])?;
+                        Ok(())
+                    })
+                    .await
+                })
+            };
+            while hub.inner.writer.capacity() == hub.inner.writer.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+            let shutdown = {
+                let hub = hub.clone();
+                tokio::spawn(async move { hub.shutdown().await })
+            };
+            assert!(!shutdown.is_finished());
+            release.send(()).unwrap();
+            active.await.unwrap().unwrap();
+            queued.await.unwrap().unwrap();
+            shutdown.await.unwrap().unwrap();
+
+            let connection = Connection::open(directory.join(DATABASE_FILENAME)).unwrap();
+            let values: i64 = connection
+                .query_row("SELECT sum(value) FROM shutdown_probe", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(values, 15);
+            assert!(matches!(
+                hub.write(|_| Ok(())).await,
+                Err(StoreError::HubClosed)
+            ));
+        });
         let _ = std::fs::remove_dir_all(directory);
     }
 
