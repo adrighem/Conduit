@@ -1,0 +1,3 @@
+Pipeline follow-up for CI run 29760369422.
+Resolved strict Clippy warnings by grouping preference/sidebar arguments, boxing large event payloads, and removing repeated enum variant prefixes.
+Verification: cargo fmt -- --check; cargo test (520 passed); cargo check; meson compile -C _build; meson test -C _build --print-errorlogs (14 passed). Local Clippy unavailable; CI provides lint verification.
