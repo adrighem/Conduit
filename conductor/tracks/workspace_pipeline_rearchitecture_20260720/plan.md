@@ -6,8 +6,8 @@
 - [x] Task: Add schema-v2 freshness metadata and derived-cache recovery coverage 4e306e2
 - [x] Task: Introduce StoreHub with bounded writer/readers, commit barriers, and clean shutdown 9e4b31a
 - [x] Task: Move bootstrap, conversation, user, history, thread, and freshness access onto focused repository operations 1cd7ebe
-- [~] Task: Add write batching, immediate user flushes, unchanged suppression, and store tracing counters
-- [ ] Task: Conductor - User Manual Verification 'Guardrails and persistent storage' (Protocol in workflow.md)
+- [x] Task: Add write batching, immediate user flushes, unchanged suppression, and store tracing counters 2b255e6
+- [~] Task: Conductor - User Manual Verification 'Guardrails and persistent storage' (Protocol in workflow.md)
 
 ## Phase 2: Canonical reducer pipeline
 
