@@ -97,6 +97,7 @@ pub(crate) enum MessageMutationKind {
     Deleted,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum WorkspaceMutation {
     Hydrate(WorkspaceBootstrapData),
@@ -113,6 +114,7 @@ pub(crate) enum WorkspaceMutation {
     ReadAdvanced {
         channel_id: String,
         ts: String,
+        remaining_unread: u64,
     },
     UsersSnapshot(SnapshotEnvelope<Vec<SlackUser>>),
     UserUpsert(SlackUser),
@@ -158,6 +160,7 @@ pub(crate) enum MessageChange {
     Remove { message_ts: String },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum WorkspaceChange {
     BootstrapReset(WorkspaceBootstrapData),
@@ -200,6 +203,7 @@ impl WorkspacePatch {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum StoreChange {
     BootstrapReplaced(WorkspaceBootstrapData),
@@ -257,6 +261,736 @@ pub(crate) struct WorkspaceReduction {
     store_batch: Option<StoreBatch>,
 }
 
+#[derive(Debug, Clone)]
+struct RevisionedConversation {
+    value: SlackConversation,
+    membership_revision: WorkspaceRevision,
+    metadata_revision: WorkspaceRevision,
+    unread_revision: WorkspaceRevision,
+}
+
+#[derive(Debug, Clone)]
+struct RevisionedValue<T> {
+    value: T,
+    revision: WorkspaceRevision,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TimelineState {
+    messages: HashMap<String, RevisionedValue<SlackMessage>>,
+    tombstones: HashMap<String, WorkspaceRevision>,
+}
+
+impl TimelineState {
+    fn messages(&self) -> Vec<SlackMessage> {
+        let mut messages = self
+            .messages
+            .values()
+            .map(|entry| entry.value.clone())
+            .collect::<Vec<_>>();
+        messages.sort_by(|left, right| left.ts.cmp(&right.ts));
+        messages
+    }
+}
+
+/// Pure owner of one workspace's canonical domain model and global revision.
+///
+/// Runtime and GTK adapters are deliberately absent here. A mutation either changes the model
+/// once and produces one revision-stamped reduction, or is a no-op that leaves the revision
+/// untouched.
+#[derive(Debug, Default)]
+pub(crate) struct WorkspaceCoordinator {
+    revision: WorkspaceRevision,
+    conversations: HashMap<String, RevisionedConversation>,
+    users: HashMap<String, RevisionedValue<SlackUser>>,
+    histories: HashMap<String, TimelineState>,
+    threads: HashMap<(String, String), TimelineState>,
+    thread_catalog: Vec<ThreadRecord>,
+}
+
+impl WorkspaceCoordinator {
+    pub(crate) fn revision(&self) -> WorkspaceRevision {
+        self.revision
+    }
+
+    pub(crate) fn conversation(&self, channel_id: &str) -> Option<&SlackConversation> {
+        self.conversations.get(channel_id).map(|entry| &entry.value)
+    }
+
+    pub(crate) fn history(&self, channel_id: &str) -> Vec<SlackMessage> {
+        self.histories
+            .get(channel_id)
+            .map(TimelineState::messages)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn apply(&mut self, mutation: WorkspaceMutation) -> Option<WorkspaceReduction> {
+        match mutation {
+            WorkspaceMutation::Hydrate(data) => self.apply_hydration(data),
+            WorkspaceMutation::MembershipSnapshot(snapshot) => {
+                self.apply_membership_snapshot(snapshot)
+            }
+            WorkspaceMutation::ConversationUpsert(conversation) => {
+                self.apply_conversation_upsert(conversation)
+            }
+            WorkspaceMutation::ConversationRemove { channel_id } => {
+                self.apply_conversation_remove(&channel_id)
+            }
+            WorkspaceMutation::UnreadChanged {
+                channel_id,
+                state,
+                server_last_read,
+            } => self.apply_unread(&channel_id, state, server_last_read),
+            WorkspaceMutation::ReadAdvanced {
+                channel_id,
+                ts,
+                remaining_unread,
+            } => self.apply_read_advanced(&channel_id, &ts, remaining_unread),
+            WorkspaceMutation::UsersSnapshot(snapshot) => self.apply_users_snapshot(snapshot),
+            WorkspaceMutation::UserUpsert(user) => self.apply_user_upsert(user),
+            WorkspaceMutation::HistorySnapshot {
+                channel_id,
+                snapshot,
+            } => self.apply_timeline_snapshot(TimelineTarget::Channel(channel_id), snapshot),
+            WorkspaceMutation::HistoryPage { channel_id, page } => self.apply_timeline_snapshot(
+                TimelineTarget::Channel(channel_id),
+                SnapshotEnvelope::new(self.revision, page),
+            ),
+            WorkspaceMutation::ThreadSnapshot {
+                channel_id,
+                thread_ts,
+                snapshot,
+            } => self.apply_timeline_snapshot(
+                TimelineTarget::Thread {
+                    channel_id,
+                    thread_ts,
+                },
+                snapshot,
+            ),
+            WorkspaceMutation::ThreadPage {
+                channel_id,
+                thread_ts,
+                page,
+            } => self.apply_timeline_snapshot(
+                TimelineTarget::Thread {
+                    channel_id,
+                    thread_ts,
+                },
+                SnapshotEnvelope::new(self.revision, page),
+            ),
+            WorkspaceMutation::MessageChanged {
+                channel_id,
+                message,
+                kind,
+                origin: _,
+            } => self.apply_message(&channel_id, message, kind),
+            WorkspaceMutation::ThreadCatalogChanged(records) => self.apply_thread_catalog(records),
+        }
+    }
+
+    fn next_revision(&self) -> WorkspaceRevision {
+        self.revision.successor()
+    }
+
+    fn commit(
+        &mut self,
+        revision: WorkspaceRevision,
+        patch_changes: Vec<WorkspaceChange>,
+        store_changes: Vec<StoreChange>,
+    ) -> Option<WorkspaceReduction> {
+        let reduction = WorkspaceReduction::new(revision, patch_changes, store_changes)?;
+        self.revision = revision;
+        Some(reduction)
+    }
+
+    fn apply_hydration(&mut self, data: WorkspaceBootstrapData) -> Option<WorkspaceReduction> {
+        let unchanged = self.conversations.len() == data.conversations.len()
+            && data
+                .conversations
+                .iter()
+                .all(|conversation| self.conversation(&conversation.id) == Some(conversation))
+            && self.users.len() == data.users.len()
+            && data.users.iter().all(|user| {
+                user.id.as_deref().is_some_and(|user_id| {
+                    self.users
+                        .get(user_id)
+                        .is_some_and(|entry| entry.value == *user)
+                })
+            })
+            && data
+                .histories
+                .iter()
+                .all(|(channel_id, messages)| self.history(channel_id) == *messages)
+            && self.thread_catalog == data.threads;
+        if unchanged {
+            return None;
+        }
+
+        let revision = self.next_revision();
+        self.conversations = data
+            .conversations
+            .iter()
+            .cloned()
+            .map(|conversation| {
+                (
+                    conversation.id.clone(),
+                    RevisionedConversation {
+                        value: conversation,
+                        membership_revision: revision,
+                        metadata_revision: revision,
+                        unread_revision: revision,
+                    },
+                )
+            })
+            .collect();
+        self.users = data
+            .users
+            .iter()
+            .cloned()
+            .filter_map(|user| {
+                let user_id = user.id.clone()?;
+                Some((
+                    user_id,
+                    RevisionedValue {
+                        value: user,
+                        revision,
+                    },
+                ))
+            })
+            .collect();
+        self.histories = data
+            .histories
+            .iter()
+            .map(|(channel_id, messages)| {
+                (
+                    channel_id.clone(),
+                    timeline_from_messages(messages, revision),
+                )
+            })
+            .collect();
+        self.thread_catalog = data.threads.clone();
+        self.commit(
+            revision,
+            vec![WorkspaceChange::BootstrapReset(data.clone())],
+            vec![StoreChange::BootstrapReplaced(data)],
+        )
+    }
+
+    fn apply_conversation_upsert(
+        &mut self,
+        conversation: SlackConversation,
+    ) -> Option<WorkspaceReduction> {
+        if conversation.id.trim().is_empty() {
+            return None;
+        }
+        let revision = self.next_revision();
+        let changed = match self.conversations.get_mut(&conversation.id) {
+            Some(entry) => {
+                let mut merged = entry.value.clone();
+                merge_conversation_metadata(&mut merged, &conversation);
+                if merged == entry.value {
+                    false
+                } else {
+                    entry.value = merged;
+                    entry.metadata_revision = revision;
+                    entry.membership_revision = revision;
+                    true
+                }
+            }
+            None => {
+                self.conversations.insert(
+                    conversation.id.clone(),
+                    RevisionedConversation {
+                        value: conversation.clone(),
+                        membership_revision: revision,
+                        metadata_revision: revision,
+                        unread_revision: revision,
+                    },
+                );
+                true
+            }
+        };
+        if !changed {
+            return None;
+        }
+        let current = self.conversation(&conversation.id).unwrap().clone();
+        self.commit(
+            revision,
+            vec![WorkspaceChange::ConversationUpsert(current.clone())],
+            vec![StoreChange::ConversationUpsert(current)],
+        )
+    }
+
+    fn apply_conversation_remove(&mut self, channel_id: &str) -> Option<WorkspaceReduction> {
+        self.conversations.remove(channel_id)?;
+        let revision = self.next_revision();
+        self.commit(
+            revision,
+            vec![WorkspaceChange::ConversationRemoved {
+                channel_id: channel_id.to_string(),
+            }],
+            vec![StoreChange::ConversationRemoved {
+                channel_id: channel_id.to_string(),
+            }],
+        )
+    }
+
+    fn apply_membership_snapshot(
+        &mut self,
+        snapshot: SnapshotEnvelope<Vec<SlackConversation>>,
+    ) -> Option<WorkspaceReduction> {
+        let base_revision = snapshot.base_revision();
+        let incoming = snapshot
+            .into_data()
+            .into_iter()
+            .filter(|conversation| !conversation.id.trim().is_empty())
+            .map(|conversation| (conversation.id.clone(), conversation))
+            .collect::<HashMap<_, _>>();
+        let revision = self.next_revision();
+        let mut patch_changes = Vec::new();
+        let mut store_changes = Vec::new();
+
+        for (channel_id, conversation) in &incoming {
+            match self.conversations.get_mut(channel_id) {
+                Some(entry) if entry.metadata_revision <= base_revision => {
+                    let mut merged = entry.value.clone();
+                    merge_conversation_metadata(&mut merged, conversation);
+                    if merged != entry.value {
+                        entry.value = merged.clone();
+                        entry.metadata_revision = revision;
+                        patch_changes.push(WorkspaceChange::ConversationUpsert(merged.clone()));
+                        store_changes.push(StoreChange::ConversationUpsert(merged));
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.conversations.insert(
+                        channel_id.clone(),
+                        RevisionedConversation {
+                            value: conversation.clone(),
+                            membership_revision: revision,
+                            metadata_revision: revision,
+                            unread_revision: revision,
+                        },
+                    );
+                    patch_changes.push(WorkspaceChange::ConversationUpsert(conversation.clone()));
+                    store_changes.push(StoreChange::ConversationUpsert(conversation.clone()));
+                }
+            }
+        }
+
+        let removed = self
+            .conversations
+            .iter()
+            .filter(|(channel_id, entry)| {
+                !incoming.contains_key(*channel_id) && entry.membership_revision <= base_revision
+            })
+            .map(|(channel_id, _)| channel_id.clone())
+            .collect::<Vec<_>>();
+        for channel_id in removed {
+            self.conversations.remove(&channel_id);
+            patch_changes.push(WorkspaceChange::ConversationRemoved {
+                channel_id: channel_id.clone(),
+            });
+            store_changes.push(StoreChange::ConversationRemoved { channel_id });
+        }
+
+        self.commit(revision, patch_changes, store_changes)
+    }
+
+    fn apply_unread(
+        &mut self,
+        channel_id: &str,
+        state: SlackUnreadState,
+        server_last_read: Option<String>,
+    ) -> Option<WorkspaceReduction> {
+        if !state.known || channel_id.trim().is_empty() {
+            return None;
+        }
+        let revision = self.next_revision();
+        let entry = self
+            .conversations
+            .entry(channel_id.to_string())
+            .or_insert_with(|| RevisionedConversation {
+                value: SlackConversation {
+                    id: channel_id.to_string(),
+                    ..Default::default()
+                },
+                membership_revision: revision,
+                metadata_revision: revision,
+                unread_revision: revision,
+            });
+        let before = entry.value.clone();
+        entry.value.apply_unread_state(state);
+        if let Some(last_read) = server_last_read.as_deref() {
+            entry.value.extra.insert(
+                "last_read".to_string(),
+                serde_json::Value::String(last_read.to_string()),
+            );
+        }
+        if entry.value == before {
+            return None;
+        }
+        entry.unread_revision = revision;
+        entry.membership_revision = entry.membership_revision.max(revision);
+        self.commit(
+            revision,
+            vec![WorkspaceChange::UnreadChanged {
+                channel_id: channel_id.to_string(),
+                state,
+            }],
+            vec![StoreChange::UnreadChanged {
+                channel_id: channel_id.to_string(),
+                state,
+                server_last_read,
+            }],
+        )
+    }
+
+    fn apply_read_advanced(
+        &mut self,
+        channel_id: &str,
+        ts: &str,
+        remaining_unread: u64,
+    ) -> Option<WorkspaceReduction> {
+        self.conversations.get(channel_id)?;
+        let revision = self.next_revision();
+        let entry = self.conversations.get_mut(channel_id).unwrap();
+        let before = entry.value.clone();
+        entry.value.advance_read_cursor(ts, remaining_unread);
+        if entry.value == before {
+            return None;
+        }
+        entry.unread_revision = revision;
+        let state = entry.value.unread_state();
+        let conversation = entry.value.clone();
+        self.commit(
+            revision,
+            vec![WorkspaceChange::UnreadChanged {
+                channel_id: channel_id.to_string(),
+                state,
+            }],
+            vec![StoreChange::ConversationUpsert(conversation)],
+        )
+    }
+
+    fn apply_users_snapshot(
+        &mut self,
+        snapshot: SnapshotEnvelope<Vec<SlackUser>>,
+    ) -> Option<WorkspaceReduction> {
+        let base_revision = snapshot.base_revision();
+        let revision = self.next_revision();
+        let mut changed = Vec::new();
+        for user in snapshot.into_data() {
+            let Some(user_id) = user
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|user_id| !user_id.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let should_apply = self
+                .users
+                .get(&user_id)
+                .is_none_or(|entry| entry.revision <= base_revision && entry.value != user);
+            if should_apply {
+                self.users.insert(
+                    user_id,
+                    RevisionedValue {
+                        value: user.clone(),
+                        revision,
+                    },
+                );
+                changed.push(user);
+            }
+        }
+        if changed.is_empty() {
+            return None;
+        }
+        self.commit(
+            revision,
+            changed
+                .iter()
+                .cloned()
+                .map(WorkspaceChange::UserUpsert)
+                .collect(),
+            changed.into_iter().map(StoreChange::UserUpsert).collect(),
+        )
+    }
+
+    fn apply_user_upsert(&mut self, user: SlackUser) -> Option<WorkspaceReduction> {
+        let user_id = user
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|user_id| !user_id.is_empty())?
+            .to_string();
+        if self
+            .users
+            .get(&user_id)
+            .is_some_and(|entry| entry.value == user)
+        {
+            return None;
+        }
+        let revision = self.next_revision();
+        self.users.insert(
+            user_id,
+            RevisionedValue {
+                value: user.clone(),
+                revision,
+            },
+        );
+        self.commit(
+            revision,
+            vec![WorkspaceChange::UserUpsert(user.clone())],
+            vec![StoreChange::UserUpsert(user)],
+        )
+    }
+
+    fn apply_timeline_snapshot(
+        &mut self,
+        target: TimelineTarget,
+        snapshot: SnapshotEnvelope<MessagePage>,
+    ) -> Option<WorkspaceReduction> {
+        let base_revision = snapshot.base_revision();
+        let page = snapshot.into_data();
+        let revision = self.next_revision();
+        let timeline = self.timeline_mut(&target);
+        let incoming = page
+            .messages
+            .into_iter()
+            .filter(|message| match &target {
+                TimelineTarget::Channel(_) => message.belongs_in_channel_timeline(),
+                TimelineTarget::Thread { thread_ts, .. } => message.belongs_to_thread(thread_ts),
+            })
+            .map(|message| (message.ts.clone(), message))
+            .collect::<HashMap<_, _>>();
+        let mut changes = Vec::new();
+        for (message_ts, message) in &incoming {
+            if timeline
+                .tombstones
+                .get(message_ts)
+                .is_some_and(|deleted_at| *deleted_at > base_revision)
+                || timeline
+                    .messages
+                    .get(message_ts)
+                    .is_some_and(|entry| entry.revision > base_revision)
+            {
+                continue;
+            }
+            if timeline
+                .messages
+                .get(message_ts)
+                .is_none_or(|entry| entry.value != *message)
+            {
+                timeline.messages.insert(
+                    message_ts.clone(),
+                    RevisionedValue {
+                        value: message.clone(),
+                        revision,
+                    },
+                );
+                timeline.tombstones.remove(message_ts);
+                changes.push(MessageChange::Upsert(message.clone()));
+            }
+        }
+        if page.complete {
+            let removed = timeline
+                .messages
+                .iter()
+                .filter(|(message_ts, entry)| {
+                    !incoming.contains_key(*message_ts) && entry.revision <= base_revision
+                })
+                .map(|(message_ts, _)| message_ts.clone())
+                .collect::<Vec<_>>();
+            for message_ts in removed {
+                timeline.messages.remove(&message_ts);
+                timeline.tombstones.insert(message_ts.clone(), revision);
+                changes.push(MessageChange::Remove { message_ts });
+            }
+        }
+        if changes.is_empty() {
+            return None;
+        }
+        let messages = timeline.messages();
+        let store_change = store_timeline_replacement(&target, messages);
+        self.commit(
+            revision,
+            vec![WorkspaceChange::TimelineChanged { target, changes }],
+            vec![store_change],
+        )
+    }
+
+    fn apply_message(
+        &mut self,
+        channel_id: &str,
+        message: SlackMessage,
+        kind: MessageMutationKind,
+    ) -> Option<WorkspaceReduction> {
+        if channel_id.trim().is_empty() || message.ts.trim().is_empty() {
+            return None;
+        }
+        let revision = self.next_revision();
+        let mut targets = Vec::new();
+        if message.belongs_in_channel_timeline() {
+            targets.push(TimelineTarget::Channel(channel_id.to_string()));
+        }
+        if let Some(thread_ts) = message.thread_root_ts() {
+            targets.push(TimelineTarget::Thread {
+                channel_id: channel_id.to_string(),
+                thread_ts: thread_ts.to_string(),
+            });
+        }
+        let mut patch_changes = Vec::new();
+        let mut store_changes = Vec::new();
+        for target in targets {
+            let timeline = self.timeline_mut(&target);
+            let changed = match kind {
+                MessageMutationKind::Deleted => {
+                    let already_deleted = timeline.tombstones.contains_key(&message.ts);
+                    let removed = timeline.messages.remove(&message.ts).is_some();
+                    if removed || !already_deleted {
+                        timeline.tombstones.insert(message.ts.clone(), revision);
+                    }
+                    removed || !already_deleted
+                }
+                MessageMutationKind::Posted | MessageMutationKind::Changed => {
+                    if timeline
+                        .messages
+                        .get(&message.ts)
+                        .is_some_and(|entry| entry.value == message)
+                    {
+                        false
+                    } else {
+                        timeline.messages.insert(
+                            message.ts.clone(),
+                            RevisionedValue {
+                                value: message.clone(),
+                                revision,
+                            },
+                        );
+                        timeline.tombstones.remove(&message.ts);
+                        true
+                    }
+                }
+            };
+            if !changed {
+                continue;
+            }
+            let message_change = match kind {
+                MessageMutationKind::Deleted => MessageChange::Remove {
+                    message_ts: message.ts.clone(),
+                },
+                _ => MessageChange::Upsert(message.clone()),
+            };
+            patch_changes.push(WorkspaceChange::TimelineChanged {
+                target: target.clone(),
+                changes: vec![message_change],
+            });
+            store_changes.push(store_timeline_replacement(&target, timeline.messages()));
+        }
+        self.commit(revision, patch_changes, store_changes)
+    }
+
+    fn apply_thread_catalog(
+        &mut self,
+        mut records: Vec<ThreadRecord>,
+    ) -> Option<WorkspaceReduction> {
+        records.sort_by(|left, right| {
+            left.key
+                .channel_id
+                .cmp(&right.key.channel_id)
+                .then_with(|| left.key.root_ts.cmp(&right.key.root_ts))
+        });
+        if self.thread_catalog == records {
+            return None;
+        }
+        let revision = self.next_revision();
+        self.thread_catalog = records.clone();
+        self.commit(
+            revision,
+            vec![WorkspaceChange::ThreadCatalogChanged(records.clone())],
+            vec![StoreChange::ThreadCatalogReplaced(records)],
+        )
+    }
+
+    fn timeline_mut(&mut self, target: &TimelineTarget) -> &mut TimelineState {
+        match target {
+            TimelineTarget::Channel(channel_id) => {
+                self.histories.entry(channel_id.clone()).or_default()
+            }
+            TimelineTarget::Thread {
+                channel_id,
+                thread_ts,
+            } => self
+                .threads
+                .entry((channel_id.clone(), thread_ts.clone()))
+                .or_default(),
+        }
+    }
+}
+
+fn timeline_from_messages(messages: &[SlackMessage], revision: WorkspaceRevision) -> TimelineState {
+    TimelineState {
+        messages: messages
+            .iter()
+            .cloned()
+            .map(|message| {
+                (
+                    message.ts.clone(),
+                    RevisionedValue {
+                        value: message,
+                        revision,
+                    },
+                )
+            })
+            .collect(),
+        tombstones: HashMap::new(),
+    }
+}
+
+fn store_timeline_replacement(target: &TimelineTarget, messages: Vec<SlackMessage>) -> StoreChange {
+    match target {
+        TimelineTarget::Channel(channel_id) => StoreChange::HistoryReplaced {
+            channel_id: channel_id.clone(),
+            messages,
+        },
+        TimelineTarget::Thread {
+            channel_id,
+            thread_ts,
+        } => StoreChange::ThreadReplaced {
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts.clone(),
+            messages,
+        },
+    }
+}
+
+fn merge_conversation_metadata(current: &mut SlackConversation, incoming: &SlackConversation) {
+    macro_rules! merge_option {
+        ($field:ident) => {
+            if incoming.$field.is_some() {
+                current.$field.clone_from(&incoming.$field);
+            }
+        };
+    }
+    merge_option!(name);
+    merge_option!(user);
+    merge_option!(is_channel);
+    merge_option!(is_group);
+    merge_option!(is_im);
+    merge_option!(is_mpim);
+    merge_option!(is_private);
+    merge_option!(is_archived);
+    for (key, value) in &incoming.extra {
+        if !key.to_ascii_lowercase().contains("unread") && key != "last_read" {
+            current.extra.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 impl WorkspaceReduction {
     pub(crate) fn new(
         revision: WorkspaceRevision,
@@ -280,6 +1014,23 @@ impl WorkspaceReduction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conversation(id: &str, name: &str) -> SlackConversation {
+        SlackConversation {
+            id: id.to_string(),
+            name: Some(name.to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn message(ts: &str, text: &str) -> SlackMessage {
+        SlackMessage {
+            ts: ts.to_string(),
+            text: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn revision_advances_monotonically() {
@@ -360,5 +1111,151 @@ mod tests {
                 StoreChange::HistoryRemoved { .. }
             ]
         ));
+    }
+
+    #[test]
+    fn coordinator_advances_once_and_suppresses_identical_mutations() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let changed = coordinator
+            .apply(WorkspaceMutation::ConversationUpsert(conversation(
+                "C1", "general",
+            )))
+            .expect("new conversation should change the workspace");
+
+        assert_eq!(coordinator.revision().value(), 1);
+        assert_eq!(changed.patch().revision(), coordinator.revision());
+        assert_eq!(
+            changed.store_batch().map(StoreBatch::revision),
+            Some(coordinator.revision())
+        );
+
+        assert!(coordinator
+            .apply(WorkspaceMutation::ConversationUpsert(conversation(
+                "C1", "general",
+            )))
+            .is_none());
+        assert_eq!(coordinator.revision().value(), 1);
+    }
+
+    #[test]
+    fn stale_membership_snapshot_updates_metadata_without_replacing_unread_overlay() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(conversation(
+            "C1", "general",
+        )));
+        let snapshot_revision = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::UnreadChanged {
+            channel_id: "C1".to_string(),
+            state: SlackUnreadState::from_parts(true, true, 4),
+            server_last_read: None,
+        });
+        let mut stale = conversation("C1", "renamed");
+        stale.apply_unread_state(SlackUnreadState::from_parts(true, true, 99));
+
+        coordinator.apply(WorkspaceMutation::MembershipSnapshot(
+            SnapshotEnvelope::new(snapshot_revision, vec![stale]),
+        ));
+
+        let current = coordinator.conversation("C1").unwrap();
+        assert_eq!(current.name.as_deref(), Some("renamed"));
+        assert_eq!(current.unread_activity_count(), 4);
+    }
+
+    #[test]
+    fn stale_history_snapshots_preserve_newer_posts_edits_and_deletes() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let empty_base = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: message("10.0", "realtime"),
+            kind: MessageMutationKind::Posted,
+            origin: MutationOrigin::Realtime,
+        });
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                empty_base,
+                MessagePage {
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        assert_eq!(
+            coordinator.history("C1")[0].text.as_deref(),
+            Some("realtime")
+        );
+
+        let old_edit_base = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: message("10.0", "new edit"),
+            kind: MessageMutationKind::Changed,
+            origin: MutationOrigin::Realtime,
+        });
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                old_edit_base,
+                MessagePage {
+                    messages: vec![message("10.0", "old edit")],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        assert_eq!(
+            coordinator.history("C1")[0].text.as_deref(),
+            Some("new edit")
+        );
+
+        let old_delete_base = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: message("10.0", "deleted"),
+            kind: MessageMutationKind::Deleted,
+            origin: MutationOrigin::Realtime,
+        });
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                old_delete_base,
+                MessagePage {
+                    messages: vec![message("10.0", "resurrected")],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        assert!(coordinator.history("C1").is_empty());
+    }
+
+    #[test]
+    fn delete_tombstone_prevents_stale_snapshot_resurrection_without_loaded_history() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let snapshot_revision = coordinator.revision();
+        assert!(coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: message("10.0", "deleted before hydration"),
+                kind: MessageMutationKind::Deleted,
+                origin: MutationOrigin::Realtime,
+            })
+            .is_some());
+
+        assert!(coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    snapshot_revision,
+                    MessagePage {
+                        messages: vec![message("10.0", "stale")],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .is_none());
+        assert!(coordinator.history("C1").is_empty());
     }
 }

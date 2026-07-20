@@ -52,7 +52,7 @@ fn now_unix() -> u64 {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackConversation {
     pub id: String,
     pub name: Option<String>,
