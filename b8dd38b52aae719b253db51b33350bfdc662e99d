@@ -1,0 +1,3 @@
+Verification follow-up: ensure xfwm4 is killed after a bounded SIGTERM wait and always terminate the isolated D-Bus daemon.
+Observed red: Meson timeline test cleanup timed out after repeated headless runs.
+Verification: meson test -C _build --print-errorlogs (14 passed).
