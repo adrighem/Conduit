@@ -1056,10 +1056,14 @@ fn load_sqlite_conversation(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    payload
-        .map(|payload| serde_json::from_str(&payload).context("invalid cached conversation"))
+    let conversation = payload
+        .map(|payload| {
+            serde_json::from_str::<SlackConversation>(&payload)
+                .context("invalid cached conversation")
+        })
         .transpose()
-        .map_err(StoreError::from)
+        .map_err(StoreError::from)?;
+    Ok(conversation.filter(|conversation| conversation.id == channel_id))
 }
 
 fn upsert_sqlite_conversation(
@@ -1938,6 +1942,125 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unrelated_payload, "{broken");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn conversation_row_mutations_do_not_follow_mismatched_payload_ids() {
+        let directory = temp_cache_dir("workspace-store-conversation-row-id-mismatch");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_conversations(&[
+                    SlackConversation {
+                        id: "C0".to_string(),
+                        name: Some("untouched".to_string()),
+                        unread_count: Some(2),
+                        ..Default::default()
+                    },
+                    SlackConversation {
+                        id: "C1".to_string(),
+                        name: Some("original".to_string()),
+                        ..Default::default()
+                    },
+                ])
+                .await
+                .expect("conversation store failed");
+
+            let mismatched = serde_json::to_string(&SlackConversation {
+                id: "C0".to_string(),
+                name: Some("mismatched".to_string()),
+                unread_count: Some(99),
+                ..Default::default()
+            })
+            .unwrap();
+            let replace_c1_payload = |payload: &str| {
+                let connection = Connection::open(store.database_path()).unwrap();
+                connection
+                    .execute(
+                        "UPDATE workspace_items SET payload_json = ?1
+                         WHERE workspace_key = ?2 AND kind = 'conversation' AND item_key = 'C1'",
+                        params![payload, &store.workspace_key],
+                    )
+                    .unwrap();
+            };
+            replace_c1_payload(&mismatched);
+
+            assert!(!store
+                .apply_conversation_unread_state(
+                    "C1",
+                    SlackUnreadState::from_parts(true, true, 7),
+                    None,
+                )
+                .await
+                .expect("mismatched unread update failed"));
+            assert!(!store
+                .clear_conversation_unread_state("C1", "20.0")
+                .await
+                .expect("mismatched read update failed"));
+
+            store
+                .store_conversation(&SlackConversation {
+                    id: "C1".to_string(),
+                    name: Some("metadata repaired".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .expect("metadata repair failed");
+            let repaired = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(
+                repaired
+                    .iter()
+                    .find(|conversation| conversation.id == "C0")
+                    .and_then(|conversation| conversation.name.as_deref()),
+                Some("untouched")
+            );
+            assert_eq!(
+                repaired
+                    .iter()
+                    .find(|conversation| conversation.id == "C0")
+                    .map(SlackConversation::unread_activity_count),
+                Some(2)
+            );
+            assert_eq!(
+                repaired
+                    .iter()
+                    .find(|conversation| conversation.id == "C1")
+                    .and_then(|conversation| conversation.name.as_deref()),
+                Some("metadata repaired")
+            );
+
+            replace_c1_payload(&mismatched);
+            assert!(store
+                .mark_conversation_unread_from_event("C1", "21.0")
+                .await
+                .expect("realtime repair failed"));
+            let repaired = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(
+                repaired
+                    .iter()
+                    .find(|conversation| conversation.id == "C0")
+                    .and_then(|conversation| conversation.name.as_deref()),
+                Some("untouched")
+            );
+            assert_eq!(
+                repaired
+                    .iter()
+                    .find(|conversation| conversation.id == "C0")
+                    .map(SlackConversation::unread_activity_count),
+                Some(2)
+            );
+            assert_eq!(
+                repaired
+                    .iter()
+                    .find(|conversation| conversation.id == "C1")
+                    .map(SlackConversation::unread_activity_count),
+                Some(1)
+            );
+        });
 
         let _ = std::fs::remove_dir_all(directory);
     }
