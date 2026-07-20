@@ -1,0 +1,5 @@
+Task: Define and test workspace mutations, patches, store batches, revisions, and snapshot envelopes
+Summary: Added pure workspace pipeline contracts for normalized cache/API/local/realtime mutations, monotonic revisions, stale snapshot envelopes, keyed UI changes, ordered persistence changes, and reductions that stamp both outputs with one revision.
+Modified files: src/main.rs, src/workspace_pipeline.rs
+Rationale: Establish one GTK/SQLite-independent boundary before extracting the coordinator and adapting existing runtime events.
+Verification: cargo test (524 passed); cargo check; meson compile -C _build; meson test -C _build --print-errorlogs (14 passed). Strict Clippy is CI-only on this machine.
