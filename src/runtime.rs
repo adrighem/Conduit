@@ -33,7 +33,7 @@ use crate::services::conversation_history::{
 };
 use crate::slack::{DownloadedPreviewAsset, SlackApi, SlackErrorCategory, SlackMessagePage};
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
-use crate::store::{StoreErrorCategory, WorkspaceStore};
+use crate::store::{StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore};
 use crate::thread_catalog::ThreadRecord;
 use crate::workspace_state::WorkspaceLifecycleEvent;
 
@@ -2060,16 +2060,7 @@ fn spawn_workspace_tasks(
                 );
             }
         }
-        load_cached_user_names_shared(&hydration_events, &hydration_connection).await;
-        load_cached_user_full_names(&hydration_events, &hydration_connection.workspace_store).await;
-        load_cached_user_avatar_urls(&hydration_events, &hydration_connection.workspace_store)
-            .await;
-        load_cached_user_search_aliases(&hydration_events, &hydration_connection.workspace_store)
-            .await;
-        load_cached_user_statuses(&hydration_events, &hydration_connection.workspace_store).await;
-        load_cached_conversations(&hydration_events, &hydration_connection.workspace_store).await;
-        load_cached_thread_catalog(&hydration_events, &hydration_connection.workspace_store).await;
-        load_cached_custom_emojis(&hydration_events, &hydration_connection.workspace_store).await;
+        load_cached_bootstrap(&hydration_events, &hydration_connection).await;
 
         let emoji_events = hydration_events.clone();
         let emoji_connection = hydration_connection.clone();
@@ -2208,6 +2199,77 @@ fn spawn_workspace_tasks(
     }
 }
 
+async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &RuntimeConnection) {
+    let Some(store) = connection.workspace_store.as_ref() else {
+        return;
+    };
+    let bootstrap = match store.load_bootstrap().await {
+        Ok(Some(bootstrap)) => bootstrap,
+        Ok(None) => return,
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!("WorkspaceBootstrapLoadFailed error={error:#}"),
+            );
+            return;
+        }
+    };
+
+    let WorkspaceBootstrap {
+        workspace_id,
+        conversations,
+        user_names,
+        user_full_names,
+        user_avatar_urls,
+        user_search_aliases,
+        user_statuses,
+        thread_catalog,
+        custom_emojis,
+        ..
+    } = bootstrap;
+    crate::debug::log(
+        "runtime",
+        &format!(
+            "WorkspaceBootstrapLoaded identified={} conversations={} users={} threads={}",
+            !workspace_id.is_empty(),
+            conversations.len(),
+            user_names.len(),
+            thread_catalog.len()
+        ),
+    );
+    if !user_names.is_empty() {
+        connection
+            .user_cache
+            .lock()
+            .expect("runtime user cache lock poisoned")
+            .extend(user_names.clone());
+        events.send_event(RuntimeEventKind::UserNamesLoaded(user_names));
+    }
+    if !user_full_names.is_empty() {
+        events.send_event(RuntimeEventKind::UserFullNamesLoaded(user_full_names));
+    }
+    if !user_avatar_urls.is_empty() {
+        events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(user_avatar_urls));
+    }
+    if !user_search_aliases.is_empty() {
+        events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(
+            user_search_aliases,
+        ));
+    }
+    if !user_statuses.is_empty() {
+        events.send_event(RuntimeEventKind::UserStatusesLoaded(user_statuses));
+    }
+    if !conversations.is_empty() {
+        events.send_event(RuntimeEventKind::ConversationsLoaded(conversations));
+    }
+    if !thread_catalog.is_empty() {
+        events.send_event(RuntimeEventKind::ThreadCatalogLoaded(thread_catalog));
+    }
+    if !custom_emojis.is_empty() {
+        events.send_event(RuntimeEventKind::EmojiCatalogLoaded(custom_emojis));
+    }
+}
+
 fn select_realtime_credentials(
     browser_credentials: Option<socket_mode::SocketModeCredentials>,
     load_app_token: impl FnOnce() -> Result<Option<String>>,
@@ -2217,95 +2279,6 @@ fn select_realtime_credentials(
         None => {
             load_app_token().map(|token| token.map(socket_mode::SocketModeCredentials::AppToken))
         }
-    }
-}
-
-async fn load_cached_user_names_shared(
-    events: &RuntimeEventSender,
-    connection: &RuntimeConnection,
-) {
-    let mut cached_names = HashMap::new();
-    load_cached_user_names(events, &connection.workspace_store, &mut cached_names).await;
-    connection
-        .user_cache
-        .lock()
-        .expect("runtime user cache lock poisoned")
-        .extend(cached_names);
-}
-
-async fn load_cached_user_search_aliases(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-    match store.load_user_search_aliases().await {
-        Ok(aliases) if !aliases.is_empty() => {
-            events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(aliases));
-        }
-        Ok(_) => {}
-        Err(error) => crate::debug::log(
-            "runtime",
-            &format!("CachedUserSearchAliasesLoadFailed error={error:#}"),
-        ),
-    }
-}
-
-async fn load_cached_user_full_names(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-    match store.load_user_full_names().await {
-        Ok(names) if !names.is_empty() => {
-            events.send_event(RuntimeEventKind::UserFullNamesLoaded(names));
-        }
-        Ok(_) => {}
-        Err(error) => crate::debug::log(
-            "runtime",
-            &format!("CachedUserFullNamesLoadFailed error={error:#}"),
-        ),
-    }
-}
-
-async fn load_cached_user_avatar_urls(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-    match store.load_user_avatar_urls().await {
-        Ok(urls) if !urls.is_empty() => {
-            events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(urls));
-        }
-        Ok(_) => {}
-        Err(error) => crate::debug::log(
-            "runtime",
-            &format!("CachedUserAvatarUrlsLoadFailed error={error:#}"),
-        ),
-    }
-}
-
-async fn load_cached_user_statuses(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-    match store.load_user_statuses().await {
-        Ok(statuses) if !statuses.is_empty() => {
-            events.send_event(RuntimeEventKind::UserStatusesLoaded(statuses));
-        }
-        Ok(_) => {}
-        Err(error) => crate::debug::log(
-            "runtime",
-            &format!("CachedUserStatusesLoadFailed error={error:#}"),
-        ),
     }
 }
 
@@ -2321,25 +2294,6 @@ fn user_avatar_urls(users: &[SlackUser]) -> HashMap<String, String> {
         .iter()
         .filter_map(|user| Some((user.id.clone()?, user.avatar_url()?)))
         .collect()
-}
-
-async fn load_cached_custom_emojis(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-    match store.load_custom_emojis().await {
-        Ok(emojis) if !emojis.is_empty() => {
-            events.send_event(RuntimeEventKind::EmojiCatalogLoaded(emojis));
-        }
-        Ok(_) => {}
-        Err(error) => crate::debug::log(
-            "store",
-            &format!("CustomEmojiCacheLoadFailed error={error:#}"),
-        ),
-    }
 }
 
 async fn handle_connected_command(
@@ -4055,32 +4009,6 @@ fn send_conversation_unread_update(
     }
 }
 
-async fn load_cached_user_names(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-    user_cache: &mut HashMap<String, String>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-
-    match store.load_user_names().await {
-        Ok(user_names) if !user_names.is_empty() => {
-            crate::debug::log(
-                "runtime",
-                &format!("CachedUserNamesLoaded count={}", user_names.len()),
-            );
-            user_cache.extend(user_names.clone());
-            events.send_event(RuntimeEventKind::UserNamesLoaded(user_names));
-        }
-        Ok(_) => {}
-        Err(error) => crate::debug::log(
-            "runtime",
-            &format!("CachedUserNamesLoadFailed error={error:#}"),
-        ),
-    }
-}
-
 async fn refresh_cached_conversation_user_names(
     events: &RuntimeEventSender,
     api: &SlackApi,
@@ -4355,30 +4283,6 @@ fn workspace_store_id(auth: &AuthInfo) -> String {
         .unwrap_or("unknown-team");
     let user = auth.user_id.as_deref().unwrap_or("unknown-user");
     format!("{team}:{user}")
-}
-
-async fn load_cached_conversations(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-
-    match store.load_conversations().await {
-        Ok(Some(conversations)) => {
-            crate::debug::log(
-                "runtime",
-                &format!("CachedConversationsLoaded count={}", conversations.len()),
-            );
-            events.send_event(RuntimeEventKind::ConversationsLoaded(conversations));
-        }
-        Ok(None) => {}
-        Err(error) => crate::debug::log(
-            "runtime",
-            &format!("CachedConversationsLoadFailed error={error:#}"),
-        ),
-    }
 }
 
 async fn load_cached_thread_catalog(

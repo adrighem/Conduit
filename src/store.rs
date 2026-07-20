@@ -11,6 +11,7 @@ use futures_util::lock::Mutex;
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -112,7 +113,7 @@ struct StoreHubInner {
     next_reader: AtomicUsize,
     closed: AtomicBool,
     admission: tokio::sync::Mutex<()>,
-    workers: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<Result<()>>>>,
+    workers: std::sync::Mutex<Vec<std::thread::JoinHandle<Result<()>>>>,
 }
 
 /// Owns the bounded, persistent SQLite connections for one derived cache.
@@ -155,7 +156,7 @@ impl StoreHub {
                 next_reader: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
                 admission: tokio::sync::Mutex::new(()),
-                workers: tokio::sync::Mutex::new(workers),
+                workers: std::sync::Mutex::new(workers),
             }),
         })
     }
@@ -203,11 +204,17 @@ impl StoreHub {
         for shutdown in shutdowns {
             shutdown.await.map_err(|_| StoreError::HubClosed)?;
         }
-        let workers = std::mem::take(&mut *self.inner.workers.lock().await);
+        let workers = std::mem::take(
+            &mut *self
+                .inner
+                .workers
+                .lock()
+                .expect("store worker lock poisoned"),
+        );
         for worker in workers {
-            worker
-                .await
-                .context("workspace store worker stopped unexpectedly")??;
+            worker.join().map_err(|_| {
+                StoreError::Other(anyhow::anyhow!("workspace store worker panicked"))
+            })??;
         }
         Ok(())
     }
@@ -265,39 +272,42 @@ fn spawn_store_worker(
 ) -> (
     tokio::sync::mpsc::Sender<StoreWorkerRequest>,
     tokio::sync::oneshot::Receiver<Result<()>>,
-    tokio::task::JoinHandle<Result<()>>,
+    std::thread::JoinHandle<Result<()>>,
 ) {
     let (sender, mut receiver) = tokio::sync::mpsc::channel(capacity);
     let (startup, started) = tokio::sync::oneshot::channel();
-    let worker = tokio::task::spawn_blocking(move || {
-        let connection = match kind {
-            StoreConnectionKind::Writer => open_database(&directory),
-            StoreConnectionKind::QueryOnly => open_query_database(&directory),
-        };
-        let mut connection = match connection {
-            Ok(connection) => {
-                let _ = startup.send(Ok(()));
-                connection
-            }
-            Err(error) => {
-                let _ = startup.send(Err(error));
-                return Ok(());
-            }
-        };
+    let worker = std::thread::Builder::new()
+        .name("conduit-store".to_string())
+        .spawn(move || {
+            let connection = match kind {
+                StoreConnectionKind::Writer => open_database(&directory),
+                StoreConnectionKind::QueryOnly => open_query_database(&directory),
+            };
+            let mut connection = match connection {
+                Ok(connection) => {
+                    let _ = startup.send(Ok(()));
+                    connection
+                }
+                Err(error) => {
+                    let _ = startup.send(Err(error));
+                    return Ok(());
+                }
+            };
 
-        while let Some(request) = receiver.blocking_recv() {
-            match request {
-                StoreWorkerRequest::Task { task, response } => {
-                    let _ = response.send(task(&mut connection));
-                }
-                StoreWorkerRequest::Shutdown { response } => {
-                    let _ = response.send(());
-                    break;
+            while let Some(request) = receiver.blocking_recv() {
+                match request {
+                    StoreWorkerRequest::Task { task, response } => {
+                        let _ = response.send(task(&mut connection));
+                    }
+                    StoreWorkerRequest::Shutdown { response } => {
+                        let _ = response.send(());
+                        break;
+                    }
                 }
             }
-        }
-        Ok(())
-    });
+            Ok(())
+        })
+        .expect("failed to spawn workspace store worker");
     (sender, started, worker)
 }
 
@@ -336,12 +346,34 @@ fn classify_wrapped_store_error(error: &anyhow::Error) -> StoreErrorCategory {
     StoreErrorCategory::Unexpected
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WorkspaceStore {
     directory: PathBuf,
     workspace_id: String,
     workspace_key: String,
     update_lock: Arc<Mutex<()>>,
+    hub: Arc<tokio::sync::OnceCell<StoreHub>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorkspaceBootstrap {
+    pub(crate) workspace_id: String,
+    pub(crate) conversations: Vec<SlackConversation>,
+    pub(crate) user_names: HashMap<String, String>,
+    pub(crate) user_full_names: HashMap<String, String>,
+    pub(crate) user_avatar_urls: HashMap<String, String>,
+    pub(crate) user_search_aliases: HashMap<String, Vec<String>>,
+    pub(crate) user_statuses: HashMap<String, SlackUserStatus>,
+    pub(crate) thread_catalog: Vec<ThreadRecord>,
+    pub(crate) custom_emojis: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SyncFreshness {
+    pub(crate) refreshed_at_ms: Option<i64>,
+    pub(crate) retry_count: u32,
+    pub(crate) retry_after_ms: Option<i64>,
 }
 
 enum ConversationRowMutation<R> {
@@ -357,46 +389,263 @@ impl WorkspaceStore {
             workspace_id: workspace_id.to_string(),
             workspace_key: cache_key(workspace_id),
             update_lock: Arc::new(Mutex::new(())),
+            hub: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
-    pub async fn load_conversations(&self) -> Result<Option<Vec<SlackConversation>>> {
-        Ok(self
-            .load_state()
+    async fn hub(&self) -> Result<&StoreHub> {
+        let directory = self.directory.clone();
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub
+            .get_or_try_init(|| async move {
+                let hub = StoreHub::open(directory.clone()).await?;
+                hub.write(move |connection| {
+                    migrate_legacy_workspace(connection, &directory, &workspace_key, &workspace_id)
+                })
+                .await?;
+                Ok(hub)
+            })
+            .await
+    }
+
+    async fn query_or_reset<T, F>(&self, empty: T, query: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let hub = self.hub().await?;
+        match hub.query(query).await {
+            Err(error) if error.category() == StoreErrorCategory::CorruptData => {
+                let workspace_key = self.workspace_key.clone();
+                hub.write(move |connection| reset_sqlite_workspace(connection, &workspace_key))
+                    .await?;
+                Ok(empty)
+            }
+            result => result,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn load_kind_map<T>(&self, kind: &'static str) -> Result<HashMap<String, T>>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        let workspace_key = self.workspace_key.clone();
+        self.query_or_reset(HashMap::new(), move |connection| {
+            load_sqlite_kind_map(connection, &workspace_key, kind)
+        })
+        .await
+    }
+
+    async fn store_kind_map<T>(
+        &self,
+        kind: &'static str,
+        values: HashMap<String, T>,
+        replace: bool,
+    ) -> Result<()>
+    where
+        T: Serialize + Send + 'static,
+    {
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub()
             .await?
-            .map(|state| state.conversations)
-            .filter(|conversations| !conversations.is_empty()))
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                if replace {
+                    sync_sqlite_kind(&transaction, &workspace_key, kind, values)?;
+                } else {
+                    for (key, value) in values {
+                        upsert_sqlite_item(&transaction, &workspace_key, kind, &key, &value)?;
+                    }
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn update_thread_catalog<F>(&self, update: F) -> Result<Vec<ThreadRecord>>
+    where
+        F: FnOnce(&mut ThreadCatalog) + Send + 'static,
+    {
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                let records =
+                    load_sqlite_kind_values(&transaction, &workspace_key, "thread_record")?;
+                let mut catalog = ThreadCatalog::from_records(records);
+                update(&mut catalog);
+                let records = catalog.into_records();
+                sync_sqlite_kind(
+                    &transaction,
+                    &workspace_key,
+                    "thread_record",
+                    records.iter().cloned().map(|record| {
+                        (
+                            thread_key(&record.key.channel_id, &record.key.root_ts),
+                            record,
+                        )
+                    }),
+                )?;
+                transaction.commit()?;
+                Ok(records)
+            })
+            .await
+    }
+
+    pub(crate) async fn load_bootstrap(&self) -> Result<Option<WorkspaceBootstrap>> {
+        Ok(self.load_state().await?.map(WorkspaceBootstrap::from))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn load_sync_freshness(
+        &self,
+        operation: &str,
+        target: &str,
+    ) -> Result<Option<SyncFreshness>> {
+        if operation.trim().is_empty() || target.trim().is_empty() {
+            return Ok(None);
+        }
+        let workspace_key = self.workspace_key.clone();
+        let operation = operation.to_string();
+        let target = target.to_string();
+        self.hub()
+            .await?
+            .query(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT refreshed_at_ms, retry_count, retry_after_ms
+                         FROM sync_metadata
+                         WHERE workspace_key = ?1 AND operation = ?2 AND target = ?3",
+                        params![workspace_key, operation, target],
+                        |row| {
+                            Ok(SyncFreshness {
+                                refreshed_at_ms: row.get(0)?,
+                                retry_count: row.get(1)?,
+                                retry_after_ms: row.get(2)?,
+                            })
+                        },
+                    )
+                    .optional()
+                    .map_err(StoreError::from)
+            })
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn store_sync_freshness(
+        &self,
+        operation: &str,
+        target: &str,
+        freshness: SyncFreshness,
+    ) -> Result<()> {
+        if operation.trim().is_empty() || target.trim().is_empty() {
+            return Ok(());
+        }
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let operation = operation.to_string();
+        let target = target.to_string();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                transaction.execute(
+                    "INSERT INTO sync_metadata(
+                         workspace_key, operation, target,
+                         refreshed_at_ms, retry_count, retry_after_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(workspace_key, operation, target) DO UPDATE SET
+                         refreshed_at_ms = excluded.refreshed_at_ms,
+                         retry_count = excluded.retry_count,
+                         retry_after_ms = excluded.retry_after_ms",
+                    params![
+                        workspace_key,
+                        operation,
+                        target,
+                        freshness.refreshed_at_ms,
+                        freshness.retry_count,
+                        freshness.retry_after_ms
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn load_conversations(&self) -> Result<Option<Vec<SlackConversation>>> {
+        let workspace_key = self.workspace_key.clone();
+        let conversations = self
+            .query_or_reset(Vec::new(), move |connection| {
+                load_sqlite_kind_values(connection, &workspace_key, "conversation")
+            })
+            .await?;
+        Ok((!conversations.is_empty()).then_some(conversations))
     }
 
     /// Records the opaque workspace identity needed by desktop integrations,
     /// including when an older cache is opened while offline.
     pub async fn ensure_workspace_identity(&self) -> Result<()> {
-        let _guard = self.update_lock.lock().await;
-        let state = self.load_state_for_update().await?;
-        self.store_state_with_activation(&state, true).await
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, true)?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
     }
 
     pub async fn load_pending_unread_refresh(&self) -> Result<Vec<String>> {
-        Ok(self
-            .load_state()
-            .await?
-            .map(|state| state.pending_unread_refresh)
-            .unwrap_or_default())
-    }
-
-    pub async fn store_pending_unread_refresh(&self, channel_ids: &[String]) -> Result<()> {
-        self.update_state(|state| {
-            state.pending_unread_refresh = channel_ids.to_vec();
-            state.pending_unread_refresh.sort();
-            state.pending_unread_refresh.dedup();
+        let workspace_key = self.workspace_key.clone();
+        self.query_or_reset(Vec::new(), move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT item_key FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'pending_unread' ORDER BY item_key",
+            )?;
+            let keys = statement
+                .query_map([workspace_key], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(StoreError::from)?;
+            Ok(keys)
         })
         .await
     }
 
+    pub async fn store_pending_unread_refresh(&self, channel_ids: &[String]) -> Result<()> {
+        let values = channel_ids
+            .iter()
+            .filter(|channel_id| !channel_id.trim().is_empty())
+            .map(|channel_id| (channel_id.clone(), ()))
+            .collect();
+        self.store_kind_map("pending_unread", values, true).await
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn store_conversations(&self, conversations: &[SlackConversation]) -> Result<()> {
-        self.update_state(|state| state.conversations = conversations.to_vec())
-            .await
+        let values = conversations
+            .iter()
+            .filter(|conversation| !conversation.id.trim().is_empty())
+            .map(conversation_for_cache)
+            .map(|conversation| (conversation.id.clone(), conversation))
+            .collect();
+        self.store_kind_map("conversation", values, true).await
     }
 
     /// Reconciles an authoritative membership response in one locked cache
@@ -406,23 +655,41 @@ impl WorkspaceStore {
         &self,
         fresh: Vec<SlackConversation>,
     ) -> Result<Vec<SlackConversation>> {
-        let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await?;
-        if fresh.is_empty() && !state.conversations.is_empty() {
-            return Err(StoreError::rejected_update(
-                "Slack returned an unexpectedly empty conversation membership snapshot",
-            ));
-        }
-        let mut catalog =
-            ConversationCatalog::from_cached(std::mem::take(&mut state.conversations));
-        let mut snapshot = catalog.begin_membership_snapshot();
-        for conversation in fresh {
-            snapshot.upsert(conversation);
-        }
-        catalog.commit_membership_snapshot(snapshot);
-        state.conversations = catalog.conversations();
-        self.store_state(&state).await?;
-        Ok(state.conversations)
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let existing: Vec<SlackConversation> =
+                    load_sqlite_kind_values(&transaction, &workspace_key, "conversation")?;
+                if fresh.is_empty() && !existing.is_empty() {
+                    return Err(StoreError::rejected_update(
+                        "Slack returned an unexpectedly empty conversation membership snapshot",
+                    ));
+                }
+                let mut catalog = ConversationCatalog::from_cached(existing);
+                let mut snapshot = catalog.begin_membership_snapshot();
+                for conversation in fresh {
+                    snapshot.upsert(conversation);
+                }
+                catalog.commit_membership_snapshot(snapshot);
+                let conversations = catalog.conversations();
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                sync_sqlite_kind(
+                    &transaction,
+                    &workspace_key,
+                    "conversation",
+                    conversations
+                        .iter()
+                        .map(conversation_for_cache)
+                        .map(|conversation| (conversation.id.clone(), conversation)),
+                )?;
+                transaction.commit()?;
+                Ok(conversations)
+            })
+            .await
     }
 
     /// Merges one cached conversation without replacing newer unread/read
@@ -598,12 +865,9 @@ impl WorkspaceStore {
         .await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn load_user_names(&self) -> Result<HashMap<String, String>> {
-        Ok(self
-            .load_state()
-            .await?
-            .map(|state| state.user_names)
-            .unwrap_or_default())
+        self.load_kind_map("user_name").await
     }
 
     pub async fn store_user_name(&self, user_id: &str, display_name: &str) -> Result<()> {
@@ -613,105 +877,81 @@ impl WorkspaceStore {
     }
 
     pub async fn store_user_names(&self, user_names: &HashMap<String, String>) -> Result<()> {
-        self.update_state(|state| {
-            state.user_names.extend(
-                user_names
-                    .iter()
-                    .filter(|(user_id, display_name)| {
-                        !user_id.trim().is_empty() && !display_name.trim().is_empty()
-                    })
-                    .map(|(user_id, display_name)| (user_id.clone(), display_name.clone())),
-            );
-        })
-        .await
+        let values = user_names
+            .iter()
+            .filter(|(user_id, display_name)| {
+                !user_id.trim().is_empty() && !display_name.trim().is_empty()
+            })
+            .map(|(user_id, display_name)| (user_id.clone(), display_name.clone()))
+            .collect();
+        self.store_kind_map("user_name", values, false).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn load_user_full_names(&self) -> Result<HashMap<String, String>> {
-        Ok(self
-            .load_state()
-            .await?
-            .map(|state| state.user_full_names)
-            .unwrap_or_default())
+        self.load_kind_map("user_full_name").await
     }
 
     pub async fn store_user_full_names(
         &self,
         user_full_names: &HashMap<String, String>,
     ) -> Result<()> {
-        self.update_state(|state| {
-            state.user_full_names.extend(
-                user_full_names
-                    .iter()
-                    .filter(|(user_id, full_name)| {
-                        !user_id.trim().is_empty() && !full_name.trim().is_empty()
-                    })
-                    .map(|(user_id, full_name)| (user_id.clone(), full_name.clone())),
-            );
-        })
-        .await
+        let values = user_full_names
+            .iter()
+            .filter(|(user_id, full_name)| {
+                !user_id.trim().is_empty() && !full_name.trim().is_empty()
+            })
+            .map(|(user_id, full_name)| (user_id.clone(), full_name.clone()))
+            .collect();
+        self.store_kind_map("user_full_name", values, false).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn load_user_avatar_urls(&self) -> Result<HashMap<String, String>> {
-        Ok(self
-            .load_state()
-            .await?
-            .map(|state| state.user_avatar_urls)
-            .unwrap_or_default())
+        self.load_kind_map("user_avatar_url").await
     }
 
     pub async fn store_user_avatar_urls(
         &self,
         avatar_urls: &HashMap<String, String>,
     ) -> Result<()> {
-        self.update_state(|state| {
-            state.user_avatar_urls.extend(
-                avatar_urls
-                    .iter()
-                    .filter(|(user_id, url)| !user_id.trim().is_empty() && !url.trim().is_empty())
-                    .map(|(user_id, url)| (user_id.clone(), url.clone())),
-            );
-        })
-        .await
+        let values = avatar_urls
+            .iter()
+            .filter(|(user_id, url)| !user_id.trim().is_empty() && !url.trim().is_empty())
+            .map(|(user_id, url)| (user_id.clone(), url.clone()))
+            .collect();
+        self.store_kind_map("user_avatar_url", values, false).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn load_user_search_aliases(&self) -> Result<HashMap<String, Vec<String>>> {
-        Ok(self
-            .load_state()
-            .await?
-            .map(|state| state.user_search_aliases)
-            .unwrap_or_default())
+        self.load_kind_map("user_aliases").await
     }
 
     pub async fn store_user_search_aliases(
         &self,
         aliases: &HashMap<String, Vec<String>>,
     ) -> Result<()> {
-        self.update_state(|state| {
-            state.user_search_aliases = aliases
-                .iter()
-                .filter(|(user_id, aliases)| {
-                    !user_id.trim().is_empty()
-                        && aliases.iter().any(|alias| !alias.trim().is_empty())
-                })
-                .map(|(user_id, aliases)| (user_id.clone(), aliases.clone()))
-                .collect();
-        })
-        .await
+        let values = aliases
+            .iter()
+            .filter(|(user_id, aliases)| {
+                !user_id.trim().is_empty() && aliases.iter().any(|alias| !alias.trim().is_empty())
+            })
+            .map(|(user_id, aliases)| (user_id.clone(), aliases.clone()))
+            .collect();
+        self.store_kind_map("user_aliases", values, true).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn load_user_statuses(&self) -> Result<HashMap<String, SlackUserStatus>> {
-        Ok(self
-            .load_state()
-            .await?
-            .map(|state| state.user_statuses)
-            .unwrap_or_default())
+        self.load_kind_map("user_status").await
     }
 
     pub async fn store_user_statuses(
         &self,
         statuses: &HashMap<String, SlackUserStatus>,
     ) -> Result<()> {
-        self.update_state(|state| state.user_statuses = statuses.clone())
+        self.store_kind_map("user_status", statuses.clone(), true)
             .await
     }
 
@@ -720,52 +960,69 @@ impl WorkspaceStore {
         user_id: &str,
         status: Option<SlackUserStatus>,
     ) -> Result<()> {
-        self.update_state(|state| match status {
-            Some(status) => {
-                state.user_statuses.insert(user_id.to_string(), status);
-            }
-            None => {
-                state.user_statuses.remove(user_id);
-            }
-        })
-        .await
+        if user_id.trim().is_empty() {
+            return Ok(());
+        }
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let user_id = user_id.to_string();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                match status {
+                    Some(status) => upsert_sqlite_item(
+                        &transaction,
+                        &workspace_key,
+                        "user_status",
+                        &user_id,
+                        &status,
+                    )?,
+                    None => {
+                        transaction.execute(
+                            "DELETE FROM workspace_items
+                             WHERE workspace_key = ?1 AND kind = 'user_status' AND item_key = ?2",
+                            params![workspace_key, user_id],
+                        )?;
+                    }
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn load_custom_emojis(&self) -> Result<HashMap<String, String>> {
-        Ok(self
-            .load_state()
-            .await?
-            .map(|state| state.custom_emojis)
-            .unwrap_or_default())
+        self.load_kind_map("custom_emoji").await
     }
 
     pub async fn store_custom_emojis(&self, emojis: &HashMap<String, String>) -> Result<()> {
-        self.update_state(|state| state.custom_emojis = emojis.clone())
+        self.store_kind_map("custom_emoji", emojis.clone(), true)
             .await
     }
 
     pub async fn load_history(&self, channel_id: &str) -> Result<Option<Vec<SlackMessage>>> {
+        let workspace_key = self.workspace_key.clone();
+        let channel_id = channel_id.to_string();
         Ok(self
-            .load_state()
+            .query_or_reset(None, move |connection| {
+                load_sqlite_item::<Vec<SlackMessage>>(
+                    connection,
+                    &workspace_key,
+                    "channel_history",
+                    &channel_id,
+                )
+            })
             .await?
-            .and_then(|state| state.channel_histories.get(channel_id).cloned())
             .map(channel_timeline_messages)
             .filter(|messages| !messages.is_empty()))
     }
 
     pub async fn store_history(&self, channel_id: &str, messages: &[SlackMessage]) -> Result<()> {
-        self.update_state(|state| {
-            let existing = state
-                .channel_histories
-                .get(channel_id)
-                .cloned()
-                .unwrap_or_default();
-            state.channel_histories.insert(
-                channel_id.to_string(),
-                merge_channel_history_pages(&existing, messages),
-            );
-        })
-        .await
+        self.store_merged_history(channel_id, messages).await
     }
 
     pub async fn store_merged_history(
@@ -773,18 +1030,38 @@ impl WorkspaceStore {
         channel_id: &str,
         messages: &[SlackMessage],
     ) -> Result<()> {
-        self.update_state(|state| {
-            let existing = state
-                .channel_histories
-                .get(channel_id)
-                .cloned()
+        if channel_id.trim().is_empty() {
+            return Ok(());
+        }
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let channel_id = channel_id.to_string();
+        let messages = messages.to_vec();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let existing = load_sqlite_item::<Vec<SlackMessage>>(
+                    &transaction,
+                    &workspace_key,
+                    "channel_history",
+                    &channel_id,
+                )?
                 .unwrap_or_default();
-            state.channel_histories.insert(
-                channel_id.to_string(),
-                merge_channel_history_pages(&existing, messages),
-            );
-        })
-        .await
+                let merged = merge_channel_history_pages(&existing, &messages);
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                upsert_sqlite_item(
+                    &transaction,
+                    &workspace_key,
+                    "channel_history",
+                    &channel_id,
+                    &merged,
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
     }
 
     pub async fn load_thread(
@@ -793,10 +1070,17 @@ impl WorkspaceStore {
         thread_ts: &str,
     ) -> Result<Option<Vec<SlackMessage>>> {
         let key = thread_key(channel_id, thread_ts);
+        let workspace_key = self.workspace_key.clone();
         Ok(self
-            .load_state()
+            .query_or_reset(None, move |connection| {
+                load_sqlite_item::<Vec<SlackMessage>>(
+                    connection,
+                    &workspace_key,
+                    "thread_replies",
+                    &key,
+                )
+            })
             .await?
-            .and_then(|state| state.thread_replies.get(&key).cloned())
             .filter(|messages| !messages.is_empty()))
     }
 
@@ -806,14 +1090,9 @@ impl WorkspaceStore {
         thread_ts: &str,
         messages: &[SlackMessage],
     ) -> Result<()> {
-        self.update_state(|state| {
-            let key = thread_key(channel_id, thread_ts);
-            let existing = state.thread_replies.get(&key).cloned().unwrap_or_default();
-            state
-                .thread_replies
-                .insert(key, merge_history_pages(&existing, messages));
-        })
-        .await
+        self.store_merged_thread(channel_id, thread_ts, messages)
+            .await
+            .map(|_| ())
     }
 
     pub async fn store_merged_thread(
@@ -822,29 +1101,54 @@ impl WorkspaceStore {
         thread_ts: &str,
         messages: &[SlackMessage],
     ) -> Result<Vec<SlackMessage>> {
-        let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await?;
         let key = thread_key(channel_id, thread_ts);
-        let existing = state.thread_replies.get(&key).cloned().unwrap_or_default();
-        let merged = merge_history_pages(&existing, messages);
-        state.thread_replies.insert(key, merged.clone());
-        self.store_state(&state).await?;
-        Ok(merged)
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let messages = messages.to_vec();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let existing = load_sqlite_item::<Vec<SlackMessage>>(
+                    &transaction,
+                    &workspace_key,
+                    "thread_replies",
+                    &key,
+                )?
+                .unwrap_or_default();
+                let merged = merge_history_pages(&existing, &messages);
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                upsert_sqlite_item(
+                    &transaction,
+                    &workspace_key,
+                    "thread_replies",
+                    &key,
+                    &merged,
+                )?;
+                transaction.commit()?;
+                Ok(merged)
+            })
+            .await
     }
 
     #[allow(dead_code)]
     pub async fn load_thread_catalog(&self) -> Result<Vec<ThreadRecord>> {
-        Ok(self
-            .load_state()
-            .await?
-            .map(|state| state.thread_catalog)
-            .unwrap_or_default())
+        let workspace_key = self.workspace_key.clone();
+        self.query_or_reset(Vec::new(), move |connection| {
+            load_sqlite_kind_values(connection, &workspace_key, "thread_record")
+        })
+        .await
     }
 
     #[allow(dead_code)]
     pub async fn store_thread_catalog(&self, records: &[ThreadRecord]) -> Result<()> {
-        self.update_state(|state| state.thread_catalog = records.to_vec())
-            .await
+        let records = records.to_vec();
+        self.update_thread_catalog(move |catalog| {
+            *catalog = ThreadCatalog::from_records(records);
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn observe_thread_history(
@@ -852,13 +1156,13 @@ impl WorkspaceStore {
         channel_id: &str,
         messages: &[SlackMessage],
     ) -> Result<()> {
-        self.update_state(|state| {
-            let mut catalog =
-                ThreadCatalog::from_records(std::mem::take(&mut state.thread_catalog));
-            catalog.observe_history(channel_id, messages);
-            state.thread_catalog = catalog.into_records();
+        let channel_id = channel_id.to_string();
+        let messages = messages.to_vec();
+        self.update_thread_catalog(move |catalog| {
+            catalog.observe_history(&channel_id, &messages);
         })
         .await
+        .map(|_| ())
     }
 
     pub async fn observe_thread_page(
@@ -868,13 +1172,14 @@ impl WorkspaceStore {
         messages: &[SlackMessage],
         complete: bool,
     ) -> Result<()> {
-        self.update_state(|state| {
-            let mut catalog =
-                ThreadCatalog::from_records(std::mem::take(&mut state.thread_catalog));
-            catalog.observe_thread(channel_id, root_ts, messages, complete);
-            state.thread_catalog = catalog.into_records();
+        let channel_id = channel_id.to_string();
+        let root_ts = root_ts.to_string();
+        let messages = messages.to_vec();
+        self.update_thread_catalog(move |catalog| {
+            catalog.observe_thread(&channel_id, &root_ts, &messages, complete);
         })
         .await
+        .map(|_| ())
     }
 
     pub async fn observe_thread_realtime(
@@ -883,13 +1188,14 @@ impl WorkspaceStore {
         message: &SlackMessage,
         current_user_id: Option<&str>,
     ) -> Result<()> {
-        self.update_state(|state| {
-            let mut catalog =
-                ThreadCatalog::from_records(std::mem::take(&mut state.thread_catalog));
-            catalog.observe_realtime(channel_id, message, current_user_id);
-            state.thread_catalog = catalog.into_records();
+        let channel_id = channel_id.to_string();
+        let message = message.clone();
+        let current_user_id = current_user_id.map(str::to_string);
+        self.update_thread_catalog(move |catalog| {
+            catalog.observe_realtime(&channel_id, &message, current_user_id.as_deref());
         })
         .await
+        .map(|_| ())
     }
 
     pub async fn mark_thread_read(
@@ -898,15 +1204,17 @@ impl WorkspaceStore {
         root_ts: &str,
         last_read: &str,
     ) -> Result<()> {
-        self.update_state(|state| {
-            let mut catalog =
-                ThreadCatalog::from_records(std::mem::take(&mut state.thread_catalog));
-            catalog.mark_read(channel_id, root_ts, last_read);
-            state.thread_catalog = catalog.into_records();
+        let channel_id = channel_id.to_string();
+        let root_ts = root_ts.to_string();
+        let last_read = last_read.to_string();
+        self.update_thread_catalog(move |catalog| {
+            catalog.mark_read(&channel_id, &root_ts, &last_read);
         })
         .await
+        .map(|_| ())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn update_state(&self, update: impl FnOnce(&mut CachedWorkspaceState)) -> Result<()> {
         let _guard = self.update_lock.lock().await;
         let mut state = self.load_state_for_update().await?;
@@ -938,65 +1246,51 @@ impl WorkspaceStore {
         // Startup and realtime sync can apply thousands of isolated conversation patches.
         // Keep those mutations row-scoped instead of rebuilding every cached workspace item.
         let _guard = self.update_lock.lock().await;
-        let directory = self.directory.clone();
         let workspace_key = self.workspace_key.clone();
         let workspace_id = self.workspace_id.clone();
         let channel_id = channel_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut connection = open_database(&directory)?;
-            migrate_legacy_workspace(&mut connection, &directory, &workspace_key, &workspace_id)?;
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let existing = load_sqlite_conversation(&transaction, &workspace_key, &channel_id)?;
-            match update(existing) {
-                ConversationRowMutation::Unchanged(result) => {
-                    transaction.rollback()?;
-                    Ok(result)
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let existing = load_sqlite_conversation(&transaction, &workspace_key, &channel_id)?;
+                match update(existing) {
+                    ConversationRowMutation::Unchanged(result) => {
+                        transaction.rollback()?;
+                        Ok(result)
+                    }
+                    ConversationRowMutation::Upsert(conversation, result) => {
+                        upsert_sqlite_conversation(
+                            &transaction,
+                            &workspace_key,
+                            &workspace_id,
+                            &conversation,
+                        )?;
+                        transaction.commit()?;
+                        Ok(result)
+                    }
+                    ConversationRowMutation::Delete(result) => {
+                        transaction.execute(
+                            "DELETE FROM workspace_items
+                             WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = ?2",
+                            params![workspace_key, channel_id],
+                        )?;
+                        transaction.commit()?;
+                        Ok(result)
+                    }
                 }
-                ConversationRowMutation::Upsert(conversation, result) => {
-                    upsert_sqlite_conversation(
-                        &transaction,
-                        &workspace_key,
-                        &workspace_id,
-                        &conversation,
-                    )?;
-                    transaction.commit()?;
-                    Ok(result)
-                }
-                ConversationRowMutation::Delete(result) => {
-                    transaction.execute(
-                        "DELETE FROM workspace_items
-                         WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = ?2",
-                        params![workspace_key, channel_id],
-                    )?;
-                    transaction.commit()?;
-                    Ok(result)
-                }
-            }
-        })
-        .await
-        .context("workspace conversation cache writer stopped unexpectedly")?
+            })
+            .await
     }
 
     async fn load_state(&self) -> Result<Option<CachedWorkspaceState>> {
-        let directory = self.directory.clone();
         let workspace_key = self.workspace_key.clone();
-        let workspace_id = self.workspace_id.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut connection = open_database(&directory)?;
-            migrate_legacy_workspace(&mut connection, &directory, &workspace_key, &workspace_id)?;
-            match load_sqlite_state(&connection, &workspace_key) {
-                Err(error) if error.category() == StoreErrorCategory::CorruptData => {
-                    drop(connection);
-                    recreate_derived_cache(&directory)?;
-                    let _ = open_database(&directory)?;
-                    Ok(None)
-                }
-                result => result,
-            }
-        })
-        .await
-        .context("workspace cache reader stopped unexpectedly")?;
+        let result = self
+            .query_or_reset(None, move |connection| {
+                load_sqlite_state(connection, &workspace_key)
+            })
+            .await;
         if let Err(error) = &result {
             crate::debug::log(
                 "store",
@@ -1006,6 +1300,7 @@ impl WorkspaceStore {
         result
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn load_state_for_update(&self) -> Result<CachedWorkspaceState> {
         let mut state = self
             .load_state()
@@ -1015,24 +1310,25 @@ impl WorkspaceStore {
         Ok(state)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn store_state(&self, state: &CachedWorkspaceState) -> Result<()> {
         self.store_state_with_activation(state, false).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn store_state_with_activation(
         &self,
         state: &CachedWorkspaceState,
         activate: bool,
     ) -> Result<()> {
-        let directory = self.directory.clone();
         let workspace_key = self.workspace_key.clone();
         let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut connection = open_database(&directory)?;
-            store_sqlite_state(&mut connection, &workspace_key, &state, activate)
-        })
-        .await
-        .context("workspace cache writer stopped unexpectedly")?
+        self.hub()
+            .await?
+            .write(move |connection| {
+                store_sqlite_state(connection, &workspace_key, &state, activate)
+            })
+            .await
     }
 
     #[cfg(test)]
@@ -1091,6 +1387,22 @@ impl CachedWorkspaceState {
             thread_catalog: Vec::new(),
             pending_unread_refresh: Vec::new(),
             custom_emojis: HashMap::new(),
+        }
+    }
+}
+
+impl From<CachedWorkspaceState> for WorkspaceBootstrap {
+    fn from(state: CachedWorkspaceState) -> Self {
+        Self {
+            workspace_id: state.workspace_id,
+            conversations: state.conversations,
+            user_names: state.user_names,
+            user_full_names: state.user_full_names,
+            user_avatar_urls: state.user_avatar_urls,
+            user_search_aliases: state.user_search_aliases,
+            user_statuses: state.user_statuses,
+            thread_catalog: state.thread_catalog,
+            custom_emojis: state.custom_emojis,
         }
     }
 }
@@ -1366,6 +1678,63 @@ fn load_sqlite_state(
     Ok(Some(state))
 }
 
+fn load_sqlite_kind_map<T: DeserializeOwned>(
+    connection: &Connection,
+    workspace_key: &str,
+    kind: &str,
+) -> Result<HashMap<String, T>> {
+    let mut statement = connection.prepare(
+        "SELECT item_key, payload_json FROM workspace_items
+         WHERE workspace_key = ?1 AND kind = ?2 ORDER BY item_key",
+    )?;
+    let rows = statement.query_map(params![workspace_key, kind], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut values = HashMap::new();
+    for row in rows {
+        let (key, payload) = row?;
+        values.insert(
+            key,
+            serde_json::from_str(&payload)
+                .with_context(|| format!("invalid cached {kind} item"))?,
+        );
+    }
+    Ok(values)
+}
+
+fn load_sqlite_kind_values<T: DeserializeOwned>(
+    connection: &Connection,
+    workspace_key: &str,
+    kind: &str,
+) -> Result<Vec<T>> {
+    Ok(load_sqlite_kind_map(connection, workspace_key, kind)?
+        .into_values()
+        .collect())
+}
+
+fn load_sqlite_item<T: DeserializeOwned>(
+    connection: &Connection,
+    workspace_key: &str,
+    kind: &str,
+    item_key: &str,
+) -> Result<Option<T>> {
+    let payload = connection
+        .query_row(
+            "SELECT payload_json FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+            params![workspace_key, kind, item_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload)
+                .with_context(|| format!("invalid cached {kind} item"))
+                .map_err(StoreError::from)
+        })
+        .transpose()
+}
+
 fn load_sqlite_conversation(
     transaction: &Transaction<'_>,
     workspace_key: &str,
@@ -1488,18 +1857,43 @@ fn store_sqlite_state(
 ) -> Result<()> {
     let desired = state_items(state)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure_sqlite_workspace(&transaction, workspace_key, &state.workspace_id, activate)?;
+    sync_state_items(&transaction, workspace_key, desired)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn ensure_sqlite_workspace(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    workspace_id: &str,
+    activate: bool,
+) -> Result<()> {
     transaction.execute(
         "INSERT INTO workspaces(workspace_key, workspace_id) VALUES (?1, ?2)
          ON CONFLICT(workspace_key) DO UPDATE SET workspace_id = excluded.workspace_id",
-        params![workspace_key, state.workspace_id],
+        params![workspace_key, workspace_id],
     )?;
-    sync_state_items(&transaction, workspace_key, desired)?;
     if activate {
         transaction.execute(
             "UPDATE app_state SET active_workspace_key = ?1 WHERE singleton = 1",
             [workspace_key],
         )?;
     }
+    Ok(())
+}
+
+fn reset_sqlite_workspace(connection: &mut Connection, workspace_key: &str) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "UPDATE app_state SET active_workspace_key = NULL
+         WHERE singleton = 1 AND active_workspace_key = ?1",
+        [workspace_key],
+    )?;
+    transaction.execute(
+        "DELETE FROM workspaces WHERE workspace_key = ?1",
+        [workspace_key],
+    )?;
     transaction.commit()?;
     Ok(())
 }
@@ -1546,6 +1940,76 @@ fn sync_state_items(
              ON CONFLICT(workspace_key, kind, item_key)
              DO UPDATE SET payload_json = excluded.payload_json",
             params![workspace_key, kind, item_key, payload],
+        )?;
+    }
+    Ok(())
+}
+
+fn upsert_sqlite_item<T: Serialize>(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    item_key: &str,
+    value: &T,
+) -> Result<()> {
+    let payload = serde_json::to_string(value).context("failed to serialize cached item")?;
+    transaction.execute(
+        "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(workspace_key, kind, item_key)
+         DO UPDATE SET payload_json = excluded.payload_json
+         WHERE payload_json IS NOT excluded.payload_json",
+        params![workspace_key, kind, item_key, payload],
+    )?;
+    Ok(())
+}
+
+fn sync_sqlite_kind<T: Serialize>(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    values: impl IntoIterator<Item = (String, T)>,
+) -> Result<()> {
+    let desired = values
+        .into_iter()
+        .map(|(key, value)| {
+            Ok((
+                key,
+                serde_json::to_string(&value).context("failed to serialize cached item")?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    let mut current = HashMap::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT item_key, payload_json FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = ?2",
+        )?;
+        let rows = statement.query_map(params![workspace_key, kind], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (key, payload) = row?;
+            current.insert(key, payload);
+        }
+    }
+    for key in current.keys().filter(|key| !desired.contains_key(*key)) {
+        transaction.execute(
+            "DELETE FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+            params![workspace_key, kind, key],
+        )?;
+    }
+    for (key, payload) in desired {
+        if current.get(&key) == Some(&payload) {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace_key, kind, item_key)
+             DO UPDATE SET payload_json = excluded.payload_json",
+            params![workspace_key, kind, key, payload],
         )?;
     }
     Ok(())
@@ -2238,6 +2702,138 @@ mod tests {
                 hub.write(|_| Ok(())).await,
                 Err(StoreError::HubClosed)
             ));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_bootstrap_loads_all_startup_domains_in_one_projection() {
+        let directory = temp_cache_dir("workspace-bootstrap");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store
+                .store_user_names(&HashMap::from([("U1".into(), "Ada".into())]))
+                .await
+                .unwrap();
+            store
+                .store_user_full_names(&HashMap::from([("U1".into(), "Ada Lovelace".into())]))
+                .await
+                .unwrap();
+            store
+                .store_user_avatar_urls(&HashMap::from([(
+                    "U1".into(),
+                    "https://avatars.slack-edge.com/u1.png".into(),
+                )]))
+                .await
+                .unwrap();
+            store
+                .store_user_search_aliases(&HashMap::from([(
+                    "U1".into(),
+                    vec!["ada".into(), "lovelace".into()],
+                )]))
+                .await
+                .unwrap();
+            store
+                .store_custom_emojis(&HashMap::from([(
+                    "party".into(),
+                    "https://emoji.slack-edge.com/party.png".into(),
+                )]))
+                .await
+                .unwrap();
+
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(bootstrap.workspace_id, "T123:U123");
+            assert_eq!(bootstrap.conversations[0].id, "C1");
+            assert_eq!(bootstrap.user_names["U1"], "Ada");
+            assert_eq!(bootstrap.user_full_names["U1"], "Ada Lovelace");
+            assert!(bootstrap.user_avatar_urls["U1"].ends_with("u1.png"));
+            assert_eq!(bootstrap.user_search_aliases["U1"][0], "ada");
+            assert!(bootstrap.custom_emojis.contains_key("party"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn focused_repository_reads_ignore_malformed_unrelated_domains() {
+        let directory = temp_cache_dir("workspace-focused-reads");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_history(
+                    "C1",
+                    &[SlackMessage {
+                        ts: "1.0".into(),
+                        text: Some("history".into()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+            store
+                .store_user_names(&HashMap::from([("U1".into(), "Ada".into())]))
+                .await
+                .unwrap();
+        });
+        let connection = Connection::open(store.database_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
+                 VALUES (?1, 'conversation', 'BROKEN', '{broken')",
+                [&store.workspace_key],
+            )
+            .unwrap();
+        drop(connection);
+
+        runtime().block_on(async {
+            assert_eq!(
+                store.load_history("C1").await.unwrap().unwrap()[0].body_text(),
+                "history"
+            );
+            assert_eq!(store.load_user_names().await.unwrap()["U1"], "Ada");
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn sync_freshness_round_trips_success_and_retry_metadata() {
+        let directory = temp_cache_dir("workspace-sync-freshness");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            assert_eq!(
+                store
+                    .load_sync_freshness("membership", "workspace")
+                    .await
+                    .unwrap(),
+                None
+            );
+            let freshness = SyncFreshness {
+                refreshed_at_ms: Some(1_721_500_000_000),
+                retry_count: 3,
+                retry_after_ms: Some(1_721_500_030_000),
+            };
+            store
+                .store_sync_freshness("membership", "workspace", freshness.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .load_sync_freshness("membership", "workspace")
+                    .await
+                    .unwrap(),
+                Some(freshness)
+            );
+            assert_eq!(
+                store.load_sync_freshness("history", "C1").await.unwrap(),
+                None
+            );
         });
         let _ = std::fs::remove_dir_all(directory);
     }
