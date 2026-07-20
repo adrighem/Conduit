@@ -38,6 +38,7 @@ use crate::thread_catalog::ThreadRecord;
 use crate::workspace_state::WorkspaceLifecycleEvent;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
+const CONVERSATION_ENRICHMENT_LIMIT: usize = 30;
 const MAX_UNREAD_REFRESH_PASSES: usize = 3;
 const UNREAD_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const CONVERSATION_PATCH_BATCH_SIZE: usize = 20;
@@ -2467,6 +2468,7 @@ fn conversation_unread_refresh_candidates(conversations: &[SlackConversation]) -
     candidates.dedup_by(|left, right| left.id == right.id);
     candidates
         .into_iter()
+        .take(CONVERSATION_ENRICHMENT_LIMIT)
         .map(|candidate| candidate.id)
         .collect()
 }
@@ -3793,8 +3795,9 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
             ),
         }
     }
-    pending.sort();
-    pending.dedup();
+    let mut seen = HashSet::new();
+    pending.retain(|channel_id| seen.insert(channel_id.clone()));
+    pending.truncate(CONVERSATION_ENRICHMENT_LIMIT);
     if let Some(store) = workspace_store.as_ref() {
         if let Err(error) = store.store_pending_unread_refresh(&pending).await {
             crate::debug::log(
@@ -6156,7 +6159,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_unread_refresh_candidates_prioritize_attention_and_cover_every_item() {
+    fn conversation_unread_refresh_candidates_prioritize_attention_and_limit_work() {
         let conversations = vec![
             channel("C-zebra", 0, None),
             archived_channel("C-archived", 10),
@@ -6173,7 +6176,10 @@ mod tests {
         let many = (0..75)
             .map(|index| channel(&format!("C{index}"), 0, None))
             .collect::<Vec<_>>();
-        assert_eq!(conversation_unread_refresh_candidates(&many).len(), 75);
+        assert_eq!(
+            conversation_unread_refresh_candidates(&many).len(),
+            CONVERSATION_ENRICHMENT_LIMIT
+        );
     }
 
     #[test]

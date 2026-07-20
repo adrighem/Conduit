@@ -538,11 +538,19 @@ fn record_store_work(metrics: &StoreMetrics, transactions: u64, changed: u64, sk
     tracing::trace!(
         target: "conduit::store",
         event = "store_batch",
-        outcome = "committed",
+        outcome = store_work_outcome(transactions),
         transactions,
         changed_rows = changed,
         skipped_rows = skipped
     );
+}
+
+fn store_work_outcome(transactions: u64) -> &'static str {
+    if transactions == 0 {
+        "unchanged"
+    } else {
+        "committed"
+    }
 }
 
 fn classify_database_error(error: &rusqlite::Error) -> StoreErrorCategory {
@@ -2121,7 +2129,8 @@ fn ensure_sqlite_workspace(
 ) -> Result<bool> {
     let mut changed = transaction.execute(
         "INSERT INTO workspaces(workspace_key, workspace_id) VALUES (?1, ?2)
-         ON CONFLICT(workspace_key) DO UPDATE SET workspace_id = excluded.workspace_id",
+         ON CONFLICT(workspace_key) DO UPDATE SET workspace_id = excluded.workspace_id
+         WHERE workspaces.workspace_id IS NOT excluded.workspace_id",
         params![workspace_key, workspace_id],
     )? > 0;
     if activate {
@@ -3236,6 +3245,12 @@ mod tests {
             assert!(after_identical.skipped_rows > after_insert.skipped_rows);
         });
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn store_work_outcome_never_labels_zero_transactions_as_committed() {
+        assert_eq!(store_work_outcome(0), "unchanged");
+        assert_eq!(store_work_outcome(1), "committed");
     }
 
     #[test]
