@@ -89,9 +89,15 @@ def run_test() -> int:
                 [sys.executable, *sys.argv[1:]], env=environment
             ).returncode
         finally:
-            window_manager.terminate()
-            window_manager.wait(timeout=5)
-            os.kill(int(output[1]), 15)
+            try:
+                window_manager.terminate()
+                try:
+                    window_manager.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    window_manager.kill()
+                    window_manager.wait(timeout=5)
+            finally:
+                os.kill(int(output[1]), 15)
 
 
 if os.environ.get("CONDUIT_HEADLESS_INNER") == "1":
