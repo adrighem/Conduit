@@ -116,6 +116,12 @@ pub struct WorkspaceStore {
     update_lock: Arc<Mutex<()>>,
 }
 
+enum ConversationRowMutation<R> {
+    Unchanged(R),
+    Upsert(SlackConversation, R),
+    Delete(R),
+}
+
 impl WorkspaceStore {
     pub fn new(directory: PathBuf, workspace_id: &str) -> Self {
         Self {
@@ -198,26 +204,22 @@ impl WorkspaceStore {
             return Ok(());
         }
 
-        self.update_state(|state| {
-            let mut catalog =
-                ConversationCatalog::from_cached(std::mem::take(&mut state.conversations));
-            catalog.upsert_metadata(conversation.clone());
-            state.conversations = catalog.conversations();
+        let incoming = conversation.clone();
+        self.mutate_conversation_row(&conversation.id, move |existing| {
+            let mut catalog = ConversationCatalog::from_cached(existing);
+            catalog.upsert_metadata(incoming);
+            let conversation = catalog
+                .conversations()
+                .into_iter()
+                .next()
+                .expect("metadata upsert should produce a conversation");
+            ConversationRowMutation::Upsert(conversation, ())
         })
         .await
     }
 
     pub async fn merge_conversation(&self, conversation: &SlackConversation) -> Result<()> {
-        if conversation.id.trim().is_empty() {
-            return Ok(());
-        }
-        self.update_state(|state| {
-            let mut catalog =
-                ConversationCatalog::from_cached(std::mem::take(&mut state.conversations));
-            catalog.upsert_metadata(conversation.clone());
-            state.conversations = catalog.conversations();
-        })
-        .await
+        self.store_conversation(conversation).await
     }
 
     /// Applies an unread-state patch to one cached conversation atomically.
@@ -233,26 +235,27 @@ impl WorkspaceStore {
             return Ok(false);
         }
 
-        let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await?;
-        let Some(conversation) = state
-            .conversations
-            .iter_mut()
-            .find(|conversation| conversation.id == channel_id)
-        else {
-            return Ok(false);
-        };
-        let newer_local_read = conversation
-            .extra
-            .get(LOCAL_READ_TS_KEY)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|local| server_last_read.is_none_or(|server| local > server));
-        if newer_local_read {
-            return Ok(false);
-        }
-        conversation.apply_unread_state(unread_state);
-        self.store_state(&state).await?;
-        Ok(true)
+        let server_last_read = server_last_read.map(str::to_string);
+        self.mutate_conversation_row(channel_id, move |conversation| {
+            let Some(mut conversation) = conversation else {
+                return ConversationRowMutation::Unchanged(false);
+            };
+            let newer_local_read = conversation
+                .extra
+                .get(LOCAL_READ_TS_KEY)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|local| {
+                    server_last_read
+                        .as_deref()
+                        .is_none_or(|server| local > server)
+                });
+            if newer_local_read {
+                return ConversationRowMutation::Unchanged(false);
+            }
+            conversation.apply_unread_state(unread_state);
+            ConversationRowMutation::Upsert(conversation, true)
+        })
+        .await
     }
 
     /// Advances one cached conversation's read cursor without assuming that
@@ -266,20 +269,21 @@ impl WorkspaceStore {
             return Ok(false);
         }
 
-        self.update_conversation(channel_id, |conversation| {
+        let last_read = last_read.to_string();
+        self.update_conversation(channel_id, move |conversation| {
             let reached_latest = conversation
                 .latest_message_ts()
-                .is_none_or(|latest| latest <= last_read);
+                .is_none_or(|latest| latest <= last_read.as_str());
             if reached_latest {
                 conversation.clear_unread_activity();
             }
             conversation.extra.insert(
                 "last_read".to_string(),
-                serde_json::Value::String(last_read.to_string()),
+                serde_json::Value::String(last_read.clone()),
             );
             conversation.extra.insert(
                 LOCAL_READ_TS_KEY.to_string(),
-                serde_json::Value::String(last_read.to_string()),
+                serde_json::Value::String(last_read),
             );
         })
         .await
@@ -303,59 +307,50 @@ impl WorkspaceStore {
             return Ok(false);
         }
 
-        let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await?;
-        let conversation = if let Some(conversation) = state
-            .conversations
-            .iter_mut()
-            .find(|conversation| conversation.id == channel_id)
-        {
-            conversation
-        } else {
-            state.conversations.push(SlackConversation {
-                id: channel_id.to_string(),
+        let channel_id = channel_id.to_string();
+        let inserted_channel_id = channel_id.clone();
+        let message_ts = message_ts.to_string();
+        self.mutate_conversation_row(&channel_id, move |conversation| {
+            let mut conversation = conversation.unwrap_or_else(|| SlackConversation {
+                id: inserted_channel_id,
                 ..Default::default()
             });
-            state
-                .conversations
-                .last_mut()
-                .expect("inserted conversation should exist")
-        };
-        if conversation
-            .extra
-            .get(LOCAL_READ_TS_KEY)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|last_read| message_ts <= last_read)
-        {
-            return Ok(false);
-        }
-        let mut seen = conversation
-            .extra
-            .get(SEEN_REALTIME_MESSAGE_TS_KEY)
-            .and_then(serde_json::Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if seen.iter().any(|seen_ts| seen_ts == message_ts) {
-            return Ok(false);
-        }
-        let count = conversation.unread_activity_count().saturating_add(1);
-        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, count));
-        seen.push(message_ts.to_string());
-        if seen.len() > MAX_SEEN_REALTIME_MESSAGES {
-            seen.drain(..seen.len() - MAX_SEEN_REALTIME_MESSAGES);
-        }
-        conversation.extra.insert(
-            SEEN_REALTIME_MESSAGE_TS_KEY.to_string(),
-            serde_json::Value::Array(seen.into_iter().map(serde_json::Value::String).collect()),
-        );
-        self.store_state(&state).await?;
-        Ok(true)
+            if conversation
+                .extra
+                .get(LOCAL_READ_TS_KEY)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|last_read| message_ts.as_str() <= last_read)
+            {
+                return ConversationRowMutation::Unchanged(false);
+            }
+            let mut seen = conversation
+                .extra
+                .get(SEEN_REALTIME_MESSAGE_TS_KEY)
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if seen.iter().any(|seen_ts| seen_ts == &message_ts) {
+                return ConversationRowMutation::Unchanged(false);
+            }
+            let count = conversation.unread_activity_count().saturating_add(1);
+            conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, count));
+            seen.push(message_ts);
+            if seen.len() > MAX_SEEN_REALTIME_MESSAGES {
+                seen.drain(..seen.len() - MAX_SEEN_REALTIME_MESSAGES);
+            }
+            conversation.extra.insert(
+                SEEN_REALTIME_MESSAGE_TS_KEY.to_string(),
+                serde_json::Value::Array(seen.into_iter().map(serde_json::Value::String).collect()),
+            );
+            ConversationRowMutation::Upsert(conversation, true)
+        })
+        .await
     }
 
     /// Removes one cached conversation without disturbing other catalog data.
@@ -365,17 +360,14 @@ impl WorkspaceStore {
             return Ok(false);
         }
 
-        let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await?;
-        let previous_len = state.conversations.len();
-        state
-            .conversations
-            .retain(|conversation| conversation.id != channel_id);
-        if state.conversations.len() == previous_len {
-            return Ok(false);
-        }
-        self.store_state(&state).await?;
-        Ok(true)
+        self.mutate_conversation_row(channel_id, |conversation| {
+            if conversation.is_some() {
+                ConversationRowMutation::Delete(true)
+            } else {
+                ConversationRowMutation::Unchanged(false)
+            }
+        })
+        .await
     }
 
     pub async fn load_user_names(&self) -> Result<HashMap<String, String>> {
@@ -698,20 +690,64 @@ impl WorkspaceStore {
     async fn update_conversation(
         &self,
         channel_id: &str,
-        update: impl FnOnce(&mut SlackConversation),
+        update: impl FnOnce(&mut SlackConversation) + Send + 'static,
     ) -> Result<bool> {
+        self.mutate_conversation_row(channel_id, move |conversation| {
+            let Some(mut conversation) = conversation else {
+                return ConversationRowMutation::Unchanged(false);
+            };
+            update(&mut conversation);
+            ConversationRowMutation::Upsert(conversation, true)
+        })
+        .await
+    }
+
+    async fn mutate_conversation_row<R, F>(&self, channel_id: &str, update: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(Option<SlackConversation>) -> ConversationRowMutation<R> + Send + 'static,
+    {
+        // Startup and realtime sync can apply thousands of isolated conversation patches.
+        // Keep those mutations row-scoped instead of rebuilding every cached workspace item.
         let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await?;
-        let Some(conversation) = state
-            .conversations
-            .iter_mut()
-            .find(|conversation| conversation.id == channel_id)
-        else {
-            return Ok(false);
-        };
-        update(conversation);
-        self.store_state(&state).await?;
-        Ok(true)
+        let directory = self.directory.clone();
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let channel_id = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = open_database(&directory)?;
+            migrate_legacy_workspace(&mut connection, &directory, &workspace_key, &workspace_id)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = load_sqlite_conversation(&transaction, &workspace_key, &channel_id)?;
+            match update(existing) {
+                ConversationRowMutation::Unchanged(result) => {
+                    transaction.rollback()?;
+                    Ok(result)
+                }
+                ConversationRowMutation::Upsert(conversation, result) => {
+                    upsert_sqlite_conversation(
+                        &transaction,
+                        &workspace_key,
+                        &workspace_id,
+                        &conversation,
+                    )?;
+                    transaction.commit()?;
+                    Ok(result)
+                }
+                ConversationRowMutation::Delete(result) => {
+                    transaction.execute(
+                        "DELETE FROM workspace_items
+                         WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = ?2",
+                        params![workspace_key, channel_id],
+                    )?;
+                    transaction.commit()?;
+                    Ok(result)
+                }
+            }
+        })
+        .await
+        .context("workspace conversation cache writer stopped unexpectedly")?
     }
 
     async fn load_state(&self) -> Result<Option<CachedWorkspaceState>> {
@@ -1004,6 +1040,50 @@ fn load_sqlite_state(
         }
     }
     Ok(Some(state))
+}
+
+fn load_sqlite_conversation(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    channel_id: &str,
+) -> Result<Option<SlackConversation>> {
+    let payload = transaction
+        .query_row(
+            "SELECT payload_json
+             FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = ?2",
+            params![workspace_key, channel_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    payload
+        .map(|payload| serde_json::from_str(&payload).context("invalid cached conversation"))
+        .transpose()
+        .map_err(StoreError::from)
+}
+
+fn upsert_sqlite_conversation(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    workspace_id: &str,
+    conversation: &SlackConversation,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO workspaces(workspace_key, workspace_id) VALUES (?1, ?2)
+         ON CONFLICT(workspace_key) DO UPDATE SET workspace_id = excluded.workspace_id",
+        params![workspace_key, workspace_id],
+    )?;
+    let conversation = conversation_for_cache(conversation);
+    let payload = serde_json::to_string(&conversation)
+        .context("failed to serialize cached workspace item")?;
+    transaction.execute(
+        "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
+         VALUES (?1, 'conversation', ?2, ?3)
+         ON CONFLICT(workspace_key, kind, item_key)
+         DO UPDATE SET payload_json = excluded.payload_json",
+        params![workspace_key, conversation.id, payload],
+    )?;
+    Ok(())
 }
 
 fn load_sqlite_search_state(
@@ -1545,9 +1625,13 @@ mod tests {
             assert!(conversation.has_huddle_metadata());
 
             store
-                .store_conversations(&[conversation])
+                .store_conversations(std::slice::from_ref(&conversation))
                 .await
-                .expect("conversation store failed");
+                .expect("conversation snapshot store failed");
+            store
+                .store_conversation(&conversation)
+                .await
+                .expect("conversation row store failed");
 
             let cached = store
                 .load_conversations()
@@ -1761,6 +1845,99 @@ mod tests {
                 .iter()
                 .any(|conversation| conversation.id == "C3"));
         });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn conversation_row_mutations_ignore_unrelated_corrupt_rows() {
+        let directory = temp_cache_dir("workspace-store-conversation-row-update");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_conversations(&[
+                    SlackConversation {
+                        id: "C1".to_string(),
+                        name: Some("old".to_string()),
+                        unread_count: Some(3),
+                        ..Default::default()
+                    },
+                    SlackConversation {
+                        id: "C2".to_string(),
+                        name: Some("unrelated".to_string()),
+                        ..Default::default()
+                    },
+                ])
+                .await
+                .expect("conversation store failed");
+
+            let connection = Connection::open(store.database_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE workspace_items SET payload_json = '{broken'
+                     WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = 'C2'",
+                    [&store.workspace_key],
+                )
+                .unwrap();
+            drop(connection);
+
+            assert!(store
+                .clear_conversation_unread_state("C1", "20.0")
+                .await
+                .expect("read update failed"));
+            store
+                .merge_conversation(&SlackConversation {
+                    id: "C1".to_string(),
+                    name: Some("renamed".to_string()),
+                    unread_count: Some(8),
+                    ..Default::default()
+                })
+                .await
+                .expect("metadata update read an unrelated row");
+            assert!(!store
+                .apply_conversation_unread_state(
+                    "C1",
+                    SlackUnreadState::from_parts(true, true, 4),
+                    Some("10.0"),
+                )
+                .await
+                .expect("stale unread update failed"));
+            assert!(store
+                .mark_conversation_unread_from_event("C1", "21.0")
+                .await
+                .expect("realtime update read an unrelated row"));
+        });
+
+        let connection = Connection::open(store.database_path()).unwrap();
+        let updated_payload: String = connection
+            .query_row(
+                "SELECT payload_json FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = 'C1'",
+                [&store.workspace_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let updated: SlackConversation = serde_json::from_str(&updated_payload).unwrap();
+        assert_eq!(updated.name.as_deref(), Some("renamed"));
+        assert_eq!(updated.unread_activity_count(), 1);
+        assert_eq!(
+            updated
+                .extra
+                .get(LOCAL_READ_TS_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some("20.0")
+        );
+        let unrelated_payload: String = connection
+            .query_row(
+                "SELECT payload_json FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = 'C2'",
+                [&store.workspace_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unrelated_payload, "{broken");
 
         let _ = std::fs::remove_dir_all(directory);
     }
