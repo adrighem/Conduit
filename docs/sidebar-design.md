@@ -34,11 +34,12 @@ Excluded from 1.0 unless explicitly revisited:
 - Slack custom sections.
 - Collapsible sections.
 - Drag and drop reordering.
-- Multi-workspace switching.
 - Muted state.
 - Slack Connect or external organization indicators.
 - Avatars and presence badges.
 - Full unread synchronization beyond conversation list and lightweight history hints.
+
+Supporting more than one connected Slack workspace is outside Conduit's product scope, not a deferred post-1.0 sidebar feature.
 
 ## Sidebar Shell
 
@@ -262,5 +263,5 @@ Known limits:
 - No muted state.
 - No Slack Connect or external organization indicators.
 - No avatars or presence badges.
-- No multiple workspace switching.
+- One connected Slack workspace by design.
 - No full unread synchronization beyond conversation list and lightweight history hints.

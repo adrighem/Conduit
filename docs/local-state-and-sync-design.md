@@ -76,4 +76,4 @@ This is not a complete scheduler. Per-method request budgeting and background sy
 - Add timestamp metadata and prune old cached histories.
 - Cache user display names and avatars once presence/avatar work starts.
 - Add event reducers once realtime ingestion lands.
-- Revisit SQLite only if search, directories, or multi-workspace history need local queries.
+- Revisit SQLite only if search or directories need local queries that the current cache cannot support cleanly.

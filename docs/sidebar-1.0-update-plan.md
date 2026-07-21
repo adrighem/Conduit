@@ -23,7 +23,7 @@ Follow-up on 2026-06-19:
 
 - Slack custom sections synced from Slack.
 - Drag and drop sidebar reordering.
-- Multi-workspace switching.
+- More than one connected Slack workspace; single-workspace operation is intentional product scope.
 - Full Slack presence or avatar support unless the data model and API usage are expanded deliberately.
 
 ## Step 1: Clarify Sidebar Header And Account Actions
@@ -167,7 +167,7 @@ Changes:
 
 - Keep filtering simple for 1.0: case-insensitive title and ID matching.
 - Keep section grouping in filtered results.
-- Consider clearing the filter when switching workspaces in future multi-workspace support.
+- Keep filter state scoped to the one connected workspace session and clear it when that session is reset.
 - Do not add match highlighting unless it can be done cleanly with native GTK labels.
 
 Design documentation update:

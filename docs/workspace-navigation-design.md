@@ -35,12 +35,13 @@ The indicators are icons, not text badges, so long channel and DM names still ge
 
 The following still belongs in later slices:
 
-- Multi-workspace switcher.
 - Custom and collapsible sidebar sections.
 - Drag and drop section reordering.
 - Presence and avatars.
 - Per-conversation notification preference editing.
 - Slack Connect organization names and management affordances.
+
+Multi-workspace switching is outside Conduit's product scope; navigation always belongs to the one connected Slack workspace.
 
 ## Tests
 

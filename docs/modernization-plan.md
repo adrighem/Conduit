@@ -140,7 +140,6 @@ Navigation parity matters because users live in the sidebar. This should remain 
 
 Scope:
 
-- Multi-workspace switcher.
 - Custom sidebar sections.
 - Collapsible sections.
 - Drag and drop section reordering where local/server support is clear.
@@ -150,6 +149,7 @@ Scope:
 
 Out of scope:
 
+- More than one connected Slack workspace; single-workspace operation is intentional product scope.
 - Admin-only Slack Connect management.
 - Full organization directory management.
 - Enterprise Grid workspace migration tools.
