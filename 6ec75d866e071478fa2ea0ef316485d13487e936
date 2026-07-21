@@ -1,0 +1,22 @@
+Manual verification fix: Canonical reducer pipeline
+
+Summary:
+- Channel notification bodies now include the sender display name.
+- Notifications defer when a channel sender name is not cached and are delivered after user resolution.
+- Added a dedicated app.open-thread action carrying workspace, channel, and thread root.
+- Thread notification activation presents Conduit, selects the conversation, and opens the thread.
+- Preserved the existing two-part conversation action used by GNOME search and huddles.
+- Extended the D-Bus activation integration test to exercise open-thread end to end.
+
+Files:
+- src/application.rs
+- src/window.rs
+- tests/test_search_provider.py
+
+Verification:
+- cargo fmt -- --check
+- git diff --check
+- cargo test (538 passed)
+- cargo check
+- meson compile -C _build
+- meson test -C _build --print-errorlogs (14 passed)
