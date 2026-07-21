@@ -18,7 +18,7 @@
 * **huddles:** complete packaging and validation ([39273c6](https://github.com/adrighem/Conduit/commit/39273c61bc246967f2171faaed920ae684165d16))
 * **huddles:** isolate Slack Chime boundary ([0e97e1e](https://github.com/adrighem/Conduit/commit/0e97e1ef4d183af59d7e9fbc8eff73d5a9c9f56b))
 * **huddles:** model Slack discovery events ([0df9f74](https://github.com/adrighem/Conduit/commit/0df9f74ce70b039936ee489c9c2f5d43f304e294))
-* implement browser-session socket mode and live connection status ([e4b7e62](https://github.com/adrighem/Conduit/commit/e4b7e6270159f737036336e7092daad1bffc337f)), closes [#7](https://github.com/adrighem/Conduit/issues/7)
+* implement browser-session socket mode and live connection status ([e4b7e62](https://github.com/adrighem/Conduit/commit/e4b7e6270159f737036336e7092daad1bffc337f))
 * **lifecycle:** define workspace transitions ([c32f890](https://github.com/adrighem/Conduit/commit/c32f890e24b8d23a92e6ace5c86e51c2385e4598))
 * **lifecycle:** emit runtime transitions ([74c1daa](https://github.com/adrighem/Conduit/commit/74c1daa5304aa71840d8fe304d9ee2582664b46f))
 * **lifecycle:** render workspace state ([c3703c6](https://github.com/adrighem/Conduit/commit/c3703c6f950af14a62ffced6f32a51668b6f8f2c))
