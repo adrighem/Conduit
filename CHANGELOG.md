@@ -88,7 +88,7 @@
 * **sidebar:** Cache DM display names ([3570402](https://github.com/adrighem/Conduit/commit/3570402cff090a4b55ff1b4f0197f151fd0eb34c))
 * **sidebar:** Keep refresh visually backgrounded ([93eec70](https://github.com/adrighem/Conduit/commit/93eec701015e5a9b153b5344210bc9d3f4f9626b))
 * **sidebar:** Preserve populated list during refresh ([6eac9a8](https://github.com/adrighem/Conduit/commit/6eac9a8c62e6854b787952a29c25ff5e2c579a8f))
-* stabilize first release packages ([af7ed57](https://github.com/adrighem/Conduit/commit/af7ed578302f37f013c441de5f49ef90adef69d2)), closes [#14](https://github.com/adrighem/Conduit/issues/14)
+* stabilize first release packages ([af7ed57](https://github.com/adrighem/Conduit/commit/af7ed578302f37f013c441de5f49ef90adef69d2)), references [#14](https://github.com/adrighem/Conduit/issues/14)
 * **store:** avoid whole-cache rewrites for unread updates ([d11f589](https://github.com/adrighem/Conduit/commit/d11f58911663d8447f837a02ec50de61d09f47b6))
 * **store:** isolate malformed conversation rows ([2e39530](https://github.com/adrighem/Conduit/commit/2e395306d50a1cb2248022697c905198e864df4e))
 * **store:** Serialize cache updates ([5cfb369](https://github.com/adrighem/Conduit/commit/5cfb369d9246721c80f46a3e5f0b7d167106abcd))
