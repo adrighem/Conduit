@@ -1,25 +1,26 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-21-approved-stabilization-push",
+  "last_manual_run": "2026-07-21-first-release-publication",
   "last_known_open_issues": 6,
   "last_known_open_pull_requests": 1,
   "last_known_total_issues": 13,
-  "last_known_total_pull_requests": 1,
+  "last_known_total_pull_requests": 2,
   "last_checks": {
     "cargo_fmt_check": "pass",
     "cargo_test": "pass: 546 tests",
     "meson_test": "pass: 14 tests with sanitized environment",
     "git_diff_check": "pass",
-    "github_actions": "main CI 29824946777, Release 29824946738, and CodeQL 29824945608 passed on a242401; corrected PR:8 head 517a45e passed CI 29825962522/29825965362 and CodeQL 29825963617",
-    "release_metadata": "pass: 7 local checks; PR:8 bootstrap state is valid and the false ISSUE:7 attribution is removed from the changelog and PR body",
-    "flatpak_manifest": "pass: JSON parse and flatpak-builder manifest expansion",
-    "optional_features": "pass in main and PR CI; local check remains unavailable because gstreamer-webrtc-1.0 development metadata is absent",
-    "cargo_clippy": "pass in main and corrected PR CI; unavailable locally"
+    "github_actions": "CI 29835081152 and CodeQL 29835080623 passed on 8c16452; guarded Release 29835203473 passed every build, validator, checksum, and publication job",
+    "release_metadata": "pass: v0.1.0 is public and its tag and release target resolve to 8c16452; PR:8 is merged without closing ISSUE:14",
+    "release_artifacts": "pass: Debian, RPM, and Flatpak were built and installed in clean jobs; all downloaded package hashes match SHA256SUMS",
+    "flatpak_manifest": "pass: release Flatpak built, installed, and validated without native-media permission",
+    "optional_features": "pass in final main CI; general release packages remain deliberately disabled while external Slack fallback stays available",
+    "cargo_clippy": "pass in final main CI for default and opt-in configurations; unavailable locally"
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
-    "priority": "hold clean, green PR:8 until the manual first-release checklist is complete; merging starts the first real package publication run",
-    "worktree": "stabilization is pushed; user-owned eu.vanadrighem.conduit.json and untracked research/backup files remain preserved",
-    "public_actions": "pushed main, approved PR CI, corrected the PR branch and body; no merge, release, issue comment, label, or closure"
+    "priority": "v0.1.0 is published; keep ISSUE:14 open until dependency-count and clean-build timing evidence is recorded, and do not merge the generated PR:15 as part of this release",
+    "worktree": "release fixes and memory are isolated from user-owned eu.vanadrighem.conduit.json and untracked research/backup files",
+    "public_actions": "merged PR:8, pushed release fixes, ran guarded recovery, published v0.1.0, and cleared one low-risk inbox notification; no issue comment, label, or closure"
   }
 }

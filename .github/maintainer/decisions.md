@@ -139,3 +139,11 @@
 - Corrected PR:8's generated ISSUE:7 attribution in both its changelog and public body. Its final head `517a45e` is clean, mergeable, and fully green.
 - Keep PR:8 open and unmerged until the manual first-release checklist is complete. Merging remains the action that creates the first real Debian, RPM, and Flatpak package run.
 - Keep ISSUE:14 open until the real package jobs validate the release definitions; no issue comment, label, closure, release, or merge was made.
+
+## 2026-07-21 First-release Publication
+
+- Merged PR:8 only after its corrected head and closure graph were fully green; the squash merge deliberately left ISSUE:14 open.
+- Keep release recovery explicit and draft-tag-guarded. Normal pushes update Release Please without rebuilding an existing draft, while recovery must verify an existing stable-version draft before packaging.
+- Fedora container release jobs must install Git before checkout and trust the checked-out `GITHUB_WORKSPACE` before creating source archives.
+- Published `v0.1.0` from `8c16452` only after Debian, RPM, and Flatpak builds and independent installation validators passed; the public assets also match `SHA256SUMS`.
+- Keep ISSUE:14 open because package behavior is now proven, but its acceptance criteria still require before/after dependency counts and clean-build timing evidence.

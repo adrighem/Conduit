@@ -306,3 +306,22 @@
 - PR:8 remains open, clean, mergeable, and unmerged. ISSUE:14 remains open. No release, issue comment, label, closure, or merge was performed.
 - Remaining release gates: complete the manual first-release checklist, then explicitly approve merging PR:8 and monitor the first real Debian/RPM/Flatpak build-install-publication workflow.
 - Non-blocking annotations: GitHub forced the Node.js 20 implementations of `actions/checkout@v4` and `release-please-action@v4` onto Node.js 24.
+
+## 2026-07-21 First-release Publication
+
+- Scope: merge PR:8, recover the first draft release safely, fix package-pipeline failures, and verify the public artifacts.
+- PR:8 was squash-merged as `49e9203`; ISSUE:14 remained open and the merge did not create a closing reference.
+- Release recovery fixes:
+  - `bad40b8` installed Git for RPM source-archive creation.
+  - `dbcf786` added a stable-tag-validated recovery path for an existing draft.
+  - `8003f95` installed Git before Fedora checkout.
+  - `8c16452` trusted the checked-out RPM workspace and removed an RPM-lint spelling false positive.
+- Final remote validation on `8c16452`:
+  - CI `29835081152`: pass for formatting, both strict-Clippy/test configurations, and both Meson builds.
+  - CodeQL `29835080623`: pass for Actions, JavaScript/TypeScript, Python, and Rust.
+  - guarded Release `29835203473`: pass for draft selection; Debian, RPM, and Flatpak build/install validation; checksums; and publication.
+- Published `v0.1.0` at exact tag target `8c16452` with `conduit_0.1.0-1_amd64.deb`, `conduit-0.1.0-1.fc44.x86_64.rpm`, `conduit-0.1.0-x86_64.flatpak`, and `SHA256SUMS`; an independent download check verified all three package hashes.
+- Credential rotation was treated as complete per operator instruction; no credential or secret values were inspected or recorded.
+- Final audit: 6 open issues, PR:15 is the only open pull request, no unread notifications, and no Dependabot or code-scanning alerts. ISSUE:14 remains open for dependency-count and clean-build timing evidence.
+- Existing user-owned changes in the root development Flatpak manifest and untracked research/backup files remained unstaged and preserved.
+- The installed maintainer package still lacks its referenced checklist, so this run used the documented manual fallback.
