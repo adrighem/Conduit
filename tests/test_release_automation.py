@@ -60,6 +60,10 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert "needs.release-please.outputs.release_created == 'true'" in workflow
     assert "debian:trixie" in workflow
     assert "fedora:44" in workflow
+    rpm_dependencies = workflow.split(
+        "      - name: Install Fedora build dependencies", maxsplit=1
+    )[1].split("      - name: Build RPM package", maxsplit=1)[0]
+    assert re.search(r"\bgit\b", rpm_dependencies)
     assert "gst-inspect-1.0" not in workflow
     assert "libgstreamer" not in workflow
     assert "gstreamer1.0-" not in workflow

@@ -135,7 +135,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             --disablerepo=fedora-cisco-openh264 \
-            appstream cargo cmake dbus-devel desktop-file-utils gcc gettext \
+            appstream cargo cmake dbus-devel desktop-file-utils gcc gettext git \
             gdk-pixbuf2-devel gtk4-devel libadwaita-devel meson ninja-build \
             pkgconf-pkg-config rpm-build rpmlint rust webkitgtk6.0-devel
       - name: Build RPM package
