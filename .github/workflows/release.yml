@@ -153,10 +153,6 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:44
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release-please.outputs.sha }}
-          fetch-depth: 0
       - name: Install Fedora build dependencies
         run: |
           dnf install -y --setopt=install_weak_deps=False \
@@ -164,6 +160,10 @@ jobs:
             appstream cargo cmake dbus-devel desktop-file-utils gcc gettext git \
             gdk-pixbuf2-devel gtk4-devel libadwaita-devel meson ninja-build \
             pkgconf-pkg-config rpm-build rpmlint rust webkitgtk6.0-devel
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+          fetch-depth: 0
       - name: Build RPM package
         env:
           VERSION: ${{ needs.release-please.outputs.version }}

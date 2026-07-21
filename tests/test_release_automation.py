@@ -69,6 +69,9 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
         "      - name: Install Fedora build dependencies", maxsplit=1
     )[1].split("      - name: Build RPM package", maxsplit=1)[0]
     assert re.search(r"\bgit\b", rpm_dependencies)
+    assert rpm_dependencies.index("dnf install") < rpm_dependencies.index(
+        "uses: actions/checkout@v4"
+    )
     assert "gst-inspect-1.0" not in workflow
     assert "libgstreamer" not in workflow
     assert "gstreamer1.0-" not in workflow
