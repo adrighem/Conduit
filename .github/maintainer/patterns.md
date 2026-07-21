@@ -84,3 +84,23 @@
 - Desktop search providers should read a deliberately small index, not deserialize the application's full offline state on the UI/D-Bus thread.
 - Cross-toolkit reuse is best expressed as a shared model and behavior contract; native GTK and WebView frontends still need thin platform-specific adapters.
 - Window-level keyboard routing can extend actions across a conversation surface, but must explicitly exclude editable/search/outside controls to preserve normal input behavior.
+
+## 2026-07-21
+
+- Bootstrap release tests must accept both the pre-release empty manifest and a manifest whose package entry matches the synchronized application version.
+- Bot-authored release PRs can appear green while normal CI is `action_required`; inspect workflow runs and job counts, not only reported check conclusions.
+- A first release PR is a publication decision, not metadata-only maintenance: package feature policy, manual smoke checks, and generated changelog semantics remain merge gates.
+- Coordinator authority should establish the seams for scheduling, presentation, and controller extraction; parallel ownership refactors would increase migration cost.
+
+## 2026-07-21 First-release Stabilization
+
+- Emoji shortcode expansion must be opt-in by semantic field. Running it across arbitrary strings corrupts time values such as `12:00:00` when a workspace defines a numeric shortcode.
+- Cached workspace data can make navigation targets available before the first live sync is complete, so data availability and UI interactivity need separate lifecycle state.
+- Treat one connected Slack workspace as a durable design constraint in storage, navigation, documentation, and issue triage rather than accumulating speculative switching abstractions.
+- Release-package permissions and dependencies should reflect production-reachable behavior, not optional infrastructure that is only exercised by synthetic tests.
+
+## 2026-07-21 Approved Stabilization Push
+
+- Release Please can render a traceability footer such as `Refs #14` as “closes #14” in generated notes. Audit generated issue attribution independently from commit-footer intent.
+- A direct update to a same-repository release branch can trigger both `push` and `pull_request` CI. Monitor both runs because either may expose event-specific behavior.
+- GitHub's forced Node.js 24 compatibility path for Node.js 20 actions is currently non-blocking, but `actions/checkout@v4` and `release-please-action@v4` should be upgraded separately before enforcement changes.

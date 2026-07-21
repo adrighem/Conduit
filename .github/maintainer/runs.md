@@ -243,3 +243,66 @@
 - Local checks: formatting and all-target checks pass; 341 Rust tests pass; Meson compile and all 6 available Meson tests pass, including search-provider metadata and live D-Bus smoke tests.
 - Exact stable Clippy remains unavailable locally and must be verified by GitHub Actions before closure.
 - No public issue, closure, comment, label, or push action was taken in this follow-up.
+
+## 2026-07-21 Maintainer Pass
+
+- Scope: manual maintainer pass for the first release PR and the new architecture/performance backlog.
+- GitHub backlog: 6 open issues (ISSUE:9–14), 1 open pull request (PR:8), 0 unread Conduit notifications, 0 Dependabot alerts, 0 code-scanning alerts, 0 secret-scanning alerts, and 0 repository security advisories.
+- PR:8 review:
+  - one verified same-repository `github-actions[bot]` commit based directly on `b93e743`
+  - complete diff is limited to the release manifest, generated changelog, and AppStream release date
+  - CodeQL passes, but CI run `29817695695` is `action_required` with zero jobs
+  - the PR head fails `tests/test_release_automation.py` because the test rejects the expected post-bootstrap manifest
+  - a minimal test adjustment accepting an empty or synchronized manifest passes all 5 release metadata checks
+  - generated notes incorrectly associate browser-session Socket Mode with closing ISSUE:7
+- Current-tree checks under a sanitized environment:
+  - `cargo fmt --check`: pass
+  - `cargo test --locked`: pass, 543 tests
+  - `git diff --check`: pass
+- Latest remote main checks: CI run `29817583831` and CodeQL pass on `b93e743`.
+- Branch state: local `main` matches `origin/main`; existing user work remains in `eu.vanadrighem.conduit.json` plus two untracked files.
+- Backlog order: ISSUE:11 → ISSUE:12 with ISSUE:13 extractions; ISSUE:9 in Phase 4; ISSUE:10 as a separate measured optimization; ISSUE:14 gates PR:8.
+- Notes: the installed maintainer package still lacks its referenced scripts and reference guides, so this run used `gh-helper`, `gh`, and manual analysis.
+- No public GitHub action was taken.
+
+## 2026-07-21 First-release Stabilization
+
+- Scope: implement the initial-sync affordance and profile emoji fix, resolve ISSUE:14 locally, and harden the first package-publication gates.
+- Local product changes:
+  - the workspace is insensitive and visibly dimmed until the first successful sync, while later reconnects stay interactive
+  - profile structured metadata remains literal text; only the Slack status field retains emoji rendering, and expiration timezones are de-duplicated
+  - one connected Slack workspace is recorded as intentional product scope
+- Local release changes:
+  - Release Please metadata accepts both valid bootstrap manifest states
+  - Debian, RPM, and Flatpak release builds explicitly disable unavailable native huddle media and screen sharing
+  - three unused direct dependencies and their transitive lock/Flatpak source entries were removed
+  - Flatpak installation validation now gates asset publication
+- Checks, all run with an allowlisted sanitized environment where inherited state could be recorded:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo test --locked`: pass, 546 tests
+  - release automation: pass, 7 tests, including synthetic manifest acceptance/rejection
+  - workflow YAML and JSON parsing: pass
+  - Flatpak manifest expansion: pass
+  - Meson configure and compile: pass with native media and screen sharing disabled
+  - `meson test -C _build`: pass, 14 tests
+  - `git diff --check`: pass
+- Remaining validation: the opt-in media feature build lacks local `gstreamer-webrtc-1.0` development metadata; real Debian/RPM/Flatpak jobs and manual release smoke checks remain remote/manual gates.
+- Generated Meson text and JSON test logs were removed after recording the pass counts.
+- Existing user-owned changes in the root development Flatpak manifest and untracked research/backup files were preserved.
+- No public GitHub action was taken.
+
+## 2026-07-21 Approved Stabilization Push
+
+- Pushed four focused commits from `b93e743` through `a242401` to `main`; user-owned changes in the root development Flatpak manifest and untracked research/backup files remained unstaged.
+- Remote `main` checks on `a242401`:
+  - CI `29824946777`: pass, including formatting, strict Clippy, 546 default tests, optional native-huddle lint/tests, and both Meson builds
+  - CodeQL `29824945608`: pass for Rust, Actions, JavaScript/TypeScript, and Python
+  - Release `29824946738`: pass; Release Please updated PR:8 and correctly did not create a release
+- PR:8 actions:
+  - approved the required CI run after Release Please refreshed the branch
+  - generated head `b230059` passed CI `29825087286` and CodeQL `29825084839`
+  - removed the false ISSUE:7 closure attribution from `CHANGELOG.md` and the PR body in commit `517a45e`
+  - corrected head `517a45e` passed CI runs `29825962522` and `29825965362` plus CodeQL `29825963617`
+- PR:8 remains open, clean, mergeable, and unmerged. ISSUE:14 remains open. No release, issue comment, label, closure, or merge was performed.
+- Remaining release gates: complete the manual first-release checklist, then explicitly approve merging PR:8 and monitor the first real Debian/RPM/Flatpak build-install-publication workflow.
+- Non-blocking annotations: GitHub forced the Node.js 20 implementations of `actions/checkout@v4` and `release-please-action@v4` onto Node.js 24.

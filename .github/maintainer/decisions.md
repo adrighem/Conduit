@@ -114,3 +114,28 @@
 - Keep the GNOME provider single-workspace by design until Conduit supports real workspace switching; an explicit active marker prevents stale cached workspaces from producing unopenable results.
 - Require remote stable Clippy, CI, and CodeQL before closing ISSUE:2, ISSUE:3, ISSUE:5, or ISSUE:7.
 - No public issue, closure, comment, label, or push action was taken in this follow-up.
+
+## 2026-07-21 Maintainer Pass
+
+- Hold PR:8. Its diff and provenance are clean, but the Release Please bootstrap state fails the repository's own metadata test, its changelog misattributes ISSUE:7, its CI is awaiting approval, and merging would start the first real package publication run.
+- Resolve ISSUE:14's native-media package policy and complete the manual first-release checklist before merging PR:8.
+- Sequence the architecture backlog as ISSUE:11 then ISSUE:12, performing ISSUE:13 extractions inside those vertical slices. Keep ISSUE:9 in workspace-pipeline Phase 4 and treat ISSUE:10 as a separately measurable P0 optimization.
+- Do not treat green CodeQL as equivalent to complete PR validation when the CI workflow has zero jobs.
+- No issue, pull request, workflow approval, label, release, repository-setting change, or public comment was made.
+
+## 2026-07-21 First-release Stabilization
+
+- Conduit is intentionally a single-Slack-workspace application. This product boundary supersedes earlier notes that described multi-workspace support as a future possibility.
+- Keep the workspace visible but insensitive during its initial live synchronization, even when cached data is available. Once the first sync completes, later reconnects remain interactive.
+- Resolve emoji shortcodes only in semantically emoji-capable content such as Slack messages and profile status. Profile names, labels, dates, contact fields, and other structured metadata remain literal text, and localized profile expirations include their timezone exactly once.
+- General Debian, RPM, and Flatpak releases disable native media and screen sharing until a production Slack/Chime join path exists; CI retains the opt-in feature matrix and users retain the exact external Slack fallback.
+- Keep PR:8 on hold until these local changes are committed and remotely validated, its generated changelog attribution is corrected, and the first-release manual/package checks are complete.
+- No issue, pull request, workflow approval, label, release, repository-setting change, public comment, or push was made.
+
+## 2026-07-21 Approved Stabilization Push
+
+- Shipped the stabilization work as four focused commits: initial-sync UX (`e3f1d08`), literal profile metadata (`1e6828c`), release packaging with `Refs #14` (`af7ed57`), and the single-workspace product contract (`a242401`).
+- Remote `main` CI, the complete optional native-media matrix, both Meson configurations, Release Please, and all CodeQL languages pass on `a242401`.
+- Corrected PR:8's generated ISSUE:7 attribution in both its changelog and public body. Its final head `517a45e` is clean, mergeable, and fully green.
+- Keep PR:8 open and unmerged until the manual first-release checklist is complete. Merging remains the action that creates the first real Debian, RPM, and Flatpak package run.
+- Keep ISSUE:14 open until the real package jobs validate the release definitions; no issue comment, label, closure, release, or merge was made.

@@ -1,21 +1,25 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-14-acceptance-gap-follow-up",
-  "last_known_open_issues": 4,
-  "last_known_open_pull_requests": 0,
-  "last_known_total_issues": 7,
-  "last_known_total_pull_requests": 0,
+  "last_manual_run": "2026-07-21-approved-stabilization-push",
+  "last_known_open_issues": 6,
+  "last_known_open_pull_requests": 1,
+  "last_known_total_issues": 13,
+  "last_known_total_pull_requests": 1,
   "last_checks": {
     "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 341 tests",
-    "meson_compile": "pass",
-    "meson_test": "pass",
-    "github_actions": "CI 29325958493 and CodeQL 29325957810 passed on 855bd8b; follow-up not pushed",
-    "cargo_clippy": "not available locally"
+    "cargo_test": "pass: 546 tests",
+    "meson_test": "pass: 14 tests with sanitized environment",
+    "git_diff_check": "pass",
+    "github_actions": "main CI 29824946777, Release 29824946738, and CodeQL 29824945608 passed on a242401; corrected PR:8 head 517a45e passed CI 29825962522/29825965362 and CodeQL 29825963617",
+    "release_metadata": "pass: 7 local checks; PR:8 bootstrap state is valid and the false ISSUE:7 attribution is removed from the changelog and PR body",
+    "flatpak_manifest": "pass: JSON parse and flatpak-builder manifest expansion",
+    "optional_features": "pass in main and PR CI; local check remains unavailable because gstreamer-webrtc-1.0 development metadata is absent",
+    "cargo_clippy": "pass in main and corrected PR CI; unavailable locally"
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
-    "clippy": "CI tracks stable Clippy and treats warnings as errors",
-    "worktree": "clean; main has one validated ISSUE:2/3/5/7 follow-up commit awaiting push approval"
+    "priority": "hold clean, green PR:8 until the manual first-release checklist is complete; merging starts the first real package publication run",
+    "worktree": "stabilization is pushed; user-owned eu.vanadrighem.conduit.json and untracked research/backup files remain preserved",
+    "public_actions": "pushed main, approved PR CI, corrected the PR branch and body; no merge, release, issue comment, label, or closure"
   }
 }
