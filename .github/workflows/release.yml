@@ -169,6 +169,7 @@ jobs:
           VERSION: ${{ needs.release-please.outputs.version }}
           RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           rpm_root="${RUNNER_TEMP}/rpmbuild"
           mkdir -p "$rpm_root"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
           git archive --format=tar.gz --prefix="conduit-${VERSION}/" \

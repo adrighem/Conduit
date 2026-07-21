@@ -72,6 +72,11 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert rpm_dependencies.index("dnf install") < rpm_dependencies.index(
         "uses: actions/checkout@v4"
     )
+    rpm_build = workflow.split("      - name: Build RPM package", maxsplit=1)[1].split(
+        "      - uses: actions/upload-artifact@v4", maxsplit=1
+    )[0]
+    assert 'git config --global --add safe.directory "$GITHUB_WORKSPACE"' in rpm_build
+    assert rpm_build.index("safe.directory") < rpm_build.index("git archive")
     assert "gst-inspect-1.0" not in workflow
     assert "libgstreamer" not in workflow
     assert "gstreamer1.0-" not in workflow

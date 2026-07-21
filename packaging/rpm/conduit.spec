@@ -27,8 +27,8 @@ Requires:       xdg-desktop-portal
 Requires:       xdg-utils
 
 %description
-Conduit is a Rust, GTK4, libadwaita, and WebKitGTK desktop client for
-everyday Slack conversations, threads, search, files, and huddles.
+Conduit is a focused GNOME desktop client for everyday Slack conversations,
+threads, search, files, and huddles.
 
 %prep
 %autosetup
