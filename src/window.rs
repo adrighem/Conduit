@@ -252,6 +252,8 @@ mod imp {
         pub workspace_name: RefCell<Option<String>>,
         pub workspace_url: RefCell<Option<String>>,
         pub workspace_ready: Cell<bool>,
+        // Cached data can make the workspace ready for routing before the initial live sync ends.
+        pub initial_sync_complete: Cell<bool>,
         pub(super) pending_notification_target: RefCell<Option<NotificationTarget>>,
         pub(super) pending_message_notifications:
             RefCell<HashMap<String, PendingMessageNotification>>,
@@ -326,6 +328,8 @@ mod imp {
             if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
                 let huddle_test = std::env::var_os("CONDUIT_TEST_HUDDLE").is_some();
                 let test_channel_id = if huddle_test { "CTEST" } else { "C_TEST" };
+                obj.apply_workspace_lifecycle(WorkspaceLifecycleEvent::ConnectRequested);
+                obj.apply_workspace_lifecycle(WorkspaceLifecycleEvent::Authenticated);
                 obj.show_workspace(AuthInfo {
                     team: Some("Test Workspace".to_string()),
                     team_id: huddle_test.then(|| "TTEST".to_string()),
@@ -338,6 +342,7 @@ mod imp {
                     is_channel: Some(true),
                     ..SlackConversation::default()
                 }]);
+                obj.apply_workspace_lifecycle(WorkspaceLifecycleEvent::SyncCompleted);
                 obj.select_conversation(test_channel_id, "#general");
                 if huddle_test {
                     let huddle = crate::huddles::model::ActiveHuddle {
@@ -1379,11 +1384,13 @@ enum WorkspaceLifecycleSurface {
 struct WorkspaceLifecyclePresentation {
     surface: WorkspaceLifecycleSurface,
     status: &'static str,
+    workspace_interactive: bool,
 }
 
 fn workspace_lifecycle_presentation(
     lifecycle: WorkspaceLifecycle,
     workspace_available: bool,
+    initial_sync_complete: bool,
 ) -> WorkspaceLifecyclePresentation {
     use WorkspaceLifecycle as Lifecycle;
     use WorkspaceLifecycleSurface as Surface;
@@ -1392,10 +1399,12 @@ fn workspace_lifecycle_presentation(
         Lifecycle::Disconnected => WorkspaceLifecyclePresentation {
             surface: Surface::Connect,
             status: "Choose a workspace to continue",
+            workspace_interactive: false,
         },
         Lifecycle::Connecting => WorkspaceLifecyclePresentation {
             surface: Surface::Loading,
             status: "Connecting to Slack…",
+            workspace_interactive: false,
         },
         Lifecycle::Syncing => WorkspaceLifecyclePresentation {
             surface: if workspace_available {
@@ -1404,10 +1413,12 @@ fn workspace_lifecycle_presentation(
                 Surface::Loading
             },
             status: "Syncing workspace…",
+            workspace_interactive: initial_sync_complete,
         },
         Lifecycle::Ready => WorkspaceLifecyclePresentation {
             surface: Surface::Workspace,
             status: "",
+            workspace_interactive: true,
         },
         Lifecycle::Degraded => WorkspaceLifecyclePresentation {
             surface: if workspace_available {
@@ -1416,15 +1427,29 @@ fn workspace_lifecycle_presentation(
                 Surface::Connect
             },
             status: "Connection interrupted. Retrying…",
+            workspace_interactive: initial_sync_complete,
         },
         Lifecycle::AuthenticationRequired => WorkspaceLifecyclePresentation {
             surface: Surface::Connect,
             status: "Slack authentication failed. Sign in again.",
+            workspace_interactive: false,
         },
         Lifecycle::StartupFailed => WorkspaceLifecyclePresentation {
             surface: Surface::Connect,
             status: "Conduit could not start.",
+            workspace_interactive: false,
         },
+    }
+}
+
+fn initial_sync_completion(completed_before: bool, lifecycle: WorkspaceLifecycle) -> bool {
+    match lifecycle {
+        WorkspaceLifecycle::Ready => true,
+        WorkspaceLifecycle::Syncing | WorkspaceLifecycle::Degraded => completed_before,
+        WorkspaceLifecycle::Disconnected
+        | WorkspaceLifecycle::Connecting
+        | WorkspaceLifecycle::AuthenticationRequired
+        | WorkspaceLifecycle::StartupFailed => false,
     }
 }
 
@@ -5198,6 +5223,7 @@ impl ConduitWindow {
         *imp.workspace_id.borrow_mut() = None;
         *imp.workspace_team_id.borrow_mut() = None;
         imp.workspace_ready.set(false);
+        imp.initial_sync_complete.set(false);
         imp.latest_message_ts_by_channel.borrow_mut().clear();
         imp.local_read_ts_by_channel.borrow_mut().clear();
         imp.seen_realtime_messages.borrow_mut().clear();
@@ -5252,6 +5278,7 @@ impl ConduitWindow {
     fn show_workspace(&self, auth: AuthInfo) {
         *self.imp().workspace_id.borrow_mut() = workspace_identity(&auth);
         self.imp().workspace_ready.set(false);
+        self.imp().initial_sync_complete.set(false);
         *self.imp().current_user_id.borrow_mut() = auth.user_id.clone();
         *self.imp().workspace_team_id.borrow_mut() = auth.team_id.clone();
         *self.imp().workspace_url.borrow_mut() = auth.url.clone();
@@ -5266,6 +5293,7 @@ impl ConduitWindow {
         self.imp().content_stack.set_visible_child_name("workspace");
         self.imp().workspace_split.set_show_content(false);
         self.sync_workspace_chrome();
+        self.render_workspace_lifecycle();
         if conversation_refresh_start_shows_sidebar_loading() {
             self.start_sidebar_loading();
         }
@@ -5285,7 +5313,12 @@ impl ConduitWindow {
     }
 
     fn apply_workspace_lifecycle(&self, event: WorkspaceLifecycleEvent) {
-        self.imp().workspace.transition_lifecycle(event);
+        let imp = self.imp();
+        let lifecycle = imp.workspace.transition_lifecycle(event);
+        imp.initial_sync_complete.set(initial_sync_completion(
+            imp.initial_sync_complete.get(),
+            lifecycle,
+        ));
         self.render_workspace_lifecycle();
     }
 
@@ -5294,10 +5327,13 @@ impl ConduitWindow {
         let presentation = workspace_lifecycle_presentation(
             imp.workspace.lifecycle(),
             imp.workspace_id.borrow().is_some(),
+            imp.initial_sync_complete.get(),
         );
         let status = gettext(presentation.status);
         imp.connection_label.set_label(&status);
         imp.workspace_status_label.set_label(&status);
+        imp.workspace_split
+            .set_sensitive(presentation.workspace_interactive);
 
         let (icon_name, tooltip) = match imp.workspace.lifecycle() {
             WorkspaceLifecycle::Ready => (
@@ -8630,50 +8666,100 @@ mod tests {
                 WorkspaceLifecycle::Disconnected,
                 WorkspaceLifecycleSurface::Connect,
                 "Choose a workspace to continue",
+                false,
+                false,
             ),
             (
                 WorkspaceLifecycle::Connecting,
                 WorkspaceLifecycleSurface::Loading,
                 "Connecting to Slack…",
+                false,
+                false,
             ),
             (
                 WorkspaceLifecycle::Syncing,
                 WorkspaceLifecycleSurface::Workspace,
                 "Syncing workspace…",
+                false,
+                false,
             ),
             (
                 WorkspaceLifecycle::Ready,
                 WorkspaceLifecycleSurface::Workspace,
                 "",
+                false,
+                true,
             ),
             (
                 WorkspaceLifecycle::Degraded,
                 WorkspaceLifecycleSurface::Workspace,
                 "Connection interrupted. Retrying…",
+                true,
+                true,
             ),
             (
                 WorkspaceLifecycle::AuthenticationRequired,
                 WorkspaceLifecycleSurface::Connect,
                 "Slack authentication failed. Sign in again.",
+                false,
+                false,
             ),
             (
                 WorkspaceLifecycle::StartupFailed,
                 WorkspaceLifecycleSurface::Connect,
                 "Conduit could not start.",
+                false,
+                false,
             ),
         ];
 
-        for (lifecycle, surface, status) in cases {
+        for (lifecycle, surface, status, initial_sync_complete, workspace_interactive) in cases {
             assert_eq!(
-                workspace_lifecycle_presentation(lifecycle, true),
-                WorkspaceLifecyclePresentation { surface, status }
+                workspace_lifecycle_presentation(lifecycle, true, initial_sync_complete),
+                WorkspaceLifecyclePresentation {
+                    surface,
+                    status,
+                    workspace_interactive,
+                }
             );
         }
 
         assert_eq!(
-            workspace_lifecycle_presentation(WorkspaceLifecycle::Degraded, false).surface,
+            workspace_lifecycle_presentation(WorkspaceLifecycle::Degraded, false, false).surface,
             WorkspaceLifecycleSurface::Connect
         );
+    }
+
+    #[test]
+    fn initial_sync_blocks_workspace_until_ready_but_recovery_does_not() {
+        let initial_sync =
+            workspace_lifecycle_presentation(WorkspaceLifecycle::Syncing, true, false);
+        assert_eq!(initial_sync.surface, WorkspaceLifecycleSurface::Workspace);
+        assert!(!initial_sync.workspace_interactive);
+
+        let ready = workspace_lifecycle_presentation(WorkspaceLifecycle::Ready, true, false);
+        assert!(ready.workspace_interactive);
+
+        let recovery = workspace_lifecycle_presentation(WorkspaceLifecycle::Syncing, true, true);
+        assert!(recovery.workspace_interactive);
+        let degraded = workspace_lifecycle_presentation(WorkspaceLifecycle::Degraded, true, true);
+        assert!(degraded.workspace_interactive);
+    }
+
+    #[test]
+    fn initial_sync_completion_is_latched_only_for_the_active_session() {
+        assert!(!initial_sync_completion(false, WorkspaceLifecycle::Syncing));
+        assert!(initial_sync_completion(false, WorkspaceLifecycle::Ready));
+        assert!(initial_sync_completion(true, WorkspaceLifecycle::Syncing));
+        assert!(initial_sync_completion(true, WorkspaceLifecycle::Degraded));
+        assert!(!initial_sync_completion(
+            true,
+            WorkspaceLifecycle::AuthenticationRequired
+        ));
+        assert!(!initial_sync_completion(
+            true,
+            WorkspaceLifecycle::Disconnected
+        ));
     }
 
     #[test]
