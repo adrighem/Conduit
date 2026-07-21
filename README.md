@@ -200,6 +200,30 @@ export CONDUIT_SLACK_USER_AGENT="Mozilla/5.0 ..." # exact source-browser value f
 
 The aliases `SLACK_MCP_XOXC_TOKEN`, `SLACK_MCP_XOXD_TOKEN`, and `SLACK_MCP_USER_AGENT` are also accepted.
 
+#### Lookup `SLACK_MCP_XOXC_TOKEN`
+
+- Open your browser's Developer Console.
+- In Firefox, under `Tools -> Browser Tools -> Web Developer tools` in the menu bar
+- In Chrome, click the "three dots" button to the right of the URL Bar, then select
+  `More Tools -> Developer Tools`
+- Switch to the console tab.
+- Type "allow pasting" and press ENTER.
+- Paste the following snippet and press ENTER to execute:
+  `JSON.parse(localStorage.localConfig_v2).teams[document.location.pathname.match(/^\/client\/([A-Z0-9]+)/)[1]].token`
+
+Token value is printed right after the executed command (it starts with
+`xoxc-`), save it somewhere for now.
+
+#### Lookup `SLACK_MCP_XOXD_TOKEN`
+
+- Switch to "Application" tab and select "Cookies" in the left navigation pane (or use a cookie manager extension).
+- Find the cookie with the name `d`.  That's right, just the letter `d`.
+- Double-click the Value of this cookie.
+- Press Ctrl+C or Cmd+C to copy it's value to clipboard.
+- Save it for later.
+
+#### User agent
+
 For Enterprise Slack, copy `navigator.userAgent` from the same signed-in browser where you obtained the `xoxc` token and `xoxd` cookie. The [upstream Slack MCP guidance](https://github.com/korotovsky/slack-mcp-server/blob/master/docs/03-configuration-and-usage.md) notes that some higher-security environments additionally require a browser-compatible TLS handshake. Conduit does not impersonate a browser TLS fingerprint; if the exact User-Agent is still rejected, use the supported OAuth flow instead.
 
 Browser-session credentials are highly sensitive and rely on an unofficial authentication path. Keep them out of shell history, logs, commits, screenshots, and issue reports. Unset the variables after import if you do not want Conduit to import them again after sign-out.
