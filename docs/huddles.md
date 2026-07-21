@@ -13,6 +13,8 @@ Neither production adapter is enabled today. Conduit still provides supported hu
 
 The optional GStreamer engine and synthetic harness are native media infrastructure and interoperability tests. They must not be described as native Slack joining.
 
+Debian, RPM, and Flatpak release packages deliberately leave `native_media` and `screen_share` disabled until the production adapters above are available. This keeps unexercised media dependencies and capture permissions out of general packages without changing discovery, preflight, notifications, or **Open in Slack**. CI still builds and tests the opt-in stack.
+
 ## Build options
 
 The default build includes discovery, huddle UI state, and the external fallback without compiling the media stack. Meson exposes two opt-in features:
@@ -63,7 +65,7 @@ The harness uses test sources and sinks and a synthetic portal. It needs no Slac
 - Screen sharing follows `CreateSession`, `SelectSources`, `Start`, and `OpenPipeWireRemote`. It asks the portal only after **Share screen** is selected, requests one monitor or window, and does not persist a restore token.
 - Cancelling the portal, stopping sharing, leaving, signing out, replacing the workspace session, or shutting down closes the portal session and PipeWire file descriptor.
 - SDP, ICE candidates, TURN credentials, bootstrap responses, media, and raw huddle payloads are never logged or persisted. Ephemeral negotiation values are redacted and cleared during teardown.
-- Flatpak needs the standard PulseAudio socket for microphone and speaker access. Portal calls use Flatpak's filtered session bus and restricted PipeWire remotes; do not add broad filesystem, session-bus, PipeWire-socket, or `--device=all` permissions.
+- An opt-in native-media Flatpak would need the standard PulseAudio socket for microphone and speaker access. The general release Flatpak does not request it while native media is disabled. Portal calls use Flatpak's filtered session bus and restricted PipeWire remotes; do not add broad filesystem, session-bus, PipeWire-socket, or `--device=all` permissions.
 
 Direct camera device discovery is suitable for host builds. A sandboxed camera must use the XDG Camera portal rather than broad device access; until that adapter is available, packaged builds should leave camera capture unavailable.
 

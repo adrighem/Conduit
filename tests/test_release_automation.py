@@ -29,7 +29,6 @@ def test_release_versions_are_synchronized() -> None:
     assert config["include-component-in-tag"] is False
     assert config["include-v-in-tag"] is True
     assert config["bootstrap-sha"] == "d634d8bebffda092c30470f4de257ddc21a9360f"
-    assert manifest == {}, "the first Release Please run must create v0.1.0"
 
     extra_files = config["packages"]["."]["extra-files"]
     assert {entry["path"] for entry in extra_files} == {
@@ -47,6 +46,10 @@ def test_release_versions_are_synchronized() -> None:
     assert appstream_release is not None
     assert cargo["package"]["version"] == meson_version.group(1)
     assert cargo["package"]["version"] == appstream_release.attrib["version"]
+    assert manifest in ({}, {".": cargo["package"]["version"]}), (
+        "the Release Please manifest must be empty before bootstrap or match "
+        "the synchronized package version afterwards"
+    )
 
 
 def test_release_workflow_builds_and_publishes_all_assets() -> None:
@@ -57,11 +60,11 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert "needs.release-please.outputs.release_created == 'true'" in workflow
     assert "debian:trixie" in workflow
     assert "fedora:44" in workflow
-    assert "gstreamer1.0-nice gstreamer1.0-plugins-bad" in workflow
-    assert "gstreamer1.0-plugins-good" in workflow
-    assert "libnice-gstreamer1" in workflow
-    assert "gstreamer1-plugins-bad-free gstreamer1-plugins-base" in workflow
-    assert "gstreamer1-plugins-good" in workflow
+    assert "gst-inspect-1.0" not in workflow
+    assert "libgstreamer" not in workflow
+    assert "gstreamer1.0-" not in workflow
+    assert "gstreamer1(" not in workflow
+    assert "gstreamer1-plugins" not in workflow
     assert 'CARGO_NET_RETRY: "10"' in workflow
     assert "RUSTUP_HOME: /opt/rustup" in workflow
     assert "RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}" in workflow
@@ -75,23 +78,46 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert "SHA256SUMS" in workflow
     assert "gh release upload" in workflow
 
+    flatpak_validation = workflow.split("\n  validate-flatpak:", maxsplit=1)[1].split(
+        "\n  publish-assets:", maxsplit=1
+    )[0]
+    publication = workflow.split("\n  publish-assets:", maxsplit=1)[1]
+    assert "needs: [release-please, build-flatpak]" in flatpak_validation
+    assert "actions/download-artifact@v4" in flatpak_validation
+    assert "flatpak install --system --noninteractive --assumeyes" in flatpak_validation
+    assert 'flatpak info --system --show-ref "$APP_ID"' in flatpak_validation
+    assert 'flatpak run --system --command=sh "$APP_ID"' in flatpak_validation
+    assert "if grep -Fq pulseaudio permissions.ini" in flatpak_validation
+    assert "      - validate-flatpak" in publication
+
 
 def test_release_build_tests_reuse_the_release_profile() -> None:
     source_build = read("src/meson.build")
-    debian_control = read("packaging/debian/control")
     rpm_spec = read("packaging/rpm/conduit.spec")
     rpm_check = rpm_spec.split("%check", maxsplit=1)[1].split("%files", maxsplit=1)[0]
 
     assert "cargo_test_args += [cargo_release_arg]" in source_build
-    assert "gstreamer1.0-nice," in debian_control
-    assert "gstreamer1.0-plugins-bad," in debian_control
-    assert "gstreamer1.0-plugins-base," in debian_control
-    assert "gstreamer1.0-plugins-good," in debian_control
     assert "%meson_test" in rpm_check
-    assert "BuildRequires:  gstreamer1(element-nicesrc)" in rpm_spec
-    assert "BuildRequires:  gstreamer1-plugins-bad-free" in rpm_spec
-    assert "BuildRequires:  gstreamer1-plugins-base" in rpm_spec
-    assert "BuildRequires:  gstreamer1-plugins-good" in rpm_spec
+
+
+def test_release_packages_disable_unavailable_native_huddle_stack() -> None:
+    ci = read(".github/workflows/ci.yml")
+    debian_control = read("packaging/debian/control")
+    debian_rules = read("packaging/debian/rules")
+    rpm_spec = read("packaging/rpm/conduit.spec")
+
+    assert "--features native-media,screen-share,huddle-harness" in ci
+    assert "-Dnative_media=enabled -Dscreen_share=enabled" in ci
+    assert "gstreamer" not in debian_control
+    assert "-Dnative_media=disabled" in debian_rules
+    assert "-Dscreen_share=disabled" in debian_rules
+    assert "-Dnative_media=enabled" not in debian_rules
+    assert "-Dscreen_share=enabled" not in debian_rules
+    assert "gstreamer" not in rpm_spec
+    assert "-Dnative_media=disabled" in rpm_spec
+    assert "-Dscreen_share=disabled" in rpm_spec
+    assert "-Dnative_media=enabled" not in rpm_spec
+    assert "-Dscreen_share=enabled" not in rpm_spec
 
 
 def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
@@ -102,6 +128,7 @@ def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
     assert manifest["runtime-version"] == "50"
     assert manifest["command"] == "conduit"
     assert "RUST_LOG" not in manifest.get("build-options", {}).get("env", {})
+    assert "--socket=pulseaudio" not in manifest["finish-args"]
 
     conduit = next(
         module for module in manifest["modules"] if module["name"] == "conduit"
@@ -114,7 +141,20 @@ def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
         if isinstance(source, dict)
     )
     assert "--libdir=lib" in conduit["config-opts"]
-    assert "-Dnative_media=enabled" in conduit["config-opts"]
+    assert "-Dnative_media=disabled" in conduit["config-opts"]
+    assert "-Dscreen_share=disabled" in conduit["config-opts"]
+    assert "-Dnative_media=enabled" not in conduit["config-opts"]
+    assert "-Dscreen_share=enabled" not in conduit["config-opts"]
+
+
+def test_unused_direct_dependencies_are_absent_from_the_lockfile() -> None:
+    cargo = tomllib.loads(read("Cargo.toml"))
+    lockfile = tomllib.loads(read("Cargo.lock"))
+    locked_names = {package["name"] for package in lockfile["package"]}
+
+    for dependency in ("pulldown-cmark", "slack-blocks", "slack-morphism"):
+        assert dependency not in cargo["dependencies"]
+        assert dependency not in locked_names
 
 
 def test_flatpak_cargo_sources_match_the_lockfile() -> None:
@@ -145,7 +185,9 @@ def main() -> None:
         test_release_versions_are_synchronized,
         test_release_workflow_builds_and_publishes_all_assets,
         test_release_build_tests_reuse_the_release_profile,
+        test_release_packages_disable_unavailable_native_huddle_stack,
         test_release_flatpak_uses_current_checkout_without_debug_logging,
+        test_unused_direct_dependencies_are_absent_from_the_lockfile,
         test_flatpak_cargo_sources_match_the_lockfile,
     ]
     for test in tests:

@@ -7,7 +7,7 @@ Conduit uses Release Please to turn conventional commits on `main` into reviewed
 1. Merge changes using conventional commit titles such as `fix: ...`, `feat: ...`, or a breaking `feat!: ...`.
 2. Review the automated `chore(main): release ...` pull request, including `CHANGELOG.md` and the synchronized Cargo, Meson, and AppStream versions.
 3. Merge that pull request when the release is ready.
-4. Wait for the Release workflow to build and validate all three package formats. It attaches the packages and `SHA256SUMS`, then changes the GitHub Release from draft to published.
+4. Wait for the Release workflow to build and install-validate all three package formats. It attaches the packages and `SHA256SUMS`, then changes the GitHub Release from draft to published.
 
 The first run creates `v0.1.0`. Thereafter fixes increment the patch version, features increment the minor version, and breaking changes increment the major version. Tags use `v<version>` without a component prefix.
 
@@ -22,7 +22,9 @@ The first packaging tier is x86_64 only:
 - `conduit-<version>-x86_64.flatpak`, built offline against the GNOME 50 runtime.
 - `SHA256SUMS`, covering all three packages.
 
-Native packages enable the optional native-media and screen-sharing build features. Clean validation containers install each package through their package manager, check dynamic libraries and RPATH, validate desktop/AppStream/GSettings metadata, and inspect the required GStreamer elements before the assets are published.
+General release packages intentionally disable the optional `native-media` and `screen-share` features while production Slack huddle joining is unavailable. Huddle discovery, preflight, and the exact **Open in Slack** fallback remain available. CI continues to compile and test the optional media stack and synthetic harness, but those experiments do not add media dependencies or capture permissions to release packages.
+
+Clean validation containers install each native package, check dynamic libraries and RPATH, and validate desktop, AppStream, and GSettings metadata. A separate privileged Flatpak validation job installs the generated bundle, verifies its ref, runtime, commit, installed files, release metadata, and permissions, and executes a command inside the sandbox. Asset publication depends on all three validation jobs.
 
 Update the pinned Debian/Fedora targets when either distribution leaves support. Update `RUST_VERSION` when the minimum Rust version in `Cargo.toml` or locked dependencies requires it.
 

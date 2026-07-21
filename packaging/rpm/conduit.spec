@@ -17,31 +17,14 @@ BuildRequires:  gettext
 BuildRequires:  meson
 BuildRequires:  pkgconfig(dbus-1)
 BuildRequires:  pkgconfig(gdk-pixbuf-2.0)
-BuildRequires:  pkgconfig(gstreamer-1.0) >= 1.24
-BuildRequires:  pkgconfig(gstreamer-sdp-1.0) >= 1.24
-BuildRequires:  pkgconfig(gstreamer-webrtc-1.0) >= 1.24
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(webkitgtk-6.0)
-BuildRequires:  gstreamer1(element-nicesrc)
-BuildRequires:  gstreamer1-plugins-bad-free
-BuildRequires:  gstreamer1-plugins-base
-BuildRequires:  gstreamer1-plugins-good
 BuildRequires:  rust >= 1.88
 
 Requires:       ca-certificates
-Requires:       gstreamer1(element-nicesrc)
-Requires:       gstreamer1(element-opusenc)
-Requires:       gstreamer1(element-pipewiresrc)
-Requires:       gstreamer1(element-rtpopuspay)
-Requires:       gstreamer1(element-rtpvp8pay)
-Requires:       gstreamer1(element-vp8enc)
-Requires:       gstreamer1(element-webrtcbin)
-Requires:       gstreamer1(element-webrtcdsp)
-Requires:       gstreamer1(element-webrtcechoprobe)
 Requires:       xdg-desktop-portal
 Requires:       xdg-utils
-Recommends:     gstreamer1-plugin-libav
 
 %description
 Conduit is a Rust, GTK4, libadwaita, and WebKitGTK desktop client for
@@ -53,8 +36,8 @@ everyday Slack conversations, threads, search, files, and huddles.
 %build
 %meson \
     --buildtype=release \
-    -Dnative_media=enabled \
-    -Dscreen_share=enabled
+    -Dnative_media=disabled \
+    -Dscreen_share=disabled
 CARGO_HOME="%{_vpath_builddir}/cargo-home" cargo fetch --locked
 CARGO_NET_OFFLINE=true %meson_build
 

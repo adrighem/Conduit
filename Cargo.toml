@@ -32,15 +32,12 @@ gettext-rs = { version = "0.7", features = ["gettext-system"] }
 gtk = { version = "0.9", package = "gtk4", features = ["gnome_46"] }
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 open = "5.3"
-pulldown-cmark = "0.13"
 rand = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "multipart", "stream", "system-proxy"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-slack-blocks = "0.25"
-slack-morphism = { version = "2.22.0", default-features = false }
 tiny_http = "0.12"
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["fs", "io-util", "rt-multi-thread", "sync", "time"] }

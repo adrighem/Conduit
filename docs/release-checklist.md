@@ -10,7 +10,7 @@
 - Run `meson compile -C _build`.
 - Run `meson test -C _build`.
 - Configure a separate build with `-Dnative_media=enabled -Dscreen_share=enabled`, then compile and test it.
-- Confirm `webrtcbin`, `webrtcdsp`, `webrtcechoprobe`, Opus, VP8, and `pipewiresrc` are available in the packaged GStreamer runtime.
+- Confirm the Debian, RPM, and Flatpak release definitions explicitly disable `native_media` and `screen_share`; the optional stack is CI/tester-only until production Slack joining is available.
 - Launch `_build/src/conduit` and confirm the login screen renders.
 - From an installed build, confirm `slack://open` activates both a cold and running Conduit instance after the user selects its desktop handler.
 - Confirm a browser's external-protocol prompt can hand a `slack://` link to Conduit while ordinary Slack HTTPS links stay in the browser.
@@ -34,9 +34,8 @@
 - Confirm Secret Service access works in the sandbox.
 - Confirm file upload works through the document portal or permitted download path.
 - Confirm a sandboxed browser can launch Conduit for `slack://` through the desktop portal after explicit handler selection.
-- Build with `native_media` and `screen_share` enabled and confirm the runtime media plugins are present inside the sandbox.
-- Confirm microphone and speaker access through the PulseAudio socket and screen sharing through the ScreenCast portal.
-- Confirm the manifest adds no broad device, filesystem, PipeWire-socket, session-bus, or portal talk-name permission for huddles.
+- Confirm the release manifest does not request PulseAudio, a PipeWire socket, or huddle portal permissions while the media features are disabled.
+- Confirm the manifest adds no broad device, filesystem, session-bus, or portal talk-name permission for huddles.
 - Leave camera unavailable in the sandbox unless it uses the XDG Camera portal; do not add `--device=all` as a workaround.
 
 ## Slack App Notes

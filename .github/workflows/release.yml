@@ -58,12 +58,8 @@ jobs:
           apt-get install -y --no-install-recommends \
             appstream build-essential ca-certificates cmake debhelper \
             desktop-file-utils gettext libadwaita-1-dev libdbus-1-dev \
-            libgdk-pixbuf-2.0-dev libgstreamer-plugins-bad1.0-dev \
-            libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
-            gstreamer1.0-nice gstreamer1.0-plugins-bad gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            libgtk-4-dev libwebkitgtk-6.0-dev lintian meson ninja-build \
-            pkgconf python3 rustup
+            libgdk-pixbuf-2.0-dev libgtk-4-dev libwebkitgtk-6.0-dev \
+            lintian meson ninja-build pkgconf python3 rustup
           rustup toolchain install "$RUST_VERSION" --profile minimal
       - name: Build Debian package
         env:
@@ -101,7 +97,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            appstream binutils desktop-file-utils gstreamer1.0-tools libglib2.0-bin
+            appstream binutils desktop-file-utils libglib2.0-bin
           apt-get install -y ./dist/*.deb
           dpkg-deb --info ./dist/*.deb
           dpkg-deb --contents ./dist/*.deb
@@ -124,9 +120,6 @@ jobs:
           glib-compile-schemas --strict --dry-run /usr/share/glib-2.0/schemas
           desktop-file-validate /usr/share/applications/eu.vanadrighem.conduit.desktop
           appstreamcli validate --no-net /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml
-          for element in webrtcbin webrtcdsp webrtcechoprobe nicesrc opusenc vp8enc pipewiresrc; do
-            gst-inspect-1.0 "$element" >/dev/null
-          done
 
   build-rpm:
     needs: release-please
@@ -143,13 +136,8 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             --disablerepo=fedora-cisco-openh264 \
             appstream cargo cmake dbus-devel desktop-file-utils gcc gettext \
-            gdk-pixbuf2-devel gstreamer1-devel \
-            libnice-gstreamer1 \
-            gstreamer1-plugins-bad-free gstreamer1-plugins-base \
-            gstreamer1-plugins-good \
-            gstreamer1-plugins-bad-free-devel gstreamer1-plugins-base-devel \
-            gtk4-devel libadwaita-devel meson ninja-build pkgconf-pkg-config \
-            rpm-build rpmlint rust webkitgtk6.0-devel
+            gdk-pixbuf2-devel gtk4-devel libadwaita-devel meson ninja-build \
+            pkgconf-pkg-config rpm-build rpmlint rust webkitgtk6.0-devel
       - name: Build RPM package
         env:
           VERSION: ${{ needs.release-please.outputs.version }}
@@ -190,7 +178,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             --disablerepo=fedora-cisco-openh264 \
-            appstream binutils desktop-file-utils glib2 gstreamer1 rpmlint
+            appstream binutils desktop-file-utils glib2 rpmlint
           dnf install -y ./dist/*.rpm
           rpm -qip ./dist/*.rpm
           rpm -qlp ./dist/*.rpm
@@ -214,9 +202,6 @@ jobs:
           glib-compile-schemas --strict --dry-run /usr/share/glib-2.0/schemas
           desktop-file-validate /usr/share/applications/eu.vanadrighem.conduit.desktop
           appstreamcli validate --no-net /usr/share/metainfo/eu.vanadrighem.conduit.metainfo.xml
-          for element in webrtcbin webrtcdsp webrtcechoprobe nicesrc opusenc vp8enc pipewiresrc; do
-            gst-inspect-1.0 "$element" >/dev/null
-          done
 
   build-flatpak:
     needs: release-please
@@ -236,6 +221,52 @@ jobs:
           manifest-path: packaging/flatpak/eu.vanadrighem.conduit.json
           cache-key: flatpak-builder-${{ needs.release-please.outputs.sha }}
 
+  validate-flatpak:
+    needs: [release-please, build-flatpak]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: conduit-${{ needs.release-please.outputs.version }}-*.flatpak
+          path: dist
+          merge-multiple: true
+      - name: Install and validate Flatpak bundle
+        env:
+          APP_ID: eu.vanadrighem.conduit
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          bundle_count=$(find dist -maxdepth 1 -type f -name '*.flatpak' | wc -l)
+          test "$bundle_count" -eq 1
+          bundle=$(find dist -maxdepth 1 -type f -name '*.flatpak' -print -quit)
+          flatpak install --system --noninteractive --assumeyes "$bundle"
+          test "$(flatpak info --system --show-ref "$APP_ID")" = \
+            "app/${APP_ID}/x86_64/master"
+          test "$(flatpak info --system --show-runtime "$APP_ID")" = \
+            "org.gnome.Platform/x86_64/50"
+          test -n "$(flatpak info --system --show-commit "$APP_ID")"
+          app_root="$(flatpak info --system --show-location "$APP_ID")/files"
+          for path in \
+            bin/conduit \
+            share/applications/eu.vanadrighem.conduit.desktop \
+            share/conduit/conduit.gresource \
+            share/dbus-1/services/eu.vanadrighem.conduit.service \
+            share/glib-2.0/schemas/eu.vanadrighem.conduit.gschema.xml \
+            share/gnome-shell/search-providers/eu.vanadrighem.conduit.search-provider.ini \
+            share/icons/hicolor/512x512/apps/eu.vanadrighem.conduit.png \
+            share/metainfo/eu.vanadrighem.conduit.metainfo.xml; do
+            test -e "${app_root}/${path}"
+          done
+          grep -Fq "release version=\"${VERSION}\"" \
+            "${app_root}/share/metainfo/eu.vanadrighem.conduit.metainfo.xml"
+          flatpak info --system --show-permissions "$APP_ID" > permissions.ini
+          if grep -Fq pulseaudio permissions.ini; then exit 1; fi
+          flatpak run --system --command=sh "$APP_ID" -c \
+            'test -x /app/bin/conduit && test -f /app/share/conduit/conduit.gresource'
+
   publish-assets:
     needs:
       - release-please
@@ -244,6 +275,7 @@ jobs:
       - build-rpm
       - validate-rpm
       - build-flatpak
+      - validate-flatpak
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     permissions:

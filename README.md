@@ -70,7 +70,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 
 ## Current limitations
 
-- Conduit currently manages one connected workspace session at a time.
+- Conduit intentionally manages one connected Slack workspace session at a time.
 - OAuth requires your own Slack app unless a packaged build supplies a client ID.
 - Socket Mode is optional and requires separate Slack app configuration and an `xapp-` token.
 - Workspace search is bounded by Slack's search API and cannot guarantee arbitrary middle-of-word discovery outside the candidates Slack returns.
@@ -97,6 +97,8 @@ flatpak install --user ./conduit-VERSION-x86_64.flatpak
 ```
 
 The single-file Flatpak bundle is installable but does not provide automatic updates. Conduit is not currently published on Flathub. See [the release guide](docs/releases.md) for release maintenance, verification, and the current Flathub boundary.
+
+General release packages keep the optional native huddle media and screen-sharing stack disabled until production Slack joining is available. Huddle discovery and the exact **Open in Slack** fallback remain supported.
 
 ## Build and run
 
