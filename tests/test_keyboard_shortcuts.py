@@ -78,12 +78,19 @@ def type_text(text: str) -> None:
 
 
 def clipboard_text() -> str:
-    return subprocess.run(
+    result = subprocess.run(
         ["xclip", "-selection", "clipboard", "-o"],
-        check=True,
         capture_output=True,
         text=True,
-    ).stdout
+    )
+    if result.returncode == 0:
+        return result.stdout
+    if result.returncode == 1:
+        # X11 briefly has no clipboard owner while Ctrl+C is being handled.
+        # Let wait_until retry instead of treating that state as a failure.
+        return ""
+    result.check_returncode()
+    return result.stdout
 
 
 def composer_text() -> str:
