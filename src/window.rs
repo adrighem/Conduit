@@ -251,6 +251,8 @@ mod imp {
         pub workspace_url: RefCell<Option<String>>,
         pub workspace_ready: Cell<bool>,
         pub(super) pending_notification_target: RefCell<Option<NotificationTarget>>,
+        pub(super) pending_message_notifications:
+            RefCell<HashMap<String, PendingMessageNotification>>,
         pub(super) pending_slack_uris: RefCell<VecDeque<SlackUri>>,
         pub(super) huddle_snapshot: RefCell<HuddleSnapshot>,
         pub(super) huddle_devices: RefCell<Vec<HuddleDevice>>,
@@ -963,6 +965,33 @@ fn message_notification_body(message: Option<&SlackMessage>) -> String {
         .unwrap_or_else(|| gettext("New message"))
 }
 
+fn message_notification_content(
+    conversation_title: &str,
+    channel_notification: bool,
+    message: &SlackMessage,
+    user_names: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    let body = message_notification_body(Some(message));
+    if !channel_notification {
+        return Some((conversation_title.to_string(), body));
+    }
+
+    let sender = message
+        .user
+        .as_deref()
+        .and_then(|user_id| user_names.get(user_id).cloned())
+        .or_else(|| {
+            message
+                .username
+                .as_deref()
+                .map(str::trim)
+                .filter(|username| !username.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| message.user.is_none().then(|| gettext("Slack")))?;
+    Some((conversation_title.to_string(), format!("{sender}: {body}")))
+}
+
 fn notification_baseline_after(previous_ts: Option<&str>, candidate_ts: &str) -> String {
     previous_ts
         .filter(|previous_ts| *previous_ts >= candidate_ts)
@@ -974,6 +1003,15 @@ fn notification_baseline_after(previous_ts: Option<&str>, candidate_ts: &str) ->
 struct NotificationTarget {
     workspace_id: String,
     channel_id: String,
+    thread_ts: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMessageNotification {
+    channel_id: String,
+    conversation_title: String,
+    channel_notification: bool,
+    message: SlackMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5063,6 +5101,7 @@ impl ConduitWindow {
         imp.latest_message_ts_by_channel.borrow_mut().clear();
         imp.local_read_ts_by_channel.borrow_mut().clear();
         imp.seen_realtime_messages.borrow_mut().clear();
+        imp.pending_message_notifications.borrow_mut().clear();
         imp.pending_opened_conversation_ids.borrow_mut().clear();
         imp.pending_sent_drafts.borrow_mut().clear();
         imp.pending_upload_drafts.borrow_mut().clear();
@@ -5535,6 +5574,7 @@ impl ConduitWindow {
         }
         self.update_huddle_surface();
         self.queue_ui_invalidations(UiInvalidations::PICKER | UiInvalidations::TITLE);
+        self.flush_pending_message_notifications();
     }
 
     fn populate_user_full_names(&self, names: HashMap<String, String>) {
@@ -7698,10 +7738,78 @@ impl ConduitWindow {
         });
 
         if action == MessageNotificationAction::Notify {
+            if let Some(message) = latest_message {
+                self.send_or_defer_message_notification(channel_id, message);
+            }
+        }
+    }
+
+    fn send_or_defer_message_notification(&self, channel_id: &str, message: &SlackMessage) {
+        let conversation_title = self.navigation_conversation_title(channel_id);
+        let channel_notification = self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .is_some_and(|conversation| {
+                !conversation.is_im.unwrap_or(false)
+                    && !conversation.is_mpim.unwrap_or(false)
+                    && (conversation.is_channel.unwrap_or(false)
+                        || conversation.is_group.unwrap_or(false)
+                        || conversation.is_private.unwrap_or(false))
+            });
+        let content = message_notification_content(
+            &conversation_title,
+            channel_notification,
+            message,
+            &self.imp().user_names.borrow(),
+        );
+        if let Some((title, body)) = content {
+            self.send_notification(channel_id, &title, &body, message.thread_root_ts());
+            return;
+        }
+
+        self.imp()
+            .pending_message_notifications
+            .borrow_mut()
+            .insert(
+                channel_id.to_string(),
+                PendingMessageNotification {
+                    channel_id: channel_id.to_string(),
+                    conversation_title,
+                    channel_notification,
+                    message: message.clone(),
+                },
+            );
+        self.request_user_names(std::slice::from_ref(message));
+    }
+
+    fn flush_pending_message_notifications(&self) {
+        let user_names = self.imp().user_names.borrow().clone();
+        let ready = {
+            let mut pending = self.imp().pending_message_notifications.borrow_mut();
+            let mut ready = Vec::new();
+            pending.retain(|_, notification| {
+                let Some((title, body)) = message_notification_content(
+                    &notification.conversation_title,
+                    notification.channel_notification,
+                    &notification.message,
+                    &user_names,
+                ) else {
+                    return true;
+                };
+                ready.push((notification.clone(), title, body));
+                false
+            });
+            ready
+        };
+        for (notification, title, body) in ready {
             self.send_notification(
-                channel_id,
-                &self.navigation_conversation_title(channel_id),
-                &message_notification_body(latest_message),
+                &notification.channel_id,
+                &title,
+                &body,
+                notification.message.thread_root_ts(),
             );
         }
     }
@@ -7721,7 +7829,13 @@ impl ConduitWindow {
             .unwrap_or((false, false))
     }
 
-    fn send_notification(&self, channel_id: &str, title: &str, body: &str) {
+    fn send_notification(
+        &self,
+        channel_id: &str,
+        title: &str,
+        body: &str,
+        thread_ts: Option<&str>,
+    ) {
         let Some(workspace_id) = self.imp().workspace_id.borrow().clone() else {
             return;
         };
@@ -7732,7 +7846,13 @@ impl ConduitWindow {
             return;
         };
 
-        application.send_conversation_notification(&workspace_id, channel_id, title, body);
+        application.send_conversation_notification(
+            &workspace_id,
+            channel_id,
+            title,
+            body,
+            thread_ts,
+        );
     }
 
     fn withdraw_conversation_notification(&self, channel_id: &str) {
@@ -7753,10 +7873,12 @@ impl ConduitWindow {
         &self,
         workspace_id: String,
         channel_id: String,
+        thread_ts: Option<String>,
     ) -> bool {
         *self.imp().pending_notification_target.borrow_mut() = Some(NotificationTarget {
             workspace_id,
             channel_id,
+            thread_ts,
         });
         self.activate_pending_notification_target()
     }
@@ -7853,6 +7975,9 @@ impl ConduitWindow {
                     ConversationTargetAction::SelectConversation(channel_id) => {
                         let title = self.conversation_title(&channel_id);
                         self.select_conversation(&channel_id, &title);
+                        if let Some(thread_ts) = target.thread_ts.as_deref() {
+                            self.open_thread(&channel_id, thread_ts);
+                        }
                         self.visible_channel_id().as_deref() == Some(channel_id.as_str())
                     }
                     ConversationTargetAction::OpenDirectMessage(user_id) => {
@@ -9280,6 +9405,29 @@ mod tests {
     }
 
     #[test]
+    fn channel_notification_content_waits_for_and_includes_sender_display_name() {
+        let mut incoming = message("1710000200.000000", "Hello");
+        incoming.user = Some("U456".into());
+        assert_eq!(
+            message_notification_content("general", true, &incoming, &HashMap::new()),
+            None
+        );
+        assert_eq!(
+            message_notification_content(
+                "general",
+                true,
+                &incoming,
+                &HashMap::from([("U456".into(), "Ada".into())]),
+            ),
+            Some(("general".into(), "Ada: Hello".into()))
+        );
+        assert_eq!(
+            message_notification_content("Ada", false, &incoming, &HashMap::new()),
+            Some(("Ada".into(), "Hello".into()))
+        );
+    }
+
+    #[test]
     fn notification_baseline_never_regresses_for_delayed_snapshots() {
         let baseline = notification_baseline_after(None, "1710000200.000000");
         assert_eq!(baseline, "1710000200.000000");
@@ -9307,6 +9455,7 @@ mod tests {
         let target = NotificationTarget {
             workspace_id: "T123".into(),
             channel_id: "C123".into(),
+            thread_ts: Some("1710000000.000100".into()),
         };
 
         assert_eq!(

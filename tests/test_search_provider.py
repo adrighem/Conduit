@@ -198,6 +198,35 @@ def main() -> None:
             "channel_id": "C_TEST",
         }
 
+        target_path.unlink()
+        subprocess.run(
+            [
+                "gdbus",
+                "call",
+                "--session",
+                "--dest",
+                APP_ID,
+                "--object-path",
+                "/eu/vanadrighem/conduit",
+                "--method",
+                "org.gtk.Actions.Activate",
+                "open-thread",
+                "[<('Test Workspace', 'C_TEST', '1710000000.000100')>]",
+                "{}",
+            ],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        wait_until(target_path.exists)
+        assert json.loads(target_path.read_text(encoding="utf-8")) == {
+            "workspace_id": "Test Workspace",
+            "channel_id": "C_TEST",
+            "thread_ts": "1710000000.000100",
+        }
+
         # Closing a window with manually parented composer popovers must not
         # wedge GtkTextView disposal in a repeated warning loop.
         quit_application(environment)

@@ -39,6 +39,7 @@ use crate::slack_link::{parse_slack_uri, SlackUri};
 use crate::ConduitWindow;
 
 const OPEN_CONVERSATION_ACTION: &str = "app.open-conversation";
+const OPEN_THREAD_ACTION: &str = "app.open-thread";
 const ABOUT_ICON_NAME: &str = config::APPLICATION_ID;
 const ABOUT_LOGO_SIZE: i32 = 192;
 const NOTIFICATION_LIFETIME: Duration = Duration::from_secs(10);
@@ -270,6 +271,24 @@ fn conversation_target_from_variant(target: &glib::Variant) -> Option<(String, S
         .then(|| (workspace_id.to_string(), channel_id.to_string()))
 }
 
+fn thread_target_variant(workspace_id: &str, channel_id: &str, thread_ts: &str) -> glib::Variant {
+    (workspace_id, channel_id, thread_ts).to_variant()
+}
+
+fn thread_target_from_variant(target: &glib::Variant) -> Option<(String, String, String)> {
+    let (workspace_id, channel_id, thread_ts) = target.get::<(String, String, String)>()?;
+    let workspace_id = workspace_id.trim();
+    let channel_id = channel_id.trim();
+    let thread_ts = thread_ts.trim();
+    (!workspace_id.is_empty() && !channel_id.is_empty() && !thread_ts.is_empty()).then(|| {
+        (
+            workspace_id.to_string(),
+            channel_id.to_string(),
+            thread_ts.to_string(),
+        )
+    })
+}
+
 mod imp {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -434,12 +453,26 @@ impl ConduitApplication {
                 app.present_conversation_target(workspace_id, channel_id);
             })
             .build();
+        let open_thread_action = gio::ActionEntry::builder("open-thread")
+            .parameter_type(Some(
+                <(String, String, String)>::static_variant_type().as_ref(),
+            ))
+            .activate(move |app: &Self, _, target| {
+                let Some((workspace_id, channel_id, thread_ts)) =
+                    target.and_then(thread_target_from_variant)
+                else {
+                    return;
+                };
+                app.present_notification_target(workspace_id, channel_id, Some(thread_ts));
+            })
+            .build();
         self.add_action_entries([
             quit_action,
             shortcuts_action,
             preferences_action,
             about_action,
             open_conversation_action,
+            open_thread_action,
         ]);
         for shortcut in APP_SHORTCUTS {
             self.set_accels_for_action(shortcut.action, shortcut.accelerators);
@@ -507,17 +540,30 @@ impl ConduitApplication {
     }
 
     fn present_conversation_target(&self, workspace_id: String, channel_id: String) {
+        self.present_notification_target(workspace_id, channel_id, None);
+    }
+
+    fn present_notification_target(
+        &self,
+        workspace_id: String,
+        channel_id: String,
+        thread_ts: Option<String>,
+    ) {
         let window = self.present_window(false, false);
-        if window.open_notification_target(workspace_id.clone(), channel_id.clone()) {
+        if window.open_notification_target(
+            workspace_id.clone(),
+            channel_id.clone(),
+            thread_ts.clone(),
+        ) {
             if let Some(path) = std::env::var_os("CONDUIT_TEST_OPEN_TARGET_FILE") {
-                let _ = std::fs::write(
-                    path,
-                    serde_json::json!({
-                        "workspace_id": workspace_id,
-                        "channel_id": channel_id,
-                    })
-                    .to_string(),
-                );
+                let mut target = serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "channel_id": channel_id,
+                });
+                if let Some(thread_ts) = thread_ts {
+                    target["thread_ts"] = serde_json::Value::String(thread_ts);
+                }
+                let _ = std::fs::write(path, target.to_string());
             }
         }
     }
@@ -528,12 +574,19 @@ impl ConduitApplication {
         channel_id: &str,
         title: &str,
         body: &str,
+        thread_ts: Option<&str>,
     ) {
         let notification = gio::Notification::new(title);
         notification.set_body(Some(body));
         notification.set_priority(gio::NotificationPriority::Normal);
-        let target = conversation_target_variant(workspace_id, channel_id);
-        notification.set_default_action_and_target_value(OPEN_CONVERSATION_ACTION, Some(&target));
+        if let Some(thread_ts) = thread_ts {
+            let target = thread_target_variant(workspace_id, channel_id, thread_ts);
+            notification.set_default_action_and_target_value(OPEN_THREAD_ACTION, Some(&target));
+        } else {
+            let target = conversation_target_variant(workspace_id, channel_id);
+            notification
+                .set_default_action_and_target_value(OPEN_CONVERSATION_ACTION, Some(&target));
+        }
         let id = conversation_notification_id(workspace_id, channel_id);
         let generation = self.imp().register_notification(&id);
         self.send_notification(Some(&id), &notification);
@@ -892,6 +945,16 @@ mod tests {
         );
         assert_eq!(
             conversation_target_from_variant(&conversation_target_variant("T123", "  ")),
+            None
+        );
+
+        let thread_target = thread_target_variant("T123", "C123", "1710000000.000100");
+        assert_eq!(
+            thread_target_from_variant(&thread_target),
+            Some(("T123".into(), "C123".into(), "1710000000.000100".into()))
+        );
+        assert_eq!(
+            thread_target_from_variant(&thread_target_variant("T123", "C123", "  ")),
             None
         );
     }
