@@ -1,5 +1,7 @@
 # Improvement And Modernization Plan
 
+> **Status: Historical plan record.** This document is preserved as implementation history and may not describe the current repository. See [README.md](../README.md) for current capabilities and [conductor/tech-stack.md](../conductor/tech-stack.md) for current architecture.
+
 This plan compares Conduit to the official Slack desktop client from an architecture and product-scope perspective, then narrows the work to what makes sense for a lightweight practical GNOME desktop app.
 
 The build order is intentionally incremental. Each Big Feature must ship as a small vertical slice with its own design notes, tests, commit, and push. After each Big Feature lands, reread this plan and the current repository state before starting the next slice.

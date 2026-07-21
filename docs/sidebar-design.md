@@ -1,8 +1,10 @@
 # Sidebar Design
 
-This document describes the implemented Conduit workspace sidebar and its channel/user list. The sidebar is native GTK4 UI; it does not use a web embed.
+> **Status: Historical design record.** This document is preserved as implementation history and may not describe the current repository. See [README.md](../README.md) for current capabilities and [conductor/tech-stack.md](../conductor/tech-stack.md) for current architecture.
 
-`docs/sidebar-improvement-plan.md` is historical planning context. This document is the current design contract.
+This document records an earlier implementation of the Conduit workspace sidebar and its channel/user list. The sidebar is native GTK4 UI; it does not use a web embed.
+
+`docs/sidebar-improvement-plan.md` is related historical planning context; both documents are preserved for reference.
 
 ## Source Files
 

@@ -38,6 +38,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Edited and deleted messages, Slack links and mentions, user-group mentions, common Block Kit content, code blocks, attachments, and image and video previews.
 - Workspace custom emoji in messages, reactions, composer completion, and the reusable searchable emoji picker.
 - Add and remove reactions, save messages for Later, copy message text or links, and forward messages.
+- Message authors use cached avatars with initial fallbacks. Author names and `@mentions` expose **Message** and **Profile** actions; hovering shows the person's full name when available, falling back to the display name.
 
 ### Search, files, and media
 
@@ -63,7 +64,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Realtime persistence is ordered through a bounded, session-owned queue; messages are cached for unopened conversations, and unread DMs are prioritized for background history refresh.
 - Automatic Socket Mode reconnect with capped backoff.
 - Scoped loading and error recovery so failures in one surface do not replace unrelated content.
-- Workspace state has one authoritative owner, while the WAL-backed SQLite cache applies incremental entity updates and supports concurrent desktop search reads.
+- Workspace inputs are normalized through a revisioned coordinator behind compatibility adapters, while the WAL-backed SQLite cache applies incremental entity updates and supports concurrent desktop search reads.
 - Tokens are validated with `auth.test` and stored through the system Secret Service/keyring.
 
 ## Current limitations
@@ -75,7 +76,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Slack's public API cannot enumerate every historical subscribed thread. Conduit retains and reconciles every thread it discovers, but a fresh installation builds its thread catalog progressively as history and replies are fetched.
 - Threads and Unreads reflect the conversations and activity Conduit has observed; they are not complete Slack-wide activity aggregators.
 - File and workspace-search views currently load a bounded result set rather than every page.
-- Rich composer formatting, autocomplete beyond emoji, message editing/deletion controls, typing indicators, general live presence, avatars, native production huddle joining, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
+- Rich composer formatting, autocomplete beyond emoji, message editing/deletion controls, typing indicators, general live presence, sidebar avatars (message and profile avatars are supported), native production huddle joining, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
 - Release bundles currently target x86_64 Debian 13, Fedora 44, and Flatpak. Other distributions and architectures still require a source build.
 - Signing out removes the stored credential and clears the active-workspace selection, but it does not currently purge cached workspace data or saved drafts from local storage.
 
@@ -215,7 +216,7 @@ For development, the token can instead be supplied through the environment:
 export CONDUIT_SLACK_APP_TOKEN=xapp-...
 ```
 
-`SLACK_APP_TOKEN` is accepted as an alias. Environment values take precedence over the keyring. Socket Mode starts after OAuth authentication, stops on sign-out, and reconnects automatically after transient failures. Browser-session workspaces use their XOXC/XOXD WebSocket instead. Incoming posts produce ten-second desktop notifications unless the message is your own, duplicated, muted, system noise, or already visible in the active conversation. Without a realtime connection, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
+`SLACK_APP_TOKEN` is accepted as an alias. Environment values take precedence over the keyring. Socket Mode starts after OAuth authentication, stops on sign-out, and reconnects automatically after transient failures. Browser-session workspaces use their XOXC/XOXD WebSocket instead. Incoming posts produce ten-second desktop notifications unless the message is your own, duplicated, muted, system noise, or already visible in the active conversation. Channel notifications include the sender, and selecting a thread-reply notification opens the matching thread. Without a realtime connection, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
 
 ## Keyboard shortcuts
 

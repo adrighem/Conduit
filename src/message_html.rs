@@ -2222,7 +2222,7 @@ fn message_article(
         message_target_attributes(Some(&message.ts)),
         message_author_attribute(message),
         avatar,
-        author_identity_html(message, &author, &status),
+        author_identity_html(message, &author, &status, context),
         metadata_html(message),
         message_body_html(message, context)
     );
@@ -2302,7 +2302,7 @@ fn message_group_article(
         "<article class=\"message message-group\"{}>{}<header class=\"message-header\">{}{}</header><div class=\"message-stack\">",
         message_author_attribute(first_message),
         avatar,
-        author_identity_html(first_message, &author, &status),
+        author_identity_html(first_message, &author, &status, context),
         metadata_html(first_message)
     );
 
@@ -2345,14 +2345,24 @@ fn message_avatar_html(
     )
 }
 
-fn author_identity_html(message: &SlackMessage, author: &str, status: &str) -> String {
+fn author_identity_html(
+    message: &SlackMessage,
+    author: &str,
+    status: &str,
+    context: &MessageHtmlContext,
+) -> String {
     let label = escape_html(author);
     let Some(user_id) = message.user.as_deref().filter(|id| !id.is_empty()) else {
         return format!("<span class=\"author author-label\" dir=\"auto\">{label}</span>{status}");
     };
+    let tooltip = context
+        .user_full_names
+        .get(user_id)
+        .map(String::as_str)
+        .unwrap_or(author);
     format!(
         "<details class=\"author-actions\"><summary class=\"author author-label\" dir=\"auto\" title=\"{}\">{label}</summary><nav class=\"author-menu\" aria-label=\"{}\"><a href=\"{}\">{}</a><a href=\"{}\">{}</a></nav></details>{status}",
-        escape_html(&format!("{}: {author}", gettext("Person actions"))),
+        escape_html(tooltip),
         escape_html(&gettext("Person actions")),
         escape_html(&user_message_action_url(user_id)),
         escape_html(&gettext("Message")),
@@ -4180,6 +4190,7 @@ mod tests {
     fn author_status_is_accessible_in_direct_group_and_channel_messages() {
         let context = MessageHtmlContext {
             user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
+            user_full_names: HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]),
             user_statuses: HashMap::from([(
                 "U123".to_string(),
                 SlackUserStatus {
@@ -4194,7 +4205,9 @@ mod tests {
         for conversation_id in ["D123", "G123", "C123"] {
             let html = conversation_document(conversation_id, &[message("hello")], &context);
 
-            assert!(html.contains("class=\"author author-label\" dir=\"auto\" title=\"Person actions: Ada\">Ada</summary>"));
+            assert!(html.contains(
+                "class=\"author author-label\" dir=\"auto\" title=\"Ada Lovelace\">Ada</summary>"
+            ));
             assert!(html.contains("<span class=\"user-status\""));
             assert!(html.contains("title=\"Heads &lt;down&gt;\""));
             assert!(html.contains("aria-label=\"Status: Heads &lt;down&gt;\""));

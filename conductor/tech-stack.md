@@ -39,21 +39,21 @@
 ## Local State
 - XDG cache paths under the application ID for WebKit data, image assets, and Slack state caches.
 - A workspace-scoped `StoreHub` owns one persistent SQLite writer and two query-only readers behind bounded channels; revisioned batches, commit barriers, and clean shutdown replace per-operation connections.
-- Schema-v2 freshness and retry metadata augments keyed derived-cache payloads. Cache migration/corruption recovery may recreate derived Slack data without touching keyring credentials or GSettings drafts.
+- Schema-v2 freshness and retry metadata augment keyed derived-cache payloads. Cache migration/corruption recovery may recreate derived Slack data without touching keyring credentials or GSettings drafts.
 - GSettings stores workspace/user/conversation/thread-scoped composer drafts.
 
 ## Workspace Pipeline
-- One headless `WorkspaceCoordinator` owns canonical conversations, users, timelines, threads, unread overlays, message identities, and workspace revisions.
-- Cached hydration, Web API responses, local actions, and realtime transports normalize into pure `WorkspaceMutation` values. Each changed logical mutation emits one revisioned `WorkspacePatch` and one ordered `StoreBatch`.
+- A headless `WorkspaceCoordinator` maintains a revisioned canonical view for the inputs migrated so far, alongside the existing runtime, persistence, and UI compatibility paths.
+- Cached hydration, Web API responses, local actions, and realtime transports normalize into pure `WorkspaceMutation` values. Each changed logical mutation emits one revisioned `WorkspacePatch` and, when persistence changes, one ordered `StoreBatch`; compatibility paths still deliver the current UI events and store writes.
 - Snapshot envelopes carry the revision at which network work began so reducer merges cannot roll back newer realtime or local overlays.
-- A bounded scheduler coalesces typed `SyncJob` work by active session, operation, and target across interactive, navigation, image, upload, and yielding maintenance lanes.
+- Runtime work is bounded by separate semaphores for navigation, interactive, background, image, and upload lanes. Typed `SyncJob` coalescing and cancellation remain part of the active workspace-pipeline track.
 
 ## Presentation
 - libadwaita split views and breakpoints adapt the workspace and thread shell to narrow windows.
 - Generated message documents use semantic HTML, logical responsive CSS, locale-aware timestamps, RTL direction, and keyboard-focusable message targets.
-- A keyed `SidebarProjection` drives a virtualized `GtkListView`; local state changes emit splices or row updates while only global filters/preferences intentionally reset the projection.
-- A revision-aware `TimelinePresenter` batches DOM deltas per frame, queues changes while documents load, and limits full WebKit document loads to navigation or recovery.
-- Cached media is exposed only through a bounded, MIME-checked `conduit-asset://` cache-key scheme.
+- A keyed `SidebarModelDiff` reconciles stable rows in the current `GtkListBox`; migration to a virtualized `GtkListView` remains planned.
+- Message timelines load generated HTML documents for navigation and apply typed DOM patches for realtime messages, response regions, user details, and loaded media. A revision-aware batching presenter remains planned.
+- Cached message media is size- and MIME-checked before it is rendered through bounded data URLs. A dedicated cache-key URI scheme remains planned.
 - Desktop notifications use stable workspace/user/channel IDs and typed application actions so activation can survive a cold start.
 
 ## External Slack URI Integration

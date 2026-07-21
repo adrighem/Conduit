@@ -16,7 +16,8 @@
 - Confirm a browser's external-protocol prompt can hand a `slack://` link to Conduit while ordinary Slack HTTPS links stay in the browser.
 - Test OAuth with a real Slack app client ID and `http://127.0.0.1:8934/callback`.
 - If requested Slack scopes changed since the last tester build, verify the README scope list and reconnect instructions before tagging.
-- If Socket Mode has been implemented for the release, test it with an `xapp-` token that has `connections:write`.
+- For an OAuth workspace, test Socket Mode with an `xapp-` token that has `connections:write`.
+- For an imported XOXC/XOXD workspace, verify browser-session realtime connects and reconnects without an app token.
 - Confirm an active huddle appears only in its matching workspace and conversation, and that ending it removes the indicator without restarting Conduit.
 - Confirm huddle preflight does not start capture, defaults the camera and sharing off, and clearly shows the selected microphone, speaker, and camera.
 - Confirm unsupported native joining offers **Open in Slack** for the exact team and conversation and does not loop through Conduit's `slack://` handler.
@@ -42,4 +43,4 @@
 
 - Desktop PKCE OAuth uses user scopes through `oauth.v2.user.access`.
 - Bot scopes are not requested by the desktop redirect flow.
-- Socket Mode is planned as an optional advanced feature because it requires a separate app-level token and explicit Slack app configuration.
+- OAuth workspaces can optionally use Socket Mode with a separate app-level token and explicit Slack app configuration; imported XOXC/XOXD workspaces use Slack's browser-session WebSocket instead.

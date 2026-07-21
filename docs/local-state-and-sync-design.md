@@ -1,5 +1,7 @@
 # Local State And Sync Design
 
+> **Status: Historical design record.** This document is preserved as implementation history and may not describe the current repository. See [README.md](../README.md) for current capabilities and [conductor/tech-stack.md](../conductor/tech-stack.md) for current architecture.
+
 This document covers Big Feature 1 from `docs/modernization-plan.md`: durable local store and rate-limited sync.
 
 ## Assessment

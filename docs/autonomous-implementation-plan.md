@@ -1,5 +1,7 @@
 # Autonomous Implementation Plan
 
+> **Status: Historical plan record.** This document is preserved as implementation history and may not describe the current repository. See [README.md](../README.md) for current capabilities and [conductor/tech-stack.md](../conductor/tech-stack.md) for current architecture.
+
 This plan turns `implementation_plan.text` into buildable vertical slices for Conduit, a native GNOME Slack client.
 
 ## Operating Approach
