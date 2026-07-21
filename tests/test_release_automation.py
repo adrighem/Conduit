@@ -57,6 +57,11 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
 
     assert "googleapis/release-please-action@v4" in workflow
     assert "release_created:" in workflow
+    assert "draft_tag:" in workflow
+    assert "Select existing draft release" in workflow
+    assert "steps.recovery.outputs.release_created" in workflow
+    assert 'gh release view "$DRAFT_TAG" --json isDraft' in workflow
+    assert "GH_REPO: ${{ github.repository }}" in workflow
     assert "needs.release-please.outputs.release_created == 'true'" in workflow
     assert "debian:trixie" in workflow
     assert "fedora:44" in workflow
@@ -81,6 +86,7 @@ def test_release_workflow_builds_and_publishes_all_assets() -> None:
     assert "artifact-name:" not in workflow
     assert "SHA256SUMS" in workflow
     assert "gh release upload" in workflow
+    assert 'gh release edit "$TAG_NAME" --target "$RELEASE_SHA"' in workflow
 
     flatpak_validation = workflow.split("\n  validate-flatpak:", maxsplit=1)[1].split(
         "\n  publish-assets:", maxsplit=1

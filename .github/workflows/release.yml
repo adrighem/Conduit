@@ -5,6 +5,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      draft_tag:
+        description: Existing draft release tag to rebuild and publish
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -26,18 +31,39 @@ jobs:
       issues: write
       pull-requests: write
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
-      sha: ${{ steps.release.outputs.sha }}
+      release_created: ${{ steps.release.outputs.release_created || steps.recovery.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name || steps.recovery.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version || steps.recovery.outputs.version }}
+      sha: ${{ steps.release.outputs.sha || steps.recovery.outputs.sha }}
     steps:
       - name: Create or update release
         id: release
+        if: github.event_name != 'workflow_dispatch' || inputs.draft_tag == ''
         uses: googleapis/release-please-action@v4
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Select existing draft release
+        id: recovery
+        if: github.event_name == 'workflow_dispatch' && inputs.draft_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRAFT_TAG: ${{ inputs.draft_tag }}
+        run: |
+          if [[ ! "$DRAFT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::draft_tag must be a stable vMAJOR.MINOR.PATCH tag"
+            exit 1
+          fi
+          if [[ "$(gh release view "$DRAFT_TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+            echo "::error::$DRAFT_TAG is not an existing draft release"
+            exit 1
+          fi
+          echo "release_created=true" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$DRAFT_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${DRAFT_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
   build-deb:
     needs: release-please
@@ -289,9 +315,11 @@ jobs:
       - name: Publish verified release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
         run: |
           cd dist
           sha256sum -- *.deb *.rpm *.flatpak > SHA256SUMS
           gh release upload "$TAG_NAME" --clobber -- *.deb *.rpm *.flatpak SHA256SUMS
-          gh release edit "$TAG_NAME" --draft=false --latest
+          gh release edit "$TAG_NAME" --target "$RELEASE_SHA" --draft=false --latest
