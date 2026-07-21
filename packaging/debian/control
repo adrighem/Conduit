@@ -8,6 +8,7 @@ Build-Depends:
  appstream,
  desktop-file-utils,
  gettext,
+ gir1.2-gdkpixbuf-2.0,
  libadwaita-1-dev,
  libdbus-1-dev,
  libgdk-pixbuf-2.0-dev,
@@ -16,6 +17,7 @@ Build-Depends:
  meson,
  ninja-build,
  pkgconf,
+ python3-gi,
  rustup
 Standards-Version: 4.7.2
 Homepage: https://github.com/adrighem/Conduit

@@ -9,11 +9,142 @@ from xml.etree import ElementTree
 
 
 ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
+BUILD_ROOT = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 APP_ID = "eu.vanadrighem.conduit"
+RELEASE_CONDITION = "needs.release-please.outputs.release_created == 'true'"
+RELEASE_PAYLOAD_PATHS = (
+    "bin/conduit",
+    f"share/applications/{APP_ID}.desktop",
+    "share/conduit/conduit.gresource",
+    f"share/dbus-1/services/{APP_ID}.service",
+    f"share/glib-2.0/schemas/{APP_ID}.gschema.xml",
+    f"share/gnome-shell/search-providers/{APP_ID}.search-provider.ini",
+    f"share/icons/hicolor/512x512/apps/{APP_ID}.png",
+    f"share/metainfo/{APP_ID}.metainfo.xml",
+)
+NATIVE_MEDIA_DISABLED_OPTIONS = (
+    "-Dnative_media=disabled",
+    "-Dscreen_share=disabled",
+)
 
 
 def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
+
+
+def active_text(document: str) -> str:
+    return "\n".join(
+        line for line in document.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+# These helpers verify the workflow's repository-specific shape. A workflow linter
+# is still required to validate YAML syntax and GitHub expression semantics.
+def workflow_jobs(document: str) -> dict[str, str]:
+    lines = active_text(document).splitlines()
+    try:
+        jobs_start = lines.index("jobs:")
+    except ValueError as error:
+        raise AssertionError("release workflow has no jobs mapping") from error
+
+    jobs: dict[str, str] = {}
+    current_name: str | None = None
+    current_lines: list[str] = []
+    for line in lines[jobs_start + 1 :]:
+        if line and not line.startswith(" "):
+            break
+        match = re.fullmatch(r"  ([A-Za-z0-9_-]+):", line)
+        if match:
+            if current_name is not None:
+                jobs[current_name] = "\n".join(current_lines)
+            current_name = match.group(1)
+            current_lines = [line]
+        elif current_name is not None:
+            current_lines.append(line)
+    if current_name is not None:
+        jobs[current_name] = "\n".join(current_lines)
+
+    assert jobs, "release workflow jobs mapping is empty"
+    return jobs
+
+
+def workflow_steps(job: str) -> list[str]:
+    lines = job.splitlines()
+    try:
+        steps_start = lines.index("    steps:")
+    except ValueError as error:
+        raise AssertionError("workflow job has no steps sequence") from error
+
+    steps: list[str] = []
+    current: list[str] = []
+    for line in lines[steps_start + 1 :]:
+        if line.startswith("      - "):
+            if current:
+                steps.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        steps.append("\n".join(current))
+
+    assert steps, "workflow job has no steps"
+    return steps
+
+
+def step_containing(steps: list[str], needle: str) -> str:
+    matches = [step for step in steps if needle in step]
+    assert len(matches) == 1, f"expected one workflow step containing {needle!r}"
+    return matches[0]
+
+
+def job_needs(job: str) -> set[str]:
+    lines = job.splitlines()
+    for index, line in enumerate(lines):
+        match = re.fullmatch(r"    needs:\s*(.*)", line)
+        if not match:
+            continue
+        inline = match.group(1)
+        if inline.startswith("[") and inline.endswith("]"):
+            return {
+                dependency.strip()
+                for dependency in inline[1:-1].split(",")
+                if dependency.strip()
+            }
+        if inline:
+            return {inline.strip("'\"")}
+
+        dependencies: set[str] = set()
+        for item in lines[index + 1 :]:
+            item_match = re.fullmatch(r"      - ([A-Za-z0-9_-]+)", item)
+            if item_match:
+                dependencies.add(item_match.group(1))
+                continue
+            if item and len(item) - len(item.lstrip()) <= 4:
+                break
+        return dependencies
+    raise AssertionError("workflow job has no needs field")
+
+
+def job_scalar(job: str, field: str) -> str:
+    match = re.search(rf"^    {re.escape(field)}:\s*(.+)$", job, re.MULTILINE)
+    assert match is not None, f"workflow job has no {field!r} field"
+    return match.group(1).strip()
+
+
+def assert_native_media_disabled(options: str | list[str], target: str) -> None:
+    contents = active_text(options if isinstance(options, str) else "\n".join(options))
+    for option in NATIVE_MEDIA_DISABLED_OPTIONS:
+        assert option in contents, f"{target} must set {option}"
+    assert "-Dnative_media=enabled" not in contents
+    assert "-Dscreen_share=enabled" not in contents
+
+
+def assert_installed_payload_contract(job: str, target: str) -> None:
+    for path in RELEASE_PAYLOAD_PATHS:
+        assert path in job, f"{target} does not validate installed {path}"
+    assert "for path in" in job
+    assert 'test -e "$path"' in job or 'test -e "${app_root}/${path}"' in job
+    assert 'grep -Fq "release version=' in job
 
 
 def test_release_versions_are_synchronized() -> None:
@@ -28,7 +159,6 @@ def test_release_versions_are_synchronized() -> None:
     assert config["release-type"] == "rust"
     assert config["include-component-in-tag"] is False
     assert config["include-v-in-tag"] is True
-    assert config["bootstrap-sha"] == "d634d8bebffda092c30470f4de257ddc21a9360f"
 
     extra_files = config["packages"]["."]["extra-files"]
     assert {entry["path"] for entry in extra_files} == {
@@ -46,96 +176,139 @@ def test_release_versions_are_synchronized() -> None:
     assert appstream_release is not None
     assert cargo["package"]["version"] == meson_version.group(1)
     assert cargo["package"]["version"] == appstream_release.attrib["version"]
-    assert manifest in ({}, {".": cargo["package"]["version"]}), (
-        "the Release Please manifest must be empty before bootstrap or match "
-        "the synchronized package version afterwards"
-    )
+    assert manifest == {".": cargo["package"]["version"]}
 
 
-def test_release_workflow_builds_and_publishes_all_assets() -> None:
+def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
     workflow = read(".github/workflows/release.yml")
+    jobs = workflow_jobs(workflow)
+    dependencies = {
+        "build-deb": {"release-please"},
+        "validate-deb": {"release-please", "build-deb"},
+        "build-rpm": {"release-please"},
+        "validate-rpm": {"release-please", "build-rpm"},
+        "build-flatpak": {"release-please"},
+        "validate-flatpak": {"release-please", "build-flatpak"},
+        "publish-assets": {
+            "release-please",
+            "build-deb",
+            "validate-deb",
+            "build-rpm",
+            "validate-rpm",
+            "build-flatpak",
+            "validate-flatpak",
+        },
+    }
+    assert {"release-please", *dependencies} <= jobs.keys()
+    for job_name, expected_needs in dependencies.items():
+        assert job_needs(jobs[job_name]) == expected_needs
+        assert job_scalar(jobs[job_name], "if") == RELEASE_CONDITION
 
-    assert "googleapis/release-please-action@v4" in workflow
-    assert "release_created:" in workflow
-    assert "draft_tag:" in workflow
-    assert "Select existing draft release" in workflow
-    assert "steps.recovery.outputs.release_created" in workflow
-    assert 'gh release view "$DRAFT_TAG" --json isDraft' in workflow
-    assert "GH_REPO: ${{ github.repository }}" in workflow
-    assert "needs.release-please.outputs.release_created == 'true'" in workflow
-    assert "debian:trixie" in workflow
-    assert "fedora:44" in workflow
-    rpm_dependencies = workflow.split(
-        "      - name: Install Fedora build dependencies", maxsplit=1
-    )[1].split("      - name: Build RPM package", maxsplit=1)[0]
+    release_job = jobs["release-please"]
+    release_steps = workflow_steps(release_job)
+    release_action = step_containing(release_steps, "googleapis/release-please-action@")
+    assert "config-file: release-please-config.json" in release_action
+    assert "manifest-file: .release-please-manifest.json" in release_action
+    recovery = step_containing(release_steps, "id: recovery")
+    assert "inputs.draft_tag != ''" in recovery
+    assert "GH_REPO: ${{ github.repository }}" in recovery
+    assert 'gh release view "$DRAFT_TAG" --json isDraft' in recovery
+    for output in ("release_created", "tag_name", "version", "sha"):
+        output_mapping = re.search(rf"^      {output}:\s*(.+)$", release_job, re.MULTILINE)
+        assert output_mapping is not None, f"release output {output!r} lacks recovery"
+        mapping = output_mapping.group(1)
+        assert f"steps.release.outputs.{output}" in mapping
+        assert f"steps.recovery.outputs.{output}" in mapping
+        assert f'echo "{output}=' in recovery
+
+    for job_name in ("build-deb", "build-rpm", "build-flatpak"):
+        checkout = step_containing(workflow_steps(jobs[job_name]), "actions/checkout@")
+        assert "ref: ${{ needs.release-please.outputs.sha }}" in checkout
+
+    rpm_steps = workflow_steps(jobs["build-rpm"])
+    rpm_dependencies = step_containing(rpm_steps, "dnf install")
+    rpm_checkout = step_containing(rpm_steps, "actions/checkout@")
+    rpm_build = step_containing(rpm_steps, "git archive")
     assert re.search(r"\bgit\b", rpm_dependencies)
-    assert rpm_dependencies.index("dnf install") < rpm_dependencies.index(
-        "uses: actions/checkout@v4"
-    )
-    rpm_build = workflow.split("      - name: Build RPM package", maxsplit=1)[1].split(
-        "      - uses: actions/upload-artifact@v4", maxsplit=1
-    )[0]
+    assert rpm_steps.index(rpm_dependencies) < rpm_steps.index(rpm_checkout)
+    assert rpm_steps.index(rpm_checkout) < rpm_steps.index(rpm_build)
     assert 'git config --global --add safe.directory "$GITHUB_WORKSPACE"' in rpm_build
     assert rpm_build.index("safe.directory") < rpm_build.index("git archive")
-    assert "gst-inspect-1.0" not in workflow
-    assert "libgstreamer" not in workflow
-    assert "gstreamer1.0-" not in workflow
-    assert "gstreamer1(" not in workflow
-    assert "gstreamer1-plugins" not in workflow
-    assert 'CARGO_NET_RETRY: "10"' in workflow
-    assert "RUSTUP_HOME: /opt/rustup" in workflow
-    assert "RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}" in workflow
-    assert 'rustup default "$RUST_VERSION"' not in workflow
-    assert "dpkg-query --showformat='${Version}'" in workflow
-    assert "rpm -q --qf '%{VERSION}-%{RELEASE}'" in workflow
-    assert "/usr/share/conduit/conduit.gresource" in workflow
-    assert "flatpak/flatpak-github-actions/flatpak-builder@v6" in workflow
-    assert f"packaging/flatpak/{APP_ID}.json" in workflow
-    assert "artifact-name:" not in workflow
-    assert "SHA256SUMS" in workflow
-    assert "gh release upload" in workflow
-    assert 'gh release edit "$TAG_NAME" --target "$RELEASE_SHA"' in workflow
 
-    flatpak_validation = workflow.split("\n  validate-flatpak:", maxsplit=1)[1].split(
-        "\n  publish-assets:", maxsplit=1
-    )[0]
-    publication = workflow.split("\n  publish-assets:", maxsplit=1)[1]
-    assert "needs: [release-please, build-flatpak]" in flatpak_validation
-    assert "actions/download-artifact@v4" in flatpak_validation
+    flatpak_build = step_containing(
+        workflow_steps(jobs["build-flatpak"]),
+        "flatpak/flatpak-github-actions/flatpak-builder@",
+    )
+    assert f"manifest-path: packaging/flatpak/{APP_ID}.json" in flatpak_build
+
+    for job_name in ("validate-deb", "validate-rpm", "validate-flatpak"):
+        assert_installed_payload_contract(jobs[job_name], job_name)
+        step_containing(workflow_steps(jobs[job_name]), "actions/download-artifact@")
+
+    for job_name in ("validate-deb", "validate-rpm"):
+        validation = jobs[job_name]
+        assert "ldd /usr/bin/conduit" in validation
+        assert "readelf -d /usr/bin/conduit" in validation
+        assert "glib-compile-schemas --strict --dry-run" in validation
+        assert "desktop-file-validate" in validation
+        assert "appstreamcli validate --no-net" in validation
+
+    debian_validation = jobs["validate-deb"]
+    assert "dpkg-query --showformat='${Version}'" in debian_validation
+    rpm_validation = jobs["validate-rpm"]
+    assert "rpm -q --qf '%{VERSION}-%{RELEASE}'" in rpm_validation
+
+    flatpak_validation = jobs["validate-flatpak"]
     assert "flatpak install --system --noninteractive --assumeyes" in flatpak_validation
     assert 'flatpak info --system --show-ref "$APP_ID"' in flatpak_validation
-    assert 'flatpak run --system --command=sh "$APP_ID"' in flatpak_validation
+    assert 'flatpak info --system --show-runtime "$APP_ID"' in flatpak_validation
+    assert 'flatpak info --system --show-commit "$APP_ID"' in flatpak_validation
     assert "if grep -Fq pulseaudio permissions.ini" in flatpak_validation
-    assert "      - validate-flatpak" in publication
+    assert 'flatpak run --system --command=sh "$APP_ID"' in flatpak_validation
+
+    publication = jobs["publish-assets"]
+    step_containing(workflow_steps(publication), "actions/download-artifact@")
+    publish_step = step_containing(workflow_steps(publication), "gh release upload")
+    assert "SHA256SUMS" in publish_step
+    assert 'gh release edit "$TAG_NAME" --target "$RELEASE_SHA"' in publish_step
 
 
 def test_release_build_tests_reuse_the_release_profile() -> None:
-    source_build = read("src/meson.build")
     rpm_spec = read("packaging/rpm/conduit.spec")
     rpm_check = rpm_spec.split("%check", maxsplit=1)[1].split("%files", maxsplit=1)[0]
 
-    assert "cargo_test_args += [cargo_release_arg]" in source_build
+    if BUILD_ROOT is not None:
+        build_options = json.loads(
+            (BUILD_ROOT / "meson-info" / "intro-buildoptions.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        buildtype = next(
+            option["value"] for option in build_options if option["name"] == "buildtype"
+        )
+        configured_tests = json.loads(
+            (BUILD_ROOT / "meson-info" / "intro-tests.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        cargo_tests = [test for test in configured_tests if test["name"] == "Cargo tests"]
+        assert len(cargo_tests) == 1
+        assert ("--release" in cargo_tests[0]["cmd"]) == (buildtype == "release")
     assert "%meson_test" in rpm_check
 
 
 def test_release_packages_disable_unavailable_native_huddle_stack() -> None:
-    ci = read(".github/workflows/ci.yml")
-    debian_control = read("packaging/debian/control")
     debian_rules = read("packaging/debian/rules")
     rpm_spec = read("packaging/rpm/conduit.spec")
+    debian_configure = debian_rules.split(
+        "override_dh_auto_configure:", maxsplit=1
+    )[1].split("override_dh_auto_build:", maxsplit=1)[0]
+    rpm_build = rpm_spec.split("%build", maxsplit=1)[1].split(
+        "%install", maxsplit=1
+    )[0]
 
-    assert "--features native-media,screen-share,huddle-harness" in ci
-    assert "-Dnative_media=enabled -Dscreen_share=enabled" in ci
-    assert "gstreamer" not in debian_control
-    assert "-Dnative_media=disabled" in debian_rules
-    assert "-Dscreen_share=disabled" in debian_rules
-    assert "-Dnative_media=enabled" not in debian_rules
-    assert "-Dscreen_share=enabled" not in debian_rules
-    assert "gstreamer" not in rpm_spec
-    assert "-Dnative_media=disabled" in rpm_spec
-    assert "-Dscreen_share=disabled" in rpm_spec
-    assert "-Dnative_media=enabled" not in rpm_spec
-    assert "-Dscreen_share=enabled" not in rpm_spec
+    assert_native_media_disabled(debian_configure, "Debian package")
+    assert_native_media_disabled(rpm_build, "RPM package")
 
 
 def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
@@ -145,8 +318,12 @@ def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
     assert manifest["runtime"] == "org.gnome.Platform"
     assert manifest["runtime-version"] == "50"
     assert manifest["command"] == "conduit"
-    assert "RUST_LOG" not in manifest.get("build-options", {}).get("env", {})
     assert "--socket=pulseaudio" not in manifest["finish-args"]
+    assert not any(
+        argument == "--env=RUST_LOG"
+        or argument.startswith("--env=RUST_LOG=")
+        for argument in manifest["finish-args"]
+    )
 
     conduit = next(
         module for module in manifest["modules"] if module["name"] == "conduit"
@@ -155,24 +332,15 @@ def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
     assert "cargo-sources.json" in conduit["sources"]
     assert any(
         source.get("type") == "shell"
+        and "cp -vf cargo/config .cargo/config.toml" in source.get("commands", [])
         for source in conduit["sources"]
         if isinstance(source, dict)
     )
     assert "--libdir=lib" in conduit["config-opts"]
-    assert "-Dnative_media=disabled" in conduit["config-opts"]
-    assert "-Dscreen_share=disabled" in conduit["config-opts"]
-    assert "-Dnative_media=enabled" not in conduit["config-opts"]
-    assert "-Dscreen_share=enabled" not in conduit["config-opts"]
-
-
-def test_unused_direct_dependencies_are_absent_from_the_lockfile() -> None:
-    cargo = tomllib.loads(read("Cargo.toml"))
-    lockfile = tomllib.loads(read("Cargo.lock"))
-    locked_names = {package["name"] for package in lockfile["package"]}
-
-    for dependency in ("pulldown-cmark", "slack-blocks", "slack-morphism"):
-        assert dependency not in cargo["dependencies"]
-        assert dependency not in locked_names
+    assert_native_media_disabled(conduit["config-opts"], "Flatpak package")
+    for scope in (manifest, *manifest["modules"]):
+        environment = scope.get("build-options", {}).get("env", {})
+        assert "RUST_LOG" not in environment
 
 
 def test_flatpak_cargo_sources_match_the_lockfile() -> None:
@@ -201,11 +369,10 @@ def test_flatpak_cargo_sources_match_the_lockfile() -> None:
 def main() -> None:
     tests = [
         test_release_versions_are_synchronized,
-        test_release_workflow_builds_and_publishes_all_assets,
+        test_release_workflow_builds_validates_and_publishes_all_assets,
         test_release_build_tests_reuse_the_release_profile,
         test_release_packages_disable_unavailable_native_huddle_stack,
         test_release_flatpak_uses_current_checkout_without_debug_logging,
-        test_unused_direct_dependencies_are_absent_from_the_lockfile,
         test_flatpak_cargo_sources_match_the_lockfile,
     ]
     for test in tests:

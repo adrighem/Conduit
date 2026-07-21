@@ -81,11 +81,6 @@ impl ThreadCatalog {
         catalog
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn records(&self) -> impl Iterator<Item = &ThreadRecord> {
-        self.records.values()
-    }
-
     pub(crate) fn into_records(self) -> Vec<ThreadRecord> {
         let mut records = self.records.into_values().collect::<Vec<_>>();
         records.sort_by(|left, right| {
@@ -500,11 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn mark_read_records_the_marker_and_records_iterator_exposes_it() {
+    fn mark_read_records_the_marker() {
         let mut catalog = ThreadCatalog::default();
         catalog.observe_history("C1", &[root("1.0", 1)]);
         catalog.mark_read("C1", "1.0", "2.0");
-        assert_eq!(catalog.records().count(), 1);
         assert_eq!(
             catalog.get("C1", "1.0").unwrap().unread,
             ThreadUnreadState::Known {

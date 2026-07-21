@@ -141,22 +141,33 @@ mod tests {
     }
 
     #[test]
-    fn shortcuts_dialog_lists_window_shortcuts() {
-        let dialog = include_str!("shortcuts-dialog.ui");
+    fn registered_accelerators_match_the_shortcuts_dialog() {
+        const PROPERTY_START: &str = "<property name=\"accelerator\">";
 
-        for text in [
-            "Jump to a Conversation",
-            "Search Workspace Messages",
-            "Messages",
-            "Unreads",
-            "Refresh Conversations",
-            "Focus Composer",
-            "&lt;Control&gt;k",
-            "&lt;Control&gt;f",
-            "&lt;Control&gt;m",
-            "&lt;Control&gt;o",
-        ] {
-            assert!(dialog.contains(text), "missing shortcut dialog text {text}");
-        }
+        let documented = include_str!("shortcuts-dialog.ui")
+            .split(PROPERTY_START)
+            .skip(1)
+            .map(|property| {
+                property
+                    .split_once("</property>")
+                    .expect("accelerator property should be closed")
+                    .0
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&")
+                    .to_ascii_lowercase()
+            })
+            .collect::<Vec<_>>();
+        let documented_set = documented.iter().cloned().collect::<HashSet<_>>();
+        let mut expected = APP_SHORTCUTS
+            .iter()
+            .chain(WINDOW_SHORTCUTS.iter())
+            .flat_map(|shortcut| shortcut.accelerators)
+            .map(|accelerator| accelerator.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        expected.extend(["return".to_string(), "<shift>return".to_string()]);
+
+        assert_eq!(documented.len(), documented_set.len());
+        assert_eq!(documented_set, expected);
     }
 }

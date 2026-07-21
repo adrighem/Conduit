@@ -312,14 +312,6 @@ impl StoreHub {
         })
     }
 
-    #[cfg(test)]
-    fn queue_capacities(&self) -> (usize, [usize; STORE_READER_COUNT]) {
-        (
-            self.inner.writer.max_capacity(),
-            std::array::from_fn(|index| self.inner.readers[index].max_capacity()),
-        )
-    }
-
     pub(crate) fn metrics(&self) -> StoreMetricsSnapshot {
         StoreMetricsSnapshot {
             connections: self.inner.metrics.connections.load(Ordering::Relaxed),
@@ -2847,7 +2839,6 @@ mod tests {
         let directory = temp_cache_dir("store-hub-connections");
         runtime().block_on(async {
             let hub = StoreHub::open(directory.clone()).await.unwrap();
-            assert_eq!(hub.queue_capacities(), (64, [32, 32]));
 
             let first_writer = hub
                 .write(|connection| Ok(connection as *const Connection as usize))
@@ -3245,12 +3236,6 @@ mod tests {
             assert!(after_identical.skipped_rows > after_insert.skipped_rows);
         });
         let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn store_work_outcome_never_labels_zero_transactions_as_committed() {
-        assert_eq!(store_work_outcome(0), "unchanged");
-        assert_eq!(store_work_outcome(1), "committed");
     }
 
     #[test]

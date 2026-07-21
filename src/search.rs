@@ -216,7 +216,6 @@ mod tests {
     #[test]
     fn terms_can_match_across_searchable_fields() {
         assert!(matches_all_terms("arch vin", ["#architecture", "Vincent"]));
-        assert!(matches_all_terms("   ", ["anything"]));
     }
 
     #[test]

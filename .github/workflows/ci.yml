@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -35,6 +36,10 @@ jobs:
             meson \
             ninja-build \
             pkg-config \
+            python3-gi \
+            gir1.2-gdkpixbuf-2.0 \
+            gir1.2-gtk-4.0 \
+            gir1.2-webkit-6.0 \
             gstreamer1.0-libav \
             gstreamer1.0-nice \
             gstreamer1.0-pipewire \
@@ -44,31 +49,29 @@ jobs:
             xclip \
             xdotool \
             xfwm4 \
+            x11-utils \
             xvfb
 
       - name: Format
         run: cargo fmt --check
 
+      - name: Lint GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --locked
 
       - name: Lint native huddle stack
         run: cargo clippy --locked --all-targets --features native-media,screen-share,huddle-harness -- -D warnings
 
-      - name: Test native huddle stack
-        run: cargo test --locked --features native-media,screen-share,huddle-harness
-
       - name: Meson build
         run: |
-          meson setup _build
+          meson setup _build -Dheadless_tests=enabled
           meson compile -C _build
-          meson test -C _build --print-errorlogs
+          meson test -C _build --no-rebuild --print-errorlogs
 
       - name: Meson native huddle build
         run: |
-          meson setup _build-huddles -Dnative_media=enabled -Dscreen_share=enabled
+          meson setup _build-huddles -Dnative_media=enabled -Dscreen_share=enabled -Dhuddle_harness=true -Dheadless_tests=enabled
           meson compile -C _build-huddles
-          meson test -C _build-huddles --print-errorlogs
+          meson test -C _build-huddles --no-rebuild --print-errorlogs --suite rust --suite huddle-ui

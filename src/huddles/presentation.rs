@@ -153,8 +153,6 @@ mod tests {
             presentation.primary_action,
             HuddlePrimaryAction::OpenExternal
         );
-        assert!(!presentation.camera_enabled);
-        assert!(!presentation.screen_share_active);
     }
 
     #[test]

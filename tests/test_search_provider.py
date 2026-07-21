@@ -6,11 +6,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import tempfile
 import time
+
+from gi.repository import GLib
 
 APP_ID = "eu.vanadrighem.conduit"
 OBJECT_PATH = "/eu/vanadrighem/conduit/SearchProvider"
@@ -47,6 +48,10 @@ def call(environment: dict[str, str], method: str, *arguments: str) -> str:
         text=True,
         timeout=10,
     ).stdout
+
+
+def unpack_call(output: str) -> tuple:
+    return GLib.Variant.parse(None, output.strip(), None, None).unpack()
 
 
 def bus_name_owned(environment: dict[str, str]) -> bool:
@@ -166,7 +171,7 @@ def main() -> None:
         # Do not start Conduit directly: the first provider call must exercise
         # the installed D-Bus activation contract.
         initial = call(environment, "GetInitialResultSet", "['gen']")
-        result_ids = re.findall(r"'([^']+)'", initial)
+        (result_ids,) = unpack_call(initial)
         assert len(result_ids) == 1, initial
         result_id = result_ids[0]
         assert "C_TEST" not in result_id
@@ -177,11 +182,16 @@ def main() -> None:
             f"['{result_id}']",
             "['general']",
         )
-        assert result_id in refined
+        (refined_ids,) = unpack_call(refined)
+        assert refined_ids == [result_id], refined
 
         metadata = call(environment, "GetResultMetas", f"['{result_id}']")
-        assert "#general" in metadata
-        assert "Public channel" in metadata
+        (metas,) = unpack_call(metadata)
+        assert len(metas) == 1, metadata
+        assert set(metas[0]) == {"id", "name", "description", "icon"}, metas[0]
+        assert metas[0]["id"] == result_id, metas[0]
+        assert metas[0]["name"] == "#general", metas[0]
+        assert metas[0]["description"] == "Public channel", metas[0]
 
         activated = call(
             environment,

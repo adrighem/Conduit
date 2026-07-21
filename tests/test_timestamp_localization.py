@@ -46,7 +46,6 @@ PROBE = r"""
   });
   const directDate = new Date(2026, 6, 10, 13, 0);
   const direct = dateTimeFormatter.format(directDate);
-  const directParts = dateTimeFormatter.formatToParts(directDate);
   const timeFormatter = new Intl.DateTimeFormat("nl-NL", {
     hour: "numeric",
     minute: "2-digit"
@@ -56,6 +55,19 @@ PROBE = r"""
     hour: "numeric",
     minute: "2-digit"
   });
+  const dateYearTimeFormatter = new Intl.DateTimeFormat("nl-NL", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+  const yesterdayDate = new Date(2026, 6, 19, 13, 0);
+  const yesterdayWord = new Intl.RelativeTimeFormat("nl-NL", { numeric: "auto" })
+    .format(-1, "day");
+  const expectedYesterday = weekdayTimeFormatter.formatToParts(yesterdayDate)
+    .map((part) => part.type === "weekday" ? yesterdayWord : part.value)
+    .join("");
 
   function snapshot(id) {
     const element = document.getElementById(id);
@@ -99,12 +111,12 @@ PROBE = r"""
 
   return JSON.stringify({
     direct,
-    directParts,
     expectedDynamic: dateTimeFormatter.format(new Date(2026, 6, 9, 13, 0)),
     expectedReplacement: dateTimeFormatter.format(new Date(2026, 6, 8, 13, 0)),
     expectedToday: timeFormatter.format(new Date(2026, 6, 20, 13, 0)),
+    expectedYesterday,
     expectedWeekday: weekdayTimeFormatter.format(new Date(2026, 6, 16, 13, 0)),
-    expectedYesterdayWord: new Intl.RelativeTimeFormat("nl-NL", { numeric: "auto" }).format(-1, "day"),
+    expectedPreviousYear: dateYearTimeFormatter.format(new Date(2025, 11, 31, 13, 0)),
     cLocaleFallback: isolatedFallback(null),
     unsupportedLocale,
     unsupportedLocaleFallback: unsupportedLocale ? isolatedFallback(unsupportedLocale) : null,
@@ -197,21 +209,14 @@ def main() -> None:
     assert payload["inserted"] is True
     assert payload["replaced"] is True
     assert payload["timelineTimestampCount"] == 2
-    part_types = [part["type"] for part in payload["directParts"]]
-    parts = {part["type"]: part["value"] for part in payload["directParts"]}
-    assert parts["day"] == "10"
-    assert parts["month"].lower().startswith("jul")
-    assert parts["hour"] == "13"
-    assert parts["minute"] == "00"
-    assert part_types.index("day") < part_types.index("month") < part_types.index("hour")
     assert payload["dynamic"]["text"] == payload["expectedDynamic"]
     assert payload["dynamic"]["localized"] == "true"
     assert payload["replacement"]["text"] == payload["expectedReplacement"]
     assert payload["replacement"]["localized"] == "true"
     assert payload["today"]["text"] == payload["expectedToday"]
-    assert payload["expectedYesterdayWord"] in payload["yesterday"]["text"]
+    assert payload["yesterday"]["text"] == payload["expectedYesterday"]
     assert payload["weekday"]["text"] == payload["expectedWeekday"]
-    assert "2025" in payload["previousYear"]["text"]
+    assert payload["previousYear"]["text"] == payload["expectedPreviousYear"]
     assert payload["cLocaleFallback"] == "server fallback"
     if payload["unsupportedLocale"] is not None:
         assert payload["unsupportedLocaleFallback"] == "server fallback"

@@ -1188,12 +1188,17 @@ mod tests {
 
     #[test]
     fn workspace_lifecycle_connects_syncs_and_becomes_ready() {
-        let lifecycle = WorkspaceLifecycle::default()
-            .transition(WorkspaceLifecycleEvent::ConnectRequested)
-            .transition(WorkspaceLifecycleEvent::Authenticated)
-            .transition(WorkspaceLifecycleEvent::SyncCompleted);
+        let connecting =
+            WorkspaceLifecycle::default().transition(WorkspaceLifecycleEvent::ConnectRequested);
+        assert_eq!(connecting, WorkspaceLifecycle::Connecting);
 
-        assert_eq!(lifecycle, WorkspaceLifecycle::Ready);
+        let syncing = connecting.transition(WorkspaceLifecycleEvent::Authenticated);
+        assert_eq!(syncing, WorkspaceLifecycle::Syncing);
+
+        assert_eq!(
+            syncing.transition(WorkspaceLifecycleEvent::SyncCompleted),
+            WorkspaceLifecycle::Ready
+        );
     }
 
     #[test]
@@ -1214,10 +1219,12 @@ mod tests {
             WorkspaceLifecycle::Ready.transition(WorkspaceLifecycleEvent::RetryableFailure);
         assert_eq!(degraded, WorkspaceLifecycle::Degraded);
 
-        let recovered = degraded
-            .transition(WorkspaceLifecycleEvent::RecoveryStarted)
-            .transition(WorkspaceLifecycleEvent::SyncCompleted);
-        assert_eq!(recovered, WorkspaceLifecycle::Ready);
+        let syncing = degraded.transition(WorkspaceLifecycleEvent::RecoveryStarted);
+        assert_eq!(syncing, WorkspaceLifecycle::Syncing);
+        assert_eq!(
+            syncing.transition(WorkspaceLifecycleEvent::SyncCompleted),
+            WorkspaceLifecycle::Ready
+        );
     }
 
     #[test]
@@ -1352,6 +1359,13 @@ mod tests {
                 ..Default::default()
             }]);
         session.view.borrow_mut().show_unreads();
+        let mut thread_root = message("1", "thread root");
+        thread_root.reply_count = Some(1);
+        session
+            .threads
+            .borrow_mut()
+            .observe_history("C1", &[thread_root]);
+        assert!(session.threads.borrow().get("C1", "1").is_some());
 
         session.reset();
 
@@ -1360,6 +1374,7 @@ mod tests {
             session.view.borrow().main_view(),
             MainMessageView::Placeholder
         );
+        assert!(session.threads.borrow().get("C1", "1").is_none());
     }
 
     #[test]
@@ -1604,67 +1619,84 @@ mod tests {
     }
 
     #[test]
-    fn surface_failures_clear_only_their_loading_state_and_report_visibility() {
-        let mut search = WorkspaceViewState::default();
-        search.start_search();
-        search.search_results.push(SearchMatch {
+    fn surface_failures_clear_only_their_loading_state_and_preserve_content() {
+        let mut state = WorkspaceViewState::default();
+        state.show_search();
+        state.search_loading = true;
+        state.files_loading = true;
+        state.saved_loading = true;
+        state.search_results.push(SearchMatch {
             text: Some("preserved".into()),
             ..SearchMatch::default()
         });
+        state.files.push(SlackFile {
+            id: Some("F1".into()),
+            ..SlackFile::default()
+        });
+        state.saved_items.push(SavedItem {
+            channel: Some("C1".into()),
+            ..SavedItem::default()
+        });
+
         assert_eq!(
-            search.fail_search(),
+            state.fail_search(),
             WorkspaceFailureOutcome {
                 active: true,
                 has_content: true,
             }
         );
-        assert!(!search.search_loading());
+        assert!(!state.search_loading());
+        assert!(state.files_loading());
+        assert!(state.saved_loading());
+        assert_eq!(state.search_results()[0].text.as_deref(), Some("preserved"));
+
+        state.show_files();
+        state.search_loading = true;
+        state.files_loading = true;
+        state.saved_loading = true;
         assert_eq!(
-            search.search_results()[0].text.as_deref(),
-            Some("preserved")
+            state.fail_files(),
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: true,
+            }
         );
-        search.start_search();
-        search.show_unreads();
+        assert!(state.search_loading());
+        assert!(!state.files_loading());
+        assert!(state.saved_loading());
+        assert_eq!(state.files()[0].id.as_deref(), Some("F1"));
+
+        state.show_saved();
+        state.search_loading = true;
+        state.files_loading = true;
+        state.saved_loading = true;
         assert_eq!(
-            search.fail_search(),
+            state.fail_saved(),
+            WorkspaceFailureOutcome {
+                active: true,
+                has_content: true,
+            }
+        );
+        assert!(state.search_loading());
+        assert!(state.files_loading());
+        assert!(!state.saved_loading());
+        assert_eq!(state.saved_items()[0].channel.as_deref(), Some("C1"));
+    }
+
+    #[test]
+    fn inactive_surface_failure_does_not_change_the_current_view() {
+        let mut state = WorkspaceViewState::default();
+        state.start_search();
+        state.show_unreads();
+
+        assert_eq!(
+            state.fail_search(),
             WorkspaceFailureOutcome {
                 active: false,
                 has_content: false,
             }
         );
-        assert_eq!(search.main_view(), MainMessageView::Unreads);
-
-        let mut files = WorkspaceViewState::default();
-        files.start_files();
-        files.files.push(SlackFile {
-            id: Some("F1".into()),
-            ..SlackFile::default()
-        });
-        assert_eq!(
-            files.fail_files(),
-            WorkspaceFailureOutcome {
-                active: true,
-                has_content: true,
-            }
-        );
-        assert!(!files.files_loading());
-        assert_eq!(files.files()[0].id.as_deref(), Some("F1"));
-
-        let mut saved = WorkspaceViewState::default();
-        saved.start_saved();
-        saved.saved_items.push(SavedItem {
-            channel: Some("C1".into()),
-            ..SavedItem::default()
-        });
-        assert_eq!(
-            saved.fail_saved(),
-            WorkspaceFailureOutcome {
-                active: true,
-                has_content: true,
-            }
-        );
-        assert!(!saved.saved_loading());
-        assert_eq!(saved.saved_items()[0].channel.as_deref(), Some("C1"));
+        assert_eq!(state.main_view(), MainMessageView::Unreads);
     }
 
     #[test]
@@ -1917,6 +1949,16 @@ mod tests {
         let mut state = WorkspaceViewState::default();
         state.select_conversation("C1");
         apply_fresh(&mut state, "C1", Vec::new());
+
+        let channel_outcome = state.apply_realtime_message(
+            "C1",
+            message("1", "first post"),
+            RealtimeMessageKind::Posted,
+        );
+        assert!(channel_outcome.channel_changed);
+        assert!(channel_outcome.render_channel);
+        assert_eq!(state.channel_messages("C1")[0].body_text(), "first post");
+
         state.open_thread("C1", "1");
         state.apply_thread("C1", "1", Vec::new(), false, None, false);
 
@@ -1929,7 +1971,7 @@ mod tests {
         assert!(!outcome.channel_changed);
         assert!(!outcome.render_channel);
         assert!(outcome.render_thread);
-        assert!(state.channel_messages("C1").is_empty());
+        assert_eq!(state.channel_messages("C1").len(), 1);
         assert_eq!(
             state.current_thread_messages()[0].body_text(),
             "first reply"
@@ -2112,7 +2154,27 @@ mod tests {
             state.channel_messages("C1")[0].reactions.as_ref().unwrap()[0].count,
             Some(1)
         );
+        assert_eq!(
+            state.current_thread_messages()[0]
+                .reactions
+                .as_ref()
+                .unwrap()[0]
+                .count,
+            Some(1)
+        );
         assert!(!state.apply_reaction(&update).changed);
+        assert_eq!(
+            state.channel_messages("C1")[0].reactions.as_ref().unwrap()[0].count,
+            Some(1)
+        );
+        assert_eq!(
+            state.current_thread_messages()[0]
+                .reactions
+                .as_ref()
+                .unwrap()[0]
+                .count,
+            Some(1)
+        );
 
         let removed = state.apply_reaction(&ReactionUpdate {
             added: false,
@@ -2120,6 +2182,11 @@ mod tests {
         });
         assert!(removed.changed);
         assert!(state.channel_messages("C1")[0]
+            .reactions
+            .as_ref()
+            .unwrap()
+            .is_empty());
+        assert!(state.current_thread_messages()[0]
             .reactions
             .as_ref()
             .unwrap()

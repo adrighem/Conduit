@@ -2106,7 +2106,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_preserves_existing_conversation_order() {
+    fn empty_query_sorts_conversations_by_title() {
         let conversations = [channel("C2", "zebra"), channel("C1", "alpha")];
 
         let items = conversation_switcher_items(&conversations, &HashMap::new(), None, "  ");
@@ -2166,7 +2166,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_picker_lists_new_channels_and_people_after_existing_conversations() {
+    fn conversation_picker_separates_new_channels_and_people_from_existing_conversations() {
         let general = channel("C1", "general");
         let existing_dm = SlackConversation {
             id: "D1".to_string(),

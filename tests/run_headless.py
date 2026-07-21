@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import signal
 import shutil
 import subprocess
 import sys
@@ -15,25 +16,37 @@ from xml.sax.saxutils import escape
 
 def wait_for_window_manager(environment: dict[str, str], process: subprocess.Popen) -> None:
     xprop = shutil.which("xprop")
-    if xprop is None:
-        time.sleep(0.5)
-        return
+    xdotool = shutil.which("xdotool")
+    if xprop is None and xdotool is None:
+        raise RuntimeError("xprop or xdotool is required to detect window-manager readiness")
 
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError("xfwm4 exited before becoming ready")
-        supported = subprocess.run(
-            [xprop, "-root", "_NET_SUPPORTED"],
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if supported.returncode == 0 and "_NET_ACTIVE_WINDOW" in supported.stdout:
-            return
+        if xprop is not None:
+            supported = subprocess.run(
+                [xprop, "-root", "_NET_SUPPORTED"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if supported.returncode == 0 and "_NET_ACTIVE_WINDOW" in supported.stdout:
+                return
+        else:
+            desktops = subprocess.run(
+                [xdotool, "get_num_desktops"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            count = desktops.stdout.strip()
+            if desktops.returncode == 0 and count.isdigit() and int(count) > 0:
+                return
         time.sleep(0.1)
-    raise RuntimeError("xfwm4 did not advertise _NET_ACTIVE_WINDOW within 10 seconds")
+    raise RuntimeError("xfwm4 did not publish its EWMH state within 10 seconds")
 
 
 def run_test() -> int:
@@ -90,14 +103,18 @@ def run_test() -> int:
             ).returncode
         finally:
             try:
-                window_manager.terminate()
-                try:
-                    window_manager.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    window_manager.kill()
-                    window_manager.wait(timeout=5)
+                if window_manager.poll() is None:
+                    window_manager.terminate()
+                    try:
+                        window_manager.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        window_manager.kill()
+                        window_manager.wait(timeout=5)
             finally:
-                os.kill(int(output[1]), 15)
+                try:
+                    os.kill(int(output[1]), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
 
 
 if os.environ.get("CONDUIT_HEADLESS_INNER") == "1":

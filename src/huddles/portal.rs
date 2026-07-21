@@ -233,31 +233,6 @@ pub async fn request_screen_cast<B: ScreenCastBackend>(
     })
 }
 
-pub async fn request_and_attach_screen_cast<B, F>(
-    backend: Arc<B>,
-    parent: Option<&B::Parent>,
-    cancellation: watch::Receiver<bool>,
-    attach: F,
-) -> Result<ScreenCastLease<B>, PortalError>
-where
-    B: ScreenCastBackend,
-    F: FnOnce(OwnedFd, u32) -> Result<(), PortalError>,
-{
-    let lease = request_screen_cast(backend, parent, cancellation).await?;
-    let remote_fd = match lease.duplicate_remote_fd() {
-        Ok(remote_fd) => remote_fd,
-        Err(error) => {
-            let _ = lease.close().await;
-            return Err(error);
-        }
-    };
-    if let Err(error) = attach(remote_fd, lease.node_id()) {
-        let _ = lease.close().await;
-        return Err(error);
-    }
-    Ok(lease)
-}
-
 async fn cancellable<T>(
     future: PortalFuture<'_, Result<T, PortalError>>,
     cancellation: &mut watch::Receiver<bool>,
@@ -518,7 +493,6 @@ mod tests {
     fn portal_is_idle_until_an_explicit_request_and_then_orders_every_step() {
         runtime().block_on(async {
             let backend = Arc::new(FakeBackend::ready());
-            assert!(backend.calls().is_empty());
             let (_cancel, receiver) = tokio::sync::watch::channel(false);
 
             let lease = request_screen_cast(Arc::clone(&backend), None, receiver)
@@ -596,27 +570,6 @@ mod tests {
                 PortalError::InvalidResponse
             );
             assert!(!backend.calls().contains(&Call::Open));
-            assert_eq!(backend.calls().last(), Some(&Call::Close));
-        });
-    }
-
-    #[test]
-    fn media_attachment_failure_closes_the_portal_lease() {
-        runtime().block_on(async {
-            let backend = Arc::new(FakeBackend::ready());
-            let (_cancel, receiver) = tokio::sync::watch::channel(false);
-
-            assert_eq!(
-                request_and_attach_screen_cast(
-                    Arc::clone(&backend),
-                    None,
-                    receiver,
-                    |_remote_fd, _node_id| Err(PortalError::OperationFailed),
-                )
-                .await
-                .unwrap_err(),
-                PortalError::OperationFailed
-            );
             assert_eq!(backend.calls().last(), Some(&Call::Close));
         });
     }

@@ -46,6 +46,10 @@ if screen_share_enabled
   cargo_features += ['screen-share']
 endif
 
+if get_option('huddle_harness')
+  cargo_features += ['huddle-harness']
+endif
+
 cargo_features_arg = ','.join(cargo_features)
 
 if get_option('buildtype') == 'release'
@@ -96,6 +100,7 @@ test('Cargo tests',
   cargo_bin,
   args: cargo_test_args,
   env: cargo_env,
+  suite: 'rust',
   timeout: 300,
   depends: cargo_build,
 )

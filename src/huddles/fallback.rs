@@ -93,8 +93,6 @@ mod tests {
         let url = external_huddle_url(&huddle(None)).unwrap();
 
         assert_eq!(url, "https://app.slack.com/huddle/T123/C456");
-        assert!(url.starts_with("https://"));
-        assert!(!url.starts_with("slack://"));
     }
 
     #[test]

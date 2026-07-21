@@ -18,3 +18,17 @@ option(
   value: 'disabled',
   description: 'Build portal-based huddle screen sharing (requires native_media)',
 )
+
+option(
+  'huddle_harness',
+  type: 'boolean',
+  value: false,
+  description: 'Build the native huddle test harness',
+)
+
+option(
+  'headless_tests',
+  type: 'feature',
+  value: 'auto',
+  description: 'Build and run the complete X11 headless test suite',
+)

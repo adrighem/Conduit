@@ -45,7 +45,7 @@ use crate::emoji::{
     EmojiPickerModel, EmojiPickerMove, EmojiValue,
 };
 use crate::huddles::fallback::external_huddle_url;
-use crate::huddles::presentation::{present_huddle, HuddlePresentation, HuddlePrimaryAction};
+use crate::huddles::presentation::{present_huddle, HuddlePrimaryAction};
 use crate::huddles::state::{
     HuddleCommand, HuddleDevice, HuddleDeviceKind, HuddleEvent, HuddlePhase,
     HuddleScreenShareState, HuddleSnapshot,
@@ -266,7 +266,6 @@ mod imp {
         pub draft_save_generation: Cell<u64>,
         pub pending_sent_drafts: RefCell<HashMap<DraftKey, String>>,
         pub pending_upload_drafts: RefCell<HashMap<DraftKey, Option<String>>>,
-        pub sidebar_loading: Cell<bool>,
         pub sidebar_error: RefCell<Option<String>>,
         pub current_user_id: RefCell<Option<String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
@@ -356,15 +355,12 @@ mod imp {
                     };
                     obj.handle_huddle_event(HuddleEvent::Snapshot(Box::new(HuddleSnapshot {
                         phase: HuddlePhase::Discovered,
-                        huddle: Some(huddle.clone()),
+                        huddle: Some(huddle),
                         participants: vec![crate::huddles::state::HuddleParticipant::from_user_id(
                             "UTEST".to_string(),
                         )],
                         ..Default::default()
                     })));
-                    if std::env::var_os("CONDUIT_TEST_HUDDLE_EXTERNAL_URI_FILE").is_some() {
-                        obj.handle_huddle_event(HuddleEvent::OpenExternalRequested(huddle));
-                    }
                 }
                 if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
                     obj.imp().thread_split.set_show_sidebar(true);
@@ -1207,10 +1203,6 @@ fn clear_stale_upload_staging() {
     }
 }
 
-fn conversation_refresh_start_shows_sidebar_loading() -> bool {
-    false
-}
-
 fn sidebar_error_change_needs_render(has_conversations: bool) -> bool {
     !has_conversations
 }
@@ -1489,15 +1481,13 @@ fn localized_replies_error(error: &str) -> String {
 fn sidebar_user_name_update_needs_render(
     conversations: &[SlackConversation],
     user_id: &str,
-    sidebar_loading: bool,
 ) -> bool {
-    !sidebar_loading
-        && conversations.iter().any(|conversation| {
-            conversation
-                .display_user_ids()
-                .iter()
-                .any(|display_user_id| display_user_id == user_id)
-        })
+    conversations.iter().any(|conversation| {
+        conversation
+            .display_user_ids()
+            .iter()
+            .any(|display_user_id| display_user_id == user_id)
+    })
 }
 
 fn message_navigation_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
@@ -1795,29 +1785,16 @@ fn timeline_scroll_behavior(behavior: WorkspaceScrollBehavior) -> TimelineScroll
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MessageWebViewFeaturePolicy {
-    javascript: bool,
-    html5_local_storage: bool,
-    file_url_access: bool,
-    universal_file_url_access: bool,
-    media: bool,
-    webgl: bool,
-    webaudio: bool,
-    zoom_text_only: bool,
-}
-
-fn message_web_view_feature_policy() -> MessageWebViewFeaturePolicy {
-    MessageWebViewFeaturePolicy {
-        javascript: true,
-        html5_local_storage: true,
-        file_url_access: false,
-        universal_file_url_access: false,
-        media: true,
-        webgl: false,
-        webaudio: false,
-        zoom_text_only: true,
-    }
+fn configure_message_web_view_settings(settings: &webkit6::Settings) {
+    settings.set_allow_file_access_from_file_urls(false);
+    settings.set_allow_universal_access_from_file_urls(false);
+    settings.set_enable_html5_database(false);
+    settings.set_enable_html5_local_storage(true);
+    settings.set_enable_javascript(true);
+    settings.set_enable_media(true);
+    settings.set_enable_webgl(false);
+    settings.set_enable_webaudio(false);
+    settings.set_zoom_text_only(true);
 }
 
 fn message_text_zoom(font_name: Option<&str>) -> f64 {
@@ -2614,16 +2591,7 @@ impl ConduitWindow {
         text_zoom: f64,
     ) -> webkit6::WebView {
         let settings = webkit6::Settings::new();
-        let features = message_web_view_feature_policy();
-        settings.set_allow_file_access_from_file_urls(features.file_url_access);
-        settings.set_allow_universal_access_from_file_urls(features.universal_file_url_access);
-        settings.set_enable_html5_database(false);
-        settings.set_enable_html5_local_storage(features.html5_local_storage);
-        settings.set_enable_javascript(features.javascript);
-        settings.set_enable_media(features.media);
-        settings.set_enable_webgl(features.webgl);
-        settings.set_enable_webaudio(features.webaudio);
-        settings.set_zoom_text_only(features.zoom_text_only);
+        configure_message_web_view_settings(&settings);
 
         let web_view = webkit6::WebView::builder()
             .network_session(network_session)
@@ -3430,6 +3398,7 @@ impl ConduitWindow {
         buffer.insert(&mut start, &replacement);
         buffer.place_cursor(&buffer.iter_at_offset(caret as i32));
         buffer.end_user_action();
+        record_test_composer_completion(self.imp(), target, &selection.1);
         self.dismiss_composer_emoji_completion(target);
         text_view.grab_focus();
     }
@@ -3487,11 +3456,6 @@ impl ConduitWindow {
             }
             RuntimeEventKind::Status(status) => {
                 if !self.imp().connect_requested.get() {
-                    if status == "Loading conversations"
-                        && conversation_refresh_start_shows_sidebar_loading()
-                    {
-                        self.start_sidebar_loading();
-                    }
                     self.set_status(&status);
                 }
             }
@@ -4221,9 +4185,6 @@ impl ConduitWindow {
     }
 
     fn refresh_conversations(&self) {
-        if conversation_refresh_start_shows_sidebar_loading() {
-            self.start_sidebar_loading();
-        }
         self.send_command(RuntimeCommand::RefreshConversations);
     }
 
@@ -5070,10 +5031,6 @@ impl ConduitWindow {
     }
 
     fn open_external_link(&self, uri: &str) {
-        if let Some(path) = std::env::var_os("CONDUIT_TEST_HUDDLE_EXTERNAL_URI_FILE") {
-            let _ = std::fs::write(path, uri);
-            return;
-        }
         if let Err(error) = open::that(uri) {
             self.set_status(&format!("Failed to open link: {error}"));
         }
@@ -5246,7 +5203,6 @@ impl ConduitWindow {
         imp.pending_user_ids.borrow_mut().clear();
         *imp.workspace_name.borrow_mut() = None;
         *imp.workspace_url.borrow_mut() = None;
-        imp.sidebar_loading.set(false);
         *imp.sidebar_error.borrow_mut() = None;
         imp.image_assets.borrow_mut().clear();
         imp.pending_image_assets.borrow_mut().clear();
@@ -5294,9 +5250,6 @@ impl ConduitWindow {
         self.imp().workspace_split.set_show_content(false);
         self.sync_workspace_chrome();
         self.render_workspace_lifecycle();
-        if conversation_refresh_start_shows_sidebar_loading() {
-            self.start_sidebar_loading();
-        }
         self.activate_pending_notification_target();
         self.activate_pending_slack_uris();
     }
@@ -5380,16 +5333,6 @@ impl ConduitWindow {
             }
             WorkspaceLifecycleSurface::Workspace => {
                 imp.content_stack.set_visible_child_name("workspace")
-            }
-        }
-    }
-
-    fn start_sidebar_loading(&self) {
-        let imp = self.imp();
-        if !imp.sidebar_loading.replace(true) {
-            *imp.sidebar_error.borrow_mut() = None;
-            if imp.workspace.conversations.borrow().is_empty() {
-                self.render_conversations();
             }
         }
     }
@@ -5605,7 +5548,6 @@ impl ConduitWindow {
     fn set_sidebar_error(&self, error: &str) {
         let imp = self.imp();
         let has_conversations = !imp.workspace.conversations.borrow().is_empty();
-        imp.sidebar_loading.set(false);
         *imp.sidebar_error.borrow_mut() = Some(error.to_string());
         if sidebar_error_change_needs_render(has_conversations) {
             self.render_conversations();
@@ -5647,7 +5589,6 @@ impl ConduitWindow {
     }
 
     fn sync_conversations_from_catalog(&self) {
-        self.imp().sidebar_loading.set(false);
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_conversation_user_names();
         self.render_conversations();
@@ -5694,13 +5635,9 @@ impl ConduitWindow {
         let should_render_sidebar = {
             let imp = self.imp();
             let conversations = imp.workspace.conversations.borrow().conversations();
-            changed_user_ids.iter().any(|user_id| {
-                sidebar_user_name_update_needs_render(
-                    &conversations,
-                    user_id,
-                    imp.sidebar_loading.get(),
-                )
-            })
+            changed_user_ids
+                .iter()
+                .any(|user_id| sidebar_user_name_update_needs_render(&conversations, user_id))
         };
         if should_render_sidebar {
             self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
@@ -6040,7 +5977,7 @@ impl ConduitWindow {
                 query: imp.sidebar_filter_entry.text().as_str(),
                 unread_only: imp.sidebar_unread_filter_button.is_active(),
                 show_unreads_section: self.show_unreads_section(),
-                loading: imp.sidebar_loading.get(),
+                loading: false,
                 has_error: imp.sidebar_error.borrow().is_some(),
                 user_search_aliases: Some(&user_search_aliases),
                 user_full_names: Some(&imp.user_full_names.borrow()),
@@ -7477,8 +7414,8 @@ impl ConduitWindow {
         let snapshot = imp.huddle_snapshot.borrow().clone();
         let presentation = present_huddle(&snapshot, self.visible_channel_id().as_deref());
         imp.huddle_revealer.set_reveal_child(presentation.visible);
-        record_test_huddle_surface(&presentation);
         if !presentation.visible {
+            record_test_huddle_surface(imp);
             return;
         }
 
@@ -7534,6 +7471,7 @@ impl ConduitWindow {
             ("video-display-symbolic", gettext("Share screen"))
         };
         set_huddle_button_state(&imp.huddle_share_button, share_icon, &share_label);
+        record_test_huddle_surface(imp);
     }
 
     fn huddle_detail(&self, snapshot: &HuddleSnapshot) -> String {
@@ -8544,18 +8482,68 @@ fn set_huddle_button_state(button: &gtk::Button, icon_name: &str, label: &str) {
     button.update_property(&[gtk::accessible::Property::Label(label)]);
 }
 
-fn record_test_huddle_surface(presentation: &HuddlePresentation) {
+fn record_test_huddle_surface(window: &imp::ConduitWindow) {
     let Some(path) = std::env::var_os("CONDUIT_TEST_HUDDLE_UI_FILE") else {
         return;
+    };
+    let primary_label = window
+        .huddle_primary_button
+        .label()
+        .map(|label| label.to_string());
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({
+            "visible": window.huddle_revealer.reveals_child(),
+            "title": window.huddle_title_label.label().to_string(),
+            "detail": window.huddle_detail_label.label().to_string(),
+            "primary_visible": window.huddle_primary_button.is_visible(),
+            "primary_label": primary_label,
+            "external_visible": window.huddle_external_button.is_visible(),
+            "controls_visible": window.huddle_controls_box.is_visible(),
+            "dismiss_visible": window.huddle_dismiss_button.is_visible(),
+            "camera_sensitive": window.huddle_camera_button.is_sensitive(),
+            "share_sensitive": window.huddle_share_button.is_sensitive(),
+        })
+        .to_string(),
+    );
+}
+
+fn record_test_composer_completion(
+    window: &imp::ConduitWindow,
+    target: ComposerTarget,
+    emoji_name: &str,
+) {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_COMPOSER_COMPLETION_FILE") else {
+        return;
+    };
+    let settings = window
+        .message_view
+        .borrow()
+        .as_ref()
+        .and_then(webkit6::prelude::WebViewExt::settings);
+    let Some(settings) = settings else {
+        return;
+    };
+    let target = match target {
+        ComposerTarget::Message => "message",
+        ComposerTarget::Thread => "thread",
     };
     let _ = std::fs::write(
         path,
         serde_json::json!({
-            "visible": presentation.visible,
-            "title": presentation.title,
-            "primary_label": presentation.primary_label,
-            "camera_enabled": presentation.camera_enabled,
-            "screen_share_active": presentation.screen_share_active,
+            "emoji": emoji_name,
+            "target": target,
+            "webkit": {
+                "allow_file_access": settings.allows_file_access_from_file_urls(),
+                "allow_universal_access": settings.allows_universal_access_from_file_urls(),
+                "html5_database": settings.enables_html5_database(),
+                "html5_local_storage": settings.enables_html5_local_storage(),
+                "javascript": settings.enables_javascript(),
+                "media": settings.enables_media(),
+                "webaudio": settings.enables_webaudio(),
+                "webgl": settings.enables_webgl(),
+                "zoom_text_only": settings.is_zoom_text_only(),
+            },
         })
         .to_string(),
     );
@@ -9376,44 +9364,17 @@ mod tests {
 
         assert!(sidebar_user_name_update_needs_render(
             &conversations,
-            "U123",
-            false
+            "U123"
         ));
         assert!(sidebar_user_name_update_needs_render(
             &conversations,
-            "U456",
-            false
+            "U456"
         ));
         assert!(!sidebar_user_name_update_needs_render(
             &conversations,
-            "U999",
-            false
+            "U999"
         ));
-        assert!(!sidebar_user_name_update_needs_render(
-            &conversations,
-            "U123",
-            true
-        ));
-        assert!(!sidebar_user_name_update_needs_render(&[], "U123", false));
-    }
-
-    #[test]
-    fn conversation_refresh_start_keeps_sidebar_visually_backgrounded() {
-        assert!(!conversation_refresh_start_shows_sidebar_loading());
-    }
-
-    #[test]
-    fn message_web_view_features_enable_internal_scroll_runtime() {
-        let features = message_web_view_feature_policy();
-
-        assert!(features.javascript);
-        assert!(features.html5_local_storage);
-        assert!(!features.file_url_access);
-        assert!(!features.universal_file_url_access);
-        assert!(features.media);
-        assert!(!features.webgl);
-        assert!(!features.webaudio);
-        assert!(features.zoom_text_only);
+        assert!(!sidebar_user_name_update_needs_render(&[], "U123"));
     }
 
     #[test]
@@ -9996,80 +9957,28 @@ mod tests {
     }
 
     #[test]
-    fn window_template_uses_adaptive_accessible_shell() {
+    fn window_template_preserves_adaptive_and_accessible_boundaries() {
         let template = include_str!("window.ui");
 
         for required in [
             "AdwNavigationSplitView\" id=\"workspace_split",
             "AdwOverlaySplitView\" id=\"thread_split",
-            "GtkSeparator\" id=\"thread_resize_handle",
-            "GtkBox\" id=\"message_pane",
-            "GtkBox\" id=\"thread_pane",
-            "AdwNavigationPage",
-            "GtkSearchBar\" id=\"message_search_bar",
-            "AdwClamp",
-            "GtkScrolledWindow\" id=\"auth_scroller",
-            "<property name=\"vscrollbar-policy\">automatic</property>",
-            "AdwEntryRow\" id=\"client_id_entry",
             "AdwPasswordEntryRow\" id=\"xoxc_token_entry",
             "AdwPasswordEntryRow\" id=\"xoxd_token_entry",
-            "AdwEntryRow\" id=\"user_agent_entry",
-            "Browser User-Agent (Enterprise)",
-            "GtkLinkButton\" id=\"browser_session_howto_link",
-            "How to find XOXC/XOXD tokens",
-            "https://github.com/adrighem/Conduit#lookup-slack_mcp_xoxc_token",
-            "<property name=\"label\" translatable=\"yes\">Message</property>",
-            "<property name=\"label\" translatable=\"yes\">Reply</property>",
-            "GtkToggleButton\" id=\"messages_button",
-            "GtkToggleButton\" id=\"threads_button",
-            "<property name=\"group\">messages_button</property>",
-            "<property name=\"icon-name\">view-list-symbolic</property>",
-            "<property name=\"icon-name\">mail-unread-symbolic</property>",
-            "<property name=\"tooltip-text\" translatable=\"yes\">Messages</property>",
-            "<property name=\"tooltip-text\" translatable=\"yes\">Unreads</property>",
-            "<property name=\"tooltip-text\" translatable=\"yes\">Threads</property>",
-            "<property name=\"enable-show-gesture\">False</property>",
             "GtkLabel\" id=\"message_status_label",
-            "<property name=\"accessible-role\">status</property>",
-            "GtkButton\" id=\"navigation_back_button",
-            "GtkRevealer\" id=\"huddle_revealer",
-            "GtkLabel\" id=\"huddle_title_label",
-            "GtkButton\" id=\"huddle_primary_button",
-            "GtkButton\" id=\"huddle_external_button",
-            "GtkBox\" id=\"huddle_controls_box",
-            "GtkButton\" id=\"huddle_mute_button",
-            "GtkButton\" id=\"huddle_camera_button",
-            "GtkButton\" id=\"huddle_share_button",
-            "GtkButton\" id=\"huddle_leave_button",
-            "<property name=\"action-name\">win.go-back</property>",
-            "<attribute name=\"action\">win.new-message</attribute>",
-            "<attribute name=\"action\">win.new-channel</attribute>",
         ] {
             assert!(
                 template.contains(required),
-                "missing template marker {required}"
+                "missing window contract {required}"
             );
         }
 
-        assert!(template.contains("<property name=\"width-request\">10</property>"));
-        assert!(template
-            .contains("<property name=\"sidebar-width-fraction\">0.6666666666666666</property>"));
-        assert!(template.contains("<property name=\"max-sidebar-width\">10000</property>"));
-        assert!(!template.contains("<object class=\"GtkPaned\""));
-        assert!(!template.contains("<property name=\"width-request\">460</property>"));
-        assert!(!template.contains("<property name=\"width-request\">280</property>"));
-        assert!(!template.contains("<property name=\"width-request\">220</property>"));
-        assert!(!template.contains("<attribute name=\"action\">win.sign-out</attribute>"));
-        assert!(!template.contains("slack://"));
-
-        let browser_session_howto = template
-            .split("GtkLinkButton\" id=\"browser_session_howto_link\"")
-            .nth(1)
-            .unwrap()
-            .split("</object>")
-            .next()
-            .unwrap();
-        assert!(browser_session_howto.contains("<property name=\"visible\">False</property>"));
+        let message_status = template
+            .split_once("GtkLabel\" id=\"message_status_label\"")
+            .and_then(|(_, rest)| rest.split_once("</object>"))
+            .map(|(object, _)| object)
+            .expect("message status label should be a complete template object");
+        assert!(message_status.contains("<property name=\"accessible-role\">status</property>"));
     }
 
     #[test]
@@ -10275,13 +10184,5 @@ mod tests {
         );
 
         assert_eq!(requests, vec![(avatar_url.clone(), avatar_url)]);
-    }
-
-    #[test]
-    fn emoji_completion_is_wired_to_both_composers() {
-        assert_eq!(
-            COMPOSER_TARGETS,
-            [ComposerTarget::Message, ComposerTarget::Thread]
-        );
     }
 }

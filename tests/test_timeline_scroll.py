@@ -64,15 +64,16 @@ START_PROBE = r"""
       part_html: ""
     });
     await wait(100);
-    const replacementTop = document
-      .querySelector('[data-message-ts="10"]')
-      .getBoundingClientRect().top;
+    const replacement = document.querySelector('[data-message-ts="10"]');
+    const replacementTop = replacement.getBoundingClientRect().top;
 
     window.timelineScrollResult = {
       initialGap,
       reflowGap,
       delayedExpansionGap,
       replaced,
+      replacementText: replacement.textContent,
+      replacementInlineHeight: replacement.style.height,
       anchorDelta: replacementTop - anchorTop
     };
   })().catch((error) => {
@@ -177,6 +178,8 @@ html, body {{ margin: 0; padding: 0; }}
     assert abs(payload["reflowGap"]) <= 2, payload
     assert abs(payload["delayedExpansionGap"]) <= 2, payload
     assert payload["replaced"] is True, payload
+    assert payload["replacementText"] == "replacement", payload
+    assert payload["replacementInlineHeight"] == "240px", payload
     assert abs(payload["anchorDelta"]) <= 2, payload
 
 

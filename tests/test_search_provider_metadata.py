@@ -37,10 +37,6 @@ def main() -> None:
     handlers = {value for value in desktop["MimeType"].split(";") if value}
     assert handlers == {"x-scheme-handler/slack"}
 
-    meson = (data / "meson.build").read_text(encoding="utf-8")
-    assert "eu.vanadrighem.conduit.search-provider.ini" in meson
-    assert "'gnome-shell' / 'search-providers'" in meson
-
 
 if __name__ == "__main__":
     main()

@@ -102,7 +102,7 @@ General release packages keep the optional native huddle media and screen-sharin
 
 ## Build and run
 
-Install Rust, Meson, Ninja, and the development packages for GTK4, libadwaita, WebKitGTK 6.0, GLib/GIO, D-Bus, gettext, and Secret Service. Package names vary by distribution.
+Install Rust, Meson, Ninja, PyGObject with GdkPixbuf introspection, and the development packages for GTK4, libadwaita, WebKitGTK 6.0, GLib/GIO, D-Bus, gettext, and Secret Service. Package names vary by distribution.
 
 Build and test with Meson:
 
@@ -127,6 +127,15 @@ meson setup _build --prefix="$HOME/.local" --reconfigure
 meson compile -C _build
 meson install -C _build
 ```
+
+To remove the files recorded by the most recent install from that build
+directory:
+
+```sh
+ninja -C _build uninstall
+```
+
+Use the same build directory and permissions that were used for installation.
 
 Useful Rust-only checks while developing:
 

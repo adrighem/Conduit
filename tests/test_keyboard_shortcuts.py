@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -94,9 +95,21 @@ def clipboard_text() -> str:
 
 
 def composer_text() -> str:
+    sentinel = f"__conduit_clipboard_{time.monotonic_ns()}__"
+    subprocess.run(
+        ["xclip", "-selection", "clipboard", "-i"],
+        input=sentinel,
+        text=True,
+        check=True,
+    )
     press("ctrl+a", "ctrl+c")
     time.sleep(0.05)
-    return wait_until(lambda: clipboard_text(), timeout=5.0)
+
+    def copied_text() -> str | None:
+        text = clipboard_text()
+        return None if text == sentinel else text
+
+    return wait_until(copied_text, timeout=5.0)
 
 
 def replace_composer_text(text: str) -> None:
@@ -105,30 +118,63 @@ def replace_composer_text(text: str) -> None:
     time.sleep(0.1)
 
 
-def verify_emoji_completion() -> None:
+def completion_state(path: Path, expected: dict) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return state if state == expected else None
+
+
+def verify_emoji_completion(target: str, state_path: Path) -> None:
+    webkit_settings = {
+        "allow_file_access": False,
+        "allow_universal_access": False,
+        "html5_database": False,
+        "html5_local_storage": True,
+        "javascript": True,
+        "media": True,
+        "webaudio": False,
+        "webgl": False,
+        "zoom_text_only": True,
+    }
+
     press("ctrl+m")
     time.sleep(0.1)
 
     replace_composer_text(":+1")
     press("Return")
-    time.sleep(0.1)
-    completed = composer_text()
-    assert completed == ":+1:", completed
+    wait_until(
+        lambda: completion_state(
+            state_path,
+            {"emoji": "+1", "target": target, "webkit": webkit_settings},
+        )
+    )
+    assert composer_text() == ":+1:"
 
     replace_composer_text(":sm")
     press("Return")
-    time.sleep(0.1)
-    first = composer_text()
-    assert first.startswith(":") and first.endswith(":"), first
+    wait_until(
+        lambda: completion_state(
+            state_path,
+            {"emoji": "smiley", "target": target, "webkit": webkit_settings},
+        )
+    )
+    assert composer_text() == ":smiley:"
 
     replace_composer_text(":sm")
     press("Down")
     time.sleep(0.05)
     press("Return")
-    time.sleep(0.1)
-    second = composer_text()
-    assert second.startswith(":") and second.endswith(":"), second
-    assert second != first, (first, second)
+    wait_until(
+        lambda: completion_state(
+            state_path,
+            {"emoji": "smile", "target": target, "webkit": webkit_settings},
+        )
+    )
+    assert composer_text() == ":smile:"
 
     replace_composer_text(":sm")
     press("Escape", "Tab", "ctrl+m")
@@ -173,6 +219,11 @@ def main() -> None:
 
         for thread_composer in (False, True):
             run_environment = environment.copy()
+            target = "thread" if thread_composer else "message"
+            completion_path = temporary_path / f"{target}-completion.json"
+            run_environment["CONDUIT_TEST_COMPOSER_COMPLETION_FILE"] = str(
+                completion_path
+            )
             if thread_composer:
                 run_environment["CONDUIT_TEST_THREAD_COMPOSER"] = "1"
             process = subprocess.Popen(
@@ -196,44 +247,20 @@ def main() -> None:
                 time.sleep(0.2)
 
                 if not thread_composer:
-                    assert not visible_window_ids(SWITCHER_TITLE)
-                    subprocess.run(
-                        [
-                            "xdotool",
-                            "keydown",
-                            "Control_L",
-                            "key",
-                            "k",
-                            "keyup",
-                            "Control_L",
-                        ],
-                        check=True,
-                    )
-                    switcher_id = wait_until(
-                        lambda: next(iter(visible_window_ids(SWITCHER_TITLE)), None)
-                    )
-                    subprocess.run(
-                        ["xdotool", "windowactivate", "--sync", switcher_id],
-                        check=True,
-                    )
-                    type_text("general")
-                    press("Escape")
-                    wait_until(
-                        lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0
-                    )
+                    for _ in range(2):
+                        press("ctrl+k")
+                        wait_until(
+                            lambda: next(
+                                iter(visible_window_ids(SWITCHER_TITLE)), None
+                            )
+                        )
+                        press("Escape")
+                        wait_until(
+                            lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0
+                        )
+                    assert process.poll() is None
 
-                    # Reopening immediately exercises cancellation of the queued
-                    # population from the first picker.
-                    press("ctrl+k")
-                    wait_until(
-                        lambda: next(iter(visible_window_ids(SWITCHER_TITLE)), None)
-                    )
-                    press("Escape")
-                    wait_until(
-                        lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0
-                    )
-
-                verify_emoji_completion()
+                verify_emoji_completion(target, completion_path)
             finally:
                 stop_process(process)
 

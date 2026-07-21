@@ -679,13 +679,9 @@ impl SlackApi {
 
     pub async fn file(&self, file_id: &str) -> Result<SlackFile> {
         let response: FileInfoResponse = self
-            .post_form("files.info", &Self::file_info_params(file_id))
+            .post_form("files.info", &[("file", file_id.to_string())])
             .await?;
         Ok(response.file)
-    }
-
-    fn file_info_params(file_id: &str) -> Vec<(&'static str, String)> {
-        vec![("file", file_id.to_string())]
     }
 
     pub async fn user_display_name(&self, user_id: &str) -> Result<String> {
@@ -1120,8 +1116,7 @@ impl SlackApi {
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = retry_after_delay(&response);
-                let max_retries = rate_limit_retries_for_method(method);
-                if retries >= max_retries {
+                if retries >= MAX_RATE_LIMIT_RETRIES {
                     crate::debug::log(
                         "slack",
                         &format!("Slack method {method} rate limited; not retrying automatically"),
@@ -1287,11 +1282,6 @@ fn retry_after_seconds(value: &str) -> u64 {
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS)
         .min(MAX_RETRY_AFTER_SECONDS)
-}
-
-fn rate_limit_retries_for_method(method: &str) -> usize {
-    let _ = method;
-    MAX_RATE_LIMIT_RETRIES
 }
 
 fn history_request_params(
@@ -1877,7 +1867,6 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use reqwest::header::{AUTHORIZATION, COOKIE, USER_AGENT};
     use tiny_http::{Header, Response, Server};
 
     #[test]
@@ -2227,22 +2216,6 @@ mod tests {
     }
 
     #[test]
-    fn conversation_catalog_requests_retry_rate_limits() {
-        assert_eq!(
-            rate_limit_retries_for_method(CONVERSATIONS_LIST_METHOD),
-            MAX_RATE_LIMIT_RETRIES
-        );
-        assert_eq!(
-            rate_limit_retries_for_method(USERS_CONVERSATIONS_METHOD),
-            MAX_RATE_LIMIT_RETRIES
-        );
-        assert_eq!(
-            rate_limit_retries_for_method("conversations.history"),
-            MAX_RATE_LIMIT_RETRIES
-        );
-    }
-
-    #[test]
     fn discovery_requests_only_non_archived_channel_types() {
         assert_eq!(
             paginated_list_params(Some(" next-page "), true),
@@ -2469,51 +2442,6 @@ mod tests {
     }
 
     #[test]
-    fn browser_session_requests_include_cookie_and_user_agent() {
-        let token = StoredToken {
-            access_token: "xoxc-browser-token".to_string(),
-            token_type: Some("browser_session".to_string()),
-            scope: None,
-            refresh_token: None,
-            expires_in: None,
-            expires_at: None,
-            team_id: None,
-            team_name: None,
-            user_id: None,
-            client_id: None,
-            browser_cookie_d: Some("xoxd-cookie-value".to_string()),
-            user_agent: Some("Browser User Agent".to_string()),
-        };
-        let api = SlackApi::new(token);
-
-        let request = api
-            .authenticated_request(reqwest::Method::POST, "https://slack.com/api/auth.test")
-            .build()
-            .expect("request should build");
-
-        assert_eq!(
-            request
-                .headers()
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer xoxc-browser-token")
-        );
-        let cookie = request
-            .headers()
-            .get(COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .expect("browser-session cookie should be present");
-        assert!(cookie.starts_with("d=xoxd-cookie-value; d-s="));
-        assert_eq!(
-            request
-                .headers()
-                .get(USER_AGENT)
-                .and_then(|value| value.to_str().ok()),
-            Some("Browser User Agent")
-        );
-    }
-
-    #[test]
     fn browser_session_auth_test_sends_upstream_form_and_cookie_shape() {
         let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
         let address = server
@@ -2598,25 +2526,60 @@ mod tests {
     }
 
     #[test]
-    fn file_info_request_targets_one_file() {
-        assert_eq!(
-            SlackApi::file_info_params("F123"),
-            vec![("file", "F123".to_string())]
-        );
-    }
+    fn file_info_requests_the_file_and_returns_the_response_model() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(r#"{"ok":true,"file":{"id":"F123","title":"Design"}}"#)
+                        .with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("content type header should be valid"),
+                        ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, body)
+        });
 
-    #[test]
-    fn file_info_response_uses_the_existing_file_model() {
-        let response: FileInfoResponse = serde_json::from_value(serde_json::json!({
-            "ok": true,
-            "file": {
-                "id": "F123",
-                "title": "Design"
-            }
-        }))
-        .expect("file info response should parse");
+        let token = StoredToken {
+            access_token: "xoxp-test-token".to_string(),
+            token_type: None,
+            scope: None,
+            refresh_token: None,
+            expires_in: None,
+            expires_at: None,
+            team_id: None,
+            team_name: None,
+            user_id: None,
+            client_id: None,
+            browser_cookie_d: None,
+            user_agent: None,
+        };
+        let mut api = SlackApi::new(token);
+        api.api_base_url = format!("http://{address}/api");
+        let file = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.file("F123"))
+            .expect("files.info should succeed");
 
-        assert_eq!(response.file.id.as_deref(), Some("F123"));
-        assert_eq!(response.file.display_title(), "Design");
+        let (path, body) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/files.info");
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(form.get("file").map(String::as_str), Some("F123"));
+        assert_eq!(file.id.as_deref(), Some("F123"));
+        assert_eq!(file.display_title(), "Design");
     }
 }

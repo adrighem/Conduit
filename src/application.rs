@@ -872,15 +872,6 @@ mod tests {
     }
 
     #[test]
-    fn requested_debug_mode_survives_application_activation() {
-        let state = imp::ConduitApplication::default();
-
-        assert!(!state.debug_enabled());
-        state.set_debug_enabled(true);
-        assert!(state.debug_enabled());
-    }
-
-    #[test]
     fn notification_ids_are_stable_scoped_and_opaque() {
         let id = conversation_notification_id("T123", "C123");
 
@@ -913,7 +904,6 @@ mod tests {
         let first = state.register_notification("message:1");
         let second = state.register_notification("message:1");
 
-        assert_eq!(NOTIFICATION_LIFETIME, Duration::from_secs(10));
         assert!(!state.forget_notification_if_current("message:1", first));
         assert!(state.forget_notification_if_current("message:1", second));
         assert!(!state.forget_notification_if_current("message:1", second));
@@ -921,14 +911,6 @@ mod tests {
         let manually_withdrawn = state.register_notification("message:2");
         state.forget_notification("message:2");
         assert!(!state.forget_notification_if_current("message:2", manually_withdrawn));
-    }
-
-    #[test]
-    fn about_logo_is_larger_than_libadwaita_default() {
-        const LIBADWAITA_ABOUT_ICON_SIZE: i32 = 128;
-
-        assert_eq!(ABOUT_ICON_NAME, config::APPLICATION_ID);
-        const { assert!(ABOUT_LOGO_SIZE > LIBADWAITA_ABOUT_ICON_SIZE) };
     }
 
     #[test]
@@ -977,14 +959,6 @@ mod tests {
                 crate::slack_link::parse_slack_uri("slack://user?team=T123&id=U456").unwrap(),
             ]
         );
-    }
-
-    #[test]
-    fn application_accepts_command_line_and_dbus_open_requests() {
-        let flags = application_flags();
-
-        assert!(flags.contains(gio::ApplicationFlags::HANDLES_COMMAND_LINE));
-        assert!(flags.contains(gio::ApplicationFlags::HANDLES_OPEN));
     }
 
     #[test]

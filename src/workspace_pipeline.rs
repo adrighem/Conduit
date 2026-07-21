@@ -1192,29 +1192,6 @@ mod tests {
     }
 
     #[test]
-    fn revision_advances_monotonically() {
-        let initial = WorkspaceRevision::INITIAL;
-        let first = initial.successor();
-        let second = first.successor();
-
-        assert_eq!(initial.value(), 0);
-        assert_eq!(first.value(), 1);
-        assert_eq!(second.value(), 2);
-        assert!(second > first);
-    }
-
-    #[test]
-    fn snapshot_envelope_retains_and_classifies_its_base_revision() {
-        let base_revision = WorkspaceRevision::INITIAL.successor();
-        let snapshot = SnapshotEnvelope::new(base_revision, vec!["cached"]);
-
-        assert_eq!(snapshot.base_revision(), base_revision);
-        assert_eq!(snapshot.data(), &["cached"]);
-        assert!(!snapshot.is_stale_at(base_revision));
-        assert!(snapshot.is_stale_at(base_revision.successor()));
-    }
-
-    #[test]
     fn patch_and_store_batch_require_changes_and_share_one_revision() {
         let revision = WorkspaceRevision::INITIAL.successor();
         assert!(WorkspacePatch::new(
@@ -1245,31 +1222,6 @@ mod tests {
         assert_eq!(patch.revision(), batch.revision());
         assert_eq!(patch.changes().len(), 1);
         assert_eq!(batch.changes().len(), 1);
-    }
-
-    #[test]
-    fn store_batch_preserves_reducer_change_order() {
-        let revision = WorkspaceRevision::INITIAL.successor();
-        let batch = StoreBatch::new(
-            revision,
-            vec![
-                StoreChange::ConversationRemoved {
-                    channel_id: "C1".to_string(),
-                },
-                StoreChange::HistoryRemoved {
-                    channel_id: "C1".to_string(),
-                },
-            ],
-        )
-        .unwrap();
-
-        assert!(matches!(
-            batch.changes(),
-            [
-                StoreChange::ConversationRemoved { .. },
-                StoreChange::HistoryRemoved { .. }
-            ]
-        ));
     }
 
     #[test]

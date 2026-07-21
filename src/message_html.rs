@@ -3946,6 +3946,36 @@ mod tests {
         (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
     }
 
+    fn document_css(html: &str) -> &str {
+        html.split_once("<style>")
+            .and_then(|(_, rest)| rest.split_once("</style>"))
+            .map(|(css, _)| css)
+            .expect("generated document should contain CSS")
+    }
+
+    fn root_css_variables(css: &str) -> Vec<HashMap<String, String>> {
+        let mut remaining = css;
+        let mut themes = Vec::new();
+
+        while let Some((_, after_root)) = remaining.split_once(":root {") {
+            let (block, rest) = after_root
+                .split_once('}')
+                .expect("CSS root block should be closed");
+            let variables = block
+                .lines()
+                .filter_map(|line| {
+                    let (name, value) = line.trim().strip_suffix(';')?.split_once(':')?;
+                    name.starts_with("--")
+                        .then(|| (name.to_string(), value.trim().to_string()))
+                })
+                .collect();
+            themes.push(variables);
+            remaining = rest;
+        }
+
+        themes
+    }
+
     #[test]
     fn normalizes_posix_locales_to_escaped_bcp_47_language_tags() {
         assert_eq!(normalize_language_tag("nl_NL.UTF-8"), Some("nl-NL".into()));
@@ -4107,64 +4137,59 @@ mod tests {
     }
 
     #[test]
-    fn document_css_supports_touch_keyboard_motion_and_logical_layout() {
+    fn document_css_preserves_keyboard_motion_and_bidirectional_accessibility() {
         let html = placeholder_document("Messages", "No messages");
+        let css = document_css(&html);
 
-        assert!(html.contains("--accent: #0061c9"));
-        assert!(html.contains("--accent: #78aeff"));
-        assert!(html.contains("flex-wrap: wrap"));
-        assert!(html.contains("opacity: 1"));
-        assert!(html.contains("@media (hover: hover) and (pointer: fine)"));
-        assert!(html.contains(":focus-visible"));
-        assert!(html.contains("@media (prefers-reduced-motion: reduce)"));
-        assert!(html.contains("padding-inline:"));
-        assert!(html.contains(".quick-actions {\n  position: static;"));
-        let fine_pointer_css = html
-            .split("@media (hover: hover) and (pointer: fine)")
-            .nth(1)
-            .unwrap()
-            .split("@media (prefers-reduced-motion: reduce)")
-            .next()
-            .unwrap();
-        assert!(fine_pointer_css.contains("position: absolute"));
-        assert!(fine_pointer_css.contains("inset-block-start: 4px"));
-        assert!(fine_pointer_css.contains("inset-inline-end: 0"));
-        assert!(fine_pointer_css.contains(".message:hover > .quick-actions"));
-        assert!(fine_pointer_css.contains(".message-part:hover > .quick-actions"));
-        assert!(fine_pointer_css.contains(".quick-actions:has(:focus-visible)"));
-        assert!(!fine_pointer_css.contains(".message:focus-within"));
-        assert!(!fine_pointer_css.contains(".message-part:focus-within"));
-        assert!(!fine_pointer_css.contains(".quick-actions:focus-within"));
-        assert!(!fine_pointer_css.contains("grid-template-columns"));
-        assert!(!fine_pointer_css.contains("grid-column"));
-        for physical_property in [
-            "padding-right:",
-            "padding-left:",
-            "margin-right:",
-            "margin-left:",
-            "right:",
-            "left:",
-        ] {
-            assert!(!html.contains(physical_property), "{physical_property}");
+        assert!(css.contains(":focus-visible"));
+        assert!(css.contains(".quick-actions:has(:focus-visible)"));
+        assert!(css.contains("@media (prefers-reduced-motion: reduce)"));
+        assert!(css.contains("padding-inline:"));
+        assert!(css.contains("inset-inline-end:"));
+
+        for line in css.lines().map(str::trim) {
+            let Some((property, _)) = line.split_once(':') else {
+                continue;
+            };
+            assert!(
+                !matches!(
+                    property,
+                    "left"
+                        | "right"
+                        | "padding-left"
+                        | "padding-right"
+                        | "margin-left"
+                        | "margin-right"
+                ),
+                "physical directional property in generated CSS: {property}"
+            );
         }
     }
 
     #[test]
     fn document_color_variables_meet_wcag_aa_for_normal_text() {
-        for (foreground, background) in [
-            ("#202124", "#fafafa"),
-            ("#6a6f76", "#fafafa"),
-            ("#0061c9", "#fafafa"),
-            ("#0061c9", "#e5f1ff"),
-            ("#f2f2f2", "#1d1f20"),
-            ("#b6babf", "#1d1f20"),
-            ("#78aeff", "#1d1f20"),
-            ("#78aeff", "#183653"),
-        ] {
-            assert!(
-                contrast_ratio(foreground, background) >= 4.5,
-                "{foreground} on {background}"
-            );
+        let html = placeholder_document("Messages", "No messages");
+        let themes = root_css_variables(document_css(&html));
+        assert_eq!(themes.len(), 2, "expected light and dark CSS variable sets");
+
+        for variables in themes {
+            for (foreground_name, background_name) in [
+                ("--text", "--page"),
+                ("--muted", "--page"),
+                ("--accent", "--page"),
+                ("--accent", "--accent-soft"),
+            ] {
+                let foreground = variables
+                    .get(foreground_name)
+                    .expect("foreground CSS variable should exist");
+                let background = variables
+                    .get(background_name)
+                    .expect("background CSS variable should exist");
+                assert!(
+                    contrast_ratio(foreground, background) >= 4.5,
+                    "{foreground_name} ({foreground}) on {background_name} ({background})"
+                );
+            }
         }
     }
 
@@ -4366,10 +4391,6 @@ mod tests {
         assert!(html.contains("data-category=\"Workspace\""));
         assert!(html.contains("data-src=\"https://emoji.example/party-parrot.gif\""));
         assert!(html.contains("data-category=\"Flags\""));
-        assert!(html.contains("categories.hidden = terms.length > 0"));
-        assert!(html.contains(".emoji-categories[hidden]"));
-        assert!(html.contains("Math.min(90, 50 + termLength * 10)"));
-        assert!(html.contains("Math.min(Math.floor((score || 0) / 5), 19)"));
     }
 
     #[test]
@@ -4400,30 +4421,21 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_documents_install_the_webkit_intl_localizer() {
+    fn timestamp_documents_include_the_localizer_only_when_needed() {
         let body = r#"<time class="metadata" datetime="2026-07-10T13:00:00+02:00" title="fallback title">jul 10, 13:00</time>"#;
         let html = html_document_with_locales("Messages", body, None, "en", Some("nl-NL"));
 
         assert!(html.contains("data-time-locale=\"nl-NL\""));
-        assert!(html.contains("new Intl.DateTimeFormat"));
-        assert!(html.contains("new Intl.RelativeTimeFormat"));
-        assert!(html.contains("Intl.DateTimeFormat.supportedLocalesOf"));
-        assert!(html.contains("window.conduitLocalizeTimestamps = localizeTimestamps"));
-        assert!(html.contains("localizeTimestamps(document)"));
-        assert_eq!(
-            html.matches("window.conduitLocalizeTimestamps = localizeTimestamps")
-                .count(),
-            1
-        );
+        assert!(html.contains(TIMESTAMP_LOCALIZATION_SCRIPT));
         assert!(html.contains(body));
 
         let without_timestamp =
             html_document_with_locales("Messages", "<main></main>", None, "en", Some("nl-NL"));
-        assert!(!without_timestamp.contains("new Intl.DateTimeFormat"));
+        assert!(!without_timestamp.contains(TIMESTAMP_LOCALIZATION_SCRIPT));
 
         let c_locale = html_document_with_locales("Messages", body, None, "en", None);
         assert!(!c_locale.contains("data-time-locale"));
-        assert!(c_locale.contains("if (!locale) return;"));
+        assert!(c_locale.contains(TIMESTAMP_LOCALIZATION_SCRIPT));
         assert!(c_locale.contains(body));
 
         let patchable_without_timestamp = html_document_with_locales(
@@ -4433,7 +4445,7 @@ mod tests {
             "en",
             Some("nl-NL"),
         );
-        assert!(patchable_without_timestamp.contains("new Intl.DateTimeFormat"));
+        assert!(patchable_without_timestamp.contains(TIMESTAMP_LOCALIZATION_SCRIPT));
     }
 
     #[test]
@@ -5367,30 +5379,15 @@ mod tests {
     }
 
     #[test]
-    fn conversation_document_installs_incremental_runtime_and_stable_regions() {
+    fn conversation_document_includes_incremental_runtime_and_stable_regions() {
         let html =
             conversation_document("C123", &[message("hello")], &MessageHtmlContext::default());
 
-        assert!(html.contains("window.conduitApplyTimelinePatch"));
-        assert!(html.contains("preserveViewportAnchorDuringResize"));
-        assert!(html.contains("new ResizeObserver"));
-        assert!(html.contains("const offset = currentTop - viewportAnchorTop"));
-        assert!(html.contains("if (Math.abs(offset) <= 0.5) return"));
-        assert!(html.contains("root.scrollTop += offset"));
-        assert!(html.contains("event.target.closest(\"[data-message-ts]\")"));
+        assert!(html.contains(timeline_dom_runtime_script()));
         assert!(html.contains("data-author-user-id=\"U123\""));
         for region in ["body", "attachments", "responses"] {
             assert!(html.contains(&format!("data-message-region=\"{region}\"")));
         }
-        assert!(html.contains("withPreservedScroll"));
-        assert!(html.contains("stableAnchor.getBoundingClientRect().top - anchorTop"));
-        assert!(html.contains("viewportPinnedToBottom"));
-        assert!(html.contains("bottomThreshold = 96"));
-        assert!(html.contains("mode = \"preserve\""));
-        assert!(html.contains("window.addEventListener(\"scroll\", rememberViewport"));
-        assert!(html.contains("patch.source.startsWith(\"data:video/\")"));
-        assert!(html.contains("document.createElement(\"video\")"));
-        assert!(html.contains("window.conduitLocalizeTimestamps(template.content)"));
     }
 
     #[test]
@@ -5407,8 +5404,6 @@ mod tests {
         );
         let script = timeline_dom_patch_call(&patch);
 
-        assert!(script
-            .starts_with("window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch({"));
         assert!(script.contains("U\\\"123"));
         assert!(script.contains("\\u003c/script\\u003e"));
         assert!(script.contains("\\u0026"));

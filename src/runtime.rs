@@ -2423,15 +2423,6 @@ struct WorkspacePipelineContext<'a> {
     reducer: &'a WorkspaceReducerAdapter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConversationRefreshMode {
-    Background,
-}
-
-fn conversation_refresh_mode() -> ConversationRefreshMode {
-    ConversationRefreshMode::Background
-}
-
 fn cached_conversation_user_ids(
     conversations: &[SlackConversation],
     user_cache: &HashMap<String, String>,
@@ -2611,10 +2602,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .send_event(RuntimeEventKind::WorkspaceLifecycle(
                     WorkspaceLifecycleEvent::RecoveryStarted,
                 ));
-            debug_assert_eq!(
-                conversation_refresh_mode(),
-                ConversationRefreshMode::Background
-            );
             let api = require_slack(context.slack)?.clone();
             let workspace_store = (*context.workspace_store).clone();
             let cached_user_names = context.user_cache.clone();
@@ -6352,14 +6339,6 @@ mod tests {
                     thread_ts: "1710000000.000100".into(),
                 },
             )
-        );
-    }
-
-    #[test]
-    fn conversation_refresh_runs_in_background() {
-        assert_eq!(
-            conversation_refresh_mode(),
-            ConversationRefreshMode::Background
         );
     }
 

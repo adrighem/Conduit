@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn dbus_interface_and_shell_metadata_agree() {
+    fn dbus_interface_exposes_the_search_provider_contract() {
         let interface = gio::DBusNodeInfo::for_xml(INTERFACE_XML)
             .unwrap()
             .lookup_interface("org.gnome.Shell.SearchProvider2")
@@ -670,15 +670,6 @@ mod tests {
                 "missing {method}"
             );
         }
-
-        let metadata = include_str!("../data/eu.vanadrighem.conduit.search-provider.ini");
-        assert!(metadata.contains("DesktopId=eu.vanadrighem.conduit.desktop"));
-        assert!(metadata.contains("BusName=eu.vanadrighem.conduit"));
-        assert!(metadata.contains(&format!("ObjectPath={OBJECT_PATH}")));
-        assert!(metadata.contains("Version=2"));
-
-        let desktop = include_str!("../data/eu.vanadrighem.conduit.desktop.in");
-        assert!(desktop.contains("DBusActivatable=true"));
     }
 
     #[test]

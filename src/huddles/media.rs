@@ -32,28 +32,6 @@ pub struct MediaSessionConfig {
     pub devices: HuddleDeviceSelection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaGraphPlan {
-    pub audio_enabled: bool,
-    pub camera_capture_enabled: bool,
-    pub screen_capture_enabled: bool,
-    pub echo_cancellation_enabled: bool,
-    pub uses_system_devices: bool,
-}
-
-impl MediaGraphPlan {
-    pub fn for_session(config: &MediaSessionConfig) -> Self {
-        let uses_system_devices = config.source_mode == MediaSourceMode::System;
-        Self {
-            audio_enabled: true,
-            camera_capture_enabled: config.controls.camera_enabled,
-            screen_capture_enabled: false,
-            echo_cancellation_enabled: uses_system_devices,
-            uses_system_devices,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaDescriptionKind {
     Offer,
@@ -1191,31 +1169,7 @@ pub use native::GStreamerMediaEngine;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::huddles::state::{HuddleControls, HuddleDeviceSelection};
-
-    #[test]
-    fn graph_plan_never_enables_visual_capture_implicitly() {
-        let plan = MediaGraphPlan::for_session(&MediaSessionConfig::default());
-
-        assert!(plan.audio_enabled);
-        assert!(plan.echo_cancellation_enabled);
-        assert!(!plan.camera_capture_enabled);
-        assert!(!plan.screen_capture_enabled);
-    }
-
-    #[test]
-    fn synthetic_sources_do_not_request_real_devices_or_echo_processing() {
-        let config = MediaSessionConfig {
-            source_mode: MediaSourceMode::Synthetic,
-            sink_mode: MediaSinkMode::Fake,
-            controls: HuddleControls::default(),
-            devices: HuddleDeviceSelection::default(),
-        };
-
-        let plan = MediaGraphPlan::for_session(&config);
-        assert!(!plan.uses_system_devices);
-        assert!(!plan.echo_cancellation_enabled);
-    }
+    use crate::huddles::state::HuddleControls;
 
     #[test]
     fn descriptions_and_candidates_are_redacted_from_debug_output() {

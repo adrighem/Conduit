@@ -160,15 +160,4 @@ mod tests {
         assert_eq!(sidebar_title_weight(false), gtk::pango::Weight::Normal);
         assert_eq!(sidebar_title_weight(true), gtk::pango::Weight::Bold);
     }
-
-    #[test]
-    fn sidebar_rows_are_denser_than_switcher_rows() {
-        let sidebar = SidebarRowLayout::sidebar();
-        let switcher = SidebarRowLayout::switcher();
-
-        assert!(sidebar.margin_top < switcher.margin_top);
-        assert!(sidebar.margin_bottom < switcher.margin_bottom);
-        assert_eq!(sidebar.margin_top, 1);
-        assert_eq!(sidebar.margin_bottom, 1);
-    }
 }

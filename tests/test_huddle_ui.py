@@ -84,7 +84,6 @@ def main() -> None:
             text=True,
         )
         state_path = root / "huddle-surface.json"
-        external_uri_path = root / "huddle-external-uri"
         environment = os.environ.copy()
         environment.update(
             {
@@ -92,7 +91,6 @@ def main() -> None:
                 "CONDUIT_TEST_WORKSPACE": "1",
                 "CONDUIT_TEST_HUDDLE": "1",
                 "CONDUIT_TEST_HUDDLE_UI_FILE": str(state_path),
-                "CONDUIT_TEST_HUDDLE_EXTERNAL_URI_FILE": str(external_uri_path),
                 "GSETTINGS_SCHEMA_DIR": str(root),
                 "XDG_CACHE_HOME": str(root / "cache"),
                 "XDG_CONFIG_HOME": str(root / "config"),
@@ -109,27 +107,29 @@ def main() -> None:
         try:
             wait_for_window(process)
 
-            def visible_state() -> dict | None:
-                if not state_path.exists():
-                    return None
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                return state if state.get("visible") else None
-
-            state = wait_until(visible_state)
-            assert state == {
+            expected_state = {
                 "visible": True,
                 "title": "Huddle is active",
+                "detail": "1 participant",
+                "primary_visible": True,
                 "primary_label": "View huddle",
-                "camera_enabled": False,
-                "screen_share_active": False,
+                "external_visible": True,
+                "controls_visible": False,
+                "dismiss_visible": True,
+                "camera_sensitive": False,
+                "share_sensitive": False,
             }
-            external_uri = wait_until(
-                lambda: external_uri_path.read_text(encoding="utf-8")
-                if external_uri_path.exists()
-                else None
-            )
-            assert external_uri == "https://app.slack.com/huddle/TTEST/CTEST"
-            assert not external_uri.startswith("slack://")
+
+            def expected_visible_state() -> dict | None:
+                if not state_path.exists():
+                    return None
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    return None
+                return state if state == expected_state else None
+
+            wait_until(expected_visible_state)
 
             quit_application(environment)
             assert process.wait(timeout=10) == 0
