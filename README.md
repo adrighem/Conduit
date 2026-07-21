@@ -39,6 +39,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Workspace custom emoji in messages, reactions, composer completion, and the reusable searchable emoji picker.
 - Add and remove reactions, save messages for Later, copy message text or links, and forward messages.
 - Message authors use cached avatars with initial fallbacks. Author names and `@mentions` expose **Message** and **Profile** actions; hovering shows the person's full name when available, falling back to the display name.
+- Message timelines follow the GTK system text size and GNOME text scaling without applying other system theme settings to their content.
 
 ### Search, files, and media
 

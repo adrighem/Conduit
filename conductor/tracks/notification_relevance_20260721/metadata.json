@@ -1,0 +1,8 @@
+{
+  "track_id": "notification_relevance_20260721",
+  "type": "feature",
+  "status": "in_progress",
+  "created_at": "2026-07-21T08:33:07Z",
+  "updated_at": "2026-07-21T08:33:07Z",
+  "description": "Make unread state noise-free and desktop notifications relevant, resolved, and preference-driven."
+}

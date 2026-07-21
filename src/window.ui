@@ -153,6 +153,14 @@
                               </object>
                             </child>
                             <child>
+                              <object class="GtkLinkButton" id="browser_session_howto_link">
+                                <property name="label" translatable="yes">How to find XOXC/XOXD tokens</property>
+                                <property name="uri">https://github.com/adrighem/Conduit#lookup-slack_mcp_xoxc_token</property>
+                                <property name="halign">center</property>
+                                <property name="visible">False</property>
+                              </object>
+                            </child>
+                            <child>
                               <object class="GtkButton" id="connect_button">
                                 <property name="label" translatable="yes">Connect Workspace</property>
                                 <property name="halign">center</property>

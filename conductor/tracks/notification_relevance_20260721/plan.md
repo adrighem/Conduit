@@ -1,0 +1,32 @@
+# Relevant Notifications And Noise-Free Unread State Plan
+
+## Phase 1: Attention domain policy
+
+- [ ] Task: Write the table-driven decision matrix for message kinds, unread actions, notification actions, and relevance reasons
+- [ ] Task: Normalize lifecycle noise, direct messages, mentions, name/alias matches, keyword/phrase matches, and relevant thread replies
+- [ ] Task: Implement the pure AttentionPolicy inputs and AttentionDecision outputs with no GTK, GSettings, Slack API, or storage dependency
+- [ ] Task: Conductor - User Manual Verification 'Attention domain policy' (Protocol in workflow.md)
+
+## Phase 2: Canonical pipeline integration
+
+- [ ] Task: Route realtime, snapshot, and local message candidates through AttentionPolicy before coordinator effects fan out
+- [ ] Task: Apply the unread decision consistently to StoreBatch persistence, sidebar/activity projection, and reconciliation without losing raw Slack counters
+- [ ] Task: Apply notification effects with display-name resolution, active-target suppression, freshness, and persistent deduplication
+- [ ] Task: Add integration regressions for join/leave suppression, relevant thread replies, reconnect redelivery, and read-marker behavior
+- [ ] Task: Conductor - User Manual Verification 'Canonical pipeline integration' (Protocol in workflow.md)
+
+## Phase 3: Preferences and live configuration
+
+- [ ] Task: Add versioned GSettings keys and defaults for notification enablement, direct messages, mentions/names, thread replies, aliases, and keywords
+- [ ] Task: Add an accessible Notifications group to Preferences with validation and concise matching guidance
+- [ ] Task: Feed live preference snapshots into AttentionPolicy without restarting or reconnecting
+- [ ] Task: Add schema, binding, default-value, and live-update tests
+- [ ] Task: Conductor - User Manual Verification 'Preferences and live configuration' (Protocol in workflow.md)
+
+## Phase 4: Hardening, measurement, and documentation
+
+- [ ] Task: Add attention counters and structured reasons for decisions without logging message content or configured keywords
+- [ ] Task: Measure a realtime burst for classification cost, queue growth, duplicate delivery, and unread reconciliation behavior
+- [ ] Task: Update user and architecture documentation for relevant-only notifications and the raw-unread/attention distinction
+- [ ] Task: Run formatting, unit, integration, Meson, GSettings, GTK, and WebKit validation suites
+- [ ] Task: Conductor - User Manual Verification 'Hardening, measurement, and documentation' (Protocol in workflow.md)

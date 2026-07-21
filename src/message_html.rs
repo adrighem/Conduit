@@ -16,6 +16,7 @@ use crate::models::{
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
 const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
+pub(crate) const MESSAGE_BASE_FONT_SIZE_CSS_PX: f64 = 14.0;
 const TIMESTAMP_LOCALIZATION_SCRIPT: &str = include_str!("timestamp_localization.js");
 static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
@@ -1134,7 +1135,7 @@ html, body {{
   margin: 0;
   background: var(--page);
   color: var(--text);
-  font: 14px/1.45 Cantarell, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: {MESSAGE_BASE_FONT_SIZE_CSS_PX}px/1.45 Cantarell, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }}
 
 body {{
@@ -2605,9 +2606,26 @@ fn localized_timestamp_parts_at(
     now: &gtk::glib::DateTime,
 ) -> Option<(String, String, String)> {
     let machine = datetime.format_iso8601().ok()?.to_string();
-    let full = datetime.format("%c %Z").ok()?.to_string();
+    let localized = datetime.format("%c").ok()?.to_string();
+    let timezone = datetime.format("%Z").ok()?.to_string();
+    let full = full_timestamp_with_timezone(&localized, &timezone);
     let short = compact_timestamp_text(datetime, now)?;
     Some((machine, full, short))
+}
+
+fn full_timestamp_with_timezone(localized: &str, timezone: &str) -> String {
+    let timezone = timezone.trim();
+    let already_present = localized.split_whitespace().any(|part| {
+        part.trim_matches(|character: char| {
+            !character.is_alphanumeric() && character != '+' && character != '-'
+        })
+        .eq_ignore_ascii_case(timezone)
+    });
+    if timezone.is_empty() || already_present {
+        localized.to_string()
+    } else {
+        format!("{localized} {timezone}")
+    }
 }
 
 fn compact_timestamp_text(
@@ -2743,10 +2761,7 @@ fn message_body_html(message: &SlackMessage, context: &MessageHtmlContext) -> St
 
     let text = message.body_text();
     if text.trim().is_empty() {
-        format!(
-            "<p class=\"empty-message\">{}</p>",
-            escape_html(&gettext("No message text"))
-        )
+        String::new()
     } else {
         text_block_html(&text, None, context)
     }
@@ -4353,6 +4368,22 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_tooltip_includes_the_timezone_once() {
+        assert_eq!(
+            full_timestamp_with_timezone("do 02 jul 2026 10:42:16 CEST", "CEST"),
+            "do 02 jul 2026 10:42:16 CEST"
+        );
+        assert_eq!(
+            full_timestamp_with_timezone("do 02 jul 2026 10:42:16", "CEST"),
+            "do 02 jul 2026 10:42:16 CEST"
+        );
+        assert_eq!(
+            full_timestamp_with_timezone("do 02 jul 2026 10:42:16", ""),
+            "do 02 jul 2026 10:42:16"
+        );
+    }
+
+    #[test]
     fn timestamp_documents_install_the_webkit_intl_localizer() {
         let body = r#"<time class="metadata" datetime="2026-07-10T13:00:00+02:00" title="fallback title">jul 10, 13:00</time>"#;
         let html = html_document_with_locales("Messages", body, None, "en", Some("nl-NL"));
@@ -4497,6 +4528,31 @@ mod tests {
 
         assert!(html.contains("Message deleted"));
         assert!(!html.contains("No message text"));
+    }
+
+    #[test]
+    fn empty_attachment_messages_do_not_render_a_text_placeholder() {
+        let image_url = "https://files.slack.com/files-pri/T123-F123/image.png";
+        let mut message = message("");
+        message.files = Some(vec![SlackFile {
+            title: Some("Screenshot".to_string()),
+            mimetype: Some("image/png".to_string()),
+            thumb_480: Some(image_url.to_string()),
+            ..Default::default()
+        }]);
+        let context = MessageHtmlContext {
+            image_assets: HashMap::from([(
+                image_url.to_string(),
+                "data:image/png;base64,image".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message], &context);
+
+        assert!(!html.contains("No message text"));
+        assert!(html.contains("src=\"data:image/png;base64,image\""));
+        assert!(html.contains("Screenshot"));
     }
 
     #[test]

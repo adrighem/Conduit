@@ -127,6 +127,8 @@ mod imp {
         #[template_child]
         pub setup_hint_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub browser_session_howto_link: TemplateChild<gtk::LinkButton>,
+        #[template_child]
         pub connect_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub connection_label: TemplateChild<gtk::Label>,
@@ -266,6 +268,7 @@ mod imp {
         pub sidebar_error: RefCell<Option<String>>,
         pub current_user_id: RefCell<Option<String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
+        pub message_font_settings_handler: RefCell<Option<(gtk::Settings, glib::SignalHandlerId)>>,
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub(super) thread_pane_controller: RefCell<Option<ThreadPane>>,
         pub image_assets: RefCell<HashMap<String, String>>,
@@ -368,6 +371,12 @@ mod imp {
         }
 
         fn dispose(&self) {
+            if let Some((settings, handler)) =
+                self.message_font_settings_handler.borrow_mut().take()
+            {
+                settings.disconnect(handler);
+            }
+
             // These popovers are manually parented to GtkTextView so they can
             // point at the composer caret. Detach them before the template
             // children are disposed; GtkTextView cannot remove unregistered
@@ -956,13 +965,20 @@ fn message_is_notification_worthy(message: &SlackMessage) -> bool {
     message.is_notification_worthy()
 }
 
-fn message_notification_body(message: Option<&SlackMessage>) -> String {
-    message
+fn message_notification_body(
+    message: Option<&SlackMessage>,
+    user_names: &HashMap<String, String>,
+) -> Option<String> {
+    let text = message
         .and_then(|message| message.text.as_deref())
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| gettext("New message"))
+        .unwrap_or_default();
+    if text.is_empty() {
+        Some(gettext("New message"))
+    } else {
+        rendering::resolve_user_mentions(text, user_names)
+    }
 }
 
 fn message_notification_content(
@@ -971,7 +987,7 @@ fn message_notification_content(
     message: &SlackMessage,
     user_names: &HashMap<String, String>,
 ) -> Option<(String, String)> {
-    let body = message_notification_body(Some(message));
+    let body = message_notification_body(Some(message), user_names)?;
     if !channel_notification {
         return Some((conversation_title.to_string(), body));
     }
@@ -997,6 +1013,22 @@ fn notification_baseline_after(previous_ts: Option<&str>, candidate_ts: &str) ->
         .filter(|previous_ts| *previous_ts >= candidate_ts)
         .unwrap_or(candidate_ts)
         .to_string()
+}
+
+fn local_reaction_update(
+    channel_id: &str,
+    ts: &str,
+    name: &str,
+    added: bool,
+    current_user_id: Option<&str>,
+) -> Option<ReactionUpdate> {
+    Some(ReactionUpdate {
+        channel_id: channel_id.to_string(),
+        ts: ts.to_string(),
+        name: name.to_string(),
+        user_id: current_user_id?.to_string(),
+        added,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1747,6 +1779,7 @@ struct MessageWebViewFeaturePolicy {
     media: bool,
     webgl: bool,
     webaudio: bool,
+    zoom_text_only: bool,
 }
 
 fn message_web_view_feature_policy() -> MessageWebViewFeaturePolicy {
@@ -1758,7 +1791,26 @@ fn message_web_view_feature_policy() -> MessageWebViewFeaturePolicy {
         media: true,
         webgl: false,
         webaudio: false,
+        zoom_text_only: true,
     }
+}
+
+fn message_text_zoom(font_name: Option<&str>) -> f64 {
+    let Some(font_name) = font_name else {
+        return 1.0;
+    };
+    let description = gtk::pango::FontDescription::from_string(font_name);
+    let size = f64::from(description.size()) / f64::from(gtk::pango::SCALE);
+    if !size.is_finite() || size <= 0.0 {
+        return 1.0;
+    }
+
+    let css_pixels = if description.is_size_absolute() {
+        size
+    } else {
+        size * 96.0 / 72.0
+    };
+    css_pixels / message_html::MESSAGE_BASE_FONT_SIZE_CSS_PX
 }
 
 fn browser_session_input(
@@ -2002,15 +2054,24 @@ impl ConduitWindow {
 
     fn setup_message_view(&self) {
         let network_session = self.create_message_network_session();
+        let font_settings = gtk::Settings::default();
+        let text_zoom = message_text_zoom(
+            font_settings
+                .as_ref()
+                .and_then(gtk::Settings::gtk_font_name)
+                .as_deref(),
+        );
 
-        let message_view = self.create_message_web_view(&network_session);
+        let message_view = self.create_message_web_view(&network_session, text_zoom);
         let viewer = self.create_media_viewer(&message_view);
         self.imp().message_view_box.append(&viewer.surface_stack);
-        *self.imp().message_view.borrow_mut() = Some(message_view);
+        *self.imp().message_view.borrow_mut() = Some(message_view.clone());
         *self.imp().media_viewer.borrow_mut() = Some(viewer);
         self.setup_media_viewer_callbacks();
 
-        let thread_view = self.create_message_web_view(&network_session);
+        let thread_view = self.create_message_web_view(&network_session, text_zoom);
+        let weak_message_view = message_view.downgrade();
+        let weak_thread_view = thread_view.downgrade();
         let thread_pane = ThreadPane::new(
             &self.imp().thread_split.get(),
             &self.imp().thread_title.get(),
@@ -2018,6 +2079,18 @@ impl ConduitWindow {
             thread_view,
         );
         *self.imp().thread_pane_controller.borrow_mut() = Some(thread_pane);
+
+        if let Some(font_settings) = font_settings {
+            let handler = font_settings.connect_gtk_font_name_notify(move |settings| {
+                let text_zoom = message_text_zoom(settings.gtk_font_name().as_deref());
+                for weak_view in [&weak_message_view, &weak_thread_view] {
+                    if let Some(view) = weak_view.upgrade() {
+                        view.set_zoom_level(text_zoom);
+                    }
+                }
+            });
+            *self.imp().message_font_settings_handler.borrow_mut() = Some((font_settings, handler));
+        }
 
         self.show_message_placeholder(&gettext("Select a conversation"));
         self.thread_pane().close();
@@ -2513,6 +2586,7 @@ impl ConduitWindow {
     fn create_message_web_view(
         &self,
         network_session: &webkit6::NetworkSession,
+        text_zoom: f64,
     ) -> webkit6::WebView {
         let settings = webkit6::Settings::new();
         let features = message_web_view_feature_policy();
@@ -2524,6 +2598,7 @@ impl ConduitWindow {
         settings.set_enable_media(features.media);
         settings.set_enable_webgl(features.webgl);
         settings.set_enable_webaudio(features.webaudio);
+        settings.set_zoom_text_only(features.zoom_text_only);
 
         let web_view = webkit6::WebView::builder()
             .network_session(network_session)
@@ -2531,6 +2606,7 @@ impl ConduitWindow {
             .build();
         web_view.set_hexpand(true);
         web_view.set_vexpand(true);
+        web_view.set_zoom_level(text_zoom);
 
         let weak_window = self.downgrade();
         web_view.connect_decide_policy(move |_, decision, decision_type| {
@@ -2651,6 +2727,15 @@ impl ConduitWindow {
                 window.update_auth_mode_ui();
             }
         });
+
+        let weak_window = self.downgrade();
+        imp.browser_session_howto_link
+            .connect_activate_link(move |button| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.open_external_link(button.uri().as_str());
+                }
+                glib::Propagation::Stop
+            });
 
         let weak_window = self.downgrade();
         imp.sidebar_filter_entry.connect_search_changed(move |_| {
@@ -3825,10 +3910,24 @@ impl ConduitWindow {
             }
             RuntimeEventKind::ReactionUpdated {
                 channel_id,
+                ts,
+                name,
+                added,
                 thread_ts,
             } => {
                 self.set_status("Reaction updated");
-                self.reload_after_message(&channel_id, thread_ts.as_deref());
+                let current_user_id = self.imp().current_user_id.borrow().clone();
+                if let Some(update) = local_reaction_update(
+                    &channel_id,
+                    &ts,
+                    &name,
+                    added,
+                    current_user_id.as_deref(),
+                ) {
+                    self.apply_reaction_update(update);
+                } else {
+                    self.reload_after_message(&channel_id, thread_ts.as_deref());
+                }
             }
             RuntimeEventKind::SavedUpdated {
                 channel_id,
@@ -4024,6 +4123,7 @@ impl ConduitWindow {
         imp.xoxc_token_entry.set_visible(browser_session);
         imp.xoxd_token_entry.set_visible(browser_session);
         imp.user_agent_entry.set_visible(browser_session);
+        imp.browser_session_howto_link.set_visible(browser_session);
 
         if browser_session {
             imp.auth_intro_label.set_label(
@@ -7241,13 +7341,16 @@ impl ConduitWindow {
     }
 
     fn apply_socket_reaction(&self, event: SocketModeReactionEvent) {
-        let update = ReactionUpdate {
+        self.apply_reaction_update(ReactionUpdate {
             channel_id: event.channel_id,
             ts: event.ts,
             name: event.name,
             user_id: event.user_id,
             added: event.added,
-        };
+        });
+    }
+
+    fn apply_reaction_update(&self, update: ReactionUpdate) {
         let outcome = self
             .imp()
             .workspace
@@ -9224,6 +9327,21 @@ mod tests {
         assert!(features.media);
         assert!(!features.webgl);
         assert!(!features.webaudio);
+        assert!(features.zoom_text_only);
+    }
+
+    #[test]
+    fn message_text_zoom_matches_the_gtk_theme_font_size() {
+        let expected = 11.0 * 96.0 / 72.0 / 14.0;
+        assert!((message_text_zoom(Some("Cantarell 11")) - expected).abs() < 1e-12);
+        assert!((message_text_zoom(Some("Sans 10.5")) - 1.0).abs() < 1e-12);
+        assert!((message_text_zoom(Some("Sans 14px")) - 1.0).abs() < 1e-12);
+        assert_eq!(
+            message_text_zoom(Some("Cantarell 11")),
+            message_text_zoom(Some("Serif 11"))
+        );
+        assert_eq!(message_text_zoom(Some("Cantarell")), 1.0);
+        assert_eq!(message_text_zoom(None), 1.0);
     }
 
     #[test]
@@ -9389,24 +9507,33 @@ mod tests {
 
     #[test]
     fn notification_body_uses_fallback_for_empty_message_text() {
-        assert_eq!(message_notification_body(None), "New message");
         assert_eq!(
-            message_notification_body(Some(&SlackMessage {
-                ts: "1710000100.000000".to_string(),
-                text: Some("   ".to_string()),
-                ..Default::default()
-            })),
-            "New message"
+            message_notification_body(None, &HashMap::new()),
+            Some("New message".into())
         );
         assert_eq!(
-            message_notification_body(Some(&message("1710000200.000000", "Hello"))),
-            "Hello"
+            message_notification_body(
+                Some(&SlackMessage {
+                    ts: "1710000100.000000".to_string(),
+                    text: Some("   ".to_string()),
+                    ..Default::default()
+                }),
+                &HashMap::new()
+            ),
+            Some("New message".into())
+        );
+        assert_eq!(
+            message_notification_body(
+                Some(&message("1710000200.000000", "Hello")),
+                &HashMap::new()
+            ),
+            Some("Hello".into())
         );
     }
 
     #[test]
     fn channel_notification_content_waits_for_and_includes_sender_display_name() {
-        let mut incoming = message("1710000200.000000", "Hello");
+        let mut incoming = message("1710000200.000000", "Hello <@U789>");
         incoming.user = Some("U456".into());
         assert_eq!(
             message_notification_content("general", true, &incoming, &HashMap::new()),
@@ -9419,11 +9546,46 @@ mod tests {
                 &incoming,
                 &HashMap::from([("U456".into(), "Ada".into())]),
             ),
-            Some(("general".into(), "Ada: Hello".into()))
+            None
         );
         assert_eq!(
-            message_notification_content("Ada", false, &incoming, &HashMap::new()),
-            Some(("Ada".into(), "Hello".into()))
+            message_notification_content(
+                "general",
+                true,
+                &incoming,
+                &HashMap::from([
+                    ("U456".into(), "Ada".into()),
+                    ("U789".into(), "Grace".into()),
+                ]),
+            ),
+            Some(("general".into(), "Ada: Hello @Grace".into()))
+        );
+        assert_eq!(
+            message_notification_content(
+                "Ada",
+                false,
+                &incoming,
+                &HashMap::from([("U789".into(), "Grace".into())]),
+            ),
+            Some(("Ada".into(), "Hello @Grace".into()))
+        );
+    }
+
+    #[test]
+    fn local_reaction_completion_keeps_the_incremental_update_payload() {
+        assert_eq!(
+            local_reaction_update("C123", "1710000200.000000", "eyes", true, Some("U123")),
+            Some(ReactionUpdate {
+                channel_id: "C123".into(),
+                ts: "1710000200.000000".into(),
+                name: "eyes".into(),
+                user_id: "U123".into(),
+                added: true,
+            })
+        );
+        assert_eq!(
+            local_reaction_update("C123", "1710000200.000000", "eyes", true, None),
+            None
         );
     }
 
@@ -9767,6 +9929,9 @@ mod tests {
             "AdwPasswordEntryRow\" id=\"xoxd_token_entry",
             "AdwEntryRow\" id=\"user_agent_entry",
             "Browser User-Agent (Enterprise)",
+            "GtkLinkButton\" id=\"browser_session_howto_link",
+            "How to find XOXC/XOXD tokens",
+            "https://github.com/adrighem/Conduit#lookup-slack_mcp_xoxc_token",
             "<property name=\"label\" translatable=\"yes\">Message</property>",
             "<property name=\"label\" translatable=\"yes\">Reply</property>",
             "GtkToggleButton\" id=\"messages_button",
@@ -9810,6 +9975,15 @@ mod tests {
         assert!(!template.contains("<property name=\"width-request\">220</property>"));
         assert!(!template.contains("<attribute name=\"action\">win.sign-out</attribute>"));
         assert!(!template.contains("slack://"));
+
+        let browser_session_howto = template
+            .split("GtkLinkButton\" id=\"browser_session_howto_link\"")
+            .nth(1)
+            .unwrap()
+            .split("</object>")
+            .next()
+            .unwrap();
+        assert!(browser_session_howto.contains("<property name=\"visible\">False</property>"));
     }
 
     #[test]

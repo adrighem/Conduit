@@ -852,6 +852,9 @@ pub enum RuntimeEventKind {
     },
     ReactionUpdated {
         channel_id: String,
+        ts: String,
+        name: String,
+        added: bool,
         thread_ts: Option<String>,
     },
     SavedUpdated {
@@ -3262,6 +3265,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .events
                 .send_event(RuntimeEventKind::ReactionUpdated {
                     channel_id,
+                    ts,
+                    name,
+                    added: add,
                     thread_ts,
                 });
         }
