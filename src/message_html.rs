@@ -705,7 +705,7 @@ pub fn user_profile_document(user: &SlackUser, context: &MessageHtmlContext) -> 
     });
     let mut body = format!(
         "<main class=\"profile-page\" aria-labelledby=\"document-title\"><nav><a href=\"conduit://profile-close\">← {}</a></nav><header class=\"profile-header\">",
-        profile_text_html(&gettext("Back to conversation"), context)
+        profile_plain_text_html(&gettext("Back to conversation"))
     );
     if let Some(image) = image.filter(|url| is_http_url(url)) {
         body.push_str(&format!(
@@ -716,33 +716,41 @@ pub fn user_profile_document(user: &SlackUser, context: &MessageHtmlContext) -> 
     }
     body.push_str(&format!(
         "<div><h1 id=\"document-title\">{}</h1><p class=\"profile-full-name\">{}</p></div></header><dl class=\"profile-details\">",
-        profile_text_html(&display_name, context), profile_text_html(full_name, context)
+        profile_plain_text_html(&display_name),
+        profile_plain_text_html(full_name)
     ));
-    let mut detail = |label: &str, value: Option<&str>| {
-        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
-            body.push_str(&format!(
-                "<div><dt>{}</dt><dd dir=\"auto\">{}</dd></div>",
-                profile_text_html(label, context),
-                profile_text_html(value, context)
-            ));
-        }
-    };
     if let Some(status) = user.status() {
         let status_value = [status.emoji.as_str(), status.text.as_str()]
             .into_iter()
             .filter(|value| !value.trim().is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        detail(&gettext("Status"), Some(&status_value));
+        body.push_str(&format!(
+            "<div><dt>{}</dt><dd dir=\"auto\">{}</dd></div>",
+            profile_plain_text_html(&gettext("Status")),
+            profile_status_text_html(&status_value, context)
+        ));
         if status.expiration > 0 {
             let expiration = gtk::glib::DateTime::from_unix_local(status.expiration)
                 .ok()
-                .and_then(|datetime| datetime.format("%c %Z").ok())
-                .map(|value| value.to_string())
+                .and_then(|datetime| localized_full_timestamp(&datetime))
                 .unwrap_or_else(|| status.expiration.to_string());
-            detail(&gettext("Status expiration"), Some(&expiration));
+            body.push_str(&format!(
+                "<div><dt>{}</dt><dd dir=\"auto\">{}</dd></div>",
+                profile_plain_text_html(&gettext("Status expiration")),
+                profile_plain_text_html(&expiration)
+            ));
         }
     }
+    let mut detail = |label: &str, value: Option<&str>| {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            body.push_str(&format!(
+                "<div><dt>{}</dt><dd dir=\"auto\">{}</dd></div>",
+                profile_plain_text_html(label),
+                profile_plain_text_html(value)
+            ));
+        }
+    };
     detail(
         &gettext("Job title"),
         profile.and_then(|p| p.title.as_deref()),
@@ -781,7 +789,11 @@ pub fn user_profile_document(user: &SlackUser, context: &MessageHtmlContext) -> 
     html_document(&display_name, &body)
 }
 
-fn profile_text_html(text: &str, context: &MessageHtmlContext) -> String {
+fn profile_plain_text_html(text: &str) -> String {
+    escape_html(text).replace('\n', "<br>")
+}
+
+fn profile_status_text_html(text: &str, context: &MessageHtmlContext) -> String {
     let mut output = String::new();
     let mut rest = text;
     while !rest.is_empty() {
@@ -2606,11 +2618,15 @@ fn localized_timestamp_parts_at(
     now: &gtk::glib::DateTime,
 ) -> Option<(String, String, String)> {
     let machine = datetime.format_iso8601().ok()?.to_string();
-    let localized = datetime.format("%c").ok()?.to_string();
-    let timezone = datetime.format("%Z").ok()?.to_string();
-    let full = full_timestamp_with_timezone(&localized, &timezone);
+    let full = localized_full_timestamp(datetime)?;
     let short = compact_timestamp_text(datetime, now)?;
     Some((machine, full, short))
+}
+
+fn localized_full_timestamp(datetime: &gtk::glib::DateTime) -> Option<String> {
+    let localized = datetime.format("%c").ok()?.to_string();
+    let timezone = datetime.format("%Z").ok()?.to_string();
+    Some(full_timestamp_with_timezone(&localized, &timezone))
 }
 
 fn full_timestamp_with_timezone(localized: &str, timezone: &str) -> String {
@@ -5501,8 +5517,63 @@ mod tests {
         assert!(profile_html.contains("title=\":working:\""));
         assert!(profile_html.contains("https://emoji.slack-edge.com/T123/working.png"));
         assert!(profile_html.contains("title=\":coffee:\""));
-        assert!(profile_html.contains("title=\":wave:\""));
-        assert!(profile_html.contains("title=\":rocket:\""));
+        assert!(profile_html.contains("Ada :wave:"));
+        assert!(profile_html.contains("Engineer :rocket:"));
+        assert!(profile_html.contains("Builds useful things :coffee:"));
+        assert!(!profile_html.contains("title=\":wave:\""));
+        assert!(!profile_html.contains("title=\":rocket:\""));
         assert!(!profile_html.contains(":working: Focused :coffee:"));
+    }
+
+    #[test]
+    fn profile_structured_fields_keep_date_and_emoji_shortcodes_literal() {
+        let user = SlackUser {
+            real_name: Some("Ada :calendar:".into()),
+            profile: Some(crate::models::SlackUserProfile {
+                status_text: Some("Focused :coffee:".into()),
+                status_emoji: Some(":working:".into()),
+                status_expiration: Some(1_784_635_200),
+                fields: HashMap::from([(
+                    "X123".into(),
+                    crate::models::SlackProfileField {
+                        label: Some("Availability :calendar:".into()),
+                        value: Some("di 21 jul 2026 12:00:00 CEST".into()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let context = MessageHtmlContext {
+            custom_emojis: HashMap::from([
+                ("00".into(), "https://emoji.example/clock-minute.png".into()),
+                (
+                    "calendar".into(),
+                    "https://emoji.example/calendar.png".into(),
+                ),
+                ("working".into(), "https://emoji.example/working.png".into()),
+            ]),
+            ..Default::default()
+        };
+
+        let html = user_profile_document(&user, &context);
+        let expiration_start = html
+            .find("<dt>Status expiration</dt>")
+            .expect("profile should include the status expiration");
+        let expiration_end = html[expiration_start..]
+            .find("</div>")
+            .map(|offset| expiration_start + offset)
+            .expect("status expiration detail should be closed");
+        let expiration_detail = &html[expiration_start..expiration_end];
+
+        assert!(html.contains("Ada :calendar:"));
+        assert!(html.contains("Availability :calendar:"));
+        assert!(html.contains("di 21 jul 2026 12:00:00 CEST"));
+        assert!(!html.contains("https://emoji.example/clock-minute.png"));
+        assert!(!html.contains("https://emoji.example/calendar.png"));
+        assert!(!expiration_detail.contains("class=\"emoji\""));
+        assert!(html.contains("title=\":working:\""));
+        assert!(html.contains("title=\":coffee:\""));
     }
 }
