@@ -9,6 +9,7 @@ export DEB_CARGO_HOME = $(CURDIR)/obj-$(DEB_HOST_GNU_TYPE)/cargo-home
 override_dh_auto_configure:
 	dh_auto_configure --buildsystem=meson -- \
 		--buildtype=release \
+		-Dheadless_tests=disabled \
 		-Dnative_media=disabled \
 		-Dscreen_share=disabled
 

@@ -26,6 +26,7 @@ NATIVE_MEDIA_DISABLED_OPTIONS = (
     "-Dnative_media=disabled",
     "-Dscreen_share=disabled",
 )
+HEADLESS_TESTS_DISABLED_OPTION = "-Dheadless_tests=disabled"
 
 
 def read(path: str) -> str:
@@ -137,6 +138,14 @@ def assert_native_media_disabled(options: str | list[str], target: str) -> None:
         assert option in contents, f"{target} must set {option}"
     assert "-Dnative_media=enabled" not in contents
     assert "-Dscreen_share=enabled" not in contents
+
+
+def assert_headless_tests_disabled(options: str | list[str], target: str) -> None:
+    contents = "\n".join(options) if isinstance(options, list) else options
+    assert HEADLESS_TESTS_DISABLED_OPTION in contents, (
+        f"{target} must disable the headless UI-test harness"
+    )
+    assert "-Dheadless_tests=enabled" not in contents
 
 
 def assert_installed_payload_contract(job: str, target: str) -> None:
@@ -297,7 +306,7 @@ def test_release_build_tests_reuse_the_release_profile() -> None:
     assert "%meson_test" in rpm_check
 
 
-def test_release_packages_disable_unavailable_native_huddle_stack() -> None:
+def test_release_packages_disable_nonproduction_features() -> None:
     debian_rules = read("packaging/debian/rules")
     rpm_spec = read("packaging/rpm/conduit.spec")
     debian_configure = debian_rules.split(
@@ -309,6 +318,8 @@ def test_release_packages_disable_unavailable_native_huddle_stack() -> None:
 
     assert_native_media_disabled(debian_configure, "Debian package")
     assert_native_media_disabled(rpm_build, "RPM package")
+    assert_headless_tests_disabled(debian_configure, "Debian package")
+    assert_headless_tests_disabled(rpm_build, "RPM package")
 
 
 def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
@@ -338,6 +349,7 @@ def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
     )
     assert "--libdir=lib" in conduit["config-opts"]
     assert_native_media_disabled(conduit["config-opts"], "Flatpak package")
+    assert_headless_tests_disabled(conduit["config-opts"], "Flatpak package")
     for scope in (manifest, *manifest["modules"]):
         environment = scope.get("build-options", {}).get("env", {})
         assert "RUST_LOG" not in environment
@@ -371,7 +383,7 @@ def main() -> None:
         test_release_versions_are_synchronized,
         test_release_workflow_builds_validates_and_publishes_all_assets,
         test_release_build_tests_reuse_the_release_profile,
-        test_release_packages_disable_unavailable_native_huddle_stack,
+        test_release_packages_disable_nonproduction_features,
         test_release_flatpak_uses_current_checkout_without_debug_logging,
         test_flatpak_cargo_sources_match_the_lockfile,
     ]

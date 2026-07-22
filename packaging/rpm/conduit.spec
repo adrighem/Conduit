@@ -37,6 +37,7 @@ threads, search, files, and huddles.
 %build
 %meson \
     --buildtype=release \
+    -Dheadless_tests=disabled \
     -Dnative_media=disabled \
     -Dscreen_share=disabled
 CARGO_HOME="%{_vpath_builddir}/cargo-home" cargo fetch --locked
