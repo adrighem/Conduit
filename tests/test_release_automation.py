@@ -27,6 +27,13 @@ NATIVE_MEDIA_DISABLED_OPTIONS = (
     "-Dscreen_share=disabled",
 )
 HEADLESS_TESTS_DISABLED_OPTION = "-Dheadless_tests=disabled"
+CHECKOUT_ACTION = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
+UPLOAD_ARTIFACT_ACTION = (
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+)
+DOWNLOAD_ARTIFACT_ACTION = (
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+)
 RELEASE_PR_FILES = {
     ".release-please-manifest.json",
     "CHANGELOG.md",
@@ -271,12 +278,15 @@ def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
         assert f'echo "{output}=' in recovery
 
     for job_name in ("build-deb", "build-rpm", "build-flatpak"):
-        checkout = step_containing(workflow_steps(jobs[job_name]), "actions/checkout@")
+        build_steps = workflow_steps(jobs[job_name])
+        checkout = step_containing(build_steps, CHECKOUT_ACTION)
         assert "ref: ${{ needs.release-please.outputs.sha }}" in checkout
+        if job_name != "build-flatpak":
+            step_containing(build_steps, UPLOAD_ARTIFACT_ACTION)
 
     rpm_steps = workflow_steps(jobs["build-rpm"])
     rpm_dependencies = step_containing(rpm_steps, "dnf install")
-    rpm_checkout = step_containing(rpm_steps, "actions/checkout@")
+    rpm_checkout = step_containing(rpm_steps, CHECKOUT_ACTION)
     rpm_build = step_containing(rpm_steps, "git archive")
     assert re.search(r"\bgit\b", rpm_dependencies)
     assert rpm_steps.index(rpm_dependencies) < rpm_steps.index(rpm_checkout)
@@ -292,7 +302,7 @@ def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
 
     for job_name in ("validate-deb", "validate-rpm", "validate-flatpak"):
         assert_installed_payload_contract(jobs[job_name], job_name)
-        step_containing(workflow_steps(jobs[job_name]), "actions/download-artifact@")
+        step_containing(workflow_steps(jobs[job_name]), DOWNLOAD_ARTIFACT_ACTION)
 
     for job_name in ("validate-deb", "validate-rpm"):
         validation = jobs[job_name]
@@ -316,7 +326,7 @@ def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
     assert 'flatpak run --system --command=sh "$APP_ID"' in flatpak_validation
 
     publication = jobs["publish-assets"]
-    step_containing(workflow_steps(publication), "actions/download-artifact@")
+    step_containing(workflow_steps(publication), DOWNLOAD_ARTIFACT_ACTION)
     publish_step = step_containing(workflow_steps(publication), "gh release upload")
     assert "SHA256SUMS" in publish_step
     assert 'gh release edit "$TAG_NAME" --target "$RELEASE_SHA"' in publish_step
@@ -333,7 +343,7 @@ def test_generated_release_pull_requests_use_verified_dispatched_ci() -> None:
     assert "        type: string" in workflow_dispatch
 
     ci_job = workflow_jobs(ci_workflow)["build"]
-    checkout = step_containing(workflow_steps(ci_job), "actions/checkout@v4")
+    checkout = step_containing(workflow_steps(ci_job), CHECKOUT_ACTION)
     assert "ref: ${{ inputs.commit_sha || github.sha }}" in checkout
     assert "persist-credentials: false" in checkout
 
