@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/adrighem/Conduit/compare/v0.1.1...v0.1.2) (2026-07-22)
+
+
+### Bug Fixes
+
+* **ci:** harden release pull request checks ([c590cdb](https://github.com/adrighem/Conduit/commit/c590cdb7c84c3dd277acdda3348a00021b909a6d))
+* **ci:** upgrade actions to Node 24 ([02ed3b3](https://github.com/adrighem/Conduit/commit/02ed3b3e305b2728b9fccb042d75a0984e142cbb))
+
 ## [0.1.1](https://github.com/adrighem/Conduit/compare/v0.1.0...v0.1.1) (2026-07-21)
 
 
