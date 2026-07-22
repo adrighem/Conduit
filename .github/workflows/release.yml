@@ -35,13 +35,15 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name || steps.recovery.outputs.tag_name }}
       version: ${{ steps.release.outputs.version || steps.recovery.outputs.version }}
       sha: ${{ steps.release.outputs.sha || steps.recovery.outputs.sha }}
+      release_pr_created: ${{ steps.release.outputs.prs_created }}
+      release_pr: ${{ steps.release.outputs.pr }}
     steps:
       - name: Create or update release
         id: release
         if: github.event_name != 'workflow_dispatch' || inputs.draft_tag == ''
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          token: ${{ github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
       - name: Select existing draft release
@@ -60,12 +62,64 @@ jobs:
             echo "::error::$DRAFT_TAG is not an existing draft release"
             exit 1
           fi
+          release_sha=$(
+            gh api "repos/${GH_REPO}/git/ref/tags/${DRAFT_TAG}" \
+              --jq 'select(.object.type == "commit") | .object.sha'
+          )
+          if [[ ! "$release_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::$DRAFT_TAG is not an immutable commit tag"
+            exit 1
+          fi
           {
             echo "release_created=true"
             echo "tag_name=$DRAFT_TAG"
             echo "version=${DRAFT_TAG#v}"
-            echo "sha=$GITHUB_SHA"
+            echo "sha=$release_sha"
           } >> "$GITHUB_OUTPUT"
+
+  validate-release-pr:
+    needs: release-please
+    if: needs.release-please.outputs.release_pr_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Validate and dispatch CI for generated release pull request
+        env:
+          EXPECTED_FILES: >-
+            [".release-please-manifest.json", "CHANGELOG.md", "Cargo.lock", "Cargo.toml", "data/eu.vanadrighem.conduit.metainfo.xml.in", "meson.build"]
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_PR: ${{ needs.release-please.outputs.release_pr }}
+        run: |
+          release_pr_branch=$(jq -er '.headBranchName' <<< "$RELEASE_PR")
+          release_pr_number=$(jq -er '.number' <<< "$RELEASE_PR")
+          expected_branch=release-please--branches--main--components--conduit
+          if [[ "$release_pr_branch" != "$expected_branch" ]]; then
+            echo "::error::unexpected release pull request branch"
+            exit 1
+          fi
+          release_pr_metadata=$(
+            gh pr view "$release_pr_number" \
+              --json author,baseRefName,files,headRefName,headRefOid,isCrossRepository,state
+          )
+          jq -e \
+            --arg branch "$release_pr_branch" \
+            --argjson expected_files "$EXPECTED_FILES" '
+              .author.login == "app/github-actions" and
+              .baseRefName == "main" and
+              .headRefName == $branch and
+              .isCrossRepository == false and
+              .state == "OPEN" and
+              (.headRefOid | test("^[0-9a-f]{40}$")) and
+              (([.files[].path] | sort) == ($expected_files | sort))
+            ' <<< "$release_pr_metadata" >/dev/null
+          release_pr_sha=$(jq -er '.headRefOid' <<< "$release_pr_metadata")
+          gh workflow run ci.yml \
+            --ref "$release_pr_branch" \
+            -f commit_sha="$release_pr_sha"
 
   build-deb:
     needs: release-please

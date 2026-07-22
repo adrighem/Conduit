@@ -4,6 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+    # GitHub approval-gates workflows for pull requests created by GITHUB_TOKEN.
+    # Release metadata is validated and dispatched at its exact SHA by release.yml.
+    paths-ignore:
+      - .release-please-manifest.json
+      - CHANGELOG.md
+      - Cargo.lock
+      - Cargo.toml
+      - data/eu.vanadrighem.conduit.metainfo.xml.in
+      - meson.build
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact trusted commit to validate
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,6 +29,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:

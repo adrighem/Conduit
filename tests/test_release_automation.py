@@ -27,6 +27,14 @@ NATIVE_MEDIA_DISABLED_OPTIONS = (
     "-Dscreen_share=disabled",
 )
 HEADLESS_TESTS_DISABLED_OPTION = "-Dheadless_tests=disabled"
+RELEASE_PR_FILES = {
+    ".release-please-manifest.json",
+    "CHANGELOG.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    f"data/{APP_ID}.metainfo.xml.in",
+    "meson.build",
+}
 
 
 def read(path: str) -> str:
@@ -67,6 +75,33 @@ def workflow_jobs(document: str) -> dict[str, str]:
 
     assert jobs, "release workflow jobs mapping is empty"
     return jobs
+
+
+def workflow_event(document: str, event: str) -> str:
+    lines = active_text(document).splitlines()
+    try:
+        events_start = lines.index("on:")
+    except ValueError as error:
+        raise AssertionError("workflow has no event mapping") from error
+
+    events: list[str] = []
+    for line in lines[events_start + 1 :]:
+        if line and not line.startswith(" "):
+            break
+        events.append(line)
+
+    marker = f"  {event}:"
+    try:
+        event_start = events.index(marker)
+    except ValueError as error:
+        raise AssertionError(f"workflow has no {event!r} event") from error
+
+    block = [marker]
+    for line in events[event_start + 1 :]:
+        if re.fullmatch(r"  [A-Za-z0-9_-]+:.*", line):
+            break
+        block.append(line)
+    return "\n".join(block).rstrip()
 
 
 def workflow_steps(job: str) -> list[str]:
@@ -141,7 +176,7 @@ def assert_native_media_disabled(options: str | list[str], target: str) -> None:
 
 
 def assert_headless_tests_disabled(options: str | list[str], target: str) -> None:
-    contents = "\n".join(options) if isinstance(options, list) else options
+    contents = active_text(options if isinstance(options, str) else "\n".join(options))
     assert HEADLESS_TESTS_DISABLED_OPTION in contents, (
         f"{target} must disable the headless UI-test harness"
     )
@@ -168,6 +203,8 @@ def test_release_versions_are_synchronized() -> None:
     assert config["release-type"] == "rust"
     assert config["include-component-in-tag"] is False
     assert config["include-v-in-tag"] is True
+    assert config["draft"] is True
+    assert config["force-tag-creation"] is True
 
     extra_files = config["packages"]["."]["extra-files"]
     assert {entry["path"] for entry in extra_files} == {
@@ -222,6 +259,9 @@ def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
     assert "inputs.draft_tag != ''" in recovery
     assert "GH_REPO: ${{ github.repository }}" in recovery
     assert 'gh release view "$DRAFT_TAG" --json isDraft' in recovery
+    assert 'git/ref/tags/${DRAFT_TAG}' in recovery
+    assert 'echo "sha=$release_sha"' in recovery
+    assert 'echo "sha=$GITHUB_SHA"' not in recovery
     for output in ("release_created", "tag_name", "version", "sha"):
         output_mapping = re.search(rf"^      {output}:\s*(.+)$", release_job, re.MULTILINE)
         assert output_mapping is not None, f"release output {output!r} lacks recovery"
@@ -280,6 +320,71 @@ def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
     publish_step = step_containing(workflow_steps(publication), "gh release upload")
     assert "SHA256SUMS" in publish_step
     assert 'gh release edit "$TAG_NAME" --target "$RELEASE_SHA"' in publish_step
+
+
+def test_generated_release_pull_requests_use_verified_dispatched_ci() -> None:
+    ci_workflow = read(".github/workflows/ci.yml")
+    pull_request = workflow_event(ci_workflow, "pull_request")
+    ignored_paths = set(re.findall(r"^      - (.+)$", pull_request, re.MULTILINE))
+    assert ignored_paths == RELEASE_PR_FILES
+    workflow_dispatch = workflow_event(ci_workflow, "workflow_dispatch")
+    assert "      commit_sha:" in workflow_dispatch
+    assert "        required: true" in workflow_dispatch
+    assert "        type: string" in workflow_dispatch
+
+    ci_job = workflow_jobs(ci_workflow)["build"]
+    checkout = step_containing(workflow_steps(ci_job), "actions/checkout@v4")
+    assert "ref: ${{ inputs.commit_sha || github.sha }}" in checkout
+    assert "persist-credentials: false" in checkout
+
+    release_workflow = read(".github/workflows/release.yml")
+    release_jobs = workflow_jobs(release_workflow)
+    release_job = release_jobs["release-please"]
+    assert "      actions: write" not in release_job
+    assert "secrets.RELEASE_PLEASE_TOKEN" not in release_job
+    assert "token: ${{ github.token }}" in release_job
+    assert (
+        "release_pr_created: ${{ steps.release.outputs.prs_created }}"
+        in release_job
+    )
+    assert "release_pr: ${{ steps.release.outputs.pr }}" in release_job
+    assert (
+        "googleapis/release-please-action@"
+        "5c625bfb5d1ff62eadeeb3772007f7f66fdcf071" in release_job
+    )
+
+    dispatch_job = release_jobs["validate-release-pr"]
+    assert job_needs(dispatch_job) == {"release-please"}
+    assert (
+        job_scalar(dispatch_job, "if")
+        == "needs.release-please.outputs.release_pr_created == 'true'"
+    )
+    permissions = dict(
+        re.findall(r"^      ([A-Za-z-]+): (read|write)$", dispatch_job, re.MULTILINE)
+    )
+    assert permissions == {
+        "actions": "write",
+        "contents": "read",
+        "pull-requests": "read",
+    }
+    dispatch = step_containing(
+        workflow_steps(dispatch_job), "gh workflow run ci.yml"
+    )
+    expected_files = re.search(r"EXPECTED_FILES: >-\n\s+(\[.*\])", dispatch)
+    assert expected_files is not None
+    assert set(json.loads(expected_files.group(1))) == RELEASE_PR_FILES
+    assert "RELEASE_PR: ${{ needs.release-please.outputs.release_pr }}" in dispatch
+    assert "release-please--branches--main--components--conduit" in dispatch
+    assert "app/github-actions" in dispatch
+    assert "isCrossRepository" in dispatch
+    assert "baseRefName" in dispatch
+    assert "files" in dispatch
+    assert "headRefOid" in dispatch
+    assert '--argjson expected_files "$EXPECTED_FILES"' in dispatch
+    assert "(([.files[].path] | sort) == ($expected_files | sort))" in dispatch
+    assert "release_pr_sha=$(jq -er '.headRefOid'" in dispatch
+    assert '--ref "$release_pr_branch"' in dispatch
+    assert '-f commit_sha="$release_pr_sha"' in dispatch
 
 
 def test_release_build_tests_reuse_the_release_profile() -> None:
@@ -382,6 +487,7 @@ def main() -> None:
     tests = [
         test_release_versions_are_synchronized,
         test_release_workflow_builds_validates_and_publishes_all_assets,
+        test_generated_release_pull_requests_use_verified_dispatched_ci,
         test_release_build_tests_reuse_the_release_profile,
         test_release_packages_disable_nonproduction_features,
         test_release_flatpak_uses_current_checkout_without_debug_logging,
