@@ -34,8 +34,8 @@
   </branding>
 
   <releases>
-    <release version="0.1.1" date="2026-07-21"> <!-- x-release-please-version-date -->
-      <url type="details">https://github.com/adrighem/Conduit/releases/tag/v0.1.1</url> <!-- x-release-please-version -->
+    <release version="0.1.2" date="2026-07-22"> <!-- x-release-please-version-date -->
+      <url type="details">https://github.com/adrighem/Conduit/releases/tag/v0.1.2</url> <!-- x-release-please-version -->
       <description translate="no">
         <p>See the linked release notes for the changes in this version.</p>
       </description>
