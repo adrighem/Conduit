@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/adrighem/Conduit/compare/v0.1.0...v0.1.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* stabilize the first release ([87a537c](https://github.com/adrighem/Conduit/commit/87a537c40cabbabc0ebfcc91d691c6b0325f38de))
+
 ## 0.1.0 (2026-07-21)
 
 
