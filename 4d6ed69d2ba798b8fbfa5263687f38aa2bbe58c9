@@ -1,0 +1,7 @@
+Task: Complete Phase 4 hardening, measurement, and documentation
+
+Summary: Added session-scoped privacy-safe attention decision, ledger, and ordered-actor counters; distinguished accepted, already-observed, read-cursor, and failed persistence outcomes; emitted live queue high-water and cumulative trace snapshots; added concurrent classifier and persistence burst measurements with duplicate, reconciliation, and durable-state assertions; and documented relevant-only notifications and raw-versus-local unread behavior.
+
+Files: README.md, docs/activity-notifications-design.md, docs/attention-and-notifications.md, docs/realtime-sync-design.md, docs/release-checklist.md, docs/sidebar-design.md, src/attention.rs, src/attention_metrics.rs, src/main.rs, src/runtime.rs, src/store.rs
+
+Rationale: Stable content-free categories make attention behavior observable without exposing messages or configured terms, while typed persistence outcomes and bounded burst regressions prevent stale deliveries from being mistaken for redeliveries and keep unread reconciliation measurable.
