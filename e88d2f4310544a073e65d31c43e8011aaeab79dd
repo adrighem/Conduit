@@ -1,0 +1,4 @@
+Task: Repair failing strict CI lint from the sidebar prerequisite
+Summary: Reused WorkspacePipelineContext to reduce the conversation loader argument list without changing behavior.
+Files: src/runtime.rs
+Rationale: The pushed prerequisite failed clippy::too_many_arguments; grouping the existing store and reducer dependencies fixes the root cause.
