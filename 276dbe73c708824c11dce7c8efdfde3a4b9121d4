@@ -1,0 +1,7 @@
+Task: Complete Phase 3 preferences and live configuration
+
+Summary: Added versioned notification GSettings defaults; built an accessible Notifications preferences group with validated aliases and keywords; applied preference snapshots live across runtime sessions; revalidated in-flight candidates against current trigger policy; and added schema, binding, parsing, and live-update regressions.
+
+Files: data/eu.vanadrighem.conduit.gschema.xml, src/application.rs, src/attention.rs, src/attention_settings.rs, src/config.rs, src/main.rs, src/runtime.rs, src/window.rs, src/workspace_pipeline.rs, tests/meson.build, tests/test_notification_preferences.py
+
+Rationale: A single live preference snapshot and trigger-aware candidate revalidation keep desktop delivery aligned with user choices without reconnecting, while retaining durable notification safeguards.
