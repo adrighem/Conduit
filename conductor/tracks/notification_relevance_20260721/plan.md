@@ -25,8 +25,8 @@
 
 ## Phase 4: Hardening, measurement, and documentation
 
-- [ ] Task: Add attention counters and structured reasons for decisions without logging message content or configured keywords
-- [ ] Task: Measure a realtime burst for classification cost, queue growth, duplicate delivery, and unread reconciliation behavior
-- [ ] Task: Update user and architecture documentation for relevant-only notifications and the raw-unread/attention distinction
-- [ ] Task: Run formatting, unit, integration, Meson, GSettings, GTK, and WebKit validation suites
-- [ ] Task: Conductor - User Manual Verification 'Hardening, measurement, and documentation' (Protocol in workflow.md)
+- [x] Task: Add attention counters and structured reasons for decisions without logging message content or configured keywords 4d6ed69
+- [x] Task: Measure a realtime burst for classification cost, queue growth, duplicate delivery, and unread reconciliation behavior 4d6ed69
+- [x] Task: Update user and architecture documentation for relevant-only notifications and the raw-unread/attention distinction 4d6ed69
+- [x] Task: Run formatting, unit, integration, Meson, GSettings, GTK, and WebKit validation suites 4d6ed69
+- [~] Task: Conductor - User Manual Verification 'Hardening, measurement, and documentation' (Protocol in workflow.md)
