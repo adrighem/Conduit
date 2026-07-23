@@ -7,13 +7,13 @@
 - [x] Task: Implement the pure AttentionPolicy inputs and AttentionDecision outputs with no GTK, GSettings, Slack API, or storage dependency b3d14b1
 - [x] Task: Conductor - User Manual Verification 'Attention domain policy' (Protocol in workflow.md) acd58e1
 
-## Phase 2: Canonical pipeline integration
+## Phase 2: Canonical pipeline integration [checkpoint: d8dc411]
 
 - [x] Task: Route realtime, snapshot, and local message candidates through AttentionPolicy before coordinator effects fan out 760fe7c
 - [x] Task: Apply the unread decision consistently to StoreBatch persistence, sidebar/activity projection, and reconciliation without losing raw Slack counters 760fe7c
 - [x] Task: Apply notification effects with display-name resolution, active-target suppression, freshness, and persistent deduplication 760fe7c
 - [x] Task: Add integration regressions for join/leave suppression, relevant thread replies, reconnect redelivery, and read-marker behavior 760fe7c
-- [~] Task: Conductor - User Manual Verification 'Canonical pipeline integration' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Canonical pipeline integration' (Protocol in workflow.md) d8dc411
 
 ## Phase 3: Preferences and live configuration
 
