@@ -20,6 +20,7 @@
 
 mod activity;
 mod application;
+mod attention;
 mod auth;
 mod composer;
 mod config;
