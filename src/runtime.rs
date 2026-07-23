@@ -2165,8 +2165,10 @@ fn spawn_workspace_tasks(
                     &refresh_events,
                     &refresh_connection.slack,
                     refresh_connection.workspace_url.as_deref(),
-                    &refresh_connection.workspace_store,
-                    &refresh_connection.workspace,
+                    WorkspacePipelineContext {
+                        store: &refresh_connection.workspace_store,
+                        reducer: &refresh_connection.workspace,
+                    },
                     cached_user_names,
                     refresh_connection.team_id.as_deref(),
                     &refresh_connection.huddles,
@@ -2709,8 +2711,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 context.events,
                 &api,
                 context.workspace_url,
-                &workspace_store,
-                context.workspace,
+                WorkspacePipelineContext {
+                    store: &workspace_store,
+                    reducer: context.workspace,
+                },
                 cached_user_names,
                 context.team_id,
                 context.huddles,
@@ -4045,20 +4049,19 @@ async fn load_conversations_best_effort_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_url: Option<&str>,
-    workspace_store: &Option<WorkspaceStore>,
-    workspace: &WorkspaceReducerAdapter,
+    workspace: WorkspacePipelineContext<'_>,
     cached_user_names: HashMap<String, String>,
     team_id: Option<&str>,
     huddles: &HuddleActorHandle,
 ) -> Result<()> {
-    match load_conversations_with_api(events, api, workspace_store, workspace).await {
+    match load_conversations_with_api(events, api, workspace.store, workspace.reducer).await {
         Ok(conversations) => {
             let browser_covered = apply_browser_unread_snapshot_best_effort(
                 events,
                 api,
                 workspace_url,
-                workspace_store,
-                workspace,
+                workspace.store,
+                workspace.reducer,
                 &conversations,
             )
             .await;
@@ -4075,12 +4078,12 @@ async fn load_conversations_best_effort_with_api(
             refresh_conversation_unread_states_best_effort(
                 events,
                 api,
-                workspace_store,
-                workspace,
+                workspace.store,
+                workspace.reducer,
                 unread_refresh_candidates,
             )
             .await;
-            let refreshed_conversations = if let Some(store) = workspace_store.as_ref() {
+            let refreshed_conversations = if let Some(store) = workspace.store.as_ref() {
                 match store.load_conversations().await {
                     Ok(Some(refreshed)) => refreshed,
                     Ok(None) => conversations.clone(),
@@ -4098,10 +4101,7 @@ async fn load_conversations_best_effort_with_api(
             prefetch_channel_histories_best_effort(
                 events,
                 api,
-                WorkspacePipelineContext {
-                    store: workspace_store,
-                    reducer: workspace,
-                },
+                workspace,
                 &refreshed_conversations,
                 &current_huddle_channels,
                 team_id,
@@ -4111,7 +4111,7 @@ async fn load_conversations_best_effort_with_api(
             refresh_cached_conversation_user_names(
                 events,
                 api,
-                workspace_store,
+                workspace.store,
                 &conversations,
                 &cached_user_names,
             )
