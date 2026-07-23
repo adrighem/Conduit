@@ -1,11 +1,11 @@
 # Relevant Notifications And Noise-Free Unread State Plan
 
-## Phase 1: Attention domain policy
+## Phase 1: Attention domain policy [checkpoint: acd58e1]
 
 - [x] Task: Write the table-driven decision matrix for message kinds, unread actions, notification actions, and relevance reasons b3d14b1
 - [x] Task: Normalize lifecycle noise, direct messages, mentions, name/alias matches, keyword/phrase matches, and relevant thread replies b3d14b1
 - [x] Task: Implement the pure AttentionPolicy inputs and AttentionDecision outputs with no GTK, GSettings, Slack API, or storage dependency b3d14b1
-- [~] Task: Conductor - User Manual Verification 'Attention domain policy' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Attention domain policy' (Protocol in workflow.md) acd58e1
 
 ## Phase 2: Canonical pipeline integration
 
