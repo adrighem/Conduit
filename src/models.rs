@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::huddles::model::{SlackHuddleRoom, SlackHuddleState};
 
 const CONVERSATION_MEMBER_KEYS: [&str; 2] = ["members", "users"];
+const SEEN_ATTENTION_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
+const MAX_SEEN_ATTENTION_MESSAGES: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredToken {
@@ -65,8 +67,26 @@ pub struct SlackConversation {
     pub is_private: Option<bool>,
     pub is_archived: Option<bool>,
     pub unread_count: Option<u64>,
+    #[serde(
+        default,
+        rename = "__conduit_attention",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attention: Option<ConversationAttentionState>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+/// Conduit's message-level unread projection. Slack's aggregate unread fields
+/// remain untouched so reconciliation can compare both views.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationAttentionState {
+    pub unread_count: u64,
+    pub has_unread: bool,
+    #[serde(default)]
+    raw_unread_count: u64,
+    #[serde(default)]
+    raw_has_unread: bool,
 }
 
 impl SlackConversation {
@@ -124,6 +144,9 @@ impl SlackConversation {
             remaining_unread > 0,
             remaining_unread,
         ));
+        if remaining_unread == 0 {
+            self.clear_attention_activity();
+        }
     }
 
     pub fn display_name(&self) -> String {
@@ -151,7 +174,7 @@ impl SlackConversation {
         user_ids
     }
 
-    pub fn unread_activity_count(&self) -> u64 {
+    pub fn raw_unread_activity_count(&self) -> u64 {
         let extra_unread_count = self
             .extra
             .iter()
@@ -165,8 +188,8 @@ impl SlackConversation {
             .max(extra_unread_count)
     }
 
-    pub fn has_unread_activity(&self) -> bool {
-        self.unread_activity_count() > 0
+    pub fn raw_has_unread_activity(&self) -> bool {
+        self.raw_unread_activity_count() > 0
             || self
                 .extra
                 .iter()
@@ -174,7 +197,7 @@ impl SlackConversation {
                 .any(|(_, value)| unread_flag_value(value))
     }
 
-    pub fn unread_state(&self) -> SlackUnreadState {
+    pub fn raw_unread_state(&self) -> SlackUnreadState {
         let known = self.unread_count.is_some() || self.extra.keys().any(|key| is_unread_key(key));
         let display_count = self
             .extra
@@ -187,7 +210,90 @@ impl SlackConversation {
             })
             .unwrap_or_else(|| self.unread_count.unwrap_or_default());
 
-        SlackUnreadState::from_parts(known, self.has_unread_activity(), display_count)
+        SlackUnreadState::from_parts(known, self.raw_has_unread_activity(), display_count)
+    }
+
+    pub fn unread_activity_count(&self) -> u64 {
+        self.attention.as_ref().map_or_else(
+            || self.raw_unread_activity_count(),
+            |state| state.unread_count,
+        )
+    }
+
+    pub fn has_unread_activity(&self) -> bool {
+        self.attention.as_ref().map_or_else(
+            || self.raw_has_unread_activity(),
+            |state| state.has_unread || state.unread_count > 0,
+        )
+    }
+
+    pub fn unread_state(&self) -> SlackUnreadState {
+        self.attention.as_ref().map_or_else(
+            || self.raw_unread_state(),
+            |state| SlackUnreadState::from_parts(true, state.has_unread, state.unread_count),
+        )
+    }
+
+    pub fn observe_attention_message(&mut self, record_unread: bool) {
+        let raw = self.raw_unread_state();
+        let state = self.attention.get_or_insert(ConversationAttentionState {
+            unread_count: 0,
+            has_unread: false,
+            raw_unread_count: raw.display_count,
+            raw_has_unread: raw.has_unread,
+        });
+        if record_unread {
+            state.unread_count = state.unread_count.saturating_add(1);
+            state.has_unread = true;
+        }
+    }
+
+    pub(crate) fn has_observed_attention_message(&self, message_ts: &str) -> bool {
+        self.extra
+            .get(SEEN_ATTENTION_MESSAGE_TS_KEY)
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|known| known == message_ts)
+            })
+    }
+
+    pub(crate) fn observe_attention_message_at(
+        &mut self,
+        message_ts: &str,
+        record_unread: bool,
+    ) -> bool {
+        if message_ts.trim().is_empty() || self.has_observed_attention_message(message_ts) {
+            return false;
+        }
+        self.observe_attention_message(record_unread);
+        let mut seen = self
+            .extra
+            .get(SEEN_ATTENTION_MESSAGE_TS_KEY)
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        seen.push(message_ts.to_string());
+        if seen.len() > MAX_SEEN_ATTENTION_MESSAGES {
+            seen.drain(..seen.len() - MAX_SEEN_ATTENTION_MESSAGES);
+        }
+        self.extra.insert(
+            SEEN_ATTENTION_MESSAGE_TS_KEY.to_string(),
+            Value::Array(seen.into_iter().map(Value::String).collect()),
+        );
+        true
+    }
+
+    pub fn clear_attention_activity(&mut self) {
+        self.attention = Some(ConversationAttentionState::default());
     }
 
     pub fn clear_unread_activity(&mut self) {
@@ -198,6 +304,7 @@ impl SlackConversation {
                 *value = cleared_unread_value(value);
             }
         }
+        self.clear_attention_activity();
     }
 
     pub fn apply_unread_state(&mut self, state: SlackUnreadState) {
@@ -214,6 +321,19 @@ impl SlackConversation {
             "has_unreads".to_string(),
             serde_json::json!(state.has_unread),
         );
+        self.reconcile_attention_with_raw(state);
+    }
+
+    fn reconcile_attention_with_raw(&mut self, raw: SlackUnreadState) {
+        let Some(attention) = self.attention.as_mut() else {
+            return;
+        };
+        if !raw.has_unread {
+            attention.unread_count = 0;
+            attention.has_unread = false;
+        }
+        attention.raw_unread_count = raw.display_count;
+        attention.raw_has_unread = raw.has_unread;
     }
 
     pub fn apply_unread_snapshot(&mut self, snapshot: &SlackConversationUnreadSnapshot) {
@@ -1507,6 +1627,82 @@ mod tests {
         assert!(state.known);
         assert!(state.has_unread);
         assert_eq!(state.display_count, 0);
+    }
+
+    #[test]
+    fn attention_unread_overlay_keeps_raw_slack_state_distinct() {
+        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "unread_count": 2,
+            "unread_count_display": 2,
+            "has_unreads": true
+        }))
+        .unwrap();
+
+        conversation.observe_attention_message(false);
+        conversation.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
+            channel_id: "C1".to_string(),
+            unread_state: SlackUnreadState::from_parts(true, true, 3),
+            ..Default::default()
+        });
+
+        assert_eq!(conversation.raw_unread_state().display_count, 3);
+        assert_eq!(conversation.unread_activity_count(), 0);
+        assert!(!conversation.has_unread_activity());
+    }
+
+    #[test]
+    fn raw_increases_never_create_local_attention_unread() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            unread_count: Some(1),
+            ..Default::default()
+        };
+
+        conversation.observe_attention_message(true);
+        assert_eq!(conversation.unread_activity_count(), 1);
+        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 2));
+        assert_eq!(conversation.raw_unread_activity_count(), 2);
+        assert_eq!(conversation.unread_activity_count(), 1);
+
+        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 4));
+        assert_eq!(conversation.unread_activity_count(), 1);
+        conversation.apply_unread_state(SlackUnreadState::from_parts(true, false, 0));
+        assert_eq!(conversation.unread_activity_count(), 0);
+    }
+
+    #[test]
+    fn badgeless_raw_snapshot_does_not_clear_classified_attention() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            unread_count: Some(3),
+            ..Default::default()
+        };
+        conversation.observe_attention_message(true);
+
+        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 0));
+
+        assert!(conversation.raw_has_unread_activity());
+        assert_eq!(conversation.raw_unread_state().display_count, 0);
+        assert!(conversation.has_unread_activity());
+        assert_eq!(conversation.unread_activity_count(), 1);
+    }
+
+    #[test]
+    fn attention_overlay_round_trips_and_local_read_clears_it() {
+        let mut conversation = SlackConversation {
+            id: "D1".to_string(),
+            ..Default::default()
+        };
+        conversation.observe_attention_message(true);
+        let serialized = serde_json::to_string(&conversation).unwrap();
+        let mut restored: SlackConversation = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(restored.raw_unread_activity_count(), 0);
+        assert_eq!(restored.unread_activity_count(), 1);
+        restored.advance_read_cursor("20.0", 0);
+        assert_eq!(restored.unread_activity_count(), 0);
+        assert!(!restored.has_unread_activity());
     }
 
     #[test]

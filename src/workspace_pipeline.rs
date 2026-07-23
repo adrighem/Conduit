@@ -12,15 +12,19 @@
 // These contracts are migrated surface-by-surface; the coordinator task wires their consumers.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::attention::{
+    AttentionCandidate, AttentionDecision, AttentionPolicy, AttentionPreferences, ConversationKind,
+    DeliveryState, MessageMutation, ThreadRelationship,
+};
 #[cfg(test)]
 use crate::models::SlackUnreadState;
 use crate::models::{
     slack_timestamp_is_after, SlackConversation, SlackConversationUnreadSnapshot, SlackMessage,
     SlackUser,
 };
-use crate::thread_catalog::ThreadRecord;
+use crate::thread_catalog::{ThreadRecord, ThreadUnreadState};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct WorkspaceRevision(u64);
@@ -105,6 +109,7 @@ pub(crate) enum MessageMutationKind {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum WorkspaceMutation {
+    AttentionContextChanged(WorkspaceAttentionContext),
     Hydrate(WorkspaceBootstrapData),
     MembershipSnapshot(SnapshotEnvelope<Vec<SlackConversation>>),
     ConversationUpsert(SlackConversation),
@@ -145,6 +150,13 @@ pub(crate) enum WorkspaceMutation {
         message: SlackMessage,
         kind: MessageMutationKind,
         origin: MutationOrigin,
+    },
+    MessageChangedWithDelivery {
+        channel_id: String,
+        message: SlackMessage,
+        kind: MessageMutationKind,
+        origin: MutationOrigin,
+        delivery: DeliveryState,
     },
     ThreadCatalogChanged(Vec<ThreadRecord>),
 }
@@ -256,10 +268,32 @@ impl StoreBatch {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkspaceAttentionContext {
+    pub(crate) current_user_id: Option<String>,
+    pub(crate) active_channel_id: Option<String>,
+    pub(crate) window_active: bool,
+    pub(crate) preferences: AttentionPreferences,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MessageAttentionEffect {
+    pub(crate) channel_id: String,
+    pub(crate) message: SlackMessage,
+    pub(crate) decision: AttentionDecision,
+    pub(crate) delivery: DeliveryState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WorkspaceEffect {
+    MessageAttention(MessageAttentionEffect),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceReduction {
     patch: WorkspacePatch,
     store_batch: Option<StoreBatch>,
+    effects: Vec<WorkspaceEffect>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,7 +339,7 @@ impl TimelineState {
 /// Runtime and GTK adapters are deliberately absent here. A mutation either changes the model
 /// once and produces one revision-stamped reduction, or is a no-op that leaves the revision
 /// untouched.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct WorkspaceCoordinator {
     revision: WorkspaceRevision,
     conversations: HashMap<String, RevisionedConversation>,
@@ -313,6 +347,8 @@ pub(crate) struct WorkspaceCoordinator {
     histories: HashMap<String, TimelineState>,
     threads: HashMap<(String, String), TimelineState>,
     thread_catalog: Vec<ThreadRecord>,
+    attention_context: WorkspaceAttentionContext,
+    attention_policy: AttentionPolicy,
 }
 
 impl WorkspaceCoordinator {
@@ -332,7 +368,20 @@ impl WorkspaceCoordinator {
     }
 
     pub(crate) fn apply(&mut self, mutation: WorkspaceMutation) -> Option<WorkspaceReduction> {
+        self.apply_from(MutationOrigin::Cache, mutation)
+    }
+
+    pub(crate) fn apply_from(
+        &mut self,
+        origin: MutationOrigin,
+        mutation: WorkspaceMutation,
+    ) -> Option<WorkspaceReduction> {
         match mutation {
+            WorkspaceMutation::AttentionContextChanged(context) => {
+                self.attention_policy = AttentionPolicy::new(context.preferences.clone());
+                self.attention_context = context;
+                None
+            }
             WorkspaceMutation::Hydrate(data) => self.apply_hydration(data),
             WorkspaceMutation::MembershipSnapshot(snapshot) => {
                 self.apply_membership_snapshot(snapshot)
@@ -357,10 +406,13 @@ impl WorkspaceCoordinator {
             WorkspaceMutation::HistorySnapshot {
                 channel_id,
                 snapshot,
-            } => self.apply_timeline_snapshot(TimelineTarget::Channel(channel_id), snapshot),
+            } => {
+                self.apply_timeline_snapshot(TimelineTarget::Channel(channel_id), snapshot, origin)
+            }
             WorkspaceMutation::HistoryPage { channel_id, page } => self.apply_timeline_snapshot(
                 TimelineTarget::Channel(channel_id),
                 SnapshotEnvelope::new(self.revision, page),
+                origin,
             ),
             WorkspaceMutation::ThreadSnapshot {
                 channel_id,
@@ -372,6 +424,7 @@ impl WorkspaceCoordinator {
                     thread_ts,
                 },
                 snapshot,
+                origin,
             ),
             WorkspaceMutation::ThreadPage {
                 channel_id,
@@ -383,13 +436,21 @@ impl WorkspaceCoordinator {
                     thread_ts,
                 },
                 SnapshotEnvelope::new(self.revision, page),
+                origin,
             ),
             WorkspaceMutation::MessageChanged {
                 channel_id,
                 message,
                 kind,
-                origin: _,
-            } => self.apply_message(&channel_id, message, kind),
+                origin,
+            } => self.apply_message(&channel_id, message, kind, origin, None),
+            WorkspaceMutation::MessageChangedWithDelivery {
+                channel_id,
+                message,
+                kind,
+                origin,
+                delivery,
+            } => self.apply_message(&channel_id, message, kind, origin, Some(delivery)),
             WorkspaceMutation::ThreadCatalogChanged(records) => self.apply_thread_catalog(records),
         }
     }
@@ -404,7 +465,18 @@ impl WorkspaceCoordinator {
         patch_changes: Vec<WorkspaceChange>,
         store_changes: Vec<StoreChange>,
     ) -> Option<WorkspaceReduction> {
-        let reduction = WorkspaceReduction::new(revision, patch_changes, store_changes)?;
+        self.commit_with_effects(revision, patch_changes, store_changes, Vec::new())
+    }
+
+    fn commit_with_effects(
+        &mut self,
+        revision: WorkspaceRevision,
+        patch_changes: Vec<WorkspaceChange>,
+        store_changes: Vec<StoreChange>,
+        effects: Vec<WorkspaceEffect>,
+    ) -> Option<WorkspaceReduction> {
+        let reduction =
+            WorkspaceReduction::new_with_effects(revision, patch_changes, store_changes, effects)?;
         self.revision = revision;
         Some(reduction)
     }
@@ -770,6 +842,7 @@ impl WorkspaceCoordinator {
         &mut self,
         target: TimelineTarget,
         snapshot: SnapshotEnvelope<MessagePage>,
+        origin: MutationOrigin,
     ) -> Option<WorkspaceReduction> {
         let base_revision = snapshot.base_revision();
         let page = snapshot.into_data();
@@ -785,6 +858,7 @@ impl WorkspaceCoordinator {
             .map(|message| (message.ts.clone(), message))
             .collect::<HashMap<_, _>>();
         let mut changes = Vec::new();
+        let mut accepted_messages = Vec::new();
         for (message_ts, message) in &incoming {
             if timeline
                 .tombstones
@@ -811,6 +885,7 @@ impl WorkspaceCoordinator {
                 );
                 timeline.tombstones.remove(message_ts);
                 changes.push(MessageChange::Upsert(Box::new(message.clone())));
+                accepted_messages.push(message.clone());
             }
         }
         if page.complete {
@@ -833,10 +908,83 @@ impl WorkspaceCoordinator {
         }
         let messages = timeline.messages();
         let store_change = store_timeline_replacement(&target, messages);
-        self.commit(
-            revision,
-            vec![WorkspaceChange::TimelineChanged { target, changes }],
-            vec![store_change],
+        let reconciled_message_ts =
+            self.reconciled_unread_message_ts(&target, &accepted_messages, origin);
+        let attention_effects = accepted_messages
+            .into_iter()
+            .filter_map(|message| {
+                let channel_id = match &target {
+                    TimelineTarget::Channel(channel_id) => channel_id.as_str(),
+                    TimelineTarget::Thread { channel_id, .. } => channel_id.as_str(),
+                };
+                let delivery = if reconciled_message_ts.contains(&message.ts) {
+                    DeliveryState::Reconciled
+                } else {
+                    DeliveryState::Historical
+                };
+                self.message_attention_effect(
+                    channel_id,
+                    &message,
+                    MessageMutationKind::Posted,
+                    origin,
+                    delivery,
+                )
+            })
+            .collect::<Vec<_>>();
+        let attention_channel_id = match &target {
+            TimelineTarget::Channel(channel_id) => channel_id.clone(),
+            TimelineTarget::Thread { channel_id, .. } => channel_id.clone(),
+        };
+        let mut attention_changed = false;
+        if let Some(entry) = self.conversations.get_mut(&attention_channel_id) {
+            let before = entry.value.clone();
+            for effect in attention_effects.iter().filter(|effect| {
+                !effect
+                    .decision
+                    .reasons
+                    .contains(&crate::attention::AttentionReason::SelfAuthored)
+            }) {
+                entry.value.observe_attention_message_at(
+                    &effect.message.ts,
+                    effect.decision.record_unread,
+                );
+            }
+            if entry.value != before {
+                entry.unread_revision = revision;
+                attention_changed = true;
+            }
+        }
+        let mut patch_changes = vec![WorkspaceChange::TimelineChanged { target, changes }];
+        let mut store_changes = vec![store_change];
+        if attention_changed {
+            if let Some(conversation) = self.conversation(&attention_channel_id).cloned() {
+                patch_changes.push(WorkspaceChange::ConversationUpsert(conversation.clone()));
+                store_changes.push(StoreChange::ConversationUpsert(conversation));
+            }
+        }
+        let effects = attention_effects
+            .into_iter()
+            .map(WorkspaceEffect::MessageAttention)
+            .collect();
+        self.commit_with_effects(revision, patch_changes, store_changes, effects)
+    }
+
+    pub(crate) fn preview_message_attention(
+        &self,
+        channel_id: &str,
+        message: &SlackMessage,
+        kind: MessageMutationKind,
+        origin: MutationOrigin,
+    ) -> Option<MessageAttentionEffect> {
+        if channel_id.trim().is_empty() || message.ts.trim().is_empty() {
+            return None;
+        }
+        self.message_attention_effect(
+            channel_id,
+            message,
+            kind,
+            origin,
+            self.message_delivery_state(channel_id, message, origin),
         )
     }
 
@@ -845,8 +993,18 @@ impl WorkspaceCoordinator {
         channel_id: &str,
         message: SlackMessage,
         kind: MessageMutationKind,
+        origin: MutationOrigin,
+        delivery_override: Option<DeliveryState>,
     ) -> Option<WorkspaceReduction> {
         if channel_id.trim().is_empty() || message.ts.trim().is_empty() {
+            return None;
+        }
+        if kind == MessageMutationKind::Posted
+            && origin == MutationOrigin::Realtime
+            && self.conversation(channel_id).is_some_and(|conversation| {
+                conversation.has_observed_attention_message(&message.ts)
+            })
+        {
             return None;
         }
         let mut targets = Vec::new();
@@ -867,6 +1025,10 @@ impl WorkspaceCoordinator {
         {
             return None;
         }
+        let delivery = delivery_override
+            .unwrap_or_else(|| self.message_delivery_state(channel_id, &message, origin));
+        let attention_effect =
+            self.message_attention_effect(channel_id, &message, kind, origin, delivery);
 
         let reply_root = message.thread_root_ts().map(str::to_string);
         let reply_was_known = reply_root.as_deref().is_some_and(|thread_ts| {
@@ -944,14 +1106,245 @@ impl WorkspaceCoordinator {
             }
         }
 
-        let store_changes = changed_targets
+        let mut store_changes = changed_targets
             .iter()
             .filter_map(|target| {
                 self.timeline(target)
                     .map(|timeline| store_timeline_replacement(target, timeline.messages()))
             })
+            .collect::<Vec<_>>();
+        if kind == MessageMutationKind::Posted {
+            if let Some(effect) = attention_effect.as_ref() {
+                let self_authored = effect
+                    .decision
+                    .reasons
+                    .contains(&crate::attention::AttentionReason::SelfAuthored);
+                if !self_authored {
+                    if let Some(entry) = self.conversations.get_mut(channel_id) {
+                        let before = entry.value.clone();
+                        entry.value.observe_attention_message_at(
+                            &effect.message.ts,
+                            effect.decision.record_unread,
+                        );
+                        if entry.value != before {
+                            entry.unread_revision = revision;
+                            patch_changes
+                                .push(WorkspaceChange::ConversationUpsert(entry.value.clone()));
+                            store_changes
+                                .push(StoreChange::ConversationUpsert(entry.value.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        let effects = attention_effect
+            .map(WorkspaceEffect::MessageAttention)
+            .into_iter()
             .collect();
-        self.commit(revision, patch_changes, store_changes)
+        self.commit_with_effects(revision, patch_changes, store_changes, effects)
+    }
+
+    fn message_delivery_state(
+        &self,
+        channel_id: &str,
+        message: &SlackMessage,
+        origin: MutationOrigin,
+    ) -> DeliveryState {
+        if origin == MutationOrigin::Realtime
+            && self
+                .conversation(channel_id)
+                .and_then(SlackConversation::last_read_ts)
+                .is_some_and(|last_read| !slack_timestamp_is_after(&message.ts, last_read))
+        {
+            DeliveryState::Stale
+        } else {
+            DeliveryState::Fresh
+        }
+    }
+
+    fn message_attention_effect(
+        &self,
+        channel_id: &str,
+        message: &SlackMessage,
+        kind: MessageMutationKind,
+        origin: MutationOrigin,
+        delivery: DeliveryState,
+    ) -> Option<MessageAttentionEffect> {
+        if channel_id.trim().is_empty() || message.ts.trim().is_empty() {
+            return None;
+        }
+        let conversation = self.conversation(channel_id);
+        let conversation_kind = conversation.map_or_else(
+            || {
+                if channel_id.starts_with('D') {
+                    ConversationKind::DirectMessage
+                } else {
+                    ConversationKind::Unknown
+                }
+            },
+            |conversation| {
+                if conversation.is_im.unwrap_or(false) {
+                    ConversationKind::DirectMessage
+                } else if conversation.is_mpim.unwrap_or(false) {
+                    ConversationKind::GroupDirectMessage
+                } else {
+                    ConversationKind::Channel
+                }
+            },
+        );
+        let current_user_id = self.attention_context.current_user_id.as_deref();
+        let author_is_self = origin == MutationOrigin::Local
+            || message
+                .user
+                .as_deref()
+                .zip(current_user_id)
+                .is_some_and(|(author, current)| author == current);
+        let has_content = message
+            .text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+            || message
+                .files
+                .as_ref()
+                .is_some_and(|files| !files.is_empty())
+            || message
+                .blocks
+                .as_ref()
+                .is_some_and(|blocks| !blocks.is_null());
+        // Window focus/navigation is delivered on a separate async lane from
+        // realtime events. Keep it as a last-mile blocker so an older context
+        // cannot permanently suppress an otherwise relevant notification.
+        let actively_reading = false;
+        let candidate = AttentionCandidate {
+            text: message.text.as_deref().unwrap_or_default(),
+            subtype: message.subtype.as_deref(),
+            mutation: match kind {
+                MessageMutationKind::Posted => MessageMutation::Posted,
+                MessageMutationKind::Changed => MessageMutation::Changed,
+                MessageMutationKind::Deleted => MessageMutation::Deleted,
+            },
+            author_is_self,
+            current_user_id,
+            conversation: conversation_kind,
+            thread_relationship: self.thread_relationship(channel_id, message),
+            has_content,
+            no_notifications: message.no_notifications.unwrap_or(false),
+            muted: conversation.is_some_and(SlackConversation::is_muted_conversation),
+            actively_reading,
+            delivery,
+        };
+        Some(MessageAttentionEffect {
+            channel_id: channel_id.to_string(),
+            message: message.clone(),
+            decision: self.attention_policy.decide(candidate),
+            delivery,
+        })
+    }
+
+    fn reconciled_unread_message_ts(
+        &self,
+        target: &TimelineTarget,
+        messages: &[SlackMessage],
+        origin: MutationOrigin,
+    ) -> HashSet<String> {
+        if !matches!(origin, MutationOrigin::Cache | MutationOrigin::WebApi) {
+            return HashSet::new();
+        }
+        let channel_id = match target {
+            TimelineTarget::Channel(channel_id) => channel_id,
+            TimelineTarget::Thread { channel_id, .. } => channel_id,
+        };
+        let Some(conversation) = self.conversation(channel_id) else {
+            return HashSet::new();
+        };
+        if origin == MutationOrigin::Cache && conversation.attention.is_some() {
+            return HashSet::new();
+        }
+        if let TimelineTarget::Thread { thread_ts, .. } = target {
+            let Some(record) = self.thread_catalog.iter().find(|record| {
+                record.key.channel_id == *channel_id && record.key.root_ts == *thread_ts
+            }) else {
+                return HashSet::new();
+            };
+            let ThreadUnreadState::Known { count, last_read } = &record.unread else {
+                return HashSet::new();
+            };
+            if let Some(last_read) = last_read {
+                return messages
+                    .iter()
+                    .filter(|message| {
+                        message.ts != *thread_ts && slack_timestamp_is_after(&message.ts, last_read)
+                    })
+                    .map(|message| message.ts.clone())
+                    .collect();
+            }
+            return newest_message_ts(messages, *count as usize, Some(thread_ts));
+        }
+        if let Some(last_read) = conversation.last_read_ts() {
+            return messages
+                .iter()
+                .filter(|message| slack_timestamp_is_after(&message.ts, last_read))
+                .map(|message| message.ts.clone())
+                .collect();
+        }
+        if !matches!(target, TimelineTarget::Channel(_)) {
+            return HashSet::new();
+        }
+        let raw = conversation.raw_unread_state();
+        if !raw.known || !raw.has_unread {
+            return HashSet::new();
+        }
+        newest_message_ts(messages, raw.display_count.max(1) as usize, None)
+    }
+
+    fn thread_relationship(&self, channel_id: &str, message: &SlackMessage) -> ThreadRelationship {
+        let Some(root_ts) = message.thread_root_ts() else {
+            return ThreadRelationship::NotAReply;
+        };
+        let Some(current_user_id) = self.attention_context.current_user_id.as_deref() else {
+            return ThreadRelationship::UnrelatedReply;
+        };
+        let root = self
+            .histories
+            .get(channel_id)
+            .and_then(|timeline| timeline.messages.get(root_ts))
+            .map(|entry| &entry.value);
+        let record = self
+            .thread_catalog
+            .iter()
+            .find(|record| record.key.channel_id == channel_id && record.key.root_ts == root_ts);
+        let persisted_root = record.and_then(|record| record.root.as_ref());
+        if [root, persisted_root]
+            .into_iter()
+            .flatten()
+            .any(|root| root.user.as_deref() == Some(current_user_id))
+        {
+            return ThreadRelationship::Started;
+        }
+        let participated = [root, persisted_root]
+            .into_iter()
+            .flatten()
+            .filter_map(|root| root.reply_users.as_ref())
+            .flatten()
+            .any(|user| user == current_user_id)
+            || self
+                .threads
+                .get(&(channel_id.to_string(), root_ts.to_string()))
+                .is_some_and(|timeline| {
+                    timeline.messages.values().any(|entry| {
+                        entry.value.user.as_deref() == Some(current_user_id)
+                            && entry.value.ts != root_ts
+                    })
+                })
+            || record.is_some_and(|record| record.participant_user_ids.contains(current_user_id));
+        if participated {
+            return ThreadRelationship::Participated;
+        }
+        if record.is_some_and(|record| record.subscribed == Some(true)) {
+            ThreadRelationship::Subscribed
+        } else {
+            ThreadRelationship::UnrelatedReply
+        }
     }
 
     fn update_channel_root_for_reply(
@@ -1085,6 +1478,31 @@ impl WorkspaceCoordinator {
     }
 }
 
+fn newest_message_ts(
+    messages: &[SlackMessage],
+    count: usize,
+    excluded_ts: Option<&str>,
+) -> HashSet<String> {
+    let mut newest = messages
+        .iter()
+        .filter(|message| excluded_ts != Some(message.ts.as_str()))
+        .collect::<Vec<_>>();
+    newest.sort_by(|left, right| {
+        if slack_timestamp_is_after(&left.ts, &right.ts) {
+            std::cmp::Ordering::Less
+        } else if slack_timestamp_is_after(&right.ts, &left.ts) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    newest
+        .into_iter()
+        .take(count)
+        .map(|message| message.ts.clone())
+        .collect()
+}
+
 fn timeline_from_messages(messages: &[SlackMessage], revision: WorkspaceRevision) -> TimelineState {
     TimelineState {
         messages: messages
@@ -1157,9 +1575,22 @@ impl WorkspaceReduction {
         patch_changes: Vec<WorkspaceChange>,
         store_changes: Vec<StoreChange>,
     ) -> Option<Self> {
+        Self::new_with_effects(revision, patch_changes, store_changes, Vec::new())
+    }
+
+    pub(crate) fn new_with_effects(
+        revision: WorkspaceRevision,
+        patch_changes: Vec<WorkspaceChange>,
+        store_changes: Vec<StoreChange>,
+        effects: Vec<WorkspaceEffect>,
+    ) -> Option<Self> {
         let patch = WorkspacePatch::new(revision, patch_changes)?;
         let store_batch = StoreBatch::new(revision, store_changes);
-        Some(Self { patch, store_batch })
+        Some(Self {
+            patch,
+            store_batch,
+            effects,
+        })
     }
 
     pub(crate) fn patch(&self) -> &WorkspacePatch {
@@ -1168,6 +1599,25 @@ impl WorkspaceReduction {
 
     pub(crate) fn store_batch(&self) -> Option<&StoreBatch> {
         self.store_batch.as_ref()
+    }
+
+    pub(crate) fn effects(&self) -> &[WorkspaceEffect] {
+        &self.effects
+    }
+}
+
+impl Default for WorkspaceCoordinator {
+    fn default() -> Self {
+        Self {
+            revision: WorkspaceRevision::INITIAL,
+            conversations: HashMap::new(),
+            users: HashMap::new(),
+            histories: HashMap::new(),
+            threads: HashMap::new(),
+            thread_catalog: Vec::new(),
+            attention_context: WorkspaceAttentionContext::default(),
+            attention_policy: AttentionPolicy::default(),
+        }
     }
 }
 
@@ -1190,6 +1640,22 @@ mod tests {
             text: Some(text.to_string()),
             ..Default::default()
         }
+    }
+
+    fn configure_attention(coordinator: &mut WorkspaceCoordinator) {
+        coordinator.apply(WorkspaceMutation::AttentionContextChanged(
+            WorkspaceAttentionContext {
+                current_user_id: Some("U_SELF".to_string()),
+                ..Default::default()
+            },
+        ));
+    }
+
+    fn attention_effect(reduction: &WorkspaceReduction) -> &MessageAttentionEffect {
+        let Some(WorkspaceEffect::MessageAttention(effect)) = reduction.effects().last() else {
+            panic!("expected a message attention effect");
+        };
+        effect
     }
 
     #[test]
@@ -1336,6 +1802,13 @@ mod tests {
                 .conversation("C1")
                 .unwrap()
                 .unread_activity_count(),
+            0
+        );
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .raw_unread_activity_count(),
             2
         );
         assert_eq!(
@@ -1495,6 +1968,402 @@ mod tests {
             })
             .is_none());
         assert_eq!(coordinator.revision(), revision);
+    }
+
+    #[test]
+    fn coordinator_classifies_realtime_before_unread_and_notification_effects_fan_out() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        let mut direct = conversation("D1", "direct");
+        direct.is_channel = Some(false);
+        direct.is_im = Some(true);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(direct));
+        let mut incoming = message("10.0", "hello");
+        incoming.user = Some("U_OTHER".to_string());
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "D1".to_string(),
+                message: incoming,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        let effect = attention_effect(&reduction);
+        assert!(effect.decision.record_unread);
+        assert!(effect.decision.send_notification);
+        assert_eq!(
+            coordinator
+                .conversation("D1")
+                .unwrap()
+                .raw_unread_activity_count(),
+            0
+        );
+        assert_eq!(
+            coordinator
+                .conversation("D1")
+                .unwrap()
+                .unread_activity_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn coordinator_records_ordinary_channels_but_filters_membership_noise() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(conversation(
+            "C1", "general",
+        )));
+
+        let mut ordinary = message("10.0", "hello channel");
+        ordinary.user = Some("U_OTHER".to_string());
+        let ordinary = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: ordinary,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(attention_effect(&ordinary).decision.record_unread);
+        assert!(!attention_effect(&ordinary).decision.send_notification);
+
+        let mut lifecycle = message("11.0", "joined");
+        lifecycle.user = Some("U_OTHER".to_string());
+        lifecycle.subtype = Some("channel_join".to_string());
+        let lifecycle = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: lifecycle,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(!attention_effect(&lifecycle).decision.record_unread);
+        assert!(!attention_effect(&lifecycle).decision.send_notification);
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            1
+        );
+
+        coordinator.apply(WorkspaceMutation::UnreadChanged {
+            snapshot: SlackConversationUnreadSnapshot {
+                channel_id: "C1".to_string(),
+                unread_state: SlackUnreadState::from_parts(true, true, 2),
+                ..Default::default()
+            },
+            base_revision: coordinator.revision(),
+        });
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .raw_unread_activity_count(),
+            2
+        );
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn hydrated_message_identity_suppresses_restart_redelivery() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        let mut direct = SlackConversation {
+            id: "D1".to_string(),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        direct.observe_attention_message_at("10.0", true);
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![direct],
+            ..Default::default()
+        }));
+        let mut redelivery = message("10.0", "already delivered");
+        redelivery.user = Some("U_OTHER".to_string());
+
+        assert!(coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "D1".to_string(),
+                message: redelivery,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn attention_preview_is_pure_and_delivery_override_suppresses_rejected_attention() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(conversation(
+            "C1", "general",
+        )));
+        let mut incoming = message("10.0", "new");
+        incoming.user = Some("U_OTHER".to_string());
+        let revision = coordinator.revision();
+
+        let preview = coordinator
+            .preview_message_attention(
+                "C1",
+                &incoming,
+                MessageMutationKind::Posted,
+                MutationOrigin::Realtime,
+            )
+            .unwrap();
+        assert!(preview.decision.record_unread);
+        assert_eq!(coordinator.revision(), revision);
+        assert!(coordinator.history("C1").is_empty());
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            0
+        );
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChangedWithDelivery {
+                channel_id: "C1".to_string(),
+                message: incoming,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+                delivery: DeliveryState::Duplicate,
+            })
+            .unwrap();
+        let effect = attention_effect(&reduction);
+        assert_eq!(effect.delivery, DeliveryState::Duplicate);
+        assert!(!effect.decision.record_unread);
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            0
+        );
+        let conversation = coordinator.conversation("C1").unwrap();
+        assert!(conversation.has_observed_attention_message("10.0"));
+        assert_eq!(coordinator.history("C1").len(), 1);
+    }
+
+    #[test]
+    fn new_direct_message_ids_are_relevant_before_metadata_refresh() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        let mut incoming = message("10.0", "hello");
+        incoming.user = Some("U_OTHER".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "D_NEW".to_string(),
+                message: incoming,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        assert!(attention_effect(&reduction)
+            .decision
+            .reasons
+            .contains(&crate::attention::AttentionReason::DirectMessage));
+        assert!(attention_effect(&reduction).decision.send_notification);
+    }
+
+    #[test]
+    fn history_reconciliation_records_only_eligible_messages_after_last_read() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        let mut channel = conversation("C1", "general");
+        channel
+            .extra
+            .insert("last_read".to_string(), serde_json::json!("10.0"));
+        channel.unread_count = Some(3);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(channel));
+
+        let mut read = message("9.0", "old");
+        read.user = Some("U_OTHER".to_string());
+        let mut ordinary = message("11.0", "new");
+        ordinary.user = Some("U_OTHER".to_string());
+        let mut lifecycle = message("12.0", "joined");
+        lifecycle.user = Some("U_OTHER".to_string());
+        lifecycle.subtype = Some("channel_join".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    coordinator.revision(),
+                    MessagePage {
+                        messages: vec![read, ordinary, lifecycle],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .unwrap();
+
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            1
+        );
+        let conversation = coordinator.conversation("C1").unwrap();
+        assert!(conversation.has_observed_attention_message("9.0"));
+        assert!(conversation.has_observed_attention_message("11.0"));
+        assert!(conversation.has_observed_attention_message("12.0"));
+        assert_eq!(
+            reduction
+                .effects()
+                .iter()
+                .filter(|effect| {
+                    matches!(
+                        effect,
+                        WorkspaceEffect::MessageAttention(effect)
+                            if effect.delivery == DeliveryState::Reconciled
+                    )
+                })
+                .count(),
+            2
+        );
+        assert!(reduction.effects().iter().all(|effect| {
+            let WorkspaceEffect::MessageAttention(effect) = effect;
+            !effect.decision.send_notification
+        }));
+        coordinator.apply(WorkspaceMutation::UnreadChanged {
+            snapshot: SlackConversationUnreadSnapshot {
+                channel_id: "C1".to_string(),
+                unread_state: SlackUnreadState::from_parts(true, true, 3),
+                ..Default::default()
+            },
+            base_revision: coordinator.revision(),
+        });
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn thread_participation_and_subscription_drive_relevance_reasons() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(conversation(
+            "C1", "general",
+        )));
+        let mut root = message("10.0", "root");
+        root.user = Some("U_OTHER".to_string());
+        root.reply_users = Some(vec!["U_SELF".to_string()]);
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                coordinator.revision(),
+                MessagePage {
+                    messages: vec![root],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let mut reply = message("11.0", "reply");
+        reply.user = Some("U_OTHER".to_string());
+        reply.thread_ts = Some("10.0".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: reply,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        assert!(attention_effect(&reduction)
+            .decision
+            .reasons
+            .contains(&crate::attention::AttentionReason::ParticipatedThreadReply));
+        assert!(attention_effect(&reduction).decision.send_notification);
+    }
+
+    #[test]
+    fn hydrated_thread_root_preserves_started_thread_relevance() {
+        let mut root = message("10.0", "root");
+        root.user = Some("U_SELF".to_string());
+        root.reply_count = Some(1);
+        let mut catalog = crate::thread_catalog::ThreadCatalog::default();
+        catalog.observe_history("C1", std::slice::from_ref(&root));
+
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![conversation("C1", "general")],
+            threads: catalog.into_records(),
+            ..Default::default()
+        }));
+        let mut reply = message("11.0", "reply");
+        reply.user = Some("U_OTHER".to_string());
+        reply.thread_ts = Some("10.0".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: reply,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        assert!(attention_effect(&reduction)
+            .decision
+            .reasons
+            .contains(&crate::attention::AttentionReason::StartedThreadReply));
+        assert!(attention_effect(&reduction).decision.send_notification);
+    }
+
+    #[test]
+    fn local_reply_immediately_preserves_participated_thread_relevance() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(conversation(
+            "C1", "general",
+        )));
+        let mut own_reply = message("11.0", "my reply");
+        own_reply.user = Some("U_SELF".to_string());
+        own_reply.thread_ts = Some("10.0".to_string());
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: own_reply,
+            kind: MessageMutationKind::Posted,
+            origin: MutationOrigin::Local,
+        });
+
+        let mut reply = message("12.0", "later reply");
+        reply.user = Some("U_OTHER".to_string());
+        reply.thread_ts = Some("10.0".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: reply,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        assert!(attention_effect(&reduction)
+            .decision
+            .reasons
+            .contains(&crate::attention::AttentionReason::ParticipatedThreadReply));
+        assert!(attention_effect(&reduction).decision.send_notification);
     }
 
     #[test]

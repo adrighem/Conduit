@@ -16,9 +16,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::conversation_catalog::ConversationCatalog;
+#[cfg(test)]
+use crate::models::SlackUnreadState;
 use crate::models::{
     slack_timestamp_is_after, SlackConversation, SlackConversationUnreadSnapshot, SlackMessage,
-    SlackUnreadState, SlackUserStatus,
+    SlackUserStatus,
 };
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 
@@ -26,9 +28,10 @@ pub(crate) const CACHE_VERSION: u32 = 1;
 const DATABASE_SCHEMA_VERSION: u32 = 2;
 const DATABASE_FILENAME: &str = "state.sqlite3";
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
-const SEEN_REALTIME_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
 const LOCAL_READ_TS_KEY: &str = "conduit_local_read_ts";
-const MAX_SEEN_REALTIME_MESSAGES: usize = 256;
+const ATTENTION_DELIVERY_KIND: &str = "attention_delivery";
+const ATTENTION_DELIVERY_LEDGER_KEY: &str = "__ledger__";
+const MAX_ATTENTION_DELIVERIES: usize = 512;
 const STORE_WRITER_QUEUE_CAPACITY: usize = 64;
 const STORE_READER_QUEUE_CAPACITY: usize = 32;
 const STORE_READER_COUNT: usize = 2;
@@ -606,6 +609,12 @@ pub(crate) struct WorkspaceBootstrap {
     pub(crate) custom_emojis: HashMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AttentionDeliveryOutcome {
+    pub(crate) observation_accepted: bool,
+    pub(crate) notification_claimed: bool,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SyncFreshness {
@@ -1081,10 +1090,22 @@ impl WorkspaceStore {
             .await
     }
 
+    #[cfg(test)]
     pub async fn mark_conversation_unread_from_event(
         &self,
         channel_id: &str,
         message_ts: &str,
+    ) -> Result<bool> {
+        self.observe_conversation_attention_from_event(channel_id, message_ts, true)
+            .await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn observe_conversation_attention_from_event(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+        record_unread: bool,
     ) -> Result<bool> {
         if channel_id.trim().is_empty() || message_ts.trim().is_empty() {
             return Ok(false);
@@ -1102,38 +1123,204 @@ impl WorkspaceStore {
                 .extra
                 .get(LOCAL_READ_TS_KEY)
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|last_read| message_ts.as_str() <= last_read)
+                .is_some_and(|last_read| !slack_timestamp_is_after(message_ts.as_str(), last_read))
             {
                 return ConversationRowMutation::Unchanged(false);
             }
-            let mut seen = conversation
-                .extra
-                .get(SEEN_REALTIME_MESSAGE_TS_KEY)
-                .and_then(serde_json::Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if seen.iter().any(|seen_ts| seen_ts == &message_ts) {
+            if !conversation.observe_attention_message_at(&message_ts, record_unread) {
                 return ConversationRowMutation::Unchanged(false);
             }
-            let count = conversation.unread_activity_count().saturating_add(1);
-            conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, count));
-            seen.push(message_ts);
-            if seen.len() > MAX_SEEN_REALTIME_MESSAGES {
-                seen.drain(..seen.len() - MAX_SEEN_REALTIME_MESSAGES);
-            }
-            conversation.extra.insert(
-                SEEN_REALTIME_MESSAGE_TS_KEY.to_string(),
-                serde_json::Value::Array(seen.into_iter().map(serde_json::Value::String).collect()),
-            );
             ConversationRowMutation::Upsert(conversation, true)
         })
         .await
+    }
+
+    pub async fn observe_conversation_attention_batch(
+        &self,
+        channel_id: &str,
+        observations: Vec<(String, bool)>,
+    ) -> Result<Vec<String>> {
+        if channel_id.trim().is_empty() || observations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _guard = self.update_lock.lock().await;
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let channel_id = channel_id.to_string();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut conversation =
+                    load_sqlite_conversation(&transaction, &workspace_key, &channel_id)?
+                        .unwrap_or_else(|| SlackConversation {
+                            id: channel_id.clone(),
+                            ..Default::default()
+                        });
+                let local_read = conversation
+                    .extra
+                    .get(LOCAL_READ_TS_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let mut accepted = Vec::new();
+                for (message_ts, record_unread) in observations {
+                    if message_ts.trim().is_empty()
+                        || local_read.as_deref().is_some_and(|last_read| {
+                            !slack_timestamp_is_after(&message_ts, last_read)
+                        })
+                        || !conversation.observe_attention_message_at(&message_ts, record_unread)
+                    {
+                        continue;
+                    }
+                    accepted.push(message_ts);
+                }
+                if accepted.is_empty() {
+                    transaction.rollback()?;
+                    return Ok(accepted);
+                }
+                let changed = upsert_sqlite_conversation(
+                    &transaction,
+                    &workspace_key,
+                    &workspace_id,
+                    &conversation,
+                )?;
+                finish_sqlite_transaction(transaction, changed)?;
+                Ok(accepted)
+            })
+            .await
+    }
+
+    /// Atomically records a classified message and, when requested, claims its
+    /// native-notification identity. This keeps a restart between the two
+    /// writes from turning one realtime delivery into divergent state.
+    pub async fn accept_attention_delivery(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+        record_unread: bool,
+        claim_notification: bool,
+    ) -> Result<AttentionDeliveryOutcome> {
+        if channel_id.trim().is_empty() || message_ts.trim().is_empty() {
+            return Ok(AttentionDeliveryOutcome::default());
+        }
+
+        let _guard = self.update_lock.lock().await;
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let channel_id = channel_id.to_string();
+        let message_ts = message_ts.to_string();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut conversation =
+                    load_sqlite_conversation(&transaction, &workspace_key, &channel_id)?
+                        .unwrap_or_else(|| SlackConversation {
+                            id: channel_id.clone(),
+                            ..Default::default()
+                        });
+                if conversation
+                    .extra
+                    .get(LOCAL_READ_TS_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|last_read| {
+                        !slack_timestamp_is_after(message_ts.as_str(), last_read)
+                    })
+                    || !conversation.observe_attention_message_at(&message_ts, record_unread)
+                {
+                    transaction.rollback()?;
+                    return Ok(AttentionDeliveryOutcome::default());
+                }
+
+                let mut changed = upsert_sqlite_conversation(
+                    &transaction,
+                    &workspace_key,
+                    &workspace_id,
+                    &conversation,
+                )?;
+                let mut notification_claimed = false;
+                if claim_notification {
+                    let identity = attention_delivery_identity(&channel_id, &message_ts)
+                        .expect("validated attention identity");
+                    let mut ledger = load_sqlite_item::<Vec<String>>(
+                        &transaction,
+                        &workspace_key,
+                        ATTENTION_DELIVERY_KIND,
+                        ATTENTION_DELIVERY_LEDGER_KEY,
+                    )?
+                    .unwrap_or_default();
+                    if !ledger.iter().any(|known| known == &identity) {
+                        ledger.push(identity);
+                        if ledger.len() > MAX_ATTENTION_DELIVERIES {
+                            ledger.drain(..ledger.len() - MAX_ATTENTION_DELIVERIES);
+                        }
+                        changed |= upsert_sqlite_item(
+                            &transaction,
+                            &workspace_key,
+                            ATTENTION_DELIVERY_KIND,
+                            ATTENTION_DELIVERY_LEDGER_KEY,
+                            &ledger,
+                        )?;
+                        notification_claimed = true;
+                    }
+                }
+                finish_sqlite_transaction(transaction, changed)?;
+                Ok(AttentionDeliveryOutcome {
+                    observation_accepted: true,
+                    notification_claimed,
+                })
+            })
+            .await
+    }
+
+    /// Atomically claims a notification identity before native delivery.
+    /// `false` means this workspace has already delivered the same message.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn claim_attention_delivery(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> Result<bool> {
+        let Some(identity) = attention_delivery_identity(channel_id, message_ts) else {
+            return Ok(false);
+        };
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut ledger = load_sqlite_item::<Vec<String>>(
+                    &transaction,
+                    &workspace_key,
+                    ATTENTION_DELIVERY_KIND,
+                    ATTENTION_DELIVERY_LEDGER_KEY,
+                )?
+                .unwrap_or_default();
+                if ledger.iter().any(|known| known == &identity) {
+                    return Ok(false);
+                }
+                ledger.push(identity);
+                if ledger.len() > MAX_ATTENTION_DELIVERIES {
+                    ledger.drain(..ledger.len() - MAX_ATTENTION_DELIVERIES);
+                }
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                changed |= upsert_sqlite_item(
+                    &transaction,
+                    &workspace_key,
+                    ATTENTION_DELIVERY_KIND,
+                    ATTENTION_DELIVERY_LEDGER_KEY,
+                    &ledger,
+                )?;
+                finish_sqlite_transaction(transaction, changed)?;
+                Ok(true)
+            })
+            .await
     }
 
     /// Removes one cached conversation without disturbing other catalog data.
@@ -1669,6 +1856,8 @@ struct CachedWorkspaceState {
     pending_unread_refresh: Vec<String>,
     #[serde(default)]
     custom_emojis: HashMap<String, String>,
+    #[serde(default)]
+    attention_deliveries: Vec<String>,
 }
 
 impl CachedWorkspaceState {
@@ -1687,6 +1876,7 @@ impl CachedWorkspaceState {
             thread_catalog: Vec::new(),
             pending_unread_refresh: Vec::new(),
             custom_emojis: HashMap::new(),
+            attention_deliveries: Vec::new(),
         }
     }
 }
@@ -1976,6 +2166,12 @@ fn load_sqlite_state(
                 state.custom_emojis.insert(
                     item_key,
                     serde_json::from_str(&payload).context("invalid cached custom emoji")?,
+                );
+            }
+            ATTENTION_DELIVERY_KIND if item_key == ATTENTION_DELIVERY_LEDGER_KEY => {
+                state.attention_deliveries.extend(
+                    serde_json::from_str::<Vec<String>>(&payload)
+                        .context("invalid cached attention delivery ledger")?,
                 );
             }
             _ => {}
@@ -2388,7 +2584,36 @@ fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String),
     for (key, value) in &state.custom_emojis {
         insert_state_item(&mut items, "custom_emoji", key.clone(), value)?;
     }
+    if !state.attention_deliveries.is_empty() {
+        insert_state_item(
+            &mut items,
+            ATTENTION_DELIVERY_KIND,
+            ATTENTION_DELIVERY_LEDGER_KEY.to_string(),
+            &state.attention_deliveries,
+        )?;
+    }
     Ok(items)
+}
+
+fn attention_delivery_identity(channel_id: &str, message_ts: &str) -> Option<String> {
+    let channel_id = channel_id.trim();
+    let message_ts = message_ts.trim();
+    if channel_id.is_empty() || message_ts.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(channel_id.as_bytes());
+    digest.update([0]);
+    digest.update(message_ts.as_bytes());
+    Some(
+        digest
+            .finalize()
+            .iter()
+            .fold(String::with_capacity(64), |mut output, byte| {
+                let _ = write!(output, "{byte:02x}");
+                output
+            }),
+    )
 }
 
 fn conversation_for_cache(conversation: &SlackConversation) -> SlackConversation {
@@ -3941,6 +4166,167 @@ mod tests {
             assert_eq!(conversations.len(), 1);
             assert_eq!(conversations[0].id, "D1");
             assert_eq!(conversations[0].unread_activity_count(), 2);
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn classified_noise_does_not_become_unread_after_raw_reconciliation() {
+        let directory = temp_cache_dir("workspace-store-attention-noise");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_conversations(&[SlackConversation {
+                    id: "C1".to_string(),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            assert!(store
+                .observe_conversation_attention_from_event("C1", "10.0", false)
+                .await
+                .unwrap());
+            assert!(store
+                .apply_conversation_unread_snapshot(&SlackConversationUnreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 1),
+                    latest: Some("10.0".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap());
+
+            let conversation = store
+                .load_conversations()
+                .await
+                .unwrap()
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(conversation.raw_unread_activity_count(), 1);
+            assert!(!conversation.has_unread_activity());
+            assert_eq!(conversation.unread_activity_count(), 0);
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn reconciled_attention_batch_persists_filtered_message_identities() {
+        let directory = temp_cache_dir("workspace-store-attention-reconciliation");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let accepted = store
+                .observe_conversation_attention_batch(
+                    "C1",
+                    vec![("10.0".to_string(), false), ("11.0".to_string(), true)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(accepted, ["10.0", "11.0"]);
+            assert!(store
+                .observe_conversation_attention_batch(
+                    "C1",
+                    vec![("10.0".to_string(), false), ("11.0".to_string(), true)],
+                )
+                .await
+                .unwrap()
+                .is_empty());
+
+            let conversation = store
+                .load_conversations()
+                .await
+                .unwrap()
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(conversation.unread_activity_count(), 1);
+            assert!(conversation.has_observed_attention_message("10.0"));
+            assert!(conversation.has_observed_attention_message("11.0"));
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn attention_delivery_claim_is_atomic_and_survives_reopen() {
+        let directory = temp_cache_dir("workspace-store-attention-delivery");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            assert!(store
+                .claim_attention_delivery("D1", "1710000001.000001")
+                .await
+                .unwrap());
+            assert!(!store
+                .claim_attention_delivery("D1", "1710000001.000001")
+                .await
+                .unwrap());
+            assert!(store
+                .claim_attention_delivery("D1", "1710000002.000001")
+                .await
+                .unwrap());
+
+            drop(store);
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            assert!(!reopened
+                .claim_attention_delivery("D1", "1710000001.000001")
+                .await
+                .unwrap());
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn realtime_attention_observation_and_notification_claim_share_one_transaction() {
+        let directory = temp_cache_dir("workspace-store-attention-acceptance");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let first = store
+                .accept_attention_delivery("D1", "1710000001.000001", true, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                first,
+                AttentionDeliveryOutcome {
+                    observation_accepted: true,
+                    notification_claimed: true,
+                }
+            );
+            assert_eq!(
+                store
+                    .accept_attention_delivery("D1", "1710000001.000001", true, true)
+                    .await
+                    .unwrap(),
+                AttentionDeliveryOutcome::default()
+            );
+
+            drop(store);
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            assert_eq!(
+                reopened
+                    .accept_attention_delivery("D1", "1710000001.000001", true, true)
+                    .await
+                    .unwrap(),
+                AttentionDeliveryOutcome::default()
+            );
+            let conversation = reopened
+                .load_conversations()
+                .await
+                .unwrap()
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(conversation.unread_activity_count(), 1);
         });
 
         let _ = std::fs::remove_dir_all(directory);

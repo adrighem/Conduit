@@ -1,10 +1,8 @@
-// The domain API is wired into the workspace pipeline in the next track phase.
-#![allow(dead_code)]
-
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConversationKind {
+    Unknown,
     Channel,
     DirectMessage,
     GroupDirectMessage,
@@ -36,7 +34,11 @@ impl ThreadRelationship {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeliveryState {
     Fresh,
+    Reconciled,
+    Historical,
+    #[cfg_attr(not(test), allow(dead_code))]
     Stale,
+    #[cfg_attr(not(test), allow(dead_code))]
     Duplicate,
 }
 
@@ -45,7 +47,7 @@ pub(crate) struct AttentionCandidate<'a> {
     pub(crate) text: &'a str,
     pub(crate) subtype: Option<&'a str>,
     pub(crate) mutation: MessageMutation,
-    pub(crate) author_user_id: Option<&'a str>,
+    pub(crate) author_is_self: bool,
     pub(crate) current_user_id: Option<&'a str>,
     pub(crate) conversation: ConversationKind,
     pub(crate) thread_relationship: ThreadRelationship,
@@ -57,7 +59,7 @@ pub(crate) struct AttentionCandidate<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AttentionPreferences {
+pub struct AttentionPreferences {
     pub(crate) desktop_notifications: bool,
     pub(crate) direct_messages: bool,
     pub(crate) mentions_and_names: bool,
@@ -80,7 +82,7 @@ impl Default for AttentionPreferences {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AttentionReason {
+pub enum AttentionReason {
     MembershipLifecycle,
     NonMessageNoise,
     EmptyMessage,
@@ -97,12 +99,13 @@ pub(crate) enum AttentionReason {
     NotificationsDisabled,
     MutedConversation,
     ActiveTarget,
+    HistoricalDelivery,
     StaleDelivery,
     DuplicateDelivery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AttentionDecision {
+pub struct AttentionDecision {
     pub(crate) record_unread: bool,
     pub(crate) send_notification: bool,
     pub(crate) reasons: Vec<AttentionReason>,
@@ -155,11 +158,7 @@ impl AttentionPolicy {
                 reasons: vec![AttentionReason::NonPostedMutation],
             };
         }
-        if candidate
-            .author_user_id
-            .zip(candidate.current_user_id)
-            .is_some_and(|(author, current)| author == current)
-        {
+        if candidate.author_is_self {
             return AttentionDecision {
                 record_unread: false,
                 send_notification: false,
@@ -220,15 +219,21 @@ impl AttentionPolicy {
         if candidate.actively_reading {
             reasons.push(AttentionReason::ActiveTarget);
         }
-        let fresh = candidate.delivery == DeliveryState::Fresh;
+        let records_unread = matches!(
+            candidate.delivery,
+            DeliveryState::Fresh | DeliveryState::Reconciled
+        );
         match candidate.delivery {
             DeliveryState::Fresh => {}
+            DeliveryState::Reconciled | DeliveryState::Historical => {
+                reasons.push(AttentionReason::HistoricalDelivery);
+            }
             DeliveryState::Stale => reasons.push(AttentionReason::StaleDelivery),
             DeliveryState::Duplicate => reasons.push(AttentionReason::DuplicateDelivery),
         }
 
-        let record_unread = fresh;
-        let send_notification = record_unread
+        let record_unread = records_unread;
+        let send_notification = candidate.delivery == DeliveryState::Fresh
             && notification_relevant
             && self.preferences.desktop_notifications
             && !candidate.muted
@@ -238,6 +243,12 @@ impl AttentionPolicy {
             send_notification,
             reasons,
         }
+    }
+}
+
+impl Default for AttentionPolicy {
+    fn default() -> Self {
+        Self::new(AttentionPreferences::default())
     }
 }
 
@@ -362,7 +373,7 @@ mod tests {
             text: "status update",
             subtype: None,
             mutation: MessageMutation::Posted,
-            author_user_id: Some("U_OTHER"),
+            author_is_self: false,
             current_user_id: Some("U_SELF"),
             conversation: ConversationKind::Channel,
             thread_relationship: ThreadRelationship::NotAReply,
@@ -553,7 +564,7 @@ mod tests {
         let cases = [
             Case {
                 name: "self authored",
-                mutate: |message| message.author_user_id = Some("U_SELF"),
+                mutate: |message| message.author_is_self = true,
                 unread: false,
                 reason: AttentionReason::SelfAuthored,
             },
@@ -568,6 +579,18 @@ mod tests {
                 mutate: |message| message.actively_reading = true,
                 unread: true,
                 reason: AttentionReason::ActiveTarget,
+            },
+            Case {
+                name: "reconciled unread",
+                mutate: |message| message.delivery = DeliveryState::Reconciled,
+                unread: true,
+                reason: AttentionReason::HistoricalDelivery,
+            },
+            Case {
+                name: "historical read",
+                mutate: |message| message.delivery = DeliveryState::Historical,
+                unread: false,
+                reason: AttentionReason::HistoricalDelivery,
             },
             Case {
                 name: "stale",

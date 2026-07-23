@@ -32,6 +32,7 @@ use gtk::{gio, glib};
 use webkit6::prelude::*;
 
 use crate::activity::{self, ActivityItem};
+use crate::attention::{AttentionDecision, AttentionPreferences};
 use crate::auth;
 use crate::composer::{
     emoji_completion_key_action, emoji_token_at_caret, replace_emoji_token, set_text_view_text,
@@ -100,6 +101,13 @@ struct HuddlePreflightDialog {
     microphone: HuddleDevicePicker,
     speaker: HuddleDevicePicker,
     camera: HuddleDevicePicker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowAttentionContext {
+    active_channel_id: Option<String>,
+    window_active: bool,
+    preferences: AttentionPreferences,
 }
 
 mod imp {
@@ -236,9 +244,8 @@ mod imp {
         pub discovered_users: RefCell<Vec<SlackUser>>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
-        pub latest_message_ts_by_channel: RefCell<HashMap<String, String>>,
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
-        pub seen_realtime_messages: RefCell<HashSet<String>>,
+        pub(super) last_attention_context: RefCell<Option<WindowAttentionContext>>,
         pub user_names: RefCell<HashMap<String, String>>,
         pub user_full_names: RefCell<HashMap<String, String>>,
         pub user_avatar_urls: RefCell<HashMap<String, String>>,
@@ -258,7 +265,7 @@ mod imp {
         pub initial_sync_complete: Cell<bool>,
         pub(super) pending_notification_target: RefCell<Option<NotificationTarget>>,
         pub(super) pending_message_notifications:
-            RefCell<HashMap<String, PendingMessageNotification>>,
+            RefCell<HashMap<(String, String), PendingMessageNotification>>,
         pub(super) pending_slack_uris: RefCell<VecDeque<SlackUri>>,
         pub(super) huddle_snapshot: RefCell<HuddleSnapshot>,
         pub(super) huddle_devices: RefCell<Vec<HuddleDevice>>,
@@ -522,6 +529,7 @@ fn is_unmodified_paste_accelerator(key: gtk::gdk::Key, state: gtk::gdk::Modifier
 const COMPOSER_TARGETS: [ComposerTarget; 2] = [ComposerTarget::Message, ComposerTarget::Thread];
 const UI_EVENT_BATCH_LIMIT: usize = 8;
 const MAX_PENDING_SLACK_URIS: usize = 16;
+const MAX_PENDING_MESSAGE_NOTIFICATIONS: usize = 128;
 const PICKER_POPULATION_BATCH_SIZE: usize = 24;
 const CANCEL_REACTION_PICKER_SCRIPT: &str = r#"(function () {
   const picker = document.getElementById("emoji-picker");
@@ -915,59 +923,6 @@ fn runtime_event_is_start_failure(event: &RuntimeEvent) -> bool {
     matches!(event.kind, RuntimeEventKind::RuntimeStartFailed(_))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MessageNotificationAction {
-    Notify,
-    RecordOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MessageNotificationDelivery {
-    Snapshot,
-    Realtime { first_delivery: bool },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MessageNotificationState<'a> {
-    previous_latest_ts: Option<&'a str>,
-    latest_ts: &'a str,
-    latest_message_user: Option<&'a str>,
-    current_user: Option<&'a str>,
-    has_unread: bool,
-    muted: bool,
-    actively_reading: bool,
-    notification_worthy: bool,
-    delivery: MessageNotificationDelivery,
-}
-
-fn message_notification_action(state: MessageNotificationState<'_>) -> MessageNotificationAction {
-    let has_newer_message = match state.delivery {
-        MessageNotificationDelivery::Realtime { first_delivery } => first_delivery,
-        MessageNotificationDelivery::Snapshot => state
-            .previous_latest_ts
-            .is_some_and(|previous_ts| state.latest_ts > previous_ts),
-    };
-    let own_message = state
-        .latest_message_user
-        .is_some_and(|user| Some(user) == state.current_user);
-
-    if has_newer_message
-        && state.has_unread
-        && !state.muted
-        && !state.actively_reading
-        && !own_message
-        && state.notification_worthy
-    {
-        MessageNotificationAction::Notify
-    } else {
-        MessageNotificationAction::RecordOnly
-    }
-}
-
-fn message_is_notification_worthy(message: &SlackMessage) -> bool {
-    message.is_notification_worthy()
-}
-
 fn message_notification_body(
     message: Option<&SlackMessage>,
     user_names: &HashMap<String, String>,
@@ -1011,11 +966,58 @@ fn message_notification_content(
     Some((conversation_title.to_string(), format!("{sender}: {body}")))
 }
 
-fn notification_baseline_after(previous_ts: Option<&str>, candidate_ts: &str) -> String {
-    previous_ts
-        .filter(|previous_ts| *previous_ts >= candidate_ts)
-        .unwrap_or(candidate_ts)
-        .to_string()
+fn message_notification_conversation(
+    conversation: Option<&SlackConversation>,
+    user_names: &HashMap<String, String>,
+    user_full_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+) -> Option<(String, bool)> {
+    let Some(conversation) = conversation else {
+        return Some((gettext("Slack"), false));
+    };
+    let resolved_user = |user_id: &str| {
+        user_full_names
+            .get(user_id)
+            .or_else(|| user_names.get(user_id))
+            .is_some_and(|name| !name.trim().is_empty())
+    };
+
+    if conversation.is_im.unwrap_or(false) {
+        let Some(user_id) = conversation.user.as_deref() else {
+            return Some((gettext("Direct message"), false));
+        };
+        if !resolved_user(user_id) {
+            return None;
+        }
+        return Some((
+            conversation.navigation_name_with_users(user_names, user_full_names, current_user_id),
+            false,
+        ));
+    }
+
+    if conversation.is_mpim.unwrap_or(false) {
+        let participants = conversation
+            .group_direct_message_user_ids()
+            .into_iter()
+            .filter(|user_id| Some(user_id.as_str()) != current_user_id)
+            .collect::<Vec<_>>();
+        if participants.iter().any(|user_id| !resolved_user(user_id)) {
+            return None;
+        }
+        let title = if participants.is_empty() {
+            gettext("Group direct message")
+        } else {
+            conversation.navigation_name_with_users(user_names, user_full_names, current_user_id)
+        };
+        return Some((title, false));
+    }
+
+    Some((
+        conversation.navigation_name_with_users(user_names, user_full_names, current_user_id),
+        conversation.is_channel.unwrap_or(false)
+            || conversation.is_group.unwrap_or(false)
+            || conversation.is_private.unwrap_or(false),
+    ))
 }
 
 fn local_reaction_update(
@@ -1044,8 +1046,6 @@ struct NotificationTarget {
 #[derive(Debug, Clone)]
 struct PendingMessageNotification {
     channel_id: String,
-    conversation_title: String,
-    channel_notification: bool,
     message: SlackMessage,
 }
 
@@ -1709,26 +1709,21 @@ fn slack_message_location(uri: &str, workspace_url: Option<&str>) -> Option<Sear
     SearchMessageLocation::new(channel_id, &message_ts, thread_ts.as_deref())
 }
 
-fn realtime_message_marks_unread(
-    _selected_channel: Option<&str>,
-    _window_active: bool,
-    current_user_id: Option<&str>,
-    event: &SocketModeMessageEvent,
-) -> bool {
-    event.kind == SocketModeMessageKind::Posted
-        && event
-            .message
-            .user
-            .as_deref()
-            .is_none_or(|user| Some(user) != current_user_id)
-}
-
 fn actively_reading_channel(
     window_active: bool,
     selected_channel: Option<&str>,
     channel_id: &str,
 ) -> bool {
     window_active && selected_channel == Some(channel_id)
+}
+
+fn attention_notification_should_deliver(
+    window_active: bool,
+    selected_channel: Option<&str>,
+    channel_id: &str,
+    muted: bool,
+) -> bool {
+    !muted && !actively_reading_channel(window_active, selected_channel, channel_id)
 }
 
 const THREAD_PANE_MIN_FRACTION: f64 = 0.2;
@@ -2669,6 +2664,12 @@ impl ConduitWindow {
             window.flush_persistent_state();
             glib::Propagation::Proceed
         });
+        let weak_window = self.downgrade();
+        self.connect_is_active_notify(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.sync_attention_context();
+            }
+        });
         self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
         self.connect_widget(&imp.messages_button.get(), |window| window.show_messages());
         self.connect_widget(&imp.unreads_button.get(), |window| window.show_unreads());
@@ -3603,14 +3604,13 @@ impl ConduitWindow {
                     self.populate_unreads(self.unread_items());
                 }
             }
-            RuntimeEventKind::ConversationNotificationCandidate {
+            RuntimeEventKind::AttentionNotificationCandidate {
                 channel_id,
-                messages,
-            } => self.notify_if_new_messages(
-                &channel_id,
-                &messages,
-                MessageNotificationDelivery::Snapshot,
-            ),
+                message,
+            } => self.handle_attention_notification_candidate(&channel_id, &message),
+            RuntimeEventKind::AttentionMessagesObserved(observations) => {
+                self.apply_attention_observations(observations);
+            }
             RuntimeEventKind::ThreadCatalogLoaded(records) => {
                 *self.imp().workspace.threads.borrow_mut() = ThreadCatalog::from_records(records);
                 if self.current_main_view() == MainMessageView::Threads {
@@ -3636,24 +3636,14 @@ impl ConduitWindow {
                     cached,
                 );
                 if outcome.visible {
-                    let rendered_messages =
-                        (outcome.render || outcome.notify_new_messages).then(|| {
-                            self.imp()
-                                .workspace
-                                .view
-                                .borrow()
-                                .snapshot()
-                                .channel_messages
-                        });
-                    if outcome.notify_new_messages {
-                        self.notify_if_new_messages(
-                            &channel_id,
-                            rendered_messages.as_deref().unwrap_or(&[]),
-                            MessageNotificationDelivery::Snapshot,
-                        );
-                    }
                     if outcome.render {
-                        let rendered_messages = rendered_messages.unwrap_or_default();
+                        let rendered_messages = self
+                            .imp()
+                            .workspace
+                            .view
+                            .borrow()
+                            .snapshot()
+                            .channel_messages;
                         self.populate_history_with_scroll(
                             &channel_id,
                             rendered_messages,
@@ -3789,7 +3779,9 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::RealtimeStatusChanged(status) => self.set_realtime_status(status),
-            RuntimeEventKind::SocketModeEvent(event) => self.handle_socket_mode_event(event),
+            RuntimeEventKind::SocketModeEvent { event, attention } => {
+                self.handle_socket_mode_event(event, attention)
+            }
             RuntimeEventKind::Huddle(event) => self.handle_huddle_event(event),
             RuntimeEventKind::UserLoaded {
                 user_id,
@@ -5205,9 +5197,8 @@ impl ConduitWindow {
         *imp.workspace_team_id.borrow_mut() = None;
         imp.workspace_ready.set(false);
         imp.initial_sync_complete.set(false);
-        imp.latest_message_ts_by_channel.borrow_mut().clear();
         imp.local_read_ts_by_channel.borrow_mut().clear();
-        imp.seen_realtime_messages.borrow_mut().clear();
+        imp.last_attention_context.borrow_mut().take();
         imp.pending_message_notifications.borrow_mut().clear();
         imp.pending_opened_conversation_ids.borrow_mut().clear();
         imp.pending_sent_drafts.borrow_mut().clear();
@@ -5692,6 +5683,7 @@ impl ConduitWindow {
             self.queue_ui_invalidations(
                 UiInvalidations::MAIN | UiInvalidations::SIDEBAR | UiInvalidations::PICKER,
             );
+            self.flush_pending_message_notifications();
         }
     }
 
@@ -5940,26 +5932,6 @@ impl ConduitWindow {
         }
     }
 
-    fn mark_conversation_locally_unread(&self, channel_id: &str) -> bool {
-        let existing_unread_count = self
-            .imp()
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(SlackConversation::unread_activity_count);
-        let unread_count = existing_unread_count.unwrap_or_default().saturating_add(1);
-        self.imp()
-            .workspace
-            .conversations
-            .borrow_mut()
-            .apply_realtime_unread(
-                channel_id,
-                SlackUnreadState::from_parts(true, true, unread_count),
-            );
-        existing_unread_count.is_some()
-    }
-
     fn channel_load_more_url(&self, channel_id: &str) -> Option<String> {
         self.imp()
             .workspace
@@ -6186,10 +6158,6 @@ impl ConduitWindow {
             .borrow_mut()
             .remove(channel_id);
         self.imp()
-            .latest_message_ts_by_channel
-            .borrow_mut()
-            .remove(channel_id);
-        self.imp()
             .local_read_ts_by_channel
             .borrow_mut()
             .remove(channel_id);
@@ -6206,21 +6174,23 @@ impl ConduitWindow {
     }
 
     fn mark_channel_read_through_latest(&self, channel_id: &str) {
-        let latest = self
-            .imp()
-            .latest_message_ts_by_channel
-            .borrow()
-            .get(channel_id)
-            .cloned()
-            .or_else(|| {
-                self.imp()
-                    .workspace
-                    .conversations
-                    .borrow()
-                    .get(channel_id)
-                    .and_then(SlackConversation::latest_message_ts)
-                    .map(ToString::to_string)
-            });
+        let latest = SlackMessage::latest_ts(
+            self.imp()
+                .workspace
+                .view
+                .borrow()
+                .channel_messages(channel_id)
+                .iter(),
+        )
+        .or_else(|| {
+            self.imp()
+                .workspace
+                .conversations
+                .borrow()
+                .get(channel_id)
+                .and_then(SlackConversation::latest_message_ts)
+                .map(ToString::to_string)
+        });
         if let Some(ts) = latest {
             self.send_command(RuntimeCommand::MarkConversationRead {
                 channel_id: channel_id.to_string(),
@@ -6900,6 +6870,28 @@ impl ConduitWindow {
                 .update_property(&[gtk::accessible::Property::Description("")]);
         }
         self.update_huddle_surface();
+        self.sync_attention_context();
+    }
+
+    fn sync_attention_context(&self) {
+        let imp = self.imp();
+        if imp.current_user_id.borrow().is_none() || imp.workspace_id.borrow().is_none() {
+            return;
+        }
+        let context = WindowAttentionContext {
+            active_channel_id: self.visible_channel_id(),
+            window_active: self.is_active(),
+            preferences: AttentionPreferences::default(),
+        };
+        if imp.last_attention_context.borrow().as_ref() == Some(&context) {
+            return;
+        }
+        imp.last_attention_context.replace(Some(context.clone()));
+        self.send_command(RuntimeCommand::UpdateAttentionContext {
+            active_channel_id: context.active_channel_id,
+            window_active: context.window_active,
+            preferences: context.preferences,
+        });
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
@@ -7173,9 +7165,13 @@ impl ConduitWindow {
         self.load_message_html(&message_html::saved_items_document(&items, &context));
     }
 
-    fn handle_socket_mode_event(&self, event: SocketModeEvent) {
+    fn handle_socket_mode_event(
+        &self,
+        event: SocketModeEvent,
+        attention: Option<AttentionDecision>,
+    ) {
         match event {
-            SocketModeEvent::Message(event) => self.apply_socket_message(*event),
+            SocketModeEvent::Message(event) => self.apply_socket_message(*event, attention),
             SocketModeEvent::Reaction(event) => self.apply_socket_reaction(event),
             SocketModeEvent::UserChanged(user) | SocketModeEvent::UserHuddleChanged(user) => {
                 let Some(user_id) = user.id.clone() else {
@@ -7205,25 +7201,14 @@ impl ConduitWindow {
         }
     }
 
-    fn apply_socket_message(&self, event: SocketModeMessageEvent) {
+    fn apply_socket_message(
+        &self,
+        event: SocketModeMessageEvent,
+        attention: Option<AttentionDecision>,
+    ) {
         let channel_id = event.channel_id.clone();
         let message = event.message.clone();
-        let reading_channel = self.visible_channel_id();
         let current_user_id = self.imp().current_user_id.borrow().clone();
-
-        let first_delivery = event.kind != SocketModeMessageKind::Posted
-            || self
-                .imp()
-                .seen_realtime_messages
-                .borrow_mut()
-                .insert(format!("{}:{}", event.channel_id, event.message.ts));
-        let should_mark_unread = first_delivery
-            && realtime_message_marks_unread(
-                reading_channel.as_deref(),
-                self.is_active(),
-                current_user_id.as_deref(),
-                &event,
-            );
         let was_unread = self
             .imp()
             .workspace
@@ -7231,10 +7216,22 @@ impl ConduitWindow {
             .borrow()
             .get(&channel_id)
             .is_some_and(SlackConversation::has_unread_activity);
-        if should_mark_unread && !self.mark_conversation_locally_unread(&channel_id) {
-            self.refresh_conversations();
+        let external_post = event.kind == SocketModeMessageKind::Posted
+            && message.user.as_deref() != current_user_id.as_deref();
+        if let Some(decision) = attention.as_ref().filter(|_| external_post) {
+            let known = self
+                .imp()
+                .workspace
+                .conversations
+                .borrow_mut()
+                .observe_attention_message(&channel_id, &message.ts, decision.record_unread);
+            if !known {
+                self.refresh_conversations();
+            }
         }
-        let became_unread = should_mark_unread && !was_unread;
+        let became_unread = attention
+            .as_ref()
+            .is_some_and(|decision| external_post && decision.record_unread && !was_unread);
 
         let kind = match event.kind {
             SocketModeMessageKind::Posted => RealtimeMessageKind::Posted,
@@ -7243,18 +7240,37 @@ impl ConduitWindow {
         };
         let outcome = self.apply_timeline_message(&channel_id, &message, kind, became_unread);
 
-        if event.kind == SocketModeMessageKind::Posted {
-            self.notify_if_new_messages(
-                &channel_id,
-                std::slice::from_ref(&message),
-                MessageNotificationDelivery::Realtime { first_delivery },
-            );
-        }
-
         if outcome.refresh_unreads {
             self.populate_unreads(self.unread_items());
         } else {
             self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+        }
+    }
+
+    fn apply_attention_observations(
+        &self,
+        observations: Vec<crate::runtime::AttentionObservation>,
+    ) {
+        if observations.is_empty() {
+            return;
+        }
+        let mut refresh_metadata = false;
+        {
+            let mut conversations = self.imp().workspace.conversations.borrow_mut();
+            for observation in observations {
+                refresh_metadata |= !conversations.observe_attention_message(
+                    &observation.channel_id,
+                    &observation.message_ts,
+                    observation.record_unread,
+                );
+            }
+        }
+        self.sync_conversations_from_catalog();
+        if self.current_main_view() == MainMessageView::Unreads {
+            self.populate_unreads(self.unread_items());
+        }
+        if refresh_metadata {
+            self.refresh_conversations();
         }
     }
 
@@ -7798,116 +7814,139 @@ impl ConduitWindow {
         application.withdraw_huddle_notification(&workspace_id, &call_id);
     }
 
-    fn notify_if_new_messages(
-        &self,
-        channel_id: &str,
-        messages: &[SlackMessage],
-        delivery: MessageNotificationDelivery,
-    ) {
-        let Some(latest_ts) = SlackMessage::latest_ts(messages.iter()) else {
-            return;
-        };
-
-        let latest_message = messages.iter().find(|message| message.ts == latest_ts);
-        let current_user_id = self.imp().current_user_id.borrow().clone();
-        let previous_ts = self
-            .imp()
-            .latest_message_ts_by_channel
-            .borrow()
-            .get(channel_id)
-            .cloned();
-
-        self.imp().latest_message_ts_by_channel.borrow_mut().insert(
-            channel_id.to_string(),
-            notification_baseline_after(previous_ts.as_deref(), &latest_ts),
-        );
-
-        let actively_reading = actively_reading_channel(
-            self.is_active(),
-            self.visible_channel_id().as_deref(),
-            channel_id,
-        );
-        let (has_unread, muted) = self.notification_conversation_state(channel_id);
-        let action = message_notification_action(MessageNotificationState {
-            previous_latest_ts: previous_ts.as_deref(),
-            latest_ts: latest_ts.as_str(),
-            latest_message_user: latest_message.and_then(|message| message.user.as_deref()),
-            current_user: current_user_id.as_deref(),
-            has_unread,
-            muted,
-            actively_reading,
-            notification_worthy: latest_message.is_some_and(message_is_notification_worthy),
-            delivery,
-        });
-
-        if action == MessageNotificationAction::Notify {
-            if let Some(message) = latest_message {
-                self.send_or_defer_message_notification(channel_id, message);
-            }
-        }
-    }
-
-    fn send_or_defer_message_notification(&self, channel_id: &str, message: &SlackMessage) {
-        let conversation_title = self.navigation_conversation_title(channel_id);
-        let channel_notification = self
+    fn handle_attention_notification_candidate(&self, channel_id: &str, message: &SlackMessage) {
+        let muted = self
             .imp()
             .workspace
             .conversations
             .borrow()
             .get(channel_id)
-            .is_some_and(|conversation| {
-                !conversation.is_im.unwrap_or(false)
-                    && !conversation.is_mpim.unwrap_or(false)
-                    && (conversation.is_channel.unwrap_or(false)
-                        || conversation.is_group.unwrap_or(false)
-                        || conversation.is_private.unwrap_or(false))
-            });
-        let content = message_notification_content(
-            &conversation_title,
-            channel_notification,
-            message,
+            .is_some_and(SlackConversation::is_muted_conversation);
+        if attention_notification_should_deliver(
+            self.is_active(),
+            self.visible_channel_id().as_deref(),
+            channel_id,
+            muted,
+        ) {
+            self.send_or_defer_message_notification(channel_id, message);
+        }
+    }
+
+    fn send_or_defer_message_notification(&self, channel_id: &str, message: &SlackMessage) {
+        let conversation = self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .cloned();
+        let content = message_notification_conversation(
+            conversation.as_ref(),
             &self.imp().user_names.borrow(),
-        );
+            &self.imp().user_full_names.borrow(),
+            self.imp().current_user_id.borrow().as_deref(),
+        )
+        .and_then(|(title, channel_notification)| {
+            message_notification_content(
+                &title,
+                channel_notification,
+                message,
+                &self.imp().user_names.borrow(),
+            )
+        });
         if let Some((title, body)) = content {
             self.send_notification(channel_id, &title, &body, message.thread_root_ts());
             return;
         }
 
-        self.imp()
-            .pending_message_notifications
-            .borrow_mut()
-            .insert(
-                channel_id.to_string(),
-                PendingMessageNotification {
-                    channel_id: channel_id.to_string(),
-                    conversation_title,
-                    channel_notification,
-                    message: message.clone(),
-                },
-            );
-        self.request_user_names(std::slice::from_ref(message));
+        let key = (channel_id.to_string(), message.ts.clone());
+        let mut pending = self.imp().pending_message_notifications.borrow_mut();
+        if !pending.contains_key(&key) && pending.len() >= MAX_PENDING_MESSAGE_NOTIFICATIONS {
+            if let Some(oldest) = pending
+                .iter()
+                .min_by(|(_, left), (_, right)| left.message.ts.cmp(&right.message.ts))
+                .map(|(key, _)| key.clone())
+            {
+                pending.remove(&oldest);
+            }
+        }
+        pending.insert(
+            key,
+            PendingMessageNotification {
+                channel_id: channel_id.to_string(),
+                message: message.clone(),
+            },
+        );
+        drop(pending);
+        let mut user_ids = conversation
+            .as_ref()
+            .into_iter()
+            .flat_map(SlackConversation::display_user_ids)
+            .chain(rendering::extract_user_ids(message))
+            .collect::<Vec<_>>();
+        user_ids.sort();
+        user_ids.dedup();
+        self.request_user_ids(user_ids);
     }
 
     fn flush_pending_message_notifications(&self) {
         let user_names = self.imp().user_names.borrow().clone();
-        let ready = {
-            let mut pending = self.imp().pending_message_notifications.borrow_mut();
-            let mut ready = Vec::new();
-            pending.retain(|_, notification| {
-                let Some((title, body)) = message_notification_content(
-                    &notification.conversation_title,
-                    notification.channel_notification,
-                    &notification.message,
-                    &user_names,
-                ) else {
-                    return true;
-                };
-                ready.push((notification.clone(), title, body));
-                false
-            });
-            ready
-        };
-        for (notification, title, body) in ready {
+        let user_full_names = self.imp().user_full_names.borrow().clone();
+        let current_user_id = self.imp().current_user_id.borrow().clone();
+        let pending = self
+            .imp()
+            .pending_message_notifications
+            .borrow()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for notification in pending {
+            let key = (
+                notification.channel_id.clone(),
+                notification.message.ts.clone(),
+            );
+            let conversation = self
+                .imp()
+                .workspace
+                .conversations
+                .borrow()
+                .get(&notification.channel_id)
+                .cloned();
+            let muted = conversation
+                .as_ref()
+                .is_some_and(SlackConversation::is_muted_conversation);
+            if !attention_notification_should_deliver(
+                self.is_active(),
+                self.visible_channel_id().as_deref(),
+                &notification.channel_id,
+                muted,
+            ) {
+                self.imp()
+                    .pending_message_notifications
+                    .borrow_mut()
+                    .remove(&key);
+                continue;
+            }
+            let Some((title, channel_notification)) = message_notification_conversation(
+                conversation.as_ref(),
+                &user_names,
+                &user_full_names,
+                current_user_id.as_deref(),
+            ) else {
+                continue;
+            };
+            let Some((title, body)) = message_notification_content(
+                &title,
+                channel_notification,
+                &notification.message,
+                &user_names,
+            ) else {
+                continue;
+            };
+            self.imp()
+                .pending_message_notifications
+                .borrow_mut()
+                .remove(&key);
             self.send_notification(
                 &notification.channel_id,
                 &title,
@@ -7915,21 +7954,6 @@ impl ConduitWindow {
                 notification.message.thread_root_ts(),
             );
         }
-    }
-
-    fn notification_conversation_state(&self, channel_id: &str) -> (bool, bool) {
-        self.imp()
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    conversation.is_muted_conversation(),
-                )
-            })
-            .unwrap_or((false, false))
     }
 
     fn send_notification(
@@ -8124,25 +8148,6 @@ impl ConduitWindow {
                 channel_id: channel_id.to_string(),
             });
         }
-    }
-
-    fn navigation_conversation_title(&self, channel_id: &str) -> String {
-        let imp = self.imp();
-        let user_names = imp.user_names.borrow();
-        let user_full_names = imp.user_full_names.borrow();
-        let current_user_id = imp.current_user_id.borrow();
-        imp.workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                conversation.navigation_name_with_users(
-                    &user_names,
-                    &user_full_names,
-                    current_user_id.as_deref(),
-                )
-            })
-            .unwrap_or_else(|| "Slack".to_string())
     }
 
     fn unread_items(&self) -> Vec<ActivityItem> {
@@ -9438,144 +9443,85 @@ mod tests {
     }
 
     #[test]
-    fn notification_policy_notifies_only_for_new_unread_incoming_messages() {
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                previous_latest_ts: Some("1710000100.000000"),
-                latest_ts: "1710000200.000000",
-                latest_message_user: Some("U456"),
-                current_user: Some("U123"),
-                has_unread: true,
-                muted: false,
-                actively_reading: false,
-                notification_worthy: true,
-                delivery: MessageNotificationDelivery::Snapshot,
-            }),
-            MessageNotificationAction::Notify
-        );
-
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                previous_latest_ts: None,
-                latest_ts: "1710000200.000000",
-                latest_message_user: Some("U456"),
-                current_user: Some("U123"),
-                has_unread: true,
-                muted: false,
-                actively_reading: false,
-                notification_worthy: true,
-                delivery: MessageNotificationDelivery::Realtime {
-                    first_delivery: true,
-                },
-            }),
-            MessageNotificationAction::Notify
-        );
+    fn attention_notification_last_mile_blocks_active_and_muted_conversations() {
+        assert!(attention_notification_should_deliver(
+            false,
+            Some("C123"),
+            "C123",
+            false
+        ));
+        assert!(attention_notification_should_deliver(
+            true,
+            Some("C999"),
+            "C123",
+            false
+        ));
+        assert!(!attention_notification_should_deliver(
+            true,
+            Some("C123"),
+            "C123",
+            false
+        ));
+        assert!(!attention_notification_should_deliver(
+            false, None, "C123", true
+        ));
     }
 
     #[test]
-    fn notification_policy_records_without_notifying_for_non_notifyable_messages() {
-        let notifyable = MessageNotificationState {
-            previous_latest_ts: Some("1710000100.000000"),
-            latest_ts: "1710000200.000000",
-            latest_message_user: Some("U456"),
-            current_user: Some("U123"),
-            has_unread: true,
-            muted: false,
-            actively_reading: false,
-            notification_worthy: true,
-            delivery: MessageNotificationDelivery::Snapshot,
+    fn notification_conversation_waits_for_direct_message_names() {
+        let direct_message = SlackConversation {
+            id: "D123".into(),
+            user: Some("U456".into()),
+            is_im: Some(true),
+            ..Default::default()
         };
-
         assert_eq!(
-            message_notification_action(MessageNotificationState {
-                previous_latest_ts: None,
-                ..notifyable
-            }),
-            MessageNotificationAction::RecordOnly
+            message_notification_conversation(
+                Some(&direct_message),
+                &HashMap::new(),
+                &HashMap::new(),
+                Some("U123"),
+            ),
+            None
         );
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                actively_reading: true,
-                ..notifyable
-            }),
-            MessageNotificationAction::RecordOnly
-        );
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                previous_latest_ts: None,
-                delivery: MessageNotificationDelivery::Realtime {
-                    first_delivery: false,
-                },
-                ..notifyable
-            }),
-            MessageNotificationAction::RecordOnly
-        );
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                has_unread: false,
-                ..notifyable
-            }),
-            MessageNotificationAction::RecordOnly
-        );
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                muted: true,
-                ..notifyable
-            }),
-            MessageNotificationAction::RecordOnly
-        );
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                latest_message_user: Some("U123"),
-                ..notifyable
-            }),
-            MessageNotificationAction::RecordOnly
-        );
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                notification_worthy: false,
-                ..notifyable
-            }),
-            MessageNotificationAction::RecordOnly
-        );
+        let resolved = message_notification_conversation(
+            Some(&direct_message),
+            &HashMap::from([("U456".into(), "Ada".into())]),
+            &HashMap::new(),
+            Some("U123"),
+        )
+        .unwrap();
+        assert_eq!(resolved, ("Ada".into(), false));
+        assert!(!resolved.0.contains("U456"));
     }
 
     #[test]
-    fn notification_content_filter_keeps_messages_and_drops_system_noise() {
-        let mut text_message = message("1710000200.000000", "Hello");
-        assert!(message_is_notification_worthy(&text_message));
-
-        text_message.subtype = Some("thread_broadcast".into());
-        assert!(message_is_notification_worthy(&text_message));
-
-        text_message.subtype = Some("channel_join".into());
-        assert!(!message_is_notification_worthy(&text_message));
-
-        assert!(!message_is_notification_worthy(&SlackMessage {
-            ts: "1710000300.000000".into(),
-            text: Some("  ".into()),
-            ..Default::default()
-        }));
-
-        assert!(message_is_notification_worthy(&SlackMessage {
-            ts: "1710000400.000000".into(),
-            subtype: Some("file_share".into()),
-            files: Some(vec![Default::default()]),
-            ..Default::default()
-        }));
-        assert!(message_is_notification_worthy(&SlackMessage {
-            ts: "1710000500.000000".into(),
-            blocks: Some(serde_json::json!([])),
-            ..Default::default()
-        }));
-
-        assert!(!message_is_notification_worthy(&SlackMessage {
-            ts: "1710000600.000000".into(),
-            subtype: Some("huddle_thread".into()),
-            text: Some("A huddle happened".into()),
-            no_notifications: Some(true),
-            ..Default::default()
-        }));
+    fn notification_conversation_waits_for_every_group_dm_name() {
+        let group_message: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "G123",
+            "is_mpim": true,
+            "users": ["U123", "U456", "U789"]
+        }))
+        .unwrap();
+        assert!(message_notification_conversation(
+            Some(&group_message),
+            &HashMap::from([("U456".into(), "Ada".into())]),
+            &HashMap::new(),
+            Some("U123"),
+        )
+        .is_none());
+        assert_eq!(
+            message_notification_conversation(
+                Some(&group_message),
+                &HashMap::from([
+                    ("U456".into(), "Ada".into()),
+                    ("U789".into(), "Grace".into()),
+                ]),
+                &HashMap::new(),
+                Some("U123"),
+            ),
+            Some(("Ada, Grace".into(), false))
+        );
     }
 
     #[test]
@@ -9659,29 +9605,6 @@ mod tests {
         assert_eq!(
             local_reaction_update("C123", "1710000200.000000", "eyes", true, None),
             None
-        );
-    }
-
-    #[test]
-    fn notification_baseline_never_regresses_for_delayed_snapshots() {
-        let baseline = notification_baseline_after(None, "1710000200.000000");
-        assert_eq!(baseline, "1710000200.000000");
-
-        let baseline = notification_baseline_after(Some(&baseline), "1710000100.000000");
-        assert_eq!(baseline, "1710000200.000000");
-        assert_eq!(
-            message_notification_action(MessageNotificationState {
-                previous_latest_ts: Some(&baseline),
-                latest_ts: "1710000200.000000",
-                latest_message_user: Some("U456"),
-                current_user: Some("U123"),
-                has_unread: true,
-                muted: false,
-                actively_reading: false,
-                notification_worthy: true,
-                delivery: MessageNotificationDelivery::Snapshot,
-            }),
-            MessageNotificationAction::RecordOnly
         );
     }
 
@@ -10032,54 +9955,6 @@ mod tests {
             Some(THREAD_PANE_MAX_FRACTION)
         );
         assert_eq!(resized_end_sidebar_fraction(400.0, 0.0, 0.0), None);
-    }
-
-    #[test]
-    fn realtime_messages_stay_unread_until_visible_and_ignore_self_sent() {
-        let event = SocketModeMessageEvent {
-            channel_id: "C123".to_string(),
-            kind: SocketModeMessageKind::Posted,
-            message: SlackMessage {
-                user: Some("U123".to_string()),
-                ts: "1710000300.000000".to_string(),
-                ..Default::default()
-            },
-        };
-        let changed = SocketModeMessageEvent {
-            kind: SocketModeMessageKind::Changed,
-            ..event.clone()
-        };
-
-        assert!(realtime_message_marks_unread(
-            Some("C123"),
-            true,
-            Some("U999"),
-            &event
-        ));
-        assert!(!realtime_message_marks_unread(
-            None,
-            true,
-            Some("U123"),
-            &event
-        ));
-        assert!(!realtime_message_marks_unread(
-            None,
-            true,
-            Some("U999"),
-            &changed
-        ));
-        assert!(realtime_message_marks_unread(
-            Some("C999"),
-            true,
-            Some("U999"),
-            &event
-        ));
-        assert!(realtime_message_marks_unread(
-            Some("C123"),
-            false,
-            Some("U999"),
-            &event
-        ));
     }
 
     #[test]

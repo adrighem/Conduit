@@ -42,6 +42,10 @@ pub struct ThreadRecord {
     /// `None` means Slack has not supplied subscription metadata yet.
     pub(crate) subscribed: Option<bool>,
     pub(crate) unread: ThreadUnreadState,
+    /// Reply authors are append-only: deleting a reply does not erase the
+    /// fact that its author previously participated in the thread.
+    #[serde(default)]
+    pub(crate) participant_user_ids: HashSet<String>,
     #[serde(default)]
     seen_reply_ts: HashSet<String>,
 }
@@ -55,6 +59,7 @@ impl ThreadRecord {
             latest_reply: None,
             subscribed: None,
             unread: ThreadUnreadState::Unknown,
+            participant_user_ids: HashSet::new(),
             seen_reply_ts: HashSet::new(),
         }
     }
@@ -285,6 +290,14 @@ impl ThreadCatalog {
         if message.ts == root_ts {
             merge_root_metadata(record, message);
         } else {
+            if let Some(user_id) = message
+                .user
+                .as_deref()
+                .map(str::trim)
+                .filter(|user_id| !user_id.is_empty())
+            {
+                record.participant_user_ids.insert(user_id.to_string());
+            }
             record.seen_reply_ts.insert(message.ts.clone());
             record.reply_count = record.reply_count.max(record.seen_reply_ts.len() as u64);
             if record.latest_reply.as_deref() < Some(message.ts.as_str()) {
@@ -309,6 +322,13 @@ fn merge_root_metadata(record: &mut ThreadRecord, root: &SlackMessage) {
     if root.subscribed.is_some() {
         record.subscribed = root.subscribed;
     }
+    record.participant_user_ids.extend(
+        root.reply_users
+            .iter()
+            .flatten()
+            .filter(|user_id| !user_id.trim().is_empty())
+            .cloned(),
+    );
     if let Some(unread_count) = root.unread_count {
         let preserves_newer_local_read = matches!(
             &record.unread,
@@ -553,11 +573,28 @@ mod tests {
         let mut catalog = ThreadCatalog::default();
         catalog.observe_history("C2", &[root("2.0", 1)]);
         catalog.observe_history("C1", &[root("1.0", 1)]);
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U_SELF"), Some("U_SELF"));
         let records = catalog.into_records();
         assert_eq!(records[0].key, ThreadKey::new("C1", "1.0").unwrap());
+        assert!(records[0].participant_user_ids.contains("U_SELF"));
         assert!(ThreadCatalog::from_records(records)
             .get("C2", "2.0")
             .is_some());
+    }
+
+    #[test]
+    fn legacy_records_default_missing_thread_participants() {
+        let mut catalog = ThreadCatalog::default();
+        catalog.observe_history("C1", &[root("1.0", 1)]);
+        let record = catalog.into_records().pop().unwrap();
+        let mut value = serde_json::to_value(record).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("participant_user_ids");
+
+        let restored: ThreadRecord = serde_json::from_value(value).unwrap();
+        assert!(restored.participant_user_ids.is_empty());
     }
 
     #[test]

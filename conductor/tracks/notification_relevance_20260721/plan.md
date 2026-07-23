@@ -9,7 +9,7 @@
 
 ## Phase 2: Canonical pipeline integration
 
-- [ ] Task: Route realtime, snapshot, and local message candidates through AttentionPolicy before coordinator effects fan out
+- [~] Task: Route realtime, snapshot, and local message candidates through AttentionPolicy before coordinator effects fan out
 - [ ] Task: Apply the unread decision consistently to StoreBatch persistence, sidebar/activity projection, and reconciliation without losing raw Slack counters
 - [ ] Task: Apply notification effects with display-name resolution, active-target suppression, freshness, and persistent deduplication
 - [ ] Task: Add integration regressions for join/leave suppression, relevant thread replies, reconnect redelivery, and read-marker behavior

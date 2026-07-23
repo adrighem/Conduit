@@ -173,6 +173,41 @@ impl ConversationCatalog {
         self.apply_unread(id, state);
     }
 
+    /// Applies Conduit's message-level attention classification without
+    /// overwriting the raw unread counters received from Slack.
+    ///
+    /// Returns whether the conversation metadata was already present.
+    pub(crate) fn observe_attention_message(
+        &mut self,
+        id: &str,
+        message_ts: &str,
+        record_unread: bool,
+    ) -> bool {
+        if id.trim().is_empty() || message_ts.trim().is_empty() {
+            return false;
+        }
+        let existed = self.entries.contains_key(id);
+        let revision = self.next_revision();
+        let entry = self
+            .entries
+            .entry(id.to_string())
+            .or_insert_with(|| CatalogEntry {
+                conversation: SlackConversation {
+                    id: id.to_string(),
+                    ..SlackConversation::default()
+                },
+                membership_revision: revision,
+                metadata_revision: revision,
+                unread_revision: revision,
+            });
+        entry
+            .conversation
+            .observe_attention_message_at(message_ts, record_unread);
+        entry.unread_revision = revision;
+        entry.membership_revision = entry.membership_revision.max(revision);
+        existed
+    }
+
     pub(crate) fn apply_unread_snapshot(&mut self, snapshot: &SlackConversationUnreadSnapshot) {
         if !snapshot.unread_state.known || snapshot.channel_id.trim().is_empty() {
             return;
@@ -422,6 +457,24 @@ mod tests {
         assert!(catalog.commit_membership_snapshot(snapshot));
 
         assert_eq!(catalog.get("C1").unwrap().unread_state().display_count, 7);
+    }
+
+    #[test]
+    fn attention_projection_filters_noise_and_read_marker_clears_local_unread() {
+        let mut cached = conversation("C1");
+        cached.unread_count = Some(0);
+        let mut catalog = ConversationCatalog::from_cached([cached]);
+
+        assert!(catalog.observe_attention_message("C1", "1.0", false));
+        catalog.apply_realtime_unread("C1", SlackUnreadState::from_parts(true, true, 1));
+        let filtered = catalog.get("C1").unwrap();
+        assert_eq!(filtered.raw_unread_activity_count(), 1);
+        assert!(!filtered.has_unread_activity());
+
+        assert!(catalog.observe_attention_message("C1", "2.0", true));
+        assert_eq!(catalog.get("C1").unwrap().unread_activity_count(), 1);
+        catalog.advance_read_cursor("C1", "20.0", 0);
+        assert!(!catalog.get("C1").unwrap().has_unread_activity());
     }
 
     #[test]
