@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,10 +78,30 @@ impl SlackConversation {
     }
 
     pub fn is_user_deleted(&self) -> bool {
-        self.extra
-            .get("is_user_deleted")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        self.extra_bool("is_user_deleted")
+    }
+
+    pub fn is_direct_message(&self) -> bool {
+        self.is_im.unwrap_or(false) || self.is_mpim.unwrap_or(false)
+    }
+
+    pub fn is_dormant(&self) -> bool {
+        self.extra_bool("is_dormant")
+    }
+
+    pub fn priority_hint(&self) -> f64 {
+        self.extra_value("priority")
+            .and_then(|value| match value {
+                Value::Number(number) => number.as_f64(),
+                Value::String(value) => value.trim().parse::<f64>().ok(),
+                _ => None,
+            })
+            .filter(|priority| priority.is_finite())
+            .unwrap_or_default()
+    }
+
+    pub fn has_active_direct_message_hint(&self) -> bool {
+        self.is_direct_message() && (self.extra_bool("is_open") || self.priority_hint() > 0.0)
     }
 
     pub fn last_read_ts(&self) -> Option<&str> {
@@ -195,6 +216,44 @@ impl SlackConversation {
         );
     }
 
+    pub fn apply_unread_snapshot(&mut self, snapshot: &SlackConversationUnreadSnapshot) {
+        if self.id != snapshot.channel_id || !snapshot.unread_state.known {
+            return;
+        }
+
+        self.apply_unread_state(snapshot.unread_state);
+        if let Some(last_read) = snapshot.last_read.as_deref() {
+            let should_advance = self
+                .last_read_ts()
+                .is_none_or(|current| slack_timestamp_is_after(last_read, current));
+            if should_advance {
+                self.extra.insert(
+                    "last_read".to_string(),
+                    Value::String(last_read.to_string()),
+                );
+            }
+        }
+        if let Some(latest) = snapshot.latest.as_deref() {
+            let should_advance = self
+                .latest_message_ts()
+                .is_none_or(|current| slack_timestamp_is_after(latest, current));
+            if should_advance {
+                self.extra
+                    .insert("latest".to_string(), Value::String(latest.to_string()));
+            }
+        }
+        if let Some(mention_count) = snapshot.mention_count {
+            self.extra.insert(
+                "mention_count".to_string(),
+                serde_json::json!(mention_count),
+            );
+        }
+        if let Some(is_open) = snapshot.is_open {
+            self.extra
+                .insert("is_open".to_string(), serde_json::json!(is_open));
+        }
+    }
+
     pub fn is_muted_conversation(&self) -> bool {
         self.extra_bool("is_muted") || self.extra_bool("muted")
     }
@@ -285,8 +344,7 @@ impl SlackConversation {
     }
 
     fn extra_bool(&self, key: &str) -> bool {
-        self.extra
-            .get(key)
+        self.extra_value(key)
             .and_then(Value::as_bool)
             .unwrap_or(false)
     }
@@ -383,6 +441,16 @@ pub struct SlackUnreadState {
     pub display_count: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlackConversationUnreadSnapshot {
+    pub channel_id: String,
+    pub unread_state: SlackUnreadState,
+    pub last_read: Option<String>,
+    pub latest: Option<String>,
+    pub mention_count: Option<u64>,
+    pub is_open: Option<bool>,
+}
+
 impl SlackUnreadState {
     pub fn from_parts(known: bool, has_unread: bool, display_count: u64) -> Self {
         Self {
@@ -391,6 +459,48 @@ impl SlackUnreadState {
             display_count,
         }
     }
+}
+
+pub(crate) fn slack_timestamp_is_after(candidate: &str, current: &str) -> bool {
+    compare_slack_timestamps(candidate, current)
+        .unwrap_or_else(|| candidate.cmp(current))
+        .is_gt()
+}
+
+fn compare_slack_timestamps(left: &str, right: &str) -> Option<Ordering> {
+    let (left_seconds, left_fraction) = slack_timestamp_parts(left)?;
+    let (right_seconds, right_fraction) = slack_timestamp_parts(right)?;
+    match left_seconds.cmp(&right_seconds) {
+        Ordering::Equal => {
+            let width = left_fraction.len().max(right_fraction.len());
+            for index in 0..width {
+                let left_digit = left_fraction.as_bytes().get(index).copied().unwrap_or(b'0');
+                let right_digit = right_fraction
+                    .as_bytes()
+                    .get(index)
+                    .copied()
+                    .unwrap_or(b'0');
+                match left_digit.cmp(&right_digit) {
+                    Ordering::Equal => {}
+                    ordering => return Some(ordering),
+                }
+            }
+            Some(Ordering::Equal)
+        }
+        ordering => Some(ordering),
+    }
+}
+
+fn slack_timestamp_parts(value: &str) -> Option<(u64, &str)> {
+    let value = value.trim();
+    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if seconds.is_empty()
+        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((seconds.parse().ok()?, fraction))
 }
 
 fn is_unread_key(key: &str) -> bool {
@@ -1354,6 +1464,36 @@ mod tests {
     }
 
     #[test]
+    fn conversation_unread_snapshot_updates_cursors_monotonically() {
+        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D1",
+            "is_im": true,
+            "latest": "10.000002"
+        }))
+        .unwrap();
+        conversation.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
+            channel_id: "D1".to_string(),
+            unread_state: SlackUnreadState::from_parts(true, true, 0),
+            last_read: Some("9.999999".to_string()),
+            latest: Some("10.000001".to_string()),
+            mention_count: Some(3),
+            is_open: Some(true),
+        });
+
+        assert_eq!(conversation.last_read_ts(), Some("9.999999"));
+        assert_eq!(conversation.latest_message_ts(), Some("10.000002"));
+        assert!(conversation.has_unread_activity());
+        assert_eq!(conversation.unread_activity_count(), 0);
+        assert_eq!(
+            conversation.extra.get("mention_count"),
+            Some(&serde_json::json!(3))
+        );
+        assert!(conversation.has_active_direct_message_hint());
+        assert!(slack_timestamp_is_after("10.0", "9.999999"));
+        assert!(!slack_timestamp_is_after("10.000001", "10.000002"));
+    }
+
+    #[test]
     fn conversation_unread_state_prefers_display_count() {
         let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "C1",
@@ -1418,6 +1558,27 @@ mod tests {
 
         assert!(conversation.is_muted_conversation());
         assert!(conversation.is_external_conversation());
+    }
+
+    #[test]
+    fn conversation_direct_message_hints_share_nested_slack_metadata() {
+        let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D1",
+            "is_im": true,
+            "properties": {
+                "is_open": true,
+                "is_dormant": true,
+                "is_user_deleted": true,
+                "priority": "0.75"
+            }
+        }))
+        .expect("failed to parse conversation");
+
+        assert!(conversation.is_direct_message());
+        assert!(conversation.is_dormant());
+        assert!(conversation.is_user_deleted());
+        assert_eq!(conversation.priority_hint(), 0.75);
+        assert!(conversation.has_active_direct_message_hint());
     }
 
     #[test]

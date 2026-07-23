@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::conversation_catalog::ConversationCatalog;
-use crate::models::{SlackConversation, SlackMessage, SlackUnreadState, SlackUserStatus};
+use crate::models::{
+    slack_timestamp_is_after, SlackConversation, SlackConversationUnreadSnapshot, SlackMessage,
+    SlackUnreadState, SlackUserStatus,
+};
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 
 pub(crate) const CACHE_VERSION: u32 = 1;
@@ -31,6 +34,7 @@ const STORE_READER_QUEUE_CAPACITY: usize = 32;
 const STORE_READER_COUNT: usize = 2;
 const STORE_MAINTENANCE_BATCH_LIMIT: usize = 50;
 const STORE_MAINTENANCE_BATCH_WINDOW: Duration = Duration::from_millis(50);
+const PENDING_UNREAD_QUEUE_KEY: &str = "__queue__";
 
 pub(crate) type Result<T> = std::result::Result<T, StoreError>;
 
@@ -860,24 +864,36 @@ impl WorkspaceStore {
         let workspace_key = self.workspace_key.clone();
         self.query_or_reset(Vec::new(), move |connection| {
             let mut statement = connection.prepare(
-                "SELECT item_key FROM workspace_items
-                 WHERE workspace_key = ?1 AND kind = 'pending_unread' ORDER BY item_key",
+                "SELECT item_key, payload_json FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'pending_unread'",
             )?;
-            let keys = statement
-                .query_map([workspace_key], |row| row.get(0))?
+            let rows = statement
+                .query_map([workspace_key], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(StoreError::from)?;
-            Ok(keys)
+            let mut queue = Vec::new();
+            let mut legacy = Vec::new();
+            for (item_key, payload) in rows {
+                if item_key == PENDING_UNREAD_QUEUE_KEY {
+                    if let Ok(stored) = serde_json::from_str::<Vec<String>>(&payload) {
+                        queue.extend(stored);
+                    }
+                } else {
+                    legacy.push(item_key);
+                }
+            }
+            legacy.sort();
+            queue.extend(legacy);
+            Ok(normalized_pending_unread_queue(queue))
         })
         .await
     }
 
     pub async fn store_pending_unread_refresh(&self, channel_ids: &[String]) -> Result<()> {
-        let values = channel_ids
-            .iter()
-            .filter(|channel_id| !channel_id.trim().is_empty())
-            .map(|channel_id| (channel_id.clone(), ()))
-            .collect();
+        let queue = normalized_pending_unread_queue(channel_ids.iter().cloned());
+        let values = HashMap::from([(PENDING_UNREAD_QUEUE_KEY.to_string(), queue)]);
         self.store_kind_map("pending_unread", values, true).await
     }
 
@@ -965,34 +981,61 @@ impl WorkspaceStore {
     /// Applies an unread-state patch to one cached conversation atomically.
     /// Returns `false` when the state is unknown or the conversation is not in
     /// the cache, allowing callers to decide whether a full snapshot is needed.
+    #[cfg(test)]
     pub async fn apply_conversation_unread_state(
         &self,
         channel_id: &str,
         unread_state: SlackUnreadState,
         server_last_read: Option<&str>,
     ) -> Result<bool> {
-        if channel_id.trim().is_empty() || !unread_state.known {
+        self.apply_conversation_unread_snapshot(&SlackConversationUnreadSnapshot {
+            channel_id: channel_id.to_string(),
+            unread_state,
+            last_read: server_last_read.map(str::to_string),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Applies a complete server unread snapshot to one cached conversation
+    /// atomically, without allowing it to roll back a newer local read.
+    pub async fn apply_conversation_unread_snapshot(
+        &self,
+        snapshot: &SlackConversationUnreadSnapshot,
+    ) -> Result<bool> {
+        if snapshot.channel_id.trim().is_empty() || !snapshot.unread_state.known {
             return Ok(false);
         }
 
-        let server_last_read = server_last_read.map(str::to_string);
-        self.mutate_conversation_row(channel_id, move |conversation| {
+        let snapshot = snapshot.clone();
+        let channel_id = snapshot.channel_id.clone();
+        self.mutate_conversation_row(&channel_id, move |conversation| {
             let Some(mut conversation) = conversation else {
                 return ConversationRowMutation::Unchanged(false);
             };
-            let newer_local_read = conversation
+            let local_read = conversation
                 .extra
                 .get(LOCAL_READ_TS_KEY)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|local| {
-                    server_last_read
-                        .as_deref()
-                        .is_none_or(|server| local > server)
-                });
-            if newer_local_read {
+                .and_then(serde_json::Value::as_str);
+            let newer_local_read = local_read.is_some_and(|local| {
+                snapshot
+                    .last_read
+                    .as_deref()
+                    .is_none_or(|server| slack_timestamp_is_after(local, server))
+            });
+            let newer_cached_read = conversation.last_read_ts().is_some_and(|current| {
+                snapshot
+                    .last_read
+                    .as_deref()
+                    .is_some_and(|server| slack_timestamp_is_after(current, server))
+            });
+            if newer_local_read || newer_cached_read {
                 return ConversationRowMutation::Unchanged(false);
             }
-            conversation.apply_unread_state(unread_state);
+            if local_read.is_some() {
+                conversation.extra.remove(LOCAL_READ_TS_KEY);
+            }
+            conversation.apply_unread_snapshot(&snapshot);
             ConversationRowMutation::Upsert(conversation, true)
         })
         .await
@@ -1590,6 +1633,15 @@ impl WorkspaceStore {
     }
 }
 
+fn normalized_pending_unread_queue(channel_ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    channel_ids
+        .into_iter()
+        .filter(|channel_id| !channel_id.trim().is_empty())
+        .filter(|channel_id| seen.insert(channel_id.clone()))
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedWorkspaceState {
     version: u32,
@@ -1913,6 +1965,12 @@ fn load_sqlite_state(
             "thread_record" => state
                 .thread_catalog
                 .push(serde_json::from_str(&payload).context("invalid cached thread record")?),
+            "pending_unread" if item_key == PENDING_UNREAD_QUEUE_KEY => {
+                state.pending_unread_refresh.extend(
+                    serde_json::from_str::<Vec<String>>(&payload)
+                        .context("invalid cached pending unread queue")?,
+                );
+            }
             "pending_unread" => state.pending_unread_refresh.push(item_key),
             "custom_emoji" => {
                 state.custom_emojis.insert(
@@ -1923,6 +1981,7 @@ fn load_sqlite_state(
             _ => {}
         }
     }
+    state.pending_unread_refresh = normalized_pending_unread_queue(state.pending_unread_refresh);
     Ok(Some(state))
 }
 
@@ -2318,8 +2377,13 @@ fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String),
             record,
         )?;
     }
-    for key in &state.pending_unread_refresh {
-        insert_state_item(&mut items, "pending_unread", key.clone(), &())?;
+    if !state.pending_unread_refresh.is_empty() {
+        insert_state_item(
+            &mut items,
+            "pending_unread",
+            PENDING_UNREAD_QUEUE_KEY.to_string(),
+            &normalized_pending_unread_queue(state.pending_unread_refresh.iter().cloned()),
+        )?;
     }
     for (key, value) in &state.custom_emojis {
         insert_state_item(&mut items, "custom_emoji", key.clone(), value)?;
@@ -3924,6 +3988,76 @@ mod tests {
     }
 
     #[test]
+    fn unread_snapshot_preserves_local_read_and_latest_ordering_across_restart() {
+        let directory = temp_cache_dir("workspace-store-unread-snapshot-ordering");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_conversations(&[serde_json::from_value(serde_json::json!({
+                    "id": "D1",
+                    "is_im": true,
+                    "latest": "30.0"
+                }))
+                .unwrap()])
+                .await
+                .unwrap();
+            store
+                .clear_conversation_unread_state("D1", "20.0")
+                .await
+                .unwrap();
+
+            assert!(!store
+                .apply_conversation_unread_snapshot(&SlackConversationUnreadSnapshot {
+                    channel_id: "D1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 0),
+                    last_read: Some("19.0".to_string()),
+                    latest: Some("31.0".to_string()),
+                    mention_count: Some(4),
+                    is_open: Some(true),
+                })
+                .await
+                .unwrap());
+            assert!(store
+                .apply_conversation_unread_snapshot(&SlackConversationUnreadSnapshot {
+                    channel_id: "D1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 0),
+                    last_read: Some("20.0".to_string()),
+                    latest: Some("29.0".to_string()),
+                    mention_count: Some(4),
+                    is_open: Some(true),
+                })
+                .await
+                .unwrap());
+            assert!(!store
+                .apply_conversation_unread_snapshot(&SlackConversationUnreadSnapshot {
+                    channel_id: "D1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, false, 0),
+                    last_read: Some("19.0".to_string()),
+                    latest: Some("31.0".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap());
+        });
+
+        let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime.block_on(async {
+            let conversations = reopened.load_conversations().await.unwrap().unwrap();
+            let conversation = &conversations[0];
+            assert!(conversation.has_unread_activity());
+            assert_eq!(conversation.unread_activity_count(), 0);
+            assert_eq!(conversation.last_read_ts(), Some("20.0"));
+            assert_eq!(conversation.latest_message_ts(), Some("30.0"));
+            assert!(conversation.has_active_direct_message_hint());
+            assert!(!conversation.extra.contains_key(LOCAL_READ_TS_KEY));
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn atomic_membership_reconciliation_preserves_unread_overlay_and_pending_work() {
         let directory = temp_cache_dir("workspace-store-atomic-membership");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");
@@ -3958,6 +4092,120 @@ mod tests {
                 vec!["C1".to_string(), "D2".to_string()]
             );
         });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_preserves_pending_unread_refresh_queue_order() {
+        let directory = temp_cache_dir("workspace-store-pending-unread-order");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+        let pending = vec![
+            "D-zebra".to_string(),
+            "C-alpha".to_string(),
+            "D-middle".to_string(),
+        ];
+
+        runtime.block_on(async {
+            store.store_pending_unread_refresh(&pending).await.unwrap();
+
+            assert_eq!(store.load_pending_unread_refresh().await.unwrap(), pending);
+            assert_eq!(
+                store
+                    .load_state()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_unread_refresh,
+                pending
+            );
+        });
+
+        let connection = Connection::open(store.database_path()).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT item_key, payload_json FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'pending_unread'",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([&store.workspace_key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, PENDING_UNREAD_QUEUE_KEY);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&rows[0].1).unwrap(),
+            pending
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_loads_and_replaces_legacy_pending_unread_rows() {
+        let directory = temp_cache_dir("workspace-store-legacy-pending-unread");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+        runtime.block_on(store.ensure_workspace_identity()).unwrap();
+
+        {
+            let connection = Connection::open(store.database_path()).unwrap();
+            for channel_id in ["D-zebra", "C-alpha", "D-middle"] {
+                connection
+                    .execute(
+                        "INSERT INTO workspace_items(
+                            workspace_key, kind, item_key, payload_json
+                         ) VALUES (?1, 'pending_unread', ?2, 'null')",
+                        params![&store.workspace_key, channel_id],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let expected = vec![
+            "C-alpha".to_string(),
+            "D-middle".to_string(),
+            "D-zebra".to_string(),
+        ];
+        runtime.block_on(async {
+            assert_eq!(store.load_pending_unread_refresh().await.unwrap(), expected);
+            assert_eq!(
+                store
+                    .load_state()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_unread_refresh,
+                expected
+            );
+            store.store_pending_unread_refresh(&expected).await.unwrap();
+        });
+
+        let connection = Connection::open(store.database_path()).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT item_key, payload_json FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'pending_unread'",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([&store.workspace_key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, PENDING_UNREAD_QUEUE_KEY);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&rows[0].1).unwrap(),
+            expected
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }

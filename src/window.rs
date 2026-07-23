@@ -55,8 +55,8 @@ use crate::message_html::{
     TimelineScrollBehavior,
 };
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUnreadState, SlackUser, SlackUserStatus,
+    slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
+    SlackConversation, SlackFile, SlackMessage, SlackUnreadState, SlackUser, SlackUserStatus,
 };
 use crate::realtime::{RealtimePhase, RealtimeStatus};
 use crate::rendering;
@@ -152,6 +152,8 @@ mod imp {
         pub sidebar_filter_entry: TemplateChild<gtk::SearchEntry>,
         #[template_child]
         pub sidebar_unread_filter_button: TemplateChild<gtk::ToggleButton>,
+        #[template_child]
+        pub sidebar_all_filter_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub conversation_list: TemplateChild<gtk::ListBox>,
         #[template_child]
@@ -2745,6 +2747,13 @@ impl ConduitWindow {
         });
 
         let weak_window = self.downgrade();
+        imp.sidebar_all_filter_button.connect_toggled(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+            }
+        });
+
+        let weak_window = self.downgrade();
         imp.conversation_list.connect_row_activated(move |_, row| {
             if let Some(window) = weak_window.upgrade() {
                 window.activate_sidebar_row(row.index());
@@ -3540,28 +3549,43 @@ impl ConduitWindow {
             }
             RuntimeEventKind::ConversationsPatched {
                 conversations,
-                unread_states,
+                unread_snapshots,
             } => {
                 let mut catalog = self.imp().workspace.conversations.borrow_mut();
                 for conversation in conversations {
                     catalog.upsert_metadata(conversation);
                 }
-                for (channel_id, unread_state, server_last_read) in unread_states {
+                let mut acknowledged_local_reads = Vec::new();
+                for snapshot in unread_snapshots {
                     let newer_local_read = self
                         .imp()
                         .local_read_ts_by_channel
                         .borrow()
-                        .get(&channel_id)
+                        .get(&snapshot.channel_id)
                         .is_some_and(|local| {
-                            server_last_read
-                                .as_deref()
-                                .is_none_or(|server| local.as_str() > server)
+                            snapshot.last_read.as_deref().is_none_or(|server| {
+                                slack_timestamp_is_after(local.as_str(), server)
+                            })
                         });
                     if !newer_local_read {
-                        catalog.apply_realtime_unread(&channel_id, unread_state);
+                        if snapshot.last_read.is_some()
+                            && self
+                                .imp()
+                                .local_read_ts_by_channel
+                                .borrow()
+                                .contains_key(&snapshot.channel_id)
+                        {
+                            acknowledged_local_reads.push(snapshot.channel_id.clone());
+                        }
+                        catalog.apply_unread_snapshot(&snapshot);
                     }
                 }
                 drop(catalog);
+                let mut local_reads = self.imp().local_read_ts_by_channel.borrow_mut();
+                for channel_id in acknowledged_local_reads {
+                    local_reads.remove(&channel_id);
+                }
+                drop(local_reads);
                 self.sync_conversations_from_catalog();
             }
             RuntimeEventKind::ConversationUnreadUpdated {
@@ -5218,6 +5242,7 @@ impl ConduitWindow {
         imp.upload_progress.set_text(None);
         imp.sidebar_filter_entry.set_text("");
         imp.sidebar_unread_filter_button.set_active(false);
+        imp.sidebar_all_filter_button.set_active(false);
         imp.workspace_title_label.set_title(&gettext("Workspace"));
         imp.workspace_status_label.set_label("");
         imp.message_status_label.set_label("");
@@ -5977,6 +6002,7 @@ impl ConduitWindow {
                 query: imp.sidebar_filter_entry.text().as_str(),
                 unread_only: imp.sidebar_unread_filter_button.is_active(),
                 show_unreads_section: self.show_unreads_section(),
+                show_all: imp.sidebar_all_filter_button.is_active(),
                 loading: false,
                 has_error: imp.sidebar_error.borrow().is_some(),
                 user_search_aliases: Some(&user_search_aliases),
@@ -9965,6 +9991,8 @@ mod tests {
             "AdwOverlaySplitView\" id=\"thread_split",
             "AdwPasswordEntryRow\" id=\"xoxc_token_entry",
             "AdwPasswordEntryRow\" id=\"xoxd_token_entry",
+            "GtkToggleButton\" id=\"sidebar_all_filter_button",
+            "Show All Conversations",
             "GtkLabel\" id=\"message_status_label",
         ] {
             assert!(

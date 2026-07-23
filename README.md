@@ -19,7 +19,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 ### Conversations and navigation
 
 - Adaptive GNOME interface for channels, direct messages, and group messages.
-- Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state.
+- Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state. The default sidebar keeps relevant DMs compact; **Show All Conversations** and the conversation switcher expose the full catalog.
 - Sections for Messages, Unreads, observed threads, Files, and Later.
 - Fast conversation switcher with discovery of channels and people.
 - Create public or private channels, start direct or group messages, and add people to existing conversations when Slack permissions allow it.
@@ -241,6 +241,8 @@ For Enterprise Slack, copy `navigator.userAgent` from the same signed-in browser
 Browser-session credentials are highly sensitive and rely on an unofficial authentication path. Keep them out of shell history, logs, commits, screenshots, and issue reports. Unset the variables after import if you do not want Conduit to import them again after sign-out.
 
 An imported browser session also supplies realtime updates through Slack's browser WebSocket. No `xapp-` token is needed for that workspace; **Preferences → Realtime updates** shows whether the XOXC/XOXD connection is online or retrying.
+
+At startup, browser sessions also use Slack Web's private bootstrap/counts flow to establish unread conversation state. Slack does not document this flow as a supported API, so Conduit validates it defensively and falls back to its bounded per-conversation refresh if it is unavailable or changes shape.
 
 ## Optional realtime updates
 

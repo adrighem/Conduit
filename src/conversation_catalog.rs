@@ -1,4 +1,4 @@
-use crate::models::{SlackConversation, SlackUnreadState};
+use crate::models::{SlackConversation, SlackConversationUnreadSnapshot, SlackUnreadState};
 use std::collections::HashMap;
 
 /// The canonical, revision-aware set of conversations for a workspace.
@@ -171,6 +171,29 @@ impl ConversationCatalog {
 
     pub(crate) fn apply_realtime_unread(&mut self, id: &str, state: SlackUnreadState) {
         self.apply_unread(id, state);
+    }
+
+    pub(crate) fn apply_unread_snapshot(&mut self, snapshot: &SlackConversationUnreadSnapshot) {
+        if !snapshot.unread_state.known || snapshot.channel_id.trim().is_empty() {
+            return;
+        }
+
+        let revision = self.next_revision();
+        let entry = self
+            .entries
+            .entry(snapshot.channel_id.clone())
+            .or_insert_with(|| CatalogEntry {
+                conversation: SlackConversation {
+                    id: snapshot.channel_id.clone(),
+                    ..SlackConversation::default()
+                },
+                membership_revision: revision,
+                metadata_revision: revision,
+                unread_revision: revision,
+            });
+        entry.conversation.apply_unread_snapshot(snapshot);
+        entry.unread_revision = revision;
+        entry.membership_revision = entry.membership_revision.max(revision);
     }
 
     pub(crate) fn advance_read_cursor(&mut self, id: &str, ts: &str, remaining_unread: u64) {
@@ -399,6 +422,29 @@ mod tests {
         assert!(catalog.commit_membership_snapshot(snapshot));
 
         assert_eq!(catalog.get("C1").unwrap().unread_state().display_count, 7);
+    }
+
+    #[test]
+    fn unread_snapshot_updates_sidebar_state_and_activity_metadata_together() {
+        let mut direct_message = conversation("D1");
+        direct_message.is_im = Some(true);
+        let mut catalog = ConversationCatalog::from_cached([direct_message]);
+
+        catalog.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
+            channel_id: "D1".to_string(),
+            unread_state: SlackUnreadState::from_parts(true, true, 0),
+            last_read: Some("10.0".to_string()),
+            latest: Some("11.0".to_string()),
+            mention_count: Some(2),
+            is_open: Some(true),
+        });
+
+        let current = catalog.get("D1").unwrap();
+        assert!(current.has_unread_activity());
+        assert_eq!(current.unread_activity_count(), 0);
+        assert_eq!(current.last_read_ts(), Some("10.0"));
+        assert_eq!(current.latest_message_ts(), Some("11.0"));
+        assert!(current.has_active_direct_message_hint());
     }
 
     #[test]

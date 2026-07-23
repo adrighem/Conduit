@@ -290,6 +290,12 @@
                                     <property name="tooltip-text" translatable="yes">Show Unread Conversations</property>
                                   </object>
                                 </child>
+                                <child>
+                                  <object class="GtkToggleButton" id="sidebar_all_filter_button">
+                                    <property name="icon-name">view-list-symbolic</property>
+                                    <property name="tooltip-text" translatable="yes">Show All Conversations</property>
+                                  </object>
+                                </child>
                               </object>
                             </child>
                             <child>

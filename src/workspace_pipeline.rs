@@ -14,7 +14,12 @@
 
 use std::collections::HashMap;
 
-use crate::models::{SlackConversation, SlackMessage, SlackUnreadState, SlackUser};
+#[cfg(test)]
+use crate::models::SlackUnreadState;
+use crate::models::{
+    slack_timestamp_is_after, SlackConversation, SlackConversationUnreadSnapshot, SlackMessage,
+    SlackUser,
+};
 use crate::thread_catalog::ThreadRecord;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,9 +112,7 @@ pub(crate) enum WorkspaceMutation {
         channel_id: String,
     },
     UnreadChanged {
-        channel_id: String,
-        state: SlackUnreadState,
-        server_last_read: Option<String>,
+        snapshot: SlackConversationUnreadSnapshot,
         base_revision: WorkspaceRevision,
     },
     ReadAdvanced {
@@ -171,8 +174,7 @@ pub(crate) enum WorkspaceChange {
         channel_id: String,
     },
     UnreadChanged {
-        channel_id: String,
-        state: SlackUnreadState,
+        snapshot: SlackConversationUnreadSnapshot,
     },
     UsersReset(Vec<SlackUser>),
     UserUpsert(SlackUser),
@@ -214,9 +216,7 @@ pub(crate) enum StoreChange {
         channel_id: String,
     },
     UnreadChanged {
-        channel_id: String,
-        state: SlackUnreadState,
-        server_last_read: Option<String>,
+        snapshot: SlackConversationUnreadSnapshot,
     },
     UsersReplaced(Vec<SlackUser>),
     UserUpsert(SlackUser),
@@ -344,11 +344,9 @@ impl WorkspaceCoordinator {
                 self.apply_conversation_remove(&channel_id)
             }
             WorkspaceMutation::UnreadChanged {
-                channel_id,
-                state,
-                server_last_read,
+                snapshot,
                 base_revision,
-            } => self.apply_unread(&channel_id, state, server_last_read, base_revision),
+            } => self.apply_unread(snapshot, base_revision),
             WorkspaceMutation::ReadAdvanced {
                 channel_id,
                 ts,
@@ -608,28 +606,39 @@ impl WorkspaceCoordinator {
 
     fn apply_unread(
         &mut self,
-        channel_id: &str,
-        state: SlackUnreadState,
-        server_last_read: Option<String>,
+        snapshot: SlackConversationUnreadSnapshot,
         base_revision: WorkspaceRevision,
     ) -> Option<WorkspaceReduction> {
-        if !state.known || channel_id.trim().is_empty() {
+        if !snapshot.unread_state.known || snapshot.channel_id.trim().is_empty() {
             return None;
         }
         if self
             .conversations
-            .get(channel_id)
+            .get(&snapshot.channel_id)
             .is_some_and(|entry| entry.unread_revision > base_revision)
+        {
+            return None;
+        }
+        if self
+            .conversations
+            .get(&snapshot.channel_id)
+            .and_then(|entry| entry.value.last_read_ts())
+            .is_some_and(|current| {
+                snapshot
+                    .last_read
+                    .as_deref()
+                    .is_some_and(|incoming| slack_timestamp_is_after(current, incoming))
+            })
         {
             return None;
         }
         let revision = self.next_revision();
         let entry = self
             .conversations
-            .entry(channel_id.to_string())
+            .entry(snapshot.channel_id.clone())
             .or_insert_with(|| RevisionedConversation {
                 value: SlackConversation {
-                    id: channel_id.to_string(),
+                    id: snapshot.channel_id.clone(),
                     ..Default::default()
                 },
                 membership_revision: revision,
@@ -637,13 +646,7 @@ impl WorkspaceCoordinator {
                 unread_revision: revision,
             });
         let before = entry.value.clone();
-        entry.value.apply_unread_state(state);
-        if let Some(last_read) = server_last_read.as_deref() {
-            entry.value.extra.insert(
-                "last_read".to_string(),
-                serde_json::Value::String(last_read.to_string()),
-            );
-        }
+        entry.value.apply_unread_snapshot(&snapshot);
         if entry.value == before {
             return None;
         }
@@ -652,14 +655,9 @@ impl WorkspaceCoordinator {
         self.commit(
             revision,
             vec![WorkspaceChange::UnreadChanged {
-                channel_id: channel_id.to_string(),
-                state,
+                snapshot: snapshot.clone(),
             }],
-            vec![StoreChange::UnreadChanged {
-                channel_id: channel_id.to_string(),
-                state,
-                server_last_read,
-            }],
+            vec![StoreChange::UnreadChanged { snapshot }],
         )
     }
 
@@ -680,12 +678,15 @@ impl WorkspaceCoordinator {
         entry.unread_revision = revision;
         let state = entry.value.unread_state();
         let conversation = entry.value.clone();
+        let snapshot = SlackConversationUnreadSnapshot {
+            channel_id: channel_id.to_string(),
+            unread_state: state,
+            last_read: Some(ts.to_string()),
+            ..Default::default()
+        };
         self.commit(
             revision,
-            vec![WorkspaceChange::UnreadChanged {
-                channel_id: channel_id.to_string(),
-                state,
-            }],
+            vec![WorkspaceChange::UnreadChanged { snapshot }],
             vec![StoreChange::ConversationUpsert(conversation)],
         )
     }
@@ -1256,9 +1257,11 @@ mod tests {
         )));
         let snapshot_revision = coordinator.revision();
         coordinator.apply(WorkspaceMutation::UnreadChanged {
-            channel_id: "C1".to_string(),
-            state: SlackUnreadState::from_parts(true, true, 4),
-            server_last_read: None,
+            snapshot: SlackConversationUnreadSnapshot {
+                channel_id: "C1".to_string(),
+                unread_state: SlackUnreadState::from_parts(true, true, 4),
+                ..Default::default()
+            },
             base_revision: snapshot_revision,
         });
         let mut stale = conversation("C1", "renamed");
@@ -1289,9 +1292,13 @@ mod tests {
 
         assert!(coordinator
             .apply(WorkspaceMutation::UnreadChanged {
-                channel_id: "C1".to_string(),
-                state: SlackUnreadState::from_parts(true, true, 5),
-                server_last_read: Some("10.0".to_string()),
+                snapshot: SlackConversationUnreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 5),
+                    last_read: Some("10.0".to_string()),
+                    latest: Some("30.0".to_string()),
+                    ..Default::default()
+                },
                 base_revision: response_base,
             })
             .is_none());
@@ -1314,9 +1321,13 @@ mod tests {
         }));
         assert!(coordinator
             .apply(WorkspaceMutation::UnreadChanged {
-                channel_id: "C1".to_string(),
-                state: SlackUnreadState::from_parts(true, true, 2),
-                server_last_read: Some("21.0".to_string()),
+                snapshot: SlackConversationUnreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 2),
+                    last_read: Some("21.0".to_string()),
+                    latest: Some("30.0".to_string()),
+                    ..Default::default()
+                },
                 base_revision: unrelated_base,
             })
             .is_some());
@@ -1326,6 +1337,10 @@ mod tests {
                 .unwrap()
                 .unread_activity_count(),
             2
+        );
+        assert_eq!(
+            coordinator.conversation("C1").unwrap().latest_message_ts(),
+            Some("30.0")
         );
     }
 

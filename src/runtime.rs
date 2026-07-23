@@ -24,14 +24,18 @@ use crate::huddles::model::{ActiveHuddle, HuddlePresence};
 use crate::huddles::signaling::{production_native_join_capability, NativeJoinCapability};
 use crate::huddles::state::{HuddleCommand, HuddleEvent, HuddleFailure, HuddlePhase};
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUnreadState, SlackUser, SlackUserGroup, SlackUserStatus, StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
+    SlackConversationUnreadSnapshot, SlackFile, SlackMessage, SlackUnreadState, SlackUser,
+    SlackUserGroup, SlackUserStatus, StoredToken,
 };
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::{
     ConversationHistoryProgress, ConversationHistoryService,
 };
-use crate::slack::{DownloadedPreviewAsset, SlackApi, SlackErrorCategory, SlackMessagePage};
+use crate::slack::{
+    DownloadedPreviewAsset, SlackApi, SlackErrorCategory, SlackMessagePage, SlackUnreadSnapshot,
+    SlackUnreadSnapshotRecord,
+};
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore};
 use crate::thread_catalog::ThreadRecord;
@@ -764,7 +768,7 @@ pub enum RuntimeEventKind {
     },
     ConversationsPatched {
         conversations: Vec<SlackConversation>,
-        unread_states: Vec<(String, SlackUnreadState, Option<String>)>,
+        unread_snapshots: Vec<SlackConversationUnreadSnapshot>,
     },
     ConversationUnreadUpdated {
         channel_id: String,
@@ -1097,6 +1101,7 @@ impl RuntimeTaskLimits {
 #[derive(Clone)]
 struct RuntimeConnection {
     slack: SlackApi,
+    workspace_url: Option<String>,
     workspace_store: Option<WorkspaceStore>,
     workspace: WorkspaceReducerAdapter,
     user_cache: Arc<Mutex<HashMap<String, String>>>,
@@ -2032,6 +2037,7 @@ fn spawn_authentication_task<F>(
                         }
                         let connection = RuntimeConnection {
                             slack: api,
+                            workspace_url: auth.url.clone(),
                             workspace_store: Some(WorkspaceStore::new(
                                 config::state_cache_dir(),
                                 &workspace_store_id(&auth),
@@ -2158,6 +2164,7 @@ fn spawn_workspace_tasks(
                 if let Err(error) = load_conversations_best_effort_with_api(
                     &refresh_events,
                     &refresh_connection.slack,
+                    refresh_connection.workspace_url.as_deref(),
                     &refresh_connection.workspace_store,
                     &refresh_connection.workspace,
                     cached_user_names,
@@ -2383,6 +2390,7 @@ async fn handle_connected_command(
         user_cache: &mut user_cache,
         read_marks: &mut read_marks,
         team_id: connection.team_id.as_deref(),
+        workspace_url: connection.workspace_url.as_deref(),
         huddles: &connection.huddles,
     };
 
@@ -2414,6 +2422,7 @@ struct RuntimeContext<'a> {
     user_cache: &'a mut HashMap<String, String>,
     read_marks: &'a mut HashMap<String, String>,
     team_id: Option<&'a str>,
+    workspace_url: Option<&'a str>,
     huddles: &'a HuddleActorHandle,
 }
 
@@ -2446,6 +2455,33 @@ struct ChannelHistoryPrefetchCandidate {
     unread_count: u64,
     activity_score: f64,
     title: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ConversationUnreadRefreshTier {
+    UnknownActiveDirectMessage,
+    UnknownDirectMessage,
+    UnreadDirectMessage,
+    ActiveDirectMessage,
+    AttentionOrUnknown,
+    Background,
+}
+
+#[derive(Debug, Clone)]
+struct ConversationUnreadRefreshCandidate {
+    id: String,
+    tier: ConversationUnreadRefreshTier,
+    unread_count: u64,
+    priority: f64,
+    activity_score: f64,
+    title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConversationUnreadRefreshPlan {
+    batch: Vec<String>,
+    queue: Vec<String>,
+    next_queue: Vec<String>,
 }
 
 #[cfg(test)]
@@ -2498,33 +2534,97 @@ fn conversation_unread_refresh_candidates(conversations: &[SlackConversation]) -
         .iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .filter(|conversation| !conversation.id.trim().is_empty())
-        .map(|conversation| ChannelHistoryPrefetchCandidate {
-            id: conversation.id.clone(),
-            huddle_metadata: false,
-            unread: conversation.has_unread_activity(),
-            direct_message: conversation.is_im.unwrap_or(false)
-                || conversation.is_mpim.unwrap_or(false),
-            unread_count: conversation.unread_activity_count(),
-            activity_score: conversation_activity_score(conversation),
-            title: conversation.display_name().to_lowercase(),
-        })
+        .map(conversation_unread_refresh_candidate)
         .collect::<Vec<_>>();
 
     candidates.sort_by(|left, right| {
-        right
-            .unread
-            .cmp(&left.unread)
+        left.tier
+            .cmp(&right.tier)
             .then_with(|| right.unread_count.cmp(&left.unread_count))
+            .then_with(|| right.priority.total_cmp(&left.priority))
             .then_with(|| right.activity_score.total_cmp(&left.activity_score))
             .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.id.cmp(&right.id))
     });
-    candidates.dedup_by(|left, right| left.id == right.id);
+    let mut seen = HashSet::new();
     candidates
         .into_iter()
-        .take(CONVERSATION_ENRICHMENT_LIMIT)
+        .filter(|candidate| seen.insert(candidate.id.clone()))
         .map(|candidate| candidate.id)
         .collect()
+}
+
+fn conversation_unread_refresh_candidate(
+    conversation: &SlackConversation,
+) -> ConversationUnreadRefreshCandidate {
+    let unread = conversation.unread_state();
+    let direct_message = conversation.is_direct_message();
+    let priority = conversation.priority_hint();
+    let active_direct_message = conversation.has_active_direct_message_hint();
+    let tier = if direct_message && !unread.known && active_direct_message {
+        ConversationUnreadRefreshTier::UnknownActiveDirectMessage
+    } else if direct_message && !unread.known {
+        ConversationUnreadRefreshTier::UnknownDirectMessage
+    } else if direct_message && unread.has_unread {
+        ConversationUnreadRefreshTier::UnreadDirectMessage
+    } else if active_direct_message {
+        ConversationUnreadRefreshTier::ActiveDirectMessage
+    } else if unread.has_unread || !unread.known {
+        ConversationUnreadRefreshTier::AttentionOrUnknown
+    } else {
+        ConversationUnreadRefreshTier::Background
+    };
+
+    ConversationUnreadRefreshCandidate {
+        id: conversation.id.clone(),
+        tier,
+        unread_count: conversation.unread_activity_count(),
+        priority,
+        activity_score: conversation_activity_score(conversation),
+        title: conversation.display_name().to_lowercase(),
+    }
+}
+
+fn conversation_unread_refresh_plan(
+    cached_pending: Vec<String>,
+    ranked_candidates: Vec<String>,
+    limit: usize,
+) -> ConversationUnreadRefreshPlan {
+    let mut candidate_ids = HashSet::new();
+    let ranked_candidates = ranked_candidates
+        .into_iter()
+        .filter(|channel_id| !channel_id.trim().is_empty())
+        .filter(|channel_id| candidate_ids.insert(channel_id.clone()))
+        .collect::<Vec<_>>();
+    let mut cached_ids = HashSet::new();
+    let cached_pending = cached_pending
+        .into_iter()
+        .filter(|channel_id| candidate_ids.contains(channel_id))
+        .filter(|channel_id| cached_ids.insert(channel_id.clone()))
+        .collect::<Vec<_>>();
+    // Preserve the circular order for already-queued IDs. Newly unread or active
+    // conversations are surfaced by their state/realtime updates, while moving
+    // existing IDs back to the front here could indefinitely starve the tail.
+    let mut seen = HashSet::new();
+    let queue = ranked_candidates
+        .into_iter()
+        .filter(|channel_id| !cached_ids.contains(channel_id))
+        .chain(cached_pending)
+        .filter(|channel_id| seen.insert(channel_id.clone()))
+        .collect::<Vec<_>>();
+    let split = limit.min(queue.len());
+    let batch = queue[..split].to_vec();
+    let next_queue = queue[split..]
+        .iter()
+        .chain(&queue[..split])
+        .cloned()
+        .collect();
+
+    ConversationUnreadRefreshPlan {
+        batch,
+        queue,
+        next_queue,
+    }
 }
 
 fn channel_history_prefetch_candidate(
@@ -2608,6 +2708,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             load_conversations_best_effort_with_api(
                 context.events,
                 &api,
+                context.workspace_url,
                 &workspace_store,
                 context.workspace,
                 cached_user_names,
@@ -3918,9 +4019,6 @@ async fn load_conversations_with_api(
         )),
     );
     events.send_event(RuntimeEventKind::ConversationsLoaded(conversations.clone()));
-    events.send_event(RuntimeEventKind::WorkspaceLifecycle(
-        WorkspaceLifecycleEvent::SyncCompleted,
-    ));
     Ok(conversations)
 }
 
@@ -3946,6 +4044,7 @@ fn reconcile_conversation_snapshot(
 async fn load_conversations_best_effort_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
+    workspace_url: Option<&str>,
     workspace_store: &Option<WorkspaceStore>,
     workspace: &WorkspaceReducerAdapter,
     cached_user_names: HashMap<String, String>,
@@ -3954,18 +4053,31 @@ async fn load_conversations_best_effort_with_api(
 ) -> Result<()> {
     match load_conversations_with_api(events, api, workspace_store, workspace).await {
         Ok(conversations) => {
+            let browser_covered = apply_browser_unread_snapshot_best_effort(
+                events,
+                api,
+                workspace_url,
+                workspace_store,
+                workspace,
+                &conversations,
+            )
+            .await;
+            events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                WorkspaceLifecycleEvent::SyncCompleted,
+            ));
             let current_huddle_channels = conversations
                 .iter()
                 .filter(|conversation| conversation.has_huddle_metadata())
                 .map(|conversation| conversation.id.clone())
                 .collect::<HashSet<_>>();
-            let unread_refresh_candidates = conversation_unread_refresh_candidates(&conversations);
+            let unread_refresh_candidates =
+                uncovered_conversation_unread_refresh_candidates(&conversations, &browser_covered);
             refresh_conversation_unread_states_best_effort(
                 events,
                 api,
                 workspace_store,
                 workspace,
-                unread_refresh_candidates.iter(),
+                unread_refresh_candidates,
             )
             .await;
             let refreshed_conversations = if let Some(store) = workspace_store.as_ref() {
@@ -4010,28 +4122,150 @@ async fn load_conversations_best_effort_with_api(
     Ok(())
 }
 
-async fn refresh_conversation_unread_states_best_effort<'a>(
+fn uncovered_conversation_unread_refresh_candidates(
+    conversations: &[SlackConversation],
+    covered: &HashSet<String>,
+) -> Vec<String> {
+    conversation_unread_refresh_candidates(conversations)
+        .into_iter()
+        .filter(|channel_id| !covered.contains(channel_id))
+        .collect()
+}
+
+fn browser_unread_snapshots_for_catalog(
+    snapshot: SlackUnreadSnapshot,
+    conversations: &[SlackConversation],
+) -> (Vec<SlackConversationUnreadSnapshot>, HashSet<String>) {
+    let known_ids = conversations
+        .iter()
+        .map(|conversation| conversation.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut covered = HashSet::new();
+    let snapshots = snapshot
+        .channels
+        .into_iter()
+        .map(|record| (record, None))
+        .chain(snapshot.ims.into_iter().map(|record| {
+            let is_open = record.is_open;
+            (record, Some(is_open))
+        }))
+        .chain(snapshot.mpims.into_iter().map(|record| (record, None)))
+        .filter(|(record, _)| known_ids.contains(record.conversation_id.as_str()))
+        .filter_map(|(record, is_open)| {
+            if !covered.insert(record.conversation_id.clone()) {
+                return None;
+            }
+            Some(browser_unread_record_snapshot(record, is_open))
+        })
+        .collect();
+    (snapshots, covered)
+}
+
+fn browser_unread_record_snapshot(
+    record: SlackUnreadSnapshotRecord,
+    is_open: Option<bool>,
+) -> SlackConversationUnreadSnapshot {
+    SlackConversationUnreadSnapshot {
+        channel_id: record.conversation_id,
+        unread_state: SlackUnreadState::from_parts(true, record.has_unreads, 0),
+        last_read: record.last_read,
+        latest: record.latest,
+        mention_count: Some(record.mention_count),
+        is_open,
+    }
+}
+
+async fn apply_browser_unread_snapshot_best_effort(
+    events: &RuntimeEventSender,
+    api: &SlackApi,
+    workspace_url: Option<&str>,
+    workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+    conversations: &[SlackConversation],
+) -> HashSet<String> {
+    if api.browser_cookie_d().is_none() {
+        return HashSet::new();
+    }
+    let Some(workspace_url) = workspace_url else {
+        crate::debug::log(
+            "runtime",
+            "BrowserUnreadSnapshotUnavailable category=Validation",
+        );
+        return HashSet::new();
+    };
+    let snapshot = match api.browser_unread_snapshot(workspace_url).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::debug::log(
+                "runtime",
+                &format!(
+                    "BrowserUnreadSnapshotUnavailable category={:?}",
+                    error.category()
+                ),
+            );
+            return HashSet::new();
+        }
+    };
+    let (snapshots, covered) = browser_unread_snapshots_for_catalog(snapshot, conversations);
+    let base_revision = workspace.revision();
+    let mut accepted = Vec::new();
+    for snapshot in snapshots {
+        let reduced = workspace.apply(
+            MutationOrigin::WebApi,
+            WorkspaceMutation::UnreadChanged {
+                snapshot: snapshot.clone(),
+                base_revision,
+            },
+        );
+        if reduced && store_conversation_unread_state(workspace_store, &snapshot).await {
+            accepted.push(snapshot);
+        }
+    }
+    crate::debug::log(
+        "runtime",
+        &format!(
+            "BrowserUnreadSnapshotApplied covered={} changed={}",
+            covered.len(),
+            accepted.len()
+        ),
+    );
+    let mut conversations = Vec::new();
+    send_conversation_patch_batch(events, workspace, &mut conversations, &mut accepted);
+    covered
+}
+
+async fn refresh_conversation_unread_states_best_effort(
     events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     workspace: &WorkspaceReducerAdapter,
-    channel_ids: impl IntoIterator<Item = &'a String>,
+    ranked_channel_ids: Vec<String>,
 ) {
-    let mut pending = channel_ids.into_iter().cloned().collect::<Vec<_>>();
-    if let Some(store) = workspace_store.as_ref() {
+    let cached_pending = if let Some(store) = workspace_store.as_ref() {
         match store.load_pending_unread_refresh().await {
-            Ok(cached_pending) => pending.extend(cached_pending),
-            Err(error) => crate::debug::log(
-                "store",
-                &format!("PendingUnreadRefreshLoadFailed error={error:#}"),
-            ),
+            Ok(cached_pending) => cached_pending,
+            Err(error) => {
+                crate::debug::log(
+                    "store",
+                    &format!("PendingUnreadRefreshLoadFailed error={error:#}"),
+                );
+                Vec::new()
+            }
         }
-    }
-    let mut seen = HashSet::new();
-    pending.retain(|channel_id| seen.insert(channel_id.clone()));
-    pending.truncate(CONVERSATION_ENRICHMENT_LIMIT);
+    } else {
+        Vec::new()
+    };
+    let ConversationUnreadRefreshPlan {
+        batch: mut pending,
+        queue,
+        next_queue,
+    } = conversation_unread_refresh_plan(
+        cached_pending,
+        ranked_channel_ids,
+        CONVERSATION_ENRICHMENT_LIMIT,
+    );
     if let Some(store) = workspace_store.as_ref() {
-        if let Err(error) = store.store_pending_unread_refresh(&pending).await {
+        if let Err(error) = store.store_pending_unread_refresh(&queue).await {
             crate::debug::log(
                 "store",
                 &format!("PendingUnreadRefreshStoreFailed error={error:#}"),
@@ -4046,10 +4280,26 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
             let unread_base_revision = workspace.revision();
             match api.conversation_with_unread_state(&channel_id).await {
                 Ok((details, unread_state)) => {
-                    let server_last_read = details.as_ref().and_then(|details| {
-                        details.extra.get("last_read")?.as_str().map(str::to_string)
-                    });
+                    let unread_snapshot = SlackConversationUnreadSnapshot {
+                        channel_id: channel_id.clone(),
+                        unread_state,
+                        last_read: details
+                            .as_ref()
+                            .and_then(|details| details.last_read_ts().map(str::to_string)),
+                        latest: details
+                            .as_ref()
+                            .and_then(|details| details.latest_message_ts().map(str::to_string)),
+                        mention_count: details
+                            .as_ref()
+                            .and_then(|details| details.extra.get("mention_count")?.as_u64()),
+                        is_open: details
+                            .as_ref()
+                            .and_then(|details| details.extra.get("is_open")?.as_bool()),
+                    };
                     if let Some(mut details) = details {
+                        // Cursor metadata is committed atomically with unread state below.
+                        details.extra.remove("last_read");
+                        details.extra.remove("latest");
                         if details.is_mpim.unwrap_or(false) {
                             match api.conversation_members(&channel_id).await {
                                 Ok(members) => {
@@ -4085,22 +4335,14 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
                         && workspace.apply(
                             MutationOrigin::WebApi,
                             WorkspaceMutation::UnreadChanged {
-                                channel_id: channel_id.clone(),
-                                state: unread_state,
-                                server_last_read: server_last_read.clone(),
+                                snapshot: unread_snapshot.clone(),
                                 base_revision: unread_base_revision,
                             },
                         );
                     if unread_accepted
-                        && store_conversation_unread_state(
-                            workspace_store,
-                            &channel_id,
-                            unread_state,
-                            server_last_read.as_deref(),
-                        )
-                        .await
+                        && store_conversation_unread_state(workspace_store, &unread_snapshot).await
                     {
-                        unread_batch.push((channel_id.clone(), unread_state, server_last_read));
+                        unread_batch.push(unread_snapshot);
                     } else if !unread_state.known {
                         failed.push(channel_id.clone());
                     }
@@ -4131,7 +4373,7 @@ async fn refresh_conversation_unread_states_best_effort<'a>(
         }
     }
     if let Some(store) = workspace_store.as_ref() {
-        if let Err(error) = store.store_pending_unread_refresh(&pending).await {
+        if let Err(error) = store.store_pending_unread_refresh(&next_queue).await {
             crate::debug::log(
                 "store",
                 &format!("PendingUnreadRefreshStoreFailed error={error:#}"),
@@ -4145,9 +4387,9 @@ fn send_conversation_patch_batch(
     events: &RuntimeEventSender,
     workspace: &WorkspaceReducerAdapter,
     conversations: &mut Vec<SlackConversation>,
-    unread_states: &mut Vec<(String, SlackUnreadState, Option<String>)>,
+    unread_snapshots: &mut Vec<SlackConversationUnreadSnapshot>,
 ) {
-    if conversations.is_empty() && unread_states.is_empty() {
+    if conversations.is_empty() && unread_snapshots.is_empty() {
         return;
     }
     for conversation in conversations.iter().cloned() {
@@ -4158,7 +4400,7 @@ fn send_conversation_patch_batch(
     }
     events.send_event(RuntimeEventKind::ConversationsPatched {
         conversations: std::mem::take(conversations),
-        unread_states: std::mem::take(unread_states),
+        unread_snapshots: std::mem::take(unread_snapshots),
     });
 }
 
@@ -4224,23 +4466,20 @@ async fn prefetch_channel_histories_best_effort(
                     },
                 );
                 observe_huddle_messages(huddles, team_id, &channel_id, &page.messages);
+                let unread_snapshot = SlackConversationUnreadSnapshot {
+                    channel_id: channel_id.clone(),
+                    unread_state: page.unread_state,
+                    ..Default::default()
+                };
                 let unread_accepted = workspace.reducer.apply(
                     MutationOrigin::WebApi,
                     WorkspaceMutation::UnreadChanged {
-                        channel_id: channel_id.clone(),
-                        state: page.unread_state,
-                        server_last_read: None,
+                        snapshot: unread_snapshot.clone(),
                         base_revision,
                     },
                 );
                 if unread_accepted
-                    && store_conversation_unread_state(
-                        workspace.store,
-                        &channel_id,
-                        page.unread_state,
-                        None,
-                    )
-                    .await
+                    && store_conversation_unread_state(workspace.store, &unread_snapshot).await
                 {
                     send_conversation_unread_update(events, &channel_id, page.unread_state);
                 }
@@ -4505,22 +4744,20 @@ async fn clear_cached_conversation_unread(
 
 async fn store_conversation_unread_state(
     workspace_store: &Option<WorkspaceStore>,
-    channel_id: &str,
-    unread_state: SlackUnreadState,
-    server_last_read: Option<&str>,
+    snapshot: &SlackConversationUnreadSnapshot,
 ) -> bool {
     let Some(store) = workspace_store.as_ref() else {
-        return unread_state.known;
+        return snapshot.unread_state.known;
     };
-    match store
-        .apply_conversation_unread_state(channel_id, unread_state, server_last_read)
-        .await
-    {
+    match store.apply_conversation_unread_snapshot(snapshot).await {
         Ok(applied) => applied,
         Err(error) => {
             crate::debug::log(
                 "store",
-                &format!("ConversationUnreadStoreFailed channel_id={channel_id} error={error:#}"),
+                &format!(
+                    "ConversationUnreadStoreFailed channel_id={} error={error:#}",
+                    snapshot.channel_id
+                ),
             );
             false
         }
@@ -6556,7 +6793,58 @@ mod tests {
     }
 
     #[test]
-    fn conversation_unread_refresh_candidates_prioritize_attention_and_limit_work() {
+    fn browser_unread_snapshot_covers_only_known_records_and_keeps_badges_boolean() {
+        let conversations = vec![channel("C1", 0, None), dm("D1", 0), dm("D2", 0)];
+        let raw = SlackUnreadSnapshot {
+            channels: vec![SlackUnreadSnapshotRecord {
+                conversation_id: "C1".to_string(),
+                last_read: Some("10.0".to_string()),
+                latest: Some("10.0".to_string()),
+                has_unreads: false,
+                mention_count: 0,
+                is_open: false,
+            }],
+            ims: vec![
+                SlackUnreadSnapshotRecord {
+                    conversation_id: "D1".to_string(),
+                    last_read: Some("10.0".to_string()),
+                    latest: Some("11.0".to_string()),
+                    has_unreads: true,
+                    mention_count: 5,
+                    is_open: true,
+                },
+                SlackUnreadSnapshotRecord {
+                    conversation_id: "D-unknown".to_string(),
+                    last_read: Some("10.0".to_string()),
+                    latest: Some("11.0".to_string()),
+                    has_unreads: true,
+                    mention_count: 1,
+                    is_open: true,
+                },
+            ],
+            mpims: Vec::new(),
+        };
+
+        let (snapshots, covered) = browser_unread_snapshots_for_catalog(raw, &conversations);
+
+        assert_eq!(covered, HashSet::from(["C1".to_string(), "D1".to_string()]));
+        assert_eq!(snapshots.len(), 2);
+        let direct_message = snapshots
+            .iter()
+            .find(|snapshot| snapshot.channel_id == "D1")
+            .unwrap();
+        assert!(direct_message.unread_state.has_unread);
+        assert_eq!(direct_message.unread_state.display_count, 0);
+        assert_eq!(direct_message.mention_count, Some(5));
+        assert_eq!(direct_message.is_open, Some(true));
+        assert_eq!(
+            uncovered_conversation_unread_refresh_candidates(&conversations, &covered),
+            vec!["D2"]
+        );
+    }
+
+    #[test]
+    fn conversation_unread_refresh_candidates_prioritize_dm_state_before_known_unread_channels() {
         let conversations = vec![
             channel("C-zebra", 0, None),
             archived_channel("C-archived", 10),
@@ -6570,13 +6858,211 @@ mod tests {
             vec!["D-ada", "C-127", "C-aggregator", "C-zebra"]
         );
 
-        let many = (0..75)
-            .map(|index| channel(&format!("C{index}"), 0, None))
+        let mut many = (0..CONVERSATION_ENRICHMENT_LIMIT + 5)
+            .map(|index| channel(&format!("C{index}"), 10, None))
             .collect::<Vec<_>>();
-        assert_eq!(
-            conversation_unread_refresh_candidates(&many).len(),
-            CONVERSATION_ENRICHMENT_LIMIT
+        let unknown_dm = SlackConversation {
+            id: "D-unknown".to_string(),
+            user: Some("U-unknown".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        let mut active_unknown_dm = SlackConversation {
+            id: "D-active".to_string(),
+            user: Some("U-active".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        active_unknown_dm
+            .extra
+            .insert("priority".to_string(), serde_json::json!(0.75));
+        let known_unread_dm = dm("D-unread", 1);
+        let mut active_known_read_count = dm("D-active-read-count", 0);
+        active_known_read_count
+            .extra
+            .insert("is_open".to_string(), serde_json::json!(true));
+        let mut active_known_read_flag = SlackConversation {
+            id: "D-active-read-flag".to_string(),
+            user: Some("U-read-flag".to_string()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        active_known_read_flag
+            .extra
+            .insert("has_unreads".to_string(), serde_json::json!(false));
+        active_known_read_flag
+            .extra
+            .insert("priority".to_string(), serde_json::json!(0.5));
+        assert!(!unknown_dm.unread_state().known);
+        assert!(active_known_read_count.unread_state().known);
+        assert!(active_known_read_flag.unread_state().known);
+        assert!(!active_known_read_flag.unread_state().has_unread);
+        many.extend([
+            unknown_dm,
+            active_unknown_dm,
+            known_unread_dm,
+            active_known_read_count,
+            active_known_read_flag,
+        ]);
+
+        let candidates = conversation_unread_refresh_candidates(&many);
+        assert_eq!(candidates.first().map(String::as_str), Some("D-active"));
+        assert_eq!(candidates.get(1).map(String::as_str), Some("D-unknown"));
+        assert_eq!(candidates.get(2).map(String::as_str), Some("D-unread"));
+        let unread_dm_index = candidates
+            .iter()
+            .position(|channel_id| channel_id == "D-unread")
+            .unwrap();
+        for active_read_id in ["D-active-read-count", "D-active-read-flag"] {
+            assert!(
+                unread_dm_index
+                    < candidates
+                        .iter()
+                        .position(|channel_id| channel_id == active_read_id)
+                        .unwrap()
+            );
+        }
+        let plan = conversation_unread_refresh_plan(
+            Vec::new(),
+            candidates.clone(),
+            CONVERSATION_ENRICHMENT_LIMIT,
         );
+        assert_eq!(plan.batch.len(), CONVERSATION_ENRICHMENT_LIMIT);
+        assert!(plan.batch.contains(&"D-active".to_string()));
+        assert!(plan.batch.contains(&"D-unknown".to_string()));
+        assert_eq!(plan.queue.len(), candidates.len());
+        assert_eq!(plan.next_queue.len(), candidates.len());
+    }
+
+    #[test]
+    fn conversation_priority_ignores_non_finite_values() {
+        for priority in ["NaN", "inf", "-inf"] {
+            let mut conversation = dm("D1", 0);
+            conversation
+                .extra
+                .insert("priority".to_string(), serde_json::json!(priority));
+
+            assert_eq!(conversation.priority_hint(), 0.0);
+        }
+    }
+
+    #[test]
+    fn conversation_unread_refresh_plan_rotates_every_candidate_without_starvation() {
+        let candidates = (0..CONVERSATION_ENRICHMENT_LIMIT * 2 + 5)
+            .map(|index| format!("C{index:02}"))
+            .collect::<Vec<_>>();
+        let first = conversation_unread_refresh_plan(
+            Vec::new(),
+            candidates.clone(),
+            CONVERSATION_ENRICHMENT_LIMIT,
+        );
+        assert_eq!(first.batch, candidates[..CONVERSATION_ENRICHMENT_LIMIT]);
+
+        let second = conversation_unread_refresh_plan(
+            first.next_queue.clone(),
+            candidates.clone(),
+            CONVERSATION_ENRICHMENT_LIMIT,
+        );
+
+        assert_eq!(
+            second.batch,
+            candidates[CONVERSATION_ENRICHMENT_LIMIT..CONVERSATION_ENRICHMENT_LIMIT * 2]
+        );
+        assert!(!second.batch.contains(&candidates[0]));
+        assert!(second.batch.len() <= CONVERSATION_ENRICHMENT_LIMIT);
+
+        let third = conversation_unread_refresh_plan(
+            second.next_queue.clone(),
+            candidates.clone(),
+            CONVERSATION_ENRICHMENT_LIMIT,
+        );
+        assert_eq!(
+            third.batch,
+            candidates[CONVERSATION_ENRICHMENT_LIMIT * 2..]
+                .iter()
+                .chain(&candidates[..CONVERSATION_ENRICHMENT_LIMIT - 5])
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        let visited = first
+            .batch
+            .iter()
+            .chain(&second.batch)
+            .chain(&third.batch)
+            .collect::<HashSet<_>>();
+        assert_eq!(visited.len(), candidates.len());
+        assert!(candidates
+            .iter()
+            .all(|channel_id| visited.contains(channel_id)));
+
+        let mut with_new_candidate = vec!["D-new-active".to_string()];
+        with_new_candidate.extend(candidates.clone());
+        let with_new = conversation_unread_refresh_plan(
+            first.next_queue.clone(),
+            with_new_candidate,
+            CONVERSATION_ENRICHMENT_LIMIT,
+        );
+        assert_eq!(
+            with_new.batch.first().map(String::as_str),
+            Some("D-new-active")
+        );
+
+        let mut reranked = candidates.clone();
+        reranked.rotate_right(1);
+        let reranked_existing = conversation_unread_refresh_plan(
+            first.next_queue,
+            reranked,
+            CONVERSATION_ENRICHMENT_LIMIT,
+        );
+        assert_eq!(
+            reranked_existing.batch.first().map(String::as_str),
+            Some("C30")
+        );
+    }
+
+    #[test]
+    fn conversation_unread_refresh_plan_prunes_and_deduplicates_pending_work() {
+        let plan = conversation_unread_refresh_plan(
+            vec![
+                "C2".to_string(),
+                "C-stale".to_string(),
+                "C2".to_string(),
+                String::new(),
+                "C1".to_string(),
+            ],
+            vec![
+                "C1".to_string(),
+                String::new(),
+                "C2".to_string(),
+                "C1".to_string(),
+                "C3".to_string(),
+            ],
+            2,
+        );
+
+        assert_eq!(plan.queue, vec!["C3", "C2", "C1"]);
+        assert_eq!(plan.batch, vec!["C3", "C2"]);
+        assert_eq!(plan.next_queue, vec!["C1", "C3", "C2"]);
+        assert_eq!(
+            plan.queue.iter().collect::<HashSet<_>>().len(),
+            plan.queue.len()
+        );
+
+        let no_network = conversation_unread_refresh_plan(
+            Vec::new(),
+            vec!["C1".to_string(), "C2".to_string()],
+            0,
+        );
+        assert!(no_network.batch.is_empty());
+        assert_eq!(no_network.next_queue, no_network.queue);
+
+        let under_limit = conversation_unread_refresh_plan(
+            Vec::new(),
+            vec!["C1".to_string(), "C2".to_string()],
+            CONVERSATION_ENRICHMENT_LIMIT,
+        );
+        assert_eq!(under_limit.batch, under_limit.queue);
+        assert_eq!(under_limit.next_queue, under_limit.queue);
     }
 
     #[test]

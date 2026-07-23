@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
+use reqwest::multipart::Form;
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -40,7 +41,11 @@ const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROP
 const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
 const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
 const USERS_LIST_METHOD: &str = "users.list";
+const CLIENT_USER_BOOT_METHOD: &str = "client.userBoot";
+const CLIENT_COUNTS_METHOD: &str = "client.counts";
 const SLACK_API_BASE_URL: &str = "https://slack.com/api";
+const USER_BOOT_OMIT_EXTRAS: &str = "feature_usage_data,plan_info,salesforce_features";
+const MAX_SLACK_ROUTE_BYTES: usize = 2048;
 const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
 static NEXT_CLIENT_MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -294,6 +299,23 @@ pub struct SlackApi {
     user_agent: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackUnreadSnapshot {
+    pub channels: Vec<SlackUnreadSnapshotRecord>,
+    pub ims: Vec<SlackUnreadSnapshotRecord>,
+    pub mpims: Vec<SlackUnreadSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackUnreadSnapshotRecord {
+    pub conversation_id: String,
+    pub last_read: Option<String>,
+    pub latest: Option<String>,
+    pub has_unreads: bool,
+    pub mention_count: u64,
+    pub is_open: bool,
+}
+
 impl SlackApi {
     pub fn access_token(&self) -> &str {
         &self.access_token
@@ -332,6 +354,54 @@ impl SlackApi {
             user_id: response.user_id,
             url: response.url,
         })
+    }
+
+    /// Loads the browser client's compact unread snapshot for one authenticated
+    /// Slack workspace. This is intentionally unavailable without the browser
+    /// cookie associated with the stored session; an imported browser user
+    /// agent is forwarded when available.
+    pub async fn browser_unread_snapshot(
+        &self,
+        workspace_url: &str,
+    ) -> Result<SlackUnreadSnapshot> {
+        self.ensure_browser_session_credentials()?;
+        let api_base_url = self.browser_workspace_api_base_url(workspace_url)?;
+        let user_boot: BrowserUserBootResponse = self
+            .post_browser_form(
+                &api_base_url,
+                CLIENT_USER_BOOT_METHOD,
+                &[],
+                &[
+                    ("version_all_channels", "false".to_string()),
+                    ("return_all_relevant_mpdms", "true".to_string()),
+                    ("omit_extras", USER_BOOT_OMIT_EXTRAS.to_string()),
+                    ("_x_app_name", "client".to_string()),
+                    ("_x_reason", "initial-data".to_string()),
+                    ("_x_sonic", "true".to_string()),
+                ],
+            )
+            .await?;
+        let slack_route = validated_slack_route(user_boot.slack_route)?;
+        let open_ims = normalize_open_im_ids(user_boot.ims)?;
+        let counts: BrowserCountsResponse = self
+            .post_browser_form(
+                &api_base_url,
+                CLIENT_COUNTS_METHOD,
+                &[("slack_route", slack_route)],
+                &[
+                    ("include_all_unreads", "true".to_string()),
+                    ("include_file_channels", "true".to_string()),
+                    ("org_wide_aware", "true".to_string()),
+                    ("thread_counts_by_channel", "true".to_string()),
+                    ("_x_app_name", "client".to_string()),
+                    ("_x_mode", "online".to_string()),
+                    ("_x_reason", "fetchClientCountsOnConnect".to_string()),
+                    ("_x_sonic", "true".to_string()),
+                ],
+            )
+            .await?;
+
+        normalize_browser_unread_snapshot(counts, &open_ims)
     }
 
     pub async fn conversations(&self) -> Result<Vec<SlackConversation>> {
@@ -1148,6 +1218,98 @@ impl SlackApi {
         }
     }
 
+    async fn post_browser_form<T>(
+        &self,
+        api_base_url: &str,
+        method: &str,
+        query_params: &[(&'static str, String)],
+        params: &[(&'static str, String)],
+    ) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de> + SlackResponse,
+    {
+        let (cookie, user_agent) = self.browser_session_headers()?;
+        let mut url =
+            reqwest::Url::parse(&format!("{}/{method}", api_base_url.trim_end_matches('/')))
+                .map_err(|_| SlackError::validation("Slack browser API URL is invalid"))?;
+        if !query_params.is_empty() {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in query_params {
+                query.append_pair(key, value);
+            }
+        }
+
+        let mut form = Form::new().text("token", self.access_token.clone());
+        for (key, value) in params {
+            form = form.text(*key, value.clone());
+        }
+        let mut request = self
+            .http
+            .post(url)
+            .timeout(API_REQUEST_TIMEOUT)
+            .header(COOKIE, cookie)
+            .multipart(form);
+        if let Some(user_agent) = user_agent {
+            request = request.header(USER_AGENT, user_agent);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("failed to call Slack method {method}"))?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(SlackError::RateLimited {
+                method: method.to_string(),
+            });
+        }
+        let response = response
+            .error_for_status()
+            .with_context(|| format!("Slack method {method} returned an HTTP error"))?
+            .json::<T>()
+            .await
+            .with_context(|| format!("failed to parse Slack method {method} response"))?;
+
+        response.into_result(method)
+    }
+
+    fn ensure_browser_session_credentials(&self) -> Result<()> {
+        if self
+            .browser_cookie_d
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+            || self.access_token.trim().is_empty()
+        {
+            return Err(SlackError::validation(
+                "browser session credentials are unavailable",
+            ));
+        }
+        Ok(())
+    }
+
+    fn browser_session_headers(&self) -> Result<(String, Option<&str>)> {
+        self.ensure_browser_session_credentials()?;
+        let cookie = self
+            .browser_cookie_d
+            .as_deref()
+            .map(str::trim)
+            .filter(|cookie| !cookie.is_empty())
+            .ok_or_else(|| SlackError::validation("browser session credentials are unavailable"))?;
+        let user_agent = self
+            .user_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|user_agent| !user_agent.is_empty());
+        Ok((browser_session_cookie_header(cookie), user_agent))
+    }
+
+    fn browser_workspace_api_base_url(&self, workspace_url: &str) -> Result<String> {
+        let workspace_api_base_url = validated_workspace_api_base_url(workspace_url)?;
+        if self.api_base_url != SLACK_API_BASE_URL {
+            return Ok(self.api_base_url.trim_end_matches('/').to_string());
+        }
+        Ok(workspace_api_base_url)
+    }
+
     fn authenticated_request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
         let mut request = self
             .http
@@ -1174,6 +1336,163 @@ impl SlackApi {
 
         request
     }
+}
+
+fn validated_workspace_api_base_url(workspace_url: &str) -> Result<String> {
+    let workspace_url = workspace_url.trim();
+    let mut parsed = reqwest::Url::parse(workspace_url)
+        .map_err(|_| SlackError::validation("Slack workspace URL is invalid"))?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.port().is_some_and(|port| port != 443)
+    {
+        return Err(SlackError::validation("Slack workspace URL is not trusted"));
+    }
+    let host = parsed
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .filter(|host| is_slack_workspace_host(host))
+        .ok_or_else(|| SlackError::validation("Slack workspace URL is not trusted"))?;
+    parsed
+        .set_port(None)
+        .map_err(|_| SlackError::validation("Slack workspace URL is not trusted"))?;
+    Ok(format!("https://{host}/api"))
+}
+
+fn is_slack_workspace_host(host: &str) -> bool {
+    let Some(workspace) = host.strip_suffix(".slack.com") else {
+        return false;
+    };
+    !workspace.is_empty()
+        && workspace.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn validated_slack_route(route: Option<String>) -> Result<String> {
+    route
+        .filter(|route| {
+            !route.trim().is_empty()
+                && route.trim() == route
+                && route.len() <= MAX_SLACK_ROUTE_BYTES
+                && !route.chars().any(char::is_control)
+        })
+        .ok_or_else(|| SlackError::validation("Slack unread routing metadata is unavailable"))
+}
+
+fn normalize_open_im_ids(ims: Vec<BrowserBootIm>) -> Result<HashSet<String>> {
+    let mut open_ims = HashSet::new();
+    for im in ims {
+        let id = im.id.trim();
+        if id.is_empty() {
+            return Err(SlackError::validation(
+                "Slack unread snapshot contains an invalid conversation record",
+            ));
+        }
+        if im.is_open {
+            open_ims.insert(id.to_string());
+        }
+    }
+    Ok(open_ims)
+}
+
+fn normalize_browser_unread_snapshot(
+    counts: BrowserCountsResponse,
+    open_ims: &HashSet<String>,
+) -> Result<SlackUnreadSnapshot> {
+    let channels = normalize_browser_unread_records(counts.channels, &HashSet::new())?;
+    let ims = normalize_browser_unread_records(counts.ims, open_ims)?;
+    let mpims = normalize_browser_unread_records(counts.mpims, &HashSet::new())?;
+    if channels.is_empty() && ims.is_empty() && mpims.is_empty() {
+        return Err(SlackError::validation(
+            "Slack unread snapshot did not contain conversation records",
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    if channels
+        .iter()
+        .chain(&ims)
+        .chain(&mpims)
+        .any(|record| !seen.insert(record.conversation_id.as_str()))
+    {
+        return Err(SlackError::validation(
+            "Slack unread snapshot contains duplicate conversation records",
+        ));
+    }
+
+    Ok(SlackUnreadSnapshot {
+        channels,
+        ims,
+        mpims,
+    })
+}
+
+fn normalize_browser_unread_records(
+    records: Vec<BrowserCountRecord>,
+    open_ids: &HashSet<String>,
+) -> Result<Vec<SlackUnreadSnapshotRecord>> {
+    records
+        .into_iter()
+        .map(|record| normalize_browser_unread_record(record, open_ids))
+        .collect()
+}
+
+fn normalize_browser_unread_record(
+    record: BrowserCountRecord,
+    open_ids: &HashSet<String>,
+) -> Result<SlackUnreadSnapshotRecord> {
+    let conversation_id = record.id.trim().to_string();
+    if conversation_id.is_empty() {
+        return Err(SlackError::validation(
+            "Slack unread snapshot contains an invalid conversation record",
+        ));
+    }
+    let last_read = normalized_optional_string(record.last_read);
+    let latest = normalized_optional_string(record.latest);
+    let has_unreads = match record.has_unreads {
+        Some(has_unreads) => has_unreads,
+        None => {
+            let (Some(last_read), Some(latest)) = (last_read.as_deref(), latest.as_deref()) else {
+                return Err(SlackError::validation(
+                    "Slack unread snapshot record is missing unread state",
+                ));
+            };
+            let (Some(last_read), Some(latest)) =
+                (parse_slack_ts(last_read), parse_slack_ts(latest))
+            else {
+                return Err(SlackError::validation(
+                    "Slack unread snapshot record has invalid read cursors",
+                ));
+            };
+            latest > last_read
+        }
+    };
+
+    Ok(SlackUnreadSnapshotRecord {
+        is_open: open_ids.contains(&conversation_id),
+        conversation_id,
+        last_read,
+        latest,
+        has_unreads,
+        mention_count: record.mention_count,
+    })
+}
+
+fn normalized_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn complete_upload_params(
@@ -1604,6 +1923,46 @@ struct AuthTestResponse {
 }
 impl_slack_response!(AuthTestResponse);
 
+#[derive(Debug, Deserialize)]
+struct BrowserUserBootResponse {
+    ok: bool,
+    error: Option<String>,
+    slack_route: Option<String>,
+    #[serde(default)]
+    ims: Vec<BrowserBootIm>,
+}
+impl_slack_response!(BrowserUserBootResponse);
+
+#[derive(Debug, Deserialize)]
+struct BrowserBootIm {
+    id: String,
+    #[serde(default)]
+    is_open: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserCountsResponse {
+    ok: bool,
+    error: Option<String>,
+    #[serde(default)]
+    channels: Vec<BrowserCountRecord>,
+    #[serde(default)]
+    ims: Vec<BrowserCountRecord>,
+    #[serde(default)]
+    mpims: Vec<BrowserCountRecord>,
+}
+impl_slack_response!(BrowserCountsResponse);
+
+#[derive(Debug, Deserialize)]
+struct BrowserCountRecord {
+    id: String,
+    last_read: Option<String>,
+    latest: Option<String>,
+    has_unreads: Option<bool>,
+    #[serde(default)]
+    mention_count: u64,
+}
+
 fn log_conversation_properties(method: &str, conversations: &[SlackConversation]) {
     if !crate::debug::enabled() {
         return;
@@ -1868,6 +2227,51 @@ mod tests {
 
     use super::*;
     use tiny_http::{Header, Response, Server};
+
+    fn browser_test_token(browser_cookie_d: Option<&str>) -> StoredToken {
+        StoredToken {
+            access_token: "browser-access-value".to_string(),
+            token_type: Some("browser_session".to_string()),
+            scope: None,
+            refresh_token: None,
+            expires_in: None,
+            expires_at: None,
+            team_id: None,
+            team_name: None,
+            user_id: None,
+            client_id: None,
+            browser_cookie_d: browser_cookie_d.map(str::to_string),
+            user_agent: Some("Conduit Browser Test Agent".to_string()),
+        }
+    }
+
+    fn multipart_field_value<'a>(body: &'a str, field: &str) -> Option<&'a str> {
+        let marker = format!("name=\"{field}\"");
+        let field_start = body.find(&marker)? + marker.len();
+        let value_start = body[field_start..].find("\r\n\r\n")? + field_start + 4;
+        let value_end = body[value_start..].find("\r\n")? + value_start;
+        Some(&body[value_start..value_end])
+    }
+
+    fn multipart_field_names(body: &str) -> HashSet<String> {
+        body.split("name=\"")
+            .skip(1)
+            .filter_map(|part| part.split_once('"').map(|(name, _)| name))
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn request_query_field(path: &str, field: &str) -> Option<String> {
+        let query = path.split_once('?')?.1;
+        url::form_urlencoded::parse(query.as_bytes())
+            .find_map(|(key, value)| (key == field).then(|| value.into_owned()))
+    }
 
     #[test]
     fn generated_client_message_ids_are_unique_uuid_values() {
@@ -2439,6 +2843,323 @@ mod tests {
         assert!(scopes.contains("channels:read"));
         assert!(scopes.contains("channels:write"));
         assert!(scopes.contains("im:write"));
+    }
+
+    #[test]
+    fn browser_unread_workspace_urls_are_restricted_to_slack_origins() {
+        assert_eq!(
+            validated_workspace_api_base_url("https://example.slack.com/").unwrap(),
+            "https://example.slack.com/api"
+        );
+        assert_eq!(
+            validated_workspace_api_base_url("https://grid.example.slack.com:443/").unwrap(),
+            "https://grid.example.slack.com/api"
+        );
+
+        for workspace_url in [
+            "http://example.slack.com/",
+            "https://example.slack.com:8443/",
+            "https://person@example.slack.com/",
+            "https://example.slack.com/path",
+            "https://example.slack.com/?mode=online",
+            "https://example.slack.com/#fragment",
+            "https://slack.com.evil.example/",
+            "https://slack.com/",
+        ] {
+            assert!(validated_workspace_api_base_url(workspace_url).is_err());
+        }
+
+        assert_eq!(
+            validated_slack_route(Some("opaque-route".to_string())).unwrap(),
+            "opaque-route"
+        );
+        assert!(validated_slack_route(None).is_err());
+        assert!(validated_slack_route(Some(" route".to_string())).is_err());
+        assert!(validated_slack_route(Some("bad\nroute".to_string())).is_err());
+    }
+
+    #[test]
+    fn browser_unread_snapshot_normalizes_cursors_and_rejects_schema_drift() {
+        let open_ims = HashSet::from(["D-open".to_string()]);
+        let snapshot = normalize_browser_unread_snapshot(
+            BrowserCountsResponse {
+                ok: true,
+                error: None,
+                channels: vec![BrowserCountRecord {
+                    id: "C1".to_string(),
+                    last_read: Some("1710000000.000000".to_string()),
+                    latest: Some("1710000001.000000".to_string()),
+                    has_unreads: None,
+                    mention_count: 0,
+                }],
+                ims: vec![BrowserCountRecord {
+                    id: "D-open".to_string(),
+                    last_read: Some("1710000002.000000".to_string()),
+                    latest: Some("1710000002.000000".to_string()),
+                    has_unreads: None,
+                    mention_count: 7,
+                }],
+                mpims: Vec::new(),
+            },
+            &open_ims,
+        )
+        .unwrap();
+
+        assert!(snapshot.channels[0].has_unreads);
+        assert!(!snapshot.ims[0].has_unreads);
+        assert!(snapshot.ims[0].is_open);
+        assert_eq!(snapshot.ims[0].mention_count, 7);
+
+        assert!(normalize_browser_unread_snapshot(
+            BrowserCountsResponse {
+                ok: true,
+                error: None,
+                channels: Vec::new(),
+                ims: Vec::new(),
+                mpims: Vec::new(),
+            },
+            &HashSet::new(),
+        )
+        .is_err());
+        assert!(normalize_browser_unread_snapshot(
+            BrowserCountsResponse {
+                ok: true,
+                error: None,
+                channels: vec![BrowserCountRecord {
+                    id: "  ".to_string(),
+                    last_read: None,
+                    latest: None,
+                    has_unreads: Some(false),
+                    mention_count: 0,
+                }],
+                ims: Vec::new(),
+                mpims: Vec::new(),
+            },
+            &HashSet::new(),
+        )
+        .is_err());
+        assert!(normalize_browser_unread_snapshot(
+            BrowserCountsResponse {
+                ok: true,
+                error: None,
+                channels: vec![BrowserCountRecord {
+                    id: "C1".to_string(),
+                    last_read: Some("invalid".to_string()),
+                    latest: Some("also-invalid".to_string()),
+                    has_unreads: None,
+                    mention_count: 0,
+                }],
+                ims: Vec::new(),
+                mpims: Vec::new(),
+            },
+            &HashSet::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn browser_unread_snapshot_requires_browser_session_credentials() {
+        let api = SlackApi::new(browser_test_token(None));
+        let error = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.browser_unread_snapshot("https://example.slack.com/"))
+            .expect_err("browser cookie should be required");
+
+        assert_eq!(error.category(), SlackErrorCategory::Validation);
+
+        let mut token = browser_test_token(Some("browser-cookie-value"));
+        token.user_agent = None;
+        SlackApi::new(token)
+            .ensure_browser_session_credentials()
+            .expect("browser user agent should remain optional");
+    }
+
+    #[test]
+    fn browser_unread_snapshot_uses_boot_route_and_browser_request_shape() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut observations = Vec::new();
+            for response_body in [
+                r#"{
+                    "ok": true,
+                    "slack_route": "test-route-value",
+                    "ims": [
+                        {"id": "D-open", "is_open": true},
+                        {"id": "D-closed", "is_open": false}
+                    ]
+                }"#,
+                r#"{
+                    "ok": true,
+                    "channels": [{
+                        "id": "C1",
+                        "last_read": "1710000000.000000",
+                        "latest": "1710000001.000000",
+                        "has_unreads": true,
+                        "mention_count": 0
+                    }],
+                    "ims": [
+                        {
+                            "id": "D-open",
+                            "last_read": "1710000002.000000",
+                            "latest": "1710000002.000000",
+                            "mention_count": 3
+                        },
+                        {
+                            "id": "D-closed",
+                            "last_read": "1710000003.000000",
+                            "latest": "1710000003.000000",
+                            "has_unreads": false,
+                            "mention_count": 0
+                        }
+                    ],
+                    "mpims": [{
+                        "id": "G1",
+                        "last_read": "1710000000.000000",
+                        "latest": "1710000004.000000",
+                        "has_unreads": true,
+                        "mention_count": 1
+                    }]
+                }"#,
+            ] {
+                let mut request = server.recv().expect("mock Slack request should arrive");
+                let path = request.url().to_string();
+                let request_path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
+                let authorization_absent = !request
+                    .headers()
+                    .iter()
+                    .any(|header| header.field.equiv("authorization"));
+                let cookie_valid = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("cookie"))
+                    .is_some_and(|header| {
+                        let value = header.value.as_str();
+                        value.starts_with("d=browser-cookie-value; d-s=")
+                    });
+                let user_agent_valid = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("user-agent"))
+                    .is_some_and(|header| header.value.as_str() == "Conduit Browser Test Agent");
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("mock Slack request body should be readable");
+                let token_valid =
+                    multipart_field_value(&body, "token") == Some("browser-access-value");
+                let route_valid = if request_path.ends_with("client.userBoot") {
+                    request_query_field(&path, "slack_route").is_none()
+                        && multipart_field_value(&body, "slack_route").is_none()
+                } else {
+                    request_query_field(&path, "slack_route").as_deref() == Some("test-route-value")
+                        && multipart_field_value(&body, "slack_route").is_none()
+                };
+                let flags_valid = if request_path.ends_with("client.userBoot") {
+                    multipart_field_value(&body, "version_all_channels") == Some("false")
+                        && multipart_field_value(&body, "return_all_relevant_mpdms") == Some("true")
+                        && multipart_field_value(&body, "omit_extras")
+                            == Some(USER_BOOT_OMIT_EXTRAS)
+                        && multipart_field_value(&body, "_x_app_name") == Some("client")
+                        && multipart_field_value(&body, "_x_reason") == Some("initial-data")
+                        && multipart_field_value(&body, "_x_sonic") == Some("true")
+                } else {
+                    multipart_field_value(&body, "include_all_unreads") == Some("true")
+                        && multipart_field_value(&body, "include_file_channels") == Some("true")
+                        && multipart_field_value(&body, "org_wide_aware") == Some("true")
+                        && multipart_field_value(&body, "thread_counts_by_channel") == Some("true")
+                        && multipart_field_value(&body, "_x_app_name") == Some("client")
+                        && multipart_field_value(&body, "_x_mode") == Some("online")
+                        && multipart_field_value(&body, "_x_reason")
+                            == Some("fetchClientCountsOnConnect")
+                        && multipart_field_value(&body, "_x_sonic") == Some("true")
+                };
+                observations.push((
+                    path,
+                    authorization_absent,
+                    cookie_valid,
+                    user_agent_valid,
+                    token_valid,
+                    route_valid,
+                    flags_valid,
+                    multipart_field_names(&body),
+                ));
+                request
+                    .respond(
+                        Response::from_string(response_body).with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("content type header should be valid"),
+                        ),
+                    )
+                    .expect("mock Slack response should be sent");
+            }
+            observations
+        });
+
+        let mut api = SlackApi::new(browser_test_token(Some("browser-cookie-value")));
+        api.api_base_url = format!("http://{address}/api");
+        let snapshot = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.browser_unread_snapshot("https://example.slack.com/"))
+            .expect("browser unread snapshot should succeed");
+
+        assert_eq!(snapshot.channels.len(), 1);
+        assert_eq!(snapshot.ims.len(), 2);
+        assert_eq!(snapshot.mpims.len(), 1);
+        assert!(snapshot.channels[0].has_unreads);
+        assert!(snapshot.ims[0].is_open);
+        assert!(!snapshot.ims[0].has_unreads);
+        assert_eq!(snapshot.ims[0].mention_count, 3);
+        assert!(!snapshot.ims[1].is_open);
+        assert!(snapshot.mpims[0].has_unreads);
+
+        let observations = received.join().expect("mock Slack server should finish");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].0, "/api/client.userBoot");
+        assert_eq!(
+            observations[1].0,
+            "/api/client.counts?slack_route=test-route-value"
+        );
+        assert!(observations
+            .iter()
+            .all(
+                |(_, no_auth, cookie, agent, token, route, flags, _)| *no_auth
+                    && *cookie
+                    && *agent
+                    && *token
+                    && *route
+                    && *flags
+            ));
+        assert_eq!(
+            observations[0].7,
+            HashSet::from([
+                "token".to_string(),
+                "version_all_channels".to_string(),
+                "return_all_relevant_mpdms".to_string(),
+                "omit_extras".to_string(),
+                "_x_app_name".to_string(),
+                "_x_reason".to_string(),
+                "_x_sonic".to_string(),
+            ])
+        );
+        assert_eq!(
+            observations[1].7,
+            HashSet::from([
+                "token".to_string(),
+                "include_all_unreads".to_string(),
+                "include_file_channels".to_string(),
+                "org_wide_aware".to_string(),
+                "thread_counts_by_channel".to_string(),
+                "_x_app_name".to_string(),
+                "_x_mode".to_string(),
+                "_x_reason".to_string(),
+                "_x_sonic".to_string(),
+            ])
+        );
     }
 
     #[test]

@@ -6,9 +6,14 @@ use crate::search::{
     MatchScore, SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT,
     SECONDARY_FIELD_WEIGHT,
 };
+use serde_json::Value;
 
 pub type UserSearchAliases = HashMap<String, Vec<String>>;
 pub type UserStatuses = HashMap<String, SlackUserStatus>;
+
+// `last_read` can remain on hundreds of old DMs, so keep only a small history
+// projection while selected, unread, and explicitly active DMs remain uncapped.
+const RECENT_HISTORY_DIRECT_MESSAGE_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
@@ -312,6 +317,7 @@ pub struct SidebarBuildOptions<'a> {
     pub query: &'a str,
     pub unread_only: bool,
     pub show_unreads_section: bool,
+    pub show_all: bool,
     pub loading: bool,
     pub has_error: bool,
     pub user_search_aliases: Option<&'a UserSearchAliases>,
@@ -458,15 +464,26 @@ pub fn build_sidebar_list(
     }
 
     let query = SearchQuery::parse(options.query);
+    let recent_history_direct_messages = if options.show_all {
+        HashSet::new()
+    } else {
+        recent_history_direct_message_ids(conversations, options.selected_channel)
+    };
     let mut rows = conversations
         .iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .filter(|conversation| {
-            options.selected_channel == Some(conversation.id.as_str())
+            options.show_all
+                || options.selected_channel == Some(conversation.id.as_str())
                 || conversation_kind(conversation) != ConversationKind::Unknown
         })
         .filter(|conversation| {
-            conversation_visible_in_default_sidebar(conversation, options.selected_channel)
+            options.show_all
+                || conversation_visible_in_default_sidebar(
+                    conversation,
+                    options.selected_channel,
+                    recent_history_direct_messages.contains(&conversation.id),
+                )
         })
         .map(|conversation| {
             SidebarRowModel::from_conversation_with_aliases(
@@ -932,23 +949,108 @@ pub fn conversation_kind(conversation: &SlackConversation) -> ConversationKind {
 pub fn conversation_visible_in_default_sidebar(
     conversation: &SlackConversation,
     selected_channel: Option<&str>,
+    recent_history_direct_message: bool,
 ) -> bool {
-    if selected_channel == Some(conversation.id.as_str()) {
-        return true;
-    }
-
     if conversation.is_archived.unwrap_or(false) {
         return false;
     }
 
+    if selected_channel == Some(conversation.id.as_str()) {
+        return true;
+    }
+
+    if conversation.has_unread_activity() {
+        return true;
+    }
+
     match conversation_kind(conversation) {
         ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
-            conversation.has_unread_activity()
+            !conversation.is_user_deleted()
+                && !conversation.is_dormant()
+                && (conversation.has_active_direct_message_hint() || recent_history_direct_message)
         }
         ConversationKind::PublicChannel
         | ConversationKind::PrivateChannel
         | ConversationKind::Unknown => true,
     }
+}
+
+#[derive(Debug)]
+struct RecentHistoryDirectMessageCandidate {
+    id: String,
+    activity: f64,
+    title: String,
+}
+
+fn recent_history_direct_message_ids(
+    conversations: &[SlackConversation],
+    selected_channel: Option<&str>,
+) -> HashSet<String> {
+    let mut candidates = conversations
+        .iter()
+        .filter(|conversation| !conversation.is_archived.unwrap_or(false))
+        .filter(|conversation| {
+            matches!(
+                conversation_kind(conversation),
+                ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
+            )
+        })
+        .filter(|conversation| selected_channel != Some(conversation.id.as_str()))
+        .filter(|conversation| !conversation.has_unread_activity())
+        .filter(|conversation| !conversation.has_active_direct_message_hint())
+        .filter(|conversation| !conversation.is_user_deleted() && !conversation.is_dormant())
+        .filter_map(|conversation| {
+            let activity = conversation_activity_score(conversation);
+            (activity > 0.0).then(|| RecentHistoryDirectMessageCandidate {
+                id: conversation.id.clone(),
+                activity,
+                title: conversation.display_name().to_lowercase(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .activity
+            .total_cmp(&left.activity)
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates
+        .into_iter()
+        .take(RECENT_HISTORY_DIRECT_MESSAGE_LIMIT)
+        .map(|candidate| candidate.id)
+        .collect()
+}
+
+fn conversation_activity_score(conversation: &SlackConversation) -> f64 {
+    ["latest", "latest_ts", "last_read"]
+        .into_iter()
+        .filter_map(|key| conversation_extra_value(conversation, key))
+        .filter_map(conversation_activity_value)
+        .fold(0.0, f64::max)
+}
+
+fn conversation_activity_value(value: &Value) -> Option<f64> {
+    let value = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(value) => value.trim().parse::<f64>().ok(),
+        Value::Object(object) => object.get("ts").and_then(conversation_activity_value),
+        _ => None,
+    }?;
+    value.is_finite().then_some(value)
+}
+
+fn conversation_extra_value<'a>(
+    conversation: &'a SlackConversation,
+    key: &str,
+) -> Option<&'a Value> {
+    conversation.extra.get(key).or_else(|| {
+        conversation
+            .extra
+            .get("properties")
+            .and_then(|properties| properties.get(key))
+    })
 }
 
 fn section(kind: SidebarSectionKind, rows: Vec<SidebarRowModel>) -> Option<SidebarSectionModel> {
@@ -1368,27 +1470,70 @@ mod tests {
     }
 
     #[test]
-    fn default_sidebar_visibility_hides_read_inactive_dms() {
+    fn default_sidebar_visibility_keeps_recent_dms_and_hides_inactive_dms() {
         let active_channel = channel("C1", "general");
-        let read_dm = dm("D1", "U1");
-        let read_group_dm = mpim("M1", "triage");
+        let mut open_dm = dm("D_OPEN", "U_OPEN");
+        open_dm
+            .extra
+            .insert("is_open".to_string(), serde_json::json!(true));
+        let mut priority_dm = dm("D_PRIORITY", "U_PRIORITY");
+        priority_dm
+            .extra
+            .insert("priority".to_string(), serde_json::json!(0.42));
+        let mut read_group_dm = mpim("M_READ", "read");
+        read_group_dm.extra.insert(
+            "last_read".to_string(),
+            serde_json::json!("1710000000.000001"),
+        );
+        let inactive_dm = dm("D_INACTIVE", "U_INACTIVE");
+        let mut unopened_group_dm = mpim("M_UNOPENED", "unopened");
+        unopened_group_dm
+            .extra
+            .insert("last_read".to_string(), serde_json::json!("0.000000"));
+        let conversations = vec![
+            open_dm.clone(),
+            priority_dm.clone(),
+            read_group_dm.clone(),
+            inactive_dm.clone(),
+            unopened_group_dm.clone(),
+        ];
+        let recent_history_direct_messages =
+            recent_history_direct_message_ids(&conversations, None);
 
         assert!(conversation_visible_in_default_sidebar(
             &active_channel,
-            None
+            None,
+            false,
         ));
-        assert!(!conversation_visible_in_default_sidebar(&read_dm, None));
+        assert!(conversation_visible_in_default_sidebar(
+            &open_dm,
+            None,
+            recent_history_direct_messages.contains(&open_dm.id),
+        ));
+        assert!(conversation_visible_in_default_sidebar(
+            &priority_dm,
+            None,
+            recent_history_direct_messages.contains(&priority_dm.id),
+        ));
+        assert!(conversation_visible_in_default_sidebar(
+            &read_group_dm,
+            None,
+            recent_history_direct_messages.contains(&read_group_dm.id),
+        ));
         assert!(!conversation_visible_in_default_sidebar(
-            &read_group_dm,
-            None
+            &inactive_dm,
+            None,
+            recent_history_direct_messages.contains(&inactive_dm.id),
+        ));
+        assert!(!conversation_visible_in_default_sidebar(
+            &unopened_group_dm,
+            None,
+            recent_history_direct_messages.contains(&unopened_group_dm.id),
         ));
         assert!(conversation_visible_in_default_sidebar(
-            &read_dm,
-            Some("D1")
-        ));
-        assert!(conversation_visible_in_default_sidebar(
-            &read_group_dm,
-            Some("M1")
+            &inactive_dm,
+            Some("D_INACTIVE"),
+            false,
         ));
     }
 
@@ -1404,21 +1549,48 @@ mod tests {
             "id": "D2",
             "user": "U2",
             "is_im": true,
-            "is_user_deleted": true
+            "is_user_deleted": true,
+            "priority": 0.75
         }))
         .expect("failed to parse deleted DM");
+        let read_dormant: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D3",
+            "user": "U3",
+            "is_im": true,
+            "priority": 0.5,
+            "properties": {
+                "is_dormant": true
+            }
+        }))
+        .expect("failed to parse dormant DM");
+        let mut archived_unread = dm("D4", "U4");
+        archived_unread.is_archived = Some(true);
+        archived_unread.unread_count = Some(1);
 
         assert!(conversation_visible_in_default_sidebar(
             &unread_dormant,
-            None
+            None,
+            false,
         ));
         assert!(conversation_visible_in_default_sidebar(
             &selected_deleted,
-            Some("D2")
+            Some("D2"),
+            false,
         ));
         assert!(!conversation_visible_in_default_sidebar(
             &selected_deleted,
-            None
+            None,
+            true,
+        ));
+        assert!(!conversation_visible_in_default_sidebar(
+            &read_dormant,
+            None,
+            true,
+        ));
+        assert!(!conversation_visible_in_default_sidebar(
+            &archived_unread,
+            Some("D4"),
+            true,
         ));
     }
 
@@ -1639,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_list_only_keeps_unread_or_selected_dms() {
+    fn sidebar_list_default_keeps_unread_or_selected_inactive_dms() {
         let read_dm = dm("D_READ", "U_READ");
         let selected_group_dm = mpim("M_SELECTED", "selected");
         let mut unread_group_dm = mpim("M_UNREAD", "unread");
@@ -1660,6 +1832,183 @@ mod tests {
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             vec!["M_SELECTED", "M_UNREAD"]
         );
+    }
+
+    #[test]
+    fn sidebar_list_caps_recent_history_without_spending_slots_on_unread_or_selected_dms() {
+        let mut conversations = (0..RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 3)
+            .map(|index| {
+                let mut conversation = dm(
+                    &format!("D_RECENT_{index:02}"),
+                    &format!("U_RECENT_{index:02}"),
+                );
+                conversation.extra.insert(
+                    "last_read".to_string(),
+                    serde_json::json!(format!("{}.000001", index + 1)),
+                );
+                conversation
+            })
+            .collect::<Vec<_>>();
+        let mut unread_deleted = dm("D_UNREAD", "U_UNREAD");
+        unread_deleted.unread_count = Some(1);
+        unread_deleted
+            .extra
+            .insert("is_user_deleted".to_string(), serde_json::json!(true));
+        let mut selected_dormant = dm("D_SELECTED", "U_SELECTED");
+        selected_dormant.extra.insert(
+            "properties".to_string(),
+            serde_json::json!({ "is_dormant": true }),
+        );
+        conversations.extend([unread_deleted, selected_dormant]);
+
+        let sections = list_sections(build_sidebar_list(
+            &conversations,
+            &HashMap::new(),
+            SidebarBuildOptions {
+                selected_channel: Some("D_SELECTED"),
+                ..Default::default()
+            },
+        ));
+        let rows = &section(&sections, SidebarSectionKind::DirectMessages).rows;
+        let ids = rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(rows.len(), RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 2);
+        assert!(ids.contains("D_UNREAD"));
+        assert!(ids.contains("D_SELECTED"));
+        assert!(ids.contains("D_RECENT_22"));
+        assert!(!ids.contains("D_RECENT_00"));
+        assert!(!ids.contains("D_RECENT_01"));
+        assert!(!ids.contains("D_RECENT_02"));
+    }
+
+    #[test]
+    fn sidebar_list_keeps_explicitly_active_dms_outside_the_recent_history_cap() {
+        let conversations = (0..RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 5)
+            .map(|index| {
+                let mut conversation = dm(
+                    &format!("D_ACTIVE_{index:02}"),
+                    &format!("U_ACTIVE_{index:02}"),
+                );
+                if index % 2 == 0 {
+                    conversation
+                        .extra
+                        .insert("is_open".to_string(), serde_json::json!(true));
+                } else {
+                    conversation.extra.insert(
+                        "priority".to_string(),
+                        serde_json::json!((index + 1) as f64),
+                    );
+                }
+                conversation
+            })
+            .collect::<Vec<_>>();
+
+        let sections = list_sections(build_sidebar_list(
+            &conversations,
+            &HashMap::new(),
+            SidebarBuildOptions::default(),
+        ));
+        let rows = &section(&sections, SidebarSectionKind::DirectMessages).rows;
+
+        assert_eq!(rows.len(), RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 5);
+    }
+
+    #[test]
+    fn sidebar_list_show_all_includes_inactive_and_unknown_but_not_archived_conversations() {
+        let read_dm = dm("D_READ", "U_READ");
+        let mut dormant_dm = dm("D_DORMANT", "U_DORMANT");
+        dormant_dm.extra.insert(
+            "properties".to_string(),
+            serde_json::json!({ "is_dormant": true }),
+        );
+        let mut archived_dm = dm("D_ARCHIVED", "U_ARCHIVED");
+        archived_dm.is_archived = Some(true);
+        let unknown = SlackConversation {
+            id: "X_UNKNOWN".to_string(),
+            ..Default::default()
+        };
+
+        let sections = list_sections(build_sidebar_list(
+            &[read_dm, dormant_dm, archived_dm, unknown],
+            &HashMap::new(),
+            SidebarBuildOptions {
+                show_all: true,
+                ..Default::default()
+            },
+        ));
+        let ids = section(&sections, SidebarSectionKind::DirectMessages)
+            .rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"D_READ"));
+        assert!(ids.contains(&"D_DORMANT"));
+        assert!(!ids.contains(&"D_ARCHIVED"));
+        assert_eq!(
+            section(&sections, SidebarSectionKind::Other).rows[0].id,
+            "X_UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn show_all_still_respects_query_and_unread_only_filters() {
+        let mut dormant_dm = dm("D_DORMANT", "U_DORMANT");
+        dormant_dm.extra.insert(
+            "properties".to_string(),
+            serde_json::json!({ "is_dormant": true }),
+        );
+        let unread_channel = SlackConversation {
+            id: "C_UNREAD".to_string(),
+            name: Some("alerts".to_string()),
+            is_channel: Some(true),
+            unread_count: Some(1),
+            ..Default::default()
+        };
+        let user_names = HashMap::from([("U_DORMANT".to_string(), "Ada".to_string())]);
+        let conversations = [dormant_dm, unread_channel];
+
+        assert_eq!(
+            list_placeholder(build_sidebar_list(
+                &conversations,
+                &user_names,
+                SidebarBuildOptions {
+                    query: "ada",
+                    ..Default::default()
+                },
+            )),
+            SidebarPlaceholder::NoMatches
+        );
+        let queried = list_rows(build_sidebar_list(
+            &conversations,
+            &user_names,
+            SidebarBuildOptions {
+                query: "ada",
+                show_all: true,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(queried[0].id, "D_DORMANT");
+
+        let unread_only = list_sections(build_sidebar_list(
+            &conversations,
+            &user_names,
+            SidebarBuildOptions {
+                unread_only: true,
+                show_all: true,
+                ..Default::default()
+            },
+        ));
+        let ids = unread_only
+            .iter()
+            .flat_map(|section| section.rows.iter())
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["C_UNREAD"]);
     }
 
     #[test]

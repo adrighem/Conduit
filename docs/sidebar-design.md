@@ -12,6 +12,8 @@ This document records an earlier implementation of the Conduit workspace sidebar
 - `src/window.rs`: Renders the pure sidebar model into GTK rows, owns row activation, and keeps the row-action map.
 - `src/sidebar.rs`: Builds the pure sidebar list model, including filtering, placeholder state, grouping, sorting, row state, accessibility labels, unread badges, switcher items, and conversation type classification.
 - `src/models.rs`: Defines `SlackConversation`, including the Slack fields used by the sidebar.
+- `src/runtime.rs`: Prioritizes and rotates bounded unread-state enrichment work.
+- `src/store.rs`: Persists the unread-refresh queue across runs.
 
 ## 1.0 Scope
 
@@ -24,6 +26,7 @@ Included for 1.0:
 - Workspace/account menu with sign out.
 - Conversation filtering by display title and Slack conversation ID.
 - Unread-only conversation filtering.
+- An all-conversations override for browsing the complete loaded catalog.
 - Sections for unreads, channels, direct messages, and unknown conversations.
 - Native selectable and activatable conversation rows.
 - Unread counts, selected state, type icons, and accessible row labels.
@@ -57,6 +60,7 @@ The sidebar is the start child of the workspace `GtkPaned`. It is a vertical `Gt
   - `Later`, using `starred-symbolic`.
 - Conversation filter entry with placeholder text `Filter conversations`.
 - Unread-only toggle button using `mail-unread-symbolic`.
+- All-conversations toggle button using `view-list-symbolic`.
 - Scrollable `GtkListBox` named `conversation_list`, styled with `navigation-sidebar`.
 - Status footer label named `workspace_status_label`, used for transient progress and errors.
 
@@ -123,7 +127,7 @@ Classification uses Slack conversation flags:
 
 Archived conversations are filtered out before section construction.
 
-Channels remain visible in the sidebar. Direct messages, including group direct messages, are shown only while they have unread activity or are open in the conversation pane. Switchers and pickers always retain the complete loaded catalog.
+Channels remain visible in the sidebar. Direct messages, including group direct messages, are shown when selected, unread, or marked active by Slack. Up to 20 additional read DMs are retained from Slack's latest-message and read-cursor activity hints. Deleted-user and dormant DMs are excluded from those active/history sets unless selected or unread. **Show All Conversations**, switchers, and pickers retain the complete non-archived loaded catalog.
 
 ## Row Model
 
@@ -156,14 +160,18 @@ The ID tie-breaker keeps ordering deterministic when titles match.
 
 ## Filtering
 
-The sidebar filter entry rerenders the list on search changes. The unread-only toggle rerenders the list on state changes.
+The sidebar filter entry rerenders the list on search changes. The unread-only and all-conversations toggles rerender the list on state changes. **Show All Conversations** expands the source set before text and unread-only filters are applied, so those filters continue to compose normally.
 
 Text filtering matches:
 
 - Resolved display title, case-insensitive.
 - Slack conversation ID, case-insensitive.
 
-Unread-only filtering keeps conversations that have unread activity according to either numeric unread counts or boolean unread hints such as `has_unreads`. Numeric display counts and boolean unread state are intentionally separate so a channel can render as unread without showing a count badge. On startup, the runtime refreshes unread state for the first 30 visible-priority conversations using conversation info and lightweight latest-message checks instead of crawling the entire workspace.
+Unread-only filtering keeps conversations that have unread activity according to either numeric unread counts or boolean unread hints such as `has_unreads`. Numeric display counts and boolean unread state are intentionally separate so a channel can render as unread without showing a count badge.
+
+On startup, browser-credential sessions first attempt Slack Web's private `client.userBoot`/`client.counts` sequence to establish a bulk unread baseline. The integration is restricted to the authenticated workspace origin, validates the observed response shape, and fails closed because Slack does not publish a stable contract for these methods. Missing records remain unknown rather than being treated as read.
+
+OAuth sessions, private-endpoint failures, and conversations omitted from that snapshot use the bounded fallback: the runtime refreshes at most 30 distinct conversations using conversation info and lightweight latest-message checks instead of crawling the entire workspace. Unknown active DMs and other DMs whose unread state is unknown are prioritized so hidden unread conversations can be discovered. The full candidate order is persisted and rotated after each batch; newly discovered priority candidates enter at the front, while deferred candidates retain their order and cannot be permanently starved.
 
 Filtered results preserve normal section grouping and hide empty sections. When unread-only filtering is active or the `Show Unreads section` preference is disabled, the `Unreads` shortcut section is omitted so the same unread conversations do not appear twice in the list. Fuzzy search and matched-text highlighting are not part of the 1.0 sidebar.
 
@@ -235,7 +243,7 @@ Expected keyboard order:
 
 1. Sidebar header/menu controls.
 2. Home and Later primary navigation.
-3. Conversation filter and unread-only toggle.
+3. Conversation filter, unread-only toggle, and all-conversations toggle.
 4. Conversation list.
 5. Main message area.
 
@@ -243,9 +251,11 @@ Section headers are skipped because they are not focusable. Conversation rows ar
 
 ## Test Coverage
 
-Sidebar model coverage lives in `src/sidebar.rs` and verifies conversation classification, list placeholders, filtering, section grouping, sorting, unread duplication, unread badge labels, selected state, switcher items, section display titles, and accessible labels.
+Sidebar model coverage lives in `src/sidebar.rs` and verifies conversation classification, list placeholders, filtering, section grouping, sorting, unread duplication, unread badge labels, selected state, active/history DM bounds, the all-conversations override, switcher items, section display titles, and accessible labels.
 
 Window/controller coverage in `src/window.rs` verifies that rendered row actions preserve the conversation ID and resolved title, unregistered rows do not activate, and unread rows map to bold title weight.
+
+Slack client, runtime, and store coverage verifies the guarded browser bootstrap request shape, schema-drift rejection, badge-less unread snapshots, monotonic cursor persistence, DM-aware fallback priority, the 30-conversation hard limit, fair queue rotation, and ordered persistence across restarts.
 
 ## Native UI Boundary
 
@@ -253,7 +263,7 @@ The sidebar is fully GTK4/libadwaita-native. WebKit is still used for message an
 
 ## Current Limits
 
-The sidebar currently uses member-scoped conversation data from `users.conversations`, lightweight history unread hints, and the user-name cache. By default it hides dormant, deleted-user, and inactive direct-message style entries unless they are unread or currently selected. The `Show All Conversations` toggle exposes the full loaded set for older or low-activity conversations. Future features should be added only when the data model and Slack API usage support them cleanly.
+The sidebar currently uses member-scoped conversation data from `users.conversations`, a browser-session-only private unread baseline when available, bounded conversation-detail enrichment, lightweight activity hints, and the user-name cache. By default it hides dormant, deleted-user, and inactive direct-message entries unless they are unread or currently selected. Slack's activity fields are hints rather than a canonical recent-conversation list, so the history fallback is deliberately capped. The `Show All Conversations` toggle exposes the full non-archived loaded set for older or low-activity conversations. Future features should be added only when the data model and Slack API usage support them cleanly.
 
 Known limits:
 
