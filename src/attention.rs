@@ -104,6 +104,79 @@ pub enum AttentionReason {
     DuplicateDelivery,
 }
 
+impl AttentionReason {
+    pub(crate) const COUNT: usize = 19;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::MembershipLifecycle,
+        Self::NonMessageNoise,
+        Self::EmptyMessage,
+        Self::SelfAuthored,
+        Self::NonPostedMutation,
+        Self::OrdinaryMessage,
+        Self::DirectMessage,
+        Self::DirectMention,
+        Self::NameOrAlias,
+        Self::KeywordOrPhrase,
+        Self::StartedThreadReply,
+        Self::ParticipatedThreadReply,
+        Self::SubscribedThreadReply,
+        Self::NotificationsDisabled,
+        Self::MutedConversation,
+        Self::ActiveTarget,
+        Self::HistoricalDelivery,
+        Self::StaleDelivery,
+        Self::DuplicateDelivery,
+    ];
+
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::MembershipLifecycle => "membership_lifecycle",
+            Self::NonMessageNoise => "non_message_noise",
+            Self::EmptyMessage => "empty_message",
+            Self::SelfAuthored => "self_authored",
+            Self::NonPostedMutation => "non_posted_mutation",
+            Self::OrdinaryMessage => "ordinary_message",
+            Self::DirectMessage => "direct_message",
+            Self::DirectMention => "direct_mention",
+            Self::NameOrAlias => "name_or_alias",
+            Self::KeywordOrPhrase => "keyword_or_phrase",
+            Self::StartedThreadReply => "started_thread_reply",
+            Self::ParticipatedThreadReply => "participated_thread_reply",
+            Self::SubscribedThreadReply => "subscribed_thread_reply",
+            Self::NotificationsDisabled => "notifications_disabled",
+            Self::MutedConversation => "muted_conversation",
+            Self::ActiveTarget => "active_target",
+            Self::HistoricalDelivery => "historical_delivery",
+            Self::StaleDelivery => "stale_delivery",
+            Self::DuplicateDelivery => "duplicate_delivery",
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::MembershipLifecycle => 0,
+            Self::NonMessageNoise => 1,
+            Self::EmptyMessage => 2,
+            Self::SelfAuthored => 3,
+            Self::NonPostedMutation => 4,
+            Self::OrdinaryMessage => 5,
+            Self::DirectMessage => 6,
+            Self::DirectMention => 7,
+            Self::NameOrAlias => 8,
+            Self::KeywordOrPhrase => 9,
+            Self::StartedThreadReply => 10,
+            Self::ParticipatedThreadReply => 11,
+            Self::SubscribedThreadReply => 12,
+            Self::NotificationsDisabled => 13,
+            Self::MutedConversation => 14,
+            Self::ActiveTarget => 15,
+            Self::HistoricalDelivery => 16,
+            Self::StaleDelivery => 17,
+            Self::DuplicateDelivery => 18,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionDecision {
     pub(crate) record_unread: bool,
@@ -413,6 +486,9 @@ fn is_non_message_noise_subtype(subtype: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
     use super::*;
 
     fn candidate() -> AttentionCandidate<'static> {
@@ -434,6 +510,25 @@ mod tests {
 
     fn decision(candidate: AttentionCandidate<'_>) -> AttentionDecision {
         AttentionPolicy::new(AttentionPreferences::default()).decide(candidate)
+    }
+
+    #[test]
+    fn reason_codes_and_counter_indexes_are_unique_and_exhaustive() {
+        let mut codes = AttentionReason::ALL
+            .iter()
+            .map(|reason| reason.code())
+            .collect::<Vec<_>>();
+        let mut indexes = AttentionReason::ALL
+            .iter()
+            .map(|reason| reason.index())
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        indexes.sort_unstable();
+        indexes.dedup();
+
+        assert_eq!(codes.len(), AttentionReason::COUNT);
+        assert_eq!(indexes, (0..AttentionReason::COUNT).collect::<Vec<_>>());
     }
 
     #[test]
@@ -843,6 +938,73 @@ mod tests {
                 send_notification: false,
                 reasons: vec![AttentionReason::NonMessageNoise],
             }
+        );
+    }
+
+    fn classifier_burst_candidate(index: usize) -> AttentionCandidate<'static> {
+        let mut message = candidate();
+        match index {
+            0..4000 => message.text = "ordinary channel update",
+            4000..6000 => {
+                message.text = "direct conversation update";
+                message.conversation = ConversationKind::DirectMessage;
+            }
+            6000..7000 => message.text = "explicit <@U_SELF> update",
+            7000..8000 => message.text = "configured priority phrase",
+            8000..9000 => {
+                message.text = "participated thread update";
+                message.thread_relationship = ThreadRelationship::Participated;
+            }
+            9000..10000 => {
+                message.text = "membership update";
+                message.subtype = Some("channel_join");
+            }
+            _ => unreachable!("the measurement workload has exactly 10,000 candidates"),
+        }
+        message
+    }
+
+    fn measure_classifier_burst(policy: &AttentionPolicy) -> (u128, u64, u64) {
+        let started = Instant::now();
+        let mut unread = 0_u64;
+        let mut notification_candidates = 0_u64;
+        for index in 0..10_000 {
+            let decision = black_box(policy.decide(black_box(classifier_burst_candidate(index))));
+            unread += u64::from(decision.record_unread);
+            notification_candidates += u64::from(decision.send_notification);
+        }
+        (
+            started.elapsed().as_nanos(),
+            unread,
+            notification_candidates,
+        )
+    }
+
+    #[test]
+    #[ignore = "release-mode attention classifier measurement"]
+    fn realtime_attention_classifier_burst_measurement() {
+        let policy = AttentionPolicy::new(AttentionPreferences {
+            keywords: vec!["priority phrase".into()],
+            ..AttentionPreferences::default()
+        });
+        let (_, warmup_unread, warmup_notifications) = measure_classifier_burst(&policy);
+        assert_eq!(warmup_unread, 9_000);
+        assert_eq!(warmup_notifications, 5_000);
+
+        let mut elapsed = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let (nanoseconds, unread, notification_candidates) = measure_classifier_burst(&policy);
+            assert_eq!(unread, 9_000);
+            assert_eq!(notification_candidates, 5_000);
+            elapsed.push(nanoseconds);
+        }
+        elapsed.sort_unstable();
+        let median_batch_nanoseconds = elapsed[elapsed.len() / 2];
+        eprintln!(
+            "attention_classifier_burst decisions=10000 iterations=5 \
+             median_batch_ns={median_batch_nanoseconds} median_ns_per_decision={} \
+             unread=9000 notification_candidates=5000",
+            median_batch_nanoseconds / 10_000
         );
     }
 }

@@ -169,6 +169,19 @@ Text filtering matches:
 
 Unread-only filtering keeps conversations that have unread activity according to either numeric unread counts or boolean unread hints such as `has_unreads`. Numeric display counts and boolean unread state are intentionally separate so a channel can render as unread without showing a count badge.
 
+Slack's aggregate unread fields remain the raw synchronization model. Once Conduit has observed
+message-level attention for a conversation, the sidebar uses that local projection instead:
+ordinary non-self messages increment it, while membership lifecycle noise is recorded as observed
+without becoming unread. Later increases in a coarse raw count cannot recreate filtered noise or
+inflate the local count. An authoritative raw read state can still clear the local projection.
+
+The local count is persisted across restarts until a read action or authoritative raw read state
+clears it. Each conversation retains only its 512 most recently recorded message identities for
+replay and history-reconciliation checks. A retained repeat is
+`already_observed`; a message whose timestamp is not newer than the durable local read cursor is
+`at_or_before_read_cursor`. Neither outcome increments the local projection. Older identities can
+age out of the bounded replay window.
+
 On startup, browser-credential sessions first attempt Slack Web's private `client.userBoot`/`client.counts` sequence to establish a bulk unread baseline. The integration is restricted to the authenticated workspace origin, validates the observed response shape, and fails closed because Slack does not publish a stable contract for these methods. Missing records remain unknown rather than being treated as read.
 
 OAuth sessions, private-endpoint failures, and conversations omitted from that snapshot use the bounded fallback: the runtime refreshes at most 30 distinct conversations using conversation info and lightweight latest-message checks instead of crawling the entire workspace. Unknown active DMs and other DMs whose unread state is unknown are prioritized so hidden unread conversations can be discovered. The full candidate order is persisted and rotated after each batch; newly discovered priority candidates enter at the front, while deferred candidates retain their order and cannot be permanently starved.

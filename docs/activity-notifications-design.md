@@ -1,6 +1,6 @@
 # Activity And Notifications Design
 
-> **Status: Historical design record.** This document is preserved as implementation history and may not describe the current repository. See [README.md](../README.md) for current capabilities and [conductor/tech-stack.md](../conductor/tech-stack.md) for current architecture.
+> **Status: Historical design record.** This document is preserved as implementation history. Its unread-source and notification-flow statements below are superseded by [Attention And Notifications](attention-and-notifications.md), [Sidebar Design](sidebar-design.md), and [Realtime Sync Design](realtime-sync-design.md); see [README.md](../README.md) for current capabilities.
 
 ## Assessment
 

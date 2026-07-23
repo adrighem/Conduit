@@ -25,7 +25,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Create public or private channels, start direct or group messages, and add people to existing conversations when Slack permissions allow it.
 - GNOME Shell search-provider integration for opening cached channels, existing direct messages, and new direct messages with cached workspace members straight from the desktop overview. It reads only conversation and name metadata for the active workspace and never indexes message history.
 - Transactional SQLite caching for conversations, names, histories, threads, unread state, statuses, and custom emoji, with automatic migration from the earlier JSON cache.
-- Unread badges, muted and external-conversation indicators, read markers, and desktop notifications for incoming realtime events.
+- Unread badges, muted and external-conversation indicators, read markers, and relevant-only desktop notifications for direct messages, mentions, configured terms, and interested-thread replies.
 - Slack status emoji and hover text for people in direct messages, shown consistently in navigation, switchers, titles, and message authors.
 - Multi-word, case-insensitive substring filtering with globally ranked, category-free results across conversation, forwarding, message, and emoji searches. Conversation ranking treats direct messages and people as one-person groups, while group DMs use the share of other participants whose names match; group titles omit your own name.
 
@@ -62,7 +62,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 
 - Network and cache work runs away from the GTK UI thread, with short connection, request, and Socket Mode liveness deadlines.
 - Optional Slack Socket Mode ingestion for message, reaction, and conversation updates.
-- Realtime persistence is ordered through a bounded, session-owned queue; messages are cached for unopened conversations, and unread DMs are prioritized for background history refresh.
+- Realtime messages, user changes, and reactions use a session-owned ordered actor with an unbounded callback queue and opt-in live high-water diagnostics; messages are cached for unopened conversations, and unread DMs are prioritized for background history refresh.
 - Automatic Socket Mode reconnect with capped backoff.
 - Scoped loading and error recovery so failures in one surface do not replace unrelated content.
 - Workspace inputs are normalized through a revisioned coordinator behind compatibility adapters, while the WAL-backed SQLite cache applies incremental entity updates and supports concurrent desktop search reads.
@@ -254,7 +254,11 @@ For development, the token can instead be supplied through the environment:
 export CONDUIT_SLACK_APP_TOKEN=xapp-...
 ```
 
-`SLACK_APP_TOKEN` is accepted as an alias. Environment values take precedence over the keyring. Socket Mode starts after OAuth authentication, stops on sign-out, and reconnects automatically after transient failures. Browser-session workspaces use their XOXC/XOXD WebSocket instead. Incoming posts produce ten-second desktop notifications unless the message is your own, duplicated, muted, system noise, or already visible in the active conversation. Channel notifications include the sender, and selecting a thread-reply notification opens the matching thread. Without a realtime connection, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
+`SLACK_APP_TOKEN` is accepted as an alias. Environment values take precedence over the keyring. Socket Mode starts after OAuth authentication, stops on sign-out, and reconnects automatically after transient failures. Browser-session workspaces use their XOXC/XOXD WebSocket instead.
+
+By default, incoming direct and group-direct messages, direct mentions, configured names/aliases or keywords/phrases, and replies in threads you started, replied to, or subscribed to can produce ten-second desktop notifications. Ordinary channel posts still become unread without notifying. Membership noise, other non-message noise, and self-authored messages become neither unread nor notifications. Muted or actively viewed messages do not notify but may remain unread; historical, already-observed, or at-or-before-read-cursor deliveries do not create new attention. Preferences → Notifications changes enabled triggers and configured terms immediately without a restart or reconnect.
+
+Names, aliases, keywords, and phrases are entered one per line. Matching is case- and diacritic-insensitive, collapses whitespace, respects alphanumeric word boundaries, and keeps punctuation significant. Channel notifications include the resolved sender, and selecting a thread-reply notification opens the matching thread. See [Attention And Notifications](docs/attention-and-notifications.md) for the complete policy and raw-unread distinction. Without a realtime connection, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
 
 ## Keyboard shortcuts
 
@@ -282,7 +286,13 @@ export CONDUIT_SLACK_APP_TOKEN=xapp-...
     --debug-auth    Enable OAuth diagnostics only
 ```
 
-Debug output can contain private workspace metadata such as channel names, user IDs, timestamps, and unread counts. It should not contain tokens or authorization codes, but always review and redact logs before sharing them.
+Debug output can contain private workspace metadata such as channel names, user IDs, timestamps, and unread counts. To opt into only the attention diagnostics target, run:
+
+```sh
+RUST_LOG=conduit::attention=trace conduit
+```
+
+That target is limited to counters, booleans, and stable category codes; it excludes message text, configured terms, and workspace, user, conversation, and message identifiers. This target-specific privacy property does not apply to general `--debug` output. Diagnostics should not contain tokens or authorization codes, but always review and redact logs before sharing them.
 
 ## Local data and security
 

@@ -18,6 +18,13 @@
 - If requested Slack scopes changed since the last tester build, verify the README scope list and reconnect instructions before tagging.
 - For an OAuth workspace, test Socket Mode with an `xapp-` token that has `connections:write`.
 - For an imported XOXC/XOXD workspace, verify browser-session realtime connects and reconnects without an app token.
+- Verify the Notifications master switch suppresses all message notifications and that direct and group-direct message triggers work independently of mention/name and thread triggers.
+- Verify mention/name, thread, alias, and keyword changes apply without reconnecting, including a candidate waiting for display-name resolution.
+- Confirm an ordinary channel post becomes unread without notifying, while a membership join/leave event becomes neither unread nor a notification.
+- Confirm muted and actively viewed messages do not notify even though they may remain locally unread.
+- Redeliver the same relevant realtime message after a disconnect/reconnect and after an application restart; within the retained 512-entry windows it must produce only one notification and one local unread observation.
+- Run the ignored release-mode attention measurements with the sanitized command in `docs/attention-and-notifications.md` and record repeated timing ranges with the commit and host details.
+- Run with `RUST_LOG=conduit::attention=trace` and review only that target for message text, configured names/terms, and workspace/user/conversation/message identifiers; only counters, booleans, and stable category codes may appear. Review general `--debug` output separately.
 - Confirm an active huddle appears only in its matching workspace and conversation, and that ending it removes the indicator without restarting Conduit.
 - Confirm huddle preflight does not start capture, defaults the camera and sharing off, and clearly shows the selected microphone, speaker, and camera.
 - Confirm unsupported native joining offers **Open in Slack** for the exact team and conversation and does not loop through Conduit's `slack://` handler.

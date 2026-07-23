@@ -609,9 +609,17 @@ pub(crate) struct WorkspaceBootstrap {
     pub(crate) custom_emojis: HashMap<String, String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttentionObservationStatus {
+    InvalidIdentity,
+    AtOrBeforeReadCursor,
+    AlreadyObserved,
+    Accepted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AttentionDeliveryOutcome {
-    pub(crate) observation_accepted: bool,
+    pub(crate) observation: AttentionObservationStatus,
     pub(crate) notification_claimed: bool,
 }
 
@@ -1203,7 +1211,10 @@ impl WorkspaceStore {
         claim_notification: bool,
     ) -> Result<AttentionDeliveryOutcome> {
         if channel_id.trim().is_empty() || message_ts.trim().is_empty() {
-            return Ok(AttentionDeliveryOutcome::default());
+            return Ok(AttentionDeliveryOutcome {
+                observation: AttentionObservationStatus::InvalidIdentity,
+                notification_claimed: false,
+            });
         }
 
         let _guard = self.update_lock.lock().await;
@@ -1229,10 +1240,19 @@ impl WorkspaceStore {
                     .is_some_and(|last_read| {
                         !slack_timestamp_is_after(message_ts.as_str(), last_read)
                     })
-                    || !conversation.observe_attention_message_at(&message_ts, record_unread)
                 {
                     transaction.rollback()?;
-                    return Ok(AttentionDeliveryOutcome::default());
+                    return Ok(AttentionDeliveryOutcome {
+                        observation: AttentionObservationStatus::AtOrBeforeReadCursor,
+                        notification_claimed: false,
+                    });
+                }
+                if !conversation.observe_attention_message_at(&message_ts, record_unread) {
+                    transaction.rollback()?;
+                    return Ok(AttentionDeliveryOutcome {
+                        observation: AttentionObservationStatus::AlreadyObserved,
+                        notification_claimed: false,
+                    });
                 }
 
                 let mut changed = upsert_sqlite_conversation(
@@ -1269,7 +1289,7 @@ impl WorkspaceStore {
                 }
                 finish_sqlite_transaction(transaction, changed)?;
                 Ok(AttentionDeliveryOutcome {
-                    observation_accepted: true,
+                    observation: AttentionObservationStatus::Accepted,
                     notification_claimed,
                 })
             })
@@ -4291,6 +4311,16 @@ mod tests {
 
         runtime.block_on(async {
             let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            assert_eq!(
+                store
+                    .accept_attention_delivery("", "1710000001.000001", true, true)
+                    .await
+                    .unwrap(),
+                AttentionDeliveryOutcome {
+                    observation: AttentionObservationStatus::InvalidIdentity,
+                    notification_claimed: false,
+                }
+            );
             let first = store
                 .accept_attention_delivery("D1", "1710000001.000001", true, true)
                 .await
@@ -4298,7 +4328,7 @@ mod tests {
             assert_eq!(
                 first,
                 AttentionDeliveryOutcome {
-                    observation_accepted: true,
+                    observation: AttentionObservationStatus::Accepted,
                     notification_claimed: true,
                 }
             );
@@ -4307,7 +4337,10 @@ mod tests {
                     .accept_attention_delivery("D1", "1710000001.000001", true, true)
                     .await
                     .unwrap(),
-                AttentionDeliveryOutcome::default()
+                AttentionDeliveryOutcome {
+                    observation: AttentionObservationStatus::AlreadyObserved,
+                    notification_claimed: false,
+                }
             );
 
             drop(store);
@@ -4317,7 +4350,10 @@ mod tests {
                     .accept_attention_delivery("D1", "1710000001.000001", true, true)
                     .await
                     .unwrap(),
-                AttentionDeliveryOutcome::default()
+                AttentionDeliveryOutcome {
+                    observation: AttentionObservationStatus::AlreadyObserved,
+                    notification_claimed: false,
+                }
             );
             let conversation = reopened
                 .load_conversations()
@@ -4350,6 +4386,16 @@ mod tests {
                 .clear_conversation_unread_state("C1", "20.0")
                 .await
                 .unwrap();
+            assert_eq!(
+                store
+                    .accept_attention_delivery("C1", "10.0", true, true)
+                    .await
+                    .unwrap(),
+                AttentionDeliveryOutcome {
+                    observation: AttentionObservationStatus::AtOrBeforeReadCursor,
+                    notification_claimed: false,
+                }
+            );
             assert!(!store
                 .apply_conversation_unread_state(
                     "C1",
