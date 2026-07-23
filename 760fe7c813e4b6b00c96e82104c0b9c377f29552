@@ -1,0 +1,4 @@
+Task: Complete Phase 2 canonical pipeline integration
+Summary: Routed realtime and snapshot candidates through the attention policy; separated raw Slack counters from classified unread state; persisted attention observations and notification claims atomically; serialized message effects before UI fan-out; reconciled history without historical notifications; and added regressions for noise, thread relevance, redelivery, read races, raw unread bootstrap, and realtime ordering.
+Files: src/attention.rs, src/conversation_catalog.rs, src/gnome_search_provider.rs, src/models.rs, src/runtime.rs, src/store.rs, src/thread_catalog.rs, src/window.rs, src/workspace_pipeline.rs
+Rationale: One durable policy-to-store-to-UI path prevents duplicate notifications, stale unread resurrection, and disagreement between sidebar, activity, and native delivery.
