@@ -727,9 +727,10 @@ impl WorkspaceStore {
             .await
     }
 
-    async fn update_thread_catalog<F>(&self, update: F) -> Result<Vec<ThreadRecord>>
+    async fn update_thread_catalog<F, T>(&self, update: F) -> Result<(Vec<ThreadRecord>, T)>
     where
-        F: FnOnce(&mut ThreadCatalog) + Send + 'static,
+        F: FnOnce(&mut ThreadCatalog) -> T + Send + 'static,
+        T: Send + 'static,
     {
         let workspace_key = self.workspace_key.clone();
         let workspace_id = self.workspace_id.clone();
@@ -743,7 +744,7 @@ impl WorkspaceStore {
                 let records =
                     load_sqlite_kind_values(&transaction, &workspace_key, "thread_record")?;
                 let mut catalog = ThreadCatalog::from_records(records);
-                update(&mut catalog);
+                let result = update(&mut catalog);
                 let records = catalog.into_records();
                 changed |= sync_sqlite_kind(
                     &transaction,
@@ -757,7 +758,7 @@ impl WorkspaceStore {
                     }),
                 )?;
                 finish_sqlite_transaction(transaction, changed)?;
-                Ok(records)
+                Ok((records, result))
             })
             .await
     }
@@ -1701,15 +1702,52 @@ impl WorkspaceStore {
         channel_id: &str,
         root_ts: &str,
         last_read: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let channel_id = channel_id.to_string();
         let root_ts = root_ts.to_string();
         let last_read = last_read.to_string();
-        self.update_thread_catalog(move |catalog| {
-            catalog.mark_read(&channel_id, &root_ts, &last_read);
-        })
-        .await
-        .map(|_| ())
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                let records =
+                    load_sqlite_kind_values(&transaction, &workspace_key, "thread_record")?;
+                let mut catalog = ThreadCatalog::from_records(records);
+                let cleared_reply_ts = catalog.mark_read(&channel_id, &root_ts, &last_read);
+                let records = catalog.into_records();
+                changed |= sync_sqlite_kind(
+                    &transaction,
+                    &workspace_key,
+                    "thread_record",
+                    records.into_iter().map(|record| {
+                        (
+                            thread_key(&record.key.channel_id, &record.key.root_ts),
+                            record,
+                        )
+                    }),
+                )?;
+                if !cleared_reply_ts.is_empty() {
+                    if let Some(mut conversation) =
+                        load_sqlite_conversation(&transaction, &workspace_key, &channel_id)?
+                    {
+                        conversation.acknowledge_attention_messages(&cleared_reply_ts);
+                        changed |= upsert_sqlite_conversation(
+                            &transaction,
+                            &workspace_key,
+                            &workspace_id,
+                            &conversation,
+                        )?;
+                    }
+                }
+                finish_sqlite_transaction(transaction, changed)?;
+                Ok(cleared_reply_ts)
+            })
+            .await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -5230,6 +5268,72 @@ mod tests {
                     .expect("thread catalog load failed"),
                 records
             );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn marking_thread_read_can_persist_only_its_parent_attention_count() {
+        use crate::thread_catalog::ThreadCatalog;
+
+        let directory = temp_cache_dir("workspace-store-thread-read-attention");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let mut conversation = SlackConversation {
+                id: "C123".into(),
+                ..Default::default()
+            };
+            conversation.observe_attention_message_at("2.0", true);
+            conversation.observe_attention_message_at("3.0", false);
+            conversation.observe_attention_message_at("10.0", true);
+            store.store_conversations(&[conversation]).await.unwrap();
+
+            let mut catalog = ThreadCatalog::default();
+            let root = SlackMessage {
+                ts: "1.0".into(),
+                subscribed: Some(true),
+                unread_count: Some(2),
+                latest_reply: Some("3.0".into()),
+                last_read: Some("1.0".into()),
+                ..Default::default()
+            };
+            let relevant_reply = SlackMessage {
+                ts: "2.0".into(),
+                thread_ts: Some("1.0".into()),
+                user: Some("U2".into()),
+                ..Default::default()
+            };
+            let filtered_reply = SlackMessage {
+                ts: "3.0".into(),
+                thread_ts: Some("1.0".into()),
+                user: Some("U3".into()),
+                ..Default::default()
+            };
+            catalog.observe_thread(
+                "C123",
+                "1.0",
+                &[root, relevant_reply, filtered_reply],
+                false,
+            );
+            store
+                .store_thread_catalog(&catalog.into_records())
+                .await
+                .unwrap();
+
+            let cleared_reply_ts = store.mark_thread_read("C123", "1.0", "3.0").await.unwrap();
+            assert_eq!(cleared_reply_ts, vec!["2.0".to_string(), "3.0".to_string()]);
+
+            let conversation = store
+                .load_conversations()
+                .await
+                .unwrap()
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(conversation.unread_activity_count(), 1);
         });
 
         let _ = std::fs::remove_dir_all(directory);

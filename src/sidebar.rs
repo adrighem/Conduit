@@ -204,6 +204,7 @@ pub enum SidebarItemModel {
     SectionHeader {
         kind: SidebarSectionKind,
         title: String,
+        collapsed: bool,
     },
     Conversation(SidebarRowModel),
 }
@@ -226,7 +227,15 @@ pub struct SidebarModelDiff {
 }
 
 impl SidebarListModel {
+    #[cfg(test)]
     pub fn keyed_items(&self) -> Vec<KeyedSidebarItem> {
+        self.keyed_items_with_collapsed_sections(&HashSet::new())
+    }
+
+    pub fn keyed_items_with_collapsed_sections(
+        &self,
+        collapsed_sections: &HashSet<SidebarSectionKind>,
+    ) -> Vec<KeyedSidebarItem> {
         match self {
             Self::Placeholder(placeholder) => vec![KeyedSidebarItem {
                 key: SidebarItemKey::Placeholder(*placeholder),
@@ -240,9 +249,13 @@ impl SidebarListModel {
                         model: SidebarItemModel::SectionHeader {
                             kind: section.kind,
                             title: section.display_title(),
+                            collapsed: collapsed_sections.contains(&section.kind),
                         },
                     };
-                    std::iter::once(header).chain(section.rows.iter().cloned().map(|row| {
+                    let rows = (!collapsed_sections.contains(&section.kind))
+                        .then_some(section.rows.as_slice())
+                        .unwrap_or_default();
+                    std::iter::once(header).chain(rows.iter().cloned().map(|row| {
                         KeyedSidebarItem {
                             key: SidebarItemKey::Conversation {
                                 section: Some(section.kind),
@@ -499,7 +512,10 @@ pub fn build_sidebar_list(
                 },
             )
         })
-        .filter(|row| row.match_score(&query).is_some() && (!options.unread_only || row.unread))
+        .filter(|row| {
+            row.match_score(&query).is_some()
+                && (!options.unread_only || row.unread || row.selected)
+        })
         .collect::<Vec<_>>();
 
     if rows.is_empty() {
@@ -901,7 +917,7 @@ fn build_sidebar_sections_from_rows(
     let mut other = Vec::new();
 
     for row in rows {
-        if row.unread {
+        if row.unread || row.selected {
             unreads.push(row.clone());
         }
 
@@ -1470,6 +1486,22 @@ mod tests {
     }
 
     #[test]
+    fn unread_section_keeps_selected_read_conversation() {
+        let sections = build_sidebar_sections(
+            &[channel("C1", "alpha"), channel("C2", "beta")],
+            &HashMap::new(),
+            Some("C1"),
+        );
+        let unread_rows = &section(&sections, SidebarSectionKind::Unreads).rows;
+
+        assert_eq!(unread_rows.len(), 1);
+        assert_eq!(unread_rows[0].id, "C1");
+        assert!(unread_rows[0].selected);
+        assert!(!unread_rows[0].unread);
+        assert_eq!(unread_rows[0].unread_badge_label(), None);
+    }
+
+    #[test]
     fn default_sidebar_visibility_keeps_recent_dms_and_hides_inactive_dms() {
         let active_channel = channel("C1", "general");
         let mut open_dm = dm("D_OPEN", "U_OPEN");
@@ -1808,6 +1840,32 @@ mod tests {
             )),
             SidebarPlaceholder::NoMatches
         );
+    }
+
+    #[test]
+    fn sidebar_unread_only_filter_keeps_selected_read_conversation() {
+        let mut unread = channel("C1", "alerts");
+        unread.unread_count = Some(2);
+        let selected_read = channel("C2", "general");
+        let read = channel("C3", "random");
+
+        let sections = list_sections(build_sidebar_list(
+            &[unread, selected_read, read],
+            &HashMap::new(),
+            SidebarBuildOptions {
+                selected_channel: Some("C2"),
+                unread_only: true,
+                ..Default::default()
+            },
+        ));
+        let rows = &section(&sections, SidebarSectionKind::Channels).rows;
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["C1", "C2"]
+        );
+        assert!(rows[1].selected);
+        assert!(!rows[1].unread);
     }
 
     #[test]
@@ -2841,6 +2899,66 @@ mod tests {
                 section: Some(SidebarSectionKind::Channels),
                 id: "C1".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn keyed_sidebar_items_hide_only_collapsed_section_rows() {
+        let model = SidebarListModel::Sections(vec![
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Channels,
+                title: SidebarSectionKind::Channels.title(),
+                rows: vec![row("C1", 0, false), row("C2", 0, false)],
+            },
+            SidebarSectionModel {
+                kind: SidebarSectionKind::DirectMessages,
+                title: SidebarSectionKind::DirectMessages.title(),
+                rows: vec![row("D1", 0, false)],
+            },
+        ]);
+
+        let collapsed = HashSet::from([SidebarSectionKind::Channels]);
+        let items = model.keyed_items_with_collapsed_sections(&collapsed);
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items[0].model,
+            SidebarItemModel::SectionHeader {
+                kind: SidebarSectionKind::Channels,
+                title: "Channels".to_string(),
+                collapsed: true,
+            }
+        );
+        assert_eq!(
+            items[1].model,
+            SidebarItemModel::SectionHeader {
+                kind: SidebarSectionKind::DirectMessages,
+                title: "Direct messages".to_string(),
+                collapsed: false,
+            }
+        );
+        assert_eq!(
+            items[2].key,
+            SidebarItemKey::Conversation {
+                section: Some(SidebarSectionKind::DirectMessages),
+                id: "D1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn collapsed_sections_do_not_change_flat_rows_or_placeholders() {
+        let collapsed = HashSet::from([SidebarSectionKind::Channels]);
+        let rows = SidebarListModel::Rows(vec![row("C1", 0, false)]);
+        let placeholder = SidebarListModel::Placeholder(SidebarPlaceholder::NoMatches);
+
+        assert_eq!(
+            rows.keyed_items_with_collapsed_sections(&collapsed),
+            rows.keyed_items()
+        );
+        assert_eq!(
+            placeholder.keyed_items_with_collapsed_sections(&collapsed),
+            placeholder.keyed_items()
         );
     }
 

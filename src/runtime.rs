@@ -787,6 +787,10 @@ pub enum RuntimeEventKind {
         channel_id: String,
         ts: String,
     },
+    ConversationAttentionAcknowledged {
+        channel_id: String,
+        message_ts: Vec<String>,
+    },
     AttentionNotificationCandidate {
         channel_id: String,
         message: Box<SlackMessage>,
@@ -910,6 +914,7 @@ impl RuntimeEventKind {
             | Self::ConversationsPatched { .. }
             | Self::ConversationsLoadFailed(_)
             | Self::ConversationUnreadUpdated { .. }
+            | Self::ConversationAttentionAcknowledged { .. }
             | Self::ThreadCatalogLoaded(_) => {
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
             }
@@ -3453,7 +3458,22 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             ts,
         } => {
             if let Some(store) = context.workspace_store.as_ref() {
-                store.mark_thread_read(&channel_id, &thread_ts, &ts).await?;
+                let cleared_reply_ts = store.mark_thread_read(&channel_id, &thread_ts, &ts).await?;
+                if !cleared_reply_ts.is_empty() {
+                    context.workspace.apply(
+                        MutationOrigin::Local,
+                        WorkspaceMutation::AttentionAcknowledged {
+                            channel_id: channel_id.clone(),
+                            message_ts: cleared_reply_ts.clone(),
+                        },
+                    );
+                    context.events.send_event(
+                        RuntimeEventKind::ConversationAttentionAcknowledged {
+                            channel_id: channel_id.clone(),
+                            message_ts: cleared_reply_ts,
+                        },
+                    );
+                }
                 load_cached_thread_catalog(
                     context.events,
                     context.workspace_store,

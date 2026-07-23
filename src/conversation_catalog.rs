@@ -173,6 +173,24 @@ impl ConversationCatalog {
         self.apply_unread(id, state);
     }
 
+    pub(crate) fn acknowledge_attention_messages(
+        &mut self,
+        id: &str,
+        message_ts: &[String],
+    ) -> u64 {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return 0;
+        };
+        let acknowledged = entry
+            .conversation
+            .acknowledge_attention_messages(message_ts);
+        if acknowledged > 0 {
+            entry.unread_revision = self.revision.saturating_add(1);
+            self.revision = entry.unread_revision;
+        }
+        acknowledged
+    }
+
     /// Applies Conduit's message-level attention classification without
     /// overwriting the raw unread counters received from Slack.
     ///

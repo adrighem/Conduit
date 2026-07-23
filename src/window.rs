@@ -71,7 +71,7 @@ use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
     self, diff_keyed_sidebar_items, ConversationPickerAction, ConversationPickerItem,
     ConversationPickerSections, KeyedSidebarItem, SidebarItemKey, SidebarItemModel,
-    SidebarRowModel,
+    SidebarRowModel, SidebarSectionKind,
 };
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::slack_link::{
@@ -238,6 +238,8 @@ mod imp {
         pub discovered_users: RefCell<Vec<SlackUser>>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
+        pub(super) sidebar_section_actions: RefCell<HashMap<i32, SidebarSectionKind>>,
+        pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<HashMap<String, String>>,
         pub user_full_names: RefCell<HashMap<String, String>>,
@@ -673,6 +675,26 @@ fn sidebar_row_action_for_index(
     row_index: i32,
 ) -> Option<SidebarRowAction> {
     actions.get(&row_index).cloned()
+}
+
+fn sidebar_section_accessible_label(title: &str, collapsed: bool) -> String {
+    format!(
+        "{} {title}",
+        if collapsed {
+            gettext("Expand")
+        } else {
+            gettext("Collapse")
+        }
+    )
+}
+
+fn toggle_sidebar_section_state(
+    collapsed_sections: &mut HashSet<SidebarSectionKind>,
+    section: SidebarSectionKind,
+) {
+    if !collapsed_sections.insert(section) {
+        collapsed_sections.remove(&section);
+    }
 }
 
 fn picker_sections(
@@ -3601,6 +3623,20 @@ impl ConduitWindow {
                     self.populate_unreads(self.unread_items());
                 }
             }
+            RuntimeEventKind::ConversationAttentionAcknowledged {
+                channel_id,
+                message_ts,
+            } => {
+                self.imp()
+                    .workspace
+                    .conversations
+                    .borrow_mut()
+                    .acknowledge_attention_messages(&channel_id, &message_ts);
+                self.render_conversations();
+                if self.current_main_view() == MainMessageView::Unreads {
+                    self.populate_unreads(self.unread_items());
+                }
+            }
             RuntimeEventKind::AttentionNotificationCandidate {
                 channel_id,
                 message,
@@ -5203,6 +5239,7 @@ impl ConduitWindow {
         imp.discovered_channels.borrow_mut().clear();
         imp.discovered_users.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
+        imp.sidebar_section_actions.borrow_mut().clear();
         imp.user_names.borrow_mut().clear();
         imp.user_full_names.borrow_mut().clear();
         imp.user_avatar_urls.borrow_mut().clear();
@@ -5980,7 +6017,9 @@ impl ConduitWindow {
             },
         );
 
-        self.reconcile_sidebar(model.keyed_items());
+        self.reconcile_sidebar(
+            model.keyed_items_with_collapsed_sections(&imp.collapsed_sidebar_sections.borrow()),
+        );
         log_performance(started, |elapsed_ms| {
             format!(
                 "sidebar_render conversations={} elapsed_ms={:.2}",
@@ -6008,7 +6047,9 @@ impl ConduitWindow {
                 row.set_child(Some(&self.placeholder_label(placeholder.label())));
                 row
             }
-            SidebarItemModel::SectionHeader { title, .. } => self.sidebar_section_row(title),
+            SidebarItemModel::SectionHeader {
+                title, collapsed, ..
+            } => self.sidebar_section_row(title, *collapsed),
             SidebarItemModel::Conversation(model) => {
                 let row = sidebar_row_widget(
                     model,
@@ -6198,22 +6239,36 @@ impl ConduitWindow {
         }
     }
 
-    fn sidebar_section_row(&self, title: &str) -> gtk::ListBoxRow {
+    fn sidebar_section_row(&self, title: &str, collapsed: bool) -> gtk::ListBoxRow {
         let header_row = gtk::ListBoxRow::new();
         header_row.set_selectable(false);
-        header_row.set_activatable(false);
-        header_row.set_focusable(false);
+        header_row.set_activatable(true);
+        header_row.set_focusable(true);
+        header_row.update_property(&[gtk::accessible::Property::Label(
+            &sidebar_section_accessible_label(title, collapsed),
+        )]);
 
         let header = gtk::Label::new(Some(title));
         header.set_xalign(0.0);
+        header.set_hexpand(true);
         header.set_margin_top(12);
         header.set_margin_bottom(3);
-        header.set_margin_start(9);
         header.set_margin_end(9);
         header.add_css_class("caption");
         header.add_css_class("heading");
 
-        header_row.set_child(Some(&header));
+        let disclosure = gtk::Image::from_icon_name(if collapsed {
+            "pan-end-symbolic"
+        } else {
+            "pan-down-symbolic"
+        });
+        disclosure.set_margin_start(9);
+        disclosure.set_accessible_role(gtk::AccessibleRole::Presentation);
+
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+        content.append(&disclosure);
+        content.append(&header);
+        header_row.set_child(Some(&content));
         header_row
     }
 
@@ -6247,10 +6302,20 @@ impl ConduitWindow {
                 existing.set_activatable(replacement.is_activatable());
                 existing.set_focusable(replacement.is_focusable());
                 existing.set_tooltip_text(replacement.tooltip_text().as_deref());
-                if let SidebarItemModel::Conversation(model) = &next_items[*index].model {
-                    existing.update_property(&[gtk::accessible::Property::Label(
-                        &model.accessible_label(),
-                    )]);
+                match &next_items[*index].model {
+                    SidebarItemModel::SectionHeader {
+                        title, collapsed, ..
+                    } => {
+                        existing.update_property(&[gtk::accessible::Property::Label(
+                            &sidebar_section_accessible_label(title, *collapsed),
+                        )]);
+                    }
+                    SidebarItemModel::Conversation(model) => {
+                        existing.update_property(&[gtk::accessible::Property::Label(
+                            &model.accessible_label(),
+                        )]);
+                    }
+                    SidebarItemModel::Placeholder(_) => {}
                 }
                 if let Some(child) = replacement.child() {
                     replacement.set_child(None::<&gtk::Widget>);
@@ -6270,17 +6335,26 @@ impl ConduitWindow {
         }
 
         imp.sidebar_row_actions.borrow_mut().clear();
+        imp.sidebar_section_actions.borrow_mut().clear();
         let rows = imp.sidebar_rows.borrow();
         let mut selected = None;
         for item in &next_items {
             let Some(row) = rows.get(&item.key) else {
                 continue;
             };
-            if let SidebarItemModel::Conversation(model) = &item.model {
-                self.register_sidebar_row_action(row.index(), model);
-                if model.selected && selected.is_none() {
-                    selected = Some(row);
+            match &item.model {
+                SidebarItemModel::SectionHeader { kind, .. } => {
+                    imp.sidebar_section_actions
+                        .borrow_mut()
+                        .insert(row.index(), *kind);
                 }
+                SidebarItemModel::Conversation(model) => {
+                    self.register_sidebar_row_action(row.index(), model);
+                    if model.selected && selected.is_none() {
+                        selected = Some(row);
+                    }
+                }
+                SidebarItemModel::Placeholder(_) => {}
             }
         }
         imp.conversation_list.select_row(selected);
@@ -6296,6 +6370,16 @@ impl ConduitWindow {
     }
 
     fn activate_sidebar_row(&self, row_index: i32) {
+        if let Some(section) = self
+            .imp()
+            .sidebar_section_actions
+            .borrow()
+            .get(&row_index)
+            .copied()
+        {
+            self.toggle_sidebar_section(section);
+            return;
+        }
         let action =
             sidebar_row_action_for_index(&self.imp().sidebar_row_actions.borrow(), row_index);
 
@@ -6303,6 +6387,13 @@ impl ConduitWindow {
             let title = self.conversation_title(&action.channel_id);
             self.select_conversation(&action.channel_id, &title);
         }
+    }
+
+    fn toggle_sidebar_section(&self, section: SidebarSectionKind) {
+        let mut collapsed = self.imp().collapsed_sidebar_sections.borrow_mut();
+        toggle_sidebar_section_state(&mut collapsed, section);
+        drop(collapsed);
+        self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
     }
 
     fn show_conversation_switcher(&self) {
@@ -9328,6 +9419,31 @@ mod tests {
 
         assert_eq!(sidebar_row_action_for_index(&actions, 3), None);
         assert_eq!(sidebar_row_action_for_index(&actions, 4), Some(action));
+    }
+
+    #[test]
+    fn sidebar_section_state_toggles_independently() {
+        let mut collapsed = HashSet::from([SidebarSectionKind::Channels]);
+
+        toggle_sidebar_section_state(&mut collapsed, SidebarSectionKind::DirectMessages);
+        assert!(collapsed.contains(&SidebarSectionKind::Channels));
+        assert!(collapsed.contains(&SidebarSectionKind::DirectMessages));
+
+        toggle_sidebar_section_state(&mut collapsed, SidebarSectionKind::Channels);
+        assert!(!collapsed.contains(&SidebarSectionKind::Channels));
+        assert!(collapsed.contains(&SidebarSectionKind::DirectMessages));
+    }
+
+    #[test]
+    fn sidebar_section_accessibility_describes_the_available_action() {
+        assert_eq!(
+            sidebar_section_accessible_label("Channels", false),
+            "Collapse Channels"
+        );
+        assert_eq!(
+            sidebar_section_accessible_label("Channels", true),
+            "Expand Channels"
+        );
     }
 
     #[test]

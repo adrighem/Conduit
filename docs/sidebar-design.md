@@ -101,11 +101,13 @@ Sections are rendered in this order:
 
 One-to-one and group direct messages share the `Direct messages` section and are sorted together. Their distinct conversation kinds are retained for row icons, accessibility labels, and Slack-specific behavior.
 
-Unread conversations can be duplicated: when the Preferences setting `Show Unreads section` is enabled, they appear in `Unreads` and also in their normal section. This keeps `Unreads` as a shortcut section rather than moving the conversation out of its normal location. The setting is disabled by default, so unread conversations stay in their normal sections unless the shortcut section is explicitly enabled.
+Unread conversations can be duplicated: when the Preferences setting `Show Unreads section` is enabled, they appear in `Unreads` and also in their normal section. The currently selected conversation also remains in `Unreads` after opening it clears its unread state. This keeps `Unreads` as a shortcut section rather than moving the conversation out of its normal location. The setting is disabled by default, so unread conversations stay in their normal sections unless the shortcut section is explicitly enabled.
 
-The `Unreads` section header includes its row count, for example `Unreads (3)`. Other section headers use their plain title.
+The unread-only filter likewise retains the currently selected conversation after it becomes read, so opening an item does not immediately remove it from the filtered sidebar.
 
-Section headers are non-selectable, non-activatable, and non-focusable. They are static grouping labels, not controls.
+The `Unreads` section header includes its total row count, for example `Unreads (3)`. Other section headers use their plain title.
+
+Section headers are non-selectable disclosure controls. Clicking or keyboard-activating a header collapses or expands that section, and the chevron shows its current state. Collapse state is kept for the current application session and survives sidebar refreshes and filter changes. Collapsing `Unreads` hides only its shortcut rows; copies in their regular sections remain available.
 
 ## Conversation Types
 
@@ -218,7 +220,7 @@ Rows are activated through the `GtkListBox::row-activated` signal on `conversati
 
 The list sets `activate-on-single-click` to `True`, so a normal mouse click activates the channel or DM. Keyboard activation still uses native list behavior.
 
-`src/window.rs` registers a `SidebarRowAction` for each conversation row, keyed by the rendered `GtkListBoxRow` index. Section headers and placeholder rows are not registered, so activating them has no navigation effect.
+`src/window.rs` registers a `SidebarRowAction` for each conversation row and a section toggle action for each header, keyed by the rendered `GtkListBoxRow` index. Placeholder rows are not registered. Activating a header toggles its collapsed state and rerenders the keyed list without navigating away from the current conversation.
 
 Activating a conversation row calls `select_conversation(channel_id, title)`.
 
@@ -260,13 +262,13 @@ Expected keyboard order:
 4. Conversation list.
 5. Main message area.
 
-Section headers are skipped because they are not focusable. Conversation rows are selectable and activatable through native list row behavior.
+Section headers are focusable and expose action-oriented labels such as `Collapse Channels` or `Expand Channels`. Conversation rows remain selectable and activatable through native list row behavior.
 
 ## Test Coverage
 
-Sidebar model coverage lives in `src/sidebar.rs` and verifies conversation classification, list placeholders, filtering, section grouping, sorting, unread duplication, unread badge labels, selected state, active/history DM bounds, the all-conversations override, switcher items, section display titles, and accessible labels.
+Sidebar model coverage lives in `src/sidebar.rs` and verifies conversation classification, list placeholders, filtering, section grouping and collapsing, sorting, unread duplication, unread badge labels, selected state, active/history DM bounds, the all-conversations override, switcher items, section display titles, and accessible labels.
 
-Window/controller coverage in `src/window.rs` verifies that rendered row actions preserve the conversation ID and resolved title, unregistered rows do not activate, and unread rows map to bold title weight.
+Window/controller coverage in `src/window.rs` verifies that rendered row actions preserve the conversation ID and resolved title, unregistered rows do not activate, section state toggles independently with appropriate accessibility labels, and unread rows map to bold title weight.
 
 Slack client, runtime, and store coverage verifies the guarded browser bootstrap request shape, schema-drift rejection, badge-less unread snapshots, monotonic cursor persistence, DM-aware fallback priority, the 30-conversation hard limit, fair queue rotation, and ordered persistence across restarts.
 
@@ -281,7 +283,6 @@ The sidebar currently uses member-scoped conversation data from `users.conversat
 Known limits:
 
 - No Slack custom section sync.
-- No collapsible sections.
 - No drag and drop reordering.
 - No muted state.
 - No Slack Connect or external organization indicators.

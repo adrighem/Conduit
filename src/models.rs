@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::huddles::model::{SlackHuddleRoom, SlackHuddleState};
@@ -87,6 +87,8 @@ pub struct ConversationAttentionState {
     raw_unread_count: u64,
     #[serde(default)]
     raw_has_unread: bool,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    unread_message_ts: BTreeSet<String>,
 }
 
 impl SlackConversation {
@@ -241,6 +243,7 @@ impl SlackConversation {
             has_unread: false,
             raw_unread_count: raw.display_count,
             raw_has_unread: raw.has_unread,
+            unread_message_ts: BTreeSet::new(),
         });
         if record_unread {
             state.unread_count = state.unread_count.saturating_add(1);
@@ -269,6 +272,13 @@ impl SlackConversation {
             return false;
         }
         self.observe_attention_message(record_unread);
+        if record_unread {
+            self.attention
+                .as_mut()
+                .expect("attention state was initialized above")
+                .unread_message_ts
+                .insert(message_ts.to_string());
+        }
         let mut seen = self
             .extra
             .get(SEEN_ATTENTION_MESSAGE_TS_KEY)
@@ -294,6 +304,24 @@ impl SlackConversation {
 
     pub fn clear_attention_activity(&mut self) {
         self.attention = Some(ConversationAttentionState::default());
+    }
+
+    pub fn acknowledge_attention_messages(&mut self, message_ts: &[String]) -> u64 {
+        let Some(attention) = self.attention.as_mut() else {
+            return 0;
+        };
+        let mut acknowledged = 0;
+        for message_ts in message_ts {
+            if acknowledged >= attention.unread_count {
+                break;
+            }
+            if attention.unread_message_ts.remove(message_ts) {
+                acknowledged += 1;
+            }
+        }
+        attention.unread_count -= acknowledged;
+        attention.has_unread = attention.unread_count > 0;
+        acknowledged
     }
 
     pub fn clear_unread_activity(&mut self) {
@@ -1669,6 +1697,45 @@ mod tests {
         assert_eq!(conversation.unread_activity_count(), 1);
         conversation.apply_unread_state(SlackUnreadState::from_parts(true, false, 0));
         assert_eq!(conversation.unread_activity_count(), 0);
+    }
+
+    #[test]
+    fn acknowledging_attention_messages_preserves_other_unreads_and_raw_state() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            unread_count: Some(9),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("1.0", true);
+        conversation.observe_attention_message_at("2.0", true);
+        conversation.observe_attention_message_at("3.0", true);
+
+        assert_eq!(
+            conversation.acknowledge_attention_messages(&["1.0".to_string(), "2.0".to_string()]),
+            2
+        );
+        assert_eq!(conversation.unread_activity_count(), 1);
+        assert!(conversation.has_unread_activity());
+        assert_eq!(conversation.raw_unread_activity_count(), 9);
+    }
+
+    #[test]
+    fn legacy_attention_state_does_not_acknowledge_untracked_message_timestamps() {
+        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C1",
+            "__conduit_attention": {
+                "unread_count": 2,
+                "has_unread": true
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            conversation.acknowledge_attention_messages(&["2.0".to_string()]),
+            0
+        );
+        assert_eq!(conversation.unread_activity_count(), 2);
+        assert!(conversation.has_unread_activity());
     }
 
     #[test]

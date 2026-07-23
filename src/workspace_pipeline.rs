@@ -126,6 +126,10 @@ pub(crate) enum WorkspaceMutation {
         ts: String,
         remaining_unread: u64,
     },
+    AttentionAcknowledged {
+        channel_id: String,
+        message_ts: Vec<String>,
+    },
     UsersSnapshot(SnapshotEnvelope<Vec<SlackUser>>),
     UserUpsert(SlackUser),
     HistorySnapshot {
@@ -406,6 +410,10 @@ impl WorkspaceCoordinator {
                 ts,
                 remaining_unread,
             } => self.apply_read_advanced(&channel_id, &ts, remaining_unread),
+            WorkspaceMutation::AttentionAcknowledged {
+                channel_id,
+                message_ts,
+            } => self.apply_attention_acknowledged(&channel_id, &message_ts),
             WorkspaceMutation::UsersSnapshot(snapshot) => self.apply_users_snapshot(snapshot),
             WorkspaceMutation::UserUpsert(user) => self.apply_user_upsert(user),
             WorkspaceMutation::HistorySnapshot {
@@ -764,6 +772,29 @@ impl WorkspaceCoordinator {
         self.commit(
             revision,
             vec![WorkspaceChange::UnreadChanged { snapshot }],
+            vec![StoreChange::ConversationUpsert(conversation)],
+        )
+    }
+
+    fn apply_attention_acknowledged(
+        &mut self,
+        channel_id: &str,
+        message_ts: &[String],
+    ) -> Option<WorkspaceReduction> {
+        if message_ts.is_empty() {
+            return None;
+        }
+        self.conversations.get(channel_id)?;
+        let revision = self.next_revision();
+        let entry = self.conversations.get_mut(channel_id).unwrap();
+        if entry.value.acknowledge_attention_messages(message_ts) == 0 {
+            return None;
+        }
+        entry.unread_revision = revision;
+        let conversation = entry.value.clone();
+        self.commit(
+            revision,
+            vec![WorkspaceChange::ConversationUpsert(conversation.clone())],
             vec![StoreChange::ConversationUpsert(conversation)],
         )
     }
@@ -1819,6 +1850,29 @@ mod tests {
         assert_eq!(
             coordinator.conversation("C1").unwrap().latest_message_ts(),
             Some("30.0")
+        );
+    }
+
+    #[test]
+    fn acknowledging_thread_attention_ignores_filtered_replies_and_preserves_channel_unreads() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut channel = conversation("C1", "general");
+        channel.observe_attention_message_at("2.0", true);
+        channel.observe_attention_message_at("3.0", false);
+        channel.observe_attention_message_at("10.0", true);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(channel));
+
+        coordinator.apply(WorkspaceMutation::AttentionAcknowledged {
+            channel_id: "C1".to_string(),
+            message_ts: vec!["2.0".to_string(), "3.0".to_string()],
+        });
+
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            1
         );
     }
 

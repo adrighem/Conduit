@@ -48,6 +48,10 @@ pub struct ThreadRecord {
     pub(crate) participant_user_ids: HashSet<String>,
     #[serde(default)]
     seen_reply_ts: HashSet<String>,
+    /// Exact locally observed reply identities that contributed to the
+    /// aggregate unread count. Older records deserialize safely without them.
+    #[serde(default)]
+    unread_reply_ts: HashSet<String>,
 }
 
 impl ThreadRecord {
@@ -61,6 +65,7 @@ impl ThreadRecord {
             unread: ThreadUnreadState::Unknown,
             participant_user_ids: HashSet::new(),
             seen_reply_ts: HashSet::new(),
+            unread_reply_ts: HashSet::new(),
         }
     }
 
@@ -194,8 +199,14 @@ impl ThreadCatalog {
                     .count() as u64;
                 record.unread = ThreadUnreadState::Known {
                     count,
-                    last_read: Some(last_read),
+                    last_read: Some(last_read.clone()),
                 };
+                record.unread_reply_ts = record
+                    .seen_reply_ts
+                    .iter()
+                    .filter(|reply_ts| reply_ts.as_str() > last_read.as_str())
+                    .cloned()
+                    .collect();
             }
         }
     }
@@ -242,14 +253,20 @@ impl ThreadCatalog {
         if record.subscribed == Some(true) {
             if let ThreadUnreadState::Known { count, .. } = &mut record.unread {
                 *count = count.saturating_add(1);
+                record.unread_reply_ts.insert(message.ts.clone());
             }
         }
     }
 
     #[allow(dead_code)]
-    pub(crate) fn mark_read(&mut self, channel_id: &str, root_ts: &str, last_read: &str) {
+    pub(crate) fn mark_read(
+        &mut self,
+        channel_id: &str,
+        root_ts: &str,
+        last_read: &str,
+    ) -> Vec<String> {
         let Some(key) = ThreadKey::new(channel_id, root_ts) else {
-            return;
+            return Vec::new();
         };
         if let Some(record) = self.records.get_mut(&key) {
             if record
@@ -257,13 +274,42 @@ impl ThreadCatalog {
                 .as_deref()
                 .is_some_and(|latest| last_read < latest)
             {
-                return;
+                return Vec::new();
             }
+            let mut cleared_reply_ts = record
+                .unread_reply_ts
+                .iter()
+                .filter(|reply_ts| reply_ts.as_str() <= last_read)
+                .cloned()
+                .collect::<Vec<_>>();
+            if let ThreadUnreadState::Known {
+                last_read: Some(previous_last_read),
+                ..
+            } = &record.unread
+            {
+                cleared_reply_ts.extend(
+                    record
+                        .seen_reply_ts
+                        .iter()
+                        .filter(|reply_ts| {
+                            reply_ts.as_str() > previous_last_read.as_str()
+                                && reply_ts.as_str() <= last_read
+                        })
+                        .cloned(),
+                );
+            }
+            cleared_reply_ts.sort();
+            cleared_reply_ts.dedup();
+            record
+                .unread_reply_ts
+                .retain(|reply_ts| reply_ts.as_str() > last_read);
             record.unread = ThreadUnreadState::Known {
                 count: 0,
                 last_read: (!last_read.trim().is_empty()).then(|| last_read.to_string()),
             };
+            return cleared_reply_ts;
         }
+        Vec::new()
     }
 
     fn observe_message(&mut self, channel_id: &str, message: &SlackMessage, thread_response: bool) {
@@ -342,6 +388,16 @@ fn merge_root_metadata(record: &mut ThreadRecord, root: &SlackMessage) {
                 count: unread_count,
                 last_read: root.last_read.clone(),
             };
+            if let Some(last_read) = root.last_read.as_deref() {
+                record.unread_reply_ts = record
+                    .seen_reply_ts
+                    .iter()
+                    .filter(|reply_ts| reply_ts.as_str() > last_read)
+                    .cloned()
+                    .collect();
+            } else if unread_count == 0 {
+                record.unread_reply_ts.clear();
+            }
         }
     } else if let Some(last_read) = root.last_read.as_ref() {
         if let ThreadUnreadState::Known {
@@ -490,6 +546,22 @@ mod tests {
             }
         );
         assert_eq!(catalog.get("C1", "1.0").unwrap().reply_count, 2);
+    }
+
+    #[test]
+    fn mark_read_returns_exact_realtime_reply_timestamps_without_a_prior_marker() {
+        let mut catalog = ThreadCatalog::default();
+        let mut root = root("1.0", 0);
+        root.subscribed = Some(true);
+        root.unread_count = Some(0);
+        catalog.observe_thread("C1", "1.0", &[root], false);
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"));
+
+        assert_eq!(
+            catalog.mark_read("C1", "1.0", "3.0"),
+            vec!["2.0".to_string(), "3.0".to_string()]
+        );
     }
 
     #[test]
