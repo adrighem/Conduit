@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/adrighem/Conduit/compare/v0.2.0...v0.3.0) (2026-07-23)
+
+
+### Features
+
+* improve unread navigation and sidebar sections ([acca7a0](https://github.com/adrighem/Conduit/commit/acca7a01db6033bbb36a452d601188d69c21c833))
+
+
+### Bug Fixes
+
+* **ci:** clarify collapsed section branch ([5458004](https://github.com/adrighem/Conduit/commit/54580046e3f5feacb156e955229a3286cb5f3197))
+
 ## [0.2.0](https://github.com/adrighem/Conduit/compare/v0.1.2...v0.2.0) (2026-07-23)
 
 
