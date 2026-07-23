@@ -1,0 +1,4 @@
+Phase: Attention domain policy
+Track: notification_relevance_20260721
+Automated verification: cargo test --locked (557 passed); cargo check --locked --all-targets with warnings denied; cargo clippy --locked --all-targets with warnings denied; cargo fmt --all -- --check; git diff --check.
+Manual verification: waived explicitly by the user; automated decision-matrix and full regression validation substituted.
