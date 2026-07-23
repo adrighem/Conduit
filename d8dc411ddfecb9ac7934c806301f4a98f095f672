@@ -1,0 +1,4 @@
+Phase: Canonical pipeline integration
+Track: notification_relevance_20260721
+Automated verification: cargo test --locked with warnings denied (578 passed); cargo check --locked --all-targets with warnings denied; cargo clippy --locked --all-targets with warnings denied; cargo fmt --all -- --check; git diff --check; meson compile -C _build; meson test -C _build --no-rebuild --print-errorlogs (14 passed). Optional native-huddle Clippy was unavailable locally because gstreamer-webrtc-1.0 is not installed and is delegated to monitored CI.
+Manual verification: waived explicitly by the user; automated integration, persistence, ordering, read-race, notification-deduplication, and headless UI regressions substituted.
