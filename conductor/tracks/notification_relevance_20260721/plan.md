@@ -15,13 +15,13 @@
 - [x] Task: Add integration regressions for join/leave suppression, relevant thread replies, reconnect redelivery, and read-marker behavior 760fe7c
 - [x] Task: Conductor - User Manual Verification 'Canonical pipeline integration' (Protocol in workflow.md) d8dc411
 
-## Phase 3: Preferences and live configuration
+## Phase 3: Preferences and live configuration [checkpoint: 96cb4cb]
 
 - [x] Task: Add versioned GSettings keys and defaults for notification enablement, direct messages, mentions/names, thread replies, aliases, and keywords 276dbe7
 - [x] Task: Add an accessible Notifications group to Preferences with validation and concise matching guidance 276dbe7
 - [x] Task: Feed live preference snapshots into AttentionPolicy without restarting or reconnecting 276dbe7
 - [x] Task: Add schema, binding, default-value, and live-update tests 276dbe7
-- [~] Task: Conductor - User Manual Verification 'Preferences and live configuration' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Preferences and live configuration' (Protocol in workflow.md) 96cb4cb
 
 ## Phase 4: Hardening, measurement, and documentation
 
