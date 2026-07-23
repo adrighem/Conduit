@@ -1,0 +1,9 @@
+Phase: Hardening, measurement, and documentation
+
+Track: notification_relevance_20260721
+
+Automated verification: cargo test --locked with warnings denied (598 passed, 2 release measurements intentionally ignored); cargo check --locked --all-targets with warnings denied; cargo clippy --locked --all-targets with warnings denied; cargo fmt --all -- --check; git diff --check; strict GSettings schema validation; clean Meson compile; meson test --no-rebuild --print-errorlogs (15 passed). Two current-tree release runs asserted 10,000 classifier decisions per iteration and a concurrent 1,200-event actor burst with 1,000 accepted, 200 already observed, 900 unread, 500 candidates/claims, all 1,000 identities reconciled, durable 700/200 local counts after reopen, final queue depth zero, and queue peaks 1,196-1,198. Classifier medians were 721-774 ns/decision; actor enqueue-and-drain times were 3,190-4,019 ms on the documented host.
+
+Optional native-huddle Clippy was unavailable locally because gstreamer-webrtc-1.0 development metadata is not installed; the monitored CI image supplies that dependency and will exercise the gate.
+
+Manual verification: waived explicitly by the user; automated policy, persistence, failure, privacy-canary, queue, redelivery, read-cursor, reconciliation, durability, schema, GTK, and WebKit regressions substituted.
