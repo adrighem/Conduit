@@ -78,11 +78,7 @@ pub enum RuntimeCommand {
     SignOut,
     Disconnect,
     RefreshConversations,
-    UpdateAttentionContext {
-        active_channel_id: Option<String>,
-        window_active: bool,
-        preferences: AttentionPreferences,
-    },
+    UpdateAttentionPreferences(AttentionPreferences),
     DiscoverChannels,
     DiscoverConversations,
     JoinConversation {
@@ -417,7 +413,7 @@ impl RuntimeCommand {
                 workspace(RuntimeOperation::Conversations),
                 RuntimeTaskLane::Background,
             ),
-            Self::UpdateAttentionContext { .. } => RuntimeCommandDescriptor::mutation(
+            Self::UpdateAttentionPreferences(_) => RuntimeCommandDescriptor::mutation(
                 workspace(RuntimeOperation::SocketMode),
                 RuntimeTaskLane::Interactive,
             ),
@@ -791,6 +787,7 @@ pub enum RuntimeEventKind {
     AttentionNotificationCandidate {
         channel_id: String,
         message: Box<SlackMessage>,
+        decision: AttentionDecision,
     },
     AttentionMessagesObserved(Vec<AttentionObservation>),
     ThreadCatalogLoaded(Vec<ThreadRecord>),
@@ -1189,6 +1186,16 @@ impl WorkspaceReducerAdapter {
             );
     }
 
+    fn update_attention_preferences(&self, preferences: AttentionPreferences) {
+        self.coordinator
+            .lock()
+            .expect("workspace coordinator lock poisoned")
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::AttentionPreferencesChanged(preferences),
+            );
+    }
+
     fn preview_message_attention(
         &self,
         channel_id: &str,
@@ -1276,6 +1283,7 @@ struct ActiveRequest {
 struct RuntimeState {
     active_session: SessionId,
     connection: Option<RuntimeConnection>,
+    attention_preferences: AttentionPreferences,
     tasks: HashMap<u64, tokio::task::AbortHandle>,
     task_requests: HashMap<u64, TrackedRequest>,
     active_requests: HashMap<OperationContext, ActiveRequest>,
@@ -1290,6 +1298,7 @@ impl RuntimeState {
         Self {
             active_session,
             connection: None,
+            attention_preferences: AttentionPreferences::default(),
             tasks: HashMap::new(),
             task_requests: HashMap::new(),
             active_requests: HashMap::new(),
@@ -1311,6 +1320,19 @@ impl RuntimeState {
         self.latest_navigation.clear();
         self.active_session = session;
         self.connection = None;
+    }
+
+    fn set_attention_preferences(&mut self, preferences: AttentionPreferences) {
+        self.attention_preferences = preferences.clone();
+        if let Some(connection) = self.connection.as_ref() {
+            connection
+                .workspace
+                .update_attention_preferences(preferences);
+        }
+    }
+
+    fn attention_context(&self, current_user_id: Option<String>) -> WorkspaceAttentionContext {
+        WorkspaceAttentionContext { current_user_id }
     }
 
     fn next_task_id(&mut self) -> u64 {
@@ -1996,6 +2018,12 @@ fn dispatch_command(
                 WorkspaceLifecycleEvent::SignedOut,
             ));
         }
+        RuntimeCommand::UpdateAttentionPreferences(preferences) => {
+            state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .set_attention_preferences(preferences);
+        }
         command => {
             let connection = state
                 .lock()
@@ -2093,10 +2121,12 @@ fn spawn_authentication_task<F>(
                             return;
                         }
                         let workspace = WorkspaceReducerAdapter::default();
-                        workspace.update_attention_context(WorkspaceAttentionContext {
-                            current_user_id: auth.user_id.clone(),
-                            ..Default::default()
-                        });
+                        workspace.update_attention_context(
+                            runtime_state.attention_context(auth.user_id.clone()),
+                        );
+                        workspace.update_attention_preferences(
+                            runtime_state.attention_preferences.clone(),
+                        );
                         let connection = RuntimeConnection {
                             slack: api,
                             workspace_url: auth.url.clone(),
@@ -2755,25 +2785,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         | RuntimeCommand::StartOAuth { .. }
         | RuntimeCommand::StartBrowserSession { .. }
         | RuntimeCommand::SignOut
-        | RuntimeCommand::Disconnect => {
+        | RuntimeCommand::Disconnect
+        | RuntimeCommand::UpdateAttentionPreferences(_) => {
             return Err(anyhow!("session command reached connected task handler"));
         }
         RuntimeCommand::Huddle(_) => {
             return Err(anyhow!("huddle command reached generic task handler"));
-        }
-        RuntimeCommand::UpdateAttentionContext {
-            active_channel_id,
-            window_active,
-            preferences,
-        } => {
-            context
-                .workspace
-                .update_attention_context(WorkspaceAttentionContext {
-                    current_user_id: context.current_user_id.map(str::to_string),
-                    active_channel_id,
-                    window_active,
-                    preferences,
-                });
         }
         RuntimeCommand::RefreshConversations => {
             crate::debug::log("runtime", "RefreshConversations");
@@ -3595,7 +3612,13 @@ async fn run_socket_mode(
                     attention
                         .as_ref()
                         .filter(|effect| effect.decision.send_notification)
-                        .map(|effect| (effect.channel_id.clone(), effect.message.clone()))
+                        .map(|effect| {
+                            (
+                                effect.channel_id.clone(),
+                                effect.message.clone(),
+                                effect.decision.clone(),
+                            )
+                        })
                 });
                 if !defer_ordered_ui {
                     events_for_run.send_event(RuntimeEventKind::SocketModeEvent {
@@ -3618,10 +3641,13 @@ async fn run_socket_mode(
                             }
                         }
                     }
-                } else if let Some(Some((channel_id, message))) = notification_without_store {
+                } else if let Some(Some((channel_id, message, decision))) =
+                    notification_without_store
+                {
                     events_for_run.send_event(RuntimeEventKind::AttentionNotificationCandidate {
                         channel_id,
                         message: Box::new(message),
+                        decision,
                     });
                 }
             },
@@ -4057,6 +4083,19 @@ enum AttentionPersistenceStatus {
     Failed,
 }
 
+fn claimed_notification_candidate(
+    notification_claimed: bool,
+    applied_attention: Option<&MessageAttentionEffect>,
+) -> Option<MessageAttentionEffect> {
+    notification_claimed
+        .then(|| {
+            applied_attention
+                .filter(|effect| effect.decision.send_notification)
+                .cloned()
+        })
+        .flatten()
+}
+
 async fn persist_realtime_events(
     mut receiver: mpsc::UnboundedReceiver<RealtimePersistenceEvent>,
     store: WorkspaceStore,
@@ -4129,20 +4168,42 @@ async fn persist_realtime_events(
                         continue;
                     }
                 };
-                workspace.reduce(
-                    MutationOrigin::Realtime,
-                    realtime_message_mutation(&outcome.event, delivery),
+                let applied_attention = workspace
+                    .reduce(
+                        MutationOrigin::Realtime,
+                        realtime_message_mutation(&outcome.event, delivery),
+                    )
+                    .and_then(|reduction| {
+                        reduction
+                            .effects()
+                            .iter()
+                            .map(|effect| match effect {
+                                WorkspaceEffect::MessageAttention(effect) => effect.clone(),
+                            })
+                            .next()
+                    });
+                let notification = claimed_notification_candidate(
+                    outcome.notification_claimed,
+                    applied_attention.as_ref(),
                 );
-                let channel_id = outcome.event.channel_id.clone();
-                let message = outcome.event.message.clone();
+                let attention = if outcome.attention_status == AttentionPersistenceStatus::Accepted
+                {
+                    applied_attention
+                        .as_ref()
+                        .map(|effect| effect.decision.clone())
+                        .or(outcome.attention)
+                } else {
+                    outcome.attention
+                };
                 events.send_event(RuntimeEventKind::SocketModeEvent {
                     event: SocketModeEvent::Message(Box::new(outcome.event)),
-                    attention: outcome.attention,
+                    attention,
                 });
-                if outcome.notification_claimed {
+                if let Some(notification) = notification {
                     events.send_event(RuntimeEventKind::AttentionNotificationCandidate {
-                        channel_id,
-                        message: Box::new(message),
+                        channel_id: notification.channel_id,
+                        message: Box::new(notification.message),
+                        decision: notification.decision,
                     });
                 }
             }
@@ -5647,6 +5708,64 @@ mod tests {
     }
 
     #[test]
+    fn preference_change_during_persistence_suppresses_the_stale_notification_claim() {
+        let workspace = WorkspaceReducerAdapter::default();
+        workspace.update_attention_context(WorkspaceAttentionContext {
+            current_user_id: Some("U_SELF".into()),
+        });
+        workspace.apply(
+            MutationOrigin::Cache,
+            WorkspaceMutation::ConversationUpsert(SlackConversation {
+                id: "D1".into(),
+                is_channel: Some(false),
+                is_im: Some(true),
+                ..Default::default()
+            }),
+        );
+        let message = SlackMessage {
+            ts: "1.000".into(),
+            user: Some("U_OTHER".into()),
+            text: Some("hello".into()),
+            ..Default::default()
+        };
+        let stale_preview = workspace
+            .preview_message_attention(
+                "D1",
+                &message,
+                MessageMutationKind::Posted,
+                MutationOrigin::Realtime,
+            )
+            .expect("direct message should have an attention preview");
+        assert!(stale_preview.decision.send_notification);
+
+        workspace.update_attention_preferences(AttentionPreferences {
+            direct_messages: false,
+            ..AttentionPreferences::default()
+        });
+        let reduction = workspace
+            .reduce(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: "D1".into(),
+                    message,
+                    kind: MessageMutationKind::Posted,
+                    origin: MutationOrigin::Realtime,
+                },
+            )
+            .expect("message should be applied after persistence");
+        let live_attention = reduction
+            .effects()
+            .iter()
+            .map(|effect| match effect {
+                WorkspaceEffect::MessageAttention(effect) => effect,
+            })
+            .next();
+
+        assert!(live_attention.is_some_and(|effect| effect.decision.record_unread));
+        assert!(claimed_notification_candidate(true, live_attention).is_none());
+    }
+
+    #[test]
     fn browser_session_realtime_takes_precedence_without_loading_an_app_token() {
         let app_token_loaded = Cell::new(false);
         let browser = socket_mode::SocketModeCredentials::BrowserSession {
@@ -6346,7 +6465,6 @@ mod tests {
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".into()),
-                ..Default::default()
             });
             let (sender, receiver) = mpsc::unbounded_channel();
             let worker = tokio::spawn(persist_realtime_events(
@@ -6437,7 +6555,6 @@ mod tests {
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".into()),
-                ..Default::default()
             });
             let (sender, receiver) = mpsc::unbounded_channel();
             let worker = tokio::spawn(persist_realtime_events(
@@ -6550,7 +6667,6 @@ mod tests {
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".into()),
-                ..Default::default()
             });
             let (sender, persistence_receiver) = mpsc::unbounded_channel();
             let worker = tokio::spawn(persist_realtime_events(
@@ -6640,7 +6756,6 @@ mod tests {
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".into()),
-                ..Default::default()
             });
             workspace.apply(
                 MutationOrigin::Cache,
@@ -6741,6 +6856,100 @@ mod tests {
                 second_session
             );
         });
+    }
+
+    #[test]
+    fn latest_attention_preferences_seed_new_sessions_without_a_connection() {
+        let first_session = SessionId::default().next();
+        let second_session = first_session.next();
+        let mut state = RuntimeState::new(first_session);
+        let first = AttentionPreferences {
+            direct_messages: false,
+            ..AttentionPreferences::default()
+        };
+        let latest = AttentionPreferences {
+            desktop_notifications: false,
+            direct_messages: false,
+            names_and_aliases: vec!["Vincent".to_string()],
+            keywords: vec!["incident review".to_string()],
+            ..AttentionPreferences::default()
+        };
+
+        state.set_attention_preferences(first);
+        state.set_attention_preferences(latest.clone());
+        assert_eq!(state.attention_preferences, latest);
+
+        state.replace_session(second_session);
+        let seeded = state.attention_context(Some("U_NEXT".to_string()));
+        assert_eq!(seeded.current_user_id.as_deref(), Some("U_NEXT"));
+        assert_eq!(state.attention_preferences, latest);
+    }
+
+    #[test]
+    fn connected_attention_update_changes_runtime_and_coordinator_together() {
+        let session = SessionId::default().next();
+        let workspace = WorkspaceReducerAdapter::default();
+        workspace.update_attention_context(WorkspaceAttentionContext {
+            current_user_id: Some("U_SELF".into()),
+        });
+        workspace.apply(
+            MutationOrigin::Cache,
+            WorkspaceMutation::ConversationUpsert(SlackConversation {
+                id: "D1".into(),
+                is_channel: Some(false),
+                is_im: Some(true),
+                ..Default::default()
+            }),
+        );
+        let (huddles, _huddle_receiver) = huddle_actor_channel();
+        let mut state = RuntimeState::new(session);
+        state.connection = Some(RuntimeConnection {
+            slack: SlackApi::new(StoredToken {
+                access_token: "test-token".into(),
+                token_type: None,
+                scope: None,
+                refresh_token: None,
+                expires_in: None,
+                expires_at: None,
+                team_id: None,
+                team_name: None,
+                user_id: Some("U_SELF".into()),
+                client_id: None,
+                browser_cookie_d: None,
+                user_agent: None,
+            }),
+            workspace_url: None,
+            workspace_store: None,
+            workspace: workspace.clone(),
+            current_user_id: Some("U_SELF".into()),
+            user_cache: Arc::new(Mutex::new(HashMap::new())),
+            read_marks: Arc::new(Mutex::new(HashMap::new())),
+            team_id: None,
+            huddles,
+        });
+        let disabled = AttentionPreferences {
+            direct_messages: false,
+            ..AttentionPreferences::default()
+        };
+
+        state.set_attention_preferences(disabled.clone());
+
+        assert_eq!(state.attention_preferences, disabled);
+        let effect = workspace
+            .preview_message_attention(
+                "D1",
+                &SlackMessage {
+                    ts: "1.0".into(),
+                    user: Some("U_OTHER".into()),
+                    text: Some("hello".into()),
+                    ..Default::default()
+                },
+                MessageMutationKind::Posted,
+                MutationOrigin::Realtime,
+            )
+            .expect("direct message should still be classified");
+        assert!(effect.decision.record_unread);
+        assert!(!effect.decision.send_notification);
     }
 
     #[test]

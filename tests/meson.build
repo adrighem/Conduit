@@ -72,6 +72,16 @@ test(
   suite: 'metadata',
 )
 
+test(
+  'Notification preference schema',
+  gi_python,
+  args: [
+    files('test_notification_preferences.py'),
+    meson.project_source_root() / 'data' / 'eu.vanadrighem.conduit.gschema.xml',
+  ],
+  suite: 'metadata',
+)
+
 if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() and \
    (xprop.found() or xdotool.found())
   test(

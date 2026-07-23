@@ -21,6 +21,7 @@
 mod activity;
 mod application;
 mod attention;
+mod attention_settings;
 mod auth;
 mod composer;
 mod config;

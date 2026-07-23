@@ -11,6 +11,36 @@
 			<summary>Show the Unreads sidebar section</summary>
 			<description>Whether unread conversations are duplicated into a separate Unreads section at the top of the conversation sidebar.</description>
 		</key>
+		<key name="notifications-enabled-v1" type="b">
+			<default>true</default>
+			<summary>Enable desktop message notifications</summary>
+			<description>Whether Conduit may send desktop notifications for relevant incoming messages.</description>
+		</key>
+		<key name="notifications-direct-messages-v1" type="b">
+			<default>true</default>
+			<summary>Notify for direct messages</summary>
+			<description>Whether incoming direct and group direct messages are relevant for desktop notifications.</description>
+		</key>
+		<key name="notifications-mentions-and-names-v1" type="b">
+			<default>true</default>
+			<summary>Notify for mentions and configured names</summary>
+			<description>Whether direct Slack mentions and configured names or aliases are relevant for desktop notifications.</description>
+		</key>
+		<key name="notifications-thread-replies-v1" type="b">
+			<default>true</default>
+			<summary>Notify for relevant thread replies</summary>
+			<description>Whether replies in threads the user started, participated in, or subscribed to are relevant for desktop notifications.</description>
+		</key>
+		<key name="notifications-names-and-aliases-v1" type="as">
+			<default>[]</default>
+			<summary>Names and aliases used for notification matching</summary>
+			<description>Names and aliases that make an incoming message relevant when mention and name notifications are enabled.</description>
+		</key>
+		<key name="notifications-keywords-v1" type="as">
+			<default>[]</default>
+			<summary>Keywords and phrases used for notification matching</summary>
+			<description>Keywords and phrases that make an incoming message relevant for desktop notifications.</description>
+		</key>
 		<key name="recent-reactions" type="as">
 			<default>['smile', 'thumbsup', 'white_check_mark']</default>
 			<summary>Recently used message reactions</summary>

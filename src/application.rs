@@ -31,6 +31,7 @@ use std::io::Write;
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::attention_settings::{self, TermListKind};
 use crate::auth::AppTokenStore;
 use crate::config::{self, VERSION};
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
@@ -180,6 +181,326 @@ fn update_realtime_preferences(
             configuration.configured_by_environment,
             configuration.stored_token,
         ))));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NotificationSwitchSpec {
+    key: &'static str,
+    title: &'static str,
+    subtitle: &'static str,
+}
+
+const NOTIFICATION_SWITCHES: [NotificationSwitchSpec; 4] = [
+    NotificationSwitchSpec {
+        key: config::NOTIFICATIONS_ENABLED_V1_KEY,
+        title: "Desktop notifications",
+        subtitle: "Show notifications for messages relevant to you.",
+    },
+    NotificationSwitchSpec {
+        key: config::NOTIFICATIONS_DIRECT_MESSAGES_V1_KEY,
+        title: "Direct messages",
+        subtitle: "Notify for one-to-one and group direct messages.",
+    },
+    NotificationSwitchSpec {
+        key: config::NOTIFICATIONS_MENTIONS_AND_NAMES_V1_KEY,
+        title: "Mentions and names",
+        subtitle: "Notify for Slack mentions and your configured names or aliases.",
+    },
+    NotificationSwitchSpec {
+        key: config::NOTIFICATIONS_THREAD_REPLIES_V1_KEY,
+        title: "Thread replies",
+        subtitle: "Notify for replies to threads you started, joined, or follow.",
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NotificationTermSpec {
+    key: &'static str,
+    title: &'static str,
+    editor_body: &'static str,
+    empty_subtitle: &'static str,
+    singular_subtitle: &'static str,
+    plural_subtitle: &'static str,
+    kind: TermListKind,
+}
+
+const NOTIFICATION_TERM_LISTS: [NotificationTermSpec; 2] = [
+    NotificationTermSpec {
+        key: config::NOTIFICATIONS_NAMES_AND_ALIASES_V1_KEY,
+        title: "Names and aliases",
+        editor_body: "Enter one name or alias per line. A leading @ is optional.",
+        empty_subtitle: "No names or aliases",
+        singular_subtitle: "1 name or alias",
+        plural_subtitle: "names or aliases",
+        kind: TermListKind::Aliases,
+    },
+    NotificationTermSpec {
+        key: config::NOTIFICATIONS_KEYWORDS_V1_KEY,
+        title: "Keywords and phrases",
+        editor_body: "Enter one keyword or phrase per line.",
+        empty_subtitle: "No keywords or phrases",
+        singular_subtitle: "1 keyword or phrase",
+        plural_subtitle: "keywords or phrases",
+        kind: TermListKind::Keywords,
+    },
+];
+
+fn notification_term_subtitle(spec: NotificationTermSpec, count: usize) -> String {
+    match count {
+        0 => gettext(spec.empty_subtitle),
+        1 => gettext(spec.singular_subtitle),
+        count => format!("{count} {}", gettext(spec.plural_subtitle)),
+    }
+}
+
+const MASTER_NOTIFICATION_DEPENDENCIES: &[&str] = &[config::NOTIFICATIONS_ENABLED_V1_KEY];
+const NAME_NOTIFICATION_DEPENDENCIES: &[&str] = &[
+    config::NOTIFICATIONS_ENABLED_V1_KEY,
+    config::NOTIFICATIONS_MENTIONS_AND_NAMES_V1_KEY,
+];
+
+fn notification_term_count(settings: &gio::Settings, spec: NotificationTermSpec) -> usize {
+    let preferences = attention_settings::load(settings);
+    match spec.kind {
+        TermListKind::Aliases => preferences.names_and_aliases.len(),
+        TermListKind::Keywords => preferences.keywords.len(),
+    }
+}
+
+fn update_notification_control_sensitivity(
+    settings: &gio::Settings,
+    control: &gtk::Widget,
+    writable_key: &str,
+    enabled_keys: &[&str],
+) {
+    control.set_sensitive(
+        settings.is_writable(writable_key) && enabled_keys.iter().all(|key| settings.boolean(key)),
+    );
+}
+
+fn bind_notification_control_sensitivity(
+    settings: &gio::Settings,
+    control: &gtk::Widget,
+    writable_key: &'static str,
+    enabled_keys: &'static [&'static str],
+) {
+    update_notification_control_sensitivity(settings, control, writable_key, enabled_keys);
+    for enabled_key in enabled_keys {
+        let weak_control = control.downgrade();
+        settings.connect_changed(Some(enabled_key), move |settings, _| {
+            if let Some(control) = weak_control.upgrade() {
+                update_notification_control_sensitivity(
+                    settings,
+                    &control,
+                    writable_key,
+                    enabled_keys,
+                );
+            }
+        });
+    }
+    let weak_control = control.downgrade();
+    settings.connect_writable_changed(Some(writable_key), move |settings, _| {
+        if let Some(control) = weak_control.upgrade() {
+            update_notification_control_sensitivity(settings, &control, writable_key, enabled_keys);
+        }
+    });
+}
+
+fn notification_preferences_group(
+    settings: &gio::Settings,
+    window: &ConduitWindow,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(gettext("Notifications"))
+        .description(gettext(
+            "Matching ignores case and accents, uses complete words or phrases, and keeps punctuation significant.",
+        ))
+        .build();
+
+    let mut dependent_rows = Vec::<(gtk::Widget, &'static str, &'static [&'static str])>::new();
+    for spec in NOTIFICATION_SWITCHES {
+        let row = adw::SwitchRow::builder()
+            .title(gettext(spec.title))
+            .subtitle(gettext(spec.subtitle))
+            .active(settings.boolean(spec.key))
+            .build();
+        let binding = settings.bind(spec.key, &row, "active");
+        if spec.key == config::NOTIFICATIONS_ENABLED_V1_KEY {
+            binding.build();
+        } else {
+            binding.no_sensitivity().build();
+            dependent_rows.push((
+                row.clone().upcast(),
+                spec.key,
+                MASTER_NOTIFICATION_DEPENDENCIES,
+            ));
+        }
+        group.add(&row);
+    }
+
+    for spec in NOTIFICATION_TERM_LISTS {
+        let count = notification_term_count(settings, spec);
+        let row = adw::ActionRow::builder()
+            .title(gettext(spec.title))
+            .subtitle(notification_term_subtitle(spec, count))
+            .build();
+        let edit = gtk::Button::with_label(&gettext("Edit"));
+        edit.set_valign(gtk::Align::Center);
+        let edit_accessible_label = format!("{}: {}", gettext("Edit"), gettext(spec.title));
+        edit.update_property(&[gtk::accessible::Property::Label(&edit_accessible_label)]);
+        row.add_suffix(&edit);
+        row.set_activatable_widget(Some(&edit));
+        let enabled_keys = if spec.kind == TermListKind::Aliases {
+            NAME_NOTIFICATION_DEPENDENCIES
+        } else {
+            MASTER_NOTIFICATION_DEPENDENCIES
+        };
+        dependent_rows.push((row.clone().upcast(), spec.key, enabled_keys));
+
+        let weak_row = row.downgrade();
+        settings.connect_changed(Some(spec.key), move |settings, _| {
+            if let Some(row) = weak_row.upgrade() {
+                row.set_subtitle(&notification_term_subtitle(
+                    spec,
+                    notification_term_count(settings, spec),
+                ));
+            }
+        });
+        let weak_settings = settings.downgrade();
+        let weak_window = window.downgrade();
+        edit.connect_clicked(move |_| {
+            if let (Some(window), Some(settings)) = (weak_window.upgrade(), weak_settings.upgrade())
+            {
+                present_notification_term_editor(&window, &settings, spec);
+            }
+        });
+        group.add(&row);
+    }
+
+    for (row, writable_key, enabled_keys) in dependent_rows {
+        bind_notification_control_sensitivity(settings, &row, writable_key, enabled_keys);
+    }
+    group
+}
+
+fn present_notification_term_editor(
+    window: &ConduitWindow,
+    settings: &gio::Settings,
+    spec: NotificationTermSpec,
+) {
+    let text_view = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .accepts_tab(false)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    let editor_accessible_label = gettext(spec.title);
+    let editor_accessible_description = gettext(spec.editor_body);
+    text_view.update_property(&[
+        gtk::accessible::Property::Label(&editor_accessible_label),
+        gtk::accessible::Property::Description(&editor_accessible_description),
+    ]);
+    let stored = settings
+        .strv(spec.key)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    text_view
+        .buffer()
+        .set_text(&attention_settings::format_term_lines(&stored));
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(160)
+        .max_content_height(320)
+        .child(&text_view)
+        .build();
+    scrolled.add_css_class("card");
+    let error = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .build();
+    error.add_css_class("error");
+    error.set_accessible_role(gtk::AccessibleRole::Alert);
+    text_view.update_relation(&[gtk::accessible::Relation::ErrorMessage(&[
+        error.upcast_ref()
+    ])]);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.append(&scrolled);
+    content.append(&error);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(gettext(spec.title))
+        .body(gettext(spec.editor_body))
+        .extra_child(&content)
+        .default_response("save")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", &gettext("Cancel"));
+    dialog.add_response("save", &gettext("Save"));
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+
+    update_notification_term_validation(&dialog, &error, &text_view, spec.kind);
+    let weak_dialog = dialog.downgrade();
+    let weak_error = error.downgrade();
+    let weak_text_view = text_view.downgrade();
+    text_view.buffer().connect_changed(move |buffer| {
+        if let (Some(dialog), Some(error), Some(text_view)) = (
+            weak_dialog.upgrade(),
+            weak_error.upgrade(),
+            weak_text_view.upgrade(),
+        ) {
+            debug_assert_eq!(buffer, &text_view.buffer());
+            update_notification_term_validation(&dialog, &error, &text_view, spec.kind);
+        }
+    });
+
+    let settings = settings.clone();
+    let buffer = text_view.buffer();
+    dialog.connect_response(Some("save"), move |_, _| {
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+        let Ok(terms) = attention_settings::parse_term_lines(&text, spec.kind) else {
+            return;
+        };
+        if settings.set_strv(spec.key, terms).is_err() {
+            crate::debug::log(
+                "settings",
+                "NotificationPreferenceSaveFailed reason=settings_write",
+            );
+        }
+    });
+    dialog.present(Some(window));
+    text_view.grab_focus();
+}
+
+fn update_notification_term_validation(
+    dialog: &adw::AlertDialog,
+    error: &gtk::Label,
+    text_view: &gtk::TextView,
+    kind: TermListKind,
+) {
+    let buffer = text_view.buffer();
+    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+    match attention_settings::parse_term_lines(&text, kind) {
+        Ok(_) => {
+            error.set_visible(false);
+            text_view.update_state(&[gtk::accessible::State::Invalid(
+                gtk::AccessibleInvalidState::False,
+            )]);
+            dialog.set_response_enabled("save", true);
+        }
+        Err(problem) => {
+            error.set_label(&gettext(problem.message()));
+            error.set_visible(true);
+            text_view.update_state(&[gtk::accessible::State::Invalid(
+                gtk::AccessibleInvalidState::True,
+            )]);
+            dialog.set_response_enabled("save", false);
+        }
+    }
 }
 
 fn application_flags() -> gio::ApplicationFlags {
@@ -677,6 +998,7 @@ impl ConduitApplication {
 
         let sidebar_group = adw::PreferencesGroup::builder().title("Sidebar").build();
         sidebar_group.add(&unreads_row);
+        let notifications_group = notification_preferences_group(&settings, &window);
 
         let realtime_row = adw::PasswordEntryRow::builder()
             .title("Socket Mode app token")
@@ -733,6 +1055,7 @@ impl ConduitApplication {
             .icon_name("view-list-symbolic")
             .build();
         page.add(&sidebar_group);
+        page.add(&notifications_group);
         page.add(&realtime_group);
         page.add(&account_group);
 
@@ -830,6 +1153,36 @@ impl ConduitApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_controls_cover_every_attention_setting_once() {
+        let control_keys = NOTIFICATION_SWITCHES
+            .iter()
+            .map(|spec| spec.key)
+            .chain(NOTIFICATION_TERM_LISTS.iter().map(|spec| spec.key))
+            .collect::<std::collections::HashSet<_>>();
+        let attention_keys = attention_settings::ATTENTION_SETTINGS_KEYS
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(control_keys, attention_keys);
+        assert_eq!(
+            NOTIFICATION_SWITCHES.len() + NOTIFICATION_TERM_LISTS.len(),
+            attention_settings::ATTENTION_SETTINGS_KEYS.len()
+        );
+    }
+
+    #[test]
+    fn notification_term_subtitles_are_concise_for_empty_single_and_plural_lists() {
+        let spec = NOTIFICATION_TERM_LISTS[1];
+
+        assert_eq!(
+            notification_term_subtitle(spec, 0),
+            "No keywords or phrases"
+        );
+        assert_eq!(notification_term_subtitle(spec, 1), "1 keyword or phrase");
+        assert_eq!(notification_term_subtitle(spec, 7), "7 keywords or phrases");
+    }
 
     #[test]
     fn browser_session_realtime_status_hides_the_app_token_editor() {

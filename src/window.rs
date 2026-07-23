@@ -32,7 +32,8 @@ use gtk::{gio, glib};
 use webkit6::prelude::*;
 
 use crate::activity::{self, ActivityItem};
-use crate::attention::{AttentionDecision, AttentionPreferences};
+use crate::attention::AttentionDecision;
+use crate::attention_settings;
 use crate::auth;
 use crate::composer::{
     emoji_completion_key_action, emoji_token_at_caret, replace_emoji_token, set_text_view_text,
@@ -101,13 +102,6 @@ struct HuddlePreflightDialog {
     microphone: HuddleDevicePicker,
     speaker: HuddleDevicePicker,
     camera: HuddleDevicePicker,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WindowAttentionContext {
-    active_channel_id: Option<String>,
-    window_active: bool,
-    preferences: AttentionPreferences,
 }
 
 mod imp {
@@ -245,7 +239,6 @@ mod imp {
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
-        pub(super) last_attention_context: RefCell<Option<WindowAttentionContext>>,
         pub user_names: RefCell<HashMap<String, String>>,
         pub user_full_names: RefCell<HashMap<String, String>>,
         pub user_avatar_urls: RefCell<HashMap<String, String>>,
@@ -1047,6 +1040,7 @@ struct NotificationTarget {
 struct PendingMessageNotification {
     channel_id: String,
     message: SlackMessage,
+    decision: AttentionDecision,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2664,12 +2658,6 @@ impl ConduitWindow {
             window.flush_persistent_state();
             glib::Propagation::Proceed
         });
-        let weak_window = self.downgrade();
-        self.connect_is_active_notify(move |_| {
-            if let Some(window) = weak_window.upgrade() {
-                window.sync_attention_context();
-            }
-        });
         self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
         self.connect_widget(&imp.messages_button.get(), |window| window.show_messages());
         self.connect_widget(&imp.unreads_button.get(), |window| window.show_unreads());
@@ -2832,7 +2820,16 @@ impl ConduitWindow {
                 }
             },
         );
+        let weak_window = self.downgrade();
+        settings.connect_changed(None, move |_, key| {
+            if attention_settings::is_attention_setting(key) {
+                if let Some(window) = weak_window.upgrade() {
+                    window.sync_attention_preferences();
+                }
+            }
+        });
         *self.imp().settings.borrow_mut() = Some(settings);
+        self.sync_attention_preferences();
     }
 
     fn restore_window_state(&self, settings: &gio::Settings) {
@@ -3607,7 +3604,8 @@ impl ConduitWindow {
             RuntimeEventKind::AttentionNotificationCandidate {
                 channel_id,
                 message,
-            } => self.handle_attention_notification_candidate(&channel_id, &message),
+                decision,
+            } => self.handle_attention_notification_candidate(&channel_id, &message, &decision),
             RuntimeEventKind::AttentionMessagesObserved(observations) => {
                 self.apply_attention_observations(observations);
             }
@@ -5198,7 +5196,6 @@ impl ConduitWindow {
         imp.workspace_ready.set(false);
         imp.initial_sync_complete.set(false);
         imp.local_read_ts_by_channel.borrow_mut().clear();
-        imp.last_attention_context.borrow_mut().take();
         imp.pending_message_notifications.borrow_mut().clear();
         imp.pending_opened_conversation_ids.borrow_mut().clear();
         imp.pending_sent_drafts.borrow_mut().clear();
@@ -6870,28 +6867,15 @@ impl ConduitWindow {
                 .update_property(&[gtk::accessible::Property::Description("")]);
         }
         self.update_huddle_surface();
-        self.sync_attention_context();
     }
 
-    fn sync_attention_context(&self) {
-        let imp = self.imp();
-        if imp.current_user_id.borrow().is_none() || imp.workspace_id.borrow().is_none() {
+    fn sync_attention_preferences(&self) {
+        let Some(settings) = self.imp().settings.borrow().as_ref().cloned() else {
             return;
-        }
-        let context = WindowAttentionContext {
-            active_channel_id: self.visible_channel_id(),
-            window_active: self.is_active(),
-            preferences: AttentionPreferences::default(),
         };
-        if imp.last_attention_context.borrow().as_ref() == Some(&context) {
-            return;
-        }
-        imp.last_attention_context.replace(Some(context.clone()));
-        self.send_command(RuntimeCommand::UpdateAttentionContext {
-            active_channel_id: context.active_channel_id,
-            window_active: context.window_active,
-            preferences: context.preferences,
-        });
+        let preferences = attention_settings::load(&settings);
+        self.flush_pending_message_notifications();
+        self.send_command(RuntimeCommand::UpdateAttentionPreferences(preferences));
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
@@ -7814,7 +7798,27 @@ impl ConduitWindow {
         application.withdraw_huddle_notification(&workspace_id, &call_id);
     }
 
-    fn handle_attention_notification_candidate(&self, channel_id: &str, message: &SlackMessage) {
+    fn handle_attention_notification_candidate(
+        &self,
+        channel_id: &str,
+        message: &SlackMessage,
+        decision: &AttentionDecision,
+    ) {
+        let remains_relevant = self
+            .imp()
+            .settings
+            .borrow()
+            .as_ref()
+            .map(attention_settings::load)
+            .is_some_and(|preferences| {
+                decision.remains_notification_relevant(
+                    message.text.as_deref().unwrap_or_default(),
+                    &preferences,
+                )
+            });
+        if !remains_relevant {
+            return;
+        }
         let muted = self
             .imp()
             .workspace
@@ -7828,11 +7832,16 @@ impl ConduitWindow {
             channel_id,
             muted,
         ) {
-            self.send_or_defer_message_notification(channel_id, message);
+            self.send_or_defer_message_notification(channel_id, message, decision);
         }
     }
 
-    fn send_or_defer_message_notification(&self, channel_id: &str, message: &SlackMessage) {
+    fn send_or_defer_message_notification(
+        &self,
+        channel_id: &str,
+        message: &SlackMessage,
+        decision: &AttentionDecision,
+    ) {
         let conversation = self
             .imp()
             .workspace
@@ -7875,6 +7884,7 @@ impl ConduitWindow {
             PendingMessageNotification {
                 channel_id: channel_id.to_string(),
                 message: message.clone(),
+                decision: decision.clone(),
             },
         );
         drop(pending);
@@ -7890,6 +7900,12 @@ impl ConduitWindow {
     }
 
     fn flush_pending_message_notifications(&self) {
+        let current_preferences = self
+            .imp()
+            .settings
+            .borrow()
+            .as_ref()
+            .map(attention_settings::load);
         let user_names = self.imp().user_names.borrow().clone();
         let user_full_names = self.imp().user_full_names.borrow().clone();
         let current_user_id = self.imp().current_user_id.borrow().clone();
@@ -7905,6 +7921,18 @@ impl ConduitWindow {
                 notification.channel_id.clone(),
                 notification.message.ts.clone(),
             );
+            if !current_preferences.as_ref().is_some_and(|preferences| {
+                notification.decision.remains_notification_relevant(
+                    notification.message.text.as_deref().unwrap_or_default(),
+                    preferences,
+                )
+            }) {
+                self.imp()
+                    .pending_message_notifications
+                    .borrow_mut()
+                    .remove(&key);
+                continue;
+            }
             let conversation = self
                 .imp()
                 .workspace

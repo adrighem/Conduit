@@ -110,6 +110,7 @@ pub(crate) enum MessageMutationKind {
 #[derive(Debug, Clone)]
 pub(crate) enum WorkspaceMutation {
     AttentionContextChanged(WorkspaceAttentionContext),
+    AttentionPreferencesChanged(AttentionPreferences),
     Hydrate(WorkspaceBootstrapData),
     MembershipSnapshot(SnapshotEnvelope<Vec<SlackConversation>>),
     ConversationUpsert(SlackConversation),
@@ -271,9 +272,6 @@ impl StoreBatch {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceAttentionContext {
     pub(crate) current_user_id: Option<String>,
-    pub(crate) active_channel_id: Option<String>,
-    pub(crate) window_active: bool,
-    pub(crate) preferences: AttentionPreferences,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -348,6 +346,7 @@ pub(crate) struct WorkspaceCoordinator {
     threads: HashMap<(String, String), TimelineState>,
     thread_catalog: Vec<ThreadRecord>,
     attention_context: WorkspaceAttentionContext,
+    attention_preferences: AttentionPreferences,
     attention_policy: AttentionPolicy,
 }
 
@@ -378,8 +377,14 @@ impl WorkspaceCoordinator {
     ) -> Option<WorkspaceReduction> {
         match mutation {
             WorkspaceMutation::AttentionContextChanged(context) => {
-                self.attention_policy = AttentionPolicy::new(context.preferences.clone());
                 self.attention_context = context;
+                None
+            }
+            WorkspaceMutation::AttentionPreferencesChanged(preferences) => {
+                if self.attention_preferences != preferences {
+                    self.attention_policy = AttentionPolicy::new(preferences.clone());
+                    self.attention_preferences = preferences;
+                }
                 None
             }
             WorkspaceMutation::Hydrate(data) => self.apply_hydration(data),
@@ -1616,6 +1621,7 @@ impl Default for WorkspaceCoordinator {
             threads: HashMap::new(),
             thread_catalog: Vec::new(),
             attention_context: WorkspaceAttentionContext::default(),
+            attention_preferences: AttentionPreferences::default(),
             attention_policy: AttentionPolicy::default(),
         }
     }
@@ -1646,7 +1652,6 @@ mod tests {
         coordinator.apply(WorkspaceMutation::AttentionContextChanged(
             WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".to_string()),
-                ..Default::default()
             },
         ));
     }
@@ -2006,6 +2011,79 @@ mod tests {
                 .unwrap()
                 .unread_activity_count(),
             1
+        );
+    }
+
+    #[test]
+    fn coordinator_applies_live_attention_preferences_to_the_next_message() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        let mut direct = conversation("D1", "direct");
+        direct.is_channel = Some(false);
+        direct.is_im = Some(true);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(direct));
+
+        let classify = |coordinator: &mut WorkspaceCoordinator, ts: &str, text: &str| {
+            let mut message = message(ts, text);
+            message.user = Some("U_OTHER".to_string());
+            coordinator
+                .apply(WorkspaceMutation::MessageChanged {
+                    channel_id: "D1".to_string(),
+                    message,
+                    kind: MessageMutationKind::Posted,
+                    origin: MutationOrigin::Realtime,
+                })
+                .expect("message should produce a reduction")
+        };
+
+        let initial = classify(&mut coordinator, "10.0", "ordinary direct message");
+        assert!(attention_effect(&initial).decision.send_notification);
+
+        let revision = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::AttentionPreferencesChanged(
+            AttentionPreferences {
+                direct_messages: false,
+                keywords: vec!["page me".to_string()],
+                ..AttentionPreferences::default()
+            },
+        ));
+        coordinator.apply(WorkspaceMutation::AttentionContextChanged(
+            WorkspaceAttentionContext {
+                current_user_id: Some("U_SELF".to_string()),
+            },
+        ));
+        assert_eq!(coordinator.revision(), revision);
+
+        let disabled_direct = classify(&mut coordinator, "11.0", "another ordinary message");
+        assert!(attention_effect(&disabled_direct).decision.record_unread);
+        assert!(
+            !attention_effect(&disabled_direct)
+                .decision
+                .send_notification
+        );
+
+        let keyword = classify(&mut coordinator, "12.0", "please page me now");
+        assert!(attention_effect(&keyword).decision.record_unread);
+        assert!(attention_effect(&keyword).decision.send_notification);
+        assert!(attention_effect(&keyword)
+            .decision
+            .reasons
+            .contains(&crate::attention::AttentionReason::KeywordOrPhrase));
+
+        coordinator.apply(WorkspaceMutation::AttentionPreferencesChanged(
+            AttentionPreferences {
+                desktop_notifications: false,
+                direct_messages: false,
+                keywords: vec!["page me".to_string()],
+                ..AttentionPreferences::default()
+            },
+        ));
+        let globally_disabled = classify(&mut coordinator, "13.0", "please page me again");
+        assert!(attention_effect(&globally_disabled).decision.record_unread);
+        assert!(
+            !attention_effect(&globally_disabled)
+                .decision
+                .send_notification
         );
     }
 

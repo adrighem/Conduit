@@ -2,6 +2,12 @@ use std::path::PathBuf;
 
 pub const APPLICATION_ID: &str = "eu.vanadrighem.conduit";
 pub const MESSAGE_DRAFTS_KEY: &str = "message-drafts";
+pub const NOTIFICATIONS_DIRECT_MESSAGES_V1_KEY: &str = "notifications-direct-messages-v1";
+pub const NOTIFICATIONS_ENABLED_V1_KEY: &str = "notifications-enabled-v1";
+pub const NOTIFICATIONS_KEYWORDS_V1_KEY: &str = "notifications-keywords-v1";
+pub const NOTIFICATIONS_MENTIONS_AND_NAMES_V1_KEY: &str = "notifications-mentions-and-names-v1";
+pub const NOTIFICATIONS_NAMES_AND_ALIASES_V1_KEY: &str = "notifications-names-and-aliases-v1";
+pub const NOTIFICATIONS_THREAD_REPLIES_V1_KEY: &str = "notifications-thread-replies-v1";
 pub const RECENT_REACTIONS_KEY: &str = "recent-reactions";
 pub const SIDEBAR_SHOW_UNREADS_SECTION_KEY: &str = "sidebar-show-unreads-section";
 pub const WINDOW_HEIGHT_KEY: &str = "window-height";

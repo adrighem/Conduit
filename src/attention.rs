@@ -111,6 +111,29 @@ pub struct AttentionDecision {
     pub(crate) reasons: Vec<AttentionReason>,
 }
 
+impl AttentionDecision {
+    pub(crate) fn remains_notification_relevant(
+        &self,
+        text: &str,
+        preferences: &AttentionPreferences,
+    ) -> bool {
+        if !self.send_notification || !preferences.desktop_notifications {
+            return false;
+        }
+
+        self.reasons.iter().copied().any(|reason| match reason {
+            AttentionReason::DirectMessage => preferences.direct_messages,
+            AttentionReason::DirectMention => preferences.mentions_and_names,
+            AttentionReason::StartedThreadReply
+            | AttentionReason::ParticipatedThreadReply
+            | AttentionReason::SubscribedThreadReply => preferences.thread_replies,
+            _ => false,
+        }) || (preferences.mentions_and_names
+            && configured_terms_match(text, &preferences.names_and_aliases))
+            || configured_terms_match(text, &preferences.keywords)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttentionPolicy {
     preferences: AttentionPreferences,
@@ -168,25 +191,21 @@ impl AttentionPolicy {
 
         let normalized_text = normalize_text(candidate.text);
         let mut reasons = Vec::new();
-        if self.preferences.direct_messages
-            && matches!(
-                candidate.conversation,
-                ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
-            )
-        {
+        if matches!(
+            candidate.conversation,
+            ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
+        ) {
             reasons.push(AttentionReason::DirectMessage);
         }
-        if self.preferences.mentions_and_names {
-            if contains_direct_mention(candidate.text, candidate.current_user_id) {
-                reasons.push(AttentionReason::DirectMention);
-            }
-            if self
-                .names_and_aliases
-                .iter()
-                .any(|term| contains_configured_term(&normalized_text, term))
-            {
-                reasons.push(AttentionReason::NameOrAlias);
-            }
+        if contains_direct_mention(candidate.text, candidate.current_user_id) {
+            reasons.push(AttentionReason::DirectMention);
+        }
+        if self
+            .names_and_aliases
+            .iter()
+            .any(|term| contains_configured_term(&normalized_text, term))
+        {
+            reasons.push(AttentionReason::NameOrAlias);
         }
         if self
             .keywords
@@ -195,7 +214,7 @@ impl AttentionPolicy {
         {
             reasons.push(AttentionReason::KeywordOrPhrase);
         }
-        if self.preferences.thread_replies && candidate.thread_relationship.is_relevant() {
+        if candidate.thread_relationship.is_relevant() {
             reasons.push(match candidate.thread_relationship {
                 ThreadRelationship::Started => AttentionReason::StartedThreadReply,
                 ThreadRelationship::Participated => AttentionReason::ParticipatedThreadReply,
@@ -205,7 +224,10 @@ impl AttentionPolicy {
                 }
             });
         }
-        let notification_relevant = !reasons.is_empty();
+        let notification_relevant = reasons
+            .iter()
+            .copied()
+            .any(|reason| relevance_reason_enabled(reason, &self.preferences));
         if !notification_relevant {
             reasons.push(AttentionReason::OrdinaryMessage);
         }
@@ -252,15 +274,40 @@ impl Default for AttentionPolicy {
     }
 }
 
+fn relevance_reason_enabled(reason: AttentionReason, preferences: &AttentionPreferences) -> bool {
+    match reason {
+        AttentionReason::DirectMessage => preferences.direct_messages,
+        AttentionReason::DirectMention | AttentionReason::NameOrAlias => {
+            preferences.mentions_and_names
+        }
+        AttentionReason::KeywordOrPhrase => true,
+        AttentionReason::StartedThreadReply
+        | AttentionReason::ParticipatedThreadReply
+        | AttentionReason::SubscribedThreadReply => preferences.thread_replies,
+        _ => false,
+    }
+}
+
+fn configured_terms_match(text: &str, terms: &[String]) -> bool {
+    let normalized_text = normalize_text(text);
+    normalized_terms(terms)
+        .iter()
+        .any(|term| contains_configured_term(&normalized_text, term))
+}
+
 fn normalized_terms(terms: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for term in terms {
-        let term = normalize_text(term);
+        let term = normalize_configured_term(term);
         if term.chars().any(char::is_alphanumeric) && !normalized.contains(&term) {
             normalized.push(term);
         }
     }
     normalized
+}
+
+pub(crate) fn normalize_configured_term(value: &str) -> String {
+    normalize_text(value)
 }
 
 fn normalize_text(value: &str) -> String {
@@ -658,6 +705,52 @@ mod tests {
             assert!(actual.record_unread);
             assert!(!actual.send_notification);
         }
+    }
+
+    #[test]
+    fn pending_notification_revalidation_preserves_any_current_trigger() {
+        let mut message = candidate();
+        message.conversation = ConversationKind::DirectMessage;
+        message.text = "please page me";
+        let decision = AttentionPolicy::new(AttentionPreferences {
+            direct_messages: false,
+            keywords: vec!["page me".to_string()],
+            ..AttentionPreferences::default()
+        })
+        .decide(message);
+        assert!(decision.send_notification);
+        assert!(decision.reasons.contains(&AttentionReason::DirectMessage));
+        assert!(decision.reasons.contains(&AttentionReason::KeywordOrPhrase));
+
+        let through_keyword = AttentionPreferences {
+            direct_messages: false,
+            names_and_aliases: vec!["unrelated alias".to_string()],
+            keywords: vec!["page me".to_string()],
+            ..AttentionPreferences::default()
+        };
+        assert!(decision.remains_notification_relevant(message.text, &through_keyword));
+
+        let through_newly_enabled_direct_message = AttentionPreferences {
+            direct_messages: true,
+            keywords: Vec::new(),
+            ..AttentionPreferences::default()
+        };
+        assert!(decision
+            .remains_notification_relevant(message.text, &through_newly_enabled_direct_message));
+
+        let no_remaining_trigger = AttentionPreferences {
+            direct_messages: false,
+            keywords: Vec::new(),
+            ..AttentionPreferences::default()
+        };
+        assert!(!decision.remains_notification_relevant(message.text, &no_remaining_trigger));
+        assert!(!decision.remains_notification_relevant(
+            message.text,
+            &AttentionPreferences {
+                desktop_notifications: false,
+                ..through_keyword
+            }
+        ));
     }
 
     #[test]
