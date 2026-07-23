@@ -1,0 +1,7 @@
+Phase: Preferences and live configuration
+
+Track: notification_relevance_20260721
+
+Automated verification: cargo test --locked with warnings denied (591 passed); cargo check --locked --all-targets with warnings denied; cargo clippy --locked --all-targets with warnings denied; cargo fmt --all -- --check; git diff --check; notification preference schema test; clean Meson compile; meson test --print-errorlogs (15 passed).
+
+Manual verification: waived explicitly by the user; automated schema binding, preference parsing, live runtime update, stale-candidate revalidation, accessibility-oriented construction, and headless integration regressions substituted.
