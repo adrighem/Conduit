@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0](https://github.com/adrighem/Conduit/compare/v0.1.2...v0.2.0) (2026-07-23)
+
+
+### Features
+
+* **attention:** add privacy-safe runtime metrics ([4d6ed69](https://github.com/adrighem/Conduit/commit/4d6ed69d2ba798b8fbfa5263687f38aa2bbe58c9))
+* **attention:** define relevance policy ([b3d14b1](https://github.com/adrighem/Conduit/commit/b3d14b1fbbd9e96be8aa1a25f99fe02e801de89e))
+* **attention:** integrate canonical notification pipeline ([760fe7c](https://github.com/adrighem/Conduit/commit/760fe7c813e4b6b00c96e82104c0b9c377f29552))
+* **preferences:** add live notification filters ([276dbe7](https://github.com/adrighem/Conduit/commit/276dbe73c708824c11dce7c8efdfde3a4b9121d4))
+
+
+### Bug Fixes
+
+* **runtime:** satisfy strict conversation loader lint ([e88d2f4](https://github.com/adrighem/Conduit/commit/e88d2f4310544a073e65d31c43e8011aaeab79dd))
+* **sidebar:** restore unread and recent direct messages ([1da79bd](https://github.com/adrighem/Conduit/commit/1da79bddaad952576c74dafdc3d1e7221aa0c59e))
+
 ## [0.1.2](https://github.com/adrighem/Conduit/compare/v0.1.1...v0.1.2) (2026-07-22)
 
 

@@ -1,5 +1,5 @@
 project('conduit', 'rust', 
-          version: '0.1.2', # x-release-please-version
+          version: '0.2.0', # x-release-please-version
     meson_version: '>= 1.0.0',
   default_options: [ 'warning_level=2', 'werror=false', ],
 )
