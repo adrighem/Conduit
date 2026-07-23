@@ -23,10 +23,10 @@
 - [x] Task: Add schema, binding, default-value, and live-update tests 276dbe7
 - [x] Task: Conductor - User Manual Verification 'Preferences and live configuration' (Protocol in workflow.md) 96cb4cb
 
-## Phase 4: Hardening, measurement, and documentation
+## Phase 4: Hardening, measurement, and documentation [checkpoint: bb88980]
 
 - [x] Task: Add attention counters and structured reasons for decisions without logging message content or configured keywords 4d6ed69
 - [x] Task: Measure a realtime burst for classification cost, queue growth, duplicate delivery, and unread reconciliation behavior 4d6ed69
 - [x] Task: Update user and architecture documentation for relevant-only notifications and the raw-unread/attention distinction 4d6ed69
 - [x] Task: Run formatting, unit, integration, Meson, GSettings, GTK, and WebKit validation suites 4d6ed69
-- [~] Task: Conductor - User Manual Verification 'Hardening, measurement, and documentation' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Hardening, measurement, and documentation' (Protocol in workflow.md) bb88980

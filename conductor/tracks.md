@@ -69,5 +69,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Relevant notifications and noise-free unread state
+## [x] Track: Relevant notifications and noise-free unread state
 *Link: [./conductor/tracks/notification_relevance_20260721/](./conductor/tracks/notification_relevance_20260721/)*
