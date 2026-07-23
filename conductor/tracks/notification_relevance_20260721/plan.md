@@ -9,11 +9,11 @@
 
 ## Phase 2: Canonical pipeline integration
 
-- [~] Task: Route realtime, snapshot, and local message candidates through AttentionPolicy before coordinator effects fan out
-- [ ] Task: Apply the unread decision consistently to StoreBatch persistence, sidebar/activity projection, and reconciliation without losing raw Slack counters
-- [ ] Task: Apply notification effects with display-name resolution, active-target suppression, freshness, and persistent deduplication
-- [ ] Task: Add integration regressions for join/leave suppression, relevant thread replies, reconnect redelivery, and read-marker behavior
-- [ ] Task: Conductor - User Manual Verification 'Canonical pipeline integration' (Protocol in workflow.md)
+- [x] Task: Route realtime, snapshot, and local message candidates through AttentionPolicy before coordinator effects fan out 760fe7c
+- [x] Task: Apply the unread decision consistently to StoreBatch persistence, sidebar/activity projection, and reconciliation without losing raw Slack counters 760fe7c
+- [x] Task: Apply notification effects with display-name resolution, active-target suppression, freshness, and persistent deduplication 760fe7c
+- [x] Task: Add integration regressions for join/leave suppression, relevant thread replies, reconnect redelivery, and read-marker behavior 760fe7c
+- [~] Task: Conductor - User Manual Verification 'Canonical pipeline integration' (Protocol in workflow.md)
 
 ## Phase 3: Preferences and live configuration
 
