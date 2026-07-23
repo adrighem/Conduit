@@ -2,10 +2,10 @@
 
 ## Phase 1: Attention domain policy
 
-- [ ] Task: Write the table-driven decision matrix for message kinds, unread actions, notification actions, and relevance reasons
-- [ ] Task: Normalize lifecycle noise, direct messages, mentions, name/alias matches, keyword/phrase matches, and relevant thread replies
-- [ ] Task: Implement the pure AttentionPolicy inputs and AttentionDecision outputs with no GTK, GSettings, Slack API, or storage dependency
-- [ ] Task: Conductor - User Manual Verification 'Attention domain policy' (Protocol in workflow.md)
+- [x] Task: Write the table-driven decision matrix for message kinds, unread actions, notification actions, and relevance reasons b3d14b1
+- [x] Task: Normalize lifecycle noise, direct messages, mentions, name/alias matches, keyword/phrase matches, and relevant thread replies b3d14b1
+- [x] Task: Implement the pure AttentionPolicy inputs and AttentionDecision outputs with no GTK, GSettings, Slack API, or storage dependency b3d14b1
+- [~] Task: Conductor - User Manual Verification 'Attention domain policy' (Protocol in workflow.md)
 
 ## Phase 2: Canonical pipeline integration
 
