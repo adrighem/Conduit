@@ -252,9 +252,11 @@ impl SidebarListModel {
                             collapsed: collapsed_sections.contains(&section.kind),
                         },
                     };
-                    let rows = (!collapsed_sections.contains(&section.kind))
-                        .then_some(section.rows.as_slice())
-                        .unwrap_or_default();
+                    let rows = if collapsed_sections.contains(&section.kind) {
+                        &[]
+                    } else {
+                        section.rows.as_slice()
+                    };
                     std::iter::once(header).chain(rows.iter().cloned().map(|row| {
                         KeyedSidebarItem {
                             key: SidebarItemKey::Conversation {
