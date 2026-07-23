@@ -1,0 +1,4 @@
+Task: Complete Phase 1 attention domain policy
+Summary: Added a pure policy with independent unread and notification decisions, deterministic reasons, lifecycle/message normalization, exact direct mentions, boundary-safe name/alias/keyword matching, thread relevance, preference gates, and table-driven tests.
+Files: src/attention.rs, src/main.rs
+Rationale: A single domain classifier prevents unread and notification behavior from drifting across adapters.
