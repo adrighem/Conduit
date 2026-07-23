@@ -17,11 +17,11 @@
 
 ## Phase 3: Preferences and live configuration
 
-- [ ] Task: Add versioned GSettings keys and defaults for notification enablement, direct messages, mentions/names, thread replies, aliases, and keywords
-- [ ] Task: Add an accessible Notifications group to Preferences with validation and concise matching guidance
-- [ ] Task: Feed live preference snapshots into AttentionPolicy without restarting or reconnecting
-- [ ] Task: Add schema, binding, default-value, and live-update tests
-- [ ] Task: Conductor - User Manual Verification 'Preferences and live configuration' (Protocol in workflow.md)
+- [x] Task: Add versioned GSettings keys and defaults for notification enablement, direct messages, mentions/names, thread replies, aliases, and keywords 276dbe7
+- [x] Task: Add an accessible Notifications group to Preferences with validation and concise matching guidance 276dbe7
+- [x] Task: Feed live preference snapshots into AttentionPolicy without restarting or reconnecting 276dbe7
+- [x] Task: Add schema, binding, default-value, and live-update tests 276dbe7
+- [~] Task: Conductor - User Manual Verification 'Preferences and live configuration' (Protocol in workflow.md)
 
 ## Phase 4: Hardening, measurement, and documentation
 
