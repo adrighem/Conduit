@@ -1675,6 +1675,10 @@ mod tests {
 
         assert!(second > first);
         assert!(!coordinator.commit_position(first));
+        assert_eq!(
+            coordinator.resolve_position(second, "C2", &[message("1", "one")]),
+            Some(ConversationOpenPosition::Latest)
+        );
         assert!(coordinator.commit_position(second));
         assert_eq!(
             coordinator.active_phase(),

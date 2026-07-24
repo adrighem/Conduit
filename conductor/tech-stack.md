@@ -52,7 +52,8 @@
 - libadwaita split views and breakpoints adapt the workspace and thread shell to narrow windows.
 - Generated message documents use semantic HTML, logical responsive CSS, locale-aware timestamps, RTL direction, and keyboard-focusable message targets.
 - A keyed `SidebarModelDiff` reconciles stable rows in the current `GtkListBox`; migration to a virtualized `GtkListView` remains planned.
-- Message timelines load generated HTML documents for navigation and apply typed DOM patches for realtime messages, response regions, user details, and loaded media. A revision-aware batching presenter remains planned.
+- Conversation navigation creates a generation-scoped opening session with an immutable semantic target. One WebKit viewport controller owns initial geometry, reveals the timeline only after positioning, cancels on user interaction, and arms read observation after commit.
+- Message timelines load generated HTML documents for navigation, then reconcile cached-to-fresh snapshots and asynchronous metadata through anchor-preserving typed DOM patches. Realtime messages, response regions, user details, and loaded media use the same patch runtime; broader revision-aware batching remains planned.
 - Cached message media is size- and MIME-checked before it is rendered through bounded data URLs. A dedicated cache-key URI scheme remains planned.
 - Desktop notifications use stable workspace/user/channel IDs and typed application actions so activation can survive a cold start.
 
