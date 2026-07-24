@@ -1,0 +1,7 @@
+Task: Run full sanitized regression validation and synchronize architecture documentation
+
+Summary: Updated presentation architecture documentation and aligned the stale-generation test with the resolved-before-commit invariant. Validation passed cargo fmt, JavaScript syntax, cargo check, 620 Rust tests (2 release measurements ignored), Meson compile, and 15 Meson tests including production WebKit anchoring. Clippy was unavailable because cargo-clippy is not installed; no coverage tool is configured.
+
+Files: conductor/tech-stack.md; src/workspace_state.rs
+
+Rationale: Record the implemented ownership boundary and preserve an auditable validation result without changing the installed toolchain.
