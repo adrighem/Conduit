@@ -390,6 +390,20 @@
   window.conduitApplyTimelinePatch = function (patch) {
     if (!patch || typeof patch.type !== "string") return false;
     return withPreservedScroll(function () {
+      if (patch.type === "replace-snapshot") {
+        const list = document.querySelector(".message-list");
+        if (
+          !list ||
+          typeof patch.list_html !== "string" ||
+          typeof patch.load_more_html !== "string"
+        ) return false;
+        const previous = list.previousElementSibling;
+        if (previous && previous.matches(".timeline-action")) previous.remove();
+        if (patch.load_more_html) list.before(fragment(patch.load_more_html));
+        list.replaceChildren(fragment(patch.list_html));
+        return true;
+      }
+
       if (patch.type === "insert-message") {
         const list = document.querySelector(".message-list");
         if (!list || typeof patch.html !== "string") return false;

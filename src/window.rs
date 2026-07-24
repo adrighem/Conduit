@@ -85,10 +85,10 @@ use crate::thread_catalog::ThreadCatalog;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_state::{
     resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
-    ConversationOpenPosition, ConversationSelectionDecision, MainMessageView, ReactionUpdate,
-    RealtimeMessageKind, RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome,
-    WorkspaceLifecycle, WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
-    WorkspaceSnapshot,
+    ConversationOpenPosition, ConversationOpenRenderAction, ConversationSelectionDecision,
+    MainMessageView, ReactionUpdate, RealtimeMessageKind, RealtimeMessageOutcome,
+    ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle, WorkspaceLifecycleEvent,
+    WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -4846,16 +4846,24 @@ impl ConduitWindow {
             Some("timeline-positioned" | "timeline-interacted") => {
                 match timeline_lifecycle_action(url) {
                     Some(TimelineLifecycleAction::Positioned(generation)) => {
-                        self.imp()
-                            .conversation_opening
-                            .borrow_mut()
-                            .commit_position(generation);
+                        let reconcile = {
+                            let mut opening = self.imp().conversation_opening.borrow_mut();
+                            opening.commit_position(generation)
+                                && opening.take_pending_reconciliation(generation)
+                        };
+                        if reconcile {
+                            self.reconcile_current_conversation_snapshot();
+                        }
                     }
                     Some(TimelineLifecycleAction::Interacted(generation)) => {
-                        self.imp()
-                            .conversation_opening
-                            .borrow_mut()
-                            .note_user_interaction(generation);
+                        let reconcile = {
+                            let mut opening = self.imp().conversation_opening.borrow_mut();
+                            opening.note_user_interaction(generation)
+                                && opening.take_pending_reconciliation(generation)
+                        };
+                        if reconcile {
+                            self.reconcile_current_conversation_snapshot();
+                        }
                     }
                     None => {}
                 }
@@ -7150,6 +7158,10 @@ impl ConduitWindow {
             context.first_unread_ts = first_unread_ts.clone();
         }
         context.timeline_scroll = scroll_behavior;
+        let active_open_generation = imp
+            .conversation_opening
+            .borrow()
+            .active_generation_for(channel_id);
         let opening_generation = imp
             .conversation_opening
             .borrow()
@@ -7199,16 +7211,49 @@ impl ConduitWindow {
                 context.failed_image_urls.len()
             ),
         );
-        let html = generate_html("conversation", || {
-            message_html::conversation_document_with_focus(
-                channel_id,
-                &messages,
-                &context,
-                focus_message_ts.as_deref(),
-            )
+        let render_action = active_open_generation.and_then(|generation| {
+            imp.conversation_opening
+                .borrow_mut()
+                .note_render_requested(generation)
         });
-        self.load_message_html(&html);
+        match render_action {
+            Some(ConversationOpenRenderAction::HoldReconciliation) => {}
+            Some(ConversationOpenRenderAction::Reconcile) => {
+                self.apply_timeline_patch(
+                    TimelineSurface::Main,
+                    message_html::conversation_snapshot_patch(channel_id, &messages, &context),
+                    UiInvalidations::MAIN,
+                );
+            }
+            Some(ConversationOpenRenderAction::InitialDocument) | None => {
+                let html = generate_html("conversation", || {
+                    message_html::conversation_document_with_focus(
+                        channel_id,
+                        &messages,
+                        &context,
+                        focus_message_ts.as_deref(),
+                    )
+                });
+                self.load_message_html(&html);
+            }
+        }
         self.queue_history_render_followups(channel_id, messages);
+    }
+
+    fn reconcile_current_conversation_snapshot(&self) {
+        let snapshot = self.current_message_snapshot();
+        let Some(channel_id) = snapshot.channel_id else {
+            return;
+        };
+        if snapshot.main_view == MainMessageView::Conversation
+            && !snapshot.channel_messages.is_empty()
+        {
+            self.populate_history_with_scroll(
+                &channel_id,
+                snapshot.channel_messages,
+                TimelineScrollBehavior::Preserve,
+            );
+        }
     }
 
     fn queue_history_render_followups(&self, channel_id: &str, messages: Vec<SlackMessage>) {

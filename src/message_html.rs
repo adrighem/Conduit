@@ -59,6 +59,10 @@ pub enum TimelineScrollBehavior {
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[allow(dead_code)]
 pub enum TimelineDomPatch {
+    ReplaceSnapshot {
+        list_html: String,
+        load_more_html: String,
+    },
     InsertMessage {
         position: TimelineInsertPosition,
         html: String,
@@ -122,6 +126,22 @@ pub fn insert_message_patch(
             "{unread_separator}<li class=\"message-list-item\">{}</li>",
             message_article(Some(channel_id), message, context)
         ),
+    }
+}
+
+#[allow(dead_code)]
+pub fn conversation_snapshot_patch(
+    channel_id: &str,
+    messages: &[SlackMessage],
+    context: &MessageHtmlContext,
+) -> TimelineDomPatch {
+    TimelineDomPatch::ReplaceSnapshot {
+        list_html: conversation_list_items_html(channel_id, messages, context),
+        load_more_html: context
+            .load_more_url
+            .as_deref()
+            .map(|url| load_more_action_html(url, &gettext("Load older messages")))
+            .unwrap_or_default(),
     }
 }
 
@@ -886,17 +906,7 @@ pub fn conversation_document_with_focus(
         }
     }
     body.push_str("<ol class=\"message-list\">");
-    for group in groups {
-        if group
-            .first()
-            .is_some_and(|message| context.first_unread_ts.as_deref() == Some(message.ts.as_str()))
-        {
-            body.push_str(&unread_separator_html());
-        }
-        body.push_str("<li class=\"message-list-item\">");
-        body.push_str(&message_group_article(Some(channel_id), &group, context));
-        body.push_str("</li>");
-    }
+    body.push_str(&conversation_list_items_html(channel_id, messages, context));
     body.push_str("</ol>");
     if context.read_marker_url.is_some()
         && context.first_unread_ts.is_none()
@@ -913,6 +923,26 @@ pub fn conversation_document_with_focus(
     body.push_str(&emoji_picker_html(context));
 
     html_document_with_script(&title, &body, Some(timeline_dom_runtime_script()))
+}
+
+fn conversation_list_items_html(
+    channel_id: &str,
+    messages: &[SlackMessage],
+    context: &MessageHtmlContext,
+) -> String {
+    let mut html = String::new();
+    for group in message_groups(messages, context.first_unread_ts.as_deref()) {
+        if group
+            .first()
+            .is_some_and(|message| context.first_unread_ts.as_deref() == Some(message.ts.as_str()))
+        {
+            html.push_str(&unread_separator_html());
+        }
+        html.push_str("<li class=\"message-list-item\">");
+        html.push_str(&message_group_article(Some(channel_id), &group, context));
+        html.push_str("</li>");
+    }
+    html
 }
 
 pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -> String {
@@ -5239,6 +5269,39 @@ mod tests {
                 html: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn conversation_snapshot_patch_replaces_messages_and_load_more_navigation() {
+        let mut older = message("older");
+        older.ts = "1710000000.000100".to_string();
+        let mut newer = message("newer");
+        newer.ts = "1710000001.000100".to_string();
+        let context = MessageHtmlContext {
+            load_more_url: Some(load_more_action_url("C123", "next", None)),
+            first_unread_ts: Some(newer.ts.clone()),
+            ..Default::default()
+        };
+
+        let patch = conversation_snapshot_patch("C123", &[newer, older], &context);
+        let TimelineDomPatch::ReplaceSnapshot {
+            list_html,
+            load_more_html,
+        } = patch
+        else {
+            panic!("expected snapshot patch");
+        };
+        assert!(list_html.contains("older"));
+        assert!(list_html.contains("newer"));
+        assert!(list_html.contains("unread-separator"));
+        assert!(load_more_html.contains("Load older messages"));
+        assert!(load_more_html.contains("cursor=next"));
+
+        let script = timeline_dom_patch_call(&TimelineDomPatch::ReplaceSnapshot {
+            list_html,
+            load_more_html,
+        });
+        assert!(script.contains("\"type\":\"replace-snapshot\""));
     }
 
     #[test]

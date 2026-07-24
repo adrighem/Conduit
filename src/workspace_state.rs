@@ -285,6 +285,13 @@ pub(crate) enum ConversationOpenPhase {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationOpenRenderAction {
+    InitialDocument,
+    HoldReconciliation,
+    Reconcile,
+}
+
 #[derive(Debug, Clone)]
 struct ConversationOpenSession {
     generation: ConversationOpenGeneration,
@@ -292,6 +299,8 @@ struct ConversationOpenSession {
     intent: ConversationOpenIntent,
     resolved_position: Option<ConversationOpenPosition>,
     phase: ConversationOpenPhase,
+    document_submitted: bool,
+    pending_reconciliation: bool,
 }
 
 #[derive(Debug, Default)]
@@ -314,6 +323,8 @@ impl ConversationOpenCoordinator {
             intent,
             resolved_position: None,
             phase: ConversationOpenPhase::Positioning,
+            document_submitted: false,
+            pending_reconciliation: false,
         });
         generation
     }
@@ -336,6 +347,16 @@ impl ConversationOpenCoordinator {
             .map(|session| session.generation)
     }
 
+    pub(crate) fn active_generation_for(
+        &self,
+        channel_id: &str,
+    ) -> Option<ConversationOpenGeneration> {
+        self.active
+            .as_ref()
+            .filter(|session| session.channel_id == channel_id)
+            .map(|session| session.generation)
+    }
+
     pub(crate) fn active_waits_for_explicit_target(&self, channel_id: &str) -> bool {
         self.active.as_ref().is_some_and(|session| {
             session.channel_id == channel_id
@@ -347,6 +368,43 @@ impl ConversationOpenCoordinator {
 
     pub(crate) fn reset(&mut self) {
         self.active = None;
+    }
+
+    pub(crate) fn note_render_requested(
+        &mut self,
+        generation: ConversationOpenGeneration,
+    ) -> Option<ConversationOpenRenderAction> {
+        let session = self
+            .active
+            .as_mut()
+            .filter(|session| session.generation == generation)?;
+        match session.phase {
+            ConversationOpenPhase::Positioning if !session.document_submitted => {
+                session.document_submitted = true;
+                Some(ConversationOpenRenderAction::InitialDocument)
+            }
+            ConversationOpenPhase::Positioning => {
+                session.pending_reconciliation = true;
+                Some(ConversationOpenRenderAction::HoldReconciliation)
+            }
+            ConversationOpenPhase::Interactive | ConversationOpenPhase::Cancelled => {
+                Some(ConversationOpenRenderAction::Reconcile)
+            }
+        }
+    }
+
+    pub(crate) fn take_pending_reconciliation(
+        &mut self,
+        generation: ConversationOpenGeneration,
+    ) -> bool {
+        let Some(session) = self
+            .active
+            .as_mut()
+            .filter(|session| session.generation == generation)
+        else {
+            return false;
+        };
+        std::mem::take(&mut session.pending_reconciliation)
     }
 
     pub(crate) fn resolve_position(
@@ -1680,17 +1738,43 @@ mod tests {
     fn conversation_open_session_stops_automatic_positioning_after_user_interaction() {
         let mut coordinator = ConversationOpenCoordinator::default();
         let generation = coordinator.begin("C1", ConversationOpenIntent::Latest);
-
         assert_eq!(
             coordinator.resolve_position(generation, "C1", &[message("1", "one")]),
             Some(ConversationOpenPosition::Latest)
         );
+
         assert!(coordinator.note_user_interaction(generation));
         assert_eq!(
             coordinator.resolve_position(generation, "C1", &[message("2", "two")]),
             None
         );
         assert!(!coordinator.commit_position(generation));
+    }
+
+    #[test]
+    fn conversation_open_session_holds_reconciliation_until_initial_commit() {
+        let mut coordinator = ConversationOpenCoordinator::default();
+        let generation = coordinator.begin("C1", ConversationOpenIntent::Latest);
+        assert_eq!(
+            coordinator.resolve_position(generation, "C1", &[message("1", "one")]),
+            Some(ConversationOpenPosition::Latest)
+        );
+
+        assert_eq!(
+            coordinator.note_render_requested(generation),
+            Some(ConversationOpenRenderAction::InitialDocument)
+        );
+        assert_eq!(
+            coordinator.note_render_requested(generation),
+            Some(ConversationOpenRenderAction::HoldReconciliation)
+        );
+        assert!(coordinator.commit_position(generation));
+        assert!(coordinator.take_pending_reconciliation(generation));
+        assert!(!coordinator.take_pending_reconciliation(generation));
+        assert_eq!(
+            coordinator.note_render_requested(generation),
+            Some(ConversationOpenRenderAction::Reconcile)
+        );
     }
 
     #[test]
