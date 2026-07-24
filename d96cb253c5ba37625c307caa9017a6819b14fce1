@@ -1,0 +1,7 @@
+Task: Consolidate initial scroll, target focus, reveal, interaction cancellation, and delayed read observation in one viewport controller
+
+Summary: Replaced three competing generated scripts with one generation-aware timeline controller, hidden positioning phase, host acknowledgement, user cancellation, deferred read observation, and stable session anchor handling.
+
+Files: src/message_html.rs; src/timeline_dom_runtime.js; src/window.rs; src/workspace_state.rs
+
+Rationale: JavaScript now solely owns viewport geometry while Rust owns immutable semantic intent and validates lifecycle callbacks.
