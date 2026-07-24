@@ -1,0 +1,4 @@
+Task: Create rich bot messages implementation track
+Summary: Recorded the approved architecture, requirements, phased TDD plan, security boundary, and acceptance criteria.
+Files: docs/rich-bot-messages-design.md; conductor/tracks.md; conductor/tracks/rich_bot_messages_20260724/*
+Rationale: Keep the implementation aligned with the revisioned workspace pipeline and Slack's documented interaction boundary.
