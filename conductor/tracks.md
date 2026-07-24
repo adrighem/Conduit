@@ -71,3 +71,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [x] Track: Relevant notifications and noise-free unread state
 *Link: [./conductor/tracks/notification_relevance_20260721/](./conductor/tracks/notification_relevance_20260721/)*
+
+---
+
+## [~] Track: Deterministic conversation opening
+*Link: [./conductor/tracks/conversation_opening_20260724/](./conductor/tracks/conversation_opening_20260724/)*

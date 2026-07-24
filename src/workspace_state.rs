@@ -238,6 +238,182 @@ struct ChannelHistoryState {
     focus_ts: Option<String>,
 }
 
+pub(crate) type ConversationOpenGeneration = u64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConversationOpenIntent {
+    Latest,
+    FirstUnread {
+        last_read: Option<String>,
+        unread_count: u64,
+    },
+    Message(String),
+}
+
+impl ConversationOpenIntent {
+    pub(crate) fn choose(
+        explicit_message_ts: Option<&str>,
+        has_unread: bool,
+        last_read: Option<&str>,
+        unread_count: u64,
+    ) -> Self {
+        if let Some(message_ts) = explicit_message_ts.filter(|ts| !ts.trim().is_empty()) {
+            Self::Message(message_ts.to_string())
+        } else if has_unread {
+            Self::FirstUnread {
+                last_read: last_read
+                    .filter(|ts| !ts.trim().is_empty())
+                    .map(ToString::to_string),
+                unread_count,
+            }
+        } else {
+            Self::Latest
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConversationOpenPosition {
+    Latest,
+    Message(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationOpenPhase {
+    Positioning,
+    Interactive,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+struct ConversationOpenSession {
+    generation: ConversationOpenGeneration,
+    channel_id: String,
+    intent: ConversationOpenIntent,
+    resolved_position: Option<ConversationOpenPosition>,
+    phase: ConversationOpenPhase,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ConversationOpenCoordinator {
+    next_generation: ConversationOpenGeneration,
+    active: Option<ConversationOpenSession>,
+}
+
+impl ConversationOpenCoordinator {
+    pub(crate) fn begin(
+        &mut self,
+        channel_id: &str,
+        intent: ConversationOpenIntent,
+    ) -> ConversationOpenGeneration {
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        self.active = Some(ConversationOpenSession {
+            generation,
+            channel_id: channel_id.to_string(),
+            intent,
+            resolved_position: None,
+            phase: ConversationOpenPhase::Positioning,
+        });
+        generation
+    }
+
+    pub(crate) fn active_phase(&self) -> Option<ConversationOpenPhase> {
+        self.active.as_ref().map(|session| session.phase)
+    }
+
+    pub(crate) fn resolve_position(
+        &mut self,
+        generation: ConversationOpenGeneration,
+        channel_id: &str,
+        messages: &[SlackMessage],
+    ) -> Option<ConversationOpenPosition> {
+        let session = self.active.as_mut().filter(|session| {
+            session.generation == generation
+                && session.channel_id == channel_id
+                && session.phase == ConversationOpenPhase::Positioning
+        })?;
+        if let Some(position) = session.resolved_position.clone() {
+            return Some(position);
+        }
+        let position = match &session.intent {
+            ConversationOpenIntent::Latest => ConversationOpenPosition::Latest,
+            ConversationOpenIntent::FirstUnread {
+                last_read,
+                unread_count,
+            } => ConversationOpenPosition::Message(resolve_first_unread_message_ts(
+                messages,
+                last_read.as_deref(),
+                *unread_count,
+            )?),
+            ConversationOpenIntent::Message(message_ts) => messages
+                .iter()
+                .any(|message| message.ts == *message_ts)
+                .then(|| ConversationOpenPosition::Message(message_ts.clone()))?,
+        };
+        session.resolved_position = Some(position.clone());
+        Some(position)
+    }
+
+    pub(crate) fn commit_position(&mut self, generation: ConversationOpenGeneration) -> bool {
+        let Some(session) = self
+            .active
+            .as_mut()
+            .filter(|session| session.generation == generation)
+        else {
+            return false;
+        };
+        if session.phase != ConversationOpenPhase::Positioning
+            || session.resolved_position.is_none()
+        {
+            return false;
+        }
+        session.phase = ConversationOpenPhase::Interactive;
+        true
+    }
+
+    pub(crate) fn note_user_interaction(&mut self, generation: ConversationOpenGeneration) -> bool {
+        let Some(session) = self
+            .active
+            .as_mut()
+            .filter(|session| session.generation == generation)
+        else {
+            return false;
+        };
+        if session.phase != ConversationOpenPhase::Positioning {
+            return false;
+        }
+        session.phase = ConversationOpenPhase::Cancelled;
+        true
+    }
+}
+
+pub(crate) fn resolve_first_unread_message_ts(
+    messages: &[SlackMessage],
+    last_read: Option<&str>,
+    unread_count: u64,
+) -> Option<String> {
+    let mut timestamps = messages
+        .iter()
+        .map(|message| message.ts.as_str())
+        .filter(|ts| !ts.is_empty())
+        .collect::<Vec<_>>();
+    timestamps.sort_unstable();
+    if let Some(last_read) = last_read.filter(|ts| !ts.trim().is_empty()) {
+        return timestamps
+            .into_iter()
+            .find(|timestamp| *timestamp > last_read)
+            .map(ToString::to_string);
+    }
+    if unread_count == 0 {
+        return None;
+    }
+    let index = timestamps.len().saturating_sub(unread_count as usize);
+    timestamps
+        .get(index)
+        .map(|timestamp| (*timestamp).to_string())
+}
+
 #[derive(Debug, Clone)]
 struct ThreadViewState {
     channel_id: String,
@@ -1401,6 +1577,109 @@ mod tests {
             ConversationSelectionDecision::RenderCurrent
         );
         assert_eq!(current.scroll, Some(WorkspaceScrollBehavior::StickToBottom));
+    }
+
+    #[test]
+    fn conversation_open_sessions_increment_generation_and_reject_stale_commits() {
+        let mut coordinator = ConversationOpenCoordinator::default();
+        let first = coordinator.begin("C1", ConversationOpenIntent::Latest);
+        let second = coordinator.begin("C2", ConversationOpenIntent::Latest);
+
+        assert!(second > first);
+        assert!(!coordinator.commit_position(first));
+        assert!(coordinator.commit_position(second));
+        assert_eq!(
+            coordinator.active_phase(),
+            Some(ConversationOpenPhase::Interactive)
+        );
+    }
+
+    #[test]
+    fn conversation_open_target_priority_is_explicit_then_unread_then_latest() {
+        assert_eq!(
+            ConversationOpenIntent::choose(Some("42"), true, Some("10"), 3,),
+            ConversationOpenIntent::Message("42".to_string())
+        );
+        assert_eq!(
+            ConversationOpenIntent::choose(None, true, Some("10"), 3),
+            ConversationOpenIntent::FirstUnread {
+                last_read: Some("10".to_string()),
+                unread_count: 3,
+            }
+        );
+        assert_eq!(
+            ConversationOpenIntent::choose(None, false, Some("10"), 3),
+            ConversationOpenIntent::Latest
+        );
+    }
+
+    #[test]
+    fn conversation_open_session_pins_first_resolved_unread_target() {
+        let mut coordinator = ConversationOpenCoordinator::default();
+        let generation = coordinator.begin(
+            "C1",
+            ConversationOpenIntent::FirstUnread {
+                last_read: Some("2".to_string()),
+                unread_count: 0,
+            },
+        );
+
+        assert_eq!(
+            coordinator.resolve_position(
+                generation,
+                "C1",
+                &[message("4", "four"), message("3", "three")],
+            ),
+            Some(ConversationOpenPosition::Message("3".to_string()))
+        );
+        assert_eq!(
+            coordinator.resolve_position(
+                generation,
+                "C1",
+                &[
+                    message("4", "four"),
+                    message("2.5", "earlier unread"),
+                    message("3", "three"),
+                ],
+            ),
+            Some(ConversationOpenPosition::Message("3".to_string()))
+        );
+    }
+
+    #[test]
+    fn conversation_open_session_stops_automatic_positioning_after_user_interaction() {
+        let mut coordinator = ConversationOpenCoordinator::default();
+        let generation = coordinator.begin("C1", ConversationOpenIntent::Latest);
+
+        assert_eq!(
+            coordinator.resolve_position(generation, "C1", &[message("1", "one")]),
+            Some(ConversationOpenPosition::Latest)
+        );
+        assert!(coordinator.note_user_interaction(generation));
+        assert_eq!(
+            coordinator.resolve_position(generation, "C1", &[message("2", "two")]),
+            None
+        );
+        assert!(!coordinator.commit_position(generation));
+    }
+
+    #[test]
+    fn first_unread_open_target_uses_count_when_cursor_is_missing() {
+        let messages = vec![
+            message("4", "four"),
+            message("3", "three"),
+            message("2", "two"),
+            message("1", "one"),
+        ];
+
+        assert_eq!(
+            resolve_first_unread_message_ts(&messages, None, 2).as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            resolve_first_unread_message_ts(&messages, None, 99).as_deref(),
+            Some("1")
+        );
     }
 
     #[test]

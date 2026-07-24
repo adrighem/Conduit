@@ -1,0 +1,8 @@
+{
+  "track_id": "conversation_opening_20260724",
+  "type": "feature",
+  "status": "in_progress",
+  "created_at": "2026-07-24T07:04:07Z",
+  "updated_at": "2026-07-24T07:04:07Z",
+  "description": "Make conversation opening a generation-scoped transaction with immutable intent, one viewport authority, stable cached-to-fresh reconciliation, and delayed read observation."
+}
