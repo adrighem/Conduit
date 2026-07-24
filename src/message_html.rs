@@ -39,6 +39,7 @@ pub struct MessageHtmlContext {
     pub custom_emojis: HashMap<String, String>,
     pub read_marker_url: Option<String>,
     pub first_unread_ts: Option<String>,
+    pub timeline_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -857,8 +858,26 @@ pub fn conversation_document_with_focus(
         .filter(|message_ts| !message_ts.is_empty())
         .map(|message_ts| format!(" data-focus-message-ts=\"{}\"", escape_html(message_ts)))
         .unwrap_or_default();
+    let scroll_identity = timeline_scroll_identity(channel_id, context.thread_ts.as_deref());
+    let sticky_key = format!("conduit:timeline-at-bottom:{scroll_identity}");
+    let anchor_key = format!("conduit:timeline-anchor:{scroll_identity}");
+    let generation_attribute = context
+        .timeline_generation
+        .map(|generation| format!(" data-timeline-generation=\"{generation}\""))
+        .unwrap_or_default();
+    let read_marker_attribute = context
+        .read_marker_url
+        .as_deref()
+        .map(|url| format!(" data-read-marker-url=\"{}\"", escape_html(url)))
+        .unwrap_or_default();
     let mut body = format!(
-        "<main class=\"timeline\" aria-labelledby=\"document-title\"{focus_attribute}>{}",
+        "<main class=\"timeline\" aria-labelledby=\"document-title\" \
+         data-timeline-positioning=\"pending\" data-timeline-mode=\"{}\" \
+         data-timeline-sticky-key=\"{}\" data-timeline-anchor-key=\"{}\"\
+         {generation_attribute}{focus_attribute}{read_marker_attribute}>{}",
+        context.timeline_scroll.js_mode(),
+        escape_html(&sticky_key),
+        escape_html(&anchor_key),
         document_heading(&title)
     );
     if context.thread_ts.is_none() {
@@ -893,19 +912,7 @@ pub fn conversation_document_with_focus(
     body.push_str("</main>");
     body.push_str(&emoji_picker_html(context));
 
-    let mut scripts = vec![timeline_dom_runtime_script().to_string()];
-    let scroll_identity = timeline_scroll_identity(channel_id, context.thread_ts.as_deref());
-    if let Some(scroll_script) = timeline_scroll_script(&scroll_identity, context.timeline_scroll) {
-        scripts.push(scroll_script);
-    }
-    if !focus_attribute.is_empty() {
-        scripts.push(message_focus_script().to_string());
-    }
-    if let Some(url) = context.read_marker_url.as_deref() {
-        scripts.push(read_marker_script(url));
-    }
-    let script = (!scripts.is_empty()).then(|| scripts.join("\n"));
-    html_document_with_script(&title, &body, script.as_deref())
+    html_document_with_script(&title, &body, Some(timeline_dom_runtime_script()))
 }
 
 pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -> String {
@@ -1176,6 +1183,10 @@ a:hover {{
   margin-inline: auto;
   padding-block: 4px 20px;
   padding-inline: 12px;
+}}
+
+.timeline[data-timeline-positioning="pending"] {{
+  visibility: hidden;
 }}
 
 .profile-page {{
@@ -1980,152 +1991,6 @@ pre code {{
     )
 }
 
-fn timeline_scroll_script(channel_id: &str, behavior: TimelineScrollBehavior) -> Option<String> {
-    let sticky_key = serde_json::to_string(&format!("conduit:timeline-at-bottom:{channel_id}"))
-        .unwrap_or_else(|_| "\"conduit:timeline-at-bottom:\"".to_string());
-    let anchor_key = serde_json::to_string(&format!("conduit:timeline-anchor:{channel_id}"))
-        .unwrap_or_else(|_| "\"conduit:timeline-anchor:\"".to_string());
-    let mode = serde_json::to_string(behavior.js_mode()).unwrap_or_else(|_| "\"preserve\"".into());
-    Some(format!(
-        r#"(function () {{
-  const mode = {mode};
-  const stickyKey = {sticky_key};
-  const anchorKey = {anchor_key};
-  const threshold = 96;
-
-  function root() {{
-    return document.scrollingElement || document.documentElement;
-  }}
-
-  function atBottom() {{
-    const scrollRoot = root();
-    return scrollRoot.scrollHeight - scrollRoot.scrollTop - scrollRoot.clientHeight <= threshold;
-  }}
-
-  function rememberPosition() {{
-    try {{
-      sessionStorage.setItem(stickyKey, atBottom() ? "true" : "false");
-    }} catch (_) {{
-    }}
-  }}
-
-  function wasAtBottom() {{
-    if (mode === "bottom") {{
-      return true;
-    }}
-    try {{
-      return sessionStorage.getItem(stickyKey) !== "false";
-    }} catch (_) {{
-      return true;
-    }}
-  }}
-
-  function messageAnchors() {{
-    return Array.from(document.querySelectorAll("[data-message-ts]"));
-  }}
-
-  function visibleAnchor() {{
-    const viewportHeight = window.innerHeight || root().clientHeight;
-    return messageAnchors().find(function (element) {{
-      const rect = element.getBoundingClientRect();
-      return rect.bottom >= 0 && rect.top <= viewportHeight;
-    }});
-  }}
-
-  function rememberAnchor() {{
-    const scrollRoot = root();
-    const anchor = visibleAnchor();
-    const payload = {{
-      scrollTop: scrollRoot.scrollTop,
-      scrollHeight: scrollRoot.scrollHeight
-    }};
-    if (anchor) {{
-      payload.ts = anchor.dataset.messageTs;
-      payload.top = anchor.getBoundingClientRect().top;
-    }}
-    try {{
-      sessionStorage.setItem(anchorKey, JSON.stringify(payload));
-    }} catch (_) {{
-    }}
-  }}
-
-  function rememberViewport() {{
-    rememberPosition();
-    rememberAnchor();
-  }}
-
-  function restoreAnchor() {{
-    let payload = null;
-    try {{
-      payload = JSON.parse(sessionStorage.getItem(anchorKey) || "null");
-    }} catch (_) {{
-      payload = null;
-    }}
-    if (!payload) {{
-      return;
-    }}
-
-    const scrollRoot = root();
-    const anchor = payload.ts
-      ? messageAnchors().find(function (element) {{
-          return element.dataset.messageTs === payload.ts;
-        }})
-      : null;
-    if (anchor && typeof payload.top === "number") {{
-      scrollRoot.scrollTop += anchor.getBoundingClientRect().top - payload.top;
-    }} else if (
-      typeof payload.scrollTop === "number" &&
-      typeof payload.scrollHeight === "number"
-    ) {{
-      scrollRoot.scrollTop = payload.scrollTop + scrollRoot.scrollHeight - payload.scrollHeight;
-    }}
-    rememberViewport();
-  }}
-
-  function scrollToBottom() {{
-    const scrollRoot = root();
-    scrollRoot.scrollTop = scrollRoot.scrollHeight;
-    rememberViewport();
-  }}
-
-  const shouldStick = wasAtBottom();
-  function applyScroll() {{
-    if (shouldStick) {{
-      scrollToBottom();
-    }} else {{
-      restoreAnchor();
-    }}
-  }}
-
-  document.addEventListener("click", function (event) {{
-    const target = event.target && event.target.closest
-      ? event.target.closest("a[href^='conduit://load-older']")
-      : null;
-    if (target) {{
-      rememberViewport();
-    }}
-  }}, true);
-
-  if (mode === "preserve-prepend") {{
-    window.addEventListener("scroll", rememberViewport, {{ passive: true }});
-    window.addEventListener("load", restoreAnchor, {{ once: true }});
-    requestAnimationFrame(restoreAnchor);
-    requestAnimationFrame(function () {{
-      requestAnimationFrame(restoreAnchor);
-    }});
-    return;
-  }}
-
-  window.addEventListener("scroll", rememberViewport, {{ passive: true }});
-  window.addEventListener("load", applyScroll, {{ once: true }});
-  requestAnimationFrame(applyScroll);
-  requestAnimationFrame(function () {{
-    requestAnimationFrame(applyScroll);
-  }});
-}})();"#
-    ))
-}
-
 fn timeline_scroll_identity(channel_id: &str, thread_ts: Option<&str>) -> String {
     match thread_ts {
         Some(thread_ts) => format!("thread:{channel_id}:{thread_ts}"),
@@ -2135,91 +2000,6 @@ fn timeline_scroll_identity(channel_id: &str, thread_ts: Option<&str>) -> String
 
 fn timeline_dom_runtime_script() -> &'static str {
     include_str!("timeline_dom_runtime.js")
-}
-
-fn message_focus_script() -> &'static str {
-    r#"(function () {
-  function focusTarget() {
-    const timeline = document.querySelector("[data-focus-message-ts]");
-    if (!timeline) {
-      return;
-    }
-    const targetTs = timeline.dataset.focusMessageTs;
-    const target = Array.from(document.querySelectorAll("[data-message-ts]")).find(
-      function (element) { return element.dataset.messageTs === targetTs; }
-    );
-    if (!target) {
-      return;
-    }
-    target.scrollIntoView({ block: "center", inline: "nearest" });
-  }
-
-  window.addEventListener("load", focusTarget, { once: true });
-  requestAnimationFrame(focusTarget);
-  requestAnimationFrame(function () { requestAnimationFrame(focusTarget); });
-})();"#
-}
-
-fn read_marker_script(url: &str) -> String {
-    let url = serde_json::to_string(url).expect("read marker URL should serialize");
-    format!(
-        r#"(function () {{
-  if (!("IntersectionObserver" in window)) return;
-  const sentinel = document.getElementById("timeline-read-sentinel");
-  if (sentinel) {{
-    const sentinelObserver = new IntersectionObserver(function (entries) {{
-      if (!entries.some(function (entry) {{ return entry.isIntersecting; }})) return;
-      sentinelObserver.disconnect();
-      window.location.href = {url};
-    }}, {{ threshold: 1.0 }});
-    sentinelObserver.observe(sentinel);
-    return;
-  }}
-  let lastSent = "";
-  let timer = 0;
-  const visible = new Set();
-  function timestampAfter(left, right) {{ return left.localeCompare(right) > 0; }}
-  function schedule() {{
-    window.clearTimeout(timer);
-    timer = window.setTimeout(function () {{
-      const newest = Array.from(visible).sort().pop();
-      if (!newest || !timestampAfter(newest, lastSent)) return;
-      lastSent = newest;
-      const ordered = Array.from(document.querySelectorAll("[data-message-ts]"));
-      const currentIndex = ordered.findIndex(function (message) {{ return message.dataset.messageTs === newest; }});
-      const next = currentIndex >= 0 ? ordered[currentIndex + 1] : null;
-      const separator = document.querySelector(".unread-separator");
-      if (separator && next) next.before(separator);
-      else if (separator) separator.remove();
-      const target = new URL({url});
-      target.searchParams.set("ts", newest);
-      window.location.href = target.toString();
-    }}, 500);
-  }}
-  const observer = new IntersectionObserver(function (entries) {{
-    entries.forEach(function (entry) {{
-      const ts = entry.target.dataset.messageTs;
-      if (!ts) return;
-      if (entry.isIntersecting) visible.add(ts); else visible.delete(ts);
-    }});
-    schedule();
-  }}, {{ threshold: 0.01 }});
-  function observeUnreadMessages() {{
-    const boundary = document.querySelector(".unread-separator");
-    if (!boundary) return;
-    let afterBoundary = false;
-    document.querySelectorAll(".unread-separator, [data-message-ts]").forEach(function (node) {{
-      if (node.classList.contains("unread-separator")) {{ afterBoundary = true; return; }}
-      if (afterBoundary && !node.dataset.readObserved) {{
-        node.dataset.readObserved = "true";
-        observer.observe(node);
-      }}
-    }});
-  }}
-  observeUnreadMessages();
-  new MutationObserver(observeUnreadMessages).observe(document.querySelector(".message-list"), {{ childList: true, subtree: true }});
-}})();"#
-    )
 }
 
 fn message_article(
@@ -4529,7 +4309,7 @@ mod tests {
 
         let html = conversation_document("C123", &[message("paged")], &context);
 
-        assert!(html.contains("mode = \"preserve-prepend\""));
+        assert!(html.contains("data-timeline-mode=\"preserve-prepend\""));
         assert!(html.contains("conduit:timeline-anchor:channel:C123"));
     }
 
@@ -4842,15 +4622,34 @@ mod tests {
         let context = MessageHtmlContext {
             read_marker_url: Some(mark_read_action_url("C123", "1710000000.000100")),
             first_unread_ts: Some("1710000000.000100".into()),
+            timeline_generation: Some(42),
             ..Default::default()
         };
 
         let html = conversation_document("C123", &[message("unread")], &context);
 
         assert!(html.contains("class=\"unread-separator\""));
+        assert!(html.contains("data-timeline-generation=\"42\""));
+        assert!(html.contains("data-timeline-positioning=\"pending\""));
+        assert!(html.contains("\"conduit://timeline-\" + action"));
+        assert!(html.contains("notifyHost(\"positioned\")"));
+        assert!(html.contains("notifyHost(\"interacted\")"));
         assert!(html.contains("new IntersectionObserver"));
+        assert!(html.contains("function armReadMarker"));
+        assert!(html.contains("commitInitialPosition"));
         assert!(html.contains("target.searchParams.set(\"ts\", newest)"));
         assert!(html.contains("if (separator && next) next.before(separator)"));
+        assert!(!html.contains("function focusTarget()"));
+        assert!(!html.contains("function applyScroll()"));
+    }
+
+    #[test]
+    fn conversation_without_generation_does_not_emit_open_session_callbacks() {
+        let html =
+            conversation_document("C123", &[message("hello")], &MessageHtmlContext::default());
+
+        assert!(!html.contains("data-timeline-generation="));
+        assert!(html.contains("if (generation !== null)"));
     }
 
     #[test]

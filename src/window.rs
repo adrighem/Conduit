@@ -1524,6 +1524,24 @@ fn query_param(url: &url::Url, name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineLifecycleAction {
+    Positioned(u64),
+    Interacted(u64),
+}
+
+fn timeline_lifecycle_action(url: &url::Url) -> Option<TimelineLifecycleAction> {
+    let generation = query_param(url, "generation")?.parse::<u64>().ok()?;
+    if generation == 0 {
+        return None;
+    }
+    match url.host_str()? {
+        "timeline-positioned" => Some(TimelineLifecycleAction::Positioned(generation)),
+        "timeline-interacted" => Some(TimelineLifecycleAction::Interacted(generation)),
+        _ => None,
+    }
+}
+
 fn promoted_recent_reactions<'a>(
     names: impl IntoIterator<Item = &'a str>,
     name: &str,
@@ -4825,6 +4843,24 @@ impl ConduitWindow {
 
     fn handle_message_action_url(&self, url: &url::Url) -> bool {
         match url.host_str() {
+            Some("timeline-positioned" | "timeline-interacted") => {
+                match timeline_lifecycle_action(url) {
+                    Some(TimelineLifecycleAction::Positioned(generation)) => {
+                        self.imp()
+                            .conversation_opening
+                            .borrow_mut()
+                            .commit_position(generation);
+                    }
+                    Some(TimelineLifecycleAction::Interacted(generation)) => {
+                        self.imp()
+                            .conversation_opening
+                            .borrow_mut()
+                            .note_user_interaction(generation);
+                    }
+                    None => {}
+                }
+                true
+            }
             Some("thread") => {
                 let Some(channel_id) = query_param(url, "channel") else {
                     return true;
@@ -7114,10 +7150,14 @@ impl ConduitWindow {
             context.first_unread_ts = first_unread_ts.clone();
         }
         context.timeline_scroll = scroll_behavior;
+        let opening_generation = imp
+            .conversation_opening
+            .borrow()
+            .positioning_generation_for(channel_id);
+        context.timeline_generation = opening_generation;
         let opening_position = {
             let mut opening = imp.conversation_opening.borrow_mut();
-            opening
-                .active_generation_for(channel_id)
+            opening_generation
                 .and_then(|generation| opening.resolve_position(generation, channel_id, &messages))
         };
         if opening_position.is_none()
@@ -8604,6 +8644,7 @@ impl ConduitWindow {
             thread_ts: thread_ts.map(ToString::to_string),
             load_more_url: None,
             timeline_scroll: TimelineScrollBehavior::Preserve,
+            timeline_generation: None,
             image_assets: imp
                 .image_assets
                 .borrow()
@@ -9037,6 +9078,34 @@ mod tests {
         let location = slack_message_location(&uri, Some(workspace)).unwrap();
         assert_eq!(location.channel_id(), "C123");
         assert_eq!(location.message_ts(), "1783592777.735299");
+    }
+
+    #[test]
+    fn timeline_lifecycle_actions_require_a_valid_generation() {
+        assert_eq!(
+            timeline_lifecycle_action(
+                &url::Url::parse("conduit://timeline-positioned?generation=42").unwrap(),
+            ),
+            Some(TimelineLifecycleAction::Positioned(42))
+        );
+        assert_eq!(
+            timeline_lifecycle_action(
+                &url::Url::parse("conduit://timeline-interacted?generation=43").unwrap(),
+            ),
+            Some(TimelineLifecycleAction::Interacted(43))
+        );
+        for uri in [
+            "conduit://timeline-positioned",
+            "conduit://timeline-positioned?generation=0",
+            "conduit://timeline-positioned?generation=oops",
+            "conduit://other?generation=42",
+        ] {
+            assert_eq!(
+                timeline_lifecycle_action(&url::Url::parse(uri).unwrap()),
+                None,
+                "{uri}"
+            );
+        }
     }
 
     fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {

@@ -318,17 +318,21 @@ impl ConversationOpenCoordinator {
         generation
     }
 
+    #[cfg(test)]
     pub(crate) fn active_phase(&self) -> Option<ConversationOpenPhase> {
         self.active.as_ref().map(|session| session.phase)
     }
 
-    pub(crate) fn active_generation_for(
+    pub(crate) fn positioning_generation_for(
         &self,
         channel_id: &str,
     ) -> Option<ConversationOpenGeneration> {
         self.active
             .as_ref()
-            .filter(|session| session.channel_id == channel_id)
+            .filter(|session| {
+                session.channel_id == channel_id
+                    && session.phase == ConversationOpenPhase::Positioning
+            })
             .map(|session| session.generation)
     }
 

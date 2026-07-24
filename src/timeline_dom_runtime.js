@@ -57,6 +57,207 @@
   let rememberViewportAnchorFrame = 0;
   let resizeCorrectionFrame = 0;
   let scrollMutationGeneration = 0;
+  const timeline = document.querySelector(".timeline");
+  const initialMode = timeline ? timeline.dataset.timelineMode || "preserve" : "preserve";
+  const stickyKey = timeline ? timeline.dataset.timelineStickyKey : "";
+  const anchorKey = timeline ? timeline.dataset.timelineAnchorKey : "";
+  const generation = timeline && timeline.dataset.timelineGeneration
+    ? Number(timeline.dataset.timelineGeneration)
+    : null;
+  let initialPositionPending = Boolean(timeline);
+  let automaticPositioning = false;
+  let userInteracted = false;
+  let readMarkerArmed = false;
+
+  function notifyHost(action) {
+    if (generation !== null) {
+      window.location.href = "conduit://timeline-" + action + "?generation=" +
+        encodeURIComponent(String(generation));
+    }
+  }
+
+  function storedAtBottom() {
+    if (initialMode === "bottom") return true;
+    if (!stickyKey) return true;
+    try {
+      return sessionStorage.getItem(stickyKey) !== "false";
+    } catch (_) {
+      return true;
+    }
+  }
+
+  function storedAnchor() {
+    if (!anchorKey) return null;
+    try {
+      return JSON.parse(sessionStorage.getItem(anchorKey) || "null");
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function rememberStoredViewport() {
+    if (!timeline) return;
+    const root = timelineRoot();
+    const anchor = visibleAnchor();
+    const payload = {
+      scrollTop: root.scrollTop,
+      scrollHeight: root.scrollHeight
+    };
+    if (anchor) {
+      payload.ts = anchor.dataset.messageTs;
+      payload.top = anchor.getBoundingClientRect().top;
+    }
+    try {
+      if (stickyKey) sessionStorage.setItem(stickyKey, isNearBottom() ? "true" : "false");
+      if (anchorKey) sessionStorage.setItem(anchorKey, JSON.stringify(payload));
+    } catch (_) {
+    }
+  }
+
+  function restoreStoredAnchor() {
+    const payload = storedAnchor();
+    if (!payload) return;
+    const root = timelineRoot();
+    const anchor = payload.ts ? messageElement(payload.ts) : null;
+    if (anchor && typeof payload.top === "number") {
+      root.scrollTop += anchor.getBoundingClientRect().top - payload.top;
+    } else if (
+      typeof payload.scrollTop === "number" &&
+      typeof payload.scrollHeight === "number"
+    ) {
+      root.scrollTop = payload.scrollTop + root.scrollHeight - payload.scrollHeight;
+    }
+  }
+
+  function applyInitialPosition() {
+    if (!initialPositionPending || userInteracted) return;
+    automaticPositioning = true;
+    const targetTs = timeline.dataset.focusMessageTs;
+    const target = targetTs ? messageElement(targetTs) : null;
+    if (target) {
+      target.scrollIntoView({ block: "center", inline: "nearest" });
+      viewportPinnedToBottom = false;
+    } else if (initialMode === "preserve-prepend" || !storedAtBottom()) {
+      restoreStoredAnchor();
+      viewportPinnedToBottom = isNearBottom();
+    } else {
+      const root = timelineRoot();
+      root.scrollTop = root.scrollHeight;
+      viewportPinnedToBottom = true;
+    }
+  }
+
+  function timestampAfter(left, right) {
+    return left.localeCompare(right) > 0;
+  }
+
+  function armReadMarker() {
+    if (readMarkerArmed || !timeline || !timeline.dataset.readMarkerUrl) return;
+    readMarkerArmed = true;
+    if (!("IntersectionObserver" in window)) return;
+    const readMarkerUrl = timeline.dataset.readMarkerUrl;
+    const sentinel = document.getElementById("timeline-read-sentinel");
+    if (sentinel) {
+      const sentinelObserver = new IntersectionObserver(function (entries) {
+        if (!entries.some(function (entry) { return entry.isIntersecting; })) return;
+        sentinelObserver.disconnect();
+        window.location.href = readMarkerUrl;
+      }, { threshold: 1.0 });
+      sentinelObserver.observe(sentinel);
+      return;
+    }
+
+    let lastSent = "";
+    let timer = 0;
+    const visible = new Set();
+    function schedule() {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(function () {
+        const newest = Array.from(visible).sort().pop();
+        if (!newest || !timestampAfter(newest, lastSent)) return;
+        lastSent = newest;
+        const ordered = Array.from(document.querySelectorAll("[data-message-ts]"));
+        const currentIndex = ordered.findIndex(function (message) {
+          return message.dataset.messageTs === newest;
+        });
+        const next = currentIndex >= 0 ? ordered[currentIndex + 1] : null;
+        const separator = document.querySelector(".unread-separator");
+        if (separator && next) next.before(separator);
+        else if (separator) separator.remove();
+        const target = new URL(readMarkerUrl);
+        target.searchParams.set("ts", newest);
+        window.location.href = target.toString();
+      }, 500);
+    }
+    const observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        const ts = entry.target.dataset.messageTs;
+        if (!ts) return;
+        if (entry.isIntersecting) visible.add(ts); else visible.delete(ts);
+      });
+      schedule();
+    }, { threshold: 0.01 });
+    function observeUnreadMessages() {
+      const boundary = document.querySelector(".unread-separator");
+      if (!boundary) return;
+      let afterBoundary = false;
+      document.querySelectorAll(".unread-separator, [data-message-ts]").forEach(function (node) {
+        if (node.classList.contains("unread-separator")) {
+          afterBoundary = true;
+          return;
+        }
+        if (afterBoundary && !node.dataset.readObserved) {
+          node.dataset.readObserved = "true";
+          observer.observe(node);
+        }
+      });
+    }
+    observeUnreadMessages();
+    const list = document.querySelector(".message-list");
+    if (list) {
+      new MutationObserver(observeUnreadMessages).observe(list, {
+        childList: true,
+        subtree: true
+      });
+    }
+  }
+
+  function revealTimeline() {
+    if (timeline) timeline.removeAttribute("data-timeline-positioning");
+  }
+
+  function commitInitialPosition() {
+    if (!initialPositionPending || userInteracted) return;
+    applyInitialPosition();
+    initialPositionPending = false;
+    automaticPositioning = false;
+    revealTimeline();
+    rememberStoredViewport();
+    rememberViewportAnchor();
+    armReadMarker();
+    notifyHost("positioned");
+  }
+
+  function noteUserInteraction() {
+    if (userInteracted || !initialPositionPending) return;
+    userInteracted = true;
+    initialPositionPending = false;
+    automaticPositioning = false;
+    revealTimeline();
+    rememberStoredViewport();
+    rememberViewportAnchor();
+    armReadMarker();
+    notifyHost("interacted");
+  }
+
+  ["wheel", "touchstart", "pointerdown"].forEach(function (eventName) {
+    window.addEventListener(eventName, noteUserInteraction, { passive: true, capture: true });
+  });
+  window.addEventListener("keydown", function (event) {
+    if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+      noteUserInteraction();
+    }
+  }, true);
 
   function finishViewportRestore() {
     requestAnimationFrame(function () {
@@ -99,6 +300,7 @@
   }, true);
 
   function preserveViewportAnchorDuringResize() {
+    if (initialPositionPending) return;
     if (viewportPinnedToBottom) {
       scrollToPinnedBottom();
       return;
@@ -126,14 +328,31 @@
     });
   }
 
-  window.addEventListener("scroll", scheduleRememberViewportAnchor, { passive: true });
+  window.addEventListener("scroll", function (event) {
+    if (initialPositionPending && !automaticPositioning && event.isTrusted) {
+      noteUserInteraction();
+      return;
+    }
+    scheduleRememberViewportAnchor();
+    if (!initialPositionPending) rememberStoredViewport();
+  }, { passive: true });
   window.addEventListener("resize", preserveViewportAnchorAfterResize, { passive: true });
   if ("ResizeObserver" in window) {
     const timelineResizeObserver = new ResizeObserver(preserveViewportAnchorAfterResize);
-    const timeline = document.querySelector(".timeline");
     if (timeline) timelineResizeObserver.observe(timeline);
   }
-  requestAnimationFrame(rememberViewportAnchor);
+  document.addEventListener("click", function (event) {
+    const target = event.target && event.target.closest
+      ? event.target.closest("a[href^='conduit://load-older']")
+      : null;
+    if (target) rememberStoredViewport();
+  }, true);
+
+  applyInitialPosition();
+  requestAnimationFrame(function () {
+    applyInitialPosition();
+    requestAnimationFrame(commitInitialPosition);
+  });
 
   function withPreservedScroll(mutate) {
     const root = timelineRoot();
