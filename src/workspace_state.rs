@@ -322,6 +322,29 @@ impl ConversationOpenCoordinator {
         self.active.as_ref().map(|session| session.phase)
     }
 
+    pub(crate) fn active_generation_for(
+        &self,
+        channel_id: &str,
+    ) -> Option<ConversationOpenGeneration> {
+        self.active
+            .as_ref()
+            .filter(|session| session.channel_id == channel_id)
+            .map(|session| session.generation)
+    }
+
+    pub(crate) fn active_waits_for_explicit_target(&self, channel_id: &str) -> bool {
+        self.active.as_ref().is_some_and(|session| {
+            session.channel_id == channel_id
+                && session.phase == ConversationOpenPhase::Positioning
+                && matches!(session.intent, ConversationOpenIntent::Message(_))
+                && session.resolved_position.is_none()
+        })
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.active = None;
+    }
+
     pub(crate) fn resolve_position(
         &mut self,
         generation: ConversationOpenGeneration,
@@ -400,10 +423,13 @@ pub(crate) fn resolve_first_unread_message_ts(
         .collect::<Vec<_>>();
     timestamps.sort_unstable();
     if let Some(last_read) = last_read.filter(|ts| !ts.trim().is_empty()) {
-        return timestamps
-            .into_iter()
+        if let Some(timestamp) = timestamps
+            .iter()
+            .copied()
             .find(|timestamp| *timestamp > last_read)
-            .map(ToString::to_string);
+        {
+            return Some(timestamp.to_string());
+        }
     }
     if unread_count == 0 {
         return None;
@@ -1679,6 +1705,41 @@ mod tests {
         assert_eq!(
             resolve_first_unread_message_ts(&messages, None, 99).as_deref(),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn conversation_open_session_waits_for_an_explicit_target_and_rejects_other_channels() {
+        let mut coordinator = ConversationOpenCoordinator::default();
+        let generation =
+            coordinator.begin("C1", ConversationOpenIntent::Message("target".to_string()));
+
+        assert_eq!(
+            coordinator.resolve_position(generation, "C2", &[message("target", "wrong")]),
+            None
+        );
+        assert_eq!(
+            coordinator.resolve_position(generation, "C1", &[message("other", "cached")]),
+            None
+        );
+        assert_eq!(
+            coordinator.resolve_position(generation, "C1", &[message("target", "context")]),
+            Some(ConversationOpenPosition::Message("target".to_string()))
+        );
+    }
+
+    #[test]
+    fn first_unread_open_target_falls_back_to_count_when_cursor_is_outside_loaded_history() {
+        let messages = vec![
+            message("4", "four"),
+            message("3", "three"),
+            message("2", "two"),
+            message("1", "one"),
+        ];
+
+        assert_eq!(
+            resolve_first_unread_message_ts(&messages, Some("9"), 2).as_deref(),
+            Some("3")
         );
     }
 

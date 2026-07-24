@@ -84,9 +84,11 @@ use crate::socket_mode::{
 use crate::thread_catalog::ThreadCatalog;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_state::{
-    ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
-    RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle,
-    WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
+    resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
+    ConversationOpenPosition, ConversationSelectionDecision, MainMessageView, ReactionUpdate,
+    RealtimeMessageKind, RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome,
+    WorkspaceLifecycle, WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
+    WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -229,6 +231,7 @@ mod imp {
 
         pub runtime: RefCell<Option<AppRuntime>>,
         pub(super) request_coordinator: RefCell<RequestCoordinator>,
+        pub(super) conversation_opening: RefCell<ConversationOpenCoordinator>,
         pub settings: RefCell<Option<gio::Settings>>,
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
@@ -1761,25 +1764,7 @@ fn first_unread_message_ts(
     last_read: Option<&str>,
     unread_count: u64,
 ) -> Option<String> {
-    let mut timestamps = messages
-        .iter()
-        .map(|message| message.ts.as_str())
-        .filter(|ts| !ts.is_empty())
-        .collect::<Vec<_>>();
-    timestamps.sort_unstable();
-    if let Some(last_read) = last_read.filter(|ts| !ts.trim().is_empty()) {
-        return timestamps
-            .into_iter()
-            .find(|timestamp| *timestamp > last_read)
-            .map(ToString::to_string);
-    }
-    if unread_count == 0 {
-        return None;
-    }
-    let index = timestamps.len().saturating_sub(unread_count as usize);
-    timestamps
-        .get(index)
-        .map(|timestamp| (*timestamp).to_string())
+    resolve_first_unread_message_ts(messages, last_read, unread_count)
 }
 
 fn mutation_completion_reloads_visible_channel(
@@ -4792,7 +4777,7 @@ impl ConduitWindow {
         let channel_id = location.channel_id().to_string();
         let thread_ts = location.thread_ts().map(ToString::to_string);
         let title = self.conversation_title(&channel_id);
-        self.select_conversation(&channel_id, &title);
+        self.select_conversation_target(&channel_id, &title, Some(location.message_ts()));
         if let Some(thread_ts) = thread_ts.as_deref() {
             self.open_thread(&channel_id, thread_ts);
         }
@@ -5221,6 +5206,7 @@ impl ConduitWindow {
         }
         imp.huddle_revealer.set_reveal_child(false);
         imp.workspace.reset();
+        imp.conversation_opening.borrow_mut().reset();
         self.set_realtime_status(RealtimeStatus::default());
         imp.navigation_history.borrow_mut().clear();
         imp.restoring_navigation.set(false);
@@ -6970,6 +6956,15 @@ impl ConduitWindow {
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
+        self.select_conversation_target(channel_id, title, None);
+    }
+
+    fn select_conversation_target(
+        &self,
+        channel_id: &str,
+        title: &str,
+        explicit_message_ts: Option<&str>,
+    ) {
         self.record_navigation(&MainNavigationTarget::Conversation(channel_id.to_string()));
         self.flush_current_drafts();
         crate::debug::log(
@@ -6978,6 +6973,32 @@ impl ConduitWindow {
         );
         let imp = self.imp();
         self.withdraw_conversation_notification(channel_id);
+        let (has_unread, last_read, unread_count) = imp
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .map(|conversation| {
+                (
+                    conversation.has_unread_activity(),
+                    imp.local_read_ts_by_channel
+                        .borrow()
+                        .get(channel_id)
+                        .cloned()
+                        .or_else(|| conversation.last_read_ts().map(ToString::to_string)),
+                    conversation.unread_activity_count(),
+                )
+            })
+            .unwrap_or_default();
+        imp.conversation_opening.borrow_mut().begin(
+            channel_id,
+            ConversationOpenIntent::choose(
+                explicit_message_ts,
+                has_unread,
+                last_read.as_deref(),
+                unread_count,
+            ),
+        );
         let outcome = imp
             .workspace
             .view
@@ -7093,16 +7114,41 @@ impl ConduitWindow {
             context.first_unread_ts = first_unread_ts.clone();
         }
         context.timeline_scroll = scroll_behavior;
+        let opening_position = {
+            let mut opening = imp.conversation_opening.borrow_mut();
+            opening
+                .active_generation_for(channel_id)
+                .and_then(|generation| opening.resolve_position(generation, channel_id, &messages))
+        };
+        if opening_position.is_none()
+            && imp
+                .conversation_opening
+                .borrow()
+                .active_waits_for_explicit_target(channel_id)
+        {
+            self.load_message_html(&message_html::placeholder_document(
+                &gettext("Messages"),
+                &gettext("Loading message context"),
+            ));
+            return;
+        }
         let explicit_focus_ts = imp
             .workspace
             .view
             .borrow_mut()
             .take_channel_focus_for_render(channel_id, &messages);
-        let unread_focus_ts = first_unread_ts;
-        let focus_message_ts = explicit_focus_ts.or(unread_focus_ts);
-        if focus_message_ts.is_some() && has_unread {
-            context.timeline_scroll = TimelineScrollBehavior::Preserve;
-        }
+        let opening_focus_ts = match opening_position {
+            Some(ConversationOpenPosition::Latest) => {
+                context.timeline_scroll = TimelineScrollBehavior::Bottom;
+                None
+            }
+            Some(ConversationOpenPosition::Message(message_ts)) => {
+                context.timeline_scroll = TimelineScrollBehavior::Preserve;
+                Some(message_ts)
+            }
+            None => None,
+        };
+        let focus_message_ts = opening_focus_ts.or(explicit_focus_ts);
         crate::debug::log(
             "ui",
             &format!(
