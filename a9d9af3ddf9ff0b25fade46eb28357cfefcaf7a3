@@ -1,0 +1,7 @@
+Task: Define and test generation-scoped conversation open sessions and immutable semantic targets
+
+Summary: Added a pure conversation-opening coordinator with monotonic generations, semantic intent priority, pinned target resolution, stale commit rejection, and user-interaction cancellation.
+
+Files: src/workspace_state.rs; conductor/tracks.md; conductor/tracks/conversation_opening_20260724/*
+
+Rationale: Establish one testable owner for navigation intent before changing rendering and WebView behavior.
