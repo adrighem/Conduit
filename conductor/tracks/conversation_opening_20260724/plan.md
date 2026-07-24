@@ -1,6 +1,6 @@
 # Deterministic Conversation Opening Plan
 
-## Phase 1: Transactional opening and stable viewport
+## Phase 1: Transactional opening and stable viewport [checkpoint: 924f65e]
 
 - [x] Task: Define and test generation-scoped conversation open sessions and immutable semantic targets a9d9af3
 - [x] Task: Route channel selection, cached history, fresh history, unread snapshots, and explicit focus through the active opening session 70eb68e
@@ -8,4 +8,4 @@
 - [x] Task: Reconcile fresh snapshots and asynchronous metadata or asset changes without restarting opening 3e8c95f
 - [x] Task: Add adversarial Rust and WebKit regression coverage for reordered data, delayed layout, and rapid navigation 8e73cdb
 - [x] Task: Run full sanitized regression validation and synchronize architecture documentation b0e108f
-- [~] Task: Conductor - User Manual Verification 'Transactional opening and stable viewport' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Transactional opening and stable viewport' (Protocol in workflow.md) 924f65e

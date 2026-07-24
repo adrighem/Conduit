@@ -74,5 +74,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Deterministic conversation opening
+## [x] Track: Deterministic conversation opening
 *Link: [./conductor/tracks/conversation_opening_20260724/](./conductor/tracks/conversation_opening_20260724/)*
