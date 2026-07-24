@@ -1,0 +1,4 @@
+Task: Implement rich bot messages and controls
+Summary: Retained legacy attachments and bot identity, rendered common Block Kit and legacy content, centralized attachment-aware text and media handling, and added exact-message Slack handoff for callback controls.
+Files: src/models.rs; src/message_html.rs; src/rendering.rs; src/slack.rs; src/runtime.rs; src/window.rs; src/store.rs; src/workspace_pipeline.rs; README.md; docs/slack-product-surfaces-design.md; conductor/tech-stack.md
+Rationale: Make Bob/Jira-style messages readable and honestly interactive without fabricating another Slack app's callback payload.
