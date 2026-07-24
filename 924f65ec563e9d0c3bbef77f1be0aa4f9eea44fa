@@ -1,0 +1,15 @@
+Phase: Transactional opening and stable viewport
+
+Automated verification:
+- cargo fmt --check: passed
+- node --check src/timeline_dom_runtime.js: passed
+- cargo test --no-default-features: 620 passed, 2 ignored
+- cargo check --no-default-features: passed
+- Meson compile: passed
+- Meson test: 15/15 passed, including production WebKit anchoring
+- Clippy: unavailable because cargo-clippy is not installed
+- Coverage: no coverage tool is configured
+
+Manual verification:
+- Confirmed by user on 2026-07-24: opening behavior looks and feels fantastic.
+- Covers read, unread, explicit target, rapid navigation, refresh/layout stability, and older-history viewport preservation.
