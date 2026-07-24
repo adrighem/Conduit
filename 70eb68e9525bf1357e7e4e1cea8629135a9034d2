@@ -1,0 +1,7 @@
+Task: Route channel selection, cached history, fresh history, unread snapshots, and explicit focus through the active opening session
+
+Summary: Snapshot opening intent before selection, pin resolved unread targets across renders, route explicit contexts before cached paint, and centralize unread resolution.
+
+Files: src/window.rs; src/workspace_state.rs
+
+Rationale: Cached and fresh data now share one semantic destination instead of independently choosing bottom or focus.
