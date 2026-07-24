@@ -37,9 +37,14 @@
   }
 
   function visibleAnchor() {
-    return Array.from(document.querySelectorAll("[data-message-ts]")).find(function (element) {
+    const messages = Array.from(document.querySelectorAll("[data-message-ts]"));
+    const fullyEntered = messages.find(function (element) {
       const rect = element.getBoundingClientRect();
-      return rect.bottom >= 0 && rect.top <= window.innerHeight;
+      return rect.top >= 0 && rect.top <= window.innerHeight;
+    });
+    return fullyEntered || messages.find(function (element) {
+      const rect = element.getBoundingClientRect();
+      return rect.bottom > 0 && rect.top <= window.innerHeight;
     }) || null;
   }
 

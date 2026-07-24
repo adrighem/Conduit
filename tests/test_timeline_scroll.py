@@ -41,6 +41,14 @@ START_PROBE = r"""
       }
     };
 
+    await nextFrame();
+    await nextFrame();
+    const initialTarget = document.querySelector('[data-message-ts="10"]');
+    const initialFocusDelta = initialTarget.getBoundingClientRect().top +
+      initialTarget.getBoundingClientRect().height / 2 - window.innerHeight / 2;
+    const initialPending = document.querySelector(".timeline")
+      .hasAttribute("data-timeline-positioning");
+
     await waitForBottom(true);
     const initialGap = bottomGap();
 
@@ -67,14 +75,38 @@ START_PROBE = r"""
     const replacement = document.querySelector('[data-message-ts="10"]');
     const replacementTop = replacement.getBoundingClientRect().top;
 
+    replacement.scrollIntoView({ block: "start" });
+    await wait(80);
+    const snapshotAnchorTop = replacement.getBoundingClientRect().top;
+    const snapshotHtml = Array.from({ length: 24 }, (_, offset) => {
+      const index = offset;
+      return '<li><article class="message" data-message-ts="' + index +
+        '" style="min-height:' + (80 + index % 3 * 20) + 'px">Snapshot ' + index +
+        ' with changed wrapping and dimensions.</article></li>';
+    }).join("");
+    const snapshotApplied = window.conduitApplyTimelinePatch({
+      type: "replace-snapshot",
+      list_html: snapshotHtml,
+      load_more_html: '<nav class="timeline-action"><a href="conduit://load-older">Older</a></nav>'
+    });
+    await wait(100);
+    const snapshotAnchor = document.querySelector('[data-message-ts="10"]');
+    const snapshotAnchorDelta = snapshotAnchor.getBoundingClientRect().top - snapshotAnchorTop;
+
     window.timelineScrollResult = {
+      initialFocusDelta,
+      initialPending,
       initialGap,
       reflowGap,
       delayedExpansionGap,
       replaced,
       replacementText: replacement.textContent,
       replacementInlineHeight: replacement.style.height,
-      anchorDelta: replacementTop - anchorTop
+      anchorDelta: replacementTop - anchorTop,
+      snapshotApplied,
+      snapshotText: snapshotAnchor.textContent,
+      snapshotAnchorDelta,
+      snapshotLoadMore: document.querySelector(".timeline-action").textContent
     };
   })().catch((error) => {
     window.timelineScrollError = String(error && error.stack ? error.stack : error);
@@ -108,7 +140,9 @@ html, body {{ margin: 0; padding: 0; }}
 .message {{ box-sizing: border-box; display: block; min-height: 90px; padding: 12px; }}
 #delayed {{ height: 20px; }}
 </style></head><body>
-<main class="timeline"><ol class="message-list">{messages}</ol>
+<main class="timeline" data-timeline-positioning="pending"
+ data-timeline-mode="preserve" data-focus-message-ts="10"
+ data-timeline-sticky-key="test:sticky" data-timeline-anchor-key="test:anchor"><ol class="message-list">{messages}</ol>
 <div id="delayed"></div></main>
 <script>{timeline_script}</script>
 </body></html>"""
@@ -174,6 +208,8 @@ html, body {{ margin: 0; padding: 0; }}
         raise outcome["error"]  # type: ignore[misc]
     payload = outcome["payload"]
     assert isinstance(payload, dict)
+    assert abs(payload["initialFocusDelta"]) <= 2, payload
+    assert payload["initialPending"] is False, payload
     assert abs(payload["initialGap"]) <= 2, payload
     assert abs(payload["reflowGap"]) <= 2, payload
     assert abs(payload["delayedExpansionGap"]) <= 2, payload
@@ -181,6 +217,10 @@ html, body {{ margin: 0; padding: 0; }}
     assert payload["replacementText"] == "replacement", payload
     assert payload["replacementInlineHeight"] == "240px", payload
     assert abs(payload["anchorDelta"]) <= 2, payload
+    assert payload["snapshotApplied"] is True, payload
+    assert payload["snapshotText"] == "Snapshot 10 with changed wrapping and dimensions.", payload
+    assert abs(payload["snapshotAnchorDelta"]) <= 2, payload
+    assert payload["snapshotLoadMore"] == "Older", payload
 
 
 if __name__ == "__main__":
