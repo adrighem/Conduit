@@ -76,3 +76,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [x] Track: Deterministic conversation opening
 *Link: [./conductor/tracks/conversation_opening_20260724/](./conductor/tracks/conversation_opening_20260724/)*
+
+---
+
+## [~] Track: Rich bot messages and controls
+*Link: [./conductor/tracks/rich_bot_messages_20260724/](./conductor/tracks/rich_bot_messages_20260724/)*
