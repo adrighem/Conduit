@@ -51,6 +51,7 @@
 ## Presentation
 - libadwaita split views and breakpoints adapt the workspace and thread shell to narrow windows.
 - Generated message documents use semantic HTML, logical responsive CSS, locale-aware timestamps, RTL direction, and keyboard-focusable message targets.
+- Slack messages retain typed legacy attachments and bot/app identity alongside Block Kit. Safe URL controls navigate directly; Slack-owned callback controls resolve through a typed runtime command to a validated exact-message external handoff.
 - A keyed `SidebarModelDiff` reconciles stable rows in the current `GtkListBox`; migration to a virtualized `GtkListView` remains planned.
 - Conversation navigation creates a generation-scoped opening session with an immutable semantic target. One WebKit viewport controller owns initial geometry, reveals the timeline only after positioning, cancels on user interaction, and arms read observation after commit.
 - Message timelines load generated HTML documents for navigation, then reconcile cached-to-fresh snapshots and asynchronous metadata through anchor-preserving typed DOM patches. Realtime messages, response regions, user details, and loaded media use the same patch runtime; broader revision-aware batching remains planned.

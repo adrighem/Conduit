@@ -35,7 +35,8 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Multiline message and thread composers with persistent per-conversation drafts.
 - File uploads with progress reporting, including pasting clipboard screenshots directly into either composer.
 - Emoji completion after typing a colon and at least two characters, with filtered keyboard navigation in main messages and threads.
-- Edited and deleted messages, Slack links and mentions, user-group mentions, common Block Kit content, code blocks, attachments, and image and video previews.
+- Edited and deleted messages, Slack links and mentions, user-group mentions, common Block Kit and legacy bot attachments, bot identities, code blocks, and image and video previews.
+- Safe bot links open directly; callback buttons and menus open the exact originating message in Slack so the publishing app remains responsible for the interaction.
 - Workspace custom emoji in messages, reactions, composer completion, and the reusable searchable emoji picker.
 - Add and remove reactions, save messages for Later, copy message text or links, and forward messages.
 - Message authors use cached avatars with initial fallbacks. Author names and `@mentions` expose **Message** and **Profile** actions; hovering shows the person's full name when available, falling back to the display name.

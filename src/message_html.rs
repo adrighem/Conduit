@@ -10,8 +10,8 @@ use crate::emoji::{
     emoji_picker_accessible_label, EmojiCatalog, EmojiEntry, EmojiPickerModel, EmojiValue,
 };
 use crate::models::{
-    SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage, SlackUser,
-    SlackUserStatus,
+    SavedItem, SearchMatch, SearchMessageLocation, SlackAttachment, SlackAttachmentAction,
+    SlackFile, SlackMessage, SlackUser, SlackUserStatus,
 };
 
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
@@ -175,7 +175,7 @@ pub fn message_region_patch(
     let html = match region {
         TimelineMessageRegion::Body => format!(
             "<div class=\"body\" dir=\"auto\">{}</div>",
-            message_body_html(message, context)
+            message_body_html(Some(channel_id), message, context)
         ),
         TimelineMessageRegion::Attachments => attachments_html(Some(channel_id), message, context),
         TimelineMessageRegion::Responses => {
@@ -2047,7 +2047,7 @@ fn message_article(
         avatar,
         author_identity_html(message, &author, &status, context),
         metadata_html(message),
-        message_body_html(message, context)
+        message_body_html(channel_id, message, context)
     );
 
     article.push_str("<div data-message-region=\"attachments\">");
@@ -2142,10 +2142,13 @@ fn message_avatar_html(
     author: &str,
     context: &MessageHtmlContext,
 ) -> String {
-    let source = message
+    let user_avatar_url = message
         .user
         .as_ref()
         .and_then(|user_id| context.user_avatar_urls.get(user_id))
+        .map(String::as_str);
+    let source = user_avatar_url
+        .or_else(|| message.avatar_url())
         .and_then(|url| context.image_assets.get(url))
         .filter(|source| source.starts_with("data:image/"));
     if let Some(source) = source {
@@ -2218,7 +2221,7 @@ fn message_part_html(
         "<div class=\"message-part\"{}{}><div data-message-region=\"body\"><div class=\"body\" dir=\"auto\">{}</div></div>",
         message_target_attributes(Some(&message.ts)),
         message_author_attribute(message),
-        message_body_html(message, context)
+        message_body_html(channel_id, message, context)
     );
 
     part.push_str("<div data-message-region=\"attachments\">");
@@ -2311,12 +2314,24 @@ fn can_group_messages(previous: &SlackMessage, current: &SlackMessage) -> bool {
 }
 
 fn sender_key(message: &SlackMessage) -> String {
-    message
-        .user
-        .as_deref()
-        .or(message.username.as_deref())
-        .unwrap_or("Slack")
-        .to_string()
+    if let Some(user_id) = message.user.as_deref().filter(|value| !value.is_empty()) {
+        return format!("user:{user_id}");
+    }
+    if let Some(bot_id) = message.bot_id.as_deref().filter(|value| !value.is_empty()) {
+        return format!("bot:{bot_id}");
+    }
+    if let Some(app_id) = message.app_id.as_deref().filter(|value| !value.is_empty()) {
+        return format!("app:{app_id}");
+    }
+    if let Some(profile_id) = message
+        .bot_profile
+        .as_ref()
+        .and_then(|profile| profile.id.as_deref())
+        .filter(|value| !value.is_empty())
+    {
+        return format!("bot-profile:{profile_id}");
+    }
+    format!("label:{}", message.author_label())
 }
 
 fn slack_ts_seconds(ts: &str) -> Option<f64> {
@@ -2570,7 +2585,11 @@ fn current_unix_seconds() -> i64 {
         .unwrap_or_default()
 }
 
-fn message_body_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
+fn message_body_html(
+    channel_id: Option<&str>,
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+) -> String {
     if message.subtype.as_deref() == Some("message_deleted") {
         return format!(
             "<p class=\"empty-message\">{}</p>",
@@ -2579,9 +2598,12 @@ fn message_body_html(message: &SlackMessage, context: &MessageHtmlContext) -> St
     }
 
     if let Some(blocks) = message.blocks.as_ref() {
-        let rendered = blocks_html(blocks, context);
+        let rendered = blocks_html(channel_id, &message.ts, blocks, context);
         if !rendered.is_empty() {
             return rendered;
+        }
+        if message.body_text().trim().is_empty() {
+            return unsupported_message_html(channel_id, &message.ts);
         }
     }
 
@@ -2593,7 +2615,12 @@ fn message_body_html(message: &SlackMessage, context: &MessageHtmlContext) -> St
     }
 }
 
-fn blocks_html(blocks: &serde_json::Value, context: &MessageHtmlContext) -> String {
+fn blocks_html(
+    channel_id: Option<&str>,
+    message_ts: &str,
+    blocks: &serde_json::Value,
+    context: &MessageHtmlContext,
+) -> String {
     let Some(blocks) = blocks.as_array() else {
         return String::new();
     };
@@ -2605,9 +2632,35 @@ fn blocks_html(blocks: &serde_json::Value, context: &MessageHtmlContext) -> Stri
         };
 
         match kind {
+            "header" => {
+                if let Some(text) = block_text(block) {
+                    rendered.push_str(&format!(
+                        "<h3 class=\"block-header\">{}</h3>",
+                        escape_html(&text)
+                    ));
+                }
+            }
             "section" => {
                 if let Some(text) = block_text(block) {
                     rendered.push_str(&text_block_html(&text, None, context));
+                }
+                if let Some(fields) = block.get("fields").and_then(|fields| fields.as_array()) {
+                    let fields = fields
+                        .iter()
+                        .filter_map(block_text)
+                        .map(|text| text_block_html(&text, Some("block-field"), context))
+                        .collect::<String>();
+                    if !fields.is_empty() {
+                        rendered.push_str(&format!("<div class=\"block-fields\">{fields}</div>"));
+                    }
+                }
+                if let Some(accessory) = block.get("accessory") {
+                    if let Some(action) =
+                        block_action_html(channel_id, message_ts, accessory, context)
+                    {
+                        rendered
+                            .push_str(&format!("<div class=\"block-accessory\">{action}</div>"));
+                    }
                 }
             }
             "context" => {
@@ -2657,12 +2710,15 @@ fn blocks_html(blocks: &serde_json::Value, context: &MessageHtmlContext) -> Stri
                     .and_then(|elements| elements.as_array())
                     .into_iter()
                     .flatten()
-                    .filter_map(|element| block_action_html(element, context))
+                    .filter_map(|element| {
+                        block_action_html(channel_id, message_ts, element, context)
+                    })
                     .collect::<String>();
                 if !labels.is_empty() {
                     rendered.push_str(&format!("<div class=\"block-actions\">{labels}</div>"));
                 }
             }
+            "rich_text" => rendered.push_str(&rich_text_block_html(block, context)),
             _ => {}
         }
     }
@@ -2670,22 +2726,243 @@ fn blocks_html(blocks: &serde_json::Value, context: &MessageHtmlContext) -> Stri
     rendered
 }
 
-fn block_action_html(element: &serde_json::Value, context: &MessageHtmlContext) -> Option<String> {
-    let label = block_text(element)?;
-    let label = mrkdwn_to_html(&label, context);
+fn block_action_html(
+    channel_id: Option<&str>,
+    message_ts: &str,
+    element: &serde_json::Value,
+    context: &MessageHtmlContext,
+) -> Option<String> {
+    let kind = element.get("type").and_then(serde_json::Value::as_str)?;
+    let label = match kind {
+        "button" => block_text(element)?,
+        "static_select" | "multi_static_select" => element
+            .get("placeholder")
+            .and_then(block_text)
+            .unwrap_or_else(|| gettext("Choose an option")),
+        "overflow" => gettext("More actions"),
+        _ => return None,
+    };
+    let label_html = mrkdwn_to_html(&label, context);
 
-    if let Some(url) = element
-        .get("url")
-        .and_then(|url| url.as_str())
-        .filter(|url| is_http_url(url))
-    {
-        Some(format!(
-            "<a class=\"block-action\" href=\"{}\" rel=\"noreferrer noopener\">{label}</a>",
-            escape_html(url)
-        ))
-    } else {
-        Some(format!("<span class=\"block-action\">{label}</span>"))
+    if kind == "button" {
+        if let Some(url) = element.get("url").and_then(serde_json::Value::as_str) {
+            if is_http_url(url) && element.get("confirm").is_none() {
+                return Some(format!(
+                    "<a class=\"block-action\" href=\"{}\" rel=\"noreferrer noopener\">{label_html}</a>",
+                    escape_html(url)
+                ));
+            }
+            if !is_http_url(url) {
+                return Some(format!(
+                    "<span class=\"block-action is-unavailable\" aria-disabled=\"true\">{label_html}</span>"
+                ));
+            }
+        }
     }
+
+    Some(external_control_html(
+        channel_id,
+        message_ts,
+        &label,
+        &label_html,
+    ))
+}
+
+fn external_control_html(
+    channel_id: Option<&str>,
+    message_ts: &str,
+    label: &str,
+    label_html: &str,
+) -> String {
+    let accessible = gettext("Open this message in Slack to use {label}").replace("{label}", label);
+    match channel_id.filter(|channel_id| !channel_id.is_empty()) {
+        Some(channel_id) if !message_ts.is_empty() => format!(
+            "<a class=\"block-action is-external\" href=\"{}\" aria-label=\"{}\">{label_html}<span class=\"external-indicator\" aria-hidden=\"true\">↗</span></a>",
+            escape_html(&message_control_action_url(channel_id, message_ts)),
+            escape_html(&accessible)
+        ),
+        _ => format!(
+            "<span class=\"block-action is-unavailable\" aria-disabled=\"true\" title=\"{}\">{label_html}</span>",
+            escape_html(&accessible)
+        ),
+    }
+}
+
+pub fn message_control_action_url(channel_id: &str, message_ts: &str) -> String {
+    format!(
+        "conduit://message-control?channel={}&ts={}",
+        encode_query(channel_id),
+        encode_query(message_ts)
+    )
+}
+
+fn unsupported_message_html(channel_id: Option<&str>, message_ts: &str) -> String {
+    let label = gettext("Unsupported Slack message");
+    let mut html = format!("<p class=\"empty-message\">{}</p>", escape_html(&label));
+    if let Some(channel_id) = channel_id.filter(|channel_id| !channel_id.is_empty()) {
+        if !message_ts.is_empty() {
+            html.push_str(&format!(
+                "<p class=\"block-actions\"><a class=\"block-action is-external\" href=\"{}\">{}<span class=\"external-indicator\" aria-hidden=\"true\">↗</span></a></p>",
+                escape_html(&message_control_action_url(channel_id, message_ts)),
+                escape_html(&gettext("Open in Slack"))
+            ));
+        }
+    }
+    html
+}
+
+fn rich_text_block_html(block: &serde_json::Value, context: &MessageHtmlContext) -> String {
+    block
+        .get("elements")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|element| rich_text_element_html(element, context))
+        .collect()
+}
+
+fn rich_text_element_html(
+    element: &serde_json::Value,
+    context: &MessageHtmlContext,
+) -> Option<String> {
+    let kind = element.get("type").and_then(serde_json::Value::as_str)?;
+    match kind {
+        "rich_text_section" => {
+            let content = rich_text_inline_children_html(element, context);
+            (!content.is_empty()).then(|| format!("<p>{content}</p>"))
+        }
+        "rich_text_preformatted" => {
+            let content = rich_text_inline_children_html(element, context);
+            (!content.is_empty()).then(|| format!("<pre><code>{content}</code></pre>"))
+        }
+        "rich_text_quote" => {
+            let content = rich_text_inline_children_html(element, context);
+            (!content.is_empty())
+                .then(|| format!("<blockquote class=\"rich-text-quote\">{content}</blockquote>"))
+        }
+        "rich_text_list" => {
+            let tag = if element.get("style").and_then(serde_json::Value::as_str) == Some("ordered")
+            {
+                "ol"
+            } else {
+                "ul"
+            };
+            let items = element
+                .get("elements")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|item| rich_text_inline_children_html(item, context))
+                .filter(|item| !item.is_empty())
+                .map(|item| format!("<li>{item}</li>"))
+                .collect::<String>();
+            (!items.is_empty()).then(|| format!("<{tag} class=\"rich-text-list\">{items}</{tag}>"))
+        }
+        _ => None,
+    }
+}
+
+fn rich_text_inline_children_html(
+    element: &serde_json::Value,
+    context: &MessageHtmlContext,
+) -> String {
+    element
+        .get("elements")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|element| rich_text_inline_html(element, context))
+        .collect()
+}
+
+fn rich_text_inline_html(
+    element: &serde_json::Value,
+    context: &MessageHtmlContext,
+) -> Option<String> {
+    let kind = element.get("type").and_then(serde_json::Value::as_str)?;
+    let mut html = match kind {
+        "text" => escape_html(element.get("text")?.as_str()?),
+        "link" => {
+            let url = element.get("url")?.as_str()?;
+            let label = element
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(url);
+            if is_http_url(url) {
+                format!(
+                    "<a href=\"{}\" rel=\"noreferrer noopener\">{}</a>",
+                    escape_html(url),
+                    escape_html(label)
+                )
+            } else {
+                escape_html(label)
+            }
+        }
+        "user" => {
+            let user_id = element.get("user_id")?.as_str()?;
+            let name = context
+                .user_names
+                .get(user_id)
+                .map(String::as_str)
+                .unwrap_or(user_id);
+            let tooltip = context
+                .user_full_names
+                .get(user_id)
+                .map(String::as_str)
+                .unwrap_or(name);
+            mention_actions_html(user_id, name, tooltip)
+        }
+        "channel" => {
+            let channel_id = element.get("channel_id")?.as_str()?;
+            let name = context
+                .conversation_titles
+                .get(channel_id)
+                .map(String::as_str)
+                .unwrap_or(channel_id);
+            format!(
+                "<a class=\"channel-reference\" href=\"{}\">#{}</a>",
+                escape_html(&channel_action_url(channel_id)),
+                escape_html(name)
+            )
+        }
+        "emoji" => {
+            let name = element.get("name")?.as_str()?;
+            mrkdwn_to_html(&format!(":{name}:"), context)
+        }
+        _ => return None,
+    };
+
+    if let Some(style) = element.get("style") {
+        if style
+            .get("code")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            html = format!("<code>{html}</code>");
+        }
+        if style
+            .get("bold")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            html = format!("<strong>{html}</strong>");
+        }
+        if style
+            .get("italic")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            html = format!("<em>{html}</em>");
+        }
+        if style
+            .get("strike")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            html = format!("<s>{html}</s>");
+        }
+    }
+    Some(html)
 }
 
 fn block_text(value: &serde_json::Value) -> Option<String> {
@@ -2718,53 +2995,236 @@ fn attachments_html(
     message: &SlackMessage,
     context: &MessageHtmlContext,
 ) -> String {
-    let Some(files) = message.files.as_ref().filter(|files| !files.is_empty()) else {
-        return String::new();
-    };
-
-    let attachments = files
+    let mut attachments = message
+        .attachments
+        .as_deref()
+        .unwrap_or_default()
         .iter()
-        .map(|file| {
-            let label = file.display_title();
-            if let (Some(channel_id), Some(kind), Some(url)) =
-                (channel_id, file.supported_media_kind(), file.media_url())
-            {
-                let viewer_url = media_action_url(channel_id, &message.ts, url, label, kind);
-                if kind == "image" {
-                    let preview_url = file.preview_url().unwrap_or(url);
-                    return image_figure_html(
-                        preview_url,
-                        Some(&viewer_url),
-                        label,
-                        Some(label),
-                        context,
-                    );
-                }
-                if kind == "video" {
-                    if let Some(poster_url) = file.video_preview_url() {
-                        return video_figure_html(poster_url, &viewer_url, label, context);
+        .filter(|attachment| attachment.has_visible_content())
+        .map(|attachment| legacy_attachment_html(channel_id, &message.ts, attachment, context))
+        .collect::<Vec<_>>();
+    attachments.extend(
+        message
+            .files
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|file| {
+                let label = file.display_title();
+                if let (Some(channel_id), Some(kind), Some(url)) =
+                    (channel_id, file.supported_media_kind(), file.media_url())
+                {
+                    let viewer_url = media_action_url(channel_id, &message.ts, url, label, kind);
+                    if kind == "image" {
+                        let preview_url = file.preview_url().unwrap_or(url);
+                        return image_figure_html(
+                            preview_url,
+                            Some(&viewer_url),
+                            label,
+                            Some(label),
+                            context,
+                        );
+                    }
+                    if kind == "video" {
+                        if let Some(poster_url) = file.video_preview_url() {
+                            return video_figure_html(poster_url, &viewer_url, label, context);
+                        }
+                        return attachment_chip_html(label, Some(&viewer_url));
                     }
                     return attachment_chip_html(label, Some(&viewer_url));
                 }
-                return attachment_chip_html(label, Some(&viewer_url));
-            }
 
-            let download_url = file
-                .download_url()
-                .filter(|url| is_http_url(url))
-                .map(|url| {
-                    let filename = file
-                        .name
-                        .as_deref()
-                        .filter(|name| !name.trim().is_empty())
-                        .unwrap_or(label);
-                    attachment_action_url(url, filename)
-                });
-            attachment_chip_html(label, download_url.as_deref())
+                let download_url = file
+                    .download_url()
+                    .filter(|url| is_http_url(url))
+                    .map(|url| {
+                        let filename = file
+                            .name
+                            .as_deref()
+                            .filter(|name| !name.trim().is_empty())
+                            .unwrap_or(label);
+                        attachment_action_url(url, filename)
+                    });
+                attachment_chip_html(label, download_url.as_deref())
+            }),
+    );
+
+    if attachments.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"attachments\">{}</div>", attachments.concat())
+    }
+}
+
+fn legacy_attachment_html(
+    channel_id: Option<&str>,
+    message_ts: &str,
+    attachment: &SlackAttachment,
+    context: &MessageHtmlContext,
+) -> String {
+    let mut content = String::new();
+    for (text, class_name) in [
+        (attachment.pretext.as_deref(), "attachment-pretext"),
+        (attachment.text.as_deref(), "attachment-text"),
+    ] {
+        if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+            content.push_str(&text_block_html(text, Some(class_name), context));
+        }
+    }
+    if let Some(author) = attachment
+        .author_name
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        content.push_str(&linked_attachment_label_html(
+            "attachment-author",
+            author,
+            attachment.author_link.as_deref(),
+        ));
+    }
+    if let Some(title) = attachment
+        .title
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        content.push_str(&linked_attachment_label_html(
+            "attachment-title",
+            title,
+            attachment.title_link.as_deref(),
+        ));
+    }
+    let fields = attachment
+        .fields
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|field| {
+            let title = field
+                .title
+                .as_deref()
+                .filter(|text| !text.trim().is_empty());
+            let value = field
+                .value
+                .as_deref()
+                .filter(|text| !text.trim().is_empty());
+            match (title, value) {
+                (Some(title), Some(value)) => Some(format!(
+                    "<div class=\"attachment-field\"><strong>{}</strong>{}</div>",
+                    escape_html(title),
+                    text_block_html(value, None, context)
+                )),
+                (Some(title), None) => Some(format!(
+                    "<div class=\"attachment-field\"><strong>{}</strong></div>",
+                    escape_html(title)
+                )),
+                (None, Some(value)) => Some(format!(
+                    "<div class=\"attachment-field\">{}</div>",
+                    text_block_html(value, None, context)
+                )),
+                (None, None) => None,
+            }
         })
         .collect::<String>();
+    if !fields.is_empty() {
+        content.push_str(&format!("<div class=\"attachment-fields\">{fields}</div>"));
+    }
+    if content.is_empty() {
+        if let Some(fallback) = attachment
+            .fallback
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            content.push_str(&text_block_html(
+                fallback,
+                Some("attachment-fallback"),
+                context,
+            ));
+        }
+    }
+    if let Some(url) = attachment
+        .image_url
+        .as_deref()
+        .or(attachment.thumb_url.as_deref())
+        .filter(|url| is_http_url(url))
+    {
+        let alt = attachment
+            .title
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .or(attachment.fallback.as_deref())
+            .unwrap_or("Attachment image");
+        content.push_str(&image_figure_html(
+            url,
+            Some(url),
+            alt,
+            attachment.title.as_deref(),
+            context,
+        ));
+    }
+    let actions = attachment
+        .actions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|action| legacy_attachment_action_html(channel_id, message_ts, action, context))
+        .collect::<String>();
+    if !actions.is_empty() {
+        content.push_str(&format!("<div class=\"block-actions\">{actions}</div>"));
+    }
+    if let Some(footer) = attachment
+        .footer
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        content.push_str(&format!(
+            "<p class=\"attachment-footer\">{}</p>",
+            escape_html(footer)
+        ));
+    }
+    format!("<section class=\"legacy-attachment\">{content}</section>")
+}
 
-    format!("<div class=\"attachments\">{attachments}</div>")
+fn linked_attachment_label_html(class_name: &str, label: &str, url: Option<&str>) -> String {
+    let label = escape_html(label);
+    let label = url
+        .filter(|url| is_http_url(url))
+        .map(|url| {
+            format!(
+                "<a href=\"{}\" rel=\"noreferrer noopener\">{label}</a>",
+                escape_html(url)
+            )
+        })
+        .unwrap_or(label);
+    format!("<p class=\"{class_name}\">{label}</p>")
+}
+
+fn legacy_attachment_action_html(
+    channel_id: Option<&str>,
+    message_ts: &str,
+    action: &SlackAttachmentAction,
+    context: &MessageHtmlContext,
+) -> Option<String> {
+    let label = action.label()?.to_string();
+    let label_html = mrkdwn_to_html(&label, context);
+    if let Some(url) = action.url.as_deref() {
+        if is_http_url(url) && action.confirm.is_none() {
+            return Some(format!(
+                "<a class=\"block-action\" href=\"{}\" rel=\"noreferrer noopener\">{label_html}</a>",
+                escape_html(url)
+            ));
+        }
+        if !is_http_url(url) {
+            return Some(format!(
+                "<span class=\"block-action is-unavailable\" aria-disabled=\"true\">{label_html}</span>"
+            ));
+        }
+    }
+    Some(external_control_html(
+        channel_id,
+        message_ts,
+        &label,
+        &label_html,
+    ))
 }
 
 pub fn media_action_url(channel_id: &str, ts: &str, url: &str, name: &str, kind: &str) -> String {
@@ -4429,6 +4889,32 @@ mod tests {
     }
 
     #[test]
+    fn does_not_group_different_bots_with_generic_names() {
+        let messages = vec![
+            SlackMessage {
+                bot_id: Some("B2".to_string()),
+                ts: "1710000001.000000".to_string(),
+                text: Some("second".to_string()),
+                ..Default::default()
+            },
+            SlackMessage {
+                bot_id: Some("B1".to_string()),
+                ts: "1710000000.000000".to_string(),
+                text: Some("first".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let html = conversation_document("C123", &messages, &MessageHtmlContext::default());
+
+        assert_eq!(
+            html.matches("<article class=\"message message-group\"")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn renders_code_blocks_as_escaped_preformatted_html() {
         let html = conversation_document(
             "C123",
@@ -4471,9 +4957,170 @@ mod tests {
         assert!(html
             .contains("<a class=\"block-action\" href=\"https://example.slack.com/canvas/C123\""));
         assert!(html.contains(">Open canvas</a>"));
-        assert!(html.contains("<span class=\"block-action\">Callback only</span>"));
-        assert!(html.contains("<span class=\"block-action\">Unsafe</span>"));
+        assert!(html
+            .contains("href=\"conduit://message-control?channel=C123&amp;ts=1710000000.000100\""));
+        assert!(html.contains("Callback only<span class=\"external-indicator\""));
+        assert!(html.contains(
+            "<span class=\"block-action is-unavailable\" aria-disabled=\"true\">Unsafe</span>"
+        ));
         assert!(!html.contains("javascript:alert"));
+    }
+
+    #[test]
+    fn renders_bot_identity_and_legacy_attachment_without_exposing_callback_data() {
+        let avatar_url = "https://cdn.example.test/bot.png";
+        let image_url = "https://cdn.example.test/request.png";
+        let mut message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000000.000100",
+            "bot_profile": {
+                "name": "People assistant",
+                "icons": { "image_72": avatar_url }
+            },
+            "attachments": [{
+                "pretext": "A request needs review",
+                "title": "Review request",
+                "text": "Choose an outcome",
+                "fields": [{ "title": "Employee", "value": "Example Person", "short": true }],
+                "image_url": image_url,
+                "callback_id": "private-callback",
+                "actions": [{
+                    "type": "button",
+                    "text": "Approve",
+                    "name": "decision",
+                    "value": "private-approval-value"
+                }]
+            }]
+        }))
+        .unwrap();
+        message.text = None;
+        let context = MessageHtmlContext {
+            image_assets: HashMap::from([
+                (
+                    avatar_url.to_string(),
+                    "data:image/png;base64,avatar".to_string(),
+                ),
+                (
+                    image_url.to_string(),
+                    "data:image/png;base64,request".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message], &context);
+
+        assert!(html.contains("People assistant"));
+        assert!(html.contains("data:image/png;base64,avatar"));
+        assert!(html.contains("A request needs review"));
+        assert!(html.contains("Review request"));
+        assert!(html.contains("Example Person"));
+        assert!(html.contains("data:image/png;base64,request"));
+        assert!(html.contains("Approve"));
+        assert!(html.contains("conduit://message-control?channel=C123&amp;ts=1710000000.000100"));
+        assert!(!html.contains("private-callback"));
+        assert!(!html.contains("private-approval-value"));
+    }
+
+    #[test]
+    fn renders_jira_like_blocks_with_safe_and_external_controls() {
+        let mut message = message("");
+        message.blocks = Some(serde_json::json!([
+            {
+                "type": "header",
+                "text": { "type": "plain_text", "text": "Issue updated" }
+            },
+            {
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [
+                        { "type": "text", "text": "Status: ", "style": { "bold": true } },
+                        { "type": "link", "url": "https://issues.example.test/ABC-1", "text": "ABC-1" }
+                    ]
+                }]
+            },
+            {
+                "type": "section",
+                "fields": [
+                    { "type": "mrkdwn", "text": "*Priority*\nHigh" },
+                    { "type": "mrkdwn", "text": "*Owner*\nExample User" }
+                ]
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Open issue" },
+                        "url": "https://issues.example.test/ABC-1"
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Assign" },
+                        "action_id": "private-action",
+                        "value": "private-value"
+                    },
+                    {
+                        "type": "static_select",
+                        "placeholder": { "type": "plain_text", "text": "Set status" },
+                        "action_id": "private-select",
+                        "options": [{
+                            "text": { "type": "plain_text", "text": "Done" },
+                            "value": "private-option"
+                        }]
+                    },
+                    {
+                        "type": "overflow",
+                        "action_id": "private-overflow",
+                        "options": [{
+                            "text": { "type": "plain_text", "text": "Delete" },
+                            "value": "private-delete"
+                        }]
+                    }
+                ]
+            }
+        ]));
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        for content in [
+            "Issue updated",
+            "Status:",
+            "ABC-1",
+            "Priority",
+            "High",
+            "Owner",
+            "Open issue",
+            "Assign",
+            "Set status",
+            "More actions",
+        ] {
+            assert!(html.contains(content), "missing {content}");
+        }
+        assert!(html.contains("href=\"https://issues.example.test/ABC-1\""));
+        assert_eq!(html.matches("conduit://message-control?").count(), 3);
+        for private in [
+            "private-action",
+            "private-value",
+            "private-select",
+            "private-option",
+            "private-overflow",
+            "private-delete",
+        ] {
+            assert!(!html.contains(private), "exposed {private}");
+        }
+    }
+
+    #[test]
+    fn unsupported_structured_message_has_a_nonblank_handoff_fallback() {
+        let mut message = message("");
+        message.blocks = Some(serde_json::json!([{ "type": "future_widget" }]));
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains("Unsupported Slack message"));
+        assert!(html.contains("Open in Slack"));
+        assert!(html.contains("conduit://message-control?channel=C123&amp;ts=1710000000.000100"));
     }
 
     #[test]

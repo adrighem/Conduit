@@ -10,13 +10,14 @@ Huddles use a narrower hybrid boundary. Conduit can safely provide supported dis
 
 ## Current Slice
 
-This slice improves thin affordances for advanced surfaces:
+This slice provides honest affordances for advanced surfaces:
 
 - Block Kit action elements with URLs render as clickable action chips instead of inert labels.
 - The existing external link handler opens those URLs in the user's browser or Slack-capable handler.
-- Non-URL Block Kit actions remain non-interactive labels because Conduit does not implement Slack interactivity callbacks.
+- Block Kit and legacy attachment callback controls retain their labels and shape, then open the exact originating message in Slack through `chat.getPermalink`.
+- Slack remains responsible for confirmations, option loading, authorization, callback delivery, and message updates.
 
-This helps messages that contain workflow buttons, canvas/list links, or other Slack-hosted deep links without adding native editors or callback infrastructure.
+This keeps workflow buttons, menus, canvas/list links, and other Slack-hosted controls understandable and usable without fabricating another app's interaction payload.
 
 ## Boundary
 
@@ -40,6 +41,7 @@ The following remains out of scope unless Slack provides stable lightweight APIs
 The implementation should keep unit coverage for:
 
 - Block Kit action URL rendering.
-- Existing non-URL action labels.
+- Non-URL action exact-message handoff.
+- Legacy attachment content, bot identity, and callback-data redaction.
 - External link safety checks.
 - Huddle discovery scoping, capability gating, and exact HTTPS fallback construction.

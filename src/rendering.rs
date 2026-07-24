@@ -6,7 +6,7 @@ pub fn extract_user_ids(message: &SlackMessage) -> Vec<String> {
     if let Some(user) = message.user.as_ref() {
         ids.push(user.clone());
     }
-    extract_mentions(&message.body_text(), &mut ids);
+    extract_mentions(&message.visible_text(), &mut ids);
     ids.extend(
         message
             .reactions
@@ -80,6 +80,19 @@ mod tests {
             extract_user_ids(&message),
             vec!["U123".to_string(), "U456".to_string(), "U999".to_string()]
         );
+    }
+
+    #[test]
+    fn extracts_mentions_from_attachment_only_messages() {
+        let message = SlackMessage {
+            attachments: Some(vec![crate::models::SlackAttachment {
+                text: Some("Review this with <@U999>".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        assert_eq!(extract_user_ids(&message), vec!["U999".to_string()]);
     }
 
     #[test]

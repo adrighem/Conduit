@@ -945,11 +945,8 @@ fn message_notification_body(
     message: Option<&SlackMessage>,
     user_names: &HashMap<String, String>,
 ) -> Option<String> {
-    let text = message
-        .and_then(|message| message.text.as_deref())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .unwrap_or_default();
+    let visible_text = message.map(SlackMessage::visible_text).unwrap_or_default();
+    let text = visible_text.trim();
     if text.is_empty() {
         Some(gettext("New message"))
     } else {
@@ -972,15 +969,7 @@ fn message_notification_content(
         .user
         .as_deref()
         .and_then(|user_id| user_names.get(user_id).cloned())
-        .or_else(|| {
-            message
-                .username
-                .as_deref()
-                .map(str::trim)
-                .filter(|username| !username.is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| message.user.is_none().then(|| gettext("Slack")))?;
+        .or_else(|| message.user.is_none().then(|| message.author_label()))?;
     Some((conversation_title.to_string(), format!("{sender}: {body}")))
 }
 
@@ -1306,6 +1295,9 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
         (RuntimeOperation::AttachmentDownload, RuntimeTarget::Attachment(_)) => {
             RuntimeFailureRecovery::Attachment
         }
+        (RuntimeOperation::MessagePermalink, RuntimeTarget::ExactMessage { .. }) => {
+            RuntimeFailureRecovery::NonDisruptive
+        }
         (
             RuntimeOperation::PostMessage,
             RuntimeTarget::Message {
@@ -1570,6 +1562,16 @@ fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
     Some((url.to_string(), url.to_string()))
 }
 
+fn attachment_image_asset_request(
+    attachment: &crate::models::SlackAttachment,
+) -> Option<(String, String)> {
+    let url = attachment
+        .image_url
+        .as_deref()
+        .or(attachment.thumb_url.as_deref())?;
+    Some((url.to_string(), url.to_string()))
+}
+
 fn message_image_asset_requests<'a>(
     messages: impl IntoIterator<Item = &'a SlackMessage>,
     avatar_urls: &HashMap<String, String>,
@@ -1584,12 +1586,22 @@ fn message_image_asset_requests<'a>(
                 .flatten()
                 .filter_map(image_asset_request),
         );
+        requests.extend(
+            message
+                .attachments
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter_map(attachment_image_asset_request),
+        );
         if let Some(url) = message
             .user
             .as_ref()
             .and_then(|user_id| avatar_urls.get(user_id))
+            .map(String::as_str)
+            .or_else(|| message.avatar_url())
         {
-            requests.push((url.clone(), url.clone()));
+            requests.push((url.to_string(), url.to_string()));
         }
     }
     requests.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1598,11 +1610,23 @@ fn message_image_asset_requests<'a>(
 }
 
 fn messages_use_image_asset(messages: &[SlackMessage], key: &str) -> bool {
-    messages
-        .iter()
-        .flat_map(|message| message.files.as_ref().into_iter().flatten())
-        .filter_map(image_asset_request)
-        .any(|(candidate, _)| candidate == key)
+    messages.iter().any(|message| {
+        message.avatar_url() == Some(key)
+            || message
+                .files
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter_map(image_asset_request)
+                .any(|(candidate, _)| candidate == key)
+            || message
+                .attachments
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter_map(attachment_image_asset_request)
+                .any(|(candidate, _)| candidate == key)
+    })
 }
 
 fn messages_use_user(messages: &[SlackMessage], user_id: &str) -> bool {
@@ -1666,31 +1690,7 @@ fn create_cache_directory(path: &Path) {
 }
 
 fn message_permalink(workspace_url: &str, channel_id: &str, ts: &str) -> Option<String> {
-    let ts = slack_permalink_ts(ts)?;
-    Some(format!(
-        "{}/archives/{}/p{}",
-        workspace_url.trim_end_matches('/'),
-        channel_id,
-        ts
-    ))
-}
-
-fn slack_permalink_ts(ts: &str) -> Option<String> {
-    let (seconds, fraction) = ts.split_once('.')?;
-    if seconds.is_empty() || !seconds.chars().all(|character| character.is_ascii_digit()) {
-        return None;
-    }
-
-    let mut fraction = fraction
-        .chars()
-        .take(6)
-        .filter(|character| character.is_ascii_digit())
-        .collect::<String>();
-    while fraction.len() < 6 {
-        fraction.push('0');
-    }
-
-    Some(format!("{seconds}{fraction}"))
+    crate::slack::constructed_message_permalink(workspace_url, channel_id, ts)
 }
 
 fn slack_timestamp_from_permalink(value: &str) -> Option<String> {
@@ -3922,6 +3922,14 @@ impl ConduitWindow {
                     Err(error) => self.set_status(&format!("Could not open {name}: {error}")),
                 }
             }
+            RuntimeEventKind::MessagePermalinkResolved { permalink, .. } => {
+                match open::that(&permalink) {
+                    Ok(()) => self.set_status("Opened in Slack to complete the action"),
+                    Err(error) => {
+                        self.set_status(&format!("Failed to open message in Slack: {error}"))
+                    }
+                }
+            }
             RuntimeEventKind::MessagePosted {
                 channel_id,
                 message,
@@ -4879,6 +4887,19 @@ impl ConduitWindow {
                 self.open_thread(&channel_id, &ts);
                 true
             }
+            Some("message-control") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    self.set_status("Message action is no longer available");
+                    return true;
+                };
+                let Some(ts) = query_param(url, "ts") else {
+                    self.set_status("Message action is no longer available");
+                    return true;
+                };
+                self.set_status("Opening message in Slack");
+                self.send_command(RuntimeCommand::ResolveMessagePermalink { channel_id, ts });
+                true
+            }
             Some("mark-read") => {
                 let Some(channel_id) = query_param(url, "channel") else {
                     return true;
@@ -5121,7 +5142,7 @@ impl ConduitWindow {
             return;
         };
 
-        let text = message.body_text();
+        let text = message.visible_text();
         if text.trim().is_empty() {
             self.set_status("Message has no text to copy");
             return;
@@ -8033,10 +8054,7 @@ impl ConduitWindow {
             .as_ref()
             .map(attention_settings::load)
             .is_some_and(|preferences| {
-                decision.remains_notification_relevant(
-                    message.text.as_deref().unwrap_or_default(),
-                    &preferences,
-                )
+                decision.remains_notification_relevant(&message.visible_text(), &preferences)
             });
         if !remains_relevant {
             return;
@@ -8145,7 +8163,7 @@ impl ConduitWindow {
             );
             if !current_preferences.as_ref().is_some_and(|preferences| {
                 notification.decision.remains_notification_relevant(
-                    notification.message.text.as_deref().unwrap_or_default(),
+                    &notification.message.visible_text(),
                     preferences,
                 )
             }) {
@@ -8623,19 +8641,10 @@ impl ConduitWindow {
         thread_ts: Option<&str>,
         message: &SlackMessage,
     ) -> MessageHtmlContext {
-        let image_keys = message
-            .files
-            .as_ref()
+        let avatar_urls = self.imp().user_avatar_urls.borrow().clone();
+        let image_keys = message_image_asset_requests([message], &avatar_urls)
             .into_iter()
-            .flatten()
-            .filter_map(image_asset_request)
             .map(|(key, _)| key)
-            .chain(
-                message
-                    .user
-                    .as_ref()
-                    .and_then(|user_id| self.imp().user_avatar_urls.borrow().get(user_id).cloned()),
-            )
             .collect::<HashSet<_>>();
         self.message_html_context_with_image_keys(thread_ts, Some(&image_keys))
     }
@@ -9855,6 +9864,26 @@ mod tests {
     }
 
     #[test]
+    fn notification_body_uses_attachment_text() {
+        let message = SlackMessage {
+            attachments: Some(vec![crate::models::SlackAttachment {
+                text: Some("Review with <@U123>".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            message_notification_body(
+                Some(&message),
+                &HashMap::from([("U123".to_string(), "Ada".to_string())]),
+            )
+            .as_deref(),
+            Some("Review with @Ada")
+        );
+    }
+
+    #[test]
     fn channel_notification_content_waits_for_and_includes_sender_display_name() {
         let mut incoming = message("1710000200.000000", "Hello <@U789>");
         incoming.user = Some("U456".into());
@@ -10391,5 +10420,33 @@ mod tests {
         );
 
         assert_eq!(requests, vec![(avatar_url.clone(), avatar_url)]);
+    }
+
+    #[test]
+    fn message_image_requests_include_bot_and_attachment_images() {
+        let bot_avatar = "https://avatars.slack-edge.com/bot.png".to_string();
+        let attachment_image = "https://files.slack.com/request.png".to_string();
+        let messages = [SlackMessage {
+            bot_profile: Some(crate::models::SlackBotProfile {
+                icons: Some(crate::models::SlackIcons {
+                    image_72: Some(bot_avatar.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            attachments: Some(vec![crate::models::SlackAttachment {
+                image_url: Some(attachment_image.clone()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            message_image_asset_requests(&messages, &HashMap::new()),
+            vec![
+                (bot_avatar.clone(), bot_avatar),
+                (attachment_image.clone(), attachment_image),
+            ]
+        );
     }
 }

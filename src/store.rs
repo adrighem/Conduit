@@ -3371,6 +3371,53 @@ mod tests {
     }
 
     #[test]
+    fn workspace_store_round_trips_rich_bot_message_fields() {
+        let directory = temp_cache_dir("rich-bot-history");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let message = SlackMessage {
+            ts: "1710000000.000200".to_string(),
+            bot_id: Some("B123".to_string()),
+            app_id: Some("A123".to_string()),
+            bot_profile: Some(crate::models::SlackBotProfile {
+                name: Some("People assistant".to_string()),
+                icons: Some(crate::models::SlackIcons {
+                    image_72: Some("https://cdn.example/bot.png".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            attachments: Some(vec![crate::models::SlackAttachment {
+                fallback: Some("Review this request in Slack".to_string()),
+                title: Some("Review request".to_string()),
+                actions: Some(vec![crate::models::SlackAttachmentAction {
+                    name: Some("decision".to_string()),
+                    text: Some("Approve".to_string()),
+                    kind: Some("button".to_string()),
+                    value: Some("test-action-value".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        runtime().block_on(async {
+            store
+                .store_history("C123", std::slice::from_ref(&message))
+                .await
+                .expect("rich history store failed");
+            let restored = store
+                .load_history("C123")
+                .await
+                .expect("rich history load failed")
+                .expect("missing rich history");
+            assert_eq!(restored, vec![message]);
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn focused_repository_reads_ignore_malformed_unrelated_domains() {
         let directory = temp_cache_dir("workspace-focused-reads");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");

@@ -1235,24 +1235,14 @@ impl WorkspaceCoordinator {
                 .as_deref()
                 .zip(current_user_id)
                 .is_some_and(|(author, current)| author == current);
-        let has_content = message
-            .text
-            .as_deref()
-            .is_some_and(|text| !text.trim().is_empty())
-            || message
-                .files
-                .as_ref()
-                .is_some_and(|files| !files.is_empty())
-            || message
-                .blocks
-                .as_ref()
-                .is_some_and(|blocks| !blocks.is_null());
+        let has_content = message.has_visible_content();
+        let visible_text = message.visible_text();
         // Window focus/navigation is delivered on a separate async lane from
         // realtime events. Keep it as a last-mile blocker so an older context
         // cannot permanently suppress an otherwise relevant notification.
         let actively_reading = false;
         let candidate = AttentionCandidate {
-            text: message.text.as_deref().unwrap_or_default(),
+            text: &visible_text,
             subtype: message.subtype.as_deref(),
             mutation: match kind {
                 MessageMutationKind::Posted => MessageMutation::Posted,

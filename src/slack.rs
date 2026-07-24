@@ -83,6 +83,90 @@ fn next_client_message_id() -> String {
 
 pub type Result<T> = std::result::Result<T, SlackError>;
 
+pub(crate) fn constructed_message_permalink(
+    workspace_url: &str,
+    channel_id: &str,
+    message_ts: &str,
+) -> Option<String> {
+    if channel_id.is_empty()
+        || !channel_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let permalink_ts = permalink_timestamp(message_ts)?;
+    let mut workspace = url::Url::parse(workspace_url).ok()?;
+    if workspace.scheme() != "https"
+        || !workspace.username().is_empty()
+        || workspace.password().is_some()
+        || !workspace.host_str()?.ends_with(".slack.com")
+    {
+        return None;
+    }
+    workspace.set_path(&format!("/archives/{channel_id}/p{permalink_ts}"));
+    workspace.set_query(None);
+    workspace.set_fragment(None);
+    Some(workspace.into())
+}
+
+pub(crate) fn validated_message_permalink(
+    permalink: &str,
+    workspace_url: &str,
+    channel_id: &str,
+    message_ts: &str,
+) -> Option<String> {
+    let expected = url::Url::parse(&constructed_message_permalink(
+        workspace_url,
+        channel_id,
+        message_ts,
+    )?)
+    .ok()?;
+    let candidate = url::Url::parse(permalink).ok()?;
+    if candidate.scheme() != "https"
+        || !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || candidate.host_str()? != expected.host_str()?
+        || candidate.port_or_known_default() != expected.port_or_known_default()
+        || candidate.path() != expected.path()
+        || candidate.fragment().is_some()
+        || !valid_message_permalink_query(&candidate, channel_id)
+    {
+        return None;
+    }
+    Some(candidate.into())
+}
+
+fn valid_message_permalink_query(candidate: &url::Url, channel_id: &str) -> bool {
+    let mut thread_ts = None;
+    let mut cid = None;
+    for (key, value) in candidate.query_pairs() {
+        match key.as_ref() {
+            "thread_ts" if thread_ts.is_none() && permalink_timestamp(&value).is_some() => {
+                thread_ts = Some(value);
+            }
+            "cid" if cid.is_none() && value == channel_id => {
+                cid = Some(value);
+            }
+            _ => return false,
+        }
+    }
+    thread_ts.is_some() == cid.is_some()
+}
+
+fn permalink_timestamp(timestamp: &str) -> Option<String> {
+    let (seconds, fraction) = timestamp.split_once('.')?;
+    if seconds.is_empty()
+        || fraction.is_empty()
+        || fraction.len() > 6
+        || !seconds.chars().all(|character| character.is_ascii_digit())
+        || !fraction.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("{seconds}{fraction:0<6}"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlackErrorCategory {
     Authentication,
@@ -1046,6 +1130,21 @@ impl SlackApi {
         let mut message = response.message;
         message.client_msg_id.get_or_insert(client_msg_id);
         Ok(message)
+    }
+
+    pub async fn message_permalink(&self, channel_id: &str, message_ts: &str) -> Result<String> {
+        let response: MessagePermalinkResponse = self
+            .post_form(
+                "chat.getPermalink",
+                &[
+                    ("channel", channel_id.to_string()),
+                    ("message_ts", message_ts.to_string()),
+                ],
+            )
+            .await?;
+        response
+            .permalink
+            .ok_or_else(|| SlackError::validation("Slack did not return a message permalink"))
     }
 
     pub async fn set_reaction(
@@ -2190,6 +2289,14 @@ struct PostMessageResponse {
 impl_slack_response!(PostMessageResponse);
 
 #[derive(Debug, Deserialize)]
+struct MessagePermalinkResponse {
+    ok: bool,
+    error: Option<String>,
+    permalink: Option<String>,
+}
+impl_slack_response!(MessagePermalinkResponse);
+
+#[derive(Debug, Deserialize)]
 struct BasicResponse {
     ok: bool,
     error: Option<String>,
@@ -2286,6 +2393,109 @@ mod tests {
             first.chars().filter(|character| *character == '-').count(),
             4
         );
+    }
+
+    #[test]
+    fn message_permalink_uses_chat_get_permalink_with_exact_message() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"permalink":"https://example.slack.com/archives/C123/p1710000000000100"}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            let form = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>();
+            (path, form)
+        });
+
+        let mut api = SlackApi::new(browser_test_token(None));
+        api.api_base_url = format!("http://{address}/api");
+        let permalink = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.message_permalink("C123", "1710000000.000100"))
+            .expect("message permalink should resolve");
+
+        assert_eq!(
+            permalink,
+            "https://example.slack.com/archives/C123/p1710000000000100"
+        );
+        let (path, form) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/chat.getPermalink");
+        assert_eq!(
+            form.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from(["channel".to_string(), "message_ts".to_string()])
+        );
+        assert_eq!(form.get("channel").map(String::as_str), Some("C123"));
+        assert_eq!(
+            form.get("message_ts").map(String::as_str),
+            Some("1710000000.000100")
+        );
+    }
+
+    #[test]
+    fn message_permalink_validation_is_exact_and_workspace_scoped() {
+        let workspace = "https://example.slack.com/";
+        let expected = "https://example.slack.com/archives/C123/p1710000000000100";
+
+        assert_eq!(
+            constructed_message_permalink(workspace, "C123", "1710000000.0001").as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            validated_message_permalink(
+                &format!("{expected}?thread_ts=1710000000.000000&cid=C123"),
+                workspace,
+                "C123",
+                "1710000000.000100",
+            )
+            .as_deref(),
+            Some(
+                "https://example.slack.com/archives/C123/p1710000000000100?thread_ts=1710000000.000000&cid=C123"
+            )
+        );
+
+        for invalid in [
+            "http://example.slack.com/archives/C123/p1710000000000100",
+            "https://other.slack.com/archives/C123/p1710000000000100",
+            "https://example.slack.com/archives/C999/p1710000000000100",
+            "https://example.slack.com/archives/C123/p1710000000000200",
+            "https://example.slack.com/archives/C123/p1710000000000100#fragment",
+            "https://example.slack.com/archives/C123/p1710000000000100?token=secret",
+            "https://example.slack.com/archives/C123/p1710000000000100?cid=C999",
+            "https://example.slack.com/archives/C123/p1710000000000100?thread_ts=bad&cid=C123",
+        ] {
+            assert!(
+                validated_message_permalink(invalid, workspace, "C123", "1710000000.000100")
+                    .is_none(),
+                "{invalid} should be rejected"
+            );
+        }
+        assert!(
+            constructed_message_permalink(workspace, "C123/path", "1710000000.000100").is_none()
+        );
+        assert!(constructed_message_permalink(workspace, "C123", "1710000000.bad").is_none());
+        assert!(constructed_message_permalink(
+            "https://example.invalid/",
+            "C123",
+            "1710000000.000100"
+        )
+        .is_none());
     }
 
     #[test]

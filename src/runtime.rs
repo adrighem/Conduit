@@ -35,8 +35,8 @@ use crate::services::conversation_history::{
     ConversationHistoryProgress, ConversationHistoryService,
 };
 use crate::slack::{
-    DownloadedPreviewAsset, SlackApi, SlackErrorCategory, SlackMessagePage, SlackUnreadSnapshot,
-    SlackUnreadSnapshotRecord,
+    constructed_message_permalink, validated_message_permalink, DownloadedPreviewAsset, SlackApi,
+    SlackErrorCategory, SlackMessagePage, SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
@@ -148,6 +148,10 @@ pub enum RuntimeCommand {
         url: String,
         name: String,
     },
+    ResolveMessagePermalink {
+        channel_id: String,
+        ts: String,
+    },
     MarkConversationRead {
         channel_id: String,
         ts: String,
@@ -232,6 +236,7 @@ pub enum RuntimeOperation {
     ImageAsset,
     Media,
     AttachmentDownload,
+    MessagePermalink,
     PostMessage,
     Reaction,
     Saved,
@@ -253,6 +258,10 @@ pub enum RuntimeTarget {
     Image(String),
     Media(String),
     Attachment(String),
+    ExactMessage {
+        channel_id: String,
+        ts: String,
+    },
     Message {
         channel_id: String,
         thread_ts: Option<String>,
@@ -315,6 +324,9 @@ fn runtime_target_for_trace(target: &RuntimeTarget) -> String {
         RuntimeTarget::Media(url) => format!("media:{}", crate::debug::url_for_log(url)),
         RuntimeTarget::Attachment(url) => {
             format!("attachment:{}", crate::debug::url_for_log(url))
+        }
+        RuntimeTarget::ExactMessage { channel_id, ts } => {
+            format!("exact-message:{channel_id}:{ts}")
         }
         RuntimeTarget::Message {
             channel_id,
@@ -522,6 +534,16 @@ impl RuntimeCommand {
                     RuntimeTarget::Attachment(url.clone()),
                 ),
                 RuntimeTaskLane::Image,
+            ),
+            Self::ResolveMessagePermalink { channel_id, ts } => RuntimeCommandDescriptor::request(
+                OperationContext::new(
+                    RuntimeOperation::MessagePermalink,
+                    RuntimeTarget::ExactMessage {
+                        channel_id: channel_id.clone(),
+                        ts: ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Interactive,
             ),
             Self::MarkConversationRead { channel_id, .. } => RuntimeCommandDescriptor::request(
                 channel(RuntimeOperation::ReadMarker, channel_id),
@@ -865,6 +887,11 @@ pub enum RuntimeEventKind {
         name: String,
         path: PathBuf,
     },
+    MessagePermalinkResolved {
+        channel_id: String,
+        ts: String,
+        permalink: String,
+    },
     MessagePosted {
         channel_id: String,
         message: Box<SlackMessage>,
@@ -1015,6 +1042,13 @@ impl RuntimeEventKind {
             Self::AttachmentDownloaded { url, .. } => OperationContext::new(
                 RuntimeOperation::AttachmentDownload,
                 RuntimeTarget::Attachment(url.clone()),
+            ),
+            Self::MessagePermalinkResolved { channel_id, ts, .. } => OperationContext::new(
+                RuntimeOperation::MessagePermalink,
+                RuntimeTarget::ExactMessage {
+                    channel_id: channel_id.clone(),
+                    ts: ts.clone(),
+                },
             ),
             Self::RealtimeStatusChanged(_) | Self::SocketModeEvent { .. } => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
@@ -3437,6 +3471,28 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     url,
                     name,
                     path: attachment.path,
+                });
+        }
+        RuntimeCommand::ResolveMessagePermalink { channel_id, ts } => {
+            let workspace_url = context
+                .workspace_url
+                .ok_or_else(|| anyhow!("Slack workspace URL is not available"))?;
+            let fallback = constructed_message_permalink(workspace_url, &channel_id, &ts)
+                .ok_or_else(|| anyhow!("message location is not valid for this Slack workspace"))?;
+            let api = require_slack(context.slack)?;
+            let permalink = match api.message_permalink(&channel_id, &ts).await {
+                Ok(permalink) => {
+                    validated_message_permalink(&permalink, workspace_url, &channel_id, &ts)
+                        .unwrap_or(fallback)
+                }
+                Err(_) => fallback,
+            };
+            context
+                .events
+                .send_event(RuntimeEventKind::MessagePermalinkResolved {
+                    channel_id,
+                    ts,
+                    permalink,
                 });
         }
         RuntimeCommand::MarkConversationRead { channel_id, ts } => {
@@ -7875,6 +7931,20 @@ mod tests {
                 RuntimeTarget::Huddle("R123".to_string()),
             )
         );
+        assert_eq!(
+            RuntimeCommand::ResolveMessagePermalink {
+                channel_id: "C123".to_string(),
+                ts: "1710000000.000100".to_string(),
+            }
+            .operation_context(),
+            OperationContext::new(
+                RuntimeOperation::MessagePermalink,
+                RuntimeTarget::ExactMessage {
+                    channel_id: "C123".to_string(),
+                    ts: "1710000000.000100".to_string(),
+                },
+            )
+        );
 
         let channel_context = RuntimeCommand::LoadMessageContext(
             SearchMessageLocation::new("C123", "1710000000.000100", None).unwrap(),
@@ -7965,6 +8035,14 @@ mod tests {
         .descriptor();
         assert_eq!(interactive.lane, RuntimeTaskLane::Interactive);
         assert!(interactive.supersedes_previous);
+
+        let permalink = RuntimeCommand::ResolveMessagePermalink {
+            channel_id: "C123".to_string(),
+            ts: "1710000000.000100".to_string(),
+        }
+        .descriptor();
+        assert_eq!(permalink.lane, RuntimeTaskLane::Interactive);
+        assert!(permalink.supersedes_previous);
 
         let leave = RuntimeCommand::LeaveConversation {
             channel_id: "C123".to_string(),

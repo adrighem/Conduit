@@ -839,6 +839,203 @@ fn file_size_label(size: u64) -> String {
     }
 }
 
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn slack_value_has_content(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlackIcons {
+    pub emoji: Option<String>,
+    pub image_36: Option<String>,
+    pub image_48: Option<String>,
+    pub image_72: Option<String>,
+}
+
+impl SlackIcons {
+    pub fn image_url(&self) -> Option<&str> {
+        non_empty(self.image_72.as_deref())
+            .or_else(|| non_empty(self.image_48.as_deref()))
+            .or_else(|| non_empty(self.image_36.as_deref()))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlackBotProfile {
+    pub id: Option<String>,
+    pub app_id: Option<String>,
+    pub user_id: Option<String>,
+    pub name: Option<String>,
+    pub deleted: Option<bool>,
+    pub updated: Option<u64>,
+    pub team_id: Option<String>,
+    pub icons: Option<SlackIcons>,
+}
+
+impl SlackBotProfile {
+    pub fn display_name(&self) -> Option<&str> {
+        non_empty(self.name.as_deref())
+    }
+
+    pub fn avatar_url(&self) -> Option<&str> {
+        self.icons.as_ref().and_then(SlackIcons::image_url)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlackAttachmentField {
+    pub title: Option<String>,
+    pub value: Option<String>,
+    pub short: Option<bool>,
+}
+
+impl SlackAttachmentField {
+    fn visible_text(&self) -> Option<String> {
+        let title = non_empty(self.title.as_deref());
+        let value = non_empty(self.value.as_deref());
+        match (title, value) {
+            (Some(title), Some(value)) => Some(format!("{title}: {value}")),
+            (Some(title), None) => Some(title.to_string()),
+            (None, Some(value)) => Some(value.to_string()),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlackAttachmentActionOption {
+    pub text: Option<String>,
+    pub value: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlackAttachmentActionConfirm {
+    pub title: Option<String>,
+    pub text: Option<String>,
+    pub ok_text: Option<String>,
+    pub dismiss_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlackAttachmentAction {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub text: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub style: Option<String>,
+    pub value: Option<String>,
+    pub url: Option<String>,
+    pub data_source: Option<String>,
+    pub options: Option<Vec<SlackAttachmentActionOption>>,
+    pub selected_options: Option<Vec<SlackAttachmentActionOption>>,
+    pub min_query_length: Option<u64>,
+    pub confirm: Option<SlackAttachmentActionConfirm>,
+}
+
+impl SlackAttachmentAction {
+    pub fn label(&self) -> Option<&str> {
+        non_empty(self.text.as_deref()).or_else(|| non_empty(self.name.as_deref()))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlackAttachment {
+    pub id: Option<u64>,
+    pub fallback: Option<String>,
+    pub color: Option<String>,
+    pub pretext: Option<String>,
+    pub author_name: Option<String>,
+    pub author_link: Option<String>,
+    pub author_icon: Option<String>,
+    pub title: Option<String>,
+    pub title_link: Option<String>,
+    pub text: Option<String>,
+    pub fields: Option<Vec<SlackAttachmentField>>,
+    pub image_url: Option<String>,
+    pub thumb_url: Option<String>,
+    pub footer: Option<String>,
+    pub footer_icon: Option<String>,
+    pub ts: Option<u64>,
+    pub callback_id: Option<String>,
+    pub actions: Option<Vec<SlackAttachmentAction>>,
+}
+
+impl SlackAttachment {
+    /// Text represented by the attachment's non-interactive visual content.
+    ///
+    /// Slack's `fallback` is used only when no structured text is available,
+    /// avoiding duplicate content for assistive technology and notifications.
+    pub fn visible_text(&self) -> String {
+        let mut parts = [
+            self.pretext.as_deref(),
+            self.author_name.as_deref(),
+            self.title.as_deref(),
+            self.text.as_deref(),
+        ]
+        .into_iter()
+        .filter_map(non_empty)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+        parts.extend(
+            self.fields
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(SlackAttachmentField::visible_text),
+        );
+        if let Some(footer) = non_empty(self.footer.as_deref()) {
+            parts.push(footer.to_string());
+        }
+        if parts.is_empty() {
+            non_empty(self.fallback.as_deref())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            parts.join("\n")
+        }
+    }
+
+    pub fn accessible_text(&self) -> String {
+        let mut parts = Vec::new();
+        let visible = self.visible_text();
+        if !visible.is_empty() {
+            parts.push(visible);
+        }
+        parts.extend(
+            self.actions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(SlackAttachmentAction::label)
+                .map(ToString::to_string),
+        );
+        parts.join("\n")
+    }
+
+    pub fn has_visible_content(&self) -> bool {
+        !self.visible_text().is_empty()
+            || non_empty(self.image_url.as_deref()).is_some()
+            || non_empty(self.thumb_url.as_deref()).is_some()
+            || self.actions.as_ref().is_some_and(|actions| {
+                actions.iter().any(|action| {
+                    action.label().is_some() || non_empty(action.url.as_deref()).is_some()
+                })
+            })
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackMessage {
     #[serde(rename = "type")]
@@ -867,6 +1064,11 @@ pub struct SlackMessage {
     pub reactions: Option<Vec<SlackReaction>>,
     pub files: Option<Vec<SlackFile>>,
     pub blocks: Option<Value>,
+    pub attachments: Option<Vec<SlackAttachment>>,
+    pub bot_id: Option<String>,
+    pub app_id: Option<String>,
+    pub bot_profile: Option<SlackBotProfile>,
+    pub icons: Option<SlackIcons>,
     #[serde(default)]
     pub no_notifications: Option<bool>,
     #[serde(default, skip_serializing)]
@@ -904,14 +1106,87 @@ impl SlackMessage {
     }
 
     pub fn author_label(&self) -> String {
-        self.username
-            .clone()
-            .or_else(|| self.user.clone())
+        non_empty(self.username.as_deref())
+            .or_else(|| {
+                self.bot_profile
+                    .as_ref()
+                    .and_then(SlackBotProfile::display_name)
+            })
+            .or_else(|| non_empty(self.user.as_deref()))
+            .map(ToString::to_string)
             .unwrap_or_else(|| "Slack".to_string())
+    }
+
+    pub fn avatar_url(&self) -> Option<&str> {
+        self.icons
+            .as_ref()
+            .and_then(SlackIcons::image_url)
+            .or_else(|| {
+                self.bot_profile
+                    .as_ref()
+                    .and_then(SlackBotProfile::avatar_url)
+            })
+    }
+
+    pub fn icon_emoji(&self) -> Option<&str> {
+        self.icons
+            .as_ref()
+            .and_then(|icons| non_empty(icons.emoji.as_deref()))
+            .or_else(|| {
+                self.bot_profile
+                    .as_ref()
+                    .and_then(|profile| profile.icons.as_ref())
+                    .and_then(|icons| non_empty(icons.emoji.as_deref()))
+            })
     }
 
     pub fn body_text(&self) -> String {
         self.text.clone().unwrap_or_default()
+    }
+
+    /// Text that can be presented without interpreting Block Kit.
+    ///
+    /// Renderers may provide richer Block Kit output, while this helper keeps
+    /// cache consumers, notifications, and accessibility fallbacks consistent.
+    pub fn visible_text(&self) -> String {
+        let mut parts = non_empty(self.text.as_deref())
+            .map(ToString::to_string)
+            .into_iter()
+            .collect::<Vec<_>>();
+        parts.extend(
+            self.attachments
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(SlackAttachment::visible_text)
+                .filter(|text| !text.is_empty()),
+        );
+        parts.join("\n")
+    }
+
+    pub fn accessible_text(&self) -> String {
+        let mut parts = non_empty(self.text.as_deref())
+            .map(ToString::to_string)
+            .into_iter()
+            .collect::<Vec<_>>();
+        parts.extend(
+            self.attachments
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(SlackAttachment::accessible_text)
+                .filter(|text| !text.is_empty()),
+        );
+        parts.join("\n")
+    }
+
+    pub fn has_visible_content(&self) -> bool {
+        non_empty(self.text.as_deref()).is_some()
+            || self.files.as_ref().is_some_and(|files| !files.is_empty())
+            || self.blocks.as_ref().is_some_and(slack_value_has_content)
+            || self.attachments.as_ref().is_some_and(|attachments| {
+                attachments.iter().any(SlackAttachment::has_visible_content)
+            })
     }
 
     pub fn has_thread(&self) -> bool {
@@ -944,11 +1219,7 @@ impl SlackMessage {
             return false;
         }
 
-        self.text
-            .as_deref()
-            .is_some_and(|text| !text.trim().is_empty())
-            || self.files.as_ref().is_some_and(|files| !files.is_empty())
-            || self.blocks.as_ref().is_some_and(|blocks| !blocks.is_null())
+        self.has_visible_content()
     }
 
     pub fn latest_ts<'a>(messages: impl Iterator<Item = &'a SlackMessage>) -> Option<String> {
@@ -1305,6 +1576,171 @@ mod tests {
             message.client_msg_id.as_deref(),
             Some("5dbb1f7d-cb70-4f65-b0f7-458c98ec2f24")
         );
+    }
+
+    #[test]
+    fn slack_message_round_trips_legacy_attachments_and_bot_identity() {
+        let message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000000.000200",
+            "bot_id": "B123",
+            "app_id": "A123",
+            "bot_profile": {
+                "id": "B123",
+                "app_id": "A123",
+                "name": "People assistant",
+                "icons": {
+                    "image_36": "https://cdn.example/bot-36.png",
+                    "image_72": "https://cdn.example/bot-72.png"
+                }
+            },
+            "icons": {
+                "emoji": ":office:",
+                "image_48": "https://cdn.example/message-48.png"
+            },
+            "attachments": [{
+                "id": 1,
+                "color": "#4a154b",
+                "pretext": "A request needs review",
+                "author_name": "People team",
+                "author_link": "https://example.com/people",
+                "author_icon": "https://cdn.example/author.png",
+                "title": "Review request",
+                "title_link": "https://example.com/request",
+                "text": "Choose an outcome",
+                "fallback": "Review the request in Slack",
+                "fields": [{
+                    "title": "Owner",
+                    "value": "People operations",
+                    "short": true
+                }],
+                "image_url": "https://cdn.example/request.png",
+                "thumb_url": "https://cdn.example/request-thumb.png",
+                "footer": "People assistant",
+                "footer_icon": "https://cdn.example/footer.png",
+                "ts": 1710000000,
+                "callback_id": "request_review",
+                "actions": [{
+                    "id": "approve",
+                    "name": "decision",
+                    "text": "Approve",
+                    "type": "button",
+                    "style": "primary",
+                    "value": "approved",
+                    "url": "https://example.com/approve",
+                    "confirm": {
+                        "title": "Confirm",
+                        "text": "Continue?",
+                        "ok_text": "Continue",
+                        "dismiss_text": "Cancel"
+                    }
+                }, {
+                    "name": "assignee",
+                    "text": "Choose assignee",
+                    "type": "select",
+                    "data_source": "static",
+                    "options": [{
+                        "text": "People operations",
+                        "value": "people_ops"
+                    }],
+                    "selected_options": [{
+                        "text": "People operations",
+                        "value": "people_ops"
+                    }],
+                    "min_query_length": 2
+                }]
+            }]
+        }))
+        .expect("rich bot message should deserialize");
+
+        let restored: SlackMessage = serde_json::from_value(
+            serde_json::to_value(&message).expect("rich bot message should serialize"),
+        )
+        .expect("serialized rich bot message should deserialize");
+
+        assert_eq!(restored, message);
+        assert_eq!(restored.author_label(), "People assistant");
+        assert_eq!(
+            restored.avatar_url(),
+            Some("https://cdn.example/message-48.png")
+        );
+        let attachment = &restored.attachments.as_ref().unwrap()[0];
+        assert_eq!(attachment.actions.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            attachment.actions.as_ref().unwrap()[1]
+                .options
+                .as_ref()
+                .unwrap()[0]
+                .value,
+            Some("people_ops".to_string())
+        );
+    }
+
+    #[test]
+    fn slack_message_helpers_keep_attachment_only_messages_visible_and_accessible() {
+        let message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000000.000300",
+            "attachments": [{
+                "pretext": "A request needs review",
+                "author_name": "People team",
+                "title": "Review request",
+                "text": "Choose an outcome",
+                "fallback": "Review the request in Slack",
+                "fields": [{
+                    "title": "Owner",
+                    "value": "People operations"
+                }],
+                "actions": [{
+                    "name": "decision",
+                    "text": "Approve",
+                    "type": "button",
+                    "value": "approved"
+                }]
+            }]
+        }))
+        .expect("attachment-only message should deserialize");
+
+        assert!(message.has_visible_content());
+        assert_eq!(
+            message.visible_text(),
+            "A request needs review\nPeople team\nReview request\nChoose an outcome\nOwner: People operations"
+        );
+        assert_eq!(
+            message.accessible_text(),
+            "A request needs review\nPeople team\nReview request\nChoose an outcome\nOwner: People operations\nApprove"
+        );
+        assert!(message.is_notification_worthy());
+    }
+
+    #[test]
+    fn attachment_fallback_is_used_only_when_structured_content_is_empty() {
+        let fallback_only: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "fallback": "Open this update in Slack"
+        }))
+        .unwrap();
+        let structured: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "title": "Visible title",
+            "fallback": "Duplicated fallback"
+        }))
+        .unwrap();
+
+        assert_eq!(fallback_only.visible_text(), "Open this update in Slack");
+        assert_eq!(structured.visible_text(), "Visible title");
+    }
+
+    #[test]
+    fn old_cached_message_shape_remains_compatible() {
+        let message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "user": "U123",
+            "text": "Existing cached text",
+            "ts": "1710000000.000400"
+        }))
+        .expect("legacy cached message should deserialize");
+
+        assert!(message.attachments.is_none());
+        assert!(message.bot_profile.is_none());
+        assert!(message.icons.is_none());
+        assert_eq!(message.visible_text(), "Existing cached text");
     }
 
     #[test]
