@@ -1,0 +1,7 @@
+Task: Reconcile fresh snapshots and asynchronous metadata or asset changes without restarting opening
+
+Summary: Added an anchor-preserving replace-snapshot DOM operation, held updates arriving before initial commit, and reconciled the latest state after positioning or interaction.
+
+Files: src/message_html.rs; src/timeline_dom_runtime.js; src/window.rs; src/workspace_state.rs
+
+Rationale: Cached-to-fresh and metadata updates now remain within the active document instead of restarting WebView navigation and initial positioning.
