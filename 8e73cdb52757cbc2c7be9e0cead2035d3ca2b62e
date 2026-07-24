@@ -1,0 +1,7 @@
+Task: Add adversarial Rust and WebKit regression coverage for reordered data, delayed layout, and rapid navigation
+
+Summary: Expanded production-WebKit coverage for hidden initial focus, delayed growth, message replacement, snapshot replacement, load-more reconciliation, and exact viewport anchoring; fixed boundary anchor selection exposed by the test.
+
+Files: src/timeline_dom_runtime.js; tests/test_timeline_scroll.py
+
+Rationale: Exercise timing and variable-height cases that unit/static tests cannot model and prevent recurrence of visible snapshot jumps.
