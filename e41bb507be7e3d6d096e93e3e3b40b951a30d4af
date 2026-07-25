@@ -1,0 +1,7 @@
+Task: Rich message architecture remediation
+
+Summary: Added a tolerant Slack wire boundary, canonical author/document model, versioned canonical cache, pure render planning, owned rich-message presentation, opaque one-shot control handles, and typed exact-message handoff policy. Added synthetic Bob/Jira, malformed sibling, cache upgrade, author capability, URL validation, replay, and redaction coverage.
+
+Modified: src/rich_message.rs, src/rich_message_normalize.rs, src/slack_message_wire.rs, src/message_html/, src/message_handoff.rs, runtime/store/window integration, contributor and design docs.
+
+Rationale: Separate transport, domain, presentation, and execution policy so rich bot messages are safe, extensible, and contributor-friendly.
