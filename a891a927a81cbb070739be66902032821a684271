@@ -1,0 +1,7 @@
+Task: Plan rich message architecture improvements
+
+Summary: Extended the active rich-bot-message spec and plan with wire/domain separation, canonical rendering, typed safety, opaque controls, handoff ports, cache evolution, DOM coverage, and contributor ergonomics.
+
+Modified files: conductor/tracks/rich_bot_messages_20260724/spec.md; conductor/tracks/rich_bot_messages_20260724/plan.md; conductor/tracks/rich_bot_messages_20260724/metadata.json
+
+Rationale: The manual acceptance audit found the feature behavior useful but the implementation did not yet satisfy the approved clean architecture or contribution-quality criteria.
