@@ -232,6 +232,20 @@ def test_release_versions_are_synchronized() -> None:
     assert manifest == {".": cargo["package"]["version"]}
 
 
+def test_rust_toolchain_is_pinned_across_local_ci_and_release() -> None:
+    toolchain = tomllib.loads(read("rust-toolchain.toml"))["toolchain"]
+    channel = toolchain["channel"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", channel)
+    assert toolchain["profile"] == "minimal"
+    assert set(toolchain["components"]) == {"clippy", "rustfmt"}
+
+    ci_workflow = active_text(read(".github/workflows/ci.yml"))
+    release_workflow = active_text(read(".github/workflows/release.yml"))
+    assert f"dtolnay/rust-toolchain@{channel}" in ci_workflow
+    assert "dtolnay/rust-toolchain@stable" not in ci_workflow
+    assert f'RUST_VERSION: "{channel}"' in release_workflow
+
+
 def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
     workflow = read(".github/workflows/release.yml")
     jobs = workflow_jobs(workflow)
@@ -348,8 +362,18 @@ def test_generated_release_pull_requests_use_verified_dispatched_ci() -> None:
     assert "persist-credentials: false" in checkout
 
     release_workflow = read(".github/workflows/release.yml")
+    release_events = active_text(release_workflow)
+    assert "\n  push:" not in release_events
+    workflow_run = workflow_event(release_workflow, "workflow_run")
+    assert "    workflows: [CI]" in workflow_run
+    assert "    types: [completed]" in workflow_run
+    assert "    branches: [main]" in workflow_run
     release_jobs = workflow_jobs(release_workflow)
     release_job = release_jobs["release-please"]
+    assert (
+        job_scalar(release_job, "if")
+        == "github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'"
+    )
     assert "      actions: write" not in release_job
     assert "secrets.RELEASE_PLEASE_TOKEN" not in release_job
     assert "token: ${{ github.token }}" in release_job
@@ -496,6 +520,7 @@ def test_flatpak_cargo_sources_match_the_lockfile() -> None:
 def main() -> None:
     tests = [
         test_release_versions_are_synchronized,
+        test_rust_toolchain_is_pinned_across_local_ci_and_release,
         test_release_workflow_builds_validates_and_publishes_all_assets,
         test_generated_release_pull_requests_use_verified_dispatched_ci,
         test_release_build_tests_reuse_the_release_profile,

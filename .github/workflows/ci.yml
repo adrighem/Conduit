@@ -33,7 +33,9 @@ jobs:
           ref: ${{ inputs.commit_sha || github.sha }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep strict Clippy deterministic. rust-toolchain.toml and the release
+      # workflow are regression-tested to remain on this reviewed version.
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
 

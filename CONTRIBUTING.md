@@ -29,6 +29,11 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
+The repository pins its reviewed Rust, rustfmt, and Clippy versions in
+`rust-toolchain.toml`. A rustup-managed installation selects that toolchain automatically. Update
+the pin deliberately and keep CI and release packaging synchronized; do not develop against a
+floating `stable` Clippy when preparing a contribution.
+
 ### Native Huddle Development
 
 The default build intentionally excludes native media dependencies. Changes to huddle media or screen sharing must also pass the full feature matrix:

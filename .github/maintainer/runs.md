@@ -325,3 +325,20 @@
 - Final audit: 6 open issues, PR:15 is the only open pull request, no unread notifications, and no Dependabot or code-scanning alerts. ISSUE:14 remains open for dependency-count and clean-build timing evidence.
 - Existing user-owned changes in the root development Flatpak manifest and untracked research/backup files remained unstaged and preserved.
 - The installed maintainer package still lacks its referenced checklist, so this run used the documented manual fallback.
+
+## 2026-07-25 CI Reliability
+
+- Scope: audit GitHub Actions failures and remove recurring failure amplification.
+- Extended audit of 200 recent workflow runs:
+  - CI: 11 failures among 63 executed runs; 9 strict-lint failures, 1 genuine UI regression,
+    and 1 clipboard race that already has retry coverage
+  - Release: 4 first-release RPM stabilization failures, all already fixed and regression-tested
+  - CodeQL: 77/77 successful
+- Direct main pushes accounted for the recurring lint failures. Release Please ran concurrently,
+  copied invalid main code into its generated PR, and dispatched a second failing CI run.
+- Local fix:
+  - pin Rust 1.97.1 with rustfmt and Clippy across rustup, CI, and release packaging
+  - regression-test toolchain synchronization
+  - trigger automatic release work only after successful main CI
+- Repository rules remain unchanged; requiring PRs and the `build` check on `main` is a separate
+  administrative recommendation.

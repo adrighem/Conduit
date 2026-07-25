@@ -104,3 +104,13 @@
 - Release Please can render a traceability footer such as `Refs #14` as “closes #14” in generated notes. Audit generated issue attribution independently from commit-footer intent.
 - A direct update to a same-repository release branch can trigger both `push` and `pull_request` CI. Monitor both runs because either may expose event-specific behavior.
 - GitHub's forced Node.js 24 compatibility path for Node.js 20 actions is currently non-blocking, but `actions/checkout@v4` and `release-please-action@v4` should be upgraded separately before enforcement changes.
+
+## 2026-07-25 CI Reliability
+
+- Strict Clippy was the recurring CI failure class: direct pushes introduced code that had not
+  passed the exact CI lint, while follow-up fixes consistently passed. The floating `stable`
+  toolchain was an additional reproducibility risk, not the demonstrated cause of those failures.
+- Pin one reviewed Rust patch release across local rustup, CI, and release packaging. Keep
+  `-D warnings`; make lint upgrades deliberate rather than weakening the quality gate.
+- Release packaging failures were confined to first-release RPM stabilization and already have
+  regression assertions. CodeQL has no recorded failures and should remain unchanged.

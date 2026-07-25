@@ -147,3 +147,14 @@
 - Fedora container release jobs must install Git before checkout and trust the checked-out `GITHUB_WORKSPACE` before creating source archives.
 - Published `v0.1.0` from `8c16452` only after Debian, RPM, and Flatpak builds and independent installation validators passed; the public assets also match `SHA256SUMS`.
 - Keep ISSUE:14 open because package behavior is now proven, but its acceptance criteria still require before/after dependency counts and clean-build timing evidence.
+
+## 2026-07-25 CI Reliability
+
+- Pin Rust 1.97.1, rustfmt, and Clippy in `rust-toolchain.toml`, CI, and release packaging.
+- Preserve strict Clippy as a required gate. Observed failures were code that had not passed the
+  exact CI lint; pinning separately removes future toolchain drift from that diagnosis.
+- Add a repository regression check that fails when the three toolchain declarations diverge.
+- Start automatic Release Please work only after successful main CI, so an invalid direct push
+  cannot update and dispatch a second failing release-PR validation run.
+- Make no packaging or CodeQL change: their historical failures do not show a current recurring
+  defect.
