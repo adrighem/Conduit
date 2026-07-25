@@ -11,17 +11,17 @@
 - [x] Task: Persist versioned canonical content while preserving compatibility with existing cache rows e41bb50
 - [x] Task: Conductor - User Manual Verification 'Lossless message model and cache' (Protocol in workflow.md) 32e7dfa
 
-## Phase 2: Rich presentation and honest controls
+## Phase 2: Rich presentation and honest controls [checkpoint: 2fb9ce8]
 
 - [x] Task: Add failing renderer tests for Bob-like attachments and Jira-like Block Kit 15509ae
 - [x] Task: Render common legacy attachments, rich text, headers, fields, selects, and overflow 15509ae
 - [x] Task: Add safe control capability resolution and opaque callback-free action URLs 15509ae
 - [x] Task: Resolve bot/app author names and avatars with stable grouping 15509ae
-- [ ] Task: Add failing render-plan, author-capability, attachment-color, malformed-sibling, and DOM/accessibility tests
-- [ ] Task: Introduce a pure capability resolver and renderer-neutral message render plan
-- [ ] Task: Render canonical nodes without raw Slack JSON and make bot/app identity behavior consistent
-- [ ] Task: Extract owned rich-message CSS and complete structured attachment and image-accessory presentation
-- [ ] Task: Conductor - User Manual Verification 'Rich presentation and honest controls' (Protocol in workflow.md)
+- [x] Task: Add failing render-plan, author-capability, attachment-color, malformed-sibling, and DOM/accessibility tests e41bb50
+- [x] Task: Introduce a pure capability resolver and renderer-neutral message render plan e41bb50
+- [x] Task: Render canonical nodes without raw Slack JSON and make bot/app identity behavior consistent e41bb50
+- [x] Task: Extract owned rich-message CSS and complete structured attachment and image-accessory presentation e41bb50
+- [x] Task: Conductor - User Manual Verification 'Rich presentation and honest controls' (Protocol in workflow.md) 2fb9ce8
 
 ## Phase 3: Exact Slack handoff and integration
 
