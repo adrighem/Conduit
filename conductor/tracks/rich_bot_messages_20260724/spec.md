@@ -51,3 +51,29 @@ cache, and presentation paths.
 
 The approved architecture is recorded in
 [`docs/rich-bot-messages-design.md`](../../../docs/rich-bot-messages-design.md).
+
+## Architectural Improvement Requirements
+
+The acceptance review found that the first implementation retained and rendered the required data,
+but left transport, domain, presentation, and action policy coupled. Before this track can be
+accepted:
+
+1. Slack message wire shapes must be decoded through a bounded, tolerant transport boundary and
+   normalized into canonical author, document, and control types.
+2. Persisted and rendered message types must not expose raw callback values through `Debug`,
+   `Display`, HTML, custom URLs, or diagnostics.
+3. Visible text, accessibility text, notifications, mention extraction, and HTML must derive from
+   the same ordered canonical document and fallback policy.
+4. HTML generation must consume a pure render plan rather than inspect raw Slack JSON or decide
+   control capabilities inline.
+5. Bot/app identity must consistently control labels, avatars, grouping, presence, and person
+   actions.
+6. Rich message presentation must have owned CSS and browser-level DOM/accessibility coverage.
+7. Callback controls must use opaque, session- and revision-scoped handles that are resolved
+   against current coordinator state and rejected when stale, replayed, or forged.
+8. Exact-message Slack handoff must live behind typed safe-URL, permalink-provider, and
+   external-opener boundaries with explicit authoritative/fallback provenance.
+9. Cache content must be versioned, and richer fresh/realtime messages must replace older lossy
+   rows without duplication.
+10. The resulting module layout and contributor documentation must make adding a supported message
+    node a local, compiler-guided change.

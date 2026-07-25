@@ -5,6 +5,10 @@
 - [x] Task: Add failing model and cache round-trip tests for attachments and bot identity 15509ae
 - [x] Task: Retain typed legacy attachments, controls, and bot/app identity 15509ae
 - [x] Task: Centralize visible/accessibility fallback and notification eligibility 15509ae
+- [~] Task: Add failing decoder, canonical-document, sensitive-value, cache-version, and fresh-over-old replacement tests
+- [ ] Task: Introduce a bounded Slack wire decoder and canonical message author/document/control model
+- [ ] Task: Derive fallback, accessibility, notifications, and mentions from the canonical document
+- [ ] Task: Persist versioned canonical content while preserving compatibility with existing cache rows
 - [ ] Task: Conductor - User Manual Verification 'Lossless message model and cache' (Protocol in workflow.md)
 
 ## Phase 2: Rich presentation and honest controls
@@ -13,6 +17,10 @@
 - [x] Task: Render common legacy attachments, rich text, headers, fields, selects, and overflow 15509ae
 - [x] Task: Add safe control capability resolution and opaque callback-free action URLs 15509ae
 - [x] Task: Resolve bot/app author names and avatars with stable grouping 15509ae
+- [ ] Task: Add failing render-plan, author-capability, attachment-color, malformed-sibling, and DOM/accessibility tests
+- [ ] Task: Introduce a pure capability resolver and renderer-neutral message render plan
+- [ ] Task: Render canonical nodes without raw Slack JSON and make bot/app identity behavior consistent
+- [ ] Task: Extract owned rich-message CSS and complete structured attachment and image-accessory presentation
 - [ ] Task: Conductor - User Manual Verification 'Rich presentation and honest controls' (Protocol in workflow.md)
 
 ## Phase 3: Exact Slack handoff and integration
@@ -21,10 +29,16 @@
 - [x] Task: Implement chat.getPermalink and external exact-message handoff 15509ae
 - [x] Task: Route control activation through typed runtime commands and refresh-safe state 15509ae
 - [x] Task: Verify Web API, realtime, coordinator, and store replacement behavior 15509ae
+- [ ] Task: Add failing opaque-handle lifecycle, handoff policy, safe-URL, and external-opener tests
+- [ ] Task: Implement presenter-owned opaque control handles scoped to session, generation, message revision, and capability
+- [ ] Task: Extract exact-message handoff behind typed provider, validation, provenance, cache, and opener ports
+- [ ] Task: Reject stale, replayed, cross-session, and forged activations and suppress duplicate in-flight handoffs
 - [ ] Task: Conductor - User Manual Verification 'Exact Slack handoff and integration' (Protocol in workflow.md)
 
 ## Phase 4: Acceptance and documentation
 
 - [x] Task: Run formatting, strict Clippy, Rust tests, Meson compilation, and Meson tests cd28961
 - [x] Task: Synchronize architecture and product documentation 15509ae
+- [ ] Task: Add shared synthetic Bob/Jira fixtures and contributor documentation for extending rich messages
+- [ ] Task: Run formatting, strict Clippy, Rust tests, Meson builds, DOM/headless tests, Release, and CodeQL
 - [ ] Task: Conductor - User Manual Verification 'Acceptance and documentation' (Protocol in workflow.md)
