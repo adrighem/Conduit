@@ -52,6 +52,10 @@ use crate::huddles::state::{
     HuddleCommand, HuddleDevice, HuddleDeviceKind, HuddleEvent, HuddlePhase,
     HuddleScreenShareState, HuddleSnapshot,
 };
+use crate::message_handoff::{
+    open_resolved_handoff, ExternalOpenError, ExternalOpener, HandoffProvenance,
+    MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
+};
 use crate::message_html::{
     self, MessageHtmlContext, TimelineDomPatch, TimelineInsertPosition, TimelineMessageRegion,
     TimelineScrollBehavior,
@@ -104,6 +108,14 @@ struct HuddlePreflightDialog {
     microphone: HuddleDevicePicker,
     speaker: HuddleDevicePicker,
     camera: HuddleDevicePicker,
+}
+
+struct SystemExternalOpener;
+
+impl ExternalOpener for SystemExternalOpener {
+    fn open(&self, permalink: &SafeSlackPermalink) -> Result<(), ExternalOpenError> {
+        open::that(permalink.as_str()).map_err(|error| ExternalOpenError::new(error.to_string()))
+    }
 }
 
 mod imp {
@@ -231,6 +243,7 @@ mod imp {
 
         pub runtime: RefCell<Option<AppRuntime>>,
         pub(super) request_coordinator: RefCell<RequestCoordinator>,
+        pub(super) message_control_registry: RefCell<MessageControlRegistry>,
         pub(super) conversation_opening: RefCell<ConversationOpenCoordinator>,
         pub settings: RefCell<Option<gio::Settings>>,
         pub connect_requested: Cell<bool>,
@@ -3922,9 +3935,17 @@ impl ConduitWindow {
                     Err(error) => self.set_status(&format!("Could not open {name}: {error}")),
                 }
             }
-            RuntimeEventKind::MessagePermalinkResolved { permalink, .. } => {
-                match open::that(&permalink) {
-                    Ok(()) => self.set_status("Opened in Slack to complete the action"),
+            RuntimeEventKind::MessagePermalinkResolved { handoff } => {
+                match open_resolved_handoff(&SystemExternalOpener, &handoff) {
+                    Ok(()) => match handoff.provenance {
+                        HandoffProvenance::Authoritative
+                        | HandoffProvenance::CachedAuthoritative => {
+                            self.set_status("Opened in Slack to complete the action")
+                        }
+                        HandoffProvenance::ConstructedFallback(_) => {
+                            self.set_status("Opened a fallback Slack link to complete the action")
+                        }
+                    },
                     Err(error) => {
                         self.set_status(&format!("Failed to open message in Slack: {error}"))
                     }
@@ -4121,6 +4142,21 @@ impl ConduitWindow {
     }
 
     fn apply_realtime_message_patch(&self, request: RealtimeMessagePatch<'_>) {
+        let control_surface = match request.surface {
+            TimelineSurface::Main => TimelineSurfaceId::Main,
+            TimelineSurface::Thread => TimelineSurfaceId::Thread,
+        };
+        if let Ok(target) = MessageRef::new(request.channel_id, request.message.ts.clone()) {
+            let mut registry = self.imp().message_control_registry.borrow_mut();
+            match request.kind {
+                RealtimeMessageKind::Posted | RealtimeMessageKind::Changed => {
+                    let _ = registry.replace_message(control_surface, target);
+                }
+                RealtimeMessageKind::Deleted => {
+                    registry.remove_message(control_surface, &target);
+                }
+            }
+        }
         let patch = match request.kind {
             RealtimeMessageKind::Posted => {
                 let mut context = self.message_patch_context(request.thread_ts, request.message);
@@ -4888,16 +4924,34 @@ impl ConduitWindow {
                 true
             }
             Some("message-control") => {
-                let Some(channel_id) = query_param(url, "channel") else {
+                let query = url.query_pairs().collect::<Vec<_>>();
+                let Some(handle) =
+                    (query.len() == 1 && query[0].0 == "id").then(|| query[0].1.to_string())
+                else {
                     self.set_status("Message action is no longer available");
                     return true;
                 };
-                let Some(ts) = query_param(url, "ts") else {
+                let target = self
+                    .imp()
+                    .message_control_registry
+                    .borrow_mut()
+                    .activate_token(&handle);
+                let Ok(target) = target else {
                     self.set_status("Message action is no longer available");
                     return true;
                 };
+                if self
+                    .find_message(target.channel_id(), target.timestamp())
+                    .is_none()
+                {
+                    self.set_status("This message changed; try again");
+                    return true;
+                }
                 self.set_status("Opening message in Slack");
-                self.send_command(RuntimeCommand::ResolveMessagePermalink { channel_id, ts });
+                self.send_command(RuntimeCommand::ResolveMessagePermalink {
+                    channel_id: target.channel_id().to_string(),
+                    ts: target.timestamp().to_string(),
+                });
                 true
             }
             Some("mark-read") => {
@@ -5272,6 +5326,7 @@ impl ConduitWindow {
         imp.huddle_revealer.set_reveal_child(false);
         imp.workspace.reset();
         imp.conversation_opening.borrow_mut().reset();
+        imp.message_control_registry.borrow_mut().reset_session();
         self.set_realtime_status(RealtimeStatus::default());
         imp.navigation_history.borrow_mut().clear();
         imp.restoring_navigation.set(false);
@@ -7149,6 +7204,8 @@ impl ConduitWindow {
         imp.message_title
             .set_title(&self.conversation_title(channel_id));
         let mut context = self.message_html_context(None);
+        context.message_control_handles =
+            self.replace_message_control_handles(TimelineSurfaceId::Main, channel_id, &messages);
         if !imp.workspace.view.borrow().has_channel_context(channel_id) {
             context.load_more_url = self.channel_load_more_url(channel_id);
         }
@@ -7301,6 +7358,8 @@ impl ConduitWindow {
         let imp = self.imp();
         self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(Some(ts));
+        context.message_control_handles =
+            self.replace_message_control_handles(TimelineSurfaceId::Thread, channel_id, &messages);
         if !imp
             .workspace
             .view
@@ -8504,6 +8563,10 @@ impl ConduitWindow {
     }
 
     fn send_session_command(&self, command: RuntimeCommand) {
+        self.imp()
+            .message_control_registry
+            .borrow_mut()
+            .reset_session();
         let identity = self
             .imp()
             .request_coordinator
@@ -8646,7 +8709,42 @@ impl ConduitWindow {
             .into_iter()
             .map(|(key, _)| key)
             .collect::<HashSet<_>>();
-        self.message_html_context_with_image_keys(thread_ts, Some(&image_keys))
+        let mut context = self.message_html_context_with_image_keys(thread_ts, Some(&image_keys));
+        if let Some(channel_id) = self.visible_channel_id() {
+            let surface = if thread_ts.is_some() {
+                TimelineSurfaceId::Thread
+            } else {
+                TimelineSurfaceId::Main
+            };
+            if let Ok(target) = MessageRef::new(channel_id, message.ts.clone()) {
+                if let Some(handle) = self
+                    .imp()
+                    .message_control_registry
+                    .borrow()
+                    .active_handle(surface, &target)
+                {
+                    context.message_control_handles.insert(target, handle);
+                }
+            }
+        }
+        context
+    }
+
+    fn replace_message_control_handles(
+        &self,
+        surface: TimelineSurfaceId,
+        channel_id: &str,
+        messages: &[SlackMessage],
+    ) -> HashMap<MessageRef, crate::message_handoff::MessageControlHandle> {
+        let targets = messages
+            .iter()
+            .filter_map(|message| MessageRef::new(channel_id, message.ts.clone()).ok())
+            .collect::<Vec<_>>();
+        self.imp()
+            .message_control_registry
+            .borrow_mut()
+            .replace_surface(surface, targets)
+            .unwrap_or_default()
     }
 
     fn message_html_context_with_image_keys(
@@ -8717,6 +8815,7 @@ impl ConduitWindow {
             custom_emojis: imp.custom_emojis.borrow().clone(),
             read_marker_url: None,
             first_unread_ts: None,
+            message_control_handles: HashMap::new(),
         }
     }
 

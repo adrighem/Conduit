@@ -25,6 +25,9 @@ use crate::huddles::coordinator::{CoordinatorInput, HuddleCoordinator, HuddleEff
 use crate::huddles::model::{ActiveHuddle, HuddlePresence};
 use crate::huddles::signaling::{production_native_join_capability, NativeJoinCapability};
 use crate::huddles::state::{HuddleCommand, HuddleEvent, HuddleFailure, HuddlePhase};
+use crate::message_handoff::{
+    MessageHandoffResolver, MessageRef, ProviderFailure, ResolvedMessageHandoff,
+};
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
     SlackConversationUnreadSnapshot, SlackFile, SlackMessage, SlackUnreadState, SlackUser,
@@ -35,8 +38,8 @@ use crate::services::conversation_history::{
     ConversationHistoryProgress, ConversationHistoryService,
 };
 use crate::slack::{
-    constructed_message_permalink, validated_message_permalink, DownloadedPreviewAsset, SlackApi,
-    SlackErrorCategory, SlackMessagePage, SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
+    DownloadedPreviewAsset, SlackApi, SlackError, SlackErrorCategory, SlackMessagePage,
+    SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
@@ -888,9 +891,7 @@ pub enum RuntimeEventKind {
         path: PathBuf,
     },
     MessagePermalinkResolved {
-        channel_id: String,
-        ts: String,
-        permalink: String,
+        handoff: ResolvedMessageHandoff,
     },
     MessagePosted {
         channel_id: String,
@@ -1043,11 +1044,11 @@ impl RuntimeEventKind {
                 RuntimeOperation::AttachmentDownload,
                 RuntimeTarget::Attachment(url.clone()),
             ),
-            Self::MessagePermalinkResolved { channel_id, ts, .. } => OperationContext::new(
+            Self::MessagePermalinkResolved { handoff } => OperationContext::new(
                 RuntimeOperation::MessagePermalink,
                 RuntimeTarget::ExactMessage {
-                    channel_id: channel_id.clone(),
-                    ts: ts.clone(),
+                    channel_id: handoff.target.channel_id().to_string(),
+                    ts: handoff.target.timestamp().to_string(),
                 },
             ),
             Self::RealtimeStatusChanged(_) | Self::SocketModeEvent { .. } => {
@@ -1170,6 +1171,7 @@ struct RuntimeConnection {
     current_user_id: Option<String>,
     user_cache: Arc<Mutex<HashMap<String, String>>>,
     read_marks: Arc<Mutex<HashMap<String, String>>>,
+    message_handoffs: Arc<Mutex<MessageHandoffResolver>>,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
 }
@@ -2213,6 +2215,9 @@ fn spawn_authentication_task<F>(
                             current_user_id: auth.user_id.clone(),
                             user_cache: Arc::new(Mutex::new(HashMap::new())),
                             read_marks: Arc::new(Mutex::new(HashMap::new())),
+                            message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(
+                                256,
+                            ))),
                             team_id: auth.team_id.clone(),
                             huddles,
                         };
@@ -2559,6 +2564,7 @@ async fn handle_connected_command(
         current_user_id: connection.current_user_id.as_deref(),
         user_cache: &mut user_cache,
         read_marks: &mut read_marks,
+        message_handoffs: &connection.message_handoffs,
         team_id: connection.team_id.as_deref(),
         workspace_url: connection.workspace_url.as_deref(),
         huddles: &connection.huddles,
@@ -2592,6 +2598,7 @@ struct RuntimeContext<'a> {
     current_user_id: Option<&'a str>,
     user_cache: &'a mut HashMap<String, String>,
     read_marks: &'a mut HashMap<String, String>,
+    message_handoffs: &'a Arc<Mutex<MessageHandoffResolver>>,
     team_id: Option<&'a str>,
     workspace_url: Option<&'a str>,
     huddles: &'a HuddleActorHandle,
@@ -3477,23 +3484,31 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let workspace_url = context
                 .workspace_url
                 .ok_or_else(|| anyhow!("Slack workspace URL is not available"))?;
-            let fallback = constructed_message_permalink(workspace_url, &channel_id, &ts)
-                .ok_or_else(|| anyhow!("message location is not valid for this Slack workspace"))?;
+            let target = MessageRef::new(channel_id, ts)?;
+            if let Some(handoff) = context
+                .message_handoffs
+                .lock()
+                .expect("message handoff cache lock poisoned")
+                .cached(&target)
+            {
+                context
+                    .events
+                    .send_event(RuntimeEventKind::MessagePermalinkResolved { handoff });
+                return Ok(());
+            }
             let api = require_slack(context.slack)?;
-            let permalink = match api.message_permalink(&channel_id, &ts).await {
-                Ok(permalink) => {
-                    validated_message_permalink(&permalink, workspace_url, &channel_id, &ts)
-                        .unwrap_or(fallback)
-                }
-                Err(_) => fallback,
-            };
+            let provider_result = api
+                .message_permalink(target.channel_id(), target.timestamp())
+                .await
+                .map_err(|error| message_handoff_provider_failure(&error));
+            let handoff = context
+                .message_handoffs
+                .lock()
+                .expect("message handoff cache lock poisoned")
+                .resolve_provider_result(workspace_url, &target, provider_result)?;
             context
                 .events
-                .send_event(RuntimeEventKind::MessagePermalinkResolved {
-                    channel_id,
-                    ts,
-                    permalink,
-                });
+                .send_event(RuntimeEventKind::MessagePermalinkResolved { handoff });
         }
         RuntimeCommand::MarkConversationRead { channel_id, ts } => {
             let api = require_slack(context.slack)?;
@@ -5714,6 +5729,28 @@ fn require_slack(slack: &Option<SlackApi>) -> Result<&SlackApi> {
     slack.as_ref().context("No Slack workspace is available")
 }
 
+fn message_handoff_provider_failure(error: &SlackError) -> ProviderFailure {
+    if error.is_permission_denied() {
+        return ProviderFailure::PermissionDenied;
+    }
+    if let SlackError::Api { code, .. } = error {
+        if matches!(code.as_str(), "channel_not_found" | "message_not_found") {
+            return ProviderFailure::NotFound;
+        }
+        if matches!(code.as_str(), "method_not_supported" | "unknown_method") {
+            return ProviderFailure::Unsupported;
+        }
+    }
+    match error.category() {
+        SlackErrorCategory::Authentication => ProviderFailure::Authentication,
+        SlackErrorCategory::Connectivity => ProviderFailure::Connectivity,
+        SlackErrorCategory::RateLimited => ProviderFailure::RateLimited,
+        SlackErrorCategory::LocalIo
+        | SlackErrorCategory::Validation
+        | SlackErrorCategory::Unexpected => ProviderFailure::Unexpected,
+    }
+}
+
 trait EventSenderExt {
     fn send_status(&self, status: &str);
     fn send_failure(&self, error: &anyhow::Error);
@@ -7700,6 +7737,7 @@ mod tests {
             current_user_id: Some("U_SELF".into()),
             user_cache: Arc::new(Mutex::new(HashMap::new())),
             read_marks: Arc::new(Mutex::new(HashMap::new())),
+            message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(256))),
             team_id: None,
             huddles,
         });

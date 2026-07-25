@@ -5,6 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::huddles::model::{SlackHuddleRoom, SlackHuddleState};
+use crate::rich_message::{MessageAuthor, MessageDocument, MESSAGE_CONTENT_VERSION};
 
 const CONVERSATION_MEMBER_KEYS: [&str; 2] = ["members", "users"];
 const SEEN_ATTENTION_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
@@ -1036,7 +1037,7 @@ impl SlackAttachment {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackMessage {
     #[serde(rename = "type")]
     pub kind: Option<String>,
@@ -1070,12 +1071,108 @@ pub struct SlackMessage {
     pub bot_profile: Option<SlackBotProfile>,
     pub icons: Option<SlackIcons>,
     #[serde(default)]
+    pub author: MessageAuthor,
+    #[serde(default)]
+    pub document: MessageDocument,
+    #[serde(default)]
+    pub content_version: u16,
+    #[serde(default)]
     pub no_notifications: Option<bool>,
     #[serde(default, skip_serializing)]
     pub room: Option<SlackHuddleRoom>,
 }
 
+impl std::fmt::Debug for SlackMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SlackMessage")
+            .field("kind", &self.kind)
+            .field("subtype", &self.subtype)
+            .field("ts", &self.ts)
+            .field("thread_ts", &self.thread_ts)
+            .field("content_version", &self.content_version)
+            .field("author_kind", &self.author_key())
+            .field("message_node_count", &self.document.nodes().len())
+            .field("file_count", &self.files.as_ref().map(Vec::len))
+            .field("reaction_count", &self.reactions.as_ref().map(Vec::len))
+            .finish_non_exhaustive()
+    }
+}
+
 impl SlackMessage {
+    pub(crate) fn refresh_canonical_content(&mut self) {
+        self.author =
+            if self.bot_id.is_some() || self.app_id.is_some() || self.bot_profile.is_some() {
+                MessageAuthor::App {
+                    app_id: self.app_id.clone().or_else(|| {
+                        self.bot_profile
+                            .as_ref()
+                            .and_then(|profile| profile.app_id.clone())
+                    }),
+                    bot_id: self.bot_id.clone().or_else(|| {
+                        self.bot_profile
+                            .as_ref()
+                            .and_then(|profile| profile.id.clone())
+                    }),
+                    display_name: non_empty(self.username.as_deref())
+                        .or_else(|| {
+                            self.bot_profile
+                                .as_ref()
+                                .and_then(SlackBotProfile::display_name)
+                        })
+                        .unwrap_or("Slack app")
+                        .to_string(),
+                    avatar_url: self.avatar_url().map(ToString::to_string),
+                    icon_emoji: self.icon_emoji().map(ToString::to_string),
+                }
+            } else if let Some(user_id) = non_empty(self.user.as_deref()) {
+                MessageAuthor::User {
+                    user_id: user_id.to_string(),
+                }
+            } else if let Some(display_name) = non_empty(self.username.as_deref()) {
+                MessageAuthor::Unknown {
+                    display_name: display_name.to_string(),
+                }
+            } else {
+                MessageAuthor::default()
+            };
+
+        let mut nodes = Vec::new();
+        if let Some(blocks) = self.blocks.as_ref() {
+            nodes.extend(
+                crate::rich_message_normalize::normalize_blocks(
+                    blocks,
+                    "Choose an option",
+                    "More actions",
+                )
+                .nodes,
+            );
+        }
+        nodes.extend(
+            crate::rich_message_normalize::normalize_attachments(
+                self.attachments.as_deref().unwrap_or_default(),
+            )
+            .nodes,
+        );
+        self.document = MessageDocument::new(
+            nodes,
+            non_empty(self.text.as_deref()).map(ToString::to_string),
+        );
+        self.content_version = MESSAGE_CONTENT_VERSION;
+    }
+
+    pub(crate) fn discard_wire_content(&mut self) {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            self.blocks = None;
+            self.attachments = None;
+            self.bot_id = None;
+            self.app_id = None;
+            self.bot_profile = None;
+            self.icons = None;
+            self.username = None;
+        }
+    }
+
     /// Returns the root timestamp when this message is a reply in a thread.
     ///
     /// Slack may set `thread_ts` to the message's own timestamp for a thread
@@ -1106,6 +1203,9 @@ impl SlackMessage {
     }
 
     pub fn author_label(&self) -> String {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return self.author.display_name().to_string();
+        }
         non_empty(self.username.as_deref())
             .or_else(|| {
                 self.bot_profile
@@ -1117,7 +1217,52 @@ impl SlackMessage {
             .unwrap_or_else(|| "Slack".to_string())
     }
 
+    pub fn author_user_id(&self) -> Option<&str> {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return self.author.user_id();
+        }
+        if self.bot_id.is_some() || self.app_id.is_some() || self.bot_profile.is_some() {
+            return None;
+        }
+        non_empty(self.user.as_deref())
+    }
+
+    pub fn author_key(&self) -> String {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return match &self.author {
+                MessageAuthor::User { user_id } => format!("user:{user_id}"),
+                MessageAuthor::App {
+                    app_id,
+                    bot_id,
+                    display_name,
+                    ..
+                } => app_id
+                    .as_deref()
+                    .map(|id| format!("app:{id}"))
+                    .or_else(|| bot_id.as_deref().map(|id| format!("bot:{id}")))
+                    .unwrap_or_else(|| format!("app-label:{display_name}")),
+                MessageAuthor::Unknown { display_name } => {
+                    format!("unknown:{display_name}")
+                }
+            };
+        }
+        self.bot_id
+            .as_deref()
+            .map(|id| format!("bot:{id}"))
+            .or_else(|| self.app_id.as_deref().map(|id| format!("app:{id}")))
+            .or_else(|| {
+                self.user
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| format!("user:{id}"))
+            })
+            .unwrap_or_else(|| format!("label:{}", self.author_label()))
+    }
+
     pub fn avatar_url(&self) -> Option<&str> {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return self.author.avatar_url();
+        }
         self.icons
             .as_ref()
             .and_then(SlackIcons::image_url)
@@ -1129,6 +1274,9 @@ impl SlackMessage {
     }
 
     pub fn icon_emoji(&self) -> Option<&str> {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return self.author.icon_emoji();
+        }
         self.icons
             .as_ref()
             .and_then(|icons| non_empty(icons.emoji.as_deref()))
@@ -1149,6 +1297,9 @@ impl SlackMessage {
     /// Renderers may provide richer Block Kit output, while this helper keeps
     /// cache consumers, notifications, and accessibility fallbacks consistent.
     pub fn visible_text(&self) -> String {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return self.document.visible_text();
+        }
         let mut parts = non_empty(self.text.as_deref())
             .map(ToString::to_string)
             .into_iter()
@@ -1165,6 +1316,9 @@ impl SlackMessage {
     }
 
     pub fn accessible_text(&self) -> String {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return self.document.accessible_text();
+        }
         let mut parts = non_empty(self.text.as_deref())
             .map(ToString::to_string)
             .into_iter()
@@ -1181,6 +1335,10 @@ impl SlackMessage {
     }
 
     pub fn has_visible_content(&self) -> bool {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return self.document.has_visible_content()
+                || self.files.as_ref().is_some_and(|files| !files.is_empty());
+        }
         non_empty(self.text.as_deref()).is_some()
             || self.files.as_ref().is_some_and(|files| !files.is_empty())
             || self.blocks.as_ref().is_some_and(slack_value_has_content)

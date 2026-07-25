@@ -21,6 +21,7 @@ use crate::models::{
 use crate::search::{
     SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
 };
+use crate::slack_message_wire::{deserialize_message, deserialize_messages};
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
@@ -88,83 +89,27 @@ pub(crate) fn constructed_message_permalink(
     channel_id: &str,
     message_ts: &str,
 ) -> Option<String> {
-    if channel_id.is_empty()
-        || !channel_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric())
-    {
-        return None;
-    }
-    let permalink_ts = permalink_timestamp(message_ts)?;
-    let mut workspace = url::Url::parse(workspace_url).ok()?;
-    if workspace.scheme() != "https"
-        || !workspace.username().is_empty()
-        || workspace.password().is_some()
-        || !workspace.host_str()?.ends_with(".slack.com")
-    {
-        return None;
-    }
-    workspace.set_path(&format!("/archives/{channel_id}/p{permalink_ts}"));
-    workspace.set_query(None);
-    workspace.set_fragment(None);
-    Some(workspace.into())
+    let target = crate::message_handoff::MessageRef::new(channel_id, message_ts).ok()?;
+    crate::message_handoff::SafeSlackPermalink::construct(workspace_url, &target)
+        .ok()
+        .map(|permalink| permalink.as_str().to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn validated_message_permalink(
     permalink: &str,
     workspace_url: &str,
     channel_id: &str,
     message_ts: &str,
 ) -> Option<String> {
-    let expected = url::Url::parse(&constructed_message_permalink(
+    let target = crate::message_handoff::MessageRef::new(channel_id, message_ts).ok()?;
+    crate::message_handoff::SafeSlackPermalink::validate_authoritative(
+        permalink,
         workspace_url,
-        channel_id,
-        message_ts,
-    )?)
-    .ok()?;
-    let candidate = url::Url::parse(permalink).ok()?;
-    if candidate.scheme() != "https"
-        || !candidate.username().is_empty()
-        || candidate.password().is_some()
-        || candidate.host_str()? != expected.host_str()?
-        || candidate.port_or_known_default() != expected.port_or_known_default()
-        || candidate.path() != expected.path()
-        || candidate.fragment().is_some()
-        || !valid_message_permalink_query(&candidate, channel_id)
-    {
-        return None;
-    }
-    Some(candidate.into())
-}
-
-fn valid_message_permalink_query(candidate: &url::Url, channel_id: &str) -> bool {
-    let mut thread_ts = None;
-    let mut cid = None;
-    for (key, value) in candidate.query_pairs() {
-        match key.as_ref() {
-            "thread_ts" if thread_ts.is_none() && permalink_timestamp(&value).is_some() => {
-                thread_ts = Some(value);
-            }
-            "cid" if cid.is_none() && value == channel_id => {
-                cid = Some(value);
-            }
-            _ => return false,
-        }
-    }
-    thread_ts.is_some() == cid.is_some()
-}
-
-fn permalink_timestamp(timestamp: &str) -> Option<String> {
-    let (seconds, fraction) = timestamp.split_once('.')?;
-    if seconds.is_empty()
-        || fraction.is_empty()
-        || fraction.len() > 6
-        || !seconds.chars().all(|character| character.is_ascii_digit())
-        || !fraction.chars().all(|character| character.is_ascii_digit())
-    {
-        return None;
-    }
-    Some(format!("{seconds}{fraction:0<6}"))
+        &target,
+    )
+    .ok()
+    .map(|permalink| permalink.as_str().to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2199,6 +2144,7 @@ impl_slack_response!(UsersListResponse);
 struct HistoryResponse {
     ok: bool,
     error: Option<String>,
+    #[serde(deserialize_with = "deserialize_messages")]
     messages: Vec<SlackMessage>,
     has_more: Option<bool>,
     unread_count: Option<u64>,
@@ -2284,6 +2230,7 @@ impl_slack_response!(EmojiListResponse);
 struct PostMessageResponse {
     ok: bool,
     error: Option<String>,
+    #[serde(deserialize_with = "deserialize_message")]
     message: SlackMessage,
 }
 impl_slack_response!(PostMessageResponse);

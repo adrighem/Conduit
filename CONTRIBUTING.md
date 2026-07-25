@@ -72,6 +72,23 @@ When changing Slack API behavior, document any new scopes, redirect behavior, to
 - Put grouping, sorting, parsing, and other behavioral logic in testable Rust modules when possible.
 - Match existing UI conventions before adding new patterns.
 
+### Extending Rich Slack Messages
+
+Rich messages have one transport-to-presentation path:
+
+1. `slack_message_wire.rs` tolerantly decodes Slack payloads.
+2. `rich_message_normalize.rs` converts supported wire shapes into the canonical types in
+   `rich_message.rs`.
+3. `message_html/rich_plan.rs` classifies control capabilities without rendering.
+4. `message_html/rich_components.rs` renders only canonical nodes.
+5. `message_handoff.rs` owns opaque control handles and exact-message Slack handoff policy.
+
+To add a supported node, extend the canonical enum first. The compiler will identify the
+normalizer, text/accessibility projection, and renderer matches that need updating. Add a small
+synthetic fixture and cover malformed siblings, accessible fallback, safe URL handling, and
+sensitive-value redaction. Do not pass raw Slack JSON or callback values into the renderer, cache,
+HTML, custom URLs, diagnostics, or fixtures copied from a real workspace.
+
 ## Pull Requests
 
 Before opening a pull request, run:

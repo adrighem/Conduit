@@ -1,0 +1,81 @@
+.legacy-attachment {
+  --attachment-accent: var(--line);
+  display: grid;
+  flex: 1 1 100%;
+  gap: 6px;
+  min-inline-size: 0;
+  padding-block: 8px;
+  padding-inline: 12px;
+  border-inline-start: 4px solid var(--attachment-accent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--soft) 55%, transparent);
+}
+
+.legacy-attachment p,
+.legacy-attachment h4 {
+  margin: 0;
+}
+
+.attachment-author,
+.attachment-footer {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.attachment-title,
+.block-header {
+  margin-block: 2px;
+  margin-inline: 0;
+  font-size: 15px;
+}
+
+.attachment-fields,
+.block-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.attachment-field,
+.block-field {
+  min-inline-size: 0;
+}
+
+.attachment-field strong {
+  display: block;
+}
+
+.block-accessory {
+  margin-block-start: 6px;
+}
+
+.block-accessory .image-attachment {
+  max-inline-size: 160px;
+}
+
+.rich-text-list {
+  margin-block: 4px;
+  padding-inline-start: 24px;
+}
+
+.rich-text-quote {
+  margin-block: 4px;
+  margin-inline: 0;
+  padding-inline-start: 10px;
+  border-inline-start: 3px solid var(--line);
+  color: var(--muted);
+}
+
+.block-action.is-external {
+  display: inline-grid;
+  gap: 1px;
+}
+
+.slack-handoff {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.block-action.is-unavailable {
+  opacity: 0.65;
+}

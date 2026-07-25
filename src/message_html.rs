@@ -9,15 +9,23 @@ use crate::debug;
 use crate::emoji::{
     emoji_picker_accessible_label, EmojiCatalog, EmojiEntry, EmojiPickerModel, EmojiValue,
 };
+use crate::message_handoff::{MessageControlHandle, MessageRef};
 use crate::models::{
     SavedItem, SearchMatch, SearchMessageLocation, SlackAttachment, SlackAttachmentAction,
     SlackFile, SlackMessage, SlackUser, SlackUserStatus,
 };
 
+mod rich_components;
+mod rich_model;
+mod rich_plan;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+
 const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
 const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 pub(crate) const MESSAGE_BASE_FONT_SIZE_CSS_PX: f64 = 14.0;
 const TIMESTAMP_LOCALIZATION_SCRIPT: &str = include_str!("timestamp_localization.js");
+const RICH_MESSAGE_CSS: &str = include_str!("message_html/message.css");
 static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
@@ -40,6 +48,18 @@ pub struct MessageHtmlContext {
     pub read_marker_url: Option<String>,
     pub first_unread_ts: Option<String>,
     pub timeline_generation: Option<u64>,
+    pub(crate) message_control_handles: HashMap<MessageRef, MessageControlHandle>,
+}
+
+impl MessageHtmlContext {
+    fn message_control_handle(
+        &self,
+        channel_id: Option<&str>,
+        message_ts: &str,
+    ) -> Option<MessageControlHandle> {
+        let target = MessageRef::new(channel_id?, message_ts).ok()?;
+        self.message_control_handles.get(&target).cloned()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2005,6 +2025,7 @@ pre code {{
     transition-duration: 0.01ms !important;
   }}
 }}
+{}
 </style>
 </head>
 <body>
@@ -2016,6 +2037,7 @@ pre code {{
         document_direction(language),
         time_locale_attributes,
         escape_html(title),
+        RICH_MESSAGE_CSS,
         body,
         script_tag
     )
@@ -2143,8 +2165,7 @@ fn message_avatar_html(
     context: &MessageHtmlContext,
 ) -> String {
     let user_avatar_url = message
-        .user
-        .as_ref()
+        .author_user_id()
         .and_then(|user_id| context.user_avatar_urls.get(user_id))
         .map(String::as_str);
     let source = user_avatar_url
@@ -2178,7 +2199,7 @@ fn author_identity_html(
     context: &MessageHtmlContext,
 ) -> String {
     let label = escape_html(author);
-    let Some(user_id) = message.user.as_deref().filter(|id| !id.is_empty()) else {
+    let Some(user_id) = message.author_user_id() else {
         return format!("<span class=\"author author-label\" dir=\"auto\">{label}</span>{status}");
     };
     let tooltip = context
@@ -2257,9 +2278,7 @@ fn message_target_attributes(ts: Option<&str>) -> String {
 
 fn message_author_attribute(message: &SlackMessage) -> String {
     message
-        .user
-        .as_deref()
-        .filter(|user_id| !user_id.is_empty())
+        .author_user_id()
         .map(|user_id| format!(" data-author-user-id=\"{}\"", escape_html(user_id)))
         .unwrap_or_default()
 }
@@ -2314,24 +2333,7 @@ fn can_group_messages(previous: &SlackMessage, current: &SlackMessage) -> bool {
 }
 
 fn sender_key(message: &SlackMessage) -> String {
-    if let Some(user_id) = message.user.as_deref().filter(|value| !value.is_empty()) {
-        return format!("user:{user_id}");
-    }
-    if let Some(bot_id) = message.bot_id.as_deref().filter(|value| !value.is_empty()) {
-        return format!("bot:{bot_id}");
-    }
-    if let Some(app_id) = message.app_id.as_deref().filter(|value| !value.is_empty()) {
-        return format!("app:{app_id}");
-    }
-    if let Some(profile_id) = message
-        .bot_profile
-        .as_ref()
-        .and_then(|profile| profile.id.as_deref())
-        .filter(|value| !value.is_empty())
-    {
-        return format!("bot-profile:{profile_id}");
-    }
-    format!("label:{}", message.author_label())
+    message.author_key()
 }
 
 fn slack_ts_seconds(ts: &str) -> Option<f64> {
@@ -2545,15 +2547,14 @@ fn parse_slack_ts(ts: &str) -> Option<(i64, u32)> {
 
 fn author_label(message: &SlackMessage, context: &MessageHtmlContext) -> String {
     message
-        .user
-        .as_ref()
+        .author_user_id()
         .and_then(|user_id| context.user_names.get(user_id))
         .cloned()
         .unwrap_or_else(|| message.author_label())
 }
 
 fn author_status_html(message: &SlackMessage, context: &MessageHtmlContext) -> String {
-    let Some(user_id) = message.user.as_deref() else {
+    let Some(user_id) = message.author_user_id() else {
         return String::new();
     };
     let Some(status) = context.user_statuses.get(user_id) else {
@@ -2597,13 +2598,44 @@ fn message_body_html(
         );
     }
 
-    if let Some(blocks) = message.blocks.as_ref() {
-        let rendered = blocks_html(channel_id, &message.ts, blocks, context);
+    if message.content_version == crate::rich_message::MESSAGE_CONTENT_VERSION {
+        let document = message.document.clone();
+        let rendered = if document.is_empty() {
+            String::new()
+        } else {
+            rich_components::render(
+                &rich_plan::RichRenderPlan::new(
+                    document,
+                    context.message_control_handle(channel_id, &message.ts),
+                ),
+                context,
+            )
+        };
+        if !rendered.is_empty() {
+            return rendered;
+        }
+    } else if let Some(blocks) = message.blocks.as_ref() {
+        let document = crate::rich_message_normalize::normalize_blocks(
+            blocks,
+            &gettext("Choose an option"),
+            &gettext("More actions"),
+        );
+        let rendered = if document.is_empty() {
+            String::new()
+        } else {
+            rich_components::render(
+                &rich_plan::RichRenderPlan::new(
+                    document,
+                    context.message_control_handle(channel_id, &message.ts),
+                ),
+                context,
+            )
+        };
         if !rendered.is_empty() {
             return rendered;
         }
         if message.body_text().trim().is_empty() {
-            return unsupported_message_html(channel_id, &message.ts);
+            return unsupported_message_html(channel_id, &message.ts, context);
         }
     }
 
@@ -2615,6 +2647,7 @@ fn message_body_html(
     }
 }
 
+#[allow(dead_code)]
 fn blocks_html(
     channel_id: Option<&str>,
     message_ts: &str,
@@ -2726,6 +2759,7 @@ fn blocks_html(
     rendered
 }
 
+#[allow(dead_code)]
 fn block_action_html(
     channel_id: Option<&str>,
     message_ts: &str,
@@ -2768,6 +2802,7 @@ fn block_action_html(
     ))
 }
 
+#[allow(dead_code)]
 fn external_control_html(
     channel_id: Option<&str>,
     message_ts: &str,
@@ -2776,9 +2811,9 @@ fn external_control_html(
 ) -> String {
     let accessible = gettext("Open this message in Slack to use {label}").replace("{label}", label);
     match channel_id.filter(|channel_id| !channel_id.is_empty()) {
-        Some(channel_id) if !message_ts.is_empty() => format!(
+        Some(_channel_id) if !message_ts.is_empty() => format!(
             "<a class=\"block-action is-external\" href=\"{}\" aria-label=\"{}\">{label_html}<span class=\"external-indicator\" aria-hidden=\"true\">↗</span></a>",
-            escape_html(&message_control_action_url(channel_id, message_ts)),
+            escape_html(""),
             escape_html(&accessible)
         ),
         _ => format!(
@@ -2788,29 +2823,31 @@ fn external_control_html(
     }
 }
 
-pub fn message_control_action_url(channel_id: &str, message_ts: &str) -> String {
+pub(crate) fn message_control_action_url(handle: &MessageControlHandle) -> String {
     format!(
-        "conduit://message-control?channel={}&ts={}",
-        encode_query(channel_id),
-        encode_query(message_ts)
+        "conduit://message-control?id={}",
+        encode_query(handle.as_str())
     )
 }
 
-fn unsupported_message_html(channel_id: Option<&str>, message_ts: &str) -> String {
+fn unsupported_message_html(
+    channel_id: Option<&str>,
+    message_ts: &str,
+    context: &MessageHtmlContext,
+) -> String {
     let label = gettext("Unsupported Slack message");
     let mut html = format!("<p class=\"empty-message\">{}</p>", escape_html(&label));
-    if let Some(channel_id) = channel_id.filter(|channel_id| !channel_id.is_empty()) {
-        if !message_ts.is_empty() {
-            html.push_str(&format!(
-                "<p class=\"block-actions\"><a class=\"block-action is-external\" href=\"{}\">{}<span class=\"external-indicator\" aria-hidden=\"true\">↗</span></a></p>",
-                escape_html(&message_control_action_url(channel_id, message_ts)),
-                escape_html(&gettext("Open in Slack"))
-            ));
-        }
+    if let Some(handle) = context.message_control_handle(channel_id, message_ts) {
+        html.push_str(&format!(
+            "<p class=\"block-actions\"><a class=\"block-action is-external\" href=\"{}\">{}<span class=\"external-indicator\" aria-hidden=\"true\">↗</span></a></p>",
+            escape_html(&message_control_action_url(&handle)),
+            escape_html(&gettext("Open in Slack"))
+        ));
     }
     html
 }
 
+#[allow(dead_code)]
 fn rich_text_block_html(block: &serde_json::Value, context: &MessageHtmlContext) -> String {
     block
         .get("elements")
@@ -2821,6 +2858,7 @@ fn rich_text_block_html(block: &serde_json::Value, context: &MessageHtmlContext)
         .collect()
 }
 
+#[allow(dead_code)]
 fn rich_text_element_html(
     element: &serde_json::Value,
     context: &MessageHtmlContext,
@@ -2862,6 +2900,7 @@ fn rich_text_element_html(
     }
 }
 
+#[allow(dead_code)]
 fn rich_text_inline_children_html(
     element: &serde_json::Value,
     context: &MessageHtmlContext,
@@ -2875,6 +2914,7 @@ fn rich_text_inline_children_html(
         .collect()
 }
 
+#[allow(dead_code)]
 fn rich_text_inline_html(
     element: &serde_json::Value,
     context: &MessageHtmlContext,
@@ -2965,6 +3005,7 @@ fn rich_text_inline_html(
     Some(html)
 }
 
+#[allow(dead_code)]
 fn block_text(value: &serde_json::Value) -> Option<String> {
     if let Some(text) = value.get("text").and_then(|text| text.as_str()) {
         return Some(text.to_string());
@@ -2995,14 +3036,24 @@ fn attachments_html(
     message: &SlackMessage,
     context: &MessageHtmlContext,
 ) -> String {
-    let mut attachments = message
-        .attachments
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter(|attachment| attachment.has_visible_content())
-        .map(|attachment| legacy_attachment_html(channel_id, &message.ts, attachment, context))
-        .collect::<Vec<_>>();
+    let document = if message.content_version == crate::rich_message::MESSAGE_CONTENT_VERSION {
+        crate::rich_message::MessageDocument::default()
+    } else {
+        crate::rich_message_normalize::normalize_attachments(
+            message.attachments.as_deref().unwrap_or_default(),
+        )
+    };
+    let mut attachments = if document.is_empty() {
+        Vec::new()
+    } else {
+        vec![rich_components::render(
+            &rich_plan::RichRenderPlan::new(
+                document,
+                context.message_control_handle(channel_id, &message.ts),
+            ),
+            context,
+        )]
+    };
     attachments.extend(
         message
             .files
@@ -3056,6 +3107,7 @@ fn attachments_html(
     }
 }
 
+#[allow(dead_code)]
 fn legacy_attachment_html(
     channel_id: Option<&str>,
     message_ts: &str,
@@ -3184,6 +3236,7 @@ fn legacy_attachment_html(
     format!("<section class=\"legacy-attachment\">{content}</section>")
 }
 
+#[allow(dead_code)]
 fn linked_attachment_label_html(class_name: &str, label: &str, url: Option<&str>) -> String {
     let label = escape_html(label);
     let label = url
@@ -3198,6 +3251,7 @@ fn linked_attachment_label_html(class_name: &str, label: &str, url: Option<&str>
     format!("<p class=\"{class_name}\">{label}</p>")
 }
 
+#[allow(dead_code)]
 fn legacy_attachment_action_html(
     channel_id: Option<&str>,
     message_ts: &str,
@@ -4177,6 +4231,7 @@ fn push_escaped_html_character(output: &mut String, character: char) {
 mod tests {
     use super::*;
     use crate::activity::{ActivityItem, ActivityKind};
+    use crate::message_handoff::{MessageControlRegistry, TimelineSurfaceId};
     use crate::models::{SavedItem, SlackFile, SlackReaction};
 
     fn message(text: &str) -> SlackMessage {
@@ -4195,6 +4250,22 @@ mod tests {
             ts: ts.to_string(),
             ..Default::default()
         }
+    }
+
+    fn with_message_control(
+        mut context: MessageHtmlContext,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> (MessageHtmlContext, String) {
+        let target = MessageRef::new(channel_id, message_ts).unwrap();
+        let mut registry = MessageControlRegistry::default();
+        let handles = registry
+            .replace_surface(TimelineSurfaceId::Main, [target.clone()])
+            .unwrap();
+        let handle = handles.get(&target).unwrap().clone();
+        let url = message_control_action_url(&handle);
+        context.message_control_handles.insert(target, handle);
+        (context, url.replace('&', "&amp;"))
     }
 
     fn contrast_ratio(foreground: &str, background: &str) -> f64 {
@@ -4434,6 +4505,16 @@ mod tests {
                 "physical directional property in generated CSS: {property}"
             );
         }
+    }
+
+    #[test]
+    fn document_includes_the_rich_message_css_asset() {
+        let html = placeholder_document("Messages", "No messages");
+        let css = document_css(&html);
+
+        assert!(RICH_MESSAGE_CSS.contains(".legacy-attachment"));
+        assert!(RICH_MESSAGE_CSS.contains(".slack-handoff"));
+        assert!(css.contains(RICH_MESSAGE_CSS));
     }
 
     #[test]
@@ -4952,14 +5033,18 @@ mod tests {
             }
         ]));
 
-        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+        let (context, control_url) =
+            with_message_control(MessageHtmlContext::default(), "C123", "1710000000.000100");
+        let html = conversation_document("C123", &[message], &context);
 
         assert!(html
             .contains("<a class=\"block-action\" href=\"https://example.slack.com/canvas/C123\""));
         assert!(html.contains(">Open canvas</a>"));
-        assert!(html
-            .contains("href=\"conduit://message-control?channel=C123&amp;ts=1710000000.000100\""));
-        assert!(html.contains("Callback only<span class=\"external-indicator\""));
+        assert!(html.contains(&format!("href=\"{control_url}\"")));
+        assert!(!control_url.contains("C123"));
+        assert!(!control_url.contains("1710000000"));
+        assert!(html.contains("<span class=\"control-label\">Callback only</span>"));
+        assert!(html.contains("<span class=\"slack-handoff\">Open in Slack</span>"));
         assert!(html.contains(
             "<span class=\"block-action is-unavailable\" aria-disabled=\"true\">Unsafe</span>"
         ));
@@ -4992,6 +5077,7 @@ mod tests {
             }]
         }))
         .unwrap();
+        message.refresh_canonical_content();
         message.text = None;
         let context = MessageHtmlContext {
             image_assets: HashMap::from([
@@ -5006,6 +5092,7 @@ mod tests {
             ]),
             ..Default::default()
         };
+        let (context, control_url) = with_message_control(context, "C123", "1710000000.000100");
 
         let html = conversation_document("C123", &[message], &context);
 
@@ -5016,9 +5103,43 @@ mod tests {
         assert!(html.contains("Example Person"));
         assert!(html.contains("data:image/png;base64,request"));
         assert!(html.contains("Approve"));
-        assert!(html.contains("conduit://message-control?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains(&control_url));
         assert!(!html.contains("private-callback"));
         assert!(!html.contains("private-approval-value"));
+    }
+
+    #[test]
+    fn canonical_app_author_never_receives_person_actions_or_presence() {
+        let mut message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000000.000100",
+            "user": "U_BOT",
+            "bot_id": "B123",
+            "app_id": "A123",
+            "bot_profile": { "name": "People assistant" },
+            "text": "A request needs review"
+        }))
+        .unwrap();
+        message.refresh_canonical_content();
+        let context = MessageHtmlContext {
+            user_names: HashMap::from([("U_BOT".to_string(), "Wrong person".to_string())]),
+            user_statuses: HashMap::from([(
+                "U_BOT".to_string(),
+                SlackUserStatus {
+                    text: "Online".to_string(),
+                    expiration: i64::MAX,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message], &context);
+
+        assert!(html.contains("People assistant"));
+        assert!(!html.contains("Wrong person"));
+        assert!(!html.contains("<details class=\"author-actions\""));
+        assert!(!html.contains("<span class=\"user-status\""));
+        assert!(!html.contains("data-author-user-id=\"U_BOT\""));
     }
 
     #[test]
@@ -5080,8 +5201,11 @@ mod tests {
                 ]
             }
         ]));
+        message.refresh_canonical_content();
 
-        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+        let (context, control_url) =
+            with_message_control(MessageHtmlContext::default(), "C123", "1710000000.000100");
+        let html = conversation_document("C123", &[message], &context);
 
         for content in [
             "Issue updated",
@@ -5099,6 +5223,7 @@ mod tests {
         }
         assert!(html.contains("href=\"https://issues.example.test/ABC-1\""));
         assert_eq!(html.matches("conduit://message-control?").count(), 3);
+        assert_eq!(html.matches(&control_url).count(), 3);
         for private in [
             "private-action",
             "private-value",
@@ -5116,11 +5241,44 @@ mod tests {
         let mut message = message("");
         message.blocks = Some(serde_json::json!([{ "type": "future_widget" }]));
 
-        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+        let (context, control_url) =
+            with_message_control(MessageHtmlContext::default(), "C123", "1710000000.000100");
+        let html = conversation_document("C123", &[message], &context);
 
         assert!(html.contains("Unsupported Slack message"));
         assert!(html.contains("Open in Slack"));
-        assert!(html.contains("conduit://message-control?channel=C123&amp;ts=1710000000.000100"));
+        assert!(html.contains(&control_url));
+    }
+
+    #[test]
+    fn rich_fixture_dom_exposes_color_handoff_and_image_accessory() {
+        let mut bob = test_fixtures::bob_message();
+        bob.refresh_canonical_content();
+        let (bob_context, _) =
+            with_message_control(MessageHtmlContext::default(), "C123", "1710000000.000100");
+        let bob_html = conversation_document("C123", &[bob], &bob_context);
+
+        assert!(bob_html.contains(
+            "<section class=\"legacy-attachment\" style=\"--attachment-accent:#2eb67d\""
+        ));
+        assert!(bob_html.contains("<span class=\"control-label\">Approve</span>"));
+        assert!(bob_html.contains("<span class=\"slack-handoff\">Open in Slack</span>"));
+        assert!(!bob_html.contains("private-callback"));
+        assert!(!bob_html.contains("private-approval-value"));
+
+        let mut jira = test_fixtures::jira_message();
+        jira.refresh_canonical_content();
+        let (jira_context, _) =
+            with_message_control(MessageHtmlContext::default(), "C123", "1710000000.000100");
+        let jira_html = conversation_document("C123", &[jira], &jira_context);
+
+        assert!(jira_html.contains("<div class=\"block-accessory\">"));
+        assert!(jira_html.contains("class=\"image-link\""));
+        assert!(jira_html.contains("alt=\"Issue icon\""));
+        assert!(jira_html.contains("Open issue"));
+        assert!(jira_html.contains("<span class=\"slack-handoff\">Open in Slack</span>"));
+        assert_eq!(jira_html.matches("conduit://message-control?").count(), 3);
+        assert!(!jira_html.contains("ignored-sibling-value"));
     }
 
     #[test]

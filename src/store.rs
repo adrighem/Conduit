@@ -22,6 +22,7 @@ use crate::models::{
     slack_timestamp_is_after, SlackConversation, SlackConversationUnreadSnapshot, SlackMessage,
     SlackUserStatus,
 };
+use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 
 pub(crate) const CACHE_VERSION: u32 = 1;
@@ -1514,6 +1515,7 @@ impl WorkspaceStore {
                 )
             })
             .await?
+            .map(normalize_cached_messages)
             .map(channel_timeline_messages)
             .filter(|messages| !messages.is_empty()))
     }
@@ -1533,19 +1535,21 @@ impl WorkspaceStore {
         let workspace_key = self.workspace_key.clone();
         let workspace_id = self.workspace_id.clone();
         let channel_id = channel_id.to_string();
-        let messages = messages.to_vec();
+        let messages = normalize_cached_messages(messages.to_vec());
         self.hub()
             .await?
             .write(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let existing = load_sqlite_item::<Vec<SlackMessage>>(
-                    &transaction,
-                    &workspace_key,
-                    "channel_history",
-                    &channel_id,
-                )?
-                .unwrap_or_default();
+                let existing = normalize_cached_messages(
+                    load_sqlite_item::<Vec<SlackMessage>>(
+                        &transaction,
+                        &workspace_key,
+                        "channel_history",
+                        &channel_id,
+                    )?
+                    .unwrap_or_default(),
+                );
                 let merged = merge_channel_history_pages(&existing, &messages);
                 let mut changed =
                     ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
@@ -1579,6 +1583,7 @@ impl WorkspaceStore {
                 )
             })
             .await?
+            .map(normalize_cached_messages)
             .filter(|messages| !messages.is_empty()))
     }
 
@@ -1602,19 +1607,21 @@ impl WorkspaceStore {
         let key = thread_key(channel_id, thread_ts);
         let workspace_key = self.workspace_key.clone();
         let workspace_id = self.workspace_id.clone();
-        let messages = messages.to_vec();
+        let messages = normalize_cached_messages(messages.to_vec());
         self.hub()
             .await?
             .write(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let existing = load_sqlite_item::<Vec<SlackMessage>>(
-                    &transaction,
-                    &workspace_key,
-                    "thread_replies",
-                    &key,
-                )?
-                .unwrap_or_default();
+                let existing = normalize_cached_messages(
+                    load_sqlite_item::<Vec<SlackMessage>>(
+                        &transaction,
+                        &workspace_key,
+                        "thread_replies",
+                        &key,
+                    )?
+                    .unwrap_or_default(),
+                );
                 let merged = merge_history_pages(&existing, &messages);
                 let mut changed =
                     ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
@@ -2201,13 +2208,17 @@ fn load_sqlite_state(
             "channel_history" => {
                 state.channel_histories.insert(
                     item_key,
-                    serde_json::from_str(&payload).context("invalid cached channel history")?,
+                    normalize_cached_messages(
+                        serde_json::from_str(&payload).context("invalid cached channel history")?,
+                    ),
                 );
             }
             "thread_replies" => {
                 state.thread_replies.insert(
                     item_key,
-                    serde_json::from_str(&payload).context("invalid cached thread replies")?,
+                    normalize_cached_messages(
+                        serde_json::from_str(&payload).context("invalid cached thread replies")?,
+                    ),
                 );
             }
             "thread_record" => state
@@ -2618,10 +2629,20 @@ fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String),
         insert_state_item(&mut items, "user_status", key.clone(), value)?;
     }
     for (key, value) in &state.channel_histories {
-        insert_state_item(&mut items, "channel_history", key.clone(), value)?;
+        insert_state_item(
+            &mut items,
+            "channel_history",
+            key.clone(),
+            &normalize_cached_messages(value.clone()),
+        )?;
     }
     for (key, value) in &state.thread_replies {
-        insert_state_item(&mut items, "thread_replies", key.clone(), value)?;
+        insert_state_item(
+            &mut items,
+            "thread_replies",
+            key.clone(),
+            &normalize_cached_messages(value.clone()),
+        )?;
     }
     for record in &state.thread_catalog {
         insert_state_item(
@@ -3374,7 +3395,7 @@ mod tests {
     fn workspace_store_round_trips_rich_bot_message_fields() {
         let directory = temp_cache_dir("rich-bot-history");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");
-        let message = SlackMessage {
+        let mut message = SlackMessage {
             ts: "1710000000.000200".to_string(),
             bot_id: Some("B123".to_string()),
             app_id: Some("A123".to_string()),
@@ -3400,6 +3421,7 @@ mod tests {
             }]),
             ..Default::default()
         };
+        message.refresh_canonical_content();
 
         runtime().block_on(async {
             store
@@ -3411,9 +3433,107 @@ mod tests {
                 .await
                 .expect("rich history load failed")
                 .expect("missing rich history");
-            assert_eq!(restored, vec![message]);
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].author_label(), "People assistant");
+            assert_eq!(restored[0].visible_text(), "Review request");
+            assert_eq!(restored[0].accessible_text(), "Review request\nApprove");
+            assert!(restored[0].blocks.is_none());
+            assert!(restored[0].attachments.is_none());
         });
 
+        let connection = Connection::open(store.database_path()).unwrap();
+        let payload: String = connection
+            .query_row(
+                "SELECT payload_json FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'channel_history' AND item_key = 'C123'",
+                [&store.workspace_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!payload.contains("test-action-value"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn legacy_cached_history_is_upgraded_to_canonical_content() {
+        let directory = temp_cache_dir("legacy-rich-history");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_history(
+                    "C123",
+                    &[SlackMessage {
+                        ts: "1710000000.000300".to_string(),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+        });
+        let connection = Connection::open(store.database_path()).unwrap();
+        let legacy_payload = serde_json::json!([{
+            "ts": "1710000000.000300",
+            "bot_profile": {"name": "People assistant"},
+            "attachments": [{"title": "Review request"}]
+        }])
+        .to_string();
+        connection
+            .execute(
+                "UPDATE workspace_items SET payload_json = ?1
+                 WHERE workspace_key = ?2 AND kind = 'channel_history' AND item_key = 'C123'",
+                params![legacy_payload, store.workspace_key],
+            )
+            .unwrap();
+        drop(connection);
+
+        runtime().block_on(async {
+            let restored = store.load_history("C123").await.unwrap().unwrap();
+            assert_eq!(
+                restored[0].content_version,
+                crate::rich_message::MESSAGE_CONTENT_VERSION
+            );
+            assert_eq!(restored[0].author_label(), "People assistant");
+            assert_eq!(restored[0].visible_text(), "Review request");
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn richer_fresh_message_replaces_legacy_cached_message_with_same_timestamp() {
+        let directory = temp_cache_dir("fresh-replaces-legacy");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_history(
+                    "C123",
+                    &[SlackMessage {
+                        ts: "1710000000.000400".to_string(),
+                        text: Some("Legacy fallback".to_string()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+            store
+                .store_merged_history(
+                    "C123",
+                    &[SlackMessage {
+                        ts: "1710000000.000400".to_string(),
+                        attachments: Some(vec![crate::models::SlackAttachment {
+                            title: Some("Fresh request".to_string()),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let restored = store.load_history("C123").await.unwrap().unwrap();
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].visible_text(), "Fresh request");
+        });
         let _ = std::fs::remove_dir_all(directory);
     }
 

@@ -3,8 +3,16 @@ use std::collections::HashMap;
 
 pub fn extract_user_ids(message: &SlackMessage) -> Vec<String> {
     let mut ids = Vec::new();
-    if let Some(user) = message.user.as_ref() {
-        ids.push(user.clone());
+    if let Some(user) = message.author_user_id() {
+        ids.push(user.to_string());
+    }
+    if message.content_version == crate::rich_message::MESSAGE_CONTENT_VERSION {
+        ids.extend(
+            message
+                .document
+                .mentioned_user_ids()
+                .map(ToString::to_string),
+        );
     }
     extract_mentions(&message.visible_text(), &mut ids);
     ids.extend(

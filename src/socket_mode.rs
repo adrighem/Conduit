@@ -11,6 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::auth::browser_session_cookie_header;
 use crate::models::{SlackMessage, SlackUser};
 use crate::realtime::RealtimeTransport;
+use crate::slack_message_wire::SlackMessageWire;
 
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
 const CLIENT_WEBSOCKET_URL: &str = "https://slack.com/api/client.getWebSocketURL";
@@ -326,7 +327,9 @@ fn message_event(event: &Value) -> Option<SocketModeMessageEvent> {
     match subtype {
         Some("message_changed" | "message_replied") => {
             let message = event.get("message")?;
-            let message = serde_json::from_value::<SlackMessage>(message.clone()).ok()?;
+            let message = SlackMessageWire::from_value(message.clone())
+                .into_message()
+                .ok()?;
             non_empty_message(channel_id, message, SocketModeMessageKind::Changed)
         }
         Some("message_deleted") => {
@@ -334,8 +337,8 @@ fn message_event(event: &Value) -> Option<SocketModeMessageEvent> {
             let previous = event
                 .get("previous_message")
                 .cloned()
-                .and_then(|value| serde_json::from_value::<SlackMessage>(value).ok());
-            let message = SlackMessage {
+                .and_then(|value| SlackMessageWire::from_value(value).into_message().ok());
+            let mut message = SlackMessage {
                 ts: deleted_ts.to_string(),
                 subtype: Some("message_deleted".to_string()),
                 user: previous.as_ref().and_then(|message| message.user.clone()),
@@ -348,10 +351,13 @@ fn message_event(event: &Value) -> Option<SocketModeMessageEvent> {
                 reactions: previous.and_then(|message| message.reactions),
                 ..Default::default()
             };
+            message.refresh_canonical_content();
             non_empty_message(channel_id, message, SocketModeMessageKind::Deleted)
         }
         _ => {
-            let message = serde_json::from_value::<SlackMessage>(event.clone()).ok()?;
+            let message = SlackMessageWire::from_value(event.clone())
+                .into_message()
+                .ok()?;
             non_empty_message(channel_id, message, SocketModeMessageKind::Posted)
         }
     }
@@ -567,19 +573,21 @@ mod tests {
             "text": "hello",
             "ts": "1710000000.000100"
         })));
+        let mut expected_message = SlackMessage {
+            kind: Some("message".to_string()),
+            user: Some("U123".to_string()),
+            text: Some("hello".to_string()),
+            ts: "1710000000.000100".to_string(),
+            ..Default::default()
+        };
+        expected_message.refresh_canonical_content();
 
         assert_eq!(
             event,
             Some(SocketModeEvent::Message(Box::new(SocketModeMessageEvent {
                 channel_id: "C123".to_string(),
                 kind: SocketModeMessageKind::Posted,
-                message: SlackMessage {
-                    kind: Some("message".to_string()),
-                    user: Some("U123".to_string()),
-                    text: Some("hello".to_string()),
-                    ts: "1710000000.000100".to_string(),
-                    ..Default::default()
-                }
+                message: expected_message,
             })))
         );
     }

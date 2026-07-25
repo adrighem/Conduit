@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed architecture for rendering and interacting with Slack messages produced by apps and bots.
+Implemented architecture for rendering and interacting with Slack messages produced by apps and
+bots. The canonical implementation lives in `rich_message.rs`, `rich_message_normalize.rs`,
+`slack_message_wire.rs`, `message_html/rich_*`, and `message_handoff.rs`.
 
 This design covers:
 
@@ -15,14 +17,14 @@ This design covers:
 
 It does not turn Conduit into a Block Kit authoring tool or a host for Slack apps.
 
-## Problem
+## Original Problem
 
-Conduit currently deserializes Web API history and realtime events directly into `SlackMessage`.
+Conduit previously deserialized Web API history and realtime events directly into `SlackMessage`.
 That type retains text, files, and raw blocks, but drops legacy attachments and bot/app identity.
 The renderer supports only a subset of blocks, treats callback actions as inert labels, and uses
 `attachments_html` for files rather than Slack attachments.
 
-This causes two distinct failures:
+That caused two distinct failures:
 
 1. Attachment-only messages, such as some Bob messages, can become blank and lose their author.
 2. Block Kit messages, such as Jira messages, can display content but cannot expose their controls
