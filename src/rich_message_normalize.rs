@@ -233,6 +233,7 @@ pub(crate) fn normalize_attachments(attachments: &[SlackAttachment]) -> RichDocu
     let nodes = attachments
         .iter()
         .filter_map(normalize_attachment)
+        .map(Box::new)
         .map(RichNode::Attachment)
         .collect();
     RichDocument::new(nodes, None)

@@ -341,7 +341,7 @@ impl SafeSlackPermalink {
     ) -> Result<Self, PermalinkPolicyError> {
         let mut workspace = validated_workspace_url(workspace_url)?;
         let timestamp =
-            permalink_timestamp(target.timestamp()).ok_or(PermalinkPolicyError::InvalidMessage)?;
+            permalink_timestamp(target.timestamp()).ok_or(PermalinkPolicyError::Message)?;
         workspace.set_path(&format!("/archives/{}/p{timestamp}", target.channel_id()));
         workspace.set_query(None);
         workspace.set_fragment(None);
@@ -354,8 +354,7 @@ impl SafeSlackPermalink {
         target: &MessageRef,
     ) -> Result<Self, PermalinkPolicyError> {
         let expected = Self::construct(workspace_url, target)?;
-        let candidate =
-            url::Url::parse(permalink).map_err(|_| PermalinkPolicyError::InvalidPermalink)?;
+        let candidate = url::Url::parse(permalink).map_err(|_| PermalinkPolicyError::Permalink)?;
         if candidate.scheme() != "https"
             || !candidate.username().is_empty()
             || candidate.password().is_some()
@@ -365,7 +364,7 @@ impl SafeSlackPermalink {
             || candidate.fragment().is_some()
             || !valid_message_permalink_query(&candidate, target.channel_id())
         {
-            return Err(PermalinkPolicyError::InvalidPermalink);
+            return Err(PermalinkPolicyError::Permalink);
         }
         Ok(Self(candidate))
     }
@@ -382,8 +381,7 @@ impl fmt::Debug for SafeSlackPermalink {
 }
 
 fn validated_workspace_url(workspace_url: &str) -> Result<url::Url, PermalinkPolicyError> {
-    let workspace =
-        url::Url::parse(workspace_url).map_err(|_| PermalinkPolicyError::InvalidWorkspace)?;
+    let workspace = url::Url::parse(workspace_url).map_err(|_| PermalinkPolicyError::Workspace)?;
     if workspace.scheme() != "https"
         || !workspace.username().is_empty()
         || workspace.password().is_some()
@@ -391,7 +389,7 @@ fn validated_workspace_url(workspace_url: &str) -> Result<url::Url, PermalinkPol
             .host_str()
             .is_some_and(|host| host.ends_with(".slack.com"))
     {
-        return Err(PermalinkPolicyError::InvalidWorkspace);
+        return Err(PermalinkPolicyError::Workspace);
     }
     Ok(workspace)
 }
@@ -426,17 +424,17 @@ fn permalink_timestamp(timestamp: &str) -> Option<String> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PermalinkPolicyError {
-    InvalidWorkspace,
-    InvalidMessage,
-    InvalidPermalink,
+    Workspace,
+    Message,
+    Permalink,
 }
 
 impl fmt::Display for PermalinkPolicyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidWorkspace => formatter.write_str("invalid Slack workspace URL"),
-            Self::InvalidMessage => formatter.write_str("invalid Slack message location"),
-            Self::InvalidPermalink => formatter.write_str("unsafe Slack message permalink"),
+            Self::Workspace => formatter.write_str("invalid Slack workspace URL"),
+            Self::Message => formatter.write_str("invalid Slack message location"),
+            Self::Permalink => formatter.write_str("unsafe Slack message permalink"),
         }
     }
 }

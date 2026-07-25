@@ -129,7 +129,7 @@ pub enum MessageNode {
     Divider,
     Actions(Vec<MessageControl>),
     RichText(Vec<RichTextNode>),
-    Attachment(MessageAttachment),
+    Attachment(Box<MessageAttachment>),
     Unsupported {
         type_label: String,
         fallback: Option<String>,
