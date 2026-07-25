@@ -1,0 +1,7 @@
+Phase: Acceptance and documentation
+
+Local verification: cargo fmt --check; cargo check; full cargo test (666 passed, 2 ignored before the final lint-only shape fix); focused post-fix canonical tests; Meson compile; Meson test (15/15).
+
+CI verification for 2628864: CI 30151498454 passed format, workflow lint, strict Clippy, native-huddle Clippy, standard Meson and native-huddle Meson; CodeQL 30151498479 passed; Release 30151498449 passed.
+
+Manual acceptance: Bob-like attachment content and controls, Jira-like blocks and controls, app identity behavior, opaque one-shot handoff URLs, exact-message fallback, malformed sibling isolation, cache upgrade, and sensitive-value exclusion were inspected through synthetic fixtures and generated DOM assertions.
