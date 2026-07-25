@@ -79,5 +79,5 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Rich bot messages and controls
+## [x] Track: Rich bot messages and controls
 *Link: [./conductor/tracks/rich_bot_messages_20260724/](./conductor/tracks/rich_bot_messages_20260724/)*

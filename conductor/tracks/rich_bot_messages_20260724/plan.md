@@ -35,10 +35,10 @@
 - [x] Task: Reject stale, replayed, cross-session, and forged activations and suppress duplicate in-flight handoffs e41bb50
 - [x] Task: Conductor - User Manual Verification 'Exact Slack handoff and integration' (Protocol in workflow.md) 92438ba
 
-## Phase 4: Acceptance and documentation
+## Phase 4: Acceptance and documentation [checkpoint: c17fdea]
 
 - [x] Task: Run formatting, strict Clippy, Rust tests, Meson compilation, and Meson tests cd28961
 - [x] Task: Synchronize architecture and product documentation 15509ae
 - [x] Task: Add shared synthetic Bob/Jira fixtures and contributor documentation for extending rich messages e41bb50
-- [~] Task: Run formatting, strict Clippy, Rust tests, Meson builds, DOM/headless tests, Release, and CodeQL
-- [ ] Task: Conductor - User Manual Verification 'Acceptance and documentation' (Protocol in workflow.md)
+- [x] Task: Run formatting, strict Clippy, Rust tests, Meson builds, DOM/headless tests, Release, and CodeQL 2628864
+- [x] Task: Conductor - User Manual Verification 'Acceptance and documentation' (Protocol in workflow.md) c17fdea
