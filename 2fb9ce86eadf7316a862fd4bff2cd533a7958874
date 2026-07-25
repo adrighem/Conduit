@@ -1,0 +1,5 @@
+Phase: Rich presentation and honest controls
+
+Verification: focused message HTML tests passed (74/74 after canonical migration); Bob and Jira synthetic DOM fixtures render attachment color, image accessories, rich text, safe URL controls, and visible Slack handoff labels; app authors have no person actions or presence.
+
+Manual acceptance: inspected generated DOM assertions for accessible labels, opaque URLs, malformed sibling isolation, and absence of callback/action values.
