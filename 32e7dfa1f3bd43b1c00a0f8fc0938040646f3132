@@ -1,0 +1,5 @@
+Phase: Lossless message model and cache
+
+Verification: cargo check passed; full cargo test passed (666 passed, 2 ignored); canonical cache round-trip, legacy upgrade, fresh-over-old replacement, mention projection, and sensitive-data redaction tests passed.
+
+Manual acceptance: inspected persisted payload behavior and canonical author/document projections; raw callback values are absent from cache output and diagnostics.
