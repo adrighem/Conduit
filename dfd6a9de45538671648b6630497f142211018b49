@@ -1,0 +1,7 @@
+Task: Automated validation for rich bot messages
+
+Summary: CI passed formatting, workflow lint, strict Clippy, native huddle lint, standard Meson build, and native huddle Meson build. Release and CodeQL also passed for cd28961.
+
+Modified files: conductor/tracks/rich_bot_messages_20260724/plan.md
+
+Rationale: Record clean-environment validation while leaving user-facing manual verification pending.
