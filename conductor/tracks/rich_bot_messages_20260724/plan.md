@@ -23,22 +23,22 @@
 - [x] Task: Extract owned rich-message CSS and complete structured attachment and image-accessory presentation e41bb50
 - [x] Task: Conductor - User Manual Verification 'Rich presentation and honest controls' (Protocol in workflow.md) 2fb9ce8
 
-## Phase 3: Exact Slack handoff and integration
+## Phase 3: Exact Slack handoff and integration [checkpoint: 92438ba]
 
 - [x] Task: Add failing permalink API and message-control routing tests 15509ae
 - [x] Task: Implement chat.getPermalink and external exact-message handoff 15509ae
 - [x] Task: Route control activation through typed runtime commands and refresh-safe state 15509ae
 - [x] Task: Verify Web API, realtime, coordinator, and store replacement behavior 15509ae
-- [ ] Task: Add failing opaque-handle lifecycle, handoff policy, safe-URL, and external-opener tests
-- [ ] Task: Implement presenter-owned opaque control handles scoped to session, generation, message revision, and capability
-- [ ] Task: Extract exact-message handoff behind typed provider, validation, provenance, cache, and opener ports
-- [ ] Task: Reject stale, replayed, cross-session, and forged activations and suppress duplicate in-flight handoffs
-- [ ] Task: Conductor - User Manual Verification 'Exact Slack handoff and integration' (Protocol in workflow.md)
+- [x] Task: Add failing opaque-handle lifecycle, handoff policy, safe-URL, and external-opener tests e41bb50
+- [x] Task: Implement presenter-owned opaque control handles scoped to session, generation, message revision, and capability e41bb50
+- [x] Task: Extract exact-message handoff behind typed provider, validation, provenance, cache, and opener ports e41bb50
+- [x] Task: Reject stale, replayed, cross-session, and forged activations and suppress duplicate in-flight handoffs e41bb50
+- [x] Task: Conductor - User Manual Verification 'Exact Slack handoff and integration' (Protocol in workflow.md) 92438ba
 
 ## Phase 4: Acceptance and documentation
 
 - [x] Task: Run formatting, strict Clippy, Rust tests, Meson compilation, and Meson tests cd28961
 - [x] Task: Synchronize architecture and product documentation 15509ae
-- [ ] Task: Add shared synthetic Bob/Jira fixtures and contributor documentation for extending rich messages
-- [ ] Task: Run formatting, strict Clippy, Rust tests, Meson builds, DOM/headless tests, Release, and CodeQL
+- [x] Task: Add shared synthetic Bob/Jira fixtures and contributor documentation for extending rich messages e41bb50
+- [~] Task: Run formatting, strict Clippy, Rust tests, Meson builds, DOM/headless tests, Release, and CodeQL
 - [ ] Task: Conductor - User Manual Verification 'Acceptance and documentation' (Protocol in workflow.md)
