@@ -1,0 +1,1 @@
+CI root cause: Rust 1.97 Clippy rejected common enum prefixes and an oversized canonical AST variant. Renamed policy error variants and boxed the large attachment node. Focused canonical normalization tests and cargo check pass.
