@@ -1,15 +1,15 @@
 # Rich Bot Messages Plan
 
-## Phase 1: Lossless message model and cache
+## Phase 1: Lossless message model and cache [checkpoint: 32e7dfa]
 
 - [x] Task: Add failing model and cache round-trip tests for attachments and bot identity 15509ae
 - [x] Task: Retain typed legacy attachments, controls, and bot/app identity 15509ae
 - [x] Task: Centralize visible/accessibility fallback and notification eligibility 15509ae
-- [~] Task: Add failing decoder, canonical-document, sensitive-value, cache-version, and fresh-over-old replacement tests
-- [ ] Task: Introduce a bounded Slack wire decoder and canonical message author/document/control model
-- [ ] Task: Derive fallback, accessibility, notifications, and mentions from the canonical document
-- [ ] Task: Persist versioned canonical content while preserving compatibility with existing cache rows
-- [ ] Task: Conductor - User Manual Verification 'Lossless message model and cache' (Protocol in workflow.md)
+- [x] Task: Add failing decoder, canonical-document, sensitive-value, cache-version, and fresh-over-old replacement tests e41bb50
+- [x] Task: Introduce a bounded Slack wire decoder and canonical message author/document/control model e41bb50
+- [x] Task: Derive fallback, accessibility, notifications, and mentions from the canonical document e41bb50
+- [x] Task: Persist versioned canonical content while preserving compatibility with existing cache rows e41bb50
+- [x] Task: Conductor - User Manual Verification 'Lossless message model and cache' (Protocol in workflow.md) 32e7dfa
 
 ## Phase 2: Rich presentation and honest controls
 
