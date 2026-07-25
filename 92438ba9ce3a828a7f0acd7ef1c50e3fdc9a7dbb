@@ -1,0 +1,5 @@
+Phase: Exact Slack handoff and integration
+
+Verification: 21 handoff tests passed, covering opaque redacted handles, session/surface/revision invalidation, one-shot replay rejection, forged input, exact permalink validation, explicit fallback provenance, bounded LRU caching, and safe external opener behavior. Runtime, realtime, store, and window integration passed the full suite.
+
+Manual acceptance: verified custom URLs contain only opaque identifiers and callback activation resolves against current coordinator state before dispatch.
