@@ -246,6 +246,17 @@ def test_rust_toolchain_is_pinned_across_local_ci_and_release() -> None:
     assert f'RUST_VERSION: "{channel}"' in release_workflow
 
 
+def test_local_meson_suite_enforces_strict_rust_lints() -> None:
+    rust_build = read("src/meson.build")
+    assert "test('Rust strict lints'" in rust_build
+    assert "'clippy'," in rust_build
+    assert "'--locked'," in rust_build
+    assert "'--all-targets'," in rust_build
+    assert "cargo_clippy_args += ['--features', cargo_features_arg]" in rust_build
+    assert "'-D', 'warnings'" in rust_build
+    assert "suite: 'rust-lint'" in rust_build
+
+
 def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
     workflow = read(".github/workflows/release.yml")
     jobs = workflow_jobs(workflow)
@@ -521,6 +532,7 @@ def main() -> None:
     tests = [
         test_release_versions_are_synchronized,
         test_rust_toolchain_is_pinned_across_local_ci_and_release,
+        test_local_meson_suite_enforces_strict_rust_lints,
         test_release_workflow_builds_validates_and_publishes_all_assets,
         test_generated_release_pull_requests_use_verified_dispatched_ci,
         test_release_build_tests_reuse_the_release_profile,

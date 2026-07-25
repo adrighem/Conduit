@@ -9,6 +9,7 @@ gnome.compile_resources('conduit',
 )
 
 cargo_bin  = find_program('cargo')
+cargo_clippy_bin = find_program('cargo-clippy', required: false)
 cargo_release_arg = ''
 cargo_features = []
 cargo_env = environment()
@@ -104,3 +105,41 @@ test('Cargo tests',
   timeout: 300,
   depends: cargo_build,
 )
+
+cargo_clippy_compatible = false
+if cargo_clippy_bin.found()
+  clippy_version = run_command(cargo_clippy_bin, '--version', check: false)
+  clippy_version_parts = clippy_version.stdout().strip().split('.')
+  rust_version_parts = meson.get_compiler('rust').version().split('.')
+  cargo_clippy_compatible = clippy_version.returncode() == 0 and \
+    clippy_version_parts.length() >= 3 and \
+    rust_version_parts.length() >= 2 and \
+    clippy_version_parts[2] == rust_version_parts[1]
+  if not cargo_clippy_compatible
+    warning('Skipping strict Rust lints: cargo-clippy does not match rustc')
+  endif
+endif
+
+if cargo_clippy_compatible
+  cargo_clippy_args = [
+    'clippy',
+    '--locked',
+    '--manifest-path', meson.project_source_root() / 'Cargo.toml',
+    '--target-dir', meson.project_build_root() / 'src',
+    '--all-targets',
+  ]
+  if cargo_features_arg != ''
+    cargo_clippy_args += ['--features', cargo_features_arg]
+  endif
+  cargo_clippy_args += ['--', '-D', 'warnings']
+
+  test('Rust strict lints',
+    cargo_bin,
+    args: cargo_clippy_args,
+    env: cargo_env,
+    suite: 'rust-lint',
+    timeout: 300,
+    depends: cargo_build,
+    is_parallel: false,
+  )
+endif
