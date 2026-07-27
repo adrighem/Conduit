@@ -6156,6 +6156,10 @@ mod tests {
     #[derive(Clone)]
     struct TraceWriter(Arc<Mutex<Vec<u8>>>);
 
+    // Tracing callsite interest is process-wide, so local subscriber captures
+    // must not rebuild it concurrently.
+    static TRACE_SUBSCRIBER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     impl Write for TraceWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -6172,6 +6176,9 @@ mod tests {
 
     #[test]
     fn runtime_trace_output_contains_correlation_fields_and_redacts_signed_urls() {
+        let _trace_guard = TRACE_SUBSCRIBER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = TraceWriter(Arc::clone(&output));
         let subscriber = tracing_subscriber::fmt()
@@ -6216,6 +6223,9 @@ mod tests {
 
     #[test]
     fn attention_traces_contain_only_stable_categories_and_counters() {
+        let _trace_guard = TRACE_SUBSCRIBER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = TraceWriter(Arc::clone(&output));
         let subscriber = tracing_subscriber::fmt()
