@@ -81,3 +81,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [x] Track: Rich bot messages and controls
 *Link: [./conductor/tracks/rich_bot_messages_20260724/](./conductor/tracks/rich_bot_messages_20260724/)*
+
+---
+
+## [~] Track: Starred priority conversations
+*Link: [./conductor/tracks/priority_conversations_20260727/](./conductor/tracks/priority_conversations_20260727/)*
