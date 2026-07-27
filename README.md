@@ -20,6 +20,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 
 - Adaptive GNOME interface for channels, direct messages, and group messages.
 - Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state. The default sidebar keeps relevant DMs compact; **Show All Conversations** and the conversation switcher expose the full catalog.
+- A Priority section mirrors Slack conversation stars, listing starred DMs as VIP conversations before starred channels. Sidebar context menus can star or unstar channels and DMs.
 - Sections for Messages, Unreads, observed threads, Files, and Later.
 - Fast conversation switcher with discovery of channels and people.
 - Create public or private channels, start direct or group messages, and add people to existing conversations when Slack permissions allow it.
@@ -73,6 +74,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 
 - Conduit intentionally manages one connected Slack workspace session at a time.
 - OAuth requires your own Slack app unless a packaged build supplies a client ID.
+- Slack does not expose its separate paid-plan VIP preference through the public API, so Conduit's VIP projection consists of starred DMs.
 - Socket Mode is optional and requires separate Slack app configuration and an `xapp-` token.
 - Workspace search is bounded by Slack's search API and cannot guarantee arbitrary middle-of-word discovery outside the candidates Slack returns.
 - Slack's public API cannot enumerate every historical subscribed thread. Conduit retains and reconciles every thread it discovers, but a fresh installation builds its thread catalog progressively as history and replies are fetched.
