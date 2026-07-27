@@ -43,7 +43,7 @@ use crate::slack::{
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
-    AttentionObservationStatus, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
+    AttentionObservationStatus, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
 };
 use crate::thread_catalog::ThreadRecord;
 use crate::workspace_pipeline::{
@@ -1186,9 +1186,12 @@ struct RuntimeConnection {
     user_cache: Arc<Mutex<HashMap<String, String>>>,
     read_marks: Arc<Mutex<HashMap<String, String>>>,
     message_handoffs: Arc<Mutex<MessageHandoffResolver>>,
+    conversation_star_sync: ConversationStarSyncGate,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
 }
+
+type ConversationStarSyncGate = Arc<tokio::sync::Mutex<()>>;
 
 #[derive(Clone, Debug, Default)]
 struct WorkspaceReducerAdapter {
@@ -2232,6 +2235,7 @@ fn spawn_authentication_task<F>(
                             message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(
                                 256,
                             ))),
+                            conversation_star_sync: ConversationStarSyncGate::default(),
                             team_id: auth.team_id.clone(),
                             huddles,
                         };
@@ -2354,6 +2358,7 @@ fn spawn_workspace_tasks(
                     WorkspacePipelineContext {
                         store: &refresh_connection.workspace_store,
                         reducer: &refresh_connection.workspace,
+                        conversation_star_sync: &refresh_connection.conversation_star_sync,
                     },
                     cached_user_names,
                     refresh_connection.team_id.as_deref(),
@@ -2579,6 +2584,7 @@ async fn handle_connected_command(
         user_cache: &mut user_cache,
         read_marks: &mut read_marks,
         message_handoffs: &connection.message_handoffs,
+        conversation_star_sync: &connection.conversation_star_sync,
         team_id: connection.team_id.as_deref(),
         workspace_url: connection.workspace_url.as_deref(),
         huddles: &connection.huddles,
@@ -2613,6 +2619,7 @@ struct RuntimeContext<'a> {
     user_cache: &'a mut HashMap<String, String>,
     read_marks: &'a mut HashMap<String, String>,
     message_handoffs: &'a Arc<Mutex<MessageHandoffResolver>>,
+    conversation_star_sync: &'a ConversationStarSyncGate,
     team_id: Option<&'a str>,
     workspace_url: Option<&'a str>,
     huddles: &'a HuddleActorHandle,
@@ -2622,6 +2629,7 @@ struct RuntimeContext<'a> {
 struct WorkspacePipelineContext<'a> {
     store: &'a Option<WorkspaceStore>,
     reducer: &'a WorkspaceReducerAdapter,
+    conversation_star_sync: &'a ConversationStarSyncGate,
 }
 
 fn cached_conversation_user_ids(
@@ -2905,6 +2913,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 WorkspacePipelineContext {
                     store: &workspace_store,
                     reducer: context.workspace,
+                    conversation_star_sync: context.conversation_star_sync,
                 },
                 cached_user_names,
                 context.team_id,
@@ -3644,6 +3653,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             channel_id,
             starred,
         } => {
+            let _star_sync_guard = context.conversation_star_sync.lock().await;
             let api = require_slack(context.slack)?;
             api.set_conversation_starred(&channel_id, starred).await?;
             let conversation = SlackConversation {
@@ -3651,16 +3661,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 is_starred: Some(starred),
                 ..Default::default()
             };
-            if let Some(store) = context.workspace_store.as_ref() {
-                store.store_conversation(&conversation).await?;
-            }
-            context.workspace.apply(
-                MutationOrigin::Local,
-                WorkspaceMutation::ConversationUpsert(conversation.clone()),
+            let persistence_error = if let Some(store) = context.workspace_store.as_ref() {
+                store.store_conversation(&conversation).await.err()
+            } else {
+                None
+            };
+            publish_confirmed_conversation_star(
+                context.events,
+                context.workspace,
+                conversation,
+                persistence_error.as_ref(),
             );
-            context
-                .events
-                .send_event(RuntimeEventKind::ConversationStarUpdated(conversation));
         }
         RuntimeCommand::UploadFile {
             channel_id,
@@ -4685,12 +4696,36 @@ async fn resolve_user_group_display_data(
     (names, members, loaded_user_names)
 }
 
+fn publish_confirmed_conversation_star(
+    events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
+    conversation: SlackConversation,
+    persistence_error: Option<&StoreError>,
+) {
+    if let Some(error) = persistence_error {
+        crate::debug::log(
+            "store",
+            &format!(
+                "ConversationStarStoreFailed category={:?}",
+                error.category()
+            ),
+        );
+    }
+    workspace.apply(
+        MutationOrigin::Local,
+        WorkspaceMutation::ConversationUpsert(conversation.clone()),
+    );
+    events.send_event(RuntimeEventKind::ConversationStarUpdated(conversation));
+}
+
 async fn load_conversations_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     workspace: &WorkspaceReducerAdapter,
+    conversation_star_sync: &ConversationStarSyncGate,
 ) -> Result<Vec<SlackConversation>> {
+    let _star_sync_guard = conversation_star_sync.lock().await;
     events.send_status("Loading conversations");
     let base_revision = workspace.revision();
     let mut fresh = api.conversations().await?;
@@ -4772,7 +4807,15 @@ async fn load_conversations_best_effort_with_api(
     team_id: Option<&str>,
     huddles: &HuddleActorHandle,
 ) -> Result<()> {
-    match load_conversations_with_api(events, api, workspace.store, workspace.reducer).await {
+    match load_conversations_with_api(
+        events,
+        api,
+        workspace.store,
+        workspace.reducer,
+        workspace.conversation_star_sync,
+    )
+    .await
+    {
         Ok(conversations) => {
             let browser_covered = apply_browser_unread_snapshot_best_effort(
                 events,
@@ -5018,6 +5061,9 @@ async fn refresh_conversation_unread_states_best_effort(
                         // Cursor metadata is committed atomically with unread state below.
                         details.extra.remove("last_read");
                         details.extra.remove("latest");
+                        // The serialized conversation refresh and local toggle path
+                        // exclusively own user-relative star state.
+                        details.is_starred = None;
                         if details.is_mpim.unwrap_or(false) {
                             match api.conversation_members(&channel_id).await {
                                 Ok(members) => {
@@ -7814,6 +7860,7 @@ mod tests {
             user_cache: Arc::new(Mutex::new(HashMap::new())),
             read_marks: Arc::new(Mutex::new(HashMap::new())),
             message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(256))),
+            conversation_star_sync: ConversationStarSyncGate::default(),
             team_id: None,
             huddles,
         });
@@ -8233,6 +8280,157 @@ mod tests {
         assert_eq!(conversations[0].is_starred, Some(false));
         assert_eq!(conversations[1].is_starred, Some(true));
         assert_eq!(conversations[2].is_starred, None);
+    }
+
+    #[test]
+    fn confirmed_conversation_star_is_published_when_cache_persistence_fails() {
+        let workspace = WorkspaceReducerAdapter::default();
+        workspace.apply(
+            MutationOrigin::Cache,
+            WorkspaceMutation::ConversationUpsert(SlackConversation {
+                id: "C1".to_string(),
+                is_channel: Some(true),
+                is_starred: Some(false),
+                ..Default::default()
+            }),
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let events = RuntimeEventSender {
+            sender,
+            session: SessionId::default().next(),
+            request: None,
+            fallback: OperationContext::new(
+                RuntimeOperation::ConversationStar,
+                RuntimeTarget::Channel("C1".to_string()),
+            ),
+        };
+        let store_error = crate::store::StoreError::from(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "test cache is read-only",
+        ));
+
+        publish_confirmed_conversation_star(
+            &events,
+            &workspace,
+            SlackConversation {
+                id: "C1".to_string(),
+                is_starred: Some(true),
+                ..Default::default()
+            },
+            Some(&store_error),
+        );
+
+        assert!(workspace
+            .coordinator
+            .lock()
+            .unwrap()
+            .conversation("C1")
+            .unwrap()
+            .is_starred());
+        assert!(matches!(
+            receiver.try_recv().unwrap().kind,
+            RuntimeEventKind::ConversationStarUpdated(conversation)
+                if conversation.id == "C1" && conversation.is_starred()
+        ));
+    }
+
+    #[test]
+    fn conversation_star_sync_keeps_a_newer_toggle_after_a_stale_refresh() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-conversation-star-race-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let workspace = WorkspaceReducerAdapter::default();
+            let initial = SlackConversation {
+                id: "C1".to_string(),
+                is_channel: Some(true),
+                is_starred: Some(false),
+                ..Default::default()
+            };
+            store.store_conversation(&initial).await.unwrap();
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::ConversationUpsert(initial.clone()),
+            );
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+            };
+            let gate = ConversationStarSyncGate::default();
+            let refresh_guard = gate.lock().await;
+
+            let toggle_gate = gate.clone();
+            let toggle_store = store.clone();
+            let toggle_workspace = workspace.clone();
+            let toggle_events = events.clone();
+            let toggle = tokio::spawn(async move {
+                let _guard = toggle_gate.lock().await;
+                let update = SlackConversation {
+                    id: "C1".to_string(),
+                    is_starred: Some(true),
+                    ..Default::default()
+                };
+                let persistence_error = toggle_store.store_conversation(&update).await.err();
+                publish_confirmed_conversation_star(
+                    &toggle_events,
+                    &toggle_workspace,
+                    update,
+                    persistence_error.as_ref(),
+                );
+            });
+            tokio::task::yield_now().await;
+            assert!(!toggle.is_finished());
+
+            store.store_conversation(&initial).await.unwrap();
+            workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ConversationUpsert(initial.clone()),
+            );
+            events.send_event(RuntimeEventKind::ConversationsLoaded(vec![initial]));
+            drop(refresh_guard);
+            toggle.await.unwrap();
+
+            let persisted = store
+                .load_conversations()
+                .await
+                .unwrap()
+                .expect("missing cached conversations");
+            assert!(persisted[0].is_starred());
+            assert!(workspace
+                .coordinator
+                .lock()
+                .unwrap()
+                .conversation("C1")
+                .unwrap()
+                .is_starred());
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::ConversationsLoaded(_)
+            ));
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::ConversationStarUpdated(conversation)
+                    if conversation.id == "C1" && conversation.is_starred()
+            ));
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
     }
 
     #[test]

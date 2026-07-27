@@ -1057,6 +1057,7 @@ fn recent_history_direct_message_ids(
         })
         .filter(|conversation| selected_channel != Some(conversation.id.as_str()))
         .filter(|conversation| !conversation.has_unread_activity())
+        .filter(|conversation| !conversation.is_starred())
         .filter(|conversation| !conversation.has_active_direct_message_hint())
         .filter(|conversation| !conversation.is_user_deleted() && !conversation.is_dormant())
         .filter_map(|conversation| {
@@ -2120,6 +2121,50 @@ mod tests {
         let rows = &section(&sections, SidebarSectionKind::DirectMessages).rows;
 
         assert_eq!(rows.len(), RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 5);
+    }
+
+    #[test]
+    fn sidebar_list_starred_dms_do_not_consume_recent_history_slots() {
+        let mut conversations = (0..RECENT_HISTORY_DIRECT_MESSAGE_LIMIT)
+            .map(|index| {
+                let mut conversation = dm(
+                    &format!("D_STARRED_{index:02}"),
+                    &format!("U_STARRED_{index:02}"),
+                );
+                conversation.is_starred = Some(true);
+                conversation.extra.insert(
+                    "last_read".to_string(),
+                    serde_json::json!(format!("{}.000001", index + 100)),
+                );
+                conversation
+            })
+            .collect::<Vec<_>>();
+        conversations.extend((0..RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 1).map(|index| {
+            let mut conversation = dm(
+                &format!("D_RECENT_{index:02}"),
+                &format!("U_RECENT_{index:02}"),
+            );
+            conversation.extra.insert(
+                "last_read".to_string(),
+                serde_json::json!(format!("{}.000001", index + 1)),
+            );
+            conversation
+        }));
+
+        let sections = list_sections(build_sidebar_list(
+            &conversations,
+            &HashMap::new(),
+            SidebarBuildOptions::default(),
+        ));
+        let rows = &section(&sections, SidebarSectionKind::DirectMessages).rows;
+        let ids = rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(rows.len(), RECENT_HISTORY_DIRECT_MESSAGE_LIMIT * 2);
+        assert!(ids.contains("D_RECENT_20"));
+        assert!(!ids.contains("D_RECENT_00"));
     }
 
     #[test]
