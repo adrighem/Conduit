@@ -3,6 +3,6 @@
   "type": "feature",
   "status": "in_progress",
   "created_at": "2026-07-27T18:01:56Z",
-  "updated_at": "2026-07-27T18:08:19Z",
+  "updated_at": "2026-07-27T18:10:40Z",
   "description": "Present starred DMs as VIP conversations before starred channels and let users toggle conversation stars."
 }
