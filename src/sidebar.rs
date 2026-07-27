@@ -48,6 +48,7 @@ impl ConversationKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidebarSectionKind {
+    Priority,
     Unreads,
     Channels,
     DirectMessages,
@@ -57,6 +58,7 @@ pub enum SidebarSectionKind {
 impl SidebarSectionKind {
     pub fn title(self) -> &'static str {
         match self {
+            Self::Priority => "Priority",
             Self::Unreads => "Unreads",
             Self::Channels => "Channels",
             Self::DirectMessages => "Direct messages",
@@ -73,6 +75,7 @@ pub struct SidebarRowModel {
     pub unread: bool,
     pub unread_count: u64,
     pub selected: bool,
+    pub starred: bool,
     pub private: bool,
     pub muted: bool,
     pub external: bool,
@@ -122,6 +125,9 @@ impl SidebarRowModel {
         }
         if self.selected {
             label.push_str(", selected");
+        }
+        if self.starred {
+            label.push_str(", starred");
         }
         if self.muted {
             label.push_str(", muted");
@@ -393,6 +399,7 @@ impl SidebarRowModel {
             unread: conversation.has_unread_activity(),
             unread_count: conversation.unread_activity_count(),
             selected: options.selected_channel == Some(conversation.id.as_str()),
+            starred: conversation.is_starred(),
             private: conversation.is_private.unwrap_or(false)
                 || conversation.is_group.unwrap_or(false)
                 || matches!(kind, ConversationKind::PrivateChannel),
@@ -849,6 +856,7 @@ pub fn conversation_picker_sections_with_statuses(
                 unread: false,
                 unread_count: 0,
                 selected: false,
+                starred: false,
                 private: true,
                 muted: false,
                 external: false,
@@ -913,12 +921,26 @@ fn build_sidebar_sections_from_rows(
     rows: impl IntoIterator<Item = SidebarRowModel>,
     query: Option<&SearchQuery>,
 ) -> Vec<SidebarSectionModel> {
+    let mut priority_direct_messages = Vec::new();
+    let mut priority_channels = Vec::new();
     let mut unreads = Vec::new();
     let mut channels = Vec::new();
     let mut direct_messages = Vec::new();
     let mut other = Vec::new();
 
     for row in rows {
+        if row.starred {
+            match row.kind {
+                ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
+                    priority_direct_messages.push(row.clone())
+                }
+                ConversationKind::PublicChannel | ConversationKind::PrivateChannel => {
+                    priority_channels.push(row.clone())
+                }
+                ConversationKind::Unknown => {}
+            }
+        }
+
         if row.unread || row.selected {
             unreads.push(row.clone());
         }
@@ -934,12 +956,20 @@ fn build_sidebar_sections_from_rows(
         }
     }
 
+    sort_rows_by_title(&mut priority_direct_messages, query);
+    sort_rows_by_title(&mut priority_channels, query);
     sort_unread_rows(&mut unreads, query);
     sort_rows_by_title(&mut channels, query);
     sort_rows_by_title(&mut direct_messages, query);
     sort_rows_by_title(&mut other, query);
 
+    let priority = priority_direct_messages
+        .into_iter()
+        .chain(priority_channels)
+        .collect();
+
     [
+        section(SidebarSectionKind::Priority, priority),
         section(SidebarSectionKind::Unreads, unreads),
         section(SidebarSectionKind::Channels, channels),
         section(SidebarSectionKind::DirectMessages, direct_messages),
@@ -978,6 +1008,18 @@ pub fn conversation_visible_in_default_sidebar(
     }
 
     if conversation.has_unread_activity() {
+        return true;
+    }
+
+    if conversation.is_starred()
+        && matches!(
+            conversation_kind(conversation),
+            ConversationKind::PublicChannel
+                | ConversationKind::PrivateChannel
+                | ConversationKind::DirectMessage
+                | ConversationKind::GroupDirectMessage
+        )
+    {
         return true;
     }
 
@@ -1317,6 +1359,7 @@ mod tests {
             unread: unread_count > 0,
             unread_count,
             selected,
+            starred: false,
             private: false,
             muted: false,
             external: false,
@@ -1426,6 +1469,92 @@ mod tests {
             titles(section(&sections, SidebarSectionKind::DirectMessages)),
             vec!["Ada", "Zoe"]
         );
+    }
+
+    #[test]
+    fn priority_section_lists_vip_dms_before_starred_channels() {
+        let mut channel_zebra = channel("C2", "zebra");
+        channel_zebra.set_starred(true);
+        let mut channel_alpha = channel("C1", "alpha");
+        channel_alpha.set_starred(true);
+        let mut dm_zoe = dm("D2", "U2");
+        dm_zoe.set_starred(true);
+        let mut dm_ada = dm("D1", "U1");
+        dm_ada.set_starred(true);
+
+        let user_names = HashMap::from([
+            ("U1".to_string(), "Ada".to_string()),
+            ("U2".to_string(), "Zoe".to_string()),
+        ]);
+        let sections = build_sidebar_sections(
+            &[
+                channel_zebra,
+                channel("C3", "general"),
+                dm_zoe,
+                channel_alpha,
+                dm_ada,
+            ],
+            &user_names,
+            None,
+        );
+
+        assert_eq!(sections[0].kind, SidebarSectionKind::Priority);
+        assert_eq!(
+            titles(section(&sections, SidebarSectionKind::Priority)),
+            vec!["Ada", "Zoe", "#alpha", "#zebra"]
+        );
+        assert_eq!(
+            titles(section(&sections, SidebarSectionKind::Channels)),
+            vec!["#alpha", "#general", "#zebra"]
+        );
+        assert_eq!(
+            titles(section(&sections, SidebarSectionKind::DirectMessages)),
+            vec!["Ada", "Zoe"]
+        );
+    }
+
+    #[test]
+    fn priority_section_uses_stable_ids_to_break_equal_title_ties() {
+        let mut first_channel = channel("C1", "same");
+        first_channel.set_starred(true);
+        let mut second_channel = channel("C2", "same");
+        second_channel.set_starred(true);
+        let mut first_dm = dm("D1", "U1");
+        first_dm.set_starred(true);
+        let mut second_dm = dm("D2", "U2");
+        second_dm.set_starred(true);
+        let user_names = HashMap::from([
+            ("U1".to_string(), "Same".to_string()),
+            ("U2".to_string(), "Same".to_string()),
+        ]);
+
+        let sections = build_sidebar_sections(
+            &[second_channel, second_dm, first_channel, first_dm],
+            &user_names,
+            None,
+        );
+
+        assert_eq!(
+            section(&sections, SidebarSectionKind::Priority)
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["D1", "D2", "C1", "C2"]
+        );
+    }
+
+    #[test]
+    fn priority_section_is_omitted_without_starred_conversations() {
+        let sections = build_sidebar_sections(
+            &[channel("C1", "general"), dm("D1", "U1")],
+            &HashMap::from([("U1".to_string(), "Ada".to_string())]),
+            None,
+        );
+
+        assert!(sections
+            .iter()
+            .all(|section| section.kind != SidebarSectionKind::Priority));
     }
 
     #[test]
@@ -1629,8 +1758,9 @@ mod tests {
     }
 
     #[test]
-    fn row_state_includes_muted_and_external_flags() {
+    fn row_state_includes_starred_muted_and_external_flags() {
         let mut alpha = channel("C1", "alpha");
+        alpha.set_starred(true);
         alpha
             .extra
             .insert("is_muted".to_string(), serde_json::json!(true));
@@ -1641,8 +1771,24 @@ mod tests {
         let sections = build_sidebar_sections(&[alpha], &HashMap::new(), None);
         let row = &section(&sections, SidebarSectionKind::Channels).rows[0];
 
+        assert!(row.starred);
         assert!(row.muted);
         assert!(row.external);
+    }
+
+    #[test]
+    fn starred_dormant_dm_remains_visible_in_the_default_sidebar() {
+        let mut conversation = dm("D1", "U1");
+        conversation.set_starred(true);
+        conversation
+            .extra
+            .insert("is_dormant".to_string(), serde_json::json!(true));
+
+        assert!(conversation_visible_in_default_sidebar(
+            &conversation,
+            None,
+            false,
+        ));
     }
 
     #[test]
@@ -2875,6 +3021,11 @@ mod tests {
         let conversation = row("C1", 2, false);
         let model = SidebarListModel::Sections(vec![
             SidebarSectionModel {
+                kind: SidebarSectionKind::Priority,
+                title: SidebarSectionKind::Priority.title(),
+                rows: vec![conversation.clone()],
+            },
+            SidebarSectionModel {
                 kind: SidebarSectionKind::Unreads,
                 title: SidebarSectionKind::Unreads.title(),
                 rows: vec![conversation.clone()],
@@ -2887,16 +3038,52 @@ mod tests {
         ]);
 
         let items = model.keyed_items();
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 6);
         assert_eq!(
             items[1].key,
+            SidebarItemKey::Conversation {
+                section: Some(SidebarSectionKind::Priority),
+                id: "C1".to_string(),
+            }
+        );
+        assert_eq!(
+            items[3].key,
             SidebarItemKey::Conversation {
                 section: Some(SidebarSectionKind::Unreads),
                 id: "C1".to_string(),
             }
         );
         assert_eq!(
-            items[3].key,
+            items[5].key,
+            SidebarItemKey::Conversation {
+                section: Some(SidebarSectionKind::Channels),
+                id: "C1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn collapsing_priority_keeps_the_regular_conversation_row() {
+        let conversation = row("C1", 0, false);
+        let model = SidebarListModel::Sections(vec![
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Priority,
+                title: SidebarSectionKind::Priority.title(),
+                rows: vec![conversation.clone()],
+            },
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Channels,
+                title: SidebarSectionKind::Channels.title(),
+                rows: vec![conversation],
+            },
+        ]);
+
+        let items = model
+            .keyed_items_with_collapsed_sections(&HashSet::from([SidebarSectionKind::Priority]));
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items[2].key,
             SidebarItemKey::Conversation {
                 section: Some(SidebarSectionKind::Channels),
                 id: "C1".to_string(),

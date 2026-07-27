@@ -9269,6 +9269,7 @@ mod tests {
             unread: false,
             unread_count: 0,
             selected: false,
+            starred: false,
             private: true,
             muted: false,
             external: false,
