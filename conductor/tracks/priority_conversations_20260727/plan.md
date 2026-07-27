@@ -5,5 +5,5 @@
 - [x] Task: Add explicit conversation-star state and a tested Slack toggle request 924854d
 - [x] Task: Add the Priority sidebar projection with VIP DMs before starred channels 161cecd
 - [x] Task: Add accessible Star and Unstar actions with persisted runtime updates 8c4b604
-- [~] Task: Run full sanitized validation and synchronize product documentation
-- [ ] Task: Conductor - User Manual Verification 'Starred priority conversations' (Protocol in workflow.md)
+- [x] Task: Run full sanitized validation and synchronize product documentation 591e437
+- [~] Task: Conductor - User Manual Verification 'Starred priority conversations' (Protocol in workflow.md)
