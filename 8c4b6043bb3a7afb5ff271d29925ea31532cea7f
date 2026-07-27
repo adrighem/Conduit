@@ -1,0 +1,7 @@
+Task: Add accessible Star and Unstar actions with persisted runtime updates
+
+Summary: Added authoritative starred-conversation synchronization, typed runtime mutations, sparse cache persistence, live sidebar rerendering, visible star indicators, and shared pointer and keyboard context-menu actions.
+
+Modified files: src/runtime.rs, src/sidebar_widgets.rs, src/store.rs, src/window.rs
+
+Rationale: Keep Slack conversation stars authoritative and make channel and DM priority controls accessible without disturbing other conversation metadata.
