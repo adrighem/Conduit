@@ -1,0 +1,7 @@
+Task: Address final priority consistency review findings
+
+Summary: Serialized authoritative star refreshes with toggle mutations, preserved Slack-confirmed UI updates when cache writes fail, excluded starred DMs from the bounded recent-history pool, and added deterministic regressions for cache, event, runtime, and cap behavior.
+
+Modified files: src/runtime.rs, src/sidebar.rs
+
+Rationale: Prevent stale background work or derived-cache failures from contradicting confirmed Slack state, while keeping non-priority recent DMs visible.
