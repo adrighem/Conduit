@@ -1,0 +1,7 @@
+Task: Add explicit conversation-star state and a tested Slack toggle request
+
+Summary: Added typed conversation star state, paginated conversation-star reads, bare channel add/remove requests, and merge coverage.
+
+Modified files: src/models.rs, src/conversation_catalog.rs, src/workspace_pipeline.rs, src/slack.rs, src/gnome_search_provider.rs
+
+Rationale: Keep user-relative Slack star state explicit, persisted, merge-safe, and independently testable before sidebar integration.
