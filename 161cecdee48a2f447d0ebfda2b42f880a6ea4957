@@ -1,0 +1,7 @@
+Task: Add the Priority sidebar projection with VIP DMs before starred channels
+
+Summary: Added a mixed Priority section, DM-first deterministic sorting, section-scoped duplicate rows, star accessibility state, and dormant starred-DM visibility.
+
+Modified files: src/sidebar.rs, src/window.rs
+
+Rationale: Keep priority conversations visible above existing sections without changing search, unread filters, or regular conversation placement.
