@@ -67,6 +67,7 @@ pub struct SlackConversation {
     pub is_mpim: Option<bool>,
     pub is_private: Option<bool>,
     pub is_archived: Option<bool>,
+    pub is_starred: Option<bool>,
     pub unread_count: Option<u64>,
     #[serde(
         default,
@@ -106,6 +107,14 @@ impl SlackConversation {
 
     pub fn is_direct_message(&self) -> bool {
         self.is_im.unwrap_or(false) || self.is_mpim.unwrap_or(false)
+    }
+
+    pub fn is_starred(&self) -> bool {
+        self.is_starred.unwrap_or(false)
+    }
+
+    pub fn set_starred(&mut self, starred: bool) {
+        self.is_starred = Some(starred);
     }
 
     pub fn is_dormant(&self) -> bool {
@@ -1490,6 +1499,7 @@ pub struct SavedItem {
     #[serde(rename = "type")]
     pub kind: Option<String>,
     pub channel: Option<String>,
+    pub group: Option<String>,
     pub message: Option<SlackMessage>,
 }
 
@@ -1951,6 +1961,26 @@ mod tests {
         }))
         .unwrap();
         assert!(conversation.is_user_deleted());
+    }
+
+    #[test]
+    fn conversation_star_state_round_trips_and_can_be_updated() {
+        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "D123",
+            "is_im": true,
+            "is_starred": true
+        }))
+        .expect("starred conversation should deserialize");
+
+        assert!(conversation.is_starred());
+        conversation.set_starred(false);
+        assert!(!conversation.is_starred());
+
+        let serialized = serde_json::to_value(conversation).expect("conversation should serialize");
+        assert_eq!(
+            serialized.get("is_starred").and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

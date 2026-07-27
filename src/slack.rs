@@ -760,10 +760,21 @@ impl SlackApi {
     }
 
     pub async fn saved_items(&self) -> Result<Vec<SavedItem>> {
-        let response: StarsListResponse = self
-            .post_form("stars.list", &[("limit", "100".to_string())])
-            .await?;
-        Ok(response.items)
+        self.star_items().await
+    }
+
+    pub async fn starred_conversation_ids(&self) -> Result<HashSet<String>> {
+        Ok(self
+            .star_items()
+            .await?
+            .into_iter()
+            .filter_map(|item| match item.kind.as_deref() {
+                Some("channel" | "im" | "mpim") => item.channel,
+                Some("group") => item.group.or(item.channel),
+                _ => None,
+            })
+            .filter(|id| !id.trim().is_empty())
+            .collect())
     }
 
     pub async fn files(&self) -> Result<Vec<SlackFile>> {
@@ -1131,6 +1142,27 @@ impl SlackApi {
         Ok(())
     }
 
+    pub async fn set_conversation_starred(&self, channel_id: &str, starred: bool) -> Result<()> {
+        let channel_id = channel_id.trim();
+        if channel_id.is_empty() {
+            return Err(SlackError::validation("conversation ID is required"));
+        }
+        let method = if starred { "stars.add" } else { "stars.remove" };
+        let response: Result<BasicResponse> = self
+            .post_form(method, &[("channel", channel_id.to_string())])
+            .await;
+        match response {
+            Ok(_) => Ok(()),
+            Err(SlackError::Api { code, .. })
+                if (starred && code == "already_starred")
+                    || (!starred && code == "not_starred") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn mark_read(&self, channel_id: &str, ts: &str) -> Result<()> {
         let _: BasicResponse = self
             .post_form(
@@ -1259,6 +1291,23 @@ impl SlackApi {
                 .with_context(|| format!("failed to parse Slack method {method} response"))?;
 
             return response.into_result(method);
+        }
+    }
+
+    async fn star_items(&self) -> Result<Vec<SavedItem>> {
+        let mut cursor: Option<String> = None;
+        let mut items = Vec::new();
+        loop {
+            let mut params = vec![("limit", "200".to_string())];
+            if let Some(cursor) = cursor.as_ref() {
+                params.push(("cursor", cursor.clone()));
+            }
+            let response: StarsListResponse = self.post_form("stars.list", &params).await?;
+            items.extend(response.items);
+            cursor = next_cursor(response.response_metadata);
+            if cursor.is_none() {
+                return Ok(items);
+            }
         }
     }
 
@@ -2173,7 +2222,9 @@ impl_slack_response!(SearchResponse);
 struct StarsListResponse {
     ok: bool,
     error: Option<String>,
+    #[serde(default)]
     items: Vec<SavedItem>,
+    response_metadata: Option<ResponseMetadata>,
 }
 impl_slack_response!(StarsListResponse);
 
@@ -2325,6 +2376,23 @@ mod tests {
         let query = path.split_once('?')?.1;
         url::form_urlencoded::parse(query.as_bytes())
             .find_map(|(key, value)| (key == field).then(|| value.into_owned()))
+    }
+
+    fn user_test_token() -> StoredToken {
+        StoredToken {
+            access_token: "xoxp-test-token".to_string(),
+            token_type: None,
+            scope: Some("stars:read,stars:write".to_string()),
+            refresh_token: None,
+            expires_in: None,
+            expires_at: None,
+            team_id: None,
+            team_name: None,
+            user_id: None,
+            client_id: None,
+            browser_cookie_d: None,
+            user_agent: None,
+        }
     }
 
     #[test]
@@ -2762,6 +2830,138 @@ mod tests {
         assert!(params.contains(&("channel_id", "C123".to_string())));
         assert!(params.contains(&("thread_ts", "1710000000.000100".to_string())));
         assert!(params.contains(&("initial_comment", "See screenshot".to_string())));
+    }
+
+    #[test]
+    fn starred_conversation_ids_are_paginated_and_ignore_message_stars() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut observations = Vec::new();
+            for response_body in [
+                r#"{
+                    "ok": true,
+                    "items": [
+                        {"type": "channel", "channel": "C1"},
+                        {"type": "im", "channel": "D1"},
+                        {"type": "group", "group": "G1"},
+                        {"type": "message", "channel": "C-message", "message": {"ts": "1.0"}}
+                    ],
+                    "response_metadata": {"next_cursor": "next-page"}
+                }"#,
+                r#"{
+                    "ok": true,
+                    "items": [{"type": "channel", "channel": "C2"}],
+                    "response_metadata": {"next_cursor": ""}
+                }"#,
+            ] {
+                let mut request = server.recv().expect("mock Slack request should arrive");
+                let path = request.url().to_string();
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("mock Slack request body should be readable");
+                request
+                    .respond(
+                        Response::from_string(response_body).with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("content type header should be valid"),
+                        ),
+                    )
+                    .expect("mock Slack response should be sent");
+                observations.push((path, body));
+            }
+            observations
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let ids = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.starred_conversation_ids())
+            .expect("starred conversations should load");
+
+        assert_eq!(
+            ids,
+            HashSet::from([
+                "C1".to_string(),
+                "C2".to_string(),
+                "D1".to_string(),
+                "G1".to_string(),
+            ])
+        );
+        let observations = received.join().expect("mock Slack server should finish");
+        assert_eq!(observations.len(), 2);
+        for (index, (path, body)) in observations.iter().enumerate() {
+            assert_eq!(path, "/api/stars.list");
+            let form = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>();
+            assert_eq!(form.get("limit").map(String::as_str), Some("200"));
+            assert_eq!(
+                form.get("cursor").map(String::as_str),
+                (index == 1).then_some("next-page")
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_star_toggle_uses_a_bare_channel_target() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut observations = Vec::new();
+            for _ in 0..2 {
+                let mut request = server.recv().expect("mock Slack request should arrive");
+                let path = request.url().to_string();
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("mock Slack request body should be readable");
+                request
+                    .respond(
+                        Response::from_string(r#"{"ok":true}"#).with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("content type header should be valid"),
+                        ),
+                    )
+                    .expect("mock Slack response should be sent");
+                observations.push((path, body));
+            }
+            observations
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime
+            .block_on(api.set_conversation_starred("D123", true))
+            .expect("conversation should be starred");
+        runtime
+            .block_on(api.set_conversation_starred("D123", false))
+            .expect("conversation should be unstarred");
+
+        let observations = received.join().expect("mock Slack server should finish");
+        assert_eq!(observations.len(), 2);
+        for ((path, body), expected_method) in observations
+            .into_iter()
+            .zip(["/api/stars.add", "/api/stars.remove"])
+        {
+            assert_eq!(path, expected_method);
+            let form = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>();
+            assert_eq!(form.get("channel").map(String::as_str), Some("D123"));
+            assert!(!form.contains_key("timestamp"));
+        }
     }
 
     #[test]

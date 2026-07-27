@@ -1588,6 +1588,7 @@ fn merge_conversation_metadata(current: &mut SlackConversation, incoming: &Slack
     merge_option!(is_mpim);
     merge_option!(is_private);
     merge_option!(is_archived);
+    merge_option!(is_starred);
     for (key, value) in &incoming.extra {
         if !key.to_ascii_lowercase().contains("unread") && key != "last_read" {
             current.extra.insert(key.clone(), value.clone());

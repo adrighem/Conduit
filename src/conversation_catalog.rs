@@ -338,6 +338,7 @@ fn merge_metadata(current: &mut SlackConversation, incoming: &SlackConversation)
     merge_option(&mut current.is_mpim, &incoming.is_mpim);
     merge_option(&mut current.is_private, &incoming.is_private);
     merge_option(&mut current.is_archived, &incoming.is_archived);
+    merge_option(&mut current.is_starred, &incoming.is_starred);
 
     for (key, value) in &incoming.extra {
         if !is_unread_key(key) {
@@ -416,6 +417,19 @@ mod tests {
         assert_eq!(merged.unread_state().display_count, 4);
         assert_eq!(merged.extra["topic"], json!("Cached topic"));
         assert_eq!(merged.extra["purpose"], json!("Fresh purpose"));
+    }
+
+    #[test]
+    fn metadata_merge_applies_explicit_conversation_star_changes() {
+        let mut cached = conversation("C1");
+        cached.is_starred = Some(true);
+        let mut catalog = ConversationCatalog::from_cached([cached]);
+
+        let mut update = conversation("C1");
+        update.is_starred = Some(false);
+        catalog.upsert_metadata(update);
+
+        assert_eq!(catalog.get("C1").unwrap().is_starred, Some(false));
     }
 
     #[test]
