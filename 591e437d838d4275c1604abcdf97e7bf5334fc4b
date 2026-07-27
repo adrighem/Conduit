@@ -1,0 +1,7 @@
+Task: Run full sanitized validation and synchronize product documentation
+
+Summary: Documented the Priority ordering, Star and Unstar controls, and the public-API boundary around Slack paid-plan VIP preferences. Validated formatting, Cargo check and tests, Meson compile, and all Meson tests with an allowlisted environment.
+
+Modified files: README.md
+
+Rationale: Keep user-facing behavior and the Slack VIP limitation explicit while confirming the feature across project build and test gates.
