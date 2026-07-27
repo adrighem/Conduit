@@ -3998,6 +3998,44 @@ mod tests {
     }
 
     #[test]
+    fn workspace_store_persists_sparse_conversation_star_updates() {
+        let directory = temp_cache_dir("workspace-store-conversation-star-update");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+
+        runtime().block_on(async {
+            store
+                .store_conversation(&SlackConversation {
+                    id: "C1".to_string(),
+                    name: Some("general".to_string()),
+                    is_channel: Some(true),
+                    is_starred: Some(true),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            store
+                .store_conversation(&SlackConversation {
+                    id: "C1".to_string(),
+                    is_starred: Some(false),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let conversations = store
+                .load_conversations()
+                .await
+                .unwrap()
+                .expect("missing cached conversations");
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].name.as_deref(), Some("general"));
+            assert_eq!(conversations[0].is_starred, Some(false));
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn conversation_row_mutations_ignore_unrelated_corrupt_rows() {
         let directory = temp_cache_dir("workspace-store-conversation-row-update");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");

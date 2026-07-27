@@ -105,6 +105,13 @@ pub fn sidebar_row_widget(
         content.append(&indicator);
     }
 
+    if model.starred {
+        let starred = gtk::Image::from_icon_name("starred-symbolic");
+        starred.set_tooltip_text(Some("Starred"));
+        starred.update_property(&[gtk::accessible::Property::Label("Starred")]);
+        content.append(&starred);
+    }
+
     if let Some(unread_label) = model.unread_badge_label() {
         let unread = gtk::Label::new(Some(&unread_label));
         unread.add_css_class("caption");

@@ -182,6 +182,10 @@ pub enum RuntimeCommand {
         add: bool,
         thread_ts: Option<String>,
     },
+    SetConversationStarred {
+        channel_id: String,
+        starred: bool,
+    },
     UploadFile {
         channel_id: String,
         thread_ts: Option<String>,
@@ -243,6 +247,7 @@ pub enum RuntimeOperation {
     PostMessage,
     Reaction,
     Saved,
+    ConversationStar,
     FileUpload,
     SocketMode,
     Huddle,
@@ -602,6 +607,10 @@ impl RuntimeCommand {
                 ),
                 RuntimeTaskLane::Interactive,
             ),
+            Self::SetConversationStarred { channel_id, .. } => RuntimeCommandDescriptor::mutation(
+                channel(RuntimeOperation::ConversationStar, channel_id),
+                RuntimeTaskLane::Interactive,
+            ),
             Self::UploadFile {
                 channel_id,
                 thread_ts,
@@ -797,6 +806,7 @@ pub enum RuntimeEventKind {
     ConversationPeopleDiscovered(Vec<SlackUser>),
     ConversationOpened(SlackConversation),
     ConversationUpdated(SlackConversation),
+    ConversationStarUpdated(SlackConversation),
     ConversationLeft {
         channel_id: String,
     },
@@ -965,6 +975,10 @@ impl RuntimeEventKind {
                     RuntimeTarget::Channel(conversation.id.clone()),
                 )
             }
+            Self::ConversationStarUpdated(conversation) => OperationContext::new(
+                RuntimeOperation::ConversationStar,
+                RuntimeTarget::Channel(conversation.id.clone()),
+            ),
             Self::ConversationLeft { channel_id } => OperationContext::new(
                 RuntimeOperation::LeaveConversation,
                 RuntimeTarget::Channel(channel_id.clone()),
@@ -3626,6 +3640,28 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 thread_ts,
             });
         }
+        RuntimeCommand::SetConversationStarred {
+            channel_id,
+            starred,
+        } => {
+            let api = require_slack(context.slack)?;
+            api.set_conversation_starred(&channel_id, starred).await?;
+            let conversation = SlackConversation {
+                id: channel_id,
+                is_starred: Some(starred),
+                ..Default::default()
+            };
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.store_conversation(&conversation).await?;
+            }
+            context.workspace.apply(
+                MutationOrigin::Local,
+                WorkspaceMutation::ConversationUpsert(conversation.clone()),
+            );
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationStarUpdated(conversation));
+        }
         RuntimeCommand::UploadFile {
             channel_id,
             thread_ts,
@@ -4657,7 +4693,21 @@ async fn load_conversations_with_api(
 ) -> Result<Vec<SlackConversation>> {
     events.send_status("Loading conversations");
     let base_revision = workspace.revision();
-    let fresh = api.conversations().await?;
+    let mut fresh = api.conversations().await?;
+    match api.starred_conversation_ids().await {
+        Ok(starred_ids) => {
+            apply_authoritative_conversation_stars(&mut fresh, &starred_ids);
+        }
+        Err(error) => {
+            crate::debug::log(
+                "runtime",
+                &format!(
+                    "StarredConversationsLoadFailed category={:?}",
+                    error.category()
+                ),
+            );
+        }
+    }
     let conversations = if let Some(store) = workspace_store.as_ref() {
         store.reconcile_conversations(fresh).await?
     } else {
@@ -4676,6 +4726,22 @@ async fn load_conversations_with_api(
     );
     events.send_event(RuntimeEventKind::ConversationsLoaded(conversations.clone()));
     Ok(conversations)
+}
+
+fn apply_authoritative_conversation_stars(
+    conversations: &mut [SlackConversation],
+    starred_ids: &HashSet<String>,
+) {
+    for conversation in conversations {
+        let supports_stars = conversation.is_channel.unwrap_or(false)
+            || conversation.is_group.unwrap_or(false)
+            || conversation.is_private.unwrap_or(false)
+            || conversation.is_im.unwrap_or(false)
+            || conversation.is_mpim.unwrap_or(false);
+        if supports_stars {
+            conversation.set_starred(starred_ids.contains(&conversation.id));
+        }
+    }
 }
 
 fn reconcile_conversation_snapshot(
@@ -8107,6 +8173,56 @@ mod tests {
                 RuntimeTarget::Huddle("active".to_string()),
             )
         );
+    }
+
+    #[test]
+    fn conversation_star_command_is_an_interactive_channel_mutation() {
+        let descriptor = RuntimeCommand::SetConversationStarred {
+            channel_id: "C123".to_string(),
+            starred: true,
+        }
+        .descriptor();
+
+        assert_eq!(descriptor.lane, RuntimeTaskLane::Interactive);
+        assert!(!descriptor.supersedes_previous);
+        assert_eq!(
+            descriptor.context,
+            OperationContext::new(
+                RuntimeOperation::ConversationStar,
+                RuntimeTarget::Channel("C123".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn authoritative_conversation_stars_set_current_values_and_clear_stale_values() {
+        let mut conversations = vec![
+            SlackConversation {
+                id: "C1".to_string(),
+                is_channel: Some(true),
+                is_starred: Some(true),
+                ..Default::default()
+            },
+            SlackConversation {
+                id: "D1".to_string(),
+                is_im: Some(true),
+                is_starred: Some(false),
+                ..Default::default()
+            },
+            SlackConversation {
+                id: "UNKNOWN".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        apply_authoritative_conversation_stars(
+            &mut conversations,
+            &HashSet::from(["D1".to_string()]),
+        );
+
+        assert_eq!(conversations[0].is_starred, Some(false));
+        assert_eq!(conversations[1].is_starred, Some(true));
+        assert_eq!(conversations[2].is_starred, None);
     }
 
     #[test]

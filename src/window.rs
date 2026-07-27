@@ -73,9 +73,9 @@ use crate::runtime::{
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
-    self, diff_keyed_sidebar_items, ConversationPickerAction, ConversationPickerItem,
-    ConversationPickerSections, KeyedSidebarItem, SidebarItemKey, SidebarItemModel,
-    SidebarRowModel, SidebarSectionKind,
+    self, diff_keyed_sidebar_items, ConversationKind, ConversationPickerAction,
+    ConversationPickerItem, ConversationPickerSections, KeyedSidebarItem, SidebarItemKey,
+    SidebarItemModel, SidebarRowModel, SidebarSectionKind,
 };
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::slack_link::{
@@ -910,6 +910,41 @@ fn sidebar_conversation_leave_requires_confirmation(conversation: &SlackConversa
         && (conversation.is_private.unwrap_or(false) || conversation.is_group.unwrap_or(false))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidebarConversationStarAction {
+    starred: bool,
+}
+
+impl SidebarConversationStarAction {
+    fn label(self) -> &'static str {
+        if self.starred {
+            "Star"
+        } else {
+            "Unstar"
+        }
+    }
+}
+
+fn sidebar_conversation_star_action(
+    conversation: &SlackConversation,
+) -> Option<SidebarConversationStarAction> {
+    matches!(
+        sidebar::conversation_kind(conversation),
+        ConversationKind::PublicChannel
+            | ConversationKind::PrivateChannel
+            | ConversationKind::DirectMessage
+            | ConversationKind::GroupDirectMessage
+    )
+    .then_some(SidebarConversationStarAction {
+        starred: !conversation.is_starred(),
+    })
+}
+
+fn sidebar_context_menu_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+    key == gtk::gdk::Key::Menu
+        || (key == gtk::gdk::Key::F10 && state.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+}
+
 #[derive(Debug, Default)]
 struct RequestCoordinator {
     session: SessionId,
@@ -1258,6 +1293,7 @@ enum RuntimeFailureRecovery {
         channel_id: String,
         thread_ts: Option<String>,
     },
+    ConversationStar,
     Upload {
         channel_id: String,
         thread_ts: Option<String>,
@@ -1341,6 +1377,9 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
             channel_id: channel_id.clone(),
             thread_ts: thread_ts.clone(),
         },
+        (RuntimeOperation::ConversationStar, RuntimeTarget::Channel(_)) => {
+            RuntimeFailureRecovery::ConversationStar
+        }
         (
             RuntimeOperation::FileUpload,
             RuntimeTarget::Upload {
@@ -3580,6 +3619,20 @@ impl ConduitWindow {
                 self.refresh_current_conversation_title();
                 self.set_status(&gettext("People added"));
             }
+            RuntimeEventKind::ConversationStarUpdated(conversation) => {
+                let starred = conversation.is_starred();
+                self.imp()
+                    .workspace
+                    .conversations
+                    .borrow_mut()
+                    .upsert_metadata(conversation);
+                self.sync_conversations_from_catalog();
+                self.set_status(&gettext(if starred {
+                    "Conversation starred"
+                } else {
+                    "Conversation unstarred"
+                }));
+            }
             RuntimeEventKind::ConversationLeft { channel_id } => {
                 self.apply_conversation_left(&channel_id);
             }
@@ -5595,6 +5648,7 @@ impl ConduitWindow {
                     self.set_status(error);
                 }
             }
+            RuntimeFailureRecovery::ConversationStar => self.set_status(error),
             RuntimeFailureRecovery::Upload {
                 channel_id,
                 thread_ts,
@@ -6169,80 +6223,151 @@ impl ConduitWindow {
     }
 
     fn attach_sidebar_context_menu(&self, row: &gtk::ListBoxRow, channel_id: &str) {
+        row.set_focusable(true);
+
         let gesture = gtk::GestureClick::new();
         gesture.set_button(3);
         let weak_window = self.downgrade();
         let row_for_menu = row.clone();
-        let channel_id = channel_id.to_string();
+        let channel_id_for_pointer = channel_id.to_string();
         gesture.connect_pressed(move |_, _, x, y| {
             let Some(window) = weak_window.upgrade() else {
                 return;
             };
-            let popover = gtk::Popover::new();
-            popover.set_parent(&row_for_menu);
-            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            menu.set_margin_top(6);
-            menu.set_margin_bottom(6);
-            menu.set_margin_start(6);
-            menu.set_margin_end(6);
-
-            let mark_read_button = gtk::Button::with_label(&gettext("Mark as read"));
-            mark_read_button.add_css_class("flat");
-            let mark_read_channel_id = channel_id.clone();
-            let weak_window = window.downgrade();
-            mark_read_button.connect_clicked(move |_| {
-                if let Some(window) = weak_window.upgrade() {
-                    window.mark_channel_read_through_latest(&mark_read_channel_id);
-                }
-            });
-            menu.append(&mark_read_button);
-
-            let conversation = window
-                .imp()
-                .workspace
-                .conversations
-                .borrow()
-                .get(&channel_id)
-                .cloned();
-            if let Some(conversation) = conversation.as_ref() {
-                let add_people_button = gtk::Button::with_label(&gettext("Add people"));
-                add_people_button.add_css_class("flat");
-                let conversation = conversation.clone();
-                let weak_window = window.downgrade();
-                let popover_for_people = popover.clone();
-                add_people_button.connect_clicked(move |_| {
-                    popover_for_people.popdown();
-                    if let Some(window) = weak_window.upgrade() {
-                        window.show_add_people_picker(&conversation);
-                    }
-                });
-                menu.append(&add_people_button);
-            }
-            if let Some(conversation) = conversation.filter(sidebar_conversation_can_leave) {
-                let leave_button = gtk::Button::with_label(&gettext("Leave channel"));
-                leave_button.add_css_class("flat");
-                leave_button.add_css_class("destructive-action");
-                let weak_window = window.downgrade();
-                let popover_for_leave = popover.clone();
-                leave_button.connect_clicked(move |_| {
-                    popover_for_leave.popdown();
-                    let Some(window) = weak_window.upgrade() else {
-                        return;
-                    };
-                    if sidebar_conversation_leave_requires_confirmation(&conversation) {
-                        window.confirm_leave_private_channel(&conversation);
-                    } else {
-                        window.leave_channel(&conversation.id);
-                    }
-                });
-                menu.append(&leave_button);
-            }
-
-            popover.set_child(Some(&menu));
-            popover.popup();
+            window.show_sidebar_context_menu(
+                &row_for_menu,
+                &channel_id_for_pointer,
+                Some(gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)),
+            );
         });
         row.add_controller(gesture);
+
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak_window = self.downgrade();
+        let row_for_menu = row.clone();
+        let channel_id_for_keyboard = channel_id.to_string();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            if !sidebar_context_menu_key(key, state) {
+                return glib::Propagation::Proceed;
+            }
+            let Some(window) = weak_window.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            window.show_sidebar_context_menu(
+                &row_for_menu,
+                &channel_id_for_keyboard,
+                Some(gtk::gdk::Rectangle::new(
+                    row_for_menu.width() / 2,
+                    row_for_menu.height() / 2,
+                    1,
+                    1,
+                )),
+            );
+            glib::Propagation::Stop
+        });
+        row.add_controller(keys);
+    }
+
+    fn show_sidebar_context_menu(
+        &self,
+        row: &gtk::ListBoxRow,
+        channel_id: &str,
+        pointing_to: Option<gtk::gdk::Rectangle>,
+    ) {
+        let popover = gtk::Popover::new();
+        popover.set_parent(row);
+        popover.set_pointing_to(pointing_to.as_ref());
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        menu.set_margin_top(6);
+        menu.set_margin_bottom(6);
+        menu.set_margin_start(6);
+        menu.set_margin_end(6);
+
+        let conversation = self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .cloned();
+
+        if let Some(action) = conversation
+            .as_ref()
+            .and_then(sidebar_conversation_star_action)
+        {
+            let star_button = gtk::Button::with_label(&gettext(action.label()));
+            star_button.add_css_class("flat");
+            let channel_id = channel_id.to_string();
+            let weak_window = self.downgrade();
+            let popover_for_star = popover.clone();
+            star_button.connect_clicked(move |_| {
+                popover_for_star.popdown();
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                window.set_status(&gettext(if action.starred {
+                    "Starring conversation..."
+                } else {
+                    "Unstarring conversation..."
+                }));
+                window.send_command(RuntimeCommand::SetConversationStarred {
+                    channel_id: channel_id.clone(),
+                    starred: action.starred,
+                });
+            });
+            menu.append(&star_button);
+        }
+
+        let mark_read_button = gtk::Button::with_label(&gettext("Mark as read"));
+        mark_read_button.add_css_class("flat");
+        let mark_read_channel_id = channel_id.to_string();
+        let weak_window = self.downgrade();
+        let popover_for_mark_read = popover.clone();
+        mark_read_button.connect_clicked(move |_| {
+            popover_for_mark_read.popdown();
+            if let Some(window) = weak_window.upgrade() {
+                window.mark_channel_read_through_latest(&mark_read_channel_id);
+            }
+        });
+        menu.append(&mark_read_button);
+
+        if let Some(conversation) = conversation.as_ref() {
+            let add_people_button = gtk::Button::with_label(&gettext("Add people"));
+            add_people_button.add_css_class("flat");
+            let conversation = conversation.clone();
+            let weak_window = self.downgrade();
+            let popover_for_people = popover.clone();
+            add_people_button.connect_clicked(move |_| {
+                popover_for_people.popdown();
+                if let Some(window) = weak_window.upgrade() {
+                    window.show_add_people_picker(&conversation);
+                }
+            });
+            menu.append(&add_people_button);
+        }
+        if let Some(conversation) = conversation.filter(sidebar_conversation_can_leave) {
+            let leave_button = gtk::Button::with_label(&gettext("Leave channel"));
+            leave_button.add_css_class("flat");
+            leave_button.add_css_class("destructive-action");
+            let weak_window = self.downgrade();
+            let popover_for_leave = popover.clone();
+            leave_button.connect_clicked(move |_| {
+                popover_for_leave.popdown();
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                if sidebar_conversation_leave_requires_confirmation(&conversation) {
+                    window.confirm_leave_private_channel(&conversation);
+                } else {
+                    window.leave_channel(&conversation.id);
+                }
+            });
+            menu.append(&leave_button);
+        }
+
+        popover.set_child(Some(&menu));
+        popover.popup();
     }
 
     fn confirm_leave_private_channel(&self, conversation: &SlackConversation) {
@@ -9589,6 +9714,11 @@ mod tests {
                 },
             ),
             (
+                RuntimeOperation::ConversationStar,
+                RuntimeTarget::Channel("C123".to_string()),
+                RuntimeFailureRecovery::ConversationStar,
+            ),
+            (
                 RuntimeOperation::FileUpload,
                 RuntimeTarget::Upload {
                     channel_id: "C123".to_string(),
@@ -10218,6 +10348,46 @@ mod tests {
         ));
         assert!(sidebar_conversation_leave_requires_confirmation(
             &private_channel
+        ));
+    }
+
+    #[test]
+    fn sidebar_star_action_toggles_supported_conversations() {
+        let public_channel = SlackConversation {
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let starred_direct_message = SlackConversation {
+            is_im: Some(true),
+            is_starred: Some(true),
+            ..Default::default()
+        };
+        let unsupported = SlackConversation::default();
+
+        let star = sidebar_conversation_star_action(&public_channel).unwrap();
+        assert_eq!(star.label(), "Star");
+        assert!(star.starred);
+
+        let unstar = sidebar_conversation_star_action(&starred_direct_message).unwrap();
+        assert_eq!(unstar.label(), "Unstar");
+        assert!(!unstar.starred);
+
+        assert_eq!(sidebar_conversation_star_action(&unsupported), None);
+    }
+
+    #[test]
+    fn sidebar_context_menu_opens_from_standard_keyboard_shortcuts() {
+        assert!(sidebar_context_menu_key(
+            gtk::gdk::Key::Menu,
+            gtk::gdk::ModifierType::empty(),
+        ));
+        assert!(sidebar_context_menu_key(
+            gtk::gdk::Key::F10,
+            gtk::gdk::ModifierType::SHIFT_MASK,
+        ));
+        assert!(!sidebar_context_menu_key(
+            gtk::gdk::Key::F10,
+            gtk::gdk::ModifierType::empty(),
         ));
     }
 
