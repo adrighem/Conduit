@@ -1,0 +1,11 @@
+Task: Add person @ completion to message and thread composers
+
+Summary: Added type-ahead person completion over the paginated workspace user catalog in both composers. Selected people remain readable by name while TextMark-backed spans serialize to canonical Slack <@USER_ID> markup for sends, drafts, and upload comments. Added draft hydration, late name refresh, stale-binding invalidation, shared emoji/person popup behavior, and focused accessibility descriptions.
+
+Files: README.md, src/composer.rs, src/window.rs, tests/meson.build, tests/test_keyboard_shortcuts.py.
+
+Rationale: Slack notifications require stable user IDs, while composers should remain readable and must not notify a stale person after a user edits the completed label.
+
+Validation: cargo fmt --check; cargo check --locked --target-dir _build/src; cargo test --locked --target-dir _build/src (695 passed, 2 ignored); meson compile -C _build; focused headless composer completion test; meson test -C _build --no-rebuild --print-errorlogs (15 passed). Initial red coverage included the missing pure mention APIs and the headless person completion flow.
+
+Limitations: Strict Clippy could not run because the installed cargo-clippy uses rustc 1.87 while Conduit requires rustc 1.88 or newer. No project coverage command is configured.
