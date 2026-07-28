@@ -91,3 +91,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [~] Track: Current user status management
 *Link: [./conductor/tracks/status_management_20260728/](./conductor/tracks/status_management_20260728/)*
+
+---
+
+## [~] Track: Installed branding consistency
+*Link: [./conductor/tracks/branding_install_20260728/](./conductor/tracks/branding_install_20260728/)*
