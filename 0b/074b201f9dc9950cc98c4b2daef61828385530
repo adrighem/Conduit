@@ -1,0 +1,11 @@
+Task: Fix status emoji picker filtering and complete loading
+
+Summary: Replaced the inert status ComboRow search with a searchable virtualized picker, retained the complete status-compatible shortcode catalog, refreshed open dialogs when workspace emoji arrive, and preserved selection across filtering and refresh.
+
+Files: src/window.rs, tests/test_status_dialog.py.
+
+Rationale: AdwComboRow search required an expression and only offered prefix matching, while the dialog snapshot prevented late workspace emoji from appearing.
+
+Validation: cargo fmt --all -- --check; git diff --check; cargo check --locked; Meson compile; status UI suite repeated three times; full Meson test (16 passed, including 714 Rust tests passed and 2 ignored).
+
+Limitations: Manual verification with the connected Slack workspace remains pending.
