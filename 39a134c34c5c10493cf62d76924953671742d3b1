@@ -1,0 +1,11 @@
+Task: Run full sanitized validation and synchronize user documentation
+
+Summary: Documented the status scope and workspace-header contract, made completion UI tests wait for observed popup selections, hardened X11 focus handling, isolated process-global tracing captures, and aligned the huddle fixture with the resolved current-user name.
+
+Files: README.md, docs/sidebar-design.md, conductor/tracks/status_management_20260728/spec.md, src/runtime.rs, src/window.rs, tests/test_huddle_ui.py, tests/test_keyboard_shortcuts.py.
+
+Rationale: Full parallel validation exposed process-global tracing and window-focus races that needed deterministic synchronization rather than test reruns.
+
+Validation: cargo fmt --check; cargo check --locked; cargo test --locked (712 passed, 2 ignored); Meson compile; Meson test (16 passed); keyboard/completion headless test repeated five times successfully.
+
+Limitations: The installed Clippy component is older than rustc 1.95 and cannot run against this toolchain. Meson coverage is disabled and the project has no configured coverage report target.
