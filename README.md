@@ -132,6 +132,12 @@ meson compile -C _build
 meson install -C _build
 ```
 
+Rerunning the install upgrades an existing source installation. Conduit's
+install hook removes known obsolete branding files from earlier versions before
+Meson refreshes the GNOME icon and desktop caches, so manual cache deletion is
+not required. Fully quit and reopen Conduit after an upgrade. If GNOME Shell
+keeps an already-rendered application icon, sign out and back in once.
+
 To remove the files recorded by the most recent install from that build
 directory:
 
