@@ -28,6 +28,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Transactional SQLite caching for conversations, names, histories, threads, unread state, statuses, and custom emoji, with automatic migration from the earlier JSON cache.
 - Unread badges, muted and external-conversation indicators, read markers, and relevant-only desktop notifications for direct messages, mentions, configured terms, and interested-thread replies.
 - Slack status emoji and hover text for people in direct messages, shown consistently in navigation, switchers, titles, and message authors.
+- The workspace header shows your display name and active custom status. Its menu opens a native status editor with searchable emoji, expiration choices, and explicit clearing.
 - Multi-word, case-insensitive substring filtering with globally ranked, category-free results across conversation, forwarding, message, and emoji searches. Conversation ranking treats direct messages and people as one-person groups, while group DMs use the share of other participants whose names match; group titles omit your own name.
 
 ### Messaging
@@ -182,7 +183,7 @@ channels:read,channels:history,channels:join,channels:write,
 groups:read,groups:history,groups:write,
 im:read,im:history,im:write,
 mpim:read,mpim:history,mpim:write,
-users:read,users:read.email,users.profile:read,usergroups:read,emoji:read,
+users:read,users:read.email,users.profile:read,users.profile:write,usergroups:read,emoji:read,
 chat:write,search:read,
 stars:read,stars:write,
 reactions:read,reactions:write,
@@ -214,6 +215,8 @@ export CONDUIT_SLACK_USER_AGENT="Mozilla/5.0 ..." # exact source-browser value f
 ```
 
 The aliases `SLACK_MCP_XOXC_TOKEN`, `SLACK_MCP_XOXD_TOKEN`, and `SLACK_MCP_USER_AGENT` are also accepted.
+
+Slack documents status changes through [`users.profile.set`](https://docs.slack.dev/reference/methods/users.profile.set/) for OAuth user tokens. Imported browser-session credentials reuse Conduit's existing request transport, but Slack does not document that credential mode for Web API status changes. Use OAuth if Slack rejects the request.
 
 #### Lookup `SLACK_MCP_XOXC_TOKEN`
 

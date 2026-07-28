@@ -4131,12 +4131,12 @@ impl ConduitWindow {
         text_view.update_property(&[gtk::accessible::Property::Description(
             &composer_completion_description(&completion.entries[0], 0, completion.entries.len()),
         )]);
-
         let insert = buffer.iter_at_offset(buffer.cursor_position());
         completion
             .popover
             .set_pointing_to(Some(&text_view.iter_location(&insert)));
         completion.popover.popup();
+        record_test_composer_completion_ready(target, completion);
     }
 
     fn dismiss_composer_completion(&self, target: ComposerTarget) {
@@ -4177,6 +4177,7 @@ impl ConduitWindow {
                     )),
                 ]);
             }
+            record_test_composer_completion_ready(target, completion);
         }
     }
 
@@ -10198,6 +10199,48 @@ enum TestComposerCompletion<'a> {
         user_id: &'a str,
         serialized: &'a str,
     },
+}
+
+fn record_test_composer_completion_ready(target: ComposerTarget, completion: &ComposerCompletion) {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_COMPOSER_COMPLETION_FILE") else {
+        return;
+    };
+    if !completion.popover.is_visible() {
+        return;
+    }
+    let target = match target {
+        ComposerTarget::Message => "message",
+        ComposerTarget::Thread => "thread",
+    };
+    let selected_index = completion
+        .list
+        .selected_row()
+        .map_or(0, |row| row.index().max(0) as usize);
+    let (kind, query, selected) = match (
+        completion.token.as_ref(),
+        completion.entries.get(selected_index),
+    ) {
+        (
+            Some(ComposerCompletionToken::Emoji(token)),
+            Some(ComposerCompletionEntry::Emoji(entry)),
+        ) => ("emoji", token.query.as_str(), entry.name.as_str()),
+        (
+            Some(ComposerCompletionToken::Mention(token)),
+            Some(ComposerCompletionEntry::Mention(candidate)),
+        ) => ("mention", token.query.as_str(), candidate.user_id.as_str()),
+        _ => return,
+    };
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({
+            "ready": kind,
+            "query": query,
+            "selected": selected,
+            "count": completion.entries.len(),
+            "target": target,
+        })
+        .to_string(),
+    );
 }
 
 fn record_test_composer_completion(

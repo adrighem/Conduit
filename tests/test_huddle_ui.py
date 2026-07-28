@@ -110,7 +110,7 @@ def main() -> None:
             expected_state = {
                 "visible": True,
                 "title": "Huddle is active",
-                "detail": "1 participant",
+                "detail": "Test User",
                 "primary_visible": True,
                 "primary_label": "View huddle",
                 "external_visible": True,

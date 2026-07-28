@@ -49,12 +49,12 @@ Supporting more than one connected Slack workspace is outside Conduit's product 
 The sidebar is the start child of the workspace `GtkPaned`. It is a vertical `GtkBox` with a 280 pixel width request and these elements:
 
 - Workspace title label named `workspace_title_label`.
-  - Shows the authenticated Slack team name when available.
-  - Falls back to `Workspace` before workspace metadata is available.
+  - Shows the authenticated user's resolved display name when available.
+  - Falls back to the Slack team name and then `Workspace` while identity metadata loads.
+  - Uses the subtitle for the current active custom status and keeps the team and complete status text available to assistive technology and as a tooltip.
 - Refresh icon button using `view-refresh-symbolic`.
 - Workspace menu button using `open-menu-symbolic`.
-  - Contains the sign-out action.
-  - Sign out is intentionally not a top-level sidebar button because it is account/session management rather than primary navigation.
+  - Opens the current-user status editor above the new-message and new-channel actions.
 - Primary navigation buttons:
   - `Home`, using `go-home-symbolic`.
   - `Later`, using `starred-symbolic`.

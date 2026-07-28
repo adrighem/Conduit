@@ -79,13 +79,42 @@ def visible_window_ids(name: str) -> list[str]:
     return result.stdout.splitlines() if result.returncode == 0 else []
 
 
-def press(*keys: str) -> None:
+def focus_window(window_id: str) -> None:
+    # Ask the window manager first so GTK receives normal activation state.
+    # Fall back to direct X input focus while the WM is still registering a
+    # newly mapped window.
+    try:
+        activated = subprocess.run(
+            ["xdotool", "windowactivate", "--sync", window_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        activated = None
+    if activated is None or activated.returncode != 0:
+        subprocess.run(["xdotool", "windowfocus", "--sync", window_id], check=True)
+    # Give GTK one main-loop iteration to apply the activation transition.
+    time.sleep(0.1)
+
+
+def press(window_id: str, *keys: str) -> None:
+    focus_window(window_id)
     subprocess.run(["xdotool", "key", *keys], check=True)
 
 
-def type_text(text: str) -> None:
+def type_text(window_id: str, text: str) -> None:
+    focus_window(window_id)
     subprocess.run(
-        ["xdotool", "type", "--clearmodifiers", "--delay", "10", text], check=True
+        [
+            "xdotool",
+            "type",
+            "--clearmodifiers",
+            "--delay",
+            "10",
+            text,
+        ],
+        check=True,
     )
 
 
@@ -105,7 +134,7 @@ def clipboard_text() -> str:
     return result.stdout
 
 
-def composer_text() -> str:
+def composer_text(window_id: str) -> str:
     sentinel = f"__conduit_clipboard_{time.monotonic_ns()}__"
     subprocess.run(
         ["xclip", "-selection", "clipboard", "-i"],
@@ -113,7 +142,7 @@ def composer_text() -> str:
         text=True,
         check=True,
     )
-    press("ctrl+a", "ctrl+c")
+    press(window_id, "ctrl+a", "ctrl+c")
     time.sleep(0.05)
 
     def copied_text() -> str | None:
@@ -123,9 +152,9 @@ def composer_text() -> str:
     return wait_until(copied_text, timeout=5.0)
 
 
-def replace_composer_text(text: str) -> None:
-    press("ctrl+a", "BackSpace")
-    type_text(text)
+def replace_composer_text(window_id: str, text: str) -> None:
+    press(window_id, "ctrl+a", "BackSpace")
+    type_text(window_id, text)
     time.sleep(0.1)
 
 
@@ -139,54 +168,92 @@ def completion_state(path: Path, expected: dict) -> dict | None:
     return state if state == expected else None
 
 
-def verify_emoji_completion(target: str, state_path: Path) -> None:
-    press("ctrl+m")
+def wait_for_completion_ready(
+    path: Path,
+    target: str,
+    kind: str,
+    query: str,
+    selected: str,
+) -> None:
+    deadline = time.monotonic() + 5.0
+    last_state = None
+    while time.monotonic() < deadline:
+        if not path.exists():
+            time.sleep(0.05)
+            continue
+        try:
+            last_state = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            time.sleep(0.05)
+            continue
+        if (
+            last_state.get("ready") == kind
+            and last_state.get("query") == query
+            and last_state.get("selected") == selected
+            and last_state.get("count", 0) > 0
+            and last_state.get("target") == target
+        ):
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        "completion did not become ready: "
+        f"expected {kind}/{query}/{selected}/{target}, last state was {last_state!r}"
+    )
+
+
+def verify_emoji_completion(window_id: str, target: str, state_path: Path) -> None:
+    press(window_id, "ctrl+m")
     time.sleep(0.1)
 
-    replace_composer_text(":+1")
-    press("Return")
+    replace_composer_text(window_id, ":+1")
+    wait_for_completion_ready(state_path, target, "emoji", "+1", "+1")
+    press(window_id, "Return")
     wait_until(
         lambda: completion_state(
             state_path,
             {"emoji": "+1", "target": target, "webkit": WEBKIT_SETTINGS},
         )
     )
-    assert composer_text() == ":+1:"
+    assert composer_text(window_id) == ":+1:"
 
-    replace_composer_text(":sm")
-    press("Return")
+    replace_composer_text(window_id, ":sm")
+    wait_for_completion_ready(state_path, target, "emoji", "sm", "smiley")
+    press(window_id, "Return")
     wait_until(
         lambda: completion_state(
             state_path,
             {"emoji": "smiley", "target": target, "webkit": WEBKIT_SETTINGS},
         )
     )
-    assert composer_text() == ":smiley:"
+    assert composer_text(window_id) == ":smiley:"
 
-    replace_composer_text(":sm")
-    press("Down")
-    time.sleep(0.05)
-    press("Return")
+    replace_composer_text(window_id, ":sm")
+    wait_for_completion_ready(state_path, target, "emoji", "sm", "smiley")
+    press(window_id, "Down")
+    wait_for_completion_ready(state_path, target, "emoji", "sm", "smile")
+    press(window_id, "Return")
     wait_until(
         lambda: completion_state(
             state_path,
             {"emoji": "smile", "target": target, "webkit": WEBKIT_SETTINGS},
         )
     )
-    assert composer_text() == ":smile:"
+    assert composer_text(window_id) == ":smile:"
 
-    replace_composer_text(":sm")
-    press("Escape", "Tab", "ctrl+m")
+    replace_composer_text(window_id, ":sm")
+    wait_for_completion_ready(state_path, target, "emoji", "sm", "smiley")
+    press(window_id, "Escape", "Tab", "ctrl+m")
     time.sleep(0.1)
-    assert composer_text() == ":sm"
+    assert composer_text(window_id) == ":sm"
 
 
-def verify_person_completion(target: str, state_path: Path) -> None:
-    press("ctrl+m")
+def verify_person_completion(window_id: str, target: str, state_path: Path) -> None:
+    press(window_id, "ctrl+m")
     time.sleep(0.1)
 
-    replace_composer_text("@gra")
-    press("Tab")
+    replace_composer_text(window_id, "@gra")
+    wait_for_completion_ready(state_path, target, "mention", "gra", "UGRACE")
+    press(window_id, "Tab")
     wait_until(
         lambda: completion_state(
             state_path,
@@ -199,11 +266,12 @@ def verify_person_completion(target: str, state_path: Path) -> None:
         ),
         timeout=5.0,
     )
-    assert composer_text() == "@Grace Hopper "
+    assert composer_text(window_id) == "@Grace Hopper "
 
-    press("Home", "Right", "Delete", "End")
-    type_text("@ada")
-    press("Tab")
+    press(window_id, "Home", "Right", "Delete", "End")
+    type_text(window_id, "@ada")
+    wait_for_completion_ready(state_path, target, "mention", "ada", "UADA")
+    press(window_id, "Tab")
     wait_until(
         lambda: completion_state(
             state_path,
@@ -216,12 +284,13 @@ def verify_person_completion(target: str, state_path: Path) -> None:
         ),
         timeout=5.0,
     )
-    assert composer_text() == "@race Hopper @Ada Lovelace "
+    assert composer_text(window_id) == "@race Hopper @Ada Lovelace "
 
-    replace_composer_text("@")
-    press("Down")
-    time.sleep(0.05)
-    press("Return")
+    replace_composer_text(window_id, "@")
+    wait_for_completion_ready(state_path, target, "mention", "", "UADA")
+    press(window_id, "Down")
+    wait_for_completion_ready(state_path, target, "mention", "", "UGRACE")
+    press(window_id, "Return")
     wait_until(
         lambda: completion_state(
             state_path,
@@ -234,18 +303,19 @@ def verify_person_completion(target: str, state_path: Path) -> None:
         ),
         timeout=5.0,
     )
-    assert composer_text() == "@Grace Hopper "
+    assert composer_text(window_id) == "@Grace Hopper "
 
-    replace_composer_text("@ada")
-    press("Escape", "Tab", "ctrl+m")
+    replace_composer_text(window_id, "@ada")
+    wait_for_completion_ready(state_path, target, "mention", "ada", "UADA")
+    press(window_id, "Escape", "Tab", "ctrl+m")
     time.sleep(0.1)
-    assert composer_text() == "@ada"
+    assert composer_text(window_id) == "@ada"
 
 
-def verify_hydrated_person_draft() -> None:
-    press("ctrl+m")
+def verify_hydrated_person_draft(window_id: str) -> None:
+    press(window_id, "ctrl+m")
     time.sleep(0.1)
-    assert composer_text() == "Draft @Grace Hopper"
+    assert composer_text(window_id) == "Draft @Grace Hopper"
 
 
 def stop_process(process: subprocess.Popen[str]) -> None:
@@ -301,35 +371,24 @@ def main() -> None:
             )
             try:
                 window_id = wait_for_window(process)
-                subprocess.run(
-                    ["xdotool", "windowactivate", "--sync", window_id], check=True
-                )
-                focused_window = subprocess.run(
-                    ["xdotool", "getwindowfocus"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                ).stdout.strip()
-                assert focused_window == window_id
-                time.sleep(0.2)
 
                 if not thread_composer:
                     for _ in range(2):
-                        press("ctrl+k")
-                        wait_until(
+                        press(window_id, "ctrl+k")
+                        switcher_id = wait_until(
                             lambda: next(
                                 iter(visible_window_ids(SWITCHER_TITLE)), None
                             )
                         )
-                        press("Escape")
+                        press(switcher_id, "Escape")
                         wait_until(
                             lambda: not visible_window_ids(SWITCHER_TITLE), timeout=10.0
                         )
                     assert process.poll() is None
 
-                verify_hydrated_person_draft()
-                verify_emoji_completion(target, completion_path)
-                verify_person_completion(target, completion_path)
+                verify_hydrated_person_draft(window_id)
+                verify_emoji_completion(window_id, target, completion_path)
+                verify_person_completion(window_id, target, completion_path)
             finally:
                 stop_process(process)
 

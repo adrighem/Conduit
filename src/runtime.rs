@@ -6448,6 +6448,31 @@ mod tests {
     // Tracing callsite interest is process-wide, so local subscriber captures
     // must not rebuild it concurrently.
     static TRACE_SUBSCRIBER_TEST_LOCK: Mutex<()> = Mutex::new(());
+    const TRACE_TEST_CHILD_ENV: &str = "CONDUIT_TRACE_TEST_CHILD";
+
+    fn run_trace_test_in_isolated_process(test_name: &str) -> bool {
+        if std::env::var_os(TRACE_TEST_CHILD_ENV).is_some() {
+            return false;
+        }
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("test executable should be available"),
+        )
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--test-threads=1")
+        .env_clear()
+        .env("LANG", "C.UTF-8")
+        .env(TRACE_TEST_CHILD_ENV, "1")
+        .output()
+        .expect("isolated trace test should start");
+        assert!(
+            output.status.success(),
+            "isolated trace test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
 
     impl Write for TraceWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -6465,6 +6490,11 @@ mod tests {
 
     #[test]
     fn runtime_trace_output_contains_correlation_fields_and_redacts_signed_urls() {
+        if run_trace_test_in_isolated_process(
+            "runtime::tests::runtime_trace_output_contains_correlation_fields_and_redacts_signed_urls",
+        ) {
+            return;
+        }
         let _trace_guard = TRACE_SUBSCRIBER_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -6512,6 +6542,11 @@ mod tests {
 
     #[test]
     fn attention_traces_contain_only_stable_categories_and_counters() {
+        if run_trace_test_in_isolated_process(
+            "runtime::tests::attention_traces_contain_only_stable_categories_and_counters",
+        ) {
+            return;
+        }
         let _trace_guard = TRACE_SUBSCRIBER_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());

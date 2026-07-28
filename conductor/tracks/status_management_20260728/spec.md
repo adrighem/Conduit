@@ -36,8 +36,8 @@ client presets.
 12. Offer predictable expiration choices: do not clear, 30 minutes, 1 hour,
     4 hours, end of today, and end of this week. Preserve an existing custom
     future expiration when the dialog opens.
-13. Keep the dialog open and actionable when Slack rejects the update, with a
-    concise accessible error.
+13. Restore the dialog and its actionable draft when Slack rejects the update,
+    with a concise accessible error.
 14. Preserve Conduit's single-workspace boundary and existing connection status
     presentation.
 15. Use the existing browser-session request transport when configured, while
@@ -60,8 +60,9 @@ client presets.
   selection behavior.
 - Successful updates refresh the header and current-user status everywhere;
   failures do not present an unconfirmed status.
-- A headless GTK test covers opening, saving, clearing, and header refresh in
-  both wide and narrow layouts.
+- A headless GTK test activates the window action and covers empty and preloaded
+  dialog and header state in wide and narrow layouts. API, runtime, and pure
+  tests cover save, clear, failure recovery, and confirmed header refresh.
 - `cargo fmt --check`, Rust tests, `cargo check`, Meson compile, and Meson tests
   pass in a sanitized allowlisted environment.
 
