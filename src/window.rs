@@ -940,6 +940,30 @@ fn sidebar_conversation_star_action(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarConversationProfileAction {
+    user_id: String,
+}
+
+impl SidebarConversationProfileAction {
+    fn label(&self) -> &'static str {
+        "Profile"
+    }
+}
+
+fn sidebar_conversation_profile_action(
+    conversation: &SlackConversation,
+) -> Option<SidebarConversationProfileAction> {
+    (sidebar::conversation_kind(conversation) == ConversationKind::DirectMessage)
+        .then_some(conversation.user.as_deref())
+        .flatten()
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
+        .map(|user_id| SidebarConversationProfileAction {
+            user_id: user_id.to_string(),
+        })
+}
+
 fn sidebar_context_menu_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
     key == gtk::gdk::Key::Menu
         || (key == gtk::gdk::Key::F10 && state.contains(gtk::gdk::ModifierType::SHIFT_MASK))
@@ -4938,6 +4962,26 @@ impl ConduitWindow {
         }
     }
 
+    fn show_user_profile(&self, user_id: &str) {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return;
+        }
+        self.close_media_viewer();
+        self.imp().profile_visible.set(true);
+        self.sync_back_button();
+        *self.imp().pending_profile_user_id.borrow_mut() = Some(user_id.to_string());
+        self.imp().message_title.set_title(&gettext("Profile"));
+        self.load_message_html(&message_html::placeholder_document(
+            &gettext("Profile"),
+            &gettext("Loading profile"),
+        ));
+        self.imp().workspace_split.set_show_content(true);
+        self.send_command(RuntimeCommand::LoadUserProfile {
+            user_id: user_id.to_string(),
+        });
+    }
+
     fn handle_message_action_url(&self, url: &url::Url) -> bool {
         match url.host_str() {
             Some("timeline-positioned" | "timeline-interacted") => {
@@ -5043,15 +5087,7 @@ impl ConduitWindow {
             }
             Some("user-profile") => {
                 if let Some(user_id) = query_param(url, "user") {
-                    self.imp().profile_visible.set(true);
-                    self.sync_back_button();
-                    *self.imp().pending_profile_user_id.borrow_mut() = Some(user_id.clone());
-                    self.imp().message_title.set_title(&gettext("Profile"));
-                    self.load_message_html(&message_html::placeholder_document(
-                        &gettext("Profile"),
-                        &gettext("Loading profile"),
-                    ));
-                    self.send_command(RuntimeCommand::LoadUserProfile { user_id });
+                    self.show_user_profile(&user_id);
                 }
                 true
             }
@@ -6317,6 +6353,23 @@ impl ConduitWindow {
                 });
             });
             menu.append(&star_button);
+        }
+
+        if let Some(action) = conversation
+            .as_ref()
+            .and_then(sidebar_conversation_profile_action)
+        {
+            let profile_button = gtk::Button::with_label(&gettext(action.label()));
+            profile_button.add_css_class("flat");
+            let weak_window = self.downgrade();
+            let popover_for_profile = popover.clone();
+            profile_button.connect_clicked(move |_| {
+                popover_for_profile.popdown();
+                if let Some(window) = weak_window.upgrade() {
+                    window.show_user_profile(&action.user_id);
+                }
+            });
+            menu.append(&profile_button);
         }
 
         let mark_read_button = gtk::Button::with_label(&gettext("Mark as read"));
@@ -10373,6 +10426,45 @@ mod tests {
         assert!(!unstar.starred);
 
         assert_eq!(sidebar_conversation_star_action(&unsupported), None);
+    }
+
+    #[test]
+    fn sidebar_profile_action_targets_only_one_to_one_dm_people() {
+        let direct_message = SlackConversation {
+            is_im: Some(true),
+            user: Some("U123".into()),
+            ..Default::default()
+        };
+        let group_direct_message = SlackConversation {
+            is_mpim: Some(true),
+            user: Some("U123".into()),
+            ..Default::default()
+        };
+        let channel = SlackConversation {
+            is_channel: Some(true),
+            user: Some("U123".into()),
+            ..Default::default()
+        };
+        let missing_user = SlackConversation {
+            is_im: Some(true),
+            ..Default::default()
+        };
+        let blank_user = SlackConversation {
+            is_im: Some(true),
+            user: Some("  ".into()),
+            ..Default::default()
+        };
+
+        let action = sidebar_conversation_profile_action(&direct_message).unwrap();
+        assert_eq!(action.label(), "Profile");
+        assert_eq!(action.user_id, "U123");
+        assert_eq!(
+            sidebar_conversation_profile_action(&group_direct_message),
+            None
+        );
+        assert_eq!(sidebar_conversation_profile_action(&channel), None);
+        assert_eq!(sidebar_conversation_profile_action(&missing_user), None);
+        assert_eq!(sidebar_conversation_profile_action(&blank_user), None);
     }
 
     #[test]
