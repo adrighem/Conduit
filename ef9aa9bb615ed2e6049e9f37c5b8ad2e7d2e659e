@@ -1,0 +1,9 @@
+Task: Diagnose and test the installed branding contract
+
+Summary: Identified orphaned scalable, symbolic, and About-specific icon files from earlier Meson installations and added an upgrade-style staged-prefix regression that requires exact cleanup, idempotency, current-icon preservation, and aligned desktop/About icon names.
+
+Files: conductor/tracks/branding_install_20260728/spec.md, tests/meson.build, tests/test_branding_assets.py.
+
+Rationale: Meson copies current files but does not prune files removed from later install manifests. The stale scalable SVG remains an exact match for GNOME app-grid and 192-pixel About icon lookups.
+
+Validation: The Branding assets test failed in the red phase because no cleanup hook existed, then passed with the implementation present in the working tree.
