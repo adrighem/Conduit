@@ -26,6 +26,17 @@ change Slack's private VIP list.
 11. Provide a Profile action in the sidebar context menu for one-to-one DMs with
     a known Slack user ID.
 12. Open that Profile action through the existing main-webview profile flow.
+13. Open person completion when `@` is typed at a mention boundary in either
+    the message or thread composer.
+14. Search the full available workspace person catalog by display name, full
+    name, normalized aliases, and Slack username rather than limiting results
+    to existing direct messages.
+15. Reuse the emoji completion popup's mouse and keyboard interactions,
+    including Up, Down, Enter, Tab, and Escape.
+16. Present the selected person's readable name in the composer while sending
+    Slack's canonical `<@USER_ID>` mention form.
+17. Preserve completed mentions through draft save and restore without
+    notifying a stale person after the visible mention text is edited.
 
 ## Acceptance Criteria
 
@@ -39,6 +50,14 @@ change Slack's private VIP list.
   channels, group DMs, and malformed DMs without a user ID.
 - Activating Profile loads the selected person's profile in the main webview
   through the same path used by message author profile links.
+- Composer tests cover mention boundaries, filtering, deterministic ranking,
+  Unicode character offsets, and canonical mention serialization.
+- Both message and thread composers expose the same person completion behavior
+  without competing with emoji completion.
+- Person suggestions exclude deleted users and bots, deduplicate by Slack user
+  ID, and remain searchable from the full loaded catalog.
+- Draft round trips preserve canonical mention IDs while restoring readable
+  names where identity data is available.
 - A successful toggle updates persisted conversation state and rerenders the sidebar.
 - `cargo fmt --check`, Rust tests, `cargo check`, Meson compile, and Meson tests pass in a sanitized allowlisted environment.
 

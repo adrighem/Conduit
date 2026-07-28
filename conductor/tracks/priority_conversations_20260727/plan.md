@@ -7,5 +7,6 @@
 - [x] Task: Add accessible Star and Unstar actions with persisted runtime updates 8c4b604
 - [x] Task: Run full sanitized validation and synchronize product documentation 591e437
 - [x] Task: Address final priority consistency review findings 16a774b
-- [~] Task: Add a DM Profile context action using the existing main-webview flow
+- [x] Task: Add a DM Profile context action using the existing main-webview flow 8947521
+- [~] Task: Add person @ completion to message and thread composers
 - [ ] Task: Conductor - User Manual Verification 'Starred priority conversations' (Protocol in workflow.md)
