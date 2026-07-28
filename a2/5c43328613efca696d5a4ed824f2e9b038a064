@@ -1,0 +1,11 @@
+Task: Run full sanitized validation and update installation documentation
+
+Summary: Documented source-upgrade branding cleanup and the expected GNOME refresh behavior.
+
+Files: README.md.
+
+Rationale: Users upgrading an existing Meson installation need to know that reinstalling performs the legacy icon migration and that a running app or Shell session may retain an already-rendered icon until restarted.
+
+Validation: cargo fmt --check; cargo check --locked; cargo test --locked (712 passed, 2 ignored); Meson compile; Meson test (16 passed); Python syntax and git diff checks.
+
+Limitations: Meson coverage is disabled and the project has no configured coverage report target. Strict Clippy is skipped because the installed cargo-clippy component does not match rustc 1.95.
