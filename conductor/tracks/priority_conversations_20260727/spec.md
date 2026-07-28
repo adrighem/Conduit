@@ -23,6 +23,9 @@ change Slack's private VIP list.
 8. Persist a successful toggle through the existing workspace conversation pipeline and update every duplicate sidebar row.
 9. Preserve the current flat search and unread-filter behavior.
 10. Keep single-workspace behavior unchanged.
+11. Provide a Profile action in the sidebar context menu for one-to-one DMs with
+    a known Slack user ID.
+12. Open that Profile action through the existing main-webview profile flow.
 
 ## Acceptance Criteria
 
@@ -32,6 +35,10 @@ change Slack's private VIP list.
 - Empty Priority sections are omitted.
 - Keyed sidebar tests prove duplicate rows remain section-scoped and independently collapsible.
 - UI helper tests cover Star and Unstar labels and supported conversation kinds.
+- UI helper tests cover Profile eligibility for one-to-one DMs and reject
+  channels, group DMs, and malformed DMs without a user ID.
+- Activating Profile loads the selected person's profile in the main webview
+  through the same path used by message author profile links.
 - A successful toggle updates persisted conversation state and rerenders the sidebar.
 - `cargo fmt --check`, Rust tests, `cargo check`, Meson compile, and Meson tests pass in a sanitized allowlisted environment.
 
