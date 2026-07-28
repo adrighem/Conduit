@@ -3,6 +3,6 @@
   "type": "feature",
   "status": "in_progress",
   "created_at": "2026-07-28T12:49:57Z",
-  "updated_at": "2026-07-28T13:56:01Z",
+  "updated_at": "2026-07-28T17:59:37Z",
   "description": "Present and edit the connected user's Slack custom status from Conduit's workspace header."
 }

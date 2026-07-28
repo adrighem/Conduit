@@ -43,6 +43,9 @@ client presets.
 15. Use the existing browser-session request transport when configured, while
     surfacing Slack authentication or permission failures without promising
     undocumented browser-session API support.
+16. Populate the status emoji chooser with the complete available Unicode and
+    workspace emoji catalog, and update its visible choices immediately as the
+    user types a case-insensitive search query.
 
 ## Acceptance Criteria
 
@@ -58,6 +61,9 @@ client presets.
   text-only and emoji-only statuses, and exposes Clear Status only when useful.
 - Emoji filtering and keyboard navigation reuse the existing catalog and
   selection behavior.
+- Opening, filtering, clearing the filter, and reopening the emoji chooser
+  cannot leave its model partially populated or disconnected from the search
+  entry.
 - Successful updates refresh the header and current-user status everywhere;
   failures do not present an unconfirmed status.
 - A headless GTK test activates the window action and covers empty and preloaded
