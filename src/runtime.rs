@@ -884,7 +884,11 @@ pub enum RuntimeEventKind {
     UserFullNamesLoaded(HashMap<String, String>),
     UserAvatarUrlsLoaded(HashMap<String, String>),
     UserSearchAliasesLoaded(HashMap<String, Vec<String>>),
-    UserStatusesLoaded(HashMap<String, SlackUserStatus>),
+    UserStatusesLoaded {
+        statuses: HashMap<String, SlackUserStatus>,
+        replace_existing: bool,
+        preserve_user_ids: HashSet<String>,
+    },
     UserGroupsLoaded {
         names: HashMap<String, String>,
         members: HashMap<String, Vec<String>>,
@@ -1053,7 +1057,7 @@ impl RuntimeEventKind {
             | Self::UserFullNamesLoaded(_)
             | Self::UserAvatarUrlsLoaded(_)
             | Self::UserSearchAliasesLoaded(_)
-            | Self::UserStatusesLoaded(_)
+            | Self::UserStatusesLoaded { .. }
             | Self::UserGroupsLoaded { .. } => {
                 OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace)
             }
@@ -1202,11 +1206,83 @@ struct RuntimeConnection {
     read_marks: Arc<Mutex<HashMap<String, String>>>,
     message_handoffs: Arc<Mutex<MessageHandoffResolver>>,
     conversation_star_sync: ConversationStarSyncGate,
+    user_status_sync: UserStatusSync,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
 }
 
 type ConversationStarSyncGate = Arc<tokio::sync::Mutex<()>>;
+
+#[derive(Clone, Debug, Default)]
+struct UserStatusSync {
+    state: Arc<Mutex<UserStatusSyncState>>,
+    persistence: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Debug, Default)]
+struct UserStatusSyncState {
+    revision: u64,
+    user_revisions: HashMap<String, u64>,
+}
+
+impl UserStatusSync {
+    fn revision(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("user status sync lock poisoned")
+            .revision
+    }
+
+    fn user_revision(&self, user_id: &str) -> u64 {
+        self.state
+            .lock()
+            .expect("user status sync lock poisoned")
+            .user_revisions
+            .get(user_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn is_revision_current(&self, revision: u64) -> bool {
+        self.revision() == revision
+    }
+
+    fn is_user_revision_current(&self, user_id: &str, revision: u64) -> bool {
+        self.user_revision(user_id) == revision
+    }
+
+    fn publish_change(&self, user_id: &str, publish: impl FnOnce()) -> u64 {
+        let mut state = self.state.lock().expect("user status sync lock poisoned");
+        state.revision = state.revision.saturating_add(1);
+        let revision = state.revision;
+        state.user_revisions.insert(user_id.to_string(), revision);
+        publish();
+        revision
+    }
+
+    fn publish_snapshot(&self, base_revision: u64, publish: impl FnOnce(HashSet<String>)) {
+        let state = self.state.lock().expect("user status sync lock poisoned");
+        let preserve_user_ids = state
+            .user_revisions
+            .iter()
+            .filter_map(|(user_id, revision)| {
+                (*revision > base_revision).then_some(user_id.clone())
+            })
+            .collect();
+        publish(preserve_user_ids);
+    }
+
+    fn publish_user_snapshot(&self, user_id: &str, base_revision: u64, publish: impl FnOnce(bool)) {
+        let state = self.state.lock().expect("user status sync lock poisoned");
+        let is_current = state
+            .user_revisions
+            .get(user_id)
+            .copied()
+            .unwrap_or_default()
+            == base_revision;
+        publish(is_current);
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct WorkspaceReducerAdapter {
@@ -2251,6 +2327,7 @@ fn spawn_authentication_task<F>(
                                 256,
                             ))),
                             conversation_star_sync: ConversationStarSyncGate::default(),
+                            user_status_sync: UserStatusSync::default(),
                             team_id: auth.team_id.clone(),
                             huddles,
                         };
@@ -2443,6 +2520,7 @@ fn spawn_workspace_tasks(
                     connection.current_user_id.clone(),
                     connection.team_id.clone(),
                     connection.huddles.clone(),
+                    connection.user_status_sync.clone(),
                 )
                 .await;
             });
@@ -2528,7 +2606,11 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
         ));
     }
     if !user_statuses.is_empty() {
-        events.send_event(RuntimeEventKind::UserStatusesLoaded(user_statuses));
+        events.send_event(RuntimeEventKind::UserStatusesLoaded {
+            statuses: user_statuses,
+            replace_existing: false,
+            preserve_user_ids: HashSet::new(),
+        });
     }
     if !conversations.is_empty() {
         events.send_event(RuntimeEventKind::ConversationsLoaded(conversations));
@@ -2600,6 +2682,7 @@ async fn handle_connected_command(
         read_marks: &mut read_marks,
         message_handoffs: &connection.message_handoffs,
         conversation_star_sync: &connection.conversation_star_sync,
+        user_status_sync: &connection.user_status_sync,
         team_id: connection.team_id.as_deref(),
         workspace_url: connection.workspace_url.as_deref(),
         huddles: &connection.huddles,
@@ -2635,6 +2718,7 @@ struct RuntimeContext<'a> {
     read_marks: &'a mut HashMap<String, String>,
     message_handoffs: &'a Arc<Mutex<MessageHandoffResolver>>,
     conversation_star_sync: &'a ConversationStarSyncGate,
+    user_status_sync: &'a UserStatusSync,
     team_id: Option<&'a str>,
     workspace_url: Option<&'a str>,
     huddles: &'a HuddleActorHandle,
@@ -2938,6 +3022,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         }
         RuntimeCommand::DiscoverConversations => {
             let api = require_slack(context.slack)?;
+            let status_base_revision = context.user_status_sync.revision();
             let users_base_revision = context.workspace.revision();
             let users = api.users().await?;
             context.workspace.apply(
@@ -2961,7 +3046,13 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 store.store_user_search_aliases(&aliases).await?;
                 store.store_user_full_names(&full_names).await?;
                 store.store_user_avatar_urls(&avatar_urls).await?;
-                store.store_user_statuses(&statuses).await?;
+                let _persistence_guard = context.user_status_sync.persistence.lock().await;
+                if context
+                    .user_status_sync
+                    .is_revision_current(status_base_revision)
+                {
+                    store.store_user_statuses(&statuses).await?;
+                }
             }
             context
                 .events
@@ -2973,8 +3064,16 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .events
                 .send_event(RuntimeEventKind::UserAvatarUrlsLoaded(avatar_urls));
             context
-                .events
-                .send_event(RuntimeEventKind::UserStatusesLoaded(statuses));
+                .user_status_sync
+                .publish_snapshot(status_base_revision, |preserve_user_ids| {
+                    context
+                        .events
+                        .send_event(RuntimeEventKind::UserStatusesLoaded {
+                            statuses,
+                            replace_existing: true,
+                            preserve_user_ids,
+                        });
+                });
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
@@ -3370,6 +3469,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     status: None,
                 });
             } else {
+                let status_base_revision = context.user_status_sync.user_revision(&user_id);
                 let api = require_slack(context.slack)?;
                 let user = api.user(&user_id).await?;
                 let display_name = user.display_name().unwrap_or_else(|| user_id.clone());
@@ -3387,22 +3487,36 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     store_user_avatar_url(context.workspace_store, &user_id, avatar_url).await;
                 }
                 if let Some(store) = context.workspace_store.as_ref() {
-                    if let Err(error) = store.store_user_status(&user_id, status.clone()).await {
-                        crate::debug::log(
-                            "store",
-                            &format!(
-                                "CachedUserStatusStoreFailed user_id={user_id} error={error:#}"
-                            ),
-                        );
+                    let _persistence_guard = context.user_status_sync.persistence.lock().await;
+                    if context
+                        .user_status_sync
+                        .is_user_revision_current(&user_id, status_base_revision)
+                    {
+                        if let Err(error) = store.store_user_status(&user_id, status.clone()).await
+                        {
+                            crate::debug::log(
+                                "store",
+                                &format!(
+                                    "CachedUserStatusStoreFailed user_id={user_id} error={error:#}"
+                                ),
+                            );
+                        }
                     }
                 }
-                context.events.send_event(RuntimeEventKind::UserLoaded {
-                    user_id,
-                    display_name,
-                    full_name,
-                    avatar_url,
-                    status,
-                });
+                let status_user_id = user_id.clone();
+                context.user_status_sync.publish_user_snapshot(
+                    &status_user_id,
+                    status_base_revision,
+                    |status_is_current| {
+                        context.events.send_event(RuntimeEventKind::UserLoaded {
+                            user_id,
+                            display_name,
+                            full_name,
+                            avatar_url,
+                            status: status_is_current.then_some(status).flatten(),
+                        });
+                    },
+                );
             }
         }
         RuntimeCommand::LoadUserProfile { user_id } => {
@@ -3696,20 +3810,32 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             let profile = api.set_current_user_status(&status).await?;
             let status = profile.status();
+            let status_for_event = status.clone();
+            let revision = context.user_status_sync.publish_change(&user_id, || {
+                context
+                    .events
+                    .send_event(RuntimeEventKind::CurrentUserStatusUpdated {
+                        user_id: user_id.clone(),
+                        status: status_for_event,
+                    });
+            });
             if let Some(store) = context.workspace_store.as_ref() {
-                if let Err(error) = store.store_user_status(&user_id, status.clone()).await {
-                    crate::debug::log(
-                        "store",
-                        &format!(
-                            "CurrentUserStatusStoreFailed category={:?}",
-                            error.category()
-                        ),
-                    );
+                let _persistence_guard = context.user_status_sync.persistence.lock().await;
+                if context
+                    .user_status_sync
+                    .is_user_revision_current(&user_id, revision)
+                {
+                    if let Err(error) = store.store_user_status(&user_id, status).await {
+                        crate::debug::log(
+                            "store",
+                            &format!(
+                                "CurrentUserStatusStoreFailed category={:?}",
+                                error.category()
+                            ),
+                        );
+                    }
                 }
             }
-            context
-                .events
-                .send_event(RuntimeEventKind::CurrentUserStatusUpdated { user_id, status });
         }
         RuntimeCommand::UploadFile {
             channel_id,
@@ -3764,6 +3890,7 @@ async fn run_socket_mode(
     current_user_id: Option<String>,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
+    user_status_sync: UserStatusSync,
 ) {
     let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
     let transport = credentials.transport();
@@ -3784,6 +3911,7 @@ async fn run_socket_mode(
                 current_user_id.clone(),
                 events_for_run.clone(),
                 workspace.clone(),
+                user_status_sync.clone(),
             ));
             sender
         });
@@ -3791,6 +3919,7 @@ async fn run_socket_mode(
         let workspace_for_run = workspace.clone();
         let huddles_for_run = huddles.clone();
         let team_id_for_run = team_id.clone();
+        let user_status_sync_for_run = user_status_sync.clone();
         let result = socket_mode::run_once(
             &credentials,
             move || {
@@ -3808,10 +3937,43 @@ async fn run_socket_mode(
                 let attention = (!defer_ordered_ui)
                     .then(|| apply_realtime_workspace_event(&workspace_for_run, &event))
                     .flatten();
+                let status_change_user_id = match &event {
+                    SocketModeEvent::UserChanged(user)
+                    | SocketModeEvent::UserHuddleChanged(user)
+                        if user
+                            .profile
+                            .as_ref()
+                            .is_some_and(|profile| profile.contains_status_fields()) =>
+                    {
+                        user.id.clone()
+                    }
+                    _ => None,
+                };
+                let status_revision = if !defer_ordered_ui {
+                    if let Some(user_id) = status_change_user_id.as_deref() {
+                        Some(user_status_sync_for_run.publish_change(user_id, || {
+                            events_for_run.send_event(RuntimeEventKind::SocketModeEvent {
+                                event: event.clone(),
+                                attention: attention.as_ref().map(|effect| effect.decision.clone()),
+                            });
+                        }))
+                    } else {
+                        events_for_run.send_event(RuntimeEventKind::SocketModeEvent {
+                            event: event.clone(),
+                            attention: attention.as_ref().map(|effect| effect.decision.clone()),
+                        });
+                        None
+                    }
+                } else {
+                    None
+                };
                 let persistence_event = match &event {
                     SocketModeEvent::UserChanged(user)
                     | SocketModeEvent::UserHuddleChanged(user) => {
-                        Some(RealtimePersistenceEvent::UserChanged(user.clone()))
+                        Some(RealtimePersistenceEvent::UserChanged {
+                            user: user.clone(),
+                            status_revision,
+                        })
                     }
                     SocketModeEvent::Message(message) => Some(RealtimePersistenceEvent::Message {
                         event: message.clone(),
@@ -3833,12 +3995,6 @@ async fn run_socket_mode(
                             )
                         })
                 });
-                if !defer_ordered_ui {
-                    events_for_run.send_event(RuntimeEventKind::SocketModeEvent {
-                        event: event.clone(),
-                        attention: attention.as_ref().map(|effect| effect.decision.clone()),
-                    });
-                }
                 if let Some(sender) = persistence_for_run.as_ref() {
                     if let Some(persistence_event) = persistence_event {
                         if sender.send(persistence_event).is_err() {
@@ -3915,10 +4071,10 @@ fn apply_realtime_workspace_event(
 ) -> Option<MessageAttentionEffect> {
     let mutation = match event {
         SocketModeEvent::Message(event) => Some(realtime_message_mutation(event, None)),
-        SocketModeEvent::UserChanged(user) | SocketModeEvent::UserHuddleChanged(user) => {
-            Some(WorkspaceMutation::UserUpsert((**user).clone()))
-        }
-        SocketModeEvent::Reaction(_) | SocketModeEvent::RefreshConversations => None,
+        SocketModeEvent::UserChanged(user) => Some(WorkspaceMutation::UserUpsert((**user).clone())),
+        SocketModeEvent::UserHuddleChanged(_)
+        | SocketModeEvent::Reaction(_)
+        | SocketModeEvent::RefreshConversations => None,
     };
     let reduction = workspace.reduce(MutationOrigin::Realtime, mutation?)?;
     reduction
@@ -4273,7 +4429,10 @@ fn apply_huddle_effects(
 
 #[derive(Debug)]
 enum RealtimePersistenceEvent {
-    UserChanged(Box<SlackUser>),
+    UserChanged {
+        user: Box<SlackUser>,
+        status_revision: Option<u64>,
+    },
     Message {
         event: Box<crate::socket_mode::SocketModeMessageEvent>,
     },
@@ -4372,10 +4531,14 @@ async fn persist_realtime_events(
     current_user_id: Option<String>,
     events: RuntimeEventSender,
     workspace: WorkspaceReducerAdapter,
+    user_status_sync: UserStatusSync,
 ) {
     while let Some(event) = receiver.recv().await {
         match event {
-            RealtimePersistenceEvent::UserChanged(user) => {
+            RealtimePersistenceEvent::UserChanged {
+                user,
+                status_revision,
+            } => {
                 let Some(user_id) = user.id.as_deref() else {
                     continue;
                 };
@@ -4405,11 +4568,25 @@ async fn persist_realtime_events(
                         );
                     }
                 }
-                if let Err(error) = store.store_user_status(user_id, user.status()).await {
-                    crate::debug::log(
-                        "store",
-                        &format!("RealtimeUserStatusStoreFailed user_id={user_id} error={error:#}"),
-                    );
+                if user
+                    .profile
+                    .as_ref()
+                    .is_some_and(|profile| profile.contains_status_fields())
+                {
+                    let _persistence_guard = user_status_sync.persistence.lock().await;
+                    let status_is_current = status_revision.is_none_or(|revision| {
+                        user_status_sync.is_user_revision_current(user_id, revision)
+                    });
+                    if status_is_current {
+                        if let Err(error) = store.store_user_status(user_id, user.status()).await {
+                            crate::debug::log(
+                                "store",
+                                &format!(
+                                    "RealtimeUserStatusStoreFailed user_id={user_id} error={error:#}"
+                                ),
+                            );
+                        }
+                    }
                 }
             }
             RealtimePersistenceEvent::Message { event } => {
@@ -6078,6 +6255,20 @@ mod tests {
 
         assert!(apply_realtime_workspace_event(
             &workspace,
+            &SocketModeEvent::UserHuddleChanged(Box::new(SlackUser {
+                id: Some("U1".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    huddle_state_call_id: Some("R1".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )
+        .is_none());
+        assert_eq!(workspace.revision().value(), 2);
+
+        assert!(apply_realtime_workspace_event(
+            &workspace,
             &SocketModeEvent::Reaction(socket_mode::SocketModeReactionEvent {
                 channel_id: "C1".into(),
                 ts: "1.000".into(),
@@ -6088,6 +6279,20 @@ mod tests {
         )
         .is_none());
         assert_eq!(workspace.revision().value(), 2);
+    }
+
+    #[test]
+    fn user_status_snapshots_preserve_users_changed_after_the_request_started() {
+        let sync = UserStatusSync::default();
+        let base_revision = sync.revision();
+        sync.publish_change("U_CHANGED", || {});
+
+        let mut preserved = HashSet::new();
+        sync.publish_snapshot(base_revision, |user_ids| preserved = user_ids);
+
+        assert_eq!(preserved, HashSet::from(["U_CHANGED".to_string()]));
+        assert!(sync.is_user_revision_current("U_CHANGED", 1));
+        assert!(sync.is_user_revision_current("U_UNCHANGED", 0));
     }
 
     #[test]
@@ -6962,6 +7167,82 @@ mod tests {
     }
 
     #[test]
+    fn realtime_status_persistence_skips_superseded_user_updates() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-realtime-status-persistence-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+            let (runtime_events, _receiver) = mpsc::unbounded_channel();
+            let event_sender = RuntimeEventSender::new(
+                runtime_events,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
+            );
+            let workspace = WorkspaceReducerAdapter::default();
+            let sync = UserStatusSync::default();
+            let old_revision = sync.publish_change("U1", || {});
+            let current_revision = sync.publish_change("U1", || {});
+            let (sender, receiver) =
+                realtime_persistence_channel(workspace.attention_metrics_handle());
+            let worker = tokio::spawn(persist_realtime_events(
+                receiver,
+                store.clone(),
+                Some("U_SELF".into()),
+                event_sender,
+                workspace,
+                sync,
+            ));
+            let status_user = |text: &str| {
+                Box::new(SlackUser {
+                    id: Some("U1".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        status_text: Some(text.to_string()),
+                        status_emoji: Some(String::new()),
+                        status_expiration: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            };
+            sender
+                .send(RealtimePersistenceEvent::UserChanged {
+                    user: status_user("Current"),
+                    status_revision: Some(current_revision),
+                })
+                .unwrap();
+            sender
+                .send(RealtimePersistenceEvent::UserChanged {
+                    user: status_user("Stale"),
+                    status_revision: Some(old_revision),
+                })
+                .unwrap();
+            drop(sender);
+            worker.await.unwrap();
+
+            let statuses = store.load_user_statuses().await.unwrap();
+            assert_eq!(
+                statuses.get("U1").map(|status| status.text.as_str()),
+                Some("Current")
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
     fn realtime_persistence_worker_drains_events_in_session_scope() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7006,6 +7287,7 @@ mod tests {
                 Some("U_SELF".into()),
                 event_sender,
                 workspace.clone(),
+                UserStatusSync::default(),
             ));
             for ts in ["1.0", "2.0"] {
                 sender
@@ -7097,6 +7379,7 @@ mod tests {
                 Some("U_SELF".into()),
                 event_sender,
                 workspace.clone(),
+                UserStatusSync::default(),
             ));
             sender
                 .send(RealtimePersistenceEvent::Message {
@@ -7210,6 +7493,7 @@ mod tests {
                 Some("U_SELF".into()),
                 event_sender,
                 workspace.clone(),
+                UserStatusSync::default(),
             ));
             let event = crate::socket_mode::SocketModeMessageEvent {
                 channel_id: "D1".into(),
@@ -7320,6 +7604,7 @@ mod tests {
                 Some("U_SELF".into()),
                 event_sender,
                 workspace.clone(),
+                UserStatusSync::default(),
             ));
             sender
                 .send(RealtimePersistenceEvent::Message {
@@ -7447,6 +7732,7 @@ mod tests {
                 Some("U_SELF".into()),
                 event_sender,
                 workspace.clone(),
+                UserStatusSync::default(),
             ));
             tokio::task::yield_now().await;
             let mut channel_messages = Vec::with_capacity(700);
@@ -7746,6 +8032,7 @@ mod tests {
                 Some("U_SELF".into()),
                 event_sender,
                 workspace.clone(),
+                UserStatusSync::default(),
             ));
             sender
                 .send(RealtimePersistenceEvent::Message {
@@ -7899,6 +8186,7 @@ mod tests {
             read_marks: Arc::new(Mutex::new(HashMap::new())),
             message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(256))),
             conversation_star_sync: ConversationStarSyncGate::default(),
+            user_status_sync: UserStatusSync::default(),
             team_id: None,
             huddles,
         });
@@ -8679,6 +8967,18 @@ mod tests {
                     thread_ts: "1710000000.000100".into(),
                 },
             )
+        );
+
+        let event = RuntimeEventKind::CurrentUserStatusUpdated {
+            user_id: "U123".to_string(),
+            status: Some(SlackUserStatus {
+                text: "Focus time".to_string(),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            event.operation_context(&fallback),
+            OperationContext::new(RuntimeOperation::UserStatus, RuntimeTarget::Workspace)
         );
     }
 

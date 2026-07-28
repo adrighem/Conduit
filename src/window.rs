@@ -63,7 +63,8 @@ use crate::message_html::{
 };
 use crate::models::{
     slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
-    SlackConversation, SlackFile, SlackMessage, SlackUnreadState, SlackUser, SlackUserStatus,
+    SlackConversation, SlackFile, SlackMessage, SlackUnreadState, SlackUser, SlackUserProfile,
+    SlackUserStatus,
 };
 use crate::realtime::{RealtimePhase, RealtimeStatus};
 use crate::rendering;
@@ -109,6 +110,35 @@ struct HuddlePreflightDialog {
     microphone: HuddleDevicePicker,
     speaker: HuddleDevicePicker,
     camera: HuddleDevicePicker,
+}
+
+#[derive(Debug, Clone)]
+struct StatusDialogState {
+    dialog: adw::AlertDialog,
+}
+
+#[derive(Debug, Clone)]
+struct PendingStatusUpdate {
+    requested: SlackUserStatus,
+    dialog_draft: SlackUserStatus,
+    clearing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusExpirationChoice {
+    Never,
+    Minutes30,
+    Hour1,
+    Hours4,
+    Today,
+    ThisWeek,
+    Existing(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserStatusPresentation {
+    subtitle: String,
+    accessible_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +320,8 @@ mod imp {
         pub(super) huddle_snapshot: RefCell<HuddleSnapshot>,
         pub(super) huddle_devices: RefCell<Vec<HuddleDevice>>,
         pub(super) huddle_preflight_dialog: RefCell<Option<HuddlePreflightDialog>>,
+        pub(super) status_dialog: RefCell<Option<StatusDialogState>>,
+        pub(super) pending_status_update: RefCell<Option<PendingStatusUpdate>>,
         pub(super) notified_huddle_call_id: RefCell<Option<String>>,
         pub drafts: RefCell<Drafts>,
         pub draft_save_generation: Cell<u64>,
@@ -357,13 +389,18 @@ mod imp {
             obj.setup_callbacks();
             if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
                 let huddle_test = std::env::var_os("CONDUIT_TEST_HUDDLE").is_some();
+                let status_test = std::env::var_os("CONDUIT_TEST_STATUS_DIALOG").is_some();
+                if status_test && std::env::var_os("CONDUIT_TEST_STATUS_NARROW").is_some() {
+                    obj.set_default_size(360, 720);
+                }
                 let test_channel_id = if huddle_test { "CTEST" } else { "C_TEST" };
                 obj.apply_workspace_lifecycle(WorkspaceLifecycleEvent::ConnectRequested);
                 obj.apply_workspace_lifecycle(WorkspaceLifecycleEvent::Authenticated);
                 obj.show_workspace(AuthInfo {
                     team: Some("Test Workspace".to_string()),
                     team_id: huddle_test.then(|| "TTEST".to_string()),
-                    user_id: huddle_test.then(|| "UTEST".to_string()),
+                    user: (huddle_test || status_test).then(|| "Test User".to_string()),
+                    user_id: (huddle_test || status_test).then(|| "UTEST".to_string()),
                     ..AuthInfo::default()
                 });
                 obj.populate_conversations(vec![SlackConversation {
@@ -403,6 +440,17 @@ mod imp {
                         .collect(),
                 );
                 *self.discovered_users.borrow_mut() = test_users;
+                if status_test && std::env::var_os("CONDUIT_TEST_STATUS_PRESET").is_some() {
+                    self.user_statuses.borrow_mut().insert(
+                        "UTEST".to_string(),
+                        SlackUserStatus {
+                            text: "Working remotely".to_string(),
+                            emoji: ":house:".to_string(),
+                            expiration: 0,
+                        },
+                    );
+                    obj.refresh_workspace_title_status();
+                }
                 obj.apply_workspace_lifecycle(WorkspaceLifecycleEvent::SyncCompleted);
                 obj.select_conversation(test_channel_id, "#general");
                 if huddle_test {
@@ -440,6 +488,18 @@ mod imp {
                         "Grace Hopper".to_string(),
                     )]));
                 }
+                if status_test {
+                    let weak_window = obj.downgrade();
+                    glib::idle_add_local_once(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            let _ = gtk::prelude::WidgetExt::activate_action(
+                                &window,
+                                "win.change-status",
+                                None,
+                            );
+                        }
+                    });
+                }
             } else {
                 obj.show_loading("Checking secure storage");
                 obj.send_session_command(RuntimeCommand::LoadStoredToken);
@@ -467,6 +527,9 @@ mod imp {
                         completion.popover.unparent();
                     }
                 }
+            }
+            if let Some(state) = self.status_dialog.borrow_mut().take() {
+                state.dialog.force_close();
             }
         }
     }
@@ -1486,6 +1549,7 @@ enum RuntimeFailureRecovery {
         thread_ts: Option<String>,
     },
     ConversationStar,
+    UserStatus,
     Upload {
         channel_id: String,
         thread_ts: Option<String>,
@@ -1572,6 +1636,9 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
         (RuntimeOperation::ConversationStar, RuntimeTarget::Channel(_)) => {
             RuntimeFailureRecovery::ConversationStar
         }
+        (RuntimeOperation::UserStatus, RuntimeTarget::Workspace) => {
+            RuntimeFailureRecovery::UserStatus
+        }
         (
             RuntimeOperation::FileUpload,
             RuntimeTarget::Upload {
@@ -1597,6 +1664,20 @@ fn runtime_failure_recovery_for_failure(
     }
 }
 
+fn current_user_status_error_message(failure: &RuntimeFailure) -> String {
+    if failure.category == RuntimeFailureCategory::Validation
+        && failure.message.contains("for this conversation")
+    {
+        gettext(
+            "Slack did not allow Conduit to change your status. Reconnect the workspace with profile access and try again.",
+        )
+    } else if failure.category == RuntimeFailureCategory::Internal {
+        gettext("Slack could not change your status. Try again.")
+    } else {
+        failure.message.clone()
+    }
+}
+
 fn mutation_target_is_active(
     visible_channel: Option<&str>,
     selected_thread: Option<&str>,
@@ -1612,6 +1693,269 @@ fn current_unix_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or_default()
+}
+
+fn status_expiration_for_choice(
+    choice: StatusExpirationChoice,
+    now: i64,
+    end_today: i64,
+    end_week: i64,
+) -> i64 {
+    match choice {
+        StatusExpirationChoice::Never => 0,
+        StatusExpirationChoice::Minutes30 => now.saturating_add(30 * 60),
+        StatusExpirationChoice::Hour1 => now.saturating_add(60 * 60),
+        StatusExpirationChoice::Hours4 => now.saturating_add(4 * 60 * 60),
+        StatusExpirationChoice::Today => end_today,
+        StatusExpirationChoice::ThisWeek => end_week,
+        StatusExpirationChoice::Existing(expiration) => expiration,
+    }
+}
+
+fn status_from_dialog_input(
+    text: &str,
+    emoji: &str,
+    expiration_choice: StatusExpirationChoice,
+    now: i64,
+    end_today: i64,
+    end_week: i64,
+) -> SlackUserStatus {
+    SlackUserStatus {
+        text: text.trim().chars().take(100).collect(),
+        emoji: emoji.trim().trim_matches(':').to_string(),
+        expiration: status_expiration_for_choice(expiration_choice, now, end_today, end_week),
+    }
+}
+
+fn status_expiration_boundaries(now: i64) -> (i64, i64) {
+    let fallback = (
+        now.saturating_add(24 * 60 * 60),
+        now.saturating_add(7 * 24 * 60 * 60),
+    );
+    let Ok(local) = glib::DateTime::now_local() else {
+        return fallback;
+    };
+    let Ok(end_today) = glib::DateTime::from_local(
+        local.year(),
+        local.month(),
+        local.day_of_month(),
+        23,
+        59,
+        59.0,
+    ) else {
+        return fallback;
+    };
+    let Ok(end_week_date) = local.add_days(7_i32.saturating_sub(local.day_of_week())) else {
+        return (end_today.to_unix(), fallback.1);
+    };
+    let Ok(end_week) = glib::DateTime::from_local(
+        end_week_date.year(),
+        end_week_date.month(),
+        end_week_date.day_of_month(),
+        23,
+        59,
+        59.0,
+    ) else {
+        return (end_today.to_unix(), fallback.1);
+    };
+    (end_today.to_unix(), end_week.to_unix())
+}
+
+fn user_status_presentation(
+    status: &SlackUserStatus,
+    custom_emojis: &HashMap<String, String>,
+    now: i64,
+) -> Option<UserStatusPresentation> {
+    if !status.active_at(now) {
+        return None;
+    }
+    let text = status.text.trim();
+    let emoji = (!status.emoji_name().is_empty()).then(|| {
+        EmojiCatalog::new(custom_emojis)
+            .resolve(status.emoji_name())
+            .and_then(|value| match value {
+                EmojiValue::Unicode(glyph) => Some(glyph.to_string()),
+                EmojiValue::CustomImage(_) => None,
+            })
+            .unwrap_or_else(|| "●".to_string())
+    });
+    let subtitle = match (emoji.as_deref(), text.is_empty()) {
+        (Some(emoji), false) => format!("{emoji} {text}"),
+        (Some(emoji), true) => emoji.to_string(),
+        (None, false) => text.to_string(),
+        (None, true) => return None,
+    };
+    Some(UserStatusPresentation {
+        subtitle,
+        accessible_text: status.accessible_text(),
+    })
+}
+
+fn apply_user_status_profile_update(
+    statuses: &mut HashMap<String, SlackUserStatus>,
+    user_id: &str,
+    profile: &SlackUserProfile,
+) -> bool {
+    if !profile.contains_status_fields() {
+        return false;
+    }
+    match profile.status() {
+        Some(status) if statuses.get(user_id) == Some(&status) => false,
+        Some(status) => {
+            statuses.insert(user_id.to_string(), status);
+            true
+        }
+        None => statuses.remove(user_id).is_some(),
+    }
+}
+
+fn apply_user_status_snapshot(
+    current: &mut HashMap<String, SlackUserStatus>,
+    statuses: HashMap<String, SlackUserStatus>,
+    replace_existing: bool,
+    preserve_user_ids: &HashSet<String>,
+) -> Vec<String> {
+    let previous = current.clone();
+    if replace_existing {
+        let mut next = statuses;
+        for user_id in preserve_user_ids {
+            if let Some(status) = previous.get(user_id) {
+                next.insert(user_id.clone(), status.clone());
+            } else {
+                next.remove(user_id);
+            }
+        }
+        *current = next;
+    } else {
+        for (user_id, status) in statuses {
+            if !preserve_user_ids.contains(&user_id) {
+                current.entry(user_id).or_insert(status);
+            }
+        }
+    }
+
+    previous
+        .keys()
+        .chain(current.keys())
+        .filter(|user_id| previous.get(*user_id) != current.get(*user_id))
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn current_user_header_title(
+    current_user_id: Option<&str>,
+    user_names: &HashMap<String, String>,
+    workspace_name: Option<&str>,
+) -> String {
+    current_user_id
+        .and_then(|user_id| user_names.get(user_id))
+        .map(String::as_str)
+        .or(workspace_name)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| gettext("Workspace"))
+}
+
+fn status_emoji_options(
+    custom_emojis: &HashMap<String, String>,
+    selected_emoji: &str,
+) -> (Vec<String>, Vec<String>, u32) {
+    let mut names = vec![String::new()];
+    let mut labels = vec![gettext("No emoji")];
+    let mut seen = HashSet::new();
+    seen.insert(String::new());
+    for entry in EmojiCatalog::new(custom_emojis).entries() {
+        if !seen.insert(entry.name.clone()) {
+            continue;
+        }
+        let label = match entry.value {
+            EmojiValue::Unicode(glyph) => {
+                format!("{glyph} :{}: - {}", entry.name, entry.label)
+            }
+            EmojiValue::CustomImage(_) => format!(":{}: - {}", entry.name, entry.label),
+        };
+        names.push(entry.name);
+        labels.push(label);
+    }
+    let selected_emoji = selected_emoji.trim().trim_matches(':');
+    let selected = names
+        .iter()
+        .position(|name| name == selected_emoji)
+        .unwrap_or_else(|| {
+            if selected_emoji.is_empty() {
+                0
+            } else {
+                names.push(selected_emoji.to_string());
+                labels.push(format!(":{selected_emoji}:"));
+                names.len() - 1
+            }
+        });
+    (names, labels, selected as u32)
+}
+
+fn status_expiration_options(
+    existing_expiration: i64,
+    now: i64,
+) -> (Vec<String>, Vec<StatusExpirationChoice>, u32) {
+    let mut labels = vec![
+        gettext("Don't clear"),
+        gettext("30 minutes"),
+        gettext("1 hour"),
+        gettext("4 hours"),
+        gettext("End of today"),
+        gettext("End of this week"),
+    ];
+    let mut choices = vec![
+        StatusExpirationChoice::Never,
+        StatusExpirationChoice::Minutes30,
+        StatusExpirationChoice::Hour1,
+        StatusExpirationChoice::Hours4,
+        StatusExpirationChoice::Today,
+        StatusExpirationChoice::ThisWeek,
+    ];
+    let selected = if existing_expiration > now {
+        let formatted = glib::DateTime::from_unix_local(existing_expiration)
+            .ok()
+            .and_then(|date_time| date_time.format("%a %H:%M").ok())
+            .map(|date_time| date_time.to_string())
+            .unwrap_or_else(|| existing_expiration.to_string());
+        labels.push(
+            gettext("Keep current clear time ({time})").replace("{time}", formatted.as_str()),
+        );
+        choices.push(StatusExpirationChoice::Existing(existing_expiration));
+        choices.len() - 1
+    } else {
+        0
+    };
+    (labels, choices, selected as u32)
+}
+
+fn update_status_dialog_save_response(
+    dialog: &adw::AlertDialog,
+    status_entry: &adw::EntryRow,
+    emoji_row: &adw::ComboRow,
+) {
+    dialog.set_response_enabled(
+        "save",
+        !status_entry.text().trim().is_empty() || emoji_row.selected() > 0,
+    );
+}
+
+fn status_dialog_clear_available(status: &SlackUserStatus, now: i64, clearing_retry: bool) -> bool {
+    clearing_retry || status.active_at(now)
+}
+
+fn enforce_status_text_limit(status_entry: &adw::EntryRow) {
+    let text = status_entry.text();
+    if text.chars().count() <= 100 {
+        return;
+    }
+    let limited = text.chars().take(100).collect::<String>();
+    status_entry.set_text(&limited);
+    status_entry.set_position(-1);
 }
 
 fn nearest_status_expiration(statuses: &HashMap<String, SlackUserStatus>, now: i64) -> Option<i64> {
@@ -3363,6 +3707,7 @@ impl ConduitWindow {
         self.add_window_action("switch-conversation", |window| {
             window.show_conversation_switcher()
         });
+        self.add_window_action("change-status", |window| window.show_change_status_dialog());
         self.add_window_action("new-message", |window| window.show_new_message_picker());
         self.add_window_action("new-channel", |window| window.show_new_channel_dialog());
         self.add_window_action("go-back", |window| window.go_back());
@@ -4010,12 +4355,6 @@ impl ConduitWindow {
                     .collect::<HashMap<_, _>>();
                 self.populate_user_names(names);
                 self.populate_user_avatar_urls(avatar_urls);
-                self.replace_user_statuses(
-                    users
-                        .iter()
-                        .filter_map(|user| Some((user.id.clone()?, user.status()?)))
-                        .collect(),
-                );
                 *self.imp().discovered_users.borrow_mut() = users;
                 self.refresh_open_conversation_picker();
                 for target in COMPOSER_TARGETS {
@@ -4064,6 +4403,7 @@ impl ConduitWindow {
                 }));
             }
             RuntimeEventKind::CurrentUserStatusUpdated { user_id, status } => {
+                self.imp().pending_status_update.borrow_mut().take();
                 let cleared = status.is_none();
                 if let Some(status) = status {
                     self.imp()
@@ -4370,8 +4710,12 @@ impl ConduitWindow {
                 *self.imp().user_search_aliases.borrow_mut() = aliases;
                 self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::PICKER);
             }
-            RuntimeEventKind::UserStatusesLoaded(statuses) => {
-                self.replace_user_statuses(statuses);
+            RuntimeEventKind::UserStatusesLoaded {
+                statuses,
+                replace_existing,
+                preserve_user_ids,
+            } => {
+                self.apply_user_statuses_snapshot(statuses, replace_existing, &preserve_user_ids);
             }
             RuntimeEventKind::UserGroupsLoaded { names, members } => {
                 self.populate_user_groups(names, members);
@@ -4587,6 +4931,7 @@ impl ConduitWindow {
             self.refresh_open_conversation_picker();
         }
         if invalidations.contains(UiInvalidations::TITLE) {
+            self.refresh_workspace_title_status();
             self.refresh_current_conversation_title();
         }
         if invalidations.contains(UiInvalidations::MAIN) {
@@ -5849,6 +6194,10 @@ impl ConduitWindow {
         if let Some(preflight) = imp.huddle_preflight_dialog.borrow_mut().take() {
             preflight.dialog.force_close();
         }
+        if let Some(state) = imp.status_dialog.borrow_mut().take() {
+            state.dialog.force_close();
+        }
+        imp.pending_status_update.borrow_mut().take();
         imp.huddle_revealer.set_reveal_child(false);
         imp.workspace.reset();
         imp.conversation_opening.borrow_mut().reset();
@@ -5901,6 +6250,10 @@ impl ConduitWindow {
         imp.sidebar_unread_filter_button.set_active(false);
         imp.sidebar_all_filter_button.set_active(false);
         imp.workspace_title_label.set_title(&gettext("Workspace"));
+        imp.workspace_title_label.set_subtitle("");
+        imp.workspace_title_label.set_tooltip_text(None);
+        imp.workspace_title_label
+            .update_property(&[gtk::accessible::Property::Description("")]);
         imp.workspace_status_label.set_label("");
         imp.message_status_label.set_label("");
         imp.workspace_split.set_show_content(false);
@@ -5917,6 +6270,15 @@ impl ConduitWindow {
         *self.imp().workspace_id.borrow_mut() = workspace_identity(&auth);
         self.imp().workspace_ready.set(false);
         self.imp().initial_sync_complete.set(false);
+        if let (Some(user_id), Some(user_name)) = (auth.user_id.as_deref(), auth.user.as_deref()) {
+            let user_name = user_name.trim();
+            if !user_name.is_empty() {
+                self.imp()
+                    .user_names
+                    .borrow_mut()
+                    .insert(user_id.to_string(), user_name.to_string());
+            }
+        }
         *self.imp().current_user_id.borrow_mut() = auth.user_id.clone();
         *self.imp().workspace_team_id.borrow_mut() = auth.team_id.clone();
         *self.imp().workspace_url.borrow_mut() = auth.url.clone();
@@ -5926,7 +6288,7 @@ impl ConduitWindow {
             .or(auth.team_id)
             .unwrap_or_else(|| "Slack".to_string());
         *self.imp().workspace_name.borrow_mut() = Some(workspace_name.clone());
-        self.imp().workspace_title_label.set_title(&workspace_name);
+        self.refresh_workspace_title_status();
         self.set_status("");
         self.imp().content_stack.set_visible_child_name("workspace");
         self.imp().workspace_split.set_show_content(false);
@@ -6122,6 +6484,18 @@ impl ConduitWindow {
                 }
             }
             RuntimeFailureRecovery::ConversationStar => self.set_status(error),
+            RuntimeFailureRecovery::UserStatus => {
+                let draft = self.imp().pending_status_update.borrow_mut().take();
+                let error = current_user_status_error_message(failure);
+                self.set_status(&error);
+                if let Some(draft) = draft {
+                    self.present_change_status_dialog(
+                        draft.dialog_draft,
+                        Some(&error),
+                        draft.clearing,
+                    );
+                }
+            }
             RuntimeFailureRecovery::Upload {
                 channel_id,
                 thread_ts,
@@ -6391,19 +6765,18 @@ impl ConduitWindow {
         self.user_statuses_changed(changed);
     }
 
-    fn replace_user_statuses(&self, statuses: HashMap<String, SlackUserStatus>) {
-        let changed = {
-            let previous = self.imp().user_statuses.borrow();
-            previous
-                .keys()
-                .chain(statuses.keys())
-                .filter(|user_id| previous.get(*user_id) != statuses.get(*user_id))
-                .cloned()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-        };
-        *self.imp().user_statuses.borrow_mut() = statuses;
+    fn apply_user_statuses_snapshot(
+        &self,
+        statuses: HashMap<String, SlackUserStatus>,
+        replace_existing: bool,
+        preserve_user_ids: &HashSet<String>,
+    ) {
+        let changed = apply_user_status_snapshot(
+            &mut self.imp().user_statuses.borrow_mut(),
+            statuses,
+            replace_existing,
+            preserve_user_ids,
+        );
         self.user_statuses_changed(changed);
     }
 
@@ -7145,6 +7518,224 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::DiscoverChannels);
     }
 
+    fn show_change_status_dialog(&self) {
+        if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
+            state.dialog.present(Some(self));
+            return;
+        }
+        if self.imp().pending_status_update.borrow().is_some() {
+            self.set_status(&gettext("A status update is already in progress"));
+            return;
+        }
+        let Some(user_id) = self.imp().current_user_id.borrow().clone() else {
+            self.set_status(&gettext("Your Slack profile is not available yet"));
+            return;
+        };
+        let now = current_unix_seconds();
+        let status = self
+            .imp()
+            .user_statuses
+            .borrow()
+            .get(&user_id)
+            .filter(|status| status.active_at(now))
+            .cloned()
+            .unwrap_or_default();
+        self.present_change_status_dialog(status, None, false);
+    }
+
+    fn present_change_status_dialog(
+        &self,
+        status: SlackUserStatus,
+        error: Option<&str>,
+        clearing_retry: bool,
+    ) {
+        if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
+            state.dialog.present(Some(self));
+            return;
+        }
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_hexpand(true);
+        if let Some(error) = error.filter(|error| !error.trim().is_empty()) {
+            let error_label = gtk::Label::new(Some(error));
+            error_label.set_wrap(true);
+            error_label.set_xalign(0.0);
+            error_label.add_css_class("error");
+            error_label.set_accessible_role(gtk::AccessibleRole::Alert);
+            error_label.update_property(&[gtk::accessible::Property::Description(error)]);
+            content.append(&error_label);
+        }
+
+        let group = adw::PreferencesGroup::new();
+        let status_entry = adw::EntryRow::builder()
+            .title(gettext("Status"))
+            .activates_default(true)
+            .build();
+        status_entry.set_text(status.text.trim());
+        status_entry.set_tooltip_text(Some(&gettext(
+            "Enter up to 100 characters for your Slack status",
+        )));
+        group.add(&status_entry);
+
+        let (emoji_names, emoji_labels, emoji_selected) =
+            status_emoji_options(&self.imp().custom_emojis.borrow(), status.emoji_name());
+        let emoji_label_refs = emoji_labels.iter().map(String::as_str).collect::<Vec<_>>();
+        let emoji_model = gtk::StringList::new(&emoji_label_refs);
+        let emoji_row = adw::ComboRow::builder()
+            .title(gettext("Emoji"))
+            .model(&emoji_model)
+            .enable_search(true)
+            .selected(emoji_selected)
+            .build();
+        emoji_row.set_tooltip_text(Some(&gettext("Search all available Slack emoji")));
+        group.add(&emoji_row);
+
+        let now = current_unix_seconds();
+        let (expiration_labels, expiration_choices, expiration_selected) =
+            status_expiration_options(status.expiration, now);
+        let expiration_label_refs = expiration_labels
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let expiration_model = gtk::StringList::new(&expiration_label_refs);
+        let expiration_row = adw::ComboRow::builder()
+            .title(gettext("Clear after"))
+            .model(&expiration_model)
+            .selected(expiration_selected)
+            .build();
+        group.add(&expiration_row);
+        content.append(&group);
+
+        let dialog = adw::AlertDialog::builder()
+            .heading(gettext("Set a status"))
+            .body(gettext("Choose what teammates see beside your name."))
+            .extra_child(&content)
+            .default_response("save")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", &gettext("Cancel"));
+        if status_dialog_clear_available(&status, now, clearing_retry) {
+            dialog.add_response("clear", &gettext("Clear status"));
+        }
+        dialog.add_response("save", &gettext("Save"));
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        update_status_dialog_save_response(&dialog, &status_entry, &emoji_row);
+
+        {
+            let weak_dialog = dialog.downgrade();
+            let weak_emoji_row = emoji_row.downgrade();
+            status_entry.connect_changed(move |entry| {
+                enforce_status_text_limit(entry);
+                let (Some(dialog), Some(emoji_row)) =
+                    (weak_dialog.upgrade(), weak_emoji_row.upgrade())
+                else {
+                    return;
+                };
+                update_status_dialog_save_response(&dialog, entry, &emoji_row);
+            });
+        }
+        {
+            let weak_dialog = dialog.downgrade();
+            let weak_status_entry = status_entry.downgrade();
+            emoji_row.connect_selected_notify(move |emoji_row| {
+                let (Some(dialog), Some(status_entry)) =
+                    (weak_dialog.upgrade(), weak_status_entry.upgrade())
+                else {
+                    return;
+                };
+                update_status_dialog_save_response(&dialog, &status_entry, emoji_row);
+            });
+        }
+
+        let emoji_names = Rc::new(emoji_names);
+        let expiration_choice_count = expiration_choices.len();
+        let expiration_choices = Rc::new(expiration_choices);
+        let weak_status_entry = status_entry.downgrade();
+        let weak_emoji_row = emoji_row.downgrade();
+        let weak_expiration_row = expiration_row.downgrade();
+        let weak_window = self.downgrade();
+        let dialog_draft = status.clone();
+        dialog.connect_response(None, move |_, response| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            window.imp().status_dialog.borrow_mut().take();
+            let pending = match response {
+                "clear" => Some(PendingStatusUpdate {
+                    requested: SlackUserStatus::default(),
+                    dialog_draft: dialog_draft.clone(),
+                    clearing: true,
+                }),
+                "save" => {
+                    let (Some(status_entry), Some(emoji_row), Some(expiration_row)) = (
+                        weak_status_entry.upgrade(),
+                        weak_emoji_row.upgrade(),
+                        weak_expiration_row.upgrade(),
+                    ) else {
+                        return;
+                    };
+                    let emoji = emoji_names
+                        .get(emoji_row.selected() as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    let choice = expiration_choices
+                        .get(expiration_row.selected() as usize)
+                        .copied()
+                        .unwrap_or(StatusExpirationChoice::Never);
+                    let now = current_unix_seconds();
+                    let (end_today, end_week) = status_expiration_boundaries(now);
+                    let status = status_from_dialog_input(
+                        status_entry.text().as_str(),
+                        &emoji,
+                        choice,
+                        now,
+                        end_today,
+                        end_week,
+                    );
+                    Some(PendingStatusUpdate {
+                        requested: status.clone(),
+                        dialog_draft: status,
+                        clearing: false,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(pending) = pending {
+                window.submit_current_user_status(pending);
+            }
+        });
+
+        self.imp()
+            .status_dialog
+            .borrow_mut()
+            .replace(StatusDialogState {
+                dialog: dialog.clone(),
+            });
+        dialog.present(Some(self));
+        status_entry.grab_focus();
+        write_status_dialog_test_state(
+            self,
+            &dialog,
+            &status_entry,
+            &emoji_row,
+            expiration_choice_count,
+        );
+    }
+
+    fn submit_current_user_status(&self, pending: PendingStatusUpdate) {
+        if self.imp().current_user_id.borrow().is_none() {
+            self.set_status(&gettext("Your Slack profile is not available yet"));
+            return;
+        }
+        let status = pending.requested.clone();
+        self.imp()
+            .pending_status_update
+            .borrow_mut()
+            .replace(pending);
+        self.set_status(&gettext("Updating status..."));
+        self.send_command(RuntimeCommand::SetCurrentUserStatus { status });
+    }
+
     fn show_new_message_picker(&self) {
         self.show_people_picker(
             "New message",
@@ -7624,6 +8215,57 @@ impl ConduitWindow {
         }
     }
 
+    fn refresh_workspace_title_status(&self) {
+        let imp = self.imp();
+        let current_user_id = imp.current_user_id.borrow().clone();
+        let workspace_name = imp.workspace_name.borrow().clone();
+        let title = current_user_header_title(
+            current_user_id.as_deref(),
+            &imp.user_names.borrow(),
+            workspace_name.as_deref(),
+        );
+        imp.workspace_title_label.set_title(&title);
+
+        let presentation = current_user_id
+            .as_deref()
+            .and_then(|user_id| imp.user_statuses.borrow().get(user_id).cloned())
+            .and_then(|status| {
+                user_status_presentation(
+                    &status,
+                    &imp.custom_emojis.borrow(),
+                    current_unix_seconds(),
+                )
+            });
+        if let Some(presentation) = presentation {
+            imp.workspace_title_label
+                .set_subtitle(&presentation.subtitle);
+            let tooltip = workspace_name.as_deref().map_or_else(
+                || format!("Status: {}", presentation.accessible_text),
+                |workspace| {
+                    format!(
+                        "{}\nStatus: {}",
+                        workspace.trim(),
+                        presentation.accessible_text
+                    )
+                },
+            );
+            imp.workspace_title_label.set_tooltip_text(Some(&tooltip));
+            imp.workspace_title_label
+                .update_property(&[gtk::accessible::Property::Description(&tooltip)]);
+        } else {
+            imp.workspace_title_label.set_subtitle("");
+            let workspace_name = workspace_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|workspace| !workspace.is_empty());
+            imp.workspace_title_label.set_tooltip_text(workspace_name);
+            imp.workspace_title_label
+                .update_property(&[gtk::accessible::Property::Description(
+                    workspace_name.unwrap_or_default(),
+                )]);
+        }
+    }
+
     fn refresh_conversation_title_status(&self, channel_id: &str) {
         let imp = self.imp();
         let status = imp
@@ -7634,21 +8276,21 @@ impl ConduitWindow {
             .filter(|conversation| conversation.is_im.unwrap_or(false))
             .and_then(|conversation| conversation.user.as_deref().map(str::to_string))
             .and_then(|user_id| imp.user_statuses.borrow().get(&user_id).cloned())
-            .filter(|status| status.active_at(current_unix_seconds()));
+            .and_then(|status| {
+                user_status_presentation(
+                    &status,
+                    &imp.custom_emojis.borrow(),
+                    current_unix_seconds(),
+                )
+            });
         if let Some(status) = status {
-            let emoji = crate::emoji::EmojiCatalog::new(&imp.custom_emojis.borrow())
-                .resolve(status.emoji_name())
-                .and_then(|value| match value {
-                    crate::emoji::EmojiValue::Unicode(glyph) => Some(glyph.to_string()),
-                    crate::emoji::EmojiValue::CustomImage(_) => None,
-                })
-                .unwrap_or_else(|| "●".to_string());
-            let text = status.accessible_text();
-            imp.message_title.set_subtitle(&format!("{emoji} {text}"));
-            imp.message_title.set_tooltip_text(Some(&text));
+            imp.message_title.set_subtitle(&status.subtitle);
+            imp.message_title
+                .set_tooltip_text(Some(&status.accessible_text));
             imp.message_title
                 .update_property(&[gtk::accessible::Property::Description(&format!(
-                    "Status: {text}"
+                    "Status: {}",
+                    status.accessible_text
                 ))]);
         } else {
             imp.message_title.set_subtitle("");
@@ -8090,16 +8732,16 @@ impl ConduitWindow {
                 if let Some(avatar_url) = user.avatar_url() {
                     self.populate_user_avatar_urls(HashMap::from([(user_id.clone(), avatar_url)]));
                 }
-                let mut statuses = self.imp().user_statuses.borrow().clone();
-                match user.status() {
-                    Some(status) => {
-                        statuses.insert(user_id, status);
-                    }
-                    None => {
-                        statuses.remove(&user_id);
+                if let Some(profile) = user.profile.as_ref() {
+                    let changed = apply_user_status_profile_update(
+                        &mut self.imp().user_statuses.borrow_mut(),
+                        &user_id,
+                        profile,
+                    );
+                    if changed {
+                        self.user_statuses_changed(vec![user_id]);
                     }
                 }
-                self.replace_user_statuses(statuses);
             }
             SocketModeEvent::RefreshConversations => self.refresh_conversations(),
         }
@@ -9516,6 +10158,40 @@ fn record_test_huddle_surface(window: &imp::ConduitWindow) {
     );
 }
 
+fn write_status_dialog_test_state(
+    window: &ConduitWindow,
+    dialog: &adw::AlertDialog,
+    status_entry: &adw::EntryRow,
+    emoji_row: &adw::ComboRow,
+    expiration_choice_count: usize,
+) {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_UI_FILE") else {
+        return;
+    };
+    let imp = window.imp();
+    let emoji_choice_count = emoji_row
+        .model()
+        .map(|model| model.n_items())
+        .unwrap_or_default();
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({
+            "dialog_heading": dialog.heading().map(|heading| heading.to_string()),
+            "emoji_search": emoji_row.enables_search(),
+            "emoji_choice_count": emoji_choice_count,
+            "expiration_choice_count": expiration_choice_count,
+            "save_enabled": dialog.is_response_enabled("save"),
+            "clear_available": dialog.has_response("clear"),
+            "status_has_value": !status_entry.text().trim().is_empty()
+                || emoji_row.selected() > 0,
+            "header_title": imp.workspace_title_label.title().to_string(),
+            "header_subtitle": imp.workspace_title_label.subtitle().to_string(),
+            "window_width": window.width(),
+        })
+        .to_string(),
+    );
+}
+
 enum TestComposerCompletion<'a> {
     Emoji(&'a str),
     Mention {
@@ -10242,6 +10918,11 @@ mod tests {
                 RuntimeFailureRecovery::ConversationStar,
             ),
             (
+                RuntimeOperation::UserStatus,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::UserStatus,
+            ),
+            (
                 RuntimeOperation::FileUpload,
                 RuntimeTarget::Upload {
                     channel_id: "C123".to_string(),
@@ -10271,6 +10952,32 @@ mod tests {
             )),
             RuntimeFailureRecovery::NonDisruptive
         );
+    }
+
+    #[test]
+    fn status_permission_failure_explains_profile_reauthorization() {
+        let failure = RuntimeFailure {
+            category: RuntimeFailureCategory::Validation,
+            message: "Slack does not allow this action for this conversation.".to_string(),
+        };
+
+        let message = current_user_status_error_message(&failure);
+        assert!(message.contains("change your status"));
+        assert!(message.contains("profile access"));
+        assert!(!message.contains("conversation"));
+    }
+
+    #[test]
+    fn internal_status_failure_does_not_assume_reauthorization_is_needed() {
+        let failure = RuntimeFailure {
+            category: RuntimeFailureCategory::Internal,
+            message: "unexpected response".to_string(),
+        };
+
+        let message = current_user_status_error_message(&failure);
+        assert!(message.contains("Try again"));
+        assert!(!message.contains("OAuth"));
+        assert!(!message.contains("Reconnect"));
     }
 
     #[test]
@@ -10401,6 +11108,296 @@ mod tests {
         ]);
 
         assert_eq!(nearest_status_expiration(&statuses, 100), Some(150));
+    }
+
+    #[test]
+    fn status_expiration_choices_resolve_to_absolute_slack_timestamps() {
+        let now = 1_000;
+
+        assert_eq!(
+            status_expiration_for_choice(StatusExpirationChoice::Never, now, 2_000, 7_000),
+            0
+        );
+        assert_eq!(
+            status_expiration_for_choice(StatusExpirationChoice::Minutes30, now, 2_000, 7_000),
+            2_800
+        );
+        assert_eq!(
+            status_expiration_for_choice(StatusExpirationChoice::Hour1, now, 2_000, 7_000),
+            4_600
+        );
+        assert_eq!(
+            status_expiration_for_choice(StatusExpirationChoice::Hours4, now, 2_000, 7_000),
+            15_400
+        );
+        assert_eq!(
+            status_expiration_for_choice(StatusExpirationChoice::Today, now, 2_000, 7_000),
+            2_000
+        );
+        assert_eq!(
+            status_expiration_for_choice(StatusExpirationChoice::ThisWeek, now, 2_000, 7_000),
+            7_000
+        );
+        assert_eq!(
+            status_expiration_for_choice(
+                StatusExpirationChoice::Existing(3_500),
+                now,
+                2_000,
+                7_000,
+            ),
+            3_500
+        );
+    }
+
+    #[test]
+    fn status_dialog_builds_text_only_and_emoji_only_statuses() {
+        assert_eq!(
+            status_from_dialog_input(
+                " Focus time ",
+                "",
+                StatusExpirationChoice::Hour1,
+                1_000,
+                2_000,
+                7_000,
+            ),
+            SlackUserStatus {
+                text: "Focus time".to_string(),
+                emoji: String::new(),
+                expiration: 4_600,
+            }
+        );
+        assert_eq!(
+            status_from_dialog_input(
+                "",
+                ":headphones:",
+                StatusExpirationChoice::Never,
+                1_000,
+                2_000,
+                7_000,
+            ),
+            SlackUserStatus {
+                text: String::new(),
+                emoji: "headphones".to_string(),
+                expiration: 0,
+            }
+        );
+        assert_eq!(
+            status_from_dialog_input(
+                &"a".repeat(101),
+                "",
+                StatusExpirationChoice::Never,
+                1_000,
+                2_000,
+                7_000,
+            )
+            .text
+            .chars()
+            .count(),
+            100
+        );
+    }
+
+    #[test]
+    fn status_dialog_keeps_clear_available_for_a_failed_clear_retry() {
+        assert!(!status_dialog_clear_available(
+            &SlackUserStatus::default(),
+            100,
+            false
+        ));
+        assert!(status_dialog_clear_available(
+            &SlackUserStatus::default(),
+            100,
+            true
+        ));
+        assert!(status_dialog_clear_available(
+            &SlackUserStatus {
+                text: "Focus".to_string(),
+                ..Default::default()
+            },
+            100,
+            false
+        ));
+    }
+
+    #[test]
+    fn user_status_presentation_handles_text_unicode_custom_and_expiry() {
+        let custom = HashMap::from([(
+            "working_remotely".to_string(),
+            "https://emoji.example/remote.png".to_string(),
+        )]);
+
+        assert_eq!(
+            user_status_presentation(
+                &SlackUserStatus {
+                    text: "Focus time".to_string(),
+                    ..Default::default()
+                },
+                &custom,
+                100,
+            ),
+            Some(UserStatusPresentation {
+                subtitle: "Focus time".to_string(),
+                accessible_text: "Focus time".to_string(),
+            })
+        );
+        assert_eq!(
+            user_status_presentation(
+                &SlackUserStatus {
+                    text: "Focus time".to_string(),
+                    emoji: ":headphones:".to_string(),
+                    ..Default::default()
+                },
+                &custom,
+                100,
+            ),
+            Some(UserStatusPresentation {
+                subtitle: "🎧 Focus time".to_string(),
+                accessible_text: "Focus time".to_string(),
+            })
+        );
+        assert_eq!(
+            user_status_presentation(
+                &SlackUserStatus {
+                    text: "Remote".to_string(),
+                    emoji: ":working_remotely:".to_string(),
+                    ..Default::default()
+                },
+                &custom,
+                100,
+            ),
+            Some(UserStatusPresentation {
+                subtitle: "● Remote".to_string(),
+                accessible_text: "Remote".to_string(),
+            })
+        );
+        assert_eq!(
+            user_status_presentation(
+                &SlackUserStatus {
+                    text: "Expired".to_string(),
+                    expiration: 100,
+                    ..Default::default()
+                },
+                &custom,
+                100,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sparse_profile_updates_preserve_status_while_explicit_blanks_clear_it() {
+        let mut statuses = HashMap::from([(
+            "U123".to_string(),
+            SlackUserStatus {
+                text: "Focus time".to_string(),
+                emoji: ":headphones:".to_string(),
+                expiration: 0,
+            },
+        )]);
+
+        assert!(!apply_user_status_profile_update(
+            &mut statuses,
+            "U123",
+            &SlackUserProfile {
+                huddle_state_call_id: Some("R123".to_string()),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            statuses.get("U123").map(|status| status.text.as_str()),
+            Some("Focus time")
+        );
+
+        assert!(apply_user_status_profile_update(
+            &mut statuses,
+            "U123",
+            &SlackUserProfile {
+                status_text: Some(String::new()),
+                status_emoji: Some(String::new()),
+                status_expiration: Some(0),
+                ..Default::default()
+            },
+        ));
+        assert!(!statuses.contains_key("U123"));
+    }
+
+    #[test]
+    fn status_snapshots_replace_stale_values_without_overwriting_newer_users() {
+        let current_status = SlackUserStatus {
+            text: "Current".to_string(),
+            ..Default::default()
+        };
+        let stale_status = SlackUserStatus {
+            text: "Stale".to_string(),
+            ..Default::default()
+        };
+        let new_status = SlackUserStatus {
+            text: "New".to_string(),
+            ..Default::default()
+        };
+        let mut statuses = HashMap::from([
+            ("U_CHANGED".to_string(), current_status.clone()),
+            ("U_REMOVED".to_string(), stale_status.clone()),
+        ]);
+
+        let changed = apply_user_status_snapshot(
+            &mut statuses,
+            HashMap::from([
+                ("U_CHANGED".to_string(), stale_status.clone()),
+                ("U_NEW".to_string(), new_status.clone()),
+            ]),
+            true,
+            &HashSet::from(["U_CHANGED".to_string()]),
+        );
+
+        assert_eq!(statuses.get("U_CHANGED"), Some(&current_status));
+        assert_eq!(statuses.get("U_NEW"), Some(&new_status));
+        assert!(!statuses.contains_key("U_REMOVED"));
+        assert!(!changed.contains(&"U_CHANGED".to_string()));
+        assert!(changed.contains(&"U_NEW".to_string()));
+        assert!(changed.contains(&"U_REMOVED".to_string()));
+
+        statuses.remove("U_CHANGED");
+        apply_user_status_snapshot(
+            &mut statuses,
+            HashMap::from([
+                ("U_CHANGED".to_string(), stale_status),
+                ("U_NEW".to_string(), new_status.clone()),
+            ]),
+            true,
+            &HashSet::from(["U_CHANGED".to_string()]),
+        );
+        assert!(!statuses.contains_key("U_CHANGED"));
+
+        apply_user_status_snapshot(
+            &mut statuses,
+            HashMap::from([
+                ("U_NEW".to_string(), current_status),
+                ("U_CACHED".to_string(), new_status.clone()),
+            ]),
+            false,
+            &HashSet::new(),
+        );
+        assert_eq!(statuses.get("U_NEW"), Some(&new_status));
+        assert_eq!(statuses.get("U_CACHED"), Some(&new_status));
+    }
+
+    #[test]
+    fn current_user_header_prefers_display_name_and_falls_back_to_workspace() {
+        let names = HashMap::from([("U123".to_string(), "Vincent".to_string())]);
+
+        assert_eq!(
+            current_user_header_title(Some("U123"), &names, Some("Signicat")),
+            "Vincent"
+        );
+        assert_eq!(
+            current_user_header_title(Some("U999"), &names, Some("Signicat")),
+            "Signicat"
+        );
+        assert_eq!(
+            current_user_header_title(None, &names, None),
+            gettext("Workspace")
+        );
     }
 
     #[test]
@@ -11095,6 +12092,14 @@ mod tests {
             .map(|(object, _)| object)
             .expect("message status label should be a complete template object");
         assert!(message_status.contains("<property name=\"accessible-role\">status</property>"));
+
+        let status_action = template
+            .find("<attribute name=\"action\">win.change-status</attribute>")
+            .expect("workspace menu should expose the status dialog");
+        let new_message_action = template
+            .find("<attribute name=\"action\">win.new-message</attribute>")
+            .expect("workspace menu should expose new message");
+        assert!(status_action < new_message_action);
     }
 
     #[test]

@@ -725,6 +725,12 @@
   <menu id="workspace_menu">
     <section>
       <item>
+        <attribute name="label" translatable="yes">Set _status...</attribute>
+        <attribute name="action">win.change-status</attribute>
+      </item>
+    </section>
+    <section>
+      <item>
         <attribute name="label" translatable="yes">New _message</attribute>
         <attribute name="action">win.new-message</attribute>
       </item>

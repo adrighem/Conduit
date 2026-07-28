@@ -235,6 +235,29 @@ if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() a
       suite: ['headless', 'huddle-ui'],
       timeout: 90,
     )
+
+    test(
+      'Status dialog and current-user header',
+      python,
+      args: [
+        files('run_headless.py'),
+        files('test_status_dialog.py'),
+      ],
+      env: [
+        'CONDUIT_TEST_BINARY=' + meson.project_build_root() / 'src' / meson.project_name(),
+        'CONDUIT_TEST_RESOURCE=' + meson.project_build_root() / 'src' / 'conduit.gresource',
+        'CONDUIT_TEST_SCHEMA=' + meson.project_source_root() / 'data' / 'eu.vanadrighem.conduit.gschema.xml',
+        'GSETTINGS_BACKEND=memory',
+        'GDK_DEBUG=no-portals',
+        'GDK_BACKEND=x11',
+        'GSK_RENDERER=cairo',
+        'GTK_A11Y=none',
+        'XDG_SESSION_TYPE=x11',
+      ],
+      depends: [cargo_build],
+      suite: ['headless', 'status-ui'],
+      timeout: 90,
+    )
   endif
 endif
 

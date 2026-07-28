@@ -1726,6 +1726,12 @@ impl SlackUserProfile {
         };
         (!status.text.trim().is_empty() || !status.emoji_name().is_empty()).then_some(status)
     }
+
+    pub fn contains_status_fields(&self) -> bool {
+        self.status_text.is_some()
+            || self.status_emoji.is_some()
+            || self.status_expiration.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -2013,6 +2019,18 @@ mod tests {
             Some("Heads down".to_string())
         );
         assert!(SlackUserProfile::default().status().is_none());
+    }
+
+    #[test]
+    fn profile_distinguishes_sparse_updates_from_explicit_status_clears() {
+        assert!(!SlackUserProfile::default().contains_status_fields());
+        assert!(SlackUserProfile {
+            status_text: Some(String::new()),
+            status_emoji: Some(String::new()),
+            status_expiration: Some(0),
+            ..Default::default()
+        }
+        .contains_status_fields());
     }
 
     #[test]

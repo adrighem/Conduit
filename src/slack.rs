@@ -819,7 +819,11 @@ impl SlackApi {
                 ],
             )
             .await?;
-        Ok(response.profile)
+        response.profile.ok_or_else(|| {
+            SlackError::Other(anyhow::anyhow!(
+                "Slack users.profile.get response omitted the profile"
+            ))
+        })
     }
 
     pub async fn set_current_user_status(
@@ -847,7 +851,11 @@ impl SlackApi {
         let response: UserProfileResponse = self
             .post_form("users.profile.set", &[("profile", profile)])
             .await?;
-        Ok(response.profile)
+        response.profile.ok_or_else(|| {
+            SlackError::Other(anyhow::anyhow!(
+                "Slack users.profile.set response omitted the profile"
+            ))
+        })
     }
 
     pub async fn user_groups(&self) -> Result<Vec<SlackUserGroup>> {
@@ -2284,7 +2292,7 @@ impl_slack_response!(UserInfoResponse);
 struct UserProfileResponse {
     ok: bool,
     error: Option<String>,
-    profile: SlackUserProfile,
+    profile: Option<SlackUserProfile>,
 }
 impl_slack_response!(UserProfileResponse);
 
@@ -2627,6 +2635,44 @@ mod tests {
             .expect_err("status text longer than 100 characters should be rejected");
 
         assert_eq!(error.category(), SlackErrorCategory::Validation);
+    }
+
+    #[test]
+    fn current_user_status_preserves_slack_errors_that_omit_profile() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            request
+                .respond(
+                    Response::from_string(r#"{"ok":false,"error":"missing_scope"}"#).with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            path
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let error = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.set_current_user_status(&SlackUserStatus {
+                text: "Focus time".to_string(),
+                ..Default::default()
+            }))
+            .expect_err("Slack missing-scope response should remain an API error");
+
+        assert!(matches!(
+            error,
+            SlackError::Api { ref code, .. } if code == "missing_scope"
+        ));
+        assert_eq!(
+            received.join().expect("mock Slack server should finish"),
+            "/api/users.profile.set"
+        );
     }
 
     #[test]
