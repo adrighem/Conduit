@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import gi
-import os
+import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,94 @@ def png_dimensions(path: Path) -> tuple[int, int]:
     return image.get_width(), image.get_height()
 
 
+def verify_install_plan(build_root: Path) -> None:
+    plan = json.loads(
+        (build_root / "meson-info" / "intro-install_plan.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    destinations = {
+        entry["destination"]
+        for section in plan.values()
+        for entry in section.values()
+    }
+    assert (
+        f"{{datadir}}/applications/{APPLICATION_ID}.desktop" in destinations
+    )
+    for size in ICON_SIZES:
+        assert (
+            f"{{datadir}}/icons/hicolor/{size}x{size}/apps/{APPLICATION_ID}.png"
+            in destinations
+        )
+    for relative_path in LEGACY_ICON_PATHS:
+        assert f"{{datadir}}/{relative_path}" not in destinations
+
+
+def minimal_environment(home: Path) -> dict[str, str]:
+    home.mkdir()
+    return {
+        "CI": "true",
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+    }
+
+
+def verify_generated_install_order(
+    build_root: Path,
+    configured_datadir: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="conduit-install-order-") as temporary:
+        temporary_root = Path(temporary)
+        copied_build = temporary_root / "build"
+        (copied_build / "meson-private").mkdir(parents=True)
+        (copied_build / "meson-logs").mkdir()
+        shutil.copy2(
+            build_root / "meson-private" / "install.dat",
+            copied_build / "meson-private" / "install.dat",
+        )
+        for directory in ("data", "src"):
+            (copied_build / directory).symlink_to(
+                build_root / directory,
+                target_is_directory=True,
+            )
+
+        environment = minimal_environment(temporary_root / "home")
+        meson = shutil.which("meson", path=environment["PATH"])
+        assert meson is not None
+        dry_run = subprocess.run(
+            [
+                meson,
+                "install",
+                "-C",
+                str(copied_build),
+                "--no-rebuild",
+                "--dry-run",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        assert dry_run.returncode == 0, dry_run.stderr
+        script_lines = [
+            line
+            for line in dry_run.stdout.splitlines()
+            if line.startswith("Running custom install script")
+        ]
+        cleanup_index = next(
+            index
+            for index, line in enumerate(script_lines)
+            if "cleanup-legacy-branding.py" in line
+        )
+        cache_index = next(
+            index
+            for index, line in enumerate(script_lines)
+            if "update-icon-cache" in line
+        )
+        assert cleanup_index < cache_index
+        assert configured_datadir in script_lines[cleanup_index]
+
+
 def staged_data_root(
     staging_root: Path,
     configured_prefix: str,
@@ -44,17 +133,13 @@ def staged_data_root(
     return staging_root / prefix / datadir
 
 
-def staged_prefix_root(staging_root: Path, configured_prefix: str) -> Path:
-    prefix = Path(configured_prefix)
-    if prefix.is_absolute():
-        prefix = prefix.relative_to("/")
-    return staging_root / prefix
-
-
 def verify_upgrade_cleanup(
     root: Path,
     configured_prefix: str,
     configured_datadir: str,
+    *,
+    use_destdir: bool,
+    use_absolute_datadir: bool = False,
 ) -> None:
     cleanup_script = root / "data" / "icons" / "cleanup-legacy-branding.py"
     assert cleanup_script.exists(), "Meson needs an installed-branding cleanup hook"
@@ -67,11 +152,22 @@ def verify_upgrade_cleanup(
 
     with tempfile.TemporaryDirectory(prefix="conduit-branding-install-") as temporary:
         staging_root = Path(temporary)
-        data_root = staged_data_root(
-            staging_root,
-            configured_prefix,
-            configured_datadir,
-        )
+        if use_destdir:
+            install_prefix = configured_prefix
+            install_datadir = configured_datadir
+            data_root = staged_data_root(
+                staging_root,
+                install_prefix,
+                install_datadir,
+            )
+        else:
+            install_prefix = str(staging_root / "installed-prefix")
+            if use_absolute_datadir:
+                install_datadir = str(staging_root / "absolute-data")
+                data_root = Path(install_datadir)
+            else:
+                install_datadir = "share"
+                data_root = Path(install_prefix) / install_datadir
         for relative_path in LEGACY_ICON_PATHS:
             legacy_icon = data_root / relative_path
             legacy_icon.parent.mkdir(parents=True, exist_ok=True)
@@ -91,28 +187,59 @@ def verify_upgrade_cleanup(
         )
         current_icon.write_text("current Conduit artwork", encoding="utf-8")
 
-        install_environment = {
-            "CI": "true",
-            "HOME": str(staging_root / "home"),
-            "LANG": "C.UTF-8",
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
-            "MESON_INSTALL_DESTDIR_PREFIX": str(
-                staged_prefix_root(staging_root, configured_prefix)
-            ),
-            "MESON_INSTALL_PREFIX": configured_prefix,
-        }
+        fixture_source = staging_root / "fixture-source"
+        fixture_build = staging_root / "fixture-build"
+        fixture_source.mkdir()
+        escaped_cleanup_script = str(cleanup_script).replace("\\", "\\\\").replace(
+            "'", "\\'"
+        )
+        (fixture_source / "meson.build").write_text(
+            f"""project('branding-cleanup-fixture')
+cleanup_python = import('python').find_installation('python3')
+meson.add_install_script(
+  cleanup_python,
+  '{escaped_cleanup_script}',
+  get_option('datadir'),
+)
+""",
+            encoding="utf-8",
+        )
+
+        install_environment = minimal_environment(staging_root / "home")
+        meson = shutil.which("meson", path=install_environment["PATH"])
+        assert meson is not None
+        setup = subprocess.run(
+            [
+                meson,
+                "setup",
+                str(fixture_build),
+                str(fixture_source),
+                f"--prefix={install_prefix}",
+                f"-Ddatadir={install_datadir}",
+            ],
+            env=install_environment,
+            capture_output=True,
+            text=True,
+        )
+        assert setup.returncode == 0, setup.stderr
+
         for _ in range(2):
-            cleanup = subprocess.run(
-                [
-                    sys.executable,
-                    str(cleanup_script),
-                    configured_datadir,
-                ],
+            install_command = [
+                meson,
+                "install",
+                "-C",
+                str(fixture_build),
+            ]
+            if use_destdir:
+                install_command.extend(["--destdir", str(staging_root)])
+            install_command.extend(["--no-rebuild", "--quiet"])
+            install = subprocess.run(
+                install_command,
                 env=install_environment,
                 capture_output=True,
                 text=True,
             )
-            assert cleanup.returncode == 0, cleanup.stderr
+            assert install.returncode == 0, install.stderr
 
         for relative_path in LEGACY_ICON_PATHS:
             assert not (data_root / relative_path).exists(), relative_path
@@ -122,8 +249,9 @@ def verify_upgrade_cleanup(
 
 def main() -> None:
     root = Path(sys.argv[1])
-    configured_prefix = sys.argv[2]
-    configured_datadir = sys.argv[3]
+    build_root = Path(sys.argv[2])
+    configured_prefix = sys.argv[3]
+    configured_datadir = sys.argv[4]
     branding = root / "data" / "branding" / "conduit.png"
     assert png_dimensions(branding) == (1024, 1024)
 
@@ -145,7 +273,33 @@ def main() -> None:
     assert "const ABOUT_ICON_NAME: &str = config::APPLICATION_ID;" in application
     assert ".application_icon(ABOUT_ICON_NAME)" in application
 
-    verify_upgrade_cleanup(root, configured_prefix, configured_datadir)
+    verify_install_plan(build_root)
+    verify_generated_install_order(build_root, configured_datadir)
+    verify_upgrade_cleanup(
+        root,
+        configured_prefix,
+        configured_datadir,
+        use_destdir=True,
+    )
+    verify_upgrade_cleanup(
+        root,
+        configured_prefix,
+        "/opt/conduit-branding-test",
+        use_destdir=True,
+    )
+    verify_upgrade_cleanup(
+        root,
+        configured_prefix,
+        configured_datadir,
+        use_destdir=False,
+    )
+    verify_upgrade_cleanup(
+        root,
+        configured_prefix,
+        configured_datadir,
+        use_destdir=False,
+        use_absolute_datadir=True,
+    )
 
 
 if __name__ == "__main__":

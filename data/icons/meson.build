@@ -18,3 +18,12 @@ foreach icon_size : app_icon_sizes
     install_dir: get_option('datadir') / 'icons' / icon_dir
   )
 endforeach
+
+# Meson upgrades do not remove files deleted from a later install manifest.
+# Run this before gnome.post_install() rebuilds the hicolor icon cache.
+branding_cleanup_python = import('python').find_installation('python3')
+meson.add_install_script(
+  branding_cleanup_python,
+  files('cleanup-legacy-branding.py'),
+  get_option('datadir'),
+)

@@ -71,6 +71,7 @@ test(
   args: [
     files('test_branding_assets.py'),
     meson.project_source_root(),
+    meson.project_build_root(),
     get_option('prefix'),
     get_option('datadir'),
   ],
