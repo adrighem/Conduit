@@ -1,0 +1,7 @@
+Checkpoint: Phase 1 - Starred priority conversations
+
+Manual verification: Confirmed by the user on 2026-07-28. Priority ordering, Star and Unstar actions, one-to-one DM Profile navigation, person completion in both composers, real Slack mention delivery, draft restoration, edited-mention invalidation, and emoji completion behaved as expected.
+
+Automated verification: cargo fmt --check and cargo check passed; cargo test passed 695 tests with 2 intentional ignores; Meson compile passed; all 15 Meson tests passed.
+
+Known tooling limitation: strict Clippy was unavailable because the installed cargo-clippy uses rustc 1.87 while Conduit requires rustc 1.88 or newer. No project coverage command is configured.
