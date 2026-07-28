@@ -1,0 +1,11 @@
+Task: Add the native status dialog, emoji selection, and current-user header
+
+Summary: Added the workspace-menu status editor, searchable Slack emoji choices, expiration and clear controls, display-name/status header presentation, accessible retry errors, and revisioned realtime/cache ordering that preserves newer user changes.
+
+Files: src/models.rs, src/runtime.rs, src/slack.rs, src/window.rs, src/window.ui, tests/meson.build, tests/test_status_dialog.py.
+
+Rationale: Slack status changes must remain server-authoritative while cached user snapshots, local writes, realtime profile changes, and sparse huddle updates can arrive concurrently.
+
+Validation: cargo check --locked; 23 focused status tests; realtime workspace adapter regression test; Meson compile; headless status UI suite in wide and narrow layouts.
+
+Limitations: Slack does not publish workspace status suggestions. Existing OAuth installations require reauthorization, and imported browser sessions depend on Slack accepting the documented Web API request through that unsupported credential transport.
