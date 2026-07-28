@@ -115,6 +115,9 @@ struct HuddlePreflightDialog {
 #[derive(Debug, Clone)]
 struct StatusDialogState {
     dialog: adw::AlertDialog,
+    status_entry: adw::EntryRow,
+    emoji_picker: StatusEmojiPicker,
+    expiration_choice_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +142,29 @@ enum StatusExpirationChoice {
 struct UserStatusPresentation {
     subtitle: String,
     accessible_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusEmojiChoice {
+    name: String,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct StatusEmojiPickerModel {
+    emojis: EmojiPickerModel,
+}
+
+#[derive(Debug, Clone)]
+struct StatusEmojiPicker {
+    row: adw::ActionRow,
+    popover: gtk::Popover,
+    search: gtk::SearchEntry,
+    visible_model: gtk::StringList,
+    visible_choices: Rc<RefCell<Vec<StatusEmojiChoice>>>,
+    selection: gtk::SingleSelection,
+    source: Rc<RefCell<StatusEmojiPickerModel>>,
+    selected_name: Rc<RefCell<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -499,6 +525,17 @@ mod imp {
                             );
                         }
                     });
+                    if std::env::var_os("CONDUIT_TEST_STATUS_LATE_EMOJI").is_some() {
+                        let weak_window = obj.downgrade();
+                        glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                            if let Some(window) = weak_window.upgrade() {
+                                window.replace_custom_emojis(HashMap::from([(
+                                    "late_status_parrot".to_string(),
+                                    "https://emoji.example/late-status-parrot.gif".to_string(),
+                                )]));
+                            }
+                        });
+                    }
                 }
             } else {
                 obj.show_loading("Checking secure storage");
@@ -528,7 +565,8 @@ mod imp {
                     }
                 }
             }
-            if let Some(state) = self.status_dialog.borrow_mut().take() {
+            let status_dialog = self.status_dialog.borrow_mut().take();
+            if let Some(state) = status_dialog {
                 state.dialog.force_close();
             }
         }
@@ -1859,41 +1897,427 @@ fn current_user_header_title(
         .unwrap_or_else(|| gettext("Workspace"))
 }
 
-fn status_emoji_options(
-    custom_emojis: &HashMap<String, String>,
-    selected_emoji: &str,
-) -> (Vec<String>, Vec<String>, u32) {
-    let mut names = vec![String::new()];
-    let mut labels = vec![gettext("No emoji")];
-    let mut seen = HashSet::new();
-    seen.insert(String::new());
-    for entry in EmojiCatalog::new(custom_emojis).entries() {
-        if !seen.insert(entry.name.clone()) {
-            continue;
+impl StatusEmojiPickerModel {
+    fn new(custom_emojis: &HashMap<String, String>, selected_emoji: &str) -> Self {
+        // Slack status emoji are submitted as team-enabled shortcodes. Keep the
+        // picker to catalog entries that have a valid shortcode name.
+        let catalog_entries = EmojiCatalog::new(custom_emojis).entries();
+        let workspace_names = catalog_entries
+            .iter()
+            .filter(|entry| entry.category == "Workspace")
+            .map(|entry| entry.name.clone())
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        let mut entries = catalog_entries
+            .into_iter()
+            .filter(|entry| entry.category == "Workspace" || !workspace_names.contains(&entry.name))
+            .filter(|entry| seen.insert(entry.name.clone()))
+            .collect::<Vec<_>>();
+
+        let selected_emoji = selected_emoji.trim().trim_matches(':');
+        if !selected_emoji.is_empty() && seen.insert(selected_emoji.to_string()) {
+            entries.push(EmojiEntry {
+                name: selected_emoji.to_string(),
+                label: selected_emoji.replace(['_', '-'], " "),
+                category: "Current status",
+                value: EmojiValue::CustomImage(String::new()),
+            });
         }
-        let label = match entry.value {
-            EmojiValue::Unicode(glyph) => {
-                format!("{glyph} :{}: - {}", entry.name, entry.label)
-            }
-            EmojiValue::CustomImage(_) => format!(":{}: - {}", entry.name, entry.label),
-        };
-        names.push(entry.name);
-        labels.push(label);
+
+        Self {
+            emojis: EmojiPickerModel::new(entries),
+        }
     }
-    let selected_emoji = selected_emoji.trim().trim_matches(':');
-    let selected = names
+
+    fn choice_count(&self) -> usize {
+        self.emojis.entries().len() + 1
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        name.is_empty() || self.emojis.entries().iter().any(|entry| entry.name == name)
+    }
+
+    fn selected_label(&self, name: &str) -> String {
+        if name.is_empty() {
+            return gettext("No emoji");
+        }
+        self.emojis
+            .entries()
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(status_emoji_entry_label)
+            .unwrap_or_else(|| format!(":{name}:"))
+    }
+
+    fn search(&self, query: &str) -> Vec<StatusEmojiChoice> {
+        let normalized_query = query.trim().to_lowercase();
+        let mut choices = Vec::new();
+        if normalized_query.is_empty()
+            || gettext("No emoji")
+                .to_lowercase()
+                .contains(&normalized_query)
+        {
+            choices.push(StatusEmojiChoice {
+                name: String::new(),
+                label: gettext("No emoji"),
+            });
+        }
+        choices.extend(
+            self.emojis
+                .search(query)
+                .into_iter()
+                .map(|entry| StatusEmojiChoice {
+                    name: entry.name.clone(),
+                    label: status_emoji_entry_label(&entry),
+                }),
+        );
+        choices
+    }
+}
+
+fn status_emoji_entry_label(entry: &EmojiEntry) -> String {
+    match entry.value {
+        EmojiValue::Unicode(glyph) => format!("{glyph} :{}: - {}", entry.name, entry.label),
+        EmojiValue::CustomImage(_) => format!(":{}: - {}", entry.name, entry.label),
+    }
+}
+
+fn populate_status_emoji_picker_results(
+    source: &StatusEmojiPickerModel,
+    query: &str,
+    visible_model: &gtk::StringList,
+    visible_choices: &RefCell<Vec<StatusEmojiChoice>>,
+) {
+    let choices = source.search(query);
+    let labels = choices
         .iter()
-        .position(|name| name == selected_emoji)
-        .unwrap_or_else(|| {
-            if selected_emoji.is_empty() {
-                0
-            } else {
-                names.push(selected_emoji.to_string());
-                labels.push(format!(":{selected_emoji}:"));
-                names.len() - 1
-            }
+        .map(|choice| choice.label.as_str())
+        .collect::<Vec<_>>();
+    visible_model.splice(0, visible_model.n_items(), &labels);
+    visible_choices.replace(choices);
+}
+
+fn sync_status_emoji_picker_selection(
+    visible_choices: &RefCell<Vec<StatusEmojiChoice>>,
+    selected_name: &RefCell<String>,
+    selection: &gtk::SingleSelection,
+) {
+    let selected_name = selected_name.borrow();
+    let position = visible_choices
+        .borrow()
+        .iter()
+        .position(|choice| choice.name == selected_name.as_str())
+        .map(|position| position as u32)
+        .unwrap_or(gtk::INVALID_LIST_POSITION);
+    selection.set_selected(position);
+}
+
+impl StatusEmojiPicker {
+    fn new(
+        custom_emojis: &HashMap<String, String>,
+        selected_emoji: &str,
+        on_selected: impl Fn(&str) + 'static,
+    ) -> Self {
+        let selected_name = Rc::new(RefCell::new(
+            selected_emoji.trim().trim_matches(':').to_string(),
+        ));
+        let source = Rc::new(RefCell::new(StatusEmojiPickerModel::new(
+            custom_emojis,
+            selected_emoji,
+        )));
+        let visible_model = gtk::StringList::new(&[]);
+        let visible_choices = Rc::new(RefCell::new(Vec::new()));
+
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, object| {
+            let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let label = gtk::Label::new(None);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_hexpand(true);
+            label.set_margin_top(6);
+            label.set_margin_bottom(6);
+            label.set_margin_start(8);
+            label.set_margin_end(8);
+            label.set_xalign(0.0);
+            item.set_child(Some(&label));
         });
-    (names, labels, selected as u32)
+        factory.connect_bind(|_, object| {
+            let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let Some(label) = item.child().and_downcast::<gtk::Label>() else {
+                return;
+            };
+            let Some(value) = item.item().and_downcast::<gtk::StringObject>() else {
+                return;
+            };
+            label.set_label(&value.string());
+            label.update_property(&[gtk::accessible::Property::Label(value.string().as_str())]);
+        });
+
+        let selection = gtk::SingleSelection::new(Some(visible_model.clone()));
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
+        selection.set_selected(gtk::INVALID_LIST_POSITION);
+        let list = gtk::ListView::new(Some(selection.clone()), Some(factory));
+        list.set_single_click_activate(true);
+        list.add_css_class("navigation-sidebar");
+        list.update_property(&[gtk::accessible::Property::Label(&gettext(
+            "Status emoji choices",
+        ))]);
+
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some(&gettext("Search emoji")));
+        search.update_property(&[gtk::accessible::Property::Label(&gettext("Search emoji"))]);
+        search.set_key_capture_widget(Some(&list));
+
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroller.set_min_content_width(320);
+        scroller.set_min_content_height(280);
+        scroller.set_max_content_height(360);
+        scroller.set_propagate_natural_height(true);
+        scroller.set_child(Some(&list));
+
+        let picker_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        picker_content.set_margin_top(8);
+        picker_content.set_margin_bottom(8);
+        picker_content.set_margin_start(8);
+        picker_content.set_margin_end(8);
+        picker_content.append(&search);
+        picker_content.append(&scroller);
+
+        let popover = gtk::Popover::new();
+        popover.set_autohide(true);
+        popover.set_child(Some(&picker_content));
+
+        let button = gtk::MenuButton::new();
+        button.set_icon_name("pan-down-symbolic");
+        button.set_popover(Some(&popover));
+        button.set_tooltip_text(Some(&gettext("Choose a status emoji")));
+        button.set_valign(gtk::Align::Center);
+        button.update_property(&[gtk::accessible::Property::Label(&gettext(
+            "Choose a status emoji",
+        ))]);
+
+        let selected_label = source.borrow().selected_label(&selected_name.borrow());
+        let row = adw::ActionRow::builder()
+            .title(gettext("Emoji"))
+            .subtitle(selected_label)
+            .build();
+        row.add_suffix(&button);
+        row.set_activatable_widget(Some(&button));
+
+        populate_status_emoji_picker_results(
+            &source.borrow(),
+            "",
+            &visible_model,
+            &visible_choices,
+        );
+        sync_status_emoji_picker_selection(&visible_choices, &selected_name, &selection);
+
+        {
+            let source = source.clone();
+            let visible_model = visible_model.clone();
+            let visible_choices = visible_choices.clone();
+            let selected_name = selected_name.clone();
+            let selection = selection.clone();
+            search.connect_search_changed(move |search| {
+                populate_status_emoji_picker_results(
+                    &source.borrow(),
+                    search.text().as_str(),
+                    &visible_model,
+                    &visible_choices,
+                );
+                sync_status_emoji_picker_selection(&visible_choices, &selected_name, &selection);
+            });
+        }
+
+        let on_selected: Rc<dyn Fn(&str)> = Rc::new(on_selected);
+        {
+            let visible_choices = visible_choices.clone();
+            let selected_name = selected_name.clone();
+            let weak_row = row.downgrade();
+            let weak_popover = popover.downgrade();
+            let weak_search = search.downgrade();
+            let on_selected = on_selected.clone();
+            list.connect_activate(move |_, position| {
+                let Some(choice) = visible_choices.borrow().get(position as usize).cloned() else {
+                    return;
+                };
+                selected_name.replace(choice.name.clone());
+                if let Some(row) = weak_row.upgrade() {
+                    row.set_subtitle(&choice.label);
+                }
+                on_selected(&choice.name);
+                if let Some(search) = weak_search.upgrade() {
+                    search.set_text("");
+                }
+                if let Some(popover) = weak_popover.upgrade() {
+                    popover.popdown();
+                }
+            });
+        }
+
+        {
+            let visible_choices = visible_choices.clone();
+            let selected_name = selected_name.clone();
+            let weak_row = row.downgrade();
+            let weak_popover = popover.downgrade();
+            let on_selected = on_selected.clone();
+            search.connect_activate(move |search| {
+                if search.text().trim().is_empty() {
+                    return;
+                }
+                let Some(choice) = visible_choices.borrow().first().cloned() else {
+                    return;
+                };
+                selected_name.replace(choice.name.clone());
+                if let Some(row) = weak_row.upgrade() {
+                    row.set_subtitle(&choice.label);
+                }
+                on_selected(&choice.name);
+                search.set_text("");
+                if let Some(popover) = weak_popover.upgrade() {
+                    popover.popdown();
+                }
+            });
+        }
+
+        {
+            let weak_list = list.downgrade();
+            let selection = selection.clone();
+            let visible_model = visible_model.clone();
+            let controller = gtk::EventControllerKey::new();
+            controller.connect_key_pressed(move |_, key, _, _| {
+                if key != gtk::gdk::Key::Down {
+                    return glib::Propagation::Proceed;
+                }
+                if visible_model.n_items() > 0 {
+                    selection.set_selected(0);
+                    if let Some(list) = weak_list.upgrade() {
+                        list.grab_focus();
+                    }
+                }
+                glib::Propagation::Stop
+            });
+            search.add_controller(controller);
+        }
+
+        {
+            let weak_search = search.downgrade();
+            let weak_list = list.downgrade();
+            let selection = selection.clone();
+            popover.connect_visible_notify(move |popover| {
+                if popover.is_visible() {
+                    if let Some(search) = weak_search.upgrade() {
+                        search.grab_focus();
+                    }
+                    let selected = selection.selected();
+                    if selected != gtk::INVALID_LIST_POSITION {
+                        if let Some(list) = weak_list.upgrade() {
+                            list.scroll_to(selected, gtk::ListScrollFlags::NONE, None);
+                        }
+                    }
+                }
+            });
+        }
+
+        {
+            let weak_popover = popover.downgrade();
+            search.connect_stop_search(move |_| {
+                if let Some(popover) = weak_popover.upgrade() {
+                    popover.popdown();
+                }
+            });
+        }
+
+        {
+            let weak_search = search.downgrade();
+            popover.connect_closed(move |_| {
+                if let Some(search) = weak_search.upgrade() {
+                    search.set_text("");
+                    search.emit_by_name::<()>("search-changed", &[]);
+                }
+            });
+        }
+
+        if let Some(query) = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_QUERY") {
+            let query = query.to_string_lossy();
+            search.set_text(&query);
+            search.emit_by_name::<()>("search-changed", &[]);
+        }
+
+        Self {
+            row,
+            popover,
+            search,
+            visible_model,
+            visible_choices,
+            selection,
+            source,
+            selected_name,
+        }
+    }
+
+    fn selected_name(&self) -> String {
+        self.selected_name.borrow().clone()
+    }
+
+    fn selected_name_state(&self) -> Rc<RefCell<String>> {
+        self.selected_name.clone()
+    }
+
+    fn source_choice_count(&self) -> usize {
+        self.source.borrow().choice_count()
+    }
+
+    fn visible_choice_count(&self) -> u32 {
+        self.visible_model.n_items()
+    }
+
+    fn first_visible_name(&self) -> Option<String> {
+        self.visible_choices
+            .borrow()
+            .first()
+            .map(|choice| choice.name.clone())
+    }
+
+    fn selected_visible_name(&self) -> Option<String> {
+        let selected = self.selection.selected();
+        if selected == gtk::INVALID_LIST_POSITION {
+            return None;
+        }
+        self.visible_choices
+            .borrow()
+            .get(selected as usize)
+            .map(|choice| choice.name.clone())
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.source.borrow().contains(name)
+    }
+
+    fn refresh_catalog(&self, custom_emojis: &HashMap<String, String>) {
+        let selected_name = self.selected_name();
+        self.source
+            .replace(StatusEmojiPickerModel::new(custom_emojis, &selected_name));
+        self.row
+            .set_subtitle(&self.source.borrow().selected_label(&selected_name));
+        populate_status_emoji_picker_results(
+            &self.source.borrow(),
+            self.search.text().as_str(),
+            &self.visible_model,
+            &self.visible_choices,
+        );
+        sync_status_emoji_picker_selection(
+            &self.visible_choices,
+            &self.selected_name,
+            &self.selection,
+        );
+    }
 }
 
 fn status_expiration_options(
@@ -1936,11 +2360,11 @@ fn status_expiration_options(
 fn update_status_dialog_save_response(
     dialog: &adw::AlertDialog,
     status_entry: &adw::EntryRow,
-    emoji_row: &adw::ComboRow,
+    selected_emoji: &str,
 ) {
     dialog.set_response_enabled(
         "save",
-        !status_entry.text().trim().is_empty() || emoji_row.selected() > 0,
+        !status_entry.text().trim().is_empty() || !selected_emoji.is_empty(),
     );
 }
 
@@ -4721,19 +5145,7 @@ impl ConduitWindow {
             RuntimeEventKind::UserGroupsLoaded { names, members } => {
                 self.populate_user_groups(names, members);
             }
-            RuntimeEventKind::EmojiCatalogLoaded(emojis) => {
-                *self.imp().custom_emojis.borrow_mut() = emojis;
-                self.queue_ui_invalidations(
-                    UiInvalidations::SIDEBAR
-                        | UiInvalidations::PICKER
-                        | UiInvalidations::TITLE
-                        | UiInvalidations::MAIN
-                        | UiInvalidations::THREAD,
-                );
-                for target in COMPOSER_TARGETS {
-                    self.refresh_composer_completion(target);
-                }
-            }
+            RuntimeEventKind::EmojiCatalogLoaded(emojis) => self.replace_custom_emojis(emojis),
             RuntimeEventKind::ImageAssetLoaded { key, data_uri } => {
                 crate::debug::log(
                     "ui",
@@ -6195,7 +6607,8 @@ impl ConduitWindow {
         if let Some(preflight) = imp.huddle_preflight_dialog.borrow_mut().take() {
             preflight.dialog.force_close();
         }
-        if let Some(state) = imp.status_dialog.borrow_mut().take() {
+        let status_dialog = imp.status_dialog.borrow_mut().take();
+        if let Some(state) = status_dialog {
             state.dialog.force_close();
         }
         imp.pending_status_update.borrow_mut().take();
@@ -6379,6 +6792,26 @@ impl ConduitWindow {
             WorkspaceLifecycleSurface::Workspace => {
                 imp.content_stack.set_visible_child_name("workspace")
             }
+        }
+    }
+
+    fn replace_custom_emojis(&self, emojis: HashMap<String, String>) {
+        *self.imp().custom_emojis.borrow_mut() = emojis;
+        if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
+            state
+                .emoji_picker
+                .refresh_catalog(&self.imp().custom_emojis.borrow());
+            write_status_dialog_test_state(self, state);
+        }
+        self.queue_ui_invalidations(
+            UiInvalidations::SIDEBAR
+                | UiInvalidations::PICKER
+                | UiInvalidations::TITLE
+                | UiInvalidations::MAIN
+                | UiInvalidations::THREAD,
+        );
+        for target in COMPOSER_TARGETS {
+            self.refresh_composer_completion(target);
         }
     }
 
@@ -7577,19 +8010,31 @@ impl ConduitWindow {
             "Enter up to 100 characters for your Slack status",
         )));
         group.add(&status_entry);
+        content.append(&group);
 
-        let (emoji_names, emoji_labels, emoji_selected) =
-            status_emoji_options(&self.imp().custom_emojis.borrow(), status.emoji_name());
-        let emoji_label_refs = emoji_labels.iter().map(String::as_str).collect::<Vec<_>>();
-        let emoji_model = gtk::StringList::new(&emoji_label_refs);
-        let emoji_row = adw::ComboRow::builder()
-            .title(gettext("Emoji"))
-            .model(&emoji_model)
-            .enable_search(true)
-            .selected(emoji_selected)
+        let dialog = adw::AlertDialog::builder()
+            .heading(gettext("Set a status"))
+            .body(gettext("Choose what teammates see beside your name."))
+            .extra_child(&content)
+            .default_response("save")
+            .close_response("cancel")
             .build();
-        emoji_row.set_tooltip_text(Some(&gettext("Search all available Slack emoji")));
-        group.add(&emoji_row);
+
+        let weak_dialog = dialog.downgrade();
+        let weak_status_entry = status_entry.downgrade();
+        let emoji_picker = StatusEmojiPicker::new(
+            &self.imp().custom_emojis.borrow(),
+            status.emoji_name(),
+            move |selected_emoji| {
+                let (Some(dialog), Some(status_entry)) =
+                    (weak_dialog.upgrade(), weak_status_entry.upgrade())
+                else {
+                    return;
+                };
+                update_status_dialog_save_response(&dialog, &status_entry, selected_emoji);
+            },
+        );
+        group.add(&emoji_picker.row);
 
         let now = current_unix_seconds();
         let (expiration_labels, expiration_choices, expiration_selected) =
@@ -7605,54 +8050,31 @@ impl ConduitWindow {
             .selected(expiration_selected)
             .build();
         group.add(&expiration_row);
-        content.append(&group);
 
-        let dialog = adw::AlertDialog::builder()
-            .heading(gettext("Set a status"))
-            .body(gettext("Choose what teammates see beside your name."))
-            .extra_child(&content)
-            .default_response("save")
-            .close_response("cancel")
-            .build();
         dialog.add_response("cancel", &gettext("Cancel"));
         if status_dialog_clear_available(&status, now, clearing_retry) {
             dialog.add_response("clear", &gettext("Clear status"));
         }
         dialog.add_response("save", &gettext("Save"));
         dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-        update_status_dialog_save_response(&dialog, &status_entry, &emoji_row);
+        update_status_dialog_save_response(&dialog, &status_entry, &emoji_picker.selected_name());
 
         {
             let weak_dialog = dialog.downgrade();
-            let weak_emoji_row = emoji_row.downgrade();
+            let selected_name = emoji_picker.selected_name_state();
             status_entry.connect_changed(move |entry| {
                 enforce_status_text_limit(entry);
-                let (Some(dialog), Some(emoji_row)) =
-                    (weak_dialog.upgrade(), weak_emoji_row.upgrade())
-                else {
+                let Some(dialog) = weak_dialog.upgrade() else {
                     return;
                 };
-                update_status_dialog_save_response(&dialog, entry, &emoji_row);
-            });
-        }
-        {
-            let weak_dialog = dialog.downgrade();
-            let weak_status_entry = status_entry.downgrade();
-            emoji_row.connect_selected_notify(move |emoji_row| {
-                let (Some(dialog), Some(status_entry)) =
-                    (weak_dialog.upgrade(), weak_status_entry.upgrade())
-                else {
-                    return;
-                };
-                update_status_dialog_save_response(&dialog, &status_entry, emoji_row);
+                update_status_dialog_save_response(&dialog, entry, &selected_name.borrow());
             });
         }
 
-        let emoji_names = Rc::new(emoji_names);
+        let selected_emoji = emoji_picker.selected_name_state();
         let expiration_choice_count = expiration_choices.len();
         let expiration_choices = Rc::new(expiration_choices);
         let weak_status_entry = status_entry.downgrade();
-        let weak_emoji_row = emoji_row.downgrade();
         let weak_expiration_row = expiration_row.downgrade();
         let weak_window = self.downgrade();
         let dialog_draft = status.clone();
@@ -7668,17 +8090,12 @@ impl ConduitWindow {
                     clearing: true,
                 }),
                 "save" => {
-                    let (Some(status_entry), Some(emoji_row), Some(expiration_row)) = (
-                        weak_status_entry.upgrade(),
-                        weak_emoji_row.upgrade(),
-                        weak_expiration_row.upgrade(),
-                    ) else {
+                    let (Some(status_entry), Some(expiration_row)) =
+                        (weak_status_entry.upgrade(), weak_expiration_row.upgrade())
+                    else {
                         return;
                     };
-                    let emoji = emoji_names
-                        .get(emoji_row.selected() as usize)
-                        .cloned()
-                        .unwrap_or_default();
+                    let emoji = selected_emoji.borrow().clone();
                     let choice = expiration_choices
                         .get(expiration_row.selected() as usize)
                         .copied()
@@ -7711,16 +8128,59 @@ impl ConduitWindow {
             .borrow_mut()
             .replace(StatusDialogState {
                 dialog: dialog.clone(),
+                status_entry: status_entry.clone(),
+                emoji_picker,
+                expiration_choice_count,
             });
         dialog.present(Some(self));
         status_entry.grab_focus();
-        write_status_dialog_test_state(
-            self,
-            &dialog,
-            &status_entry,
-            &emoji_row,
-            expiration_choice_count,
-        );
+        if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
+            write_status_dialog_test_state(self, state);
+        }
+        if std::env::var_os("CONDUIT_TEST_STATUS_OPEN_EMOJI").is_some() {
+            let weak_window = self.downgrade();
+            glib::idle_add_local_once(move || {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                if let Some(state) = window.imp().status_dialog.borrow().as_ref() {
+                    state.emoji_picker.popover.popup();
+                    state.emoji_picker.search.grab_focus();
+                    write_status_dialog_test_state(&window, state);
+                };
+            });
+        }
+        if std::env::var_os("CONDUIT_TEST_STATUS_REOPEN_EMOJI").is_some() {
+            let reopened = Rc::new(Cell::new(false));
+            if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
+                let weak_window = self.downgrade();
+                let reopened = reopened.clone();
+                state.emoji_picker.popover.connect_closed(move |_| {
+                    if reopened.replace(true) {
+                        return;
+                    }
+                    let weak_window = weak_window.clone();
+                    glib::idle_add_local_once(move || {
+                        let Some(window) = weak_window.upgrade() else {
+                            return;
+                        };
+                        if let Some(state) = window.imp().status_dialog.borrow().as_ref() {
+                            state.emoji_picker.popover.popup();
+                            state.emoji_picker.search.grab_focus();
+                            write_status_dialog_test_state(&window, state);
+                        };
+                    });
+                });
+            }
+            let weak_window = self.downgrade();
+            glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                if let Some(window) = weak_window.upgrade() {
+                    if let Some(state) = window.imp().status_dialog.borrow().as_ref() {
+                        state.emoji_picker.popover.popdown();
+                    };
+                }
+            });
+        }
     }
 
     fn submit_current_user_status(&self, pending: PendingStatusUpdate) {
@@ -10159,32 +10619,30 @@ fn record_test_huddle_surface(window: &imp::ConduitWindow) {
     );
 }
 
-fn write_status_dialog_test_state(
-    window: &ConduitWindow,
-    dialog: &adw::AlertDialog,
-    status_entry: &adw::EntryRow,
-    emoji_row: &adw::ComboRow,
-    expiration_choice_count: usize,
-) {
+fn write_status_dialog_test_state(window: &ConduitWindow, state: &StatusDialogState) {
     let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_UI_FILE") else {
         return;
     };
     let imp = window.imp();
-    let emoji_choice_count = emoji_row
-        .model()
-        .map(|model| model.n_items())
-        .unwrap_or_default();
     let _ = std::fs::write(
         path,
         serde_json::json!({
-            "dialog_heading": dialog.heading().map(|heading| heading.to_string()),
-            "emoji_search": emoji_row.enables_search(),
-            "emoji_choice_count": emoji_choice_count,
-            "expiration_choice_count": expiration_choice_count,
-            "save_enabled": dialog.is_response_enabled("save"),
-            "clear_available": dialog.has_response("clear"),
-            "status_has_value": !status_entry.text().trim().is_empty()
-                || emoji_row.selected() > 0,
+            "dialog_heading": state.dialog.heading().map(|heading| heading.to_string()),
+            "emoji_search": true,
+            "emoji_filter_ready": state.emoji_picker.popover.child().is_some(),
+            "emoji_popup_visible": state.emoji_picker.popover.is_visible(),
+            "emoji_query": state.emoji_picker.search.text().to_string(),
+            "emoji_choice_count": state.emoji_picker.source_choice_count(),
+            "emoji_visible_choice_count": state.emoji_picker.visible_choice_count(),
+            "emoji_first_visible_name": state.emoji_picker.first_visible_name(),
+            "emoji_contains_late_custom": state.emoji_picker.contains("late_status_parrot"),
+            "emoji_selected_name": state.emoji_picker.selected_name(),
+            "emoji_selected_visible_name": state.emoji_picker.selected_visible_name(),
+            "expiration_choice_count": state.expiration_choice_count,
+            "save_enabled": state.dialog.is_response_enabled("save"),
+            "clear_available": state.dialog.has_response("clear"),
+            "status_has_value": !state.status_entry.text().trim().is_empty()
+                || !state.emoji_picker.selected_name().is_empty(),
             "header_title": imp.workspace_title_label.title().to_string(),
             "header_subtitle": imp.workspace_title_label.subtitle().to_string(),
             "window_width": window.width(),
@@ -11237,6 +11695,52 @@ mod tests {
             .chars()
             .count(),
             100
+        );
+    }
+
+    #[test]
+    fn status_emoji_picker_searches_the_entire_compatible_source_without_truncation() {
+        let custom = HashMap::from([(
+            "party_parrot".to_string(),
+            "https://emoji.example/party-parrot.gif".to_string(),
+        )]);
+        let model = StatusEmojiPickerModel::new(&custom, "");
+        let all = model.search("");
+
+        assert_eq!(all.len(), model.choice_count());
+        assert_eq!(all.first().map(|choice| choice.name.as_str()), Some(""));
+        assert!(all.iter().any(|choice| choice.name == "wales"));
+        assert!(all.iter().any(|choice| choice.name == "party_parrot"));
+        assert_eq!(
+            model
+                .search("PARTY parr")
+                .first()
+                .map(|choice| choice.name.as_str()),
+            Some("party_parrot")
+        );
+    }
+
+    #[test]
+    fn status_emoji_picker_preserves_selection_and_prefers_workspace_collisions() {
+        let selected = StatusEmojiPickerModel::new(&HashMap::new(), ":still_loading:");
+        assert!(selected.contains("still_loading"));
+        assert_eq!(
+            selected.selected_label("still_loading"),
+            ":still_loading: - still loading"
+        );
+
+        let custom = HashMap::from([(
+            "rocket".to_string(),
+            "https://emoji.example/custom-rocket.gif".to_string(),
+        )]);
+        let refreshed = StatusEmojiPickerModel::new(&custom, "still_loading");
+        assert!(refreshed.contains("still_loading"));
+        assert_eq!(
+            refreshed
+                .search("rocket")
+                .first()
+                .map(|choice| choice.label.as_str()),
+            Some(":rocket: - rocket")
         );
     }
 
