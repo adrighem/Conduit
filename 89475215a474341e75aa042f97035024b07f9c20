@@ -1,0 +1,7 @@
+Task: Add a DM Profile context action using the existing main-webview flow
+
+Summary: Added a Profile action for one-to-one DM sidebar menus, reused the existing main-webview profile loader, switched narrow layouts to content, and closed media overlays before rendering.
+
+Modified files: src/window.rs
+
+Rationale: Keep native sidebar navigation consistent with message author profile links without duplicating runtime or Slack API behavior.
