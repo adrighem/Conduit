@@ -20,7 +20,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 
 - Adaptive GNOME interface for channels, direct messages, and group messages.
 - Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state. The default sidebar keeps relevant DMs compact; **Show All Conversations** and the conversation switcher expose the full catalog.
-- A Priority section mirrors Slack conversation stars, listing starred DMs as VIP conversations before starred channels. Sidebar context menus can star or unstar channels and DMs.
+- A Priority section mirrors Slack conversation stars, listing starred DMs as VIP conversations before starred channels. Sidebar context menus can star or unstar channels and DMs, and one-to-one DMs expose a **Profile** action.
 - Sections for Messages, Unreads, observed threads, Files, and Later.
 - Fast conversation switcher with discovery of channels and people.
 - Create public or private channels, start direct or group messages, and add people to existing conversations when Slack permissions allow it.
@@ -33,9 +33,9 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 ### Messaging
 
 - Paged channel history and threaded replies.
-- Multiline message and thread composers with persistent per-conversation drafts.
+- Multiline message and thread composers with persistent per-conversation drafts and person completion after typing `@`.
 - File uploads with progress reporting, including pasting clipboard screenshots directly into either composer.
-- Emoji completion after typing a colon and at least two characters, with filtered keyboard navigation in main messages and threads.
+- Emoji and person completion with type-ahead filtering and keyboard navigation in main messages and threads. Completed people remain readable by name while being sent to Slack as real mentions.
 - Edited and deleted messages, Slack links and mentions, user-group mentions, common Block Kit and legacy bot attachments, bot identities, code blocks, and image and video previews.
 - Safe bot links open directly; callback buttons and menus open the exact originating message in Slack so the publishing app remains responsible for the interaction.
 - Workspace custom emoji in messages, reactions, composer completion, and the reusable searchable emoji picker.
@@ -80,7 +80,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Slack's public API cannot enumerate every historical subscribed thread. Conduit retains and reconciles every thread it discovers, but a fresh installation builds its thread catalog progressively as history and replies are fetched.
 - Threads and Unreads reflect the conversations and activity Conduit has observed; they are not complete Slack-wide activity aggregators.
 - File and workspace-search views currently load a bounded result set rather than every page.
-- Rich composer formatting, autocomplete beyond emoji, message editing/deletion controls, typing indicators, general live presence, sidebar avatars (message and profile avatars are supported), native production huddle joining, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
+- Rich composer formatting, autocomplete beyond emoji and people, message editing/deletion controls, typing indicators, general live presence, sidebar avatars (message and profile avatars are supported), native production huddle joining, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
 - Release bundles currently target x86_64 Debian 13, Fedora 44, and Flatpak. Other distributions and architectures still require a source build.
 - Signing out removes the stored credential and clears the active-workspace selection, but it does not currently purge cached workspace data or saved drafts from local storage.
 
@@ -274,6 +274,7 @@ Names, aliases, keywords, and phrases are entered one per line. Matching is case
 | Send message | `Enter` |
 | Insert newline | `Shift+Enter` or `Ctrl+Enter` |
 | Complete emoji | Type `:` and at least two characters, then `Enter` or `Tab` |
+| Complete person | Type `@`, filter by name, then `Enter` or `Tab` |
 | Upload file | `Ctrl+O` |
 | Close thread | `Ctrl+Shift+W` |
 | Refresh conversations | `F5` |

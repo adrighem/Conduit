@@ -36,9 +36,10 @@ use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
 use crate::composer::{
-    emoji_completion_key_action, emoji_token_at_caret, replace_emoji_token, set_text_view_text,
-    text_view_enter_action, text_view_text, EmojiCompletionKeyAction, EmojiToken,
-    TextViewEnterAction,
+    completion_key_action, emoji_token_at_caret, hydrate_composer_mentions, mention_candidates,
+    mention_token_at_caret, replace_emoji_token, replace_mention_token, search_mention_candidates,
+    serialize_composer_mentions, text_view_enter_action, text_view_text, CompletionKeyAction,
+    EmojiToken, MentionCandidate, MentionSpan, MentionToken, TextViewEnterAction,
 };
 use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
@@ -108,6 +109,14 @@ struct HuddlePreflightDialog {
     microphone: HuddleDevicePicker,
     speaker: HuddleDevicePicker,
     camera: HuddleDevicePicker,
+}
+
+#[derive(Debug, Clone)]
+struct ComposerMentionMark {
+    start: gtk::TextMark,
+    end: gtk::TextMark,
+    user_id: String,
+    label: String,
 }
 
 struct SystemExternalOpener;
@@ -297,8 +306,10 @@ mod imp {
         pub failed_image_assets: RefCell<HashSet<String>>,
         pub custom_emojis: RefCell<HashMap<String, String>>,
         pub realtime_status: Cell<RealtimeStatus>,
-        pub(super) message_emoji_completion: RefCell<Option<ComposerEmojiCompletion>>,
-        pub(super) thread_emoji_completion: RefCell<Option<ComposerEmojiCompletion>>,
+        pub(super) message_composer_completion: RefCell<Option<ComposerCompletion>>,
+        pub(super) thread_composer_completion: RefCell<Option<ComposerCompletion>>,
+        pub(super) message_mentions: RefCell<Vec<ComposerMentionMark>>,
+        pub(super) thread_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
         pub(super) sidebar_items: RefCell<Vec<KeyedSidebarItem>>,
         pub(super) sidebar_rows: RefCell<HashMap<SidebarItemKey, gtk::ListBoxRow>>,
@@ -361,6 +372,37 @@ mod imp {
                     is_channel: Some(true),
                     ..SlackConversation::default()
                 }]);
+                let test_users = vec![
+                    SlackUser {
+                        id: Some("UADA".to_string()),
+                        name: Some("ada".to_string()),
+                        real_name: Some("Ada Lovelace".to_string()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            display_name: Some("Ada Lovelace".to_string()),
+                            real_name: Some("Ada Lovelace".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    SlackUser {
+                        id: Some("UGRACE".to_string()),
+                        name: Some("grace".to_string()),
+                        real_name: Some("Grace Hopper".to_string()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            display_name: Some("Grace Hopper".to_string()),
+                            real_name: Some("Grace Hopper".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ];
+                obj.populate_user_names(
+                    test_users
+                        .iter()
+                        .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
+                        .collect(),
+                );
+                *self.discovered_users.borrow_mut() = test_users;
                 obj.apply_workspace_lifecycle(WorkspaceLifecycleEvent::SyncCompleted);
                 obj.select_conversation(test_channel_id, "#general");
                 if huddle_test {
@@ -385,6 +427,19 @@ mod imp {
                 if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
                     obj.imp().thread_split.set_show_sidebar(true);
                 }
+                if std::env::var_os("CONDUIT_TEST_COMPOSER_HYDRATION").is_some() {
+                    let target = if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
+                        ComposerTarget::Thread
+                    } else {
+                        ComposerTarget::Message
+                    };
+                    obj.imp().user_names.borrow_mut().remove("UGRACE");
+                    obj.set_composer_canonical_text(target, "Draft <@UGRACE>");
+                    obj.populate_user_names(HashMap::from([(
+                        "UGRACE".to_string(),
+                        "Grace Hopper".to_string(),
+                    )]));
+                }
             } else {
                 obj.show_loading("Checking secure storage");
                 obj.send_session_command(RuntimeCommand::LoadStoredToken);
@@ -403,8 +458,8 @@ mod imp {
             // children are disposed; GtkTextView cannot remove unregistered
             // direct children itself and otherwise loops while warning.
             for completion in [
-                &self.message_emoji_completion,
-                &self.thread_emoji_completion,
+                &self.message_composer_completion,
+                &self.thread_composer_completion,
             ] {
                 if let Some(completion) = completion.borrow_mut().take() {
                     completion.popover.popdown();
@@ -549,12 +604,24 @@ const CANCEL_REACTION_PICKER_SCRIPT: &str = r#"(function () {
   return true;
 })()"#;
 
+#[derive(Debug, Clone)]
+enum ComposerCompletionToken {
+    Emoji(EmojiToken),
+    Mention(MentionToken),
+}
+
+#[derive(Debug, Clone)]
+enum ComposerCompletionEntry {
+    Emoji(EmojiEntry),
+    Mention(MentionCandidate),
+}
+
 #[derive(Debug)]
-struct ComposerEmojiCompletion {
+struct ComposerCompletion {
     popover: gtk::Popover,
     list: gtk::ListBox,
-    entries: Vec<EmojiEntry>,
-    token: Option<EmojiToken>,
+    entries: Vec<ComposerCompletionEntry>,
+    token: Option<ComposerCompletionToken>,
 }
 
 fn composer_emoji_preview(entry: &EmojiEntry) -> gtk::Widget {
@@ -571,6 +638,107 @@ fn composer_emoji_preview(entry: &EmojiEntry) -> gtk::Widget {
             preview.set_content_fit(gtk::ContentFit::Contain);
             preview.set_size_request(24, 24);
             preview.upcast()
+        }
+    }
+}
+
+fn composer_person_detail(candidate: &MentionCandidate) -> Option<String> {
+    let mut details = Vec::new();
+    if let Some(full_name) = candidate
+        .full_name
+        .as_deref()
+        .filter(|name| !name.eq_ignore_ascii_case(&candidate.display_name))
+    {
+        details.push(full_name.to_string());
+    }
+    if let Some(username) = candidate
+        .username
+        .as_deref()
+        .filter(|name| !name.eq_ignore_ascii_case(&candidate.display_name))
+    {
+        details.push(format!("@{username}"));
+    }
+    (!details.is_empty()).then(|| details.join("  "))
+}
+
+fn composer_completion_row(entry: &ComposerCompletionEntry) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    content.set_margin_start(8);
+    content.set_margin_end(8);
+
+    match entry {
+        ComposerCompletionEntry::Emoji(entry) => {
+            let preview = composer_emoji_preview(entry);
+            let label = gtk::Label::new(Some(&format!(":{}:  {}", entry.name, entry.label)));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            content.append(&preview);
+            content.append(&label);
+            row.update_property(&[gtk::accessible::Property::Label(
+                &emoji_picker_accessible_label(entry),
+            )]);
+        }
+        ComposerCompletionEntry::Mention(candidate) => {
+            let preview = gtk::Image::from_icon_name("avatar-default-symbolic");
+            preview.set_pixel_size(24);
+
+            let labels = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            labels.set_hexpand(true);
+            let primary = gtk::Label::new(Some(&format!("@{}", candidate.display_name)));
+            primary.set_xalign(0.0);
+            labels.append(&primary);
+            let detail = composer_person_detail(candidate);
+            if let Some(detail) = detail.as_deref() {
+                let secondary = gtk::Label::new(Some(detail));
+                secondary.add_css_class("dim-label");
+                secondary.set_xalign(0.0);
+                labels.append(&secondary);
+            }
+
+            content.append(&preview);
+            content.append(&labels);
+            let accessible = detail.map_or_else(
+                || format!("Person: {}", candidate.display_name),
+                |detail| {
+                    format!(
+                        "Person: {}, {}",
+                        candidate.display_name,
+                        detail.replace("  ", ", ")
+                    )
+                },
+            );
+            row.update_property(&[gtk::accessible::Property::Label(&accessible)]);
+        }
+    }
+
+    row.set_child(Some(&content));
+    row
+}
+
+fn composer_completion_description(
+    entry: &ComposerCompletionEntry,
+    index: usize,
+    total: usize,
+) -> String {
+    let position = format!("{} of {}", index + 1, total);
+    match entry {
+        ComposerCompletionEntry::Emoji(entry) => {
+            format!(
+                "Emoji suggestion {position}: :{}:, {}",
+                entry.name, entry.label
+            )
+        }
+        ComposerCompletionEntry::Mention(candidate) => {
+            let detail = composer_person_detail(candidate)
+                .map(|detail| format!(", {}", detail.replace("  ", ", ")))
+                .unwrap_or_default();
+            format!(
+                "Person suggestion {position}: {}{detail}",
+                candidate.display_name
+            )
         }
     }
 }
@@ -2803,7 +2971,7 @@ impl ConduitWindow {
         });
 
         for target in COMPOSER_TARGETS {
-            self.setup_composer_emoji_completion(target);
+            self.setup_composer_completion(target);
         }
 
         let weak_window = self.downgrade();
@@ -3030,8 +3198,8 @@ impl ConduitWindow {
         let thread_key = self
             .selected_thread_ts()
             .and_then(|thread_ts| self.draft_key(&channel_id, Some(&thread_ts)));
-        let message_text = text_view_text(&self.imp().message_entry);
-        let thread_text = text_view_text(&self.imp().thread_entry);
+        let message_text = self.composer_canonical_text(ComposerTarget::Message);
+        let thread_text = self.composer_canonical_text(ComposerTarget::Thread);
         let changed = {
             let mut drafts = self.imp().drafts.borrow_mut();
             let mut changed = drafts.upsert(channel_key, &message_text);
@@ -3065,7 +3233,7 @@ impl ConduitWindow {
                     .map(ToString::to_string)
             })
             .unwrap_or_default();
-        set_text_view_text(&self.imp().message_entry, &text);
+        self.set_composer_canonical_text(ComposerTarget::Message, &text);
     }
 
     fn restore_thread_draft(&self, channel_id: &str, thread_ts: &str) {
@@ -3079,7 +3247,7 @@ impl ConduitWindow {
                     .map(ToString::to_string)
             })
             .unwrap_or_default();
-        set_text_view_text(&self.imp().thread_entry, &text);
+        self.set_composer_canonical_text(ComposerTarget::Thread, &text);
     }
 
     fn remember_submitted_draft(
@@ -3114,9 +3282,9 @@ impl ConduitWindow {
         });
         let current_text = (current_key.as_ref() == Some(&key)).then(|| {
             if thread_ts.is_some() {
-                text_view_text(&self.imp().thread_entry)
+                self.composer_canonical_text(ComposerTarget::Thread)
             } else {
-                text_view_text(&self.imp().message_entry)
+                self.composer_canonical_text(ComposerTarget::Message)
             }
         });
         let stored_text = self
@@ -3135,9 +3303,9 @@ impl ConduitWindow {
         }
         if current_key.as_ref() == Some(&key) {
             if thread_ts.is_some() {
-                set_text_view_text(&self.imp().thread_entry, "");
+                self.set_composer_canonical_text(ComposerTarget::Thread, "");
             } else {
-                set_text_view_text(&self.imp().message_entry, "");
+                self.set_composer_canonical_text(ComposerTarget::Message, "");
             }
         }
     }
@@ -3159,9 +3327,9 @@ impl ConduitWindow {
                 .is_none_or(|thread_ts| self.selected_thread_ts().as_deref() == Some(thread_ts));
         let current_text = current_target_matches.then(|| {
             if thread_ts.is_some() {
-                text_view_text(&self.imp().thread_entry)
+                self.composer_canonical_text(ComposerTarget::Thread)
             } else {
-                text_view_text(&self.imp().message_entry)
+                self.composer_canonical_text(ComposerTarget::Message)
             }
         });
         let stored_text = self
@@ -3181,9 +3349,9 @@ impl ConduitWindow {
         }
         if current_text.is_some() {
             if thread_ts.is_some() {
-                set_text_view_text(&self.imp().thread_entry, "");
+                self.set_composer_canonical_text(ComposerTarget::Thread, "");
             } else {
-                set_text_view_text(&self.imp().message_entry, "");
+                self.set_composer_canonical_text(ComposerTarget::Message, "");
             }
         }
     }
@@ -3282,7 +3450,197 @@ impl ConduitWindow {
         }
     }
 
-    fn setup_composer_emoji_completion(&self, target: ComposerTarget) {
+    fn composer_completion(&self, target: ComposerTarget) -> &RefCell<Option<ComposerCompletion>> {
+        match target {
+            ComposerTarget::Message => &self.imp().message_composer_completion,
+            ComposerTarget::Thread => &self.imp().thread_composer_completion,
+        }
+    }
+
+    fn composer_mentions(&self, target: ComposerTarget) -> &RefCell<Vec<ComposerMentionMark>> {
+        match target {
+            ComposerTarget::Message => &self.imp().message_mentions,
+            ComposerTarget::Thread => &self.imp().thread_mentions,
+        }
+    }
+
+    fn ensure_composer_mention_tag(&self, target: ComposerTarget) {
+        const TAG_NAME: &str = "composer-mention";
+        let buffer = self.composer_text_view(target).buffer();
+        let table = buffer.tag_table();
+        if table.lookup(TAG_NAME).is_none() {
+            let tag = gtk::TextTag::builder().name(TAG_NAME).weight(600).build();
+            table.add(&tag);
+        }
+    }
+
+    fn clear_composer_mentions(&self, target: ComposerTarget) {
+        let buffer = self.composer_text_view(target).buffer();
+        for mention in self.composer_mentions(target).borrow_mut().drain(..) {
+            if !mention.start.is_deleted() {
+                buffer.delete_mark(&mention.start);
+            }
+            if !mention.end.is_deleted() {
+                buffer.delete_mark(&mention.end);
+            }
+        }
+    }
+
+    fn add_composer_mention(&self, target: ComposerTarget, span: MentionSpan) {
+        const TAG_NAME: &str = "composer-mention";
+        self.ensure_composer_mention_tag(target);
+        let buffer = self.composer_text_view(target).buffer();
+        let start = buffer.iter_at_offset(span.start as i32);
+        let end = buffer.iter_at_offset(span.end as i32);
+        buffer.apply_tag_by_name(TAG_NAME, &start, &end);
+        self.composer_mentions(target)
+            .borrow_mut()
+            .push(ComposerMentionMark {
+                // Right gravity keeps text inserted immediately before the
+                // mention outside its semantic span.
+                start: buffer.create_mark(None, &start, false),
+                // Left gravity keeps text inserted immediately after the
+                // mention outside its semantic span.
+                end: buffer.create_mark(None, &end, true),
+                user_id: span.user_id,
+                label: span.label,
+            });
+    }
+
+    fn composer_mention_spans(&self, target: ComposerTarget) -> Vec<MentionSpan> {
+        const TAG_NAME: &str = "composer-mention";
+        let text_view = self.composer_text_view(target);
+        let buffer = text_view.buffer();
+        let text = text_view_text(&text_view);
+        let characters = text.chars().collect::<Vec<_>>();
+        let mut spans = Vec::new();
+        self.composer_mentions(target)
+            .borrow_mut()
+            .retain(|mention| {
+                if mention.start.is_deleted() || mention.end.is_deleted() {
+                    return false;
+                }
+                let start = buffer.iter_at_mark(&mention.start).offset().max(0) as usize;
+                let end = buffer.iter_at_mark(&mention.end).offset().max(0) as usize;
+                let valid = start < end
+                    && end <= characters.len()
+                    && characters[start..end].iter().collect::<String>() == mention.label;
+                if valid {
+                    spans.push(MentionSpan {
+                        start,
+                        end,
+                        user_id: mention.user_id.clone(),
+                        label: mention.label.clone(),
+                    });
+                    true
+                } else {
+                    let tag_start = start.min(end).min(characters.len());
+                    let tag_end = start.max(end).min(characters.len());
+                    let start_iter = buffer.iter_at_offset(tag_start as i32);
+                    let end_iter = buffer.iter_at_offset(tag_end as i32);
+                    buffer.remove_tag_by_name(TAG_NAME, &start_iter, &end_iter);
+                    buffer.delete_mark(&mention.start);
+                    buffer.delete_mark(&mention.end);
+                    false
+                }
+            });
+        spans
+    }
+
+    fn refresh_composer_mention_names(&self, target: ComposerTarget) {
+        const TAG_NAME: &str = "composer-mention";
+        let text_view = self.composer_text_view(target);
+        let buffer = text_view.buffer();
+        let mut changed = false;
+
+        loop {
+            let update = {
+                let names = self.imp().user_names.borrow();
+                let mentions = self.composer_mentions(target).borrow();
+                let text = text_view_text(&text_view);
+                let characters = text.chars().collect::<Vec<_>>();
+
+                mentions.iter().enumerate().find_map(|(index, mention)| {
+                    if mention.start.is_deleted() || mention.end.is_deleted() {
+                        return None;
+                    }
+                    let display_name = names
+                        .get(&mention.user_id)
+                        .map(String::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())?;
+                    let label = format!("@{display_name}");
+                    if label == mention.label {
+                        return None;
+                    }
+                    let start = buffer.iter_at_mark(&mention.start).offset().max(0) as usize;
+                    let end = buffer.iter_at_mark(&mention.end).offset().max(0) as usize;
+                    (start < end
+                        && end <= characters.len()
+                        && characters[start..end].iter().collect::<String>() == mention.label)
+                        .then(|| (index, start, end, mention.user_id.clone(), label))
+                })
+            };
+            let Some((index, start, end, user_id, label)) = update else {
+                break;
+            };
+
+            let mention = self.composer_mentions(target).borrow_mut().remove(index);
+            let mut start_iter = buffer.iter_at_offset(start as i32);
+            let mut end_iter = buffer.iter_at_offset(end as i32);
+            buffer.remove_tag_by_name(TAG_NAME, &start_iter, &end_iter);
+            buffer.delete_mark(&mention.start);
+            buffer.delete_mark(&mention.end);
+            buffer.begin_user_action();
+            buffer.delete(&mut start_iter, &mut end_iter);
+            buffer.insert(&mut start_iter, &label);
+            buffer.end_user_action();
+            changed = true;
+            self.add_composer_mention(
+                target,
+                MentionSpan {
+                    start,
+                    end: start + label.chars().count(),
+                    user_id,
+                    label,
+                },
+            );
+        }
+        if changed {
+            self.refresh_composer_completion(target);
+        }
+    }
+
+    fn composer_range_intersects_mention(
+        &self,
+        target: ComposerTarget,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        self.composer_mention_spans(target)
+            .iter()
+            .any(|span| start < span.end && span.start < end)
+    }
+
+    fn composer_canonical_text(&self, target: ComposerTarget) -> String {
+        let text = text_view_text(&self.composer_text_view(target));
+        serialize_composer_mentions(&text, &self.composer_mention_spans(target))
+    }
+
+    fn set_composer_canonical_text(&self, target: ComposerTarget, text: &str) {
+        let names = self.imp().user_names.borrow();
+        let hydrated = hydrate_composer_mentions(text, &names);
+        drop(names);
+        self.clear_composer_mentions(target);
+        self.composer_text_view(target)
+            .buffer()
+            .set_text(&hydrated.text);
+        for mention in hydrated.mentions {
+            self.add_composer_mention(target, mention);
+        }
+    }
+
+    fn setup_composer_completion(&self, target: ComposerTarget) {
         let text_view = self.composer_text_view(target);
         let popover = gtk::Popover::new();
         popover.set_parent(&text_view);
@@ -3296,7 +3654,7 @@ impl ConduitWindow {
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.set_activate_on_single_click(true);
-        list.update_property(&[gtk::accessible::Property::Label("Emoji suggestions")]);
+        list.update_property(&[gtk::accessible::Property::Label("Composer suggestions")]);
 
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -3306,32 +3664,25 @@ impl ConduitWindow {
         scroller.set_child(Some(&list));
         popover.set_child(Some(&scroller));
 
-        let completion = ComposerEmojiCompletion {
+        let completion = ComposerCompletion {
             popover: popover.clone(),
             list: list.clone(),
             entries: Vec::new(),
             token: None,
         };
-        match target {
-            ComposerTarget::Message => {
-                *self.imp().message_emoji_completion.borrow_mut() = Some(completion)
-            }
-            ComposerTarget::Thread => {
-                *self.imp().thread_emoji_completion.borrow_mut() = Some(completion)
-            }
-        }
+        *self.composer_completion(target).borrow_mut() = Some(completion);
 
         let weak_window = self.downgrade();
         list.connect_row_activated(move |_, _| {
             if let Some(window) = weak_window.upgrade() {
-                window.accept_composer_emoji_completion(target);
+                window.accept_composer_completion(target);
             }
         });
 
         let weak_window = self.downgrade();
         text_view.buffer().connect_changed(move |_| {
             if let Some(window) = weak_window.upgrade() {
-                window.refresh_composer_emoji_completion(target);
+                window.refresh_composer_completion(target);
             }
         });
 
@@ -3339,7 +3690,7 @@ impl ConduitWindow {
         text_view.buffer().connect_mark_set(move |_, _, mark| {
             if mark.name().as_deref() == Some("insert") {
                 if let Some(window) = weak_window.upgrade() {
-                    window.refresh_composer_emoji_completion(target);
+                    window.refresh_composer_completion(target);
                 }
             }
         });
@@ -3353,7 +3704,7 @@ impl ConduitWindow {
             glib::idle_add_local_once(move || {
                 if let Some(window) = weak_window.upgrade() {
                     if !window.composer_text_view(target).has_focus() {
-                        window.dismiss_composer_emoji_completion(target);
+                        window.dismiss_composer_completion(target);
                     }
                 }
             });
@@ -3366,32 +3717,44 @@ impl ConduitWindow {
             weak_window
                 .upgrade()
                 .map_or(glib::Propagation::Proceed, |window| {
-                    window.handle_composer_emoji_completion_key(target, key, state)
+                    window.handle_composer_completion_key(target, key, state)
                 })
         });
         text_view.add_controller(controller);
     }
 
-    fn refresh_composer_emoji_completion(&self, target: ComposerTarget) {
+    fn refresh_composer_completion(&self, target: ComposerTarget) {
         let text_view = self.composer_text_view(target);
         let buffer = text_view.buffer();
         let text = text_view_text(&text_view);
         let caret = buffer.cursor_position().max(0) as usize;
-        let token = emoji_token_at_caret(&text, caret);
-        let entries = token.as_ref().map_or_else(Vec::new, |token| {
-            let custom_emojis = self.imp().custom_emojis.borrow();
-            let catalog = EmojiCatalog::new(&custom_emojis);
-            EmojiPickerModel::new(catalog.entries())
-                .search(&token.query)
-                .into_iter()
-                .take(10)
-                .collect::<Vec<_>>()
+        let mention_token = mention_token_at_caret(&text, caret).filter(|token| {
+            !self.composer_range_intersects_mention(target, token.start, token.end)
         });
-
-        let mut completion_ref = match target {
-            ComposerTarget::Message => self.imp().message_emoji_completion.borrow_mut(),
-            ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow_mut(),
+        let (token, entries) = if let Some(token) = mention_token {
+            let candidates = mention_candidates(&self.imp().discovered_users.borrow());
+            let entries = search_mention_candidates(&candidates, &token.query, 10)
+                .into_iter()
+                .map(ComposerCompletionEntry::Mention)
+                .collect();
+            (Some(ComposerCompletionToken::Mention(token)), entries)
+        } else {
+            let token = emoji_token_at_caret(&text, caret);
+            let entries = token.as_ref().map_or_else(Vec::new, |token| {
+                let custom_emojis = self.imp().custom_emojis.borrow();
+                let catalog = EmojiCatalog::new(&custom_emojis);
+                EmojiPickerModel::new(catalog.entries())
+                    .search(&token.query)
+                    .into_iter()
+                    .take(10)
+                    .map(ComposerCompletionEntry::Emoji)
+                    .collect::<Vec<_>>()
+            });
+            (token.map(ComposerCompletionToken::Emoji), entries)
         };
+        let is_person_completion = matches!(token, Some(ComposerCompletionToken::Mention(_)));
+
+        let mut completion_ref = self.composer_completion(target).borrow_mut();
         let Some(completion) = completion_ref.as_mut() else {
             return;
         };
@@ -3402,32 +3765,27 @@ impl ConduitWindow {
             completion.list.remove(&child);
         }
         if completion.entries.is_empty() {
+            text_view.update_property(&[gtk::accessible::Property::Description("")]);
             completion.popover.popdown();
             return;
         }
 
+        completion
+            .list
+            .update_property(&[gtk::accessible::Property::Label(if is_person_completion {
+                "Person suggestions"
+            } else {
+                "Emoji suggestions"
+            })]);
         for entry in &completion.entries {
-            let row = gtk::ListBoxRow::new();
-            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            content.set_margin_top(6);
-            content.set_margin_bottom(6);
-            content.set_margin_start(8);
-            content.set_margin_end(8);
-            let preview = composer_emoji_preview(entry);
-            let label = gtk::Label::new(Some(&format!(":{}:  {}", entry.name, entry.label)));
-            label.set_xalign(0.0);
-            label.set_hexpand(true);
-            content.append(&preview);
-            content.append(&label);
-            row.set_child(Some(&content));
-            row.update_property(&[gtk::accessible::Property::Label(
-                &emoji_picker_accessible_label(entry),
-            )]);
-            completion.list.append(&row);
+            completion.list.append(&composer_completion_row(entry));
         }
         completion
             .list
             .select_row(completion.list.row_at_index(0).as_ref());
+        text_view.update_property(&[gtk::accessible::Property::Description(
+            &composer_completion_description(&completion.entries[0], 0, completion.entries.len()),
+        )]);
 
         let insert = buffer.iter_at_offset(buffer.cursor_position());
         completion
@@ -3436,23 +3794,23 @@ impl ConduitWindow {
         completion.popover.popup();
     }
 
-    fn dismiss_composer_emoji_completion(&self, target: ComposerTarget) {
-        let mut completion_ref = match target {
-            ComposerTarget::Message => self.imp().message_emoji_completion.borrow_mut(),
-            ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow_mut(),
-        };
+    fn dismiss_composer_completion(&self, target: ComposerTarget) {
+        let mut completion_ref = self.composer_completion(target).borrow_mut();
         if let Some(completion) = completion_ref.as_mut() {
             completion.token = None;
             completion.entries.clear();
             completion.popover.popdown();
         }
+        self.composer_text_view(target)
+            .update_property(&[gtk::accessible::Property::Description("")]);
     }
 
-    fn move_composer_emoji_selection(&self, target: ComposerTarget, movement: EmojiPickerMove) {
-        let completion_ref = match target {
-            ComposerTarget::Message => self.imp().message_emoji_completion.borrow(),
-            ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow(),
-        };
+    fn move_composer_completion_selection(
+        &self,
+        target: ComposerTarget,
+        movement: EmojiPickerMove,
+    ) {
+        let completion_ref = self.composer_completion(target).borrow();
         let Some(completion) = completion_ref.as_ref() else {
             return;
         };
@@ -3465,15 +3823,21 @@ impl ConduitWindow {
             completion
                 .list
                 .select_row(completion.list.row_at_index(next as i32).as_ref());
+            if let Some(entry) = completion.entries.get(next) {
+                self.composer_text_view(target).update_property(&[
+                    gtk::accessible::Property::Description(&composer_completion_description(
+                        entry,
+                        next,
+                        completion.entries.len(),
+                    )),
+                ]);
+            }
         }
     }
 
-    fn accept_composer_emoji_completion(&self, target: ComposerTarget) {
+    fn accept_composer_completion(&self, target: ComposerTarget) {
         let selection = {
-            let completion_ref = match target {
-                ComposerTarget::Message => self.imp().message_emoji_completion.borrow(),
-                ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow(),
-            };
+            let completion_ref = self.composer_completion(target).borrow();
             let Some(completion) = completion_ref.as_ref() else {
                 return;
             };
@@ -3487,41 +3851,80 @@ impl ConduitWindow {
             let Some(entry) = completion.entries.get(index) else {
                 return;
             };
-            (token, entry.name.clone())
+            (token, entry.clone())
         };
 
         let text_view = self.composer_text_view(target);
         let buffer = text_view.buffer();
-        let (updated, caret) =
-            replace_emoji_token(&text_view_text(&text_view), &selection.0, &selection.1);
-        let replacement = updated
-            .chars()
-            .skip(selection.0.start)
-            .take(caret.saturating_sub(selection.0.start))
-            .collect::<String>();
-        let mut start = buffer.iter_at_offset(selection.0.start as i32);
-        let mut end = buffer.iter_at_offset(selection.0.end as i32);
-        buffer.begin_user_action();
-        buffer.delete(&mut start, &mut end);
-        buffer.insert(&mut start, &replacement);
-        buffer.place_cursor(&buffer.iter_at_offset(caret as i32));
-        buffer.end_user_action();
-        record_test_composer_completion(self.imp(), target, &selection.1);
-        self.dismiss_composer_emoji_completion(target);
+        let text = text_view_text(&text_view);
+        match selection {
+            (ComposerCompletionToken::Emoji(token), ComposerCompletionEntry::Emoji(entry)) => {
+                let (updated, caret) = replace_emoji_token(&text, &token, &entry.name);
+                let replacement = updated
+                    .chars()
+                    .skip(token.start)
+                    .take(caret.saturating_sub(token.start))
+                    .collect::<String>();
+                let mut start = buffer.iter_at_offset(token.start as i32);
+                let mut end = buffer.iter_at_offset(token.end as i32);
+                buffer.begin_user_action();
+                buffer.delete(&mut start, &mut end);
+                buffer.insert(&mut start, &replacement);
+                buffer.place_cursor(&buffer.iter_at_offset(caret as i32));
+                buffer.end_user_action();
+                record_test_composer_completion(
+                    self.imp(),
+                    target,
+                    TestComposerCompletion::Emoji(&entry.name),
+                );
+            }
+            (
+                ComposerCompletionToken::Mention(token),
+                ComposerCompletionEntry::Mention(candidate),
+            ) => {
+                let insertion = replace_mention_token(&text, &token, &candidate);
+                let old_length = text.chars().count();
+                let new_length = insertion.text.chars().count();
+                let replacement_length =
+                    new_length.saturating_sub(old_length.saturating_sub(token.end - token.start));
+                let replacement = insertion
+                    .text
+                    .chars()
+                    .skip(token.start)
+                    .take(replacement_length)
+                    .collect::<String>();
+                let mut start = buffer.iter_at_offset(token.start as i32);
+                let mut end = buffer.iter_at_offset(token.end as i32);
+                buffer.begin_user_action();
+                buffer.delete(&mut start, &mut end);
+                buffer.insert(&mut start, &replacement);
+                buffer.place_cursor(&buffer.iter_at_offset(insertion.caret as i32));
+                buffer.end_user_action();
+                self.add_composer_mention(target, insertion.span);
+                let serialized = self.composer_canonical_text(target);
+                record_test_composer_completion(
+                    self.imp(),
+                    target,
+                    TestComposerCompletion::Mention {
+                        user_id: &candidate.user_id,
+                        serialized: &serialized,
+                    },
+                );
+            }
+            _ => return,
+        }
+        self.dismiss_composer_completion(target);
         text_view.grab_focus();
     }
 
-    fn handle_composer_emoji_completion_key(
+    fn handle_composer_completion_key(
         &self,
         target: ComposerTarget,
         key: gtk::gdk::Key,
         state: gtk::gdk::ModifierType,
     ) -> glib::Propagation {
         let is_open = {
-            let completion_ref = match target {
-                ComposerTarget::Message => self.imp().message_emoji_completion.borrow(),
-                ComposerTarget::Thread => self.imp().thread_emoji_completion.borrow(),
-            };
+            let completion_ref = self.composer_completion(target).borrow();
             completion_ref
                 .as_ref()
                 .is_some_and(|completion| completion.popover.is_visible())
@@ -3530,16 +3933,16 @@ impl ConduitWindow {
             return glib::Propagation::Proceed;
         }
 
-        match emoji_completion_key_action(key, state) {
-            EmojiCompletionKeyAction::Previous => {
-                self.move_composer_emoji_selection(target, EmojiPickerMove::Previous)
+        match completion_key_action(key, state) {
+            CompletionKeyAction::Previous => {
+                self.move_composer_completion_selection(target, EmojiPickerMove::Previous)
             }
-            EmojiCompletionKeyAction::Next => {
-                self.move_composer_emoji_selection(target, EmojiPickerMove::Next)
+            CompletionKeyAction::Next => {
+                self.move_composer_completion_selection(target, EmojiPickerMove::Next)
             }
-            EmojiCompletionKeyAction::Accept => self.accept_composer_emoji_completion(target),
-            EmojiCompletionKeyAction::Dismiss => self.dismiss_composer_emoji_completion(target),
-            EmojiCompletionKeyAction::Ignore => return glib::Propagation::Proceed,
+            CompletionKeyAction::Accept => self.accept_composer_completion(target),
+            CompletionKeyAction::Dismiss => self.dismiss_composer_completion(target),
+            CompletionKeyAction::Ignore => return glib::Propagation::Proceed,
         }
         glib::Propagation::Stop
     }
@@ -3615,6 +4018,9 @@ impl ConduitWindow {
                 );
                 *self.imp().discovered_users.borrow_mut() = users;
                 self.refresh_open_conversation_picker();
+                for target in COMPOSER_TARGETS {
+                    self.refresh_composer_completion(target);
+                }
             }
             RuntimeEventKind::ConversationOpened(conversation) => {
                 let channel_id = conversation.id.clone();
@@ -3963,7 +4369,7 @@ impl ConduitWindow {
                         | UiInvalidations::THREAD,
                 );
                 for target in COMPOSER_TARGETS {
-                    self.refresh_composer_emoji_completion(target);
+                    self.refresh_composer_completion(target);
                 }
             }
             RuntimeEventKind::ImageAssetLoaded { key, data_uri } => {
@@ -4569,7 +4975,10 @@ impl ConduitWindow {
             self.set_status("Select a conversation");
             return;
         };
-        let text = text_view_text(&imp.message_entry).trim().to_string();
+        let text = self
+            .composer_canonical_text(ComposerTarget::Message)
+            .trim()
+            .to_string();
         if text.is_empty() {
             return;
         }
@@ -4598,7 +5007,10 @@ impl ConduitWindow {
             self.set_status("Open a thread");
             return;
         };
-        let text = text_view_text(&imp.thread_entry).trim().to_string();
+        let text = self
+            .composer_canonical_text(ComposerTarget::Thread)
+            .trim()
+            .to_string();
         if text.is_empty() {
             return;
         }
@@ -4635,7 +5047,10 @@ impl ConduitWindow {
             self.set_status(&gettext("A file is already being uploaded here."));
             return;
         }
-        let initial_comment = text_view_text(&self.imp().message_entry).trim().to_string();
+        let initial_comment = self
+            .composer_canonical_text(ComposerTarget::Message)
+            .trim()
+            .to_string();
 
         let dialog = gtk::FileDialog::builder()
             .title("Upload File")
@@ -4735,7 +5150,12 @@ impl ConduitWindow {
             } else {
                 None
             };
-            let initial_comment = text_view_text(text_view).trim().to_string();
+            let target = if thread {
+                ComposerTarget::Thread
+            } else {
+                ComposerTarget::Message
+            };
+            let initial_comment = window.composer_canonical_text(target).trim().to_string();
             let initial_comment = (!initial_comment.is_empty()).then_some(initial_comment);
             window.read_clipboard_image_for_upload(
                 clipboard,
@@ -4934,7 +5354,7 @@ impl ConduitWindow {
     }
 
     fn render_closed_thread(&self) {
-        set_text_view_text(&self.imp().thread_entry, "");
+        self.set_composer_canonical_text(ComposerTarget::Thread, "");
         self.thread_pane().close();
     }
 
@@ -5452,8 +5872,8 @@ impl ConduitWindow {
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
         imp.custom_emojis.borrow_mut().clear();
-        set_text_view_text(&imp.message_entry, "");
-        set_text_view_text(&imp.thread_entry, "");
+        self.set_composer_canonical_text(ComposerTarget::Message, "");
+        self.set_composer_canonical_text(ComposerTarget::Thread, "");
         imp.send_button.set_sensitive(true);
         imp.thread_send_button.set_sensitive(true);
         imp.upload_button.set_sensitive(true);
@@ -5878,6 +6298,9 @@ impl ConduitWindow {
             return;
         }
 
+        for target in COMPOSER_TARGETS {
+            self.refresh_composer_mention_names(target);
+        }
         let should_render_sidebar = {
             let imp = self.imp();
             let conversations = imp.workspace.conversations.borrow().conversations();
@@ -7306,7 +7729,7 @@ impl ConduitWindow {
         imp.message_title.set_title(title);
         self.refresh_conversation_title_status(channel_id);
         self.restore_channel_draft(channel_id);
-        set_text_view_text(&imp.thread_entry, "");
+        self.set_composer_canonical_text(ComposerTarget::Thread, "");
         self.thread_pane().close();
         imp.workspace_split.set_show_content(true);
         self.render_conversations();
@@ -9076,10 +9499,18 @@ fn record_test_huddle_surface(window: &imp::ConduitWindow) {
     );
 }
 
+enum TestComposerCompletion<'a> {
+    Emoji(&'a str),
+    Mention {
+        user_id: &'a str,
+        serialized: &'a str,
+    },
+}
+
 fn record_test_composer_completion(
     window: &imp::ConduitWindow,
     target: ComposerTarget,
-    emoji_name: &str,
+    completion: TestComposerCompletion<'_>,
 ) {
     let Some(path) = std::env::var_os("CONDUIT_TEST_COMPOSER_COMPLETION_FILE") else {
         return;
@@ -9096,25 +9527,31 @@ fn record_test_composer_completion(
         ComposerTarget::Message => "message",
         ComposerTarget::Thread => "thread",
     };
-    let _ = std::fs::write(
-        path,
-        serde_json::json!({
-            "emoji": emoji_name,
-            "target": target,
-            "webkit": {
-                "allow_file_access": settings.allows_file_access_from_file_urls(),
-                "allow_universal_access": settings.allows_universal_access_from_file_urls(),
-                "html5_database": settings.enables_html5_database(),
-                "html5_local_storage": settings.enables_html5_local_storage(),
-                "javascript": settings.enables_javascript(),
-                "media": settings.enables_media(),
-                "webaudio": settings.enables_webaudio(),
-                "webgl": settings.enables_webgl(),
-                "zoom_text_only": settings.is_zoom_text_only(),
-            },
-        })
-        .to_string(),
-    );
+    let mut state = serde_json::json!({
+        "target": target,
+        "webkit": {
+            "allow_file_access": settings.allows_file_access_from_file_urls(),
+            "allow_universal_access": settings.allows_universal_access_from_file_urls(),
+            "html5_database": settings.enables_html5_database(),
+            "html5_local_storage": settings.enables_html5_local_storage(),
+            "javascript": settings.enables_javascript(),
+            "media": settings.enables_media(),
+            "webaudio": settings.enables_webaudio(),
+            "webgl": settings.enables_webgl(),
+            "zoom_text_only": settings.is_zoom_text_only(),
+        },
+    });
+    match completion {
+        TestComposerCompletion::Emoji(name) => state["emoji"] = name.into(),
+        TestComposerCompletion::Mention {
+            user_id,
+            serialized,
+        } => {
+            state["mention"] = user_id.into();
+            state["serialized"] = serialized.into();
+        }
+    }
+    let _ = std::fs::write(path, state.to_string());
 }
 
 fn huddle_device_row(label: &str, dropdown: &gtk::DropDown) -> gtk::Box {
@@ -9164,6 +9601,22 @@ fn update_huddle_device_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_completion_description_announces_person_and_position() {
+        let entry = ComposerCompletionEntry::Mention(MentionCandidate {
+            user_id: "U1".to_string(),
+            display_name: "Ada".to_string(),
+            full_name: Some("Ada Lovelace".to_string()),
+            username: Some("ada.dev".to_string()),
+            search_aliases: Vec::new(),
+        });
+
+        assert_eq!(
+            composer_completion_description(&entry, 1, 4),
+            "Person suggestion 2 of 4: Ada, Ada Lovelace, @ada.dev"
+        );
+    }
 
     #[test]
     fn navigation_history_keeps_distinct_bounded_visits() {

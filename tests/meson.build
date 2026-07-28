@@ -241,7 +241,7 @@ endif
 if not headless_tests_option.disabled() and xvfb_run.found() and xdotool.found() and \
    xclip.found() and xfwm4.found()
   test(
-    'Keyboard shortcuts and emoji completion',
+    'Keyboard shortcuts and composer completion',
     python,
     args: [
       files('run_headless.py'),

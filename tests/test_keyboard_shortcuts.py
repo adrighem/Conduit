@@ -12,6 +12,17 @@ import tempfile
 import time
 
 SWITCHER_TITLE = "Switch conversation"
+WEBKIT_SETTINGS = {
+    "allow_file_access": False,
+    "allow_universal_access": False,
+    "html5_database": False,
+    "html5_local_storage": True,
+    "javascript": True,
+    "media": True,
+    "webaudio": False,
+    "webgl": False,
+    "zoom_text_only": True,
+}
 
 
 def wait_until(predicate, timeout: float = 40.0, interval: float = 0.1):
@@ -129,18 +140,6 @@ def completion_state(path: Path, expected: dict) -> dict | None:
 
 
 def verify_emoji_completion(target: str, state_path: Path) -> None:
-    webkit_settings = {
-        "allow_file_access": False,
-        "allow_universal_access": False,
-        "html5_database": False,
-        "html5_local_storage": True,
-        "javascript": True,
-        "media": True,
-        "webaudio": False,
-        "webgl": False,
-        "zoom_text_only": True,
-    }
-
     press("ctrl+m")
     time.sleep(0.1)
 
@@ -149,7 +148,7 @@ def verify_emoji_completion(target: str, state_path: Path) -> None:
     wait_until(
         lambda: completion_state(
             state_path,
-            {"emoji": "+1", "target": target, "webkit": webkit_settings},
+            {"emoji": "+1", "target": target, "webkit": WEBKIT_SETTINGS},
         )
     )
     assert composer_text() == ":+1:"
@@ -159,7 +158,7 @@ def verify_emoji_completion(target: str, state_path: Path) -> None:
     wait_until(
         lambda: completion_state(
             state_path,
-            {"emoji": "smiley", "target": target, "webkit": webkit_settings},
+            {"emoji": "smiley", "target": target, "webkit": WEBKIT_SETTINGS},
         )
     )
     assert composer_text() == ":smiley:"
@@ -171,7 +170,7 @@ def verify_emoji_completion(target: str, state_path: Path) -> None:
     wait_until(
         lambda: completion_state(
             state_path,
-            {"emoji": "smile", "target": target, "webkit": webkit_settings},
+            {"emoji": "smile", "target": target, "webkit": WEBKIT_SETTINGS},
         )
     )
     assert composer_text() == ":smile:"
@@ -180,6 +179,73 @@ def verify_emoji_completion(target: str, state_path: Path) -> None:
     press("Escape", "Tab", "ctrl+m")
     time.sleep(0.1)
     assert composer_text() == ":sm"
+
+
+def verify_person_completion(target: str, state_path: Path) -> None:
+    press("ctrl+m")
+    time.sleep(0.1)
+
+    replace_composer_text("@gra")
+    press("Tab")
+    wait_until(
+        lambda: completion_state(
+            state_path,
+            {
+                "mention": "UGRACE",
+                "serialized": "<@UGRACE> ",
+                "target": target,
+                "webkit": WEBKIT_SETTINGS,
+            },
+        ),
+        timeout=5.0,
+    )
+    assert composer_text() == "@Grace Hopper "
+
+    press("Home", "Right", "Delete", "End")
+    type_text("@ada")
+    press("Tab")
+    wait_until(
+        lambda: completion_state(
+            state_path,
+            {
+                "mention": "UADA",
+                "serialized": "@race Hopper <@UADA> ",
+                "target": target,
+                "webkit": WEBKIT_SETTINGS,
+            },
+        ),
+        timeout=5.0,
+    )
+    assert composer_text() == "@race Hopper @Ada Lovelace "
+
+    replace_composer_text("@")
+    press("Down")
+    time.sleep(0.05)
+    press("Return")
+    wait_until(
+        lambda: completion_state(
+            state_path,
+            {
+                "mention": "UGRACE",
+                "serialized": "<@UGRACE> ",
+                "target": target,
+                "webkit": WEBKIT_SETTINGS,
+            },
+        ),
+        timeout=5.0,
+    )
+    assert composer_text() == "@Grace Hopper "
+
+    replace_composer_text("@ada")
+    press("Escape", "Tab", "ctrl+m")
+    time.sleep(0.1)
+    assert composer_text() == "@ada"
+
+
+def verify_hydrated_person_draft() -> None:
+    press("ctrl+m")
+    time.sleep(0.1)
+    assert composer_text() == "Draft @Grace Hopper"
 
 
 def stop_process(process: subprocess.Popen[str]) -> None:
@@ -224,6 +290,7 @@ def main() -> None:
             run_environment["CONDUIT_TEST_COMPOSER_COMPLETION_FILE"] = str(
                 completion_path
             )
+            run_environment["CONDUIT_TEST_COMPOSER_HYDRATION"] = "1"
             if thread_composer:
                 run_environment["CONDUIT_TEST_THREAD_COMPOSER"] = "1"
             process = subprocess.Popen(
@@ -260,7 +327,9 @@ def main() -> None:
                         )
                     assert process.poll() is None
 
+                verify_hydrated_person_draft()
                 verify_emoji_completion(target, completion_path)
+                verify_person_completion(target, completion_path)
             finally:
                 stop_process(process)
 
