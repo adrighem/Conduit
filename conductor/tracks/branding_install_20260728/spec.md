@@ -9,8 +9,8 @@ branding consistently in the GNOME application grid and the About dialog.
 
 1. Install the current Conduit application icon under the application ID at the
    standard hicolor icon locations.
-2. Install the current symbolic icon under the application ID for shell and
-   desktop integration that requests a symbolic variant.
+2. Remove known obsolete scalable, symbolic, and About-specific icon files from
+   earlier Conduit installations so they cannot override current artwork.
 3. Keep the desktop entry, application ID, GTK application icon name, and About
    dialog logo aligned with the installed icon name.
 4. Refresh relevant desktop and icon caches after a real installation while
@@ -22,8 +22,10 @@ branding consistently in the GNOME application grid and the About dialog.
 
 ## Acceptance Criteria
 
-- A clean staged Meson install contains the canonical application and symbolic
-  icons at their expected hicolor paths.
+- A clean staged Meson install contains the canonical application icons at
+  their expected hicolor paths.
+- An upgrade-style staged install removes only known obsolete Conduit icon
+  variants and preserves unrelated icon files.
 - The installed desktop file and About dialog both resolve the canonical
   application icon name.
 - Packaging metadata tests fail if branding names or install destinations drift.

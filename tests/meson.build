@@ -68,7 +68,12 @@ test(
 test(
   'Branding assets',
   gi_python,
-  args: [files('test_branding_assets.py'), meson.project_source_root()],
+  args: [
+    files('test_branding_assets.py'),
+    meson.project_source_root(),
+    get_option('prefix'),
+    get_option('datadir'),
+  ],
   suite: 'metadata',
 )
 
