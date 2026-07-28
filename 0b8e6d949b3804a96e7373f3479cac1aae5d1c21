@@ -1,0 +1,11 @@
+Task: Add a tested Slack and runtime current-user status mutation
+
+Summary: Added the users.profile:write OAuth scope, exact users.profile.set payload handling for set and clear operations, server-authoritative runtime events, and best-effort status cache persistence after Slack confirms success.
+
+Files: src/auth.rs, src/slack.rs, src/runtime.rs, src/window.rs.
+
+Rationale: Status updates are self-only and the UI must reflect Slack response state only after the mutation succeeds.
+
+Validation: cargo fmt --check; focused current_user_status tests (4 passed); default OAuth scope test (1 passed). Initial red coverage failed on the absent Slack method and runtime command/operation.
+
+Limitations: Existing OAuth installations require reauthorization for users.profile:write. Full project validation remains scheduled in this track.
