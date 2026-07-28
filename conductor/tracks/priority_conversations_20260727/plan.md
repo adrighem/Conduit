@@ -8,5 +8,5 @@
 - [x] Task: Run full sanitized validation and synchronize product documentation 591e437
 - [x] Task: Address final priority consistency review findings 16a774b
 - [x] Task: Add a DM Profile context action using the existing main-webview flow 8947521
-- [~] Task: Add person @ completion to message and thread composers
-- [ ] Task: Conductor - User Manual Verification 'Starred priority conversations' (Protocol in workflow.md)
+- [x] Task: Add person @ completion to message and thread composers 7c88040
+- [~] Task: Conductor - User Manual Verification 'Starred priority conversations' (Protocol in workflow.md)
