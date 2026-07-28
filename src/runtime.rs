@@ -186,6 +186,9 @@ pub enum RuntimeCommand {
         channel_id: String,
         starred: bool,
     },
+    SetCurrentUserStatus {
+        status: SlackUserStatus,
+    },
     UploadFile {
         channel_id: String,
         thread_ts: Option<String>,
@@ -248,6 +251,7 @@ pub enum RuntimeOperation {
     Reaction,
     Saved,
     ConversationStar,
+    UserStatus,
     FileUpload,
     SocketMode,
     Huddle,
@@ -611,6 +615,10 @@ impl RuntimeCommand {
                 channel(RuntimeOperation::ConversationStar, channel_id),
                 RuntimeTaskLane::Interactive,
             ),
+            Self::SetCurrentUserStatus { .. } => RuntimeCommandDescriptor::mutation(
+                workspace(RuntimeOperation::UserStatus),
+                RuntimeTaskLane::Interactive,
+            ),
             Self::UploadFile {
                 channel_id,
                 thread_ts,
@@ -807,6 +815,10 @@ pub enum RuntimeEventKind {
     ConversationOpened(SlackConversation),
     ConversationUpdated(SlackConversation),
     ConversationStarUpdated(SlackConversation),
+    CurrentUserStatusUpdated {
+        user_id: String,
+        status: Option<SlackUserStatus>,
+    },
     ConversationLeft {
         channel_id: String,
     },
@@ -979,6 +991,9 @@ impl RuntimeEventKind {
                 RuntimeOperation::ConversationStar,
                 RuntimeTarget::Channel(conversation.id.clone()),
             ),
+            Self::CurrentUserStatusUpdated { .. } => {
+                OperationContext::new(RuntimeOperation::UserStatus, RuntimeTarget::Workspace)
+            }
             Self::ConversationLeft { channel_id } => OperationContext::new(
                 RuntimeOperation::LeaveConversation,
                 RuntimeTarget::Channel(channel_id.clone()),
@@ -3672,6 +3687,29 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 conversation,
                 persistence_error.as_ref(),
             );
+        }
+        RuntimeCommand::SetCurrentUserStatus { status } => {
+            let user_id = context
+                .current_user_id
+                .ok_or_else(|| anyhow!("current Slack user identity is unavailable"))?
+                .to_string();
+            let api = require_slack(context.slack)?;
+            let profile = api.set_current_user_status(&status).await?;
+            let status = profile.status();
+            if let Some(store) = context.workspace_store.as_ref() {
+                if let Err(error) = store.store_user_status(&user_id, status.clone()).await {
+                    crate::debug::log(
+                        "store",
+                        &format!(
+                            "CurrentUserStatusStoreFailed category={:?}",
+                            error.category()
+                        ),
+                    );
+                }
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::CurrentUserStatusUpdated { user_id, status });
         }
         RuntimeCommand::UploadFile {
             channel_id,
@@ -8248,6 +8286,25 @@ mod tests {
                 RuntimeOperation::ConversationStar,
                 RuntimeTarget::Channel("C123".to_string()),
             )
+        );
+    }
+
+    #[test]
+    fn current_user_status_command_is_an_interactive_user_mutation() {
+        let descriptor = RuntimeCommand::SetCurrentUserStatus {
+            status: SlackUserStatus {
+                text: "Focus time".to_string(),
+                emoji: ":headphones:".to_string(),
+                expiration: 2_000_000_000,
+            },
+        }
+        .descriptor();
+
+        assert_eq!(descriptor.lane, RuntimeTaskLane::Interactive);
+        assert!(!descriptor.supersedes_previous);
+        assert_eq!(
+            descriptor.context,
+            OperationContext::new(RuntimeOperation::UserStatus, RuntimeTarget::Workspace,)
         );
     }
 

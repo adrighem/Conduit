@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use crate::auth::browser_session_cookie_header;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
-    SlackUser, SlackUserGroup, SlackUserProfile, StoredToken,
+    SlackUser, SlackUserGroup, SlackUserProfile, SlackUserStatus, StoredToken,
 };
 use crate::search::{
     SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
@@ -818,6 +818,34 @@ impl SlackApi {
                     ("include_labels", "true".to_string()),
                 ],
             )
+            .await?;
+        Ok(response.profile)
+    }
+
+    pub async fn set_current_user_status(
+        &self,
+        status: &SlackUserStatus,
+    ) -> Result<SlackUserProfile> {
+        let status_text = status.text.trim();
+        if status_text.chars().count() > 100 {
+            return Err(SlackError::validation(
+                "Slack status text must be 100 characters or fewer",
+            ));
+        }
+        let emoji_name = status.emoji_name();
+        let status_emoji = if emoji_name.is_empty() {
+            String::new()
+        } else {
+            format!(":{emoji_name}:")
+        };
+        let profile = json!({
+            "status_text": status_text,
+            "status_emoji": status_emoji,
+            "status_expiration": status.expiration.max(0),
+        })
+        .to_string();
+        let response: UserProfileResponse = self
+            .post_form("users.profile.set", &[("profile", profile)])
             .await?;
         Ok(response.profile)
     }
@@ -2461,6 +2489,144 @@ mod tests {
             form.get("message_ts").map(String::as_str),
             Some("1710000000.000100")
         );
+    }
+
+    #[test]
+    fn current_user_status_uses_users_profile_set_with_exact_profile_fields() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"profile":{"display_name":"Vincent","status_text":"Focus time","status_emoji":":headphones:","status_expiration":2000000000}}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            let form = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>();
+            (path, form)
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let profile = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.set_current_user_status(&SlackUserStatus {
+                text: " Focus time ".to_string(),
+                emoji: "headphones".to_string(),
+                expiration: 2_000_000_000,
+            }))
+            .expect("current user status should update");
+
+        let (path, form) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/users.profile.set");
+        assert_eq!(
+            form.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from(["profile".to_string()])
+        );
+        let payload: Value = serde_json::from_str(
+            form.get("profile")
+                .expect("profile JSON should be included in the form"),
+        )
+        .expect("profile form value should be JSON");
+        assert_eq!(
+            payload,
+            json!({
+                "status_text": "Focus time",
+                "status_emoji": ":headphones:",
+                "status_expiration": 2_000_000_000_i64,
+            })
+        );
+        assert_eq!(profile.display_name.as_deref(), Some("Vincent"));
+        assert_eq!(
+            profile.status(),
+            Some(SlackUserStatus {
+                text: "Focus time".to_string(),
+                emoji: ":headphones:".to_string(),
+                expiration: 2_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn clearing_current_user_status_sends_empty_text_emoji_and_zero_expiration() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"profile":{"status_text":"","status_emoji":"","status_expiration":0}}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            let form = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>();
+            (path, form)
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let profile = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.set_current_user_status(&SlackUserStatus::default()))
+            .expect("current user status should clear");
+
+        let (path, form) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/users.profile.set");
+        let payload: Value = serde_json::from_str(
+            form.get("profile")
+                .expect("profile JSON should be included in the form"),
+        )
+        .expect("profile form value should be JSON");
+        assert_eq!(
+            payload,
+            json!({
+                "status_text": "",
+                "status_emoji": "",
+                "status_expiration": 0,
+            })
+        );
+        assert_eq!(profile.status(), None);
+    }
+
+    #[test]
+    fn current_user_status_rejects_text_longer_than_slacks_limit() {
+        let api = SlackApi::new(user_test_token());
+        let error = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.set_current_user_status(&SlackUserStatus {
+                text: "a".repeat(101),
+                ..Default::default()
+            }))
+            .expect_err("status text longer than 100 characters should be rejected");
+
+        assert_eq!(error.category(), SlackErrorCategory::Validation);
     }
 
     #[test]

@@ -4063,6 +4063,23 @@ impl ConduitWindow {
                     "Conversation unstarred"
                 }));
             }
+            RuntimeEventKind::CurrentUserStatusUpdated { user_id, status } => {
+                let cleared = status.is_none();
+                if let Some(status) = status {
+                    self.imp()
+                        .user_statuses
+                        .borrow_mut()
+                        .insert(user_id.clone(), status);
+                } else {
+                    self.imp().user_statuses.borrow_mut().remove(&user_id);
+                }
+                self.user_statuses_changed(vec![user_id]);
+                self.set_status(&gettext(if cleared {
+                    "Status cleared"
+                } else {
+                    "Status updated"
+                }));
+            }
             RuntimeEventKind::ConversationLeft { channel_id } => {
                 self.apply_conversation_left(&channel_id);
             }
