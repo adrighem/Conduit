@@ -1,0 +1,9 @@
+Task: Correct icon installation and About dialog branding
+
+Summary: Added an idempotent Meson install migration that removes five exact legacy Conduit icon paths before the hicolor cache refresh. Strengthened branding coverage with generated install-plan checks, real temporary Meson installs for direct and DESTDIR modes, absolute datadir coverage, and generated install-script ordering.
+
+Files: data/icons/cleanup-legacy-branding.py, data/icons/meson.build, tests/meson.build, tests/test_branding_assets.py.
+
+Rationale: Older installations retain a same-name scalable SVG that GNOME selects at app-grid and About-dialog sizes even after current PNGs and a fresh icon cache are installed.
+
+Validation: Branding assets test passed across direct-prefix, relative DESTDIR, absolute-datadir DESTDIR, and absolute-datadir direct-install scenarios; metadata suite passed; Meson compile passed; Python syntax and git diff checks passed.
