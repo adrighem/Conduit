@@ -1,0 +1,20 @@
+Conductor task: Add target-aware coalescing, cancellation, retry, and shutdown behavior
+
+Summary:
+- Added exact target and refresh-class coalescing without exceeding admission capacity.
+- Protected durable actions and read markers from coalescing and cancellation.
+- Added acknowledged running cancellation, retained retry admission, generation-safe completion, and deterministic delayed retry fairness.
+- Added idempotent shutdown that rejects new work, cancels ephemeral work, and drains durable work.
+
+Modified files:
+- src/sync_scheduler.rs
+
+Verification:
+- Red phase covered missing lifecycle APIs, delayed-retry fairness inheritance, and reused job-ID supersession attribution.
+- Sanitized scheduler suite passed: 41 passed.
+- Sanitized full suite passed: 771 passed, 3 ignored.
+- cargo check, cargo fmt --check, and git diff --check passed.
+- Independent lifecycle review found no remaining correctness issues.
+
+Rationale:
+The bounded scheduler needs explicit ownership handoff and deterministic lifecycle behavior before runtime tasks can rely on it.
