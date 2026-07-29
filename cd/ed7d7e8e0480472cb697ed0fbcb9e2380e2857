@@ -1,0 +1,19 @@
+Conductor task: Implement bounded pre-spawn admission with priority and starvation protection
+
+Summary:
+- Added validated total and running capacities.
+- Reserved admission before dispatch and running capacity before callers may spawn work.
+- Added owned rejections, active identity uniqueness, deterministic priority queues, and bounded fairness.
+- Added generation-scoped run tokens to reject stale or duplicate completion.
+
+Modified files:
+- src/sync_scheduler.rs
+
+Verification:
+- Red phase: 21 missing admission types, followed by a missing stale-run guard.
+- Sanitized scheduler tests passed: 17 passed.
+- Sanitized full suite passed: 740 passed, 2 ignored.
+- cargo check --no-default-features, cargo fmt --check, and git diff --check passed.
+
+Rationale:
+The scheduler must reserve finite capacity before task creation and protect accepted low-priority work from starvation without weakening interactive priority.
