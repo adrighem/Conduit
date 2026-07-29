@@ -609,6 +609,8 @@ pub struct WorkspaceStore {
     update_lock: Arc<Mutex<()>>,
     hub: Arc<tokio::sync::OnceCell<StoreHub>>,
     store_batch_revision: Arc<std::sync::Mutex<WorkspaceRevision>>,
+    recovery_generation: Arc<AtomicU64>,
+    conversation_repair_generation: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -661,6 +663,8 @@ impl WorkspaceStore {
             update_lock: Arc::new(Mutex::new(())),
             hub: Arc::new(tokio::sync::OnceCell::new()),
             store_batch_revision: Arc::new(std::sync::Mutex::new(WorkspaceRevision::INITIAL)),
+            recovery_generation: Arc::new(AtomicU64::new(0)),
+            conversation_repair_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -689,6 +693,24 @@ impl WorkspaceStore {
         &self,
         batch: StoreBatch,
     ) -> Result<StoreBatchExecution> {
+        self.execute_store_batch_inner(batch, false).await
+    }
+
+    /// Rebuilds a reset cache from the coordinator's complete current
+    /// projection. An equal revision is accepted because an intervening delta
+    /// may already have reached the newly empty cache.
+    pub(crate) async fn execute_store_repair_batch(
+        &self,
+        batch: StoreBatch,
+    ) -> Result<StoreBatchExecution> {
+        self.execute_store_batch_inner(batch, true).await
+    }
+
+    async fn execute_store_batch_inner(
+        &self,
+        batch: StoreBatch,
+        accept_equal_revision: bool,
+    ) -> Result<StoreBatchExecution> {
         let revision = batch.revision();
         let changes = batch.changes().to_vec();
         let workspace_key = self.workspace_key.clone();
@@ -700,7 +722,9 @@ impl WorkspaceStore {
                 let mut persisted_revision = store_batch_revision.lock().map_err(|_| {
                     StoreError::Other(anyhow::anyhow!("store batch revision lock poisoned"))
                 })?;
-                if revision <= *persisted_revision {
+                if revision < *persisted_revision
+                    || (!accept_equal_revision && revision == *persisted_revision)
+                {
                     return Ok(StoreBatchExecution::SkippedStale);
                 }
 
@@ -738,12 +762,14 @@ impl WorkspaceStore {
             Err(error) if error.category() == StoreErrorCategory::CorruptData => {
                 let workspace_key = self.workspace_key.clone();
                 let store_batch_revision = Arc::clone(&self.store_batch_revision);
+                let recovery_generation = Arc::clone(&self.recovery_generation);
                 hub.write(move |connection| {
                     let mut persisted_revision = store_batch_revision.lock().map_err(|_| {
                         StoreError::Other(anyhow::anyhow!("store batch revision lock poisoned"))
                     })?;
                     reset_sqlite_workspace(connection, &workspace_key)?;
                     *persisted_revision = WorkspaceRevision::INITIAL;
+                    recovery_generation.fetch_add(1, Ordering::Release);
                     Ok(())
                 })
                 .await?;
@@ -751,6 +777,19 @@ impl WorkspaceStore {
             }
             result => result,
         }
+    }
+
+    pub(crate) fn recovery_generation(&self) -> u64 {
+        self.recovery_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn conversation_cache_needs_repair(&self) -> bool {
+        self.conversation_repair_generation.load(Ordering::Acquire) < self.recovery_generation()
+    }
+
+    pub(crate) fn mark_conversation_cache_repaired(&self, recovery_generation: u64) {
+        self.conversation_repair_generation
+            .fetch_max(recovery_generation, Ordering::AcqRel);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1958,17 +1997,47 @@ impl WorkspaceStore {
 
     #[cfg(test)]
     pub(crate) async fn install_conversation_batch_failure_trigger(&self) -> Result<()> {
+        self.install_conversation_batch_failure_trigger_matching(None)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_conversation_batch_failure_trigger_for(
+        &self,
+        channel_id: &str,
+    ) -> Result<()> {
+        if channel_id.is_empty()
+            || !channel_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        {
+            return Err(StoreError::rejected_update(
+                "test failure channel id must be ASCII alphanumeric",
+            ));
+        }
+        self.install_conversation_batch_failure_trigger_matching(Some(channel_id))
+            .await
+    }
+
+    #[cfg(test)]
+    async fn install_conversation_batch_failure_trigger_matching(
+        &self,
+        channel_id: Option<&str>,
+    ) -> Result<()> {
+        let target = channel_id
+            .map(|channel_id| format!(" AND NEW.item_key = '{channel_id}'"))
+            .unwrap_or_default();
         self.hub()
             .await?
-            .write(|connection| {
-                connection.execute_batch(
+            .write(move |connection| {
+                connection.execute_batch(&format!(
                     "CREATE TEMP TRIGGER conduit_test_fail_conversation_batch
                      BEFORE INSERT ON workspace_items
-                     WHEN NEW.kind = 'conversation'
+                     WHEN NEW.kind = 'conversation'{target}
                      BEGIN
                          SELECT RAISE(ABORT, 'injected conversation batch failure');
-                     END;",
-                )?;
+                     END;"
+                ))?;
                 Ok(())
             })
             .await
@@ -1982,6 +2051,46 @@ impl WorkspaceStore {
                 connection.execute_batch(
                     "DROP TRIGGER IF EXISTS conduit_test_fail_conversation_batch;",
                 )?;
+                Ok(())
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn occupy_writer_until(
+        &self,
+        started: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Result<()> {
+        self.hub()
+            .await?
+            .write(move |_| {
+                let _ = started.send(());
+                release.recv().map_err(|_| {
+                    StoreError::Other(anyhow::anyhow!("test writer release was dropped"))
+                })?;
+                Ok(())
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn corrupt_conversation_payload(&self, channel_id: &str) -> Result<()> {
+        let workspace_key = self.workspace_key.clone();
+        let channel_id = channel_id.to_string();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE workspace_items SET payload_json = '{'
+                     WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = ?2",
+                    params![workspace_key, channel_id],
+                )?;
+                if changed == 0 {
+                    return Err(StoreError::rejected_update(
+                        "test conversation payload was not found",
+                    ));
+                }
                 Ok(())
             })
             .await
@@ -2576,6 +2685,26 @@ fn apply_store_change(
             require_store_key("conversation", &conversation.id)?;
             upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
         }
+        StoreChange::ConversationMetadataUpsert(conversation) => {
+            require_store_key("conversation", &conversation.id)?;
+            upsert_sqlite_conversation_metadata(
+                transaction,
+                workspace_key,
+                workspace_id,
+                conversation,
+                true,
+            )
+        }
+        StoreChange::ConversationMembershipUpsert(conversation) => {
+            require_store_key("conversation", &conversation.id)?;
+            upsert_sqlite_conversation_metadata(
+                transaction,
+                workspace_key,
+                workspace_id,
+                conversation,
+                false,
+            )
+        }
         StoreChange::ConversationRemoved { channel_id } => {
             require_store_key("conversation", &channel_id)?;
             Ok(transaction.execute(
@@ -2649,6 +2778,52 @@ fn sync_conversations(
     sync_sqlite_kind(transaction, workspace_key, "conversation", conversations)
 }
 
+fn upsert_sqlite_conversation_metadata(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    workspace_id: &str,
+    conversation: SlackConversation,
+    preserve_existing_star: bool,
+) -> Result<bool> {
+    let existing = load_sqlite_conversation(transaction, workspace_key, &conversation.id)?;
+    let existing_star = if preserve_existing_star {
+        existing
+            .as_ref()
+            .and_then(|conversation| conversation.is_starred)
+    } else {
+        None
+    };
+    let existing_last_read = existing
+        .as_ref()
+        .and_then(|conversation| conversation.extra.get("last_read"))
+        .cloned();
+    let existing_local_read = existing
+        .as_ref()
+        .and_then(|conversation| conversation.extra.get(LOCAL_READ_TS_KEY))
+        .cloned();
+    let mut catalog = ConversationCatalog::from_cached(existing);
+    catalog.upsert_metadata(conversation);
+    let mut conversation = catalog
+        .conversations()
+        .into_iter()
+        .next()
+        .expect("metadata upsert should produce one conversation");
+    if let Some(last_read) = existing_last_read {
+        conversation
+            .extra
+            .insert("last_read".to_string(), last_read);
+    }
+    if let Some(local_read) = existing_local_read {
+        conversation
+            .extra
+            .insert(LOCAL_READ_TS_KEY.to_string(), local_read);
+    }
+    if let Some(existing_star) = existing_star {
+        conversation.is_starred = Some(existing_star);
+    }
+    upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
+}
+
 fn sync_users(
     transaction: &Transaction<'_>,
     workspace_key: &str,
@@ -2702,13 +2877,7 @@ struct CachedUserProjections {
 
 impl CachedUserProjections {
     fn insert(&mut self, user: SlackUser) -> Result<()> {
-        let user_id = user
-            .id
-            .as_deref()
-            .map(str::trim)
-            .filter(|user_id| !user_id.is_empty())
-            .ok_or_else(|| StoreError::rejected_update("user id must not be empty"))?
-            .to_string();
+        let user_id = user_projection_id(&user)?;
         if let Some(display_name) = user.display_name() {
             self.display_names.insert(user_id.clone(), display_name);
         }
@@ -2734,6 +2903,11 @@ fn upsert_user_projection(
     workspace_key: &str,
     user: SlackUser,
 ) -> Result<bool> {
+    let user_id = user_projection_id(&user)?;
+    let clears_status = user
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.contains_status_fields() && profile.status().is_none());
     let mut projections = CachedUserProjections::default();
     projections.insert(user)?;
     let mut changed = false;
@@ -2777,7 +2951,23 @@ fn upsert_user_projection(
         changed |=
             upsert_sqlite_item(transaction, workspace_key, "user_status", &user_id, &status)?;
     }
+    if clears_status {
+        changed |= transaction.execute(
+            "DELETE FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = 'user_status' AND item_key = ?2",
+            params![workspace_key, user_id],
+        )? > 0;
+    }
     Ok(changed)
+}
+
+fn user_projection_id(user: &SlackUser) -> Result<String> {
+    user.id
+        .as_deref()
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| StoreError::rejected_update("user id must not be empty"))
 }
 
 fn sync_thread_records(
@@ -3452,6 +3642,70 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_store_repair_replaces_a_partial_current_revision() {
+        let directory = temp_cache_dir("coordinator-store-repair");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let revision = WorkspaceRevision::INITIAL.successor();
+            let partial = StoreBatch::new(
+                revision,
+                vec![StoreChange::ConversationUpsert(SlackConversation {
+                    id: "C2".into(),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(partial).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            let repair = StoreBatch::new(
+                revision,
+                vec![StoreChange::ConversationsReplaced(vec![
+                    SlackConversation {
+                        id: "C1".into(),
+                        ..Default::default()
+                    },
+                    SlackConversation {
+                        id: "C2".into(),
+                        ..Default::default()
+                    },
+                ])],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_repair_batch(repair).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+            assert_eq!(
+                store
+                    .load_conversations()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_iter()
+                    .map(|conversation| conversation.id)
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["C1".to_string(), "C2".to_string()])
+            );
+
+            let stale = StoreBatch::new(
+                revision,
+                vec![StoreChange::ConversationRemoved {
+                    channel_id: "C1".into(),
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(stale).await.unwrap(),
+                StoreBatchExecution::SkippedStale
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn coordinator_store_batch_failure_rolls_back_data_and_revision() {
         let directory = temp_cache_dir("coordinator-store-rollback");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");
@@ -3497,6 +3751,77 @@ mod tests {
             let conversations = store.load_conversations().await.unwrap().unwrap();
             assert_eq!(conversations.len(), 1);
             assert_eq!(conversations[0].name.as_deref(), Some("retry-commits"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_metadata_upsert_preserves_a_newer_legacy_read_overlay() {
+        let directory = temp_cache_dir("coordinator-metadata-read-overlay");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            let initial = StoreBatch::new(
+                first_revision,
+                vec![StoreChange::ConversationUpsert(SlackConversation {
+                    id: "C1".into(),
+                    name: Some("old-name".into()),
+                    is_starred: Some(true),
+                    unread_count: Some(7),
+                    extra: HashMap::from([
+                        ("has_unreads".into(), serde_json::json!(true)),
+                        ("last_read".into(), serde_json::json!("1.000")),
+                    ]),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            store.execute_store_batch(initial).await.unwrap();
+
+            assert!(store
+                .advance_conversation_read_cursor("C1", "20.000")
+                .await
+                .unwrap());
+
+            let stale_metadata = StoreBatch::new(
+                first_revision.successor(),
+                vec![StoreChange::ConversationMetadataUpsert(SlackConversation {
+                    id: "C1".into(),
+                    name: Some("new-name".into()),
+                    is_starred: Some(false),
+                    unread_count: Some(7),
+                    extra: HashMap::from([
+                        ("has_unreads".into(), serde_json::json!(true)),
+                        ("last_read".into(), serde_json::json!("1.000")),
+                    ]),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            store.execute_store_batch(stale_metadata).await.unwrap();
+
+            let stored = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(stored[0].name.as_deref(), Some("new-name"));
+            assert_eq!(stored[0].is_starred, Some(true));
+            assert_eq!(stored[0].last_read_ts(), Some("20.000"));
+            assert_eq!(stored[0].unread_activity_count(), 0);
+            assert!(!stored[0].has_unread_activity());
+
+            let authoritative_star = StoreBatch::new(
+                first_revision.successor().successor(),
+                vec![StoreChange::ConversationMembershipUpsert(
+                    SlackConversation {
+                        id: "C1".into(),
+                        is_starred: Some(false),
+                        ..Default::default()
+                    },
+                )],
+            )
+            .unwrap();
+            store.execute_store_batch(authoritative_star).await.unwrap();
+            let stored = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(stored[0].is_starred, Some(false));
+            assert_eq!(stored[0].last_read_ts(), Some("20.000"));
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -3568,6 +3893,74 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_user_upsert_preserves_sparse_status_and_deletes_explicit_clear() {
+        let directory = temp_cache_dir("coordinator-user-status-clear");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            let active = StoreBatch::new(
+                first_revision,
+                vec![StoreChange::UserUpsert(SlackUser {
+                    id: Some("U1".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        status_text: Some("Heads down".into()),
+                        status_emoji: Some(":construction:".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(active).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            let sparse = StoreBatch::new(
+                first_revision.successor(),
+                vec![StoreChange::UserUpsert(SlackUser {
+                    id: Some("U1".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        huddle_state_call_id: Some("R1".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(sparse).await.unwrap(),
+                StoreBatchExecution::Unchanged
+            );
+            assert_eq!(
+                store.load_user_statuses().await.unwrap()["U1"].text,
+                "Heads down"
+            );
+
+            let cleared = StoreBatch::new(
+                first_revision.successor().successor(),
+                vec![StoreChange::UserUpsert(SlackUser {
+                    id: Some("U1".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        status_text: Some(String::new()),
+                        status_emoji: Some(String::new()),
+                        status_expiration: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(cleared).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+            assert!(!store.load_user_statuses().await.unwrap().contains_key("U1"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn coordinator_store_executor_handles_every_change_variant() {
         let directory = temp_cache_dir("coordinator-all-store-changes");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");
@@ -3622,6 +4015,16 @@ mod tests {
                     StoreChange::ConversationUpsert(SlackConversation {
                         id: "C3".into(),
                         name: Some("upsert".into()),
+                        ..Default::default()
+                    }),
+                    StoreChange::ConversationMetadataUpsert(SlackConversation {
+                        id: "C3".into(),
+                        name: Some("metadata".into()),
+                        ..Default::default()
+                    }),
+                    StoreChange::ConversationMembershipUpsert(SlackConversation {
+                        id: "C3".into(),
+                        is_starred: Some(true),
                         ..Default::default()
                     }),
                     StoreChange::ConversationRemoved {
@@ -3679,6 +4082,8 @@ mod tests {
             let conversations = store.load_conversations().await.unwrap().unwrap();
             assert_eq!(conversations.len(), 1);
             assert_eq!(conversations[0].id, "C3");
+            assert_eq!(conversations[0].name.as_deref(), Some("metadata"));
+            assert_eq!(conversations[0].is_starred, Some(true));
             assert_eq!(conversations[0].unread_activity_count(), 2);
             let names = store.load_user_names().await.unwrap();
             assert_eq!(names.get("U2"), Some(&"replace-user".to_string()));

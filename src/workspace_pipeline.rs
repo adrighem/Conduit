@@ -229,6 +229,8 @@ pub(crate) enum StoreChange {
     BootstrapReplaced(WorkspaceBootstrapData),
     ConversationsReplaced(Vec<SlackConversation>),
     ConversationUpsert(SlackConversation),
+    ConversationMetadataUpsert(SlackConversation),
+    ConversationMembershipUpsert(SlackConversation),
     ConversationRemoved {
         channel_id: String,
     },
@@ -361,6 +363,16 @@ impl WorkspaceCoordinator {
 
     pub(crate) fn conversation(&self, channel_id: &str) -> Option<&SlackConversation> {
         self.conversations.get(channel_id).map(|entry| &entry.value)
+    }
+
+    pub(crate) fn conversations(&self) -> Vec<SlackConversation> {
+        let mut conversations = self
+            .conversations
+            .values()
+            .map(|entry| entry.value.clone())
+            .collect::<Vec<_>>();
+        conversations.sort_by(|left, right| left.id.cmp(&right.id));
+        conversations
     }
 
     pub(crate) fn history(&self, channel_id: &str) -> Vec<SlackMessage> {
@@ -617,7 +629,7 @@ impl WorkspaceCoordinator {
         self.commit(
             revision,
             vec![WorkspaceChange::ConversationUpsert(current.clone())],
-            vec![StoreChange::ConversationUpsert(current)],
+            vec![StoreChange::ConversationMetadataUpsert(current)],
         )
     }
 
@@ -659,7 +671,7 @@ impl WorkspaceCoordinator {
                         entry.value = merged.clone();
                         entry.metadata_revision = revision;
                         patch_changes.push(WorkspaceChange::ConversationUpsert(merged.clone()));
-                        store_changes.push(StoreChange::ConversationUpsert(merged));
+                        store_changes.push(StoreChange::ConversationMembershipUpsert(merged));
                     }
                 }
                 Some(_) => {}
@@ -674,7 +686,9 @@ impl WorkspaceCoordinator {
                         },
                     );
                     patch_changes.push(WorkspaceChange::ConversationUpsert(conversation.clone()));
-                    store_changes.push(StoreChange::ConversationUpsert(conversation.clone()));
+                    store_changes.push(StoreChange::ConversationMembershipUpsert(
+                        conversation.clone(),
+                    ));
                 }
             }
         }
