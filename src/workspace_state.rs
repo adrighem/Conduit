@@ -1115,28 +1115,25 @@ impl WorkspaceViewState {
         let visible = self.visible_channel_id() == Some(channel_id);
         let history = self.channels.entry(channel_id.to_string()).or_default();
         let channel_changed = {
-            let existing = std::mem::take(&mut history.messages);
-            let normalized = normalize_channel_messages(existing.clone());
-            let removed_misrouted_replies = normalized != existing;
-            history.messages = normalized;
-            let already_in_channel = history.messages.iter().any(|item| item.ts == message.ts);
+            let channel_cleanup_changed = clean_channel_messages_in_place(&mut history.messages);
+            let already_in_channel = contains_message_timestamp(&history.messages, &message.ts);
             let affects_channel = message.belongs_in_channel_timeline()
                 || (kind != RealtimeMessageKind::Posted && already_in_channel);
             let base_changed = if affects_channel && history.loaded {
                 apply_realtime_message_to(&mut history.messages, &message, kind)
-                    || removed_misrouted_replies
+                    || channel_cleanup_changed
             } else if affects_channel && kind == RealtimeMessageKind::Posted {
                 let changed = apply_realtime_message_to(&mut history.messages, &message, kind);
                 history.loaded = true;
                 history.loading = false;
-                changed || removed_misrouted_replies
+                changed || channel_cleanup_changed
             } else {
-                removed_misrouted_replies
+                channel_cleanup_changed
             };
             let context_changed = history
                 .context_messages
                 .as_mut()
-                .filter(|messages| messages.iter().any(|item| item.ts == message.ts))
+                .filter(|messages| contains_message_timestamp(messages, &message.ts))
                 .is_some_and(|messages| apply_realtime_message_to(messages, &message, kind));
             base_changed || context_changed
         };
@@ -1159,7 +1156,7 @@ impl WorkspaceViewState {
                 let context_changed = thread
                     .context_messages
                     .as_mut()
-                    .filter(|messages| messages.iter().any(|item| item.ts == message.ts))
+                    .filter(|messages| contains_message_timestamp(messages, &message.ts))
                     .is_some_and(|messages| apply_realtime_message_to(messages, &message, kind));
                 base_changed || context_changed
             });
@@ -1345,26 +1342,55 @@ fn merge_channel_message_refresh(
     normalize_channel_messages(snapshot.iter().chain(existing).cloned().collect::<Vec<_>>())
 }
 
+fn clean_channel_messages_in_place(messages: &mut Vec<SlackMessage>) -> bool {
+    let previous_len = messages.len();
+    messages.retain(SlackMessage::belongs_in_channel_timeline);
+    let mut changed = previous_len != messages.len();
+    if messages.windows(2).any(|pair| pair[0].ts < pair[1].ts) {
+        messages.sort_by(|left, right| right.ts.cmp(&left.ts));
+        changed = true;
+    }
+    let filtered_len = messages.len();
+    messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
+    changed || filtered_len != messages.len()
+}
+
+fn message_timestamp_range(messages: &[SlackMessage], timestamp: &str) -> (usize, usize) {
+    debug_assert!(
+        messages.windows(2).all(|pair| pair[0].ts >= pair[1].ts),
+        "workspace messages must remain newest-first"
+    );
+    let start = messages.partition_point(|message| message.ts.as_str() > timestamp);
+    let end = start + messages[start..].partition_point(|message| message.ts.as_str() == timestamp);
+    (start, end)
+}
+
+fn contains_message_timestamp(messages: &[SlackMessage], timestamp: &str) -> bool {
+    let (start, end) = message_timestamp_range(messages, timestamp);
+    start != end
+}
+
 fn apply_realtime_message_to(
     existing: &mut Vec<SlackMessage>,
     message: &SlackMessage,
     kind: RealtimeMessageKind,
 ) -> bool {
-    let current = existing.iter().find(|item| item.ts == message.ts);
-    if current == Some(message) {
+    let (start, end) = message_timestamp_range(existing, &message.ts);
+    if start != end && existing[start] == *message {
         return false;
     }
-    if current.is_none() && kind != RealtimeMessageKind::Posted {
+    if start == end && kind != RealtimeMessageKind::Posted {
         return false;
     }
 
-    let mut messages = existing
-        .iter()
-        .filter(|existing_message| existing_message.ts != message.ts)
-        .cloned()
-        .collect::<Vec<_>>();
-    messages.push(message.clone());
-    *existing = normalize_messages(messages);
+    if start == end {
+        existing.insert(start, message.clone());
+    } else {
+        existing[start] = message.clone();
+        if end > start + 1 {
+            existing.drain(start + 1..end);
+        }
+    }
     true
 }
 
@@ -2374,6 +2400,141 @@ mod tests {
         );
         assert!(activity.refresh_unreads);
         assert!(!activity.render_channel);
+    }
+
+    #[test]
+    fn realtime_posts_keep_channel_messages_in_descending_timestamp_order() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(
+            &mut state,
+            "C1",
+            vec![message("3", "three"), message("1", "one")],
+        );
+
+        for (timestamp, text) in [("2", "two"), ("5", "five"), ("0", "zero"), ("4", "four")] {
+            assert!(
+                state
+                    .apply_realtime_message(
+                        "C1",
+                        message(timestamp, text),
+                        RealtimeMessageKind::Posted,
+                    )
+                    .channel_changed
+            );
+        }
+
+        assert_eq!(
+            state
+                .channel_messages("C1")
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5", "4", "3", "2", "1", "0"]
+        );
+    }
+
+    #[test]
+    fn realtime_changes_and_deletions_replace_existing_messages_in_place() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(
+            &mut state,
+            "C1",
+            vec![
+                message("5", "five"),
+                message("3", "three"),
+                message("1", "one"),
+            ],
+        );
+
+        let changed = state.apply_realtime_message(
+            "C1",
+            message("3", "edited"),
+            RealtimeMessageKind::Changed,
+        );
+        let deleted = state.apply_realtime_message(
+            "C1",
+            message("5", "deleted"),
+            RealtimeMessageKind::Deleted,
+        );
+        let missing_change = state.apply_realtime_message(
+            "C1",
+            message("4", "missing"),
+            RealtimeMessageKind::Changed,
+        );
+        let missing_deletion = state.apply_realtime_message(
+            "C1",
+            message("0", "missing"),
+            RealtimeMessageKind::Deleted,
+        );
+
+        assert!(changed.channel_changed);
+        assert!(deleted.channel_changed);
+        assert!(!missing_change.channel_changed);
+        assert!(!missing_deletion.channel_changed);
+        assert_eq!(
+            state
+                .channel_messages("C1")
+                .iter()
+                .map(|message| (message.ts.as_str(), message.body_text()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("5", "deleted".to_string()),
+                ("3", "edited".to_string()),
+                ("1", "one".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn realtime_reply_cleans_up_a_misrouted_channel_copy() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        let root = message("1", "root");
+        apply_fresh(
+            &mut state,
+            "C1",
+            vec![message("3", "channel"), root.clone()],
+        );
+        state
+            .channels
+            .get_mut("C1")
+            .expect("channel history should exist")
+            .messages
+            .insert(1, thread_message("2", "1", "misrouted reply"));
+        state.open_thread("C1", "1");
+        state.apply_thread("C1", "1", vec![root], false, None, false);
+
+        let outcome = state.apply_realtime_message(
+            "C1",
+            thread_message("2", "1", "reply"),
+            RealtimeMessageKind::Posted,
+        );
+
+        assert!(outcome.channel_changed);
+        assert!(outcome.render_channel);
+        assert!(outcome.render_thread);
+        assert_eq!(
+            outcome.channel_scroll,
+            Some(WorkspaceScrollBehavior::Preserve)
+        );
+        assert_eq!(
+            state
+                .channel_messages("C1")
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>(),
+            vec!["3", "1"]
+        );
+        assert_eq!(
+            state
+                .current_thread_messages()
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2", "1"]
+        );
     }
 
     #[test]

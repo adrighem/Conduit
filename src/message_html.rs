@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use gettextrs::gettext;
 use serde::Serialize;
@@ -30,13 +30,13 @@ static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
-    pub user_names: HashMap<String, String>,
-    pub user_full_names: HashMap<String, String>,
-    pub user_avatar_urls: HashMap<String, String>,
+    pub user_names: Arc<HashMap<String, String>>,
+    pub user_full_names: Arc<HashMap<String, String>>,
+    pub user_avatar_urls: Arc<HashMap<String, String>>,
     pub conversation_titles: HashMap<String, String>,
-    pub user_statuses: HashMap<String, SlackUserStatus>,
-    pub user_group_names: HashMap<String, String>,
-    pub user_group_members: HashMap<String, Vec<String>>,
+    pub user_statuses: Arc<HashMap<String, SlackUserStatus>>,
+    pub user_group_names: Arc<HashMap<String, String>>,
+    pub user_group_members: Arc<HashMap<String, Vec<String>>>,
     pub current_user_id: Option<String>,
     pub thread_ts: Option<String>,
     pub load_more_url: Option<String>,
@@ -44,7 +44,7 @@ pub struct MessageHtmlContext {
     pub image_assets: HashMap<String, String>,
     pub failed_image_urls: HashSet<String>,
     pub recent_reactions: Vec<String>,
-    pub custom_emojis: HashMap<String, String>,
+    pub custom_emojis: Arc<HashMap<String, String>>,
     pub read_marker_url: Option<String>,
     pub first_unread_ts: Option<String>,
     pub timeline_generation: Option<u64>,
@@ -4594,8 +4594,11 @@ mod tests {
     fn message_groups_render_one_cached_avatar_with_an_initials_fallback() {
         let avatar_url = "https://avatars.slack-edge.com/ada.png";
         let context = MessageHtmlContext {
-            user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
-            user_avatar_urls: HashMap::from([("U123".to_string(), avatar_url.to_string())]),
+            user_names: Arc::new(HashMap::from([("U123".to_string(), "Ada".to_string())])),
+            user_avatar_urls: Arc::new(HashMap::from([(
+                "U123".to_string(),
+                avatar_url.to_string(),
+            )])),
             image_assets: HashMap::from([(
                 avatar_url.to_string(),
                 "data:image/png;base64,YXZhdGFy".to_string(),
@@ -4616,7 +4619,7 @@ mod tests {
             "C123",
             &[message("hello")],
             &MessageHtmlContext {
-                user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
+                user_names: Arc::new(HashMap::from([("U123".to_string(), "Ada".to_string())])),
                 ..Default::default()
             },
         );
@@ -4630,16 +4633,19 @@ mod tests {
     #[test]
     fn author_status_is_accessible_in_direct_group_and_channel_messages() {
         let context = MessageHtmlContext {
-            user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
-            user_full_names: HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]),
-            user_statuses: HashMap::from([(
+            user_names: Arc::new(HashMap::from([("U123".to_string(), "Ada".to_string())])),
+            user_full_names: Arc::new(HashMap::from([(
+                "U123".to_string(),
+                "Ada Lovelace".to_string(),
+            )])),
+            user_statuses: Arc::new(HashMap::from([(
                 "U123".to_string(),
                 SlackUserStatus {
                     text: "Heads <down>".to_string(),
                     emoji: ":brain:".to_string(),
                     expiration: i64::MAX,
                 },
-            )]),
+            )])),
             ..Default::default()
         };
 
@@ -4659,8 +4665,11 @@ mod tests {
     #[test]
     fn resolves_mentions_channels_and_slack_links() {
         let context = MessageHtmlContext {
-            user_names: HashMap::from([("U123".to_string(), "Ada".to_string())]),
-            user_full_names: HashMap::from([("U123".to_string(), "Ada Lovelace".to_string())]),
+            user_names: Arc::new(HashMap::from([("U123".to_string(), "Ada".to_string())])),
+            user_full_names: Arc::new(HashMap::from([(
+                "U123".to_string(),
+                "Ada Lovelace".to_string(),
+            )])),
             conversation_titles: HashMap::from([
                 ("C999".to_string(), "#general-renamed".to_string()),
                 (
@@ -4701,11 +4710,14 @@ mod tests {
     #[test]
     fn resolves_user_group_mentions_with_member_tooltips() {
         let context = MessageHtmlContext {
-            user_group_names: HashMap::from([("S123".to_string(), "platform".to_string())]),
-            user_group_members: HashMap::from([(
+            user_group_names: Arc::new(HashMap::from([(
+                "S123".to_string(),
+                "platform".to_string(),
+            )])),
+            user_group_members: Arc::new(HashMap::from([(
                 "S123".to_string(),
                 vec!["Ada Lovelace".to_string(), "Grace Hopper".to_string()],
-            )]),
+            )])),
             ..Default::default()
         };
         let html = conversation_document(
@@ -4756,13 +4768,13 @@ mod tests {
     #[test]
     fn workspace_emoji_are_shared_by_messages_quick_actions_and_picker() {
         let context = MessageHtmlContext {
-            custom_emojis: HashMap::from([
+            custom_emojis: Arc::new(HashMap::from([
                 (
                     "party_parrot".to_string(),
                     "https://emoji.example/party-parrot.gif".to_string(),
                 ),
                 ("parrot_alias".to_string(), "alias:party_parrot".to_string()),
-            ]),
+            ])),
             recent_reactions: vec!["party_parrot".to_string()],
             ..Default::default()
         };
@@ -5155,15 +5167,18 @@ mod tests {
         .unwrap();
         message.refresh_canonical_content();
         let context = MessageHtmlContext {
-            user_names: HashMap::from([("U_BOT".to_string(), "Wrong person".to_string())]),
-            user_statuses: HashMap::from([(
+            user_names: Arc::new(HashMap::from([(
+                "U_BOT".to_string(),
+                "Wrong person".to_string(),
+            )])),
+            user_statuses: Arc::new(HashMap::from([(
                 "U_BOT".to_string(),
                 SlackUserStatus {
                     text: "Online".to_string(),
                     expiration: i64::MAX,
                     ..Default::default()
                 },
-            )]),
+            )])),
             ..Default::default()
         };
 
@@ -5338,11 +5353,11 @@ mod tests {
         ]);
         let context = MessageHtmlContext {
             current_user_id: Some("U999".to_string()),
-            user_names: HashMap::from([
+            user_names: Arc::new(HashMap::from([
                 ("U999".to_string(), "Ada Lovelace".to_string()),
                 ("U456".to_string(), "Grace Hopper".to_string()),
                 ("U123".to_string(), "Linus Torvalds".to_string()),
-            ]),
+            ])),
             recent_reactions: vec![
                 "heart".to_string(),
                 "thumbsup".to_string(),
@@ -5422,11 +5437,14 @@ mod tests {
         }]);
         let context = MessageHtmlContext {
             current_user_id: Some("U999".to_string()),
-            user_names: HashMap::from([("U456".to_string(), "Grace Hopper".to_string())]),
-            custom_emojis: HashMap::from([(
+            user_names: Arc::new(HashMap::from([(
+                "U456".to_string(),
+                "Grace Hopper".to_string(),
+            )])),
+            custom_emojis: Arc::new(HashMap::from([(
                 "party_parrot".to_string(),
                 "https://example.com/party-parrot.gif".to_string(),
-            )]),
+            )])),
             ..Default::default()
         };
 
@@ -5964,7 +5982,10 @@ mod tests {
             },
         ];
         let context = MessageHtmlContext {
-            user_names: HashMap::from([("U_AUTHOR".to_string(), "Linus Torvalds".to_string())]),
+            user_names: Arc::new(HashMap::from([(
+                "U_AUTHOR".to_string(),
+                "Linus Torvalds".to_string(),
+            )])),
             conversation_titles: HashMap::from([
                 ("D123".to_string(), "Ada Lovelace".to_string()),
                 ("G123".to_string(), "Ada Lovelace, Grace Hopper".to_string()),
@@ -6082,9 +6103,7 @@ mod tests {
     #[test]
     fn message_patch_helpers_render_escaped_standalone_and_region_html() {
         let mut context = MessageHtmlContext::default();
-        context
-            .user_names
-            .insert("U123".into(), "Ada <Admin>".into());
+        Arc::make_mut(&mut context.user_names).insert("U123".into(), "Ada <Admin>".into());
         let message = message("Hello <everyone>");
 
         let inserted = insert_message_patch(
@@ -6141,6 +6160,48 @@ mod tests {
     }
 
     #[test]
+    fn cloned_render_context_shares_workspace_catalogs() {
+        let context = MessageHtmlContext {
+            user_names: Arc::new(HashMap::from([("U123".into(), "Ada".into())])),
+            user_full_names: Arc::new(HashMap::from([("U123".into(), "Ada Lovelace".into())])),
+            user_avatar_urls: Arc::new(HashMap::from([(
+                "U123".into(),
+                "https://avatars.example/ada.png".into(),
+            )])),
+            user_statuses: Arc::new(HashMap::from([("U123".into(), SlackUserStatus::default())])),
+            user_group_names: Arc::new(HashMap::from([("S123".into(), "platform".into())])),
+            user_group_members: Arc::new(HashMap::from([("S123".into(), vec!["Ada".into()])])),
+            custom_emojis: Arc::new(HashMap::from([(
+                "party_parrot".into(),
+                "https://emoji.example/party.gif".into(),
+            )])),
+            ..Default::default()
+        };
+
+        let cloned = context.clone();
+
+        assert!(Arc::ptr_eq(&context.user_names, &cloned.user_names));
+        assert!(Arc::ptr_eq(
+            &context.user_full_names,
+            &cloned.user_full_names
+        ));
+        assert!(Arc::ptr_eq(
+            &context.user_avatar_urls,
+            &cloned.user_avatar_urls
+        ));
+        assert!(Arc::ptr_eq(&context.user_statuses, &cloned.user_statuses));
+        assert!(Arc::ptr_eq(
+            &context.user_group_names,
+            &cloned.user_group_names
+        ));
+        assert!(Arc::ptr_eq(
+            &context.user_group_members,
+            &cloned.user_group_members
+        ));
+        assert!(Arc::ptr_eq(&context.custom_emojis, &cloned.custom_emojis));
+    }
+
+    #[test]
     fn conversation_snapshot_patch_replaces_messages_and_load_more_navigation() {
         let mut older = message("older");
         older.ts = "1710000000.000100".to_string();
@@ -6193,7 +6254,7 @@ mod tests {
     #[test]
     fn author_menu_and_profile_page_expose_person_actions_and_details() {
         let context = MessageHtmlContext {
-            user_names: HashMap::from([("U123".into(), "Ada".into())]),
+            user_names: Arc::new(HashMap::from([("U123".into(), "Ada".into())])),
             ..Default::default()
         };
         let html = conversation_document("C123", &[message("hello")], &context);
@@ -6223,10 +6284,10 @@ mod tests {
             ..Default::default()
         };
         let context = MessageHtmlContext {
-            custom_emojis: HashMap::from([(
+            custom_emojis: Arc::new(HashMap::from([(
                 "working".into(),
                 "https://emoji.slack-edge.com/T123/working.png".into(),
-            )]),
+            )])),
             ..Default::default()
         };
         let mut profile = profile;
@@ -6272,14 +6333,14 @@ mod tests {
             ..Default::default()
         };
         let context = MessageHtmlContext {
-            custom_emojis: HashMap::from([
+            custom_emojis: Arc::new(HashMap::from([
                 ("00".into(), "https://emoji.example/clock-minute.png".into()),
                 (
                     "calendar".into(),
                     "https://emoji.example/calendar.png".into(),
                 ),
                 ("working".into(), "https://emoji.example/working.png".into()),
-            ]),
+            ])),
             ..Default::default()
         };
 

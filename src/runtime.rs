@@ -3717,23 +3717,33 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 },
             );
             if let Some(store) = context.workspace_store.as_ref() {
-                persist_realtime_message(
-                    store,
-                    context.current_user_id,
-                    context.events,
-                    crate::socket_mode::SocketModeMessageEvent {
-                        channel_id: channel_id.clone(),
-                        message: message.clone(),
-                        kind: SocketModeMessageKind::Posted,
+                let persistence_event = crate::socket_mode::SocketModeMessageEvent {
+                    channel_id: channel_id.clone(),
+                    message: message.clone(),
+                    kind: SocketModeMessageKind::Posted,
+                };
+                publish_posted_message_before_persistence(
+                    context.events.clone(),
+                    channel_id,
+                    message,
+                    async {
+                        persist_realtime_message(
+                            store,
+                            context.current_user_id,
+                            context.events,
+                            persistence_event,
+                            None,
+                        )
+                        .await;
                     },
-                    None,
                 )
                 .await;
+            } else {
+                context.events.send_event(RuntimeEventKind::MessagePosted {
+                    channel_id,
+                    message: Box::new(message),
+                });
             }
-            context.events.send_event(RuntimeEventKind::MessagePosted {
-                channel_id,
-                message: Box::new(message),
-            });
         }
         RuntimeCommand::SetReaction {
             channel_id,
@@ -4662,6 +4672,25 @@ async fn persist_realtime_events(
             }
         }
     }
+}
+
+/// Publish Slack's authoritative response before recoverable local cache work.
+///
+/// A later sync can restore a cache write interrupted by shutdown, while delaying
+/// this event keeps the composer waiting on SQLite after Slack accepted the message.
+async fn publish_posted_message_before_persistence<F>(
+    events: RuntimeEventSender,
+    channel_id: String,
+    message: SlackMessage,
+    persistence: F,
+) where
+    F: Future<Output = ()>,
+{
+    events.send_event(RuntimeEventKind::MessagePosted {
+        channel_id,
+        message: Box::new(message),
+    });
+    persistence.await;
 }
 
 async fn persist_realtime_message(
@@ -7103,6 +7132,76 @@ mod tests {
                 events.recv().await.map(|event| event.kind),
                 Some(RuntimeEventKind::SignedOut)
             ));
+        });
+    }
+
+    #[test]
+    fn posted_message_is_visible_before_persistence_completes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let (sender, mut events) = mpsc::unbounded_channel();
+            let event_sender = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(
+                    RuntimeOperation::PostMessage,
+                    RuntimeTarget::Message {
+                        channel_id: "C1".into(),
+                        thread_ts: None,
+                    },
+                ),
+            );
+            let message = SlackMessage {
+                ts: "1.000".into(),
+                text: Some("sent".into()),
+                ..SlackMessage::default()
+            };
+            let (persistence_started, persistence_started_rx) = oneshot::channel();
+            let (release_persistence, release_persistence_rx) = oneshot::channel();
+
+            let publish = tokio::spawn(publish_posted_message_before_persistence(
+                event_sender,
+                "C1".into(),
+                message.clone(),
+                async move {
+                    let _ = persistence_started.send(());
+                    let _ = release_persistence_rx.await;
+                },
+            ));
+
+            tokio::time::timeout(Duration::from_secs(1), persistence_started_rx)
+                .await
+                .expect("persistence did not start")
+                .expect("persistence start signal was dropped");
+            assert!(
+                !publish.is_finished(),
+                "publish task completed while persistence was blocked"
+            );
+
+            let event = events
+                .try_recv()
+                .expect("message event should be queued before persistence completes");
+            let RuntimeEventKind::MessagePosted {
+                channel_id,
+                message: posted,
+            } = event.kind
+            else {
+                panic!("expected posted message event");
+            };
+            assert_eq!(channel_id, "C1");
+            assert_eq!(*posted, message);
+
+            release_persistence
+                .send(())
+                .expect("persistence task should still be waiting");
+            publish.await.expect("publish task failed");
         });
     }
 

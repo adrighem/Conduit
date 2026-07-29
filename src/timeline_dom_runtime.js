@@ -391,9 +391,10 @@
 
   function withPreservedScroll(mutate) {
     const root = timelineRoot();
-    const arrivalVisible = isNearBottom();
-    const wasAtBottom = viewportPinnedToBottom || isNearBottom();
-    const anchor = visibleAnchor();
+    const nearBottom = isNearBottom();
+    const arrivalVisible = nearBottom;
+    const wasAtBottom = viewportPinnedToBottom || nearBottom;
+    const anchor = wasAtBottom ? null : visibleAnchor();
     const anchorTs = anchor ? anchor.dataset.messageTs : null;
     const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
     const oldScrollTop = root.scrollTop;

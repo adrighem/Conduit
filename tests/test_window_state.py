@@ -15,6 +15,7 @@ APP_ID = "eu.vanadrighem.conduit"
 APPLICATION_PATH = "/eu/vanadrighem/conduit"
 EXPECTED_SIZE = (920, 640)
 SIZE_TOLERANCE = 4
+SWITCHER_TITLE = "Switch conversation"
 
 
 def wait_until(predicate, timeout: float = 15.0, interval: float = 0.1):
@@ -42,6 +43,41 @@ def wait_for_window(process: subprocess.Popen[str]) -> str:
         return next(iter(result.stdout.splitlines()), None)
 
     return wait_until(find_window)
+
+
+def visible_window_ids(name: str) -> list[str]:
+    result = subprocess.run(
+        ["xdotool", "search", "--onlyvisible", "--name", f"^{name}$"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.splitlines() if result.returncode == 0 else []
+
+
+def focus_window(window_id: str, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        active = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            capture_output=True,
+            text=True,
+        )
+        if active.returncode == 0 and active.stdout.strip() == window_id:
+            return
+        try:
+            activation = subprocess.run(
+                ["xdotool", "windowactivate", "--sync", window_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            activation = None
+        if activation is not None and activation.returncode != 0:
+            time.sleep(0.1)
+            continue
+        time.sleep(0.1)
+    raise AssertionError(f"window {window_id} did not become activatable")
 
 
 def window_size(window_id: str) -> tuple[int, int]:
@@ -87,9 +123,7 @@ def wait_for_size(
 
 
 def resize_window(window_id: str, expected: tuple[int, int]) -> None:
-    subprocess.run(
-        ["xdotool", "windowactivate", "--sync", window_id], check=True
-    )
+    focus_window(window_id)
     subprocess.run(
         ["xdotool", "windowsize", "--sync", window_id, *map(str, expected)],
         check=True,
@@ -110,6 +144,7 @@ def window_is_maximized(window_id: str) -> bool:
 
 
 def toggle_maximized(window_id: str) -> None:
+    focus_window(window_id)
     width, _ = window_size(window_id)
     subprocess.run(
         [
@@ -130,16 +165,23 @@ def toggle_maximized(window_id: str) -> None:
     )
 
 
-def verify_header_bar_interactive(window_id: str) -> None:
+def press(window_id: str, key: str) -> None:
+    focus_window(window_id)
     subprocess.run(
-        ["xdotool", "windowactivate", "--sync", window_id],
+        ["xdotool", "key", "--clearmodifiers", key],
         check=True,
     )
-    toggle_maximized(window_id)
-    wait_until(lambda: window_is_maximized(window_id))
-    time.sleep(0.75)
-    toggle_maximized(window_id)
-    wait_until(lambda: not window_is_maximized(window_id))
+
+
+def verify_initial_sync_interactive(window_id: str) -> None:
+    # A single accelerator avoids the timing sensitivity of synthesized
+    # double-clicks while still proving that GTK is servicing input during sync.
+    press(window_id, "ctrl+k")
+    switcher_id = wait_until(
+        lambda: next(iter(visible_window_ids(SWITCHER_TITLE)), None)
+    )
+    press(switcher_id, "Escape")
+    wait_until(lambda: not visible_window_ids(SWITCHER_TITLE))
 
 
 def quit_application(environment: dict[str, str]) -> None:
@@ -229,7 +271,7 @@ def main() -> None:
         try:
             environment["CONDUIT_TEST_INITIAL_SYNC"] = "1"
             process, window_id = run_application(binary, environment)
-            verify_header_bar_interactive(window_id)
+            verify_initial_sync_interactive(window_id)
             stop_application(process, environment)
             process = None
             environment.pop("CONDUIT_TEST_INITIAL_SYNC")
@@ -241,9 +283,7 @@ def main() -> None:
 
             process, window_id = run_application(binary, environment)
             wait_for_size(window_id, EXPECTED_SIZE)
-            subprocess.run(
-                ["xdotool", "windowactivate", "--sync", window_id], check=True
-            )
+            focus_window(window_id)
             toggle_maximized(window_id)
             wait_until(lambda: window_is_maximized(window_id))
             stop_application(process, environment)

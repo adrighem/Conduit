@@ -22,7 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -322,14 +322,14 @@ mod imp {
         pub(super) sidebar_section_actions: RefCell<HashMap<i32, SidebarSectionKind>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
-        pub user_names: RefCell<HashMap<String, String>>,
-        pub user_full_names: RefCell<HashMap<String, String>>,
-        pub user_avatar_urls: RefCell<HashMap<String, String>>,
+        pub user_names: RefCell<Arc<HashMap<String, String>>>,
+        pub user_full_names: RefCell<Arc<HashMap<String, String>>>,
+        pub user_avatar_urls: RefCell<Arc<HashMap<String, String>>>,
         pub user_search_aliases: RefCell<sidebar::UserSearchAliases>,
-        pub user_statuses: RefCell<sidebar::UserStatuses>,
+        pub user_statuses: RefCell<Arc<sidebar::UserStatuses>>,
         pub status_expiry_generation: Cell<u64>,
-        pub user_group_names: RefCell<HashMap<String, String>>,
-        pub user_group_members: RefCell<HashMap<String, Vec<String>>>,
+        pub user_group_names: RefCell<Arc<HashMap<String, String>>>,
+        pub user_group_members: RefCell<Arc<HashMap<String, Vec<String>>>>,
         pub pending_user_ids: RefCell<HashSet<String>>,
         pub pending_profile_user_id: RefCell<Option<String>>,
         pub workspace_id: RefCell<Option<String>>,
@@ -351,6 +351,7 @@ mod imp {
         pub(super) notified_huddle_call_id: RefCell<Option<String>>,
         pub drafts: RefCell<Drafts>,
         pub draft_save_generation: Cell<u64>,
+        pub draft_persist_pending: Cell<bool>,
         pub pending_sent_drafts: RefCell<HashMap<DraftKey, String>>,
         pub pending_upload_drafts: RefCell<HashMap<DraftKey, Option<String>>>,
         pub sidebar_error: RefCell<Option<String>>,
@@ -362,7 +363,7 @@ mod imp {
         pub image_assets: RefCell<HashMap<String, String>>,
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
-        pub custom_emojis: RefCell<HashMap<String, String>>,
+        pub custom_emojis: RefCell<Arc<HashMap<String, String>>>,
         pub realtime_status: Cell<RealtimeStatus>,
         pub(super) message_composer_completion: RefCell<Option<ComposerCompletion>>,
         pub(super) thread_composer_completion: RefCell<Option<ComposerCompletion>>,
@@ -471,7 +472,7 @@ mod imp {
                 );
                 *self.discovered_users.borrow_mut() = test_users;
                 if status_test && std::env::var_os("CONDUIT_TEST_STATUS_PRESET").is_some() {
-                    self.user_statuses.borrow_mut().insert(
+                    Arc::make_mut(&mut self.user_statuses.borrow_mut()).insert(
                         "UTEST".to_string(),
                         SlackUserStatus {
                             text: "Working remotely".to_string(),
@@ -511,7 +512,7 @@ mod imp {
                     } else {
                         ComposerTarget::Message
                     };
-                    obj.imp().user_names.borrow_mut().remove("UGRACE");
+                    Arc::make_mut(&mut obj.imp().user_names.borrow_mut()).remove("UGRACE");
                     obj.set_composer_canonical_text(target, "Draft <@UGRACE>");
                     obj.populate_user_names(HashMap::from([(
                         "UGRACE".to_string(),
@@ -1480,6 +1481,10 @@ fn submitted_draft_matches(
     current_text
         .or(stored_text)
         .is_some_and(|text| text.trim() == submitted)
+}
+
+fn draft_persist_required(drafts_changed: bool, persist_pending: bool) -> bool {
+    drafts_changed || persist_pending
 }
 
 fn posted_message_thread_ts(
@@ -3972,27 +3977,31 @@ impl ConduitWindow {
     }
 
     fn save_current_drafts(&self) {
+        let changed = self.update_current_drafts();
+        if draft_persist_required(changed, self.imp().draft_persist_pending.get()) {
+            self.persist_drafts();
+        }
+    }
+
+    fn update_current_drafts(&self) -> bool {
         let Some(channel_id) = self.visible_channel_id() else {
-            return;
+            return false;
         };
         let Some(channel_key) = self.draft_key(&channel_id, None) else {
-            return;
+            return false;
         };
         let thread_key = self
             .selected_thread_ts()
             .and_then(|thread_ts| self.draft_key(&channel_id, Some(&thread_ts)));
         let message_text = self.composer_canonical_text(ComposerTarget::Message);
         let thread_text = self.composer_canonical_text(ComposerTarget::Thread);
-        let changed = {
+        {
             let mut drafts = self.imp().drafts.borrow_mut();
             let mut changed = drafts.upsert(channel_key, &message_text);
             if let Some(thread_key) = thread_key {
                 changed |= drafts.upsert(thread_key, &thread_text);
             }
             changed
-        };
-        if changed {
-            self.persist_drafts();
         }
     }
 
@@ -4001,8 +4010,23 @@ impl ConduitWindow {
             return;
         };
         if let Err(error) = DraftSettings::new(settings).save(&self.imp().drafts.borrow()) {
+            self.imp().draft_persist_pending.set(true);
             crate::debug::log("drafts", &format!("failed to persist drafts: {error}"));
+            return;
         }
+        self.imp().draft_persist_pending.set(false);
+    }
+
+    fn schedule_draft_persist(&self) {
+        self.imp().draft_persist_pending.set(true);
+        let weak_window = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(window) = weak_window.upgrade() {
+                if window.imp().draft_persist_pending.get() {
+                    window.persist_drafts();
+                }
+            }
+        });
     }
 
     fn restore_channel_draft(&self, channel_id: &str) {
@@ -4082,7 +4106,7 @@ impl ConduitWindow {
 
         let stored_matches = stored_text.is_some_and(|text| text.trim() == submitted);
         if stored_matches && self.imp().drafts.borrow_mut().remove(&key) {
-            self.persist_drafts();
+            self.schedule_draft_persist();
         }
         if current_key.as_ref() == Some(&key) {
             if thread_ts.is_some() {
@@ -4128,7 +4152,7 @@ impl ConduitWindow {
         if stored_text.is_some_and(|text| text.trim() == submitted)
             && self.imp().drafts.borrow_mut().remove(&key)
         {
-            self.persist_drafts();
+            self.schedule_draft_persist();
         }
         if current_text.is_some() {
             if thread_ts.is_some() {
@@ -4845,14 +4869,13 @@ impl ConduitWindow {
             RuntimeEventKind::CurrentUserStatusUpdated { user_id, status } => {
                 self.imp().pending_status_update.borrow_mut().take();
                 let cleared = status.is_none();
+                let mut statuses = self.imp().user_statuses.borrow_mut();
                 if let Some(status) = status {
-                    self.imp()
-                        .user_statuses
-                        .borrow_mut()
-                        .insert(user_id.clone(), status);
+                    Arc::make_mut(&mut statuses).insert(user_id.clone(), status);
                 } else {
-                    self.imp().user_statuses.borrow_mut().remove(&user_id);
+                    Arc::make_mut(&mut statuses).remove(&user_id);
                 }
+                drop(statuses);
                 self.user_statuses_changed(vec![user_id]);
                 self.set_status(&gettext(if cleared {
                     "Status cleared"
@@ -5777,7 +5800,6 @@ impl ConduitWindow {
             return;
         }
 
-        self.flush_current_drafts();
         if !self.remember_submitted_draft(&channel_id, None, &text) {
             self.set_status(&gettext("A message is already being sent."));
             return;
@@ -5809,7 +5831,6 @@ impl ConduitWindow {
             return;
         }
 
-        self.flush_current_drafts();
         if !self.remember_submitted_draft(&channel_id, Some(&thread_ts), &text) {
             self.set_status(&gettext("A reply is already being sent."));
             return;
@@ -6654,15 +6675,15 @@ impl ConduitWindow {
         imp.discovered_users.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
         imp.sidebar_section_actions.borrow_mut().clear();
-        imp.user_names.borrow_mut().clear();
-        imp.user_full_names.borrow_mut().clear();
-        imp.user_avatar_urls.borrow_mut().clear();
+        *imp.user_names.borrow_mut() = Arc::default();
+        *imp.user_full_names.borrow_mut() = Arc::default();
+        *imp.user_avatar_urls.borrow_mut() = Arc::default();
         imp.user_search_aliases.borrow_mut().clear();
-        imp.user_statuses.borrow_mut().clear();
+        *imp.user_statuses.borrow_mut() = Arc::default();
         imp.status_expiry_generation
             .set(imp.status_expiry_generation.get().saturating_add(1));
-        imp.user_group_names.borrow_mut().clear();
-        imp.user_group_members.borrow_mut().clear();
+        *imp.user_group_names.borrow_mut() = Arc::default();
+        *imp.user_group_members.borrow_mut() = Arc::default();
         imp.pending_user_ids.borrow_mut().clear();
         *imp.workspace_name.borrow_mut() = None;
         *imp.workspace_url.borrow_mut() = None;
@@ -6670,7 +6691,7 @@ impl ConduitWindow {
         imp.image_assets.borrow_mut().clear();
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
-        imp.custom_emojis.borrow_mut().clear();
+        *imp.custom_emojis.borrow_mut() = Arc::default();
         self.set_composer_canonical_text(ComposerTarget::Message, "");
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
         imp.send_button.set_sensitive(true);
@@ -6706,9 +6727,7 @@ impl ConduitWindow {
         if let (Some(user_id), Some(user_name)) = (auth.user_id.as_deref(), auth.user.as_deref()) {
             let user_name = user_name.trim();
             if !user_name.is_empty() {
-                self.imp()
-                    .user_names
-                    .borrow_mut()
+                Arc::make_mut(&mut self.imp().user_names.borrow_mut())
                     .insert(user_id.to_string(), user_name.to_string());
             }
         }
@@ -6815,7 +6834,7 @@ impl ConduitWindow {
     }
 
     fn replace_custom_emojis(&self, emojis: HashMap<String, String>) {
-        *self.imp().custom_emojis.borrow_mut() = emojis;
+        *self.imp().custom_emojis.borrow_mut() = Arc::new(emojis);
         if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
             state
                 .emoji_picker
@@ -7121,6 +7140,7 @@ impl ConduitWindow {
         let changed_user_ids = {
             let imp = self.imp();
             let mut known_user_names = imp.user_names.borrow_mut();
+            let known_user_names = Arc::make_mut(&mut known_user_names);
             let mut pending_user_ids = imp.pending_user_ids.borrow_mut();
             let mut changed_user_ids = Vec::new();
 
@@ -7169,6 +7189,7 @@ impl ConduitWindow {
         }
         let changed = {
             let mut known = self.imp().user_full_names.borrow_mut();
+            let known = Arc::make_mut(&mut known);
             let mut changed = false;
             for (user_id, full_name) in names {
                 changed |= known.get(&user_id) != Some(&full_name);
@@ -7190,6 +7211,7 @@ impl ConduitWindow {
         }
         let changed = {
             let mut known = self.imp().user_avatar_urls.borrow_mut();
+            let known = Arc::make_mut(&mut known);
             urls.into_iter()
                 .filter(|(user_id, url)| !user_id.trim().is_empty() && !url.trim().is_empty())
                 .fold(false, |changed, (user_id, url)| {
@@ -7207,6 +7229,7 @@ impl ConduitWindow {
         }
         let changed = {
             let mut known = self.imp().user_statuses.borrow_mut();
+            let known = Arc::make_mut(&mut known);
             statuses
                 .into_iter()
                 .filter_map(|(user_id, status)| {
@@ -7224,12 +7247,14 @@ impl ConduitWindow {
         replace_existing: bool,
         preserve_user_ids: &HashSet<String>,
     ) {
+        let mut known = self.imp().user_statuses.borrow_mut();
         let changed = apply_user_status_snapshot(
-            &mut self.imp().user_statuses.borrow_mut(),
+            Arc::make_mut(&mut known),
             statuses,
             replace_existing,
             preserve_user_ids,
         );
+        drop(known);
         self.user_statuses_changed(changed);
     }
 
@@ -7336,6 +7361,8 @@ impl ConduitWindow {
             let imp = self.imp();
             let mut known_names = imp.user_group_names.borrow_mut();
             let mut known_members = imp.user_group_members.borrow_mut();
+            let known_names = Arc::make_mut(&mut known_names);
+            let known_members = Arc::make_mut(&mut known_members);
             let mut changed = false;
 
             for (group_id, name) in names {
@@ -9213,11 +9240,13 @@ impl ConduitWindow {
                     self.populate_user_avatar_urls(HashMap::from([(user_id.clone(), avatar_url)]));
                 }
                 if let Some(profile) = user.profile.as_ref() {
+                    let mut statuses = self.imp().user_statuses.borrow_mut();
                     let changed = apply_user_status_profile_update(
-                        &mut self.imp().user_statuses.borrow_mut(),
+                        Arc::make_mut(&mut statuses),
                         &user_id,
                         profile,
                     );
+                    drop(statuses);
                     if changed {
                         self.user_statuses_changed(vec![user_id]);
                     }
@@ -10359,7 +10388,7 @@ impl ConduitWindow {
     }
 
     fn request_user_ids(&self, ids: Vec<String>) {
-        let known_users = self.imp().user_names.borrow().clone();
+        let known_users = self.imp().user_names.borrow();
         let mut pending_user_ids = self.imp().pending_user_ids.borrow_mut();
         let missing_ids = ids
             .into_iter()
@@ -10368,6 +10397,7 @@ impl ConduitWindow {
             })
             .collect::<Vec<_>>();
         drop(pending_user_ids);
+        drop(known_users);
 
         for user_id in missing_ids {
             self.send_command(RuntimeCommand::LoadUser { user_id });
@@ -10375,11 +10405,15 @@ impl ConduitWindow {
     }
 
     fn request_image_assets<'a>(&self, messages: impl IntoIterator<Item = &'a SlackMessage>) {
-        let avatar_urls = self.imp().user_avatar_urls.borrow().clone();
+        let avatar_urls = self.imp().user_avatar_urls.borrow();
         let requests = message_image_asset_requests(messages, &avatar_urls);
+        drop(avatar_urls);
+        if requests.is_empty() {
+            return;
+        }
 
-        let known_assets = self.imp().image_assets.borrow().clone();
-        let failed_assets = self.imp().failed_image_assets.borrow().clone();
+        let known_assets = self.imp().image_assets.borrow();
+        let failed_assets = self.imp().failed_image_assets.borrow();
         let mut pending_assets = self.imp().pending_image_assets.borrow_mut();
         let missing_requests = requests
             .into_iter()
@@ -10390,6 +10424,8 @@ impl ConduitWindow {
             })
             .collect::<Vec<_>>();
         drop(pending_assets);
+        drop(failed_assets);
+        drop(known_assets);
 
         crate::debug::log(
             "ui",
@@ -10453,11 +10489,12 @@ impl ConduitWindow {
         thread_ts: Option<&str>,
         message: &SlackMessage,
     ) -> MessageHtmlContext {
-        let avatar_urls = self.imp().user_avatar_urls.borrow().clone();
+        let avatar_urls = self.imp().user_avatar_urls.borrow();
         let image_keys = message_image_asset_requests([message], &avatar_urls)
             .into_iter()
             .map(|(key, _)| key)
             .collect::<HashSet<_>>();
+        drop(avatar_urls);
         let mut context = self.message_html_context_with_image_keys(thread_ts, Some(&image_keys));
         if let Some(channel_id) = self.visible_channel_id() {
             let surface = if thread_ts.is_some() {
@@ -12368,6 +12405,13 @@ mod tests {
             posted_message_thread_ts(&context, "C123", &SlackMessage::default()).as_deref(),
             Some("parent")
         );
+    }
+
+    #[test]
+    fn pending_draft_deletion_forces_shutdown_persistence() {
+        assert!(draft_persist_required(false, true));
+        assert!(draft_persist_required(true, false));
+        assert!(!draft_persist_required(false, false));
     }
 
     #[test]
