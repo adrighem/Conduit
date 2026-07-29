@@ -176,7 +176,7 @@ pub(crate) enum WorkspaceMutation {
     ThreadCatalogChanged(Vec<ThreadRecord>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum TimelineTarget {
     Channel(String),
     Thread {
@@ -254,6 +254,11 @@ pub(crate) enum StoreChange {
     },
     UsersReplaced(Vec<SlackUser>),
     UserUpsert(SlackUser),
+    MessageDelta {
+        channel_id: String,
+        message: SlackMessage,
+        kind: MessageMutationKind,
+    },
     HistoryReplaced {
         channel_id: String,
         messages: Vec<SlackMessage>,
@@ -330,6 +335,13 @@ struct RevisionedValue<T> {
     revision: WorkspaceRevision,
 }
 
+#[derive(Debug, Clone)]
+struct MessageProjectionAuthority {
+    revision: WorkspaceRevision,
+    current_ts: String,
+    retained_targets: Vec<TimelineTarget>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct TimelineState {
     messages: HashMap<String, RevisionedValue<SlackMessage>>,
@@ -352,6 +364,25 @@ impl TimelineState {
             .values()
             .any(|entry| same_message_identity(&entry.value, message))
     }
+
+    fn identity_timestamps(&self, message: &SlackMessage) -> Vec<String> {
+        let mut timestamps = self
+            .messages
+            .iter()
+            .filter(|(_, entry)| same_message_identity(&entry.value, message))
+            .map(|(message_ts, _)| message_ts.clone())
+            .collect::<Vec<_>>();
+        timestamps.sort();
+        timestamps
+    }
+
+    fn identity_message(&self, message: &SlackMessage) -> Option<SlackMessage> {
+        self.messages
+            .values()
+            .filter(|entry| same_message_identity(&entry.value, message))
+            .map(|entry| entry.value.clone())
+            .max_by(|left, right| left.ts.cmp(&right.ts))
+    }
 }
 
 /// Pure owner of one workspace's canonical domain model and global revision.
@@ -366,6 +397,8 @@ pub(crate) struct WorkspaceCoordinator {
     users: HashMap<String, RevisionedValue<SlackUser>>,
     histories: HashMap<String, TimelineState>,
     threads: HashMap<(String, String), TimelineState>,
+    message_authority_by_ts: HashMap<(String, String), MessageProjectionAuthority>,
+    message_authority_by_client_id: HashMap<(String, String), MessageProjectionAuthority>,
     thread_catalog: Vec<ThreadRecord>,
     attention_context: WorkspaceAttentionContext,
     attention_preferences: AttentionPreferences,
@@ -596,6 +629,8 @@ impl WorkspaceCoordinator {
                 )
             })
             .collect();
+        self.message_authority_by_ts.clear();
+        self.message_authority_by_client_id.clear();
         self.thread_catalog = data.threads.clone();
         let store_changes = if origin == MutationOrigin::Cache {
             Vec::new()
@@ -996,6 +1031,70 @@ impl WorkspaceCoordinator {
         )
     }
 
+    fn message_projection_is_superseded(
+        &self,
+        target: &TimelineTarget,
+        message: &SlackMessage,
+        base_revision: WorkspaceRevision,
+    ) -> bool {
+        let channel_id = match target {
+            TimelineTarget::Channel(channel_id) => channel_id,
+            TimelineTarget::Thread { channel_id, .. } => channel_id,
+        };
+        let timestamp_key = (channel_id.clone(), message.ts.clone());
+        let client_key = message
+            .client_msg_id
+            .as_deref()
+            .filter(|client_id| !client_id.trim().is_empty())
+            .map(|client_id| (channel_id.clone(), client_id.to_string()));
+        let authority = [
+            self.message_authority_by_ts.get(&timestamp_key),
+            client_key
+                .as_ref()
+                .and_then(|key| self.message_authority_by_client_id.get(key)),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|authority| authority.revision > base_revision)
+        .max_by_key(|authority| authority.revision);
+        authority.is_some_and(|authority| {
+            authority.current_ts != message.ts || !authority.retained_targets.contains(target)
+        })
+    }
+
+    fn record_message_projection_authority(
+        &mut self,
+        channel_id: &str,
+        current: &SlackMessage,
+        identity_messages: &[SlackMessage],
+        retained_targets: Vec<TimelineTarget>,
+        revision: WorkspaceRevision,
+    ) {
+        let authority = MessageProjectionAuthority {
+            revision,
+            current_ts: current.ts.clone(),
+            retained_targets,
+        };
+        for message in identity_messages {
+            if !message.ts.trim().is_empty() {
+                self.message_authority_by_ts.insert(
+                    (channel_id.to_string(), message.ts.clone()),
+                    authority.clone(),
+                );
+            }
+            if let Some(client_id) = message
+                .client_msg_id
+                .as_deref()
+                .filter(|client_id| !client_id.trim().is_empty())
+            {
+                self.message_authority_by_client_id.insert(
+                    (channel_id.to_string(), client_id.to_string()),
+                    authority.clone(),
+                );
+            }
+        }
+    }
+
     fn apply_timeline_snapshot(
         &mut self,
         target: TimelineTarget,
@@ -1005,7 +1104,6 @@ impl WorkspaceCoordinator {
         let base_revision = snapshot.base_revision();
         let page = snapshot.into_data();
         let revision = self.next_revision();
-        let timeline = self.timeline_mut(&target);
         let incoming = page
             .messages
             .into_iter()
@@ -1013,8 +1111,12 @@ impl WorkspaceCoordinator {
                 TimelineTarget::Channel(_) => message.belongs_in_channel_timeline(),
                 TimelineTarget::Thread { thread_ts, .. } => message.belongs_to_thread(thread_ts),
             })
+            .filter(|message| {
+                !self.message_projection_is_superseded(&target, message, base_revision)
+            })
             .map(|message| (message.ts.clone(), message))
             .collect::<HashMap<_, _>>();
+        let timeline = self.timeline_mut(&target);
         let mut changes = Vec::new();
         let mut accepted_messages = Vec::new();
         for (message_ts, message) in &incoming {
@@ -1149,7 +1251,7 @@ impl WorkspaceCoordinator {
     fn apply_message(
         &mut self,
         channel_id: &str,
-        message: SlackMessage,
+        mut message: SlackMessage,
         kind: MessageMutationKind,
         origin: MutationOrigin,
         delivery_override: Option<DeliveryState>,
@@ -1165,15 +1267,98 @@ impl WorkspaceCoordinator {
         {
             return None;
         }
+        let previous_channel_message = self
+            .histories
+            .get(channel_id)
+            .and_then(|timeline| timeline.identity_message(&message));
+        let previous_thread_root_message = self
+            .threads
+            .get(&(channel_id.to_string(), message.ts.clone()))
+            .and_then(|timeline| timeline.identity_message(&message));
+        let previous_catalog_root_message = self
+            .thread_catalog
+            .iter()
+            .find(|record| record.key.channel_id == channel_id && record.key.root_ts == message.ts)
+            .and_then(|record| record.root.clone());
+        if kind == MessageMutationKind::Changed && message.thread_root_ts().is_none() {
+            preserve_missing_root_aggregates(
+                &mut message,
+                [
+                    previous_channel_message.as_ref(),
+                    previous_thread_root_message.as_ref(),
+                    previous_catalog_root_message.as_ref(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+        let previous_channel_known = previous_channel_message.is_some();
+        let mut previous_replies = self
+            .threads
+            .iter()
+            .filter_map(|((known_channel_id, thread_ts), timeline)| {
+                if known_channel_id != channel_id {
+                    return None;
+                }
+                timeline
+                    .identity_message(&message)
+                    .filter(|message| message.thread_root_ts() == Some(thread_ts.as_str()))
+                    .map(|message| (thread_ts.clone(), message))
+            })
+            .collect::<Vec<_>>();
+        previous_replies.sort_by(|left, right| left.0.cmp(&right.0));
         let mut targets = Vec::new();
         if message.belongs_in_channel_timeline() {
             targets.push(TimelineTarget::Channel(channel_id.to_string()));
         }
+        let existing_own_thread_root = self
+            .threads
+            .get(&(channel_id.to_string(), message.ts.clone()))
+            .is_some_and(|timeline| timeline.messages.contains_key(&message.ts));
+        let has_thread_root_aggregate = message.reply_count.is_some()
+            || message.latest_reply.is_some()
+            || message.reply_users.is_some();
+        let catalog_own_thread_root = self
+            .thread_catalog
+            .iter()
+            .any(|record| record.key.channel_id == channel_id && record.key.root_ts == message.ts);
         if let Some(thread_ts) = message.thread_root_ts() {
             targets.push(TimelineTarget::Thread {
                 channel_id: channel_id.to_string(),
                 thread_ts: thread_ts.to_string(),
             });
+        } else if message.thread_ts.as_deref() == Some(message.ts.as_str())
+            || existing_own_thread_root
+            || has_thread_root_aggregate
+            || catalog_own_thread_root
+        {
+            targets.push(TimelineTarget::Thread {
+                channel_id: channel_id.to_string(),
+                thread_ts: message.ts.clone(),
+            });
+        }
+        let retained_targets = targets.clone();
+        if matches!(
+            kind,
+            MessageMutationKind::Changed | MessageMutationKind::Deleted
+        ) {
+            let mut previous_targets = Vec::new();
+            let channel_target = TimelineTarget::Channel(channel_id.to_string());
+            if previous_channel_known {
+                previous_targets.push(channel_target);
+            }
+            previous_targets.extend(previous_replies.iter().map(|(thread_ts, _)| {
+                TimelineTarget::Thread {
+                    channel_id: channel_id.to_string(),
+                    thread_ts: thread_ts.clone(),
+                }
+            }));
+            previous_targets.sort();
+            for target in previous_targets {
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
         }
         if kind == MessageMutationKind::Posted
             && targets.iter().any(|target| {
@@ -1188,33 +1373,37 @@ impl WorkspaceCoordinator {
         let attention_effect =
             self.message_attention_effect(channel_id, &message, kind, origin, delivery);
 
-        let reply_root = message.thread_root_ts().map(str::to_string);
-        let reply_was_known = reply_root.as_deref().is_some_and(|thread_ts| {
-            self.threads
-                .get(&(channel_id.to_string(), thread_ts.to_string()))
-                .is_some_and(|timeline| timeline.contains_identity(&message))
-        });
         let revision = self.next_revision();
         let mut patch_changes = Vec::new();
-        let mut changed_targets = Vec::new();
         for target in targets {
             let timeline = self.timeline_mut(&target);
-            let changed = match kind {
+            let identity_timestamps = timeline.identity_timestamps(&message);
+            let belongs_in_target = message_belongs_in_target(&message, &target);
+            let message_changes = match kind {
                 MessageMutationKind::Deleted => {
-                    let already_deleted = timeline.tombstones.contains_key(&message.ts);
-                    let removed = timeline.messages.remove(&message.ts).is_some();
-                    if removed || !already_deleted {
-                        timeline.tombstones.insert(message.ts.clone(), revision);
+                    let mut timestamps = identity_timestamps;
+                    if !timestamps.contains(&message.ts) {
+                        timestamps.push(message.ts.clone());
+                        timestamps.sort();
                     }
-                    removed || !already_deleted
+                    let mut changes = Vec::new();
+                    for message_ts in timestamps {
+                        let already_deleted = timeline.tombstones.contains_key(&message_ts);
+                        let removed = timeline.messages.remove(&message_ts).is_some();
+                        if removed || !already_deleted {
+                            timeline.tombstones.insert(message_ts.clone(), revision);
+                            changes.push(MessageChange::Remove { message_ts });
+                        }
+                    }
+                    changes
                 }
-                MessageMutationKind::Posted | MessageMutationKind::Changed => {
+                MessageMutationKind::Posted => {
                     if timeline
                         .messages
                         .get(&message.ts)
                         .is_some_and(|entry| entry.value == message)
                     {
-                        false
+                        Vec::new()
                     } else {
                         timeline.messages.insert(
                             message.ts.clone(),
@@ -1224,53 +1413,113 @@ impl WorkspaceCoordinator {
                             },
                         );
                         timeline.tombstones.remove(&message.ts);
-                        true
+                        vec![MessageChange::Upsert(Box::new(message.clone()))]
                     }
                 }
+                MessageMutationKind::Changed if belongs_in_target => {
+                    if identity_timestamps.len() == 1
+                        && identity_timestamps[0] == message.ts
+                        && timeline
+                            .messages
+                            .get(&message.ts)
+                            .is_some_and(|entry| entry.value == message)
+                    {
+                        Vec::new()
+                    } else {
+                        let mut changes = Vec::new();
+                        for message_ts in identity_timestamps {
+                            if message_ts == message.ts {
+                                continue;
+                            }
+                            timeline.messages.remove(&message_ts);
+                            timeline.tombstones.insert(message_ts.clone(), revision);
+                            changes.push(MessageChange::Remove { message_ts });
+                        }
+                        timeline.messages.insert(
+                            message.ts.clone(),
+                            RevisionedValue {
+                                value: message.clone(),
+                                revision,
+                            },
+                        );
+                        timeline.tombstones.remove(&message.ts);
+                        changes.push(MessageChange::Upsert(Box::new(message.clone())));
+                        changes
+                    }
+                }
+                MessageMutationKind::Changed => {
+                    let mut changes = Vec::new();
+                    for message_ts in identity_timestamps {
+                        timeline.messages.remove(&message_ts);
+                        timeline.tombstones.insert(message_ts.clone(), revision);
+                        changes.push(MessageChange::Remove { message_ts });
+                    }
+                    changes
+                }
             };
-            if !changed {
+            if message_changes.is_empty() {
                 continue;
             }
-            let message_change = match kind {
-                MessageMutationKind::Deleted => MessageChange::Remove {
-                    message_ts: message.ts.clone(),
-                },
-                _ => MessageChange::Upsert(Box::new(message.clone())),
-            };
             patch_changes.push(WorkspaceChange::TimelineChanged {
-                target: target.clone(),
-                changes: vec![message_change],
+                target,
+                changes: message_changes,
             });
-            changed_targets.push(target);
         }
 
-        if let Some(root_ts) = reply_root {
-            if let Some(root) = self.update_channel_root_for_reply(
-                channel_id,
-                &root_ts,
-                &message,
-                kind,
-                reply_was_known,
-                revision,
-            ) {
-                let channel_target = TimelineTarget::Channel(channel_id.to_string());
+        let changed_roots = self.reconcile_channel_roots_for_message(
+            channel_id,
+            &message,
+            kind,
+            previous_channel_known,
+            &previous_replies,
+            revision,
+        );
+        for (root, thread_root_change) in changed_roots {
+            let channel_target = TimelineTarget::Channel(channel_id.to_string());
+            patch_changes.push(WorkspaceChange::TimelineChanged {
+                target: channel_target,
+                changes: vec![MessageChange::Upsert(Box::new(root.clone()))],
+            });
+            if let Some(thread_root) = thread_root_change {
                 patch_changes.push(WorkspaceChange::TimelineChanged {
-                    target: channel_target.clone(),
-                    changes: vec![MessageChange::Upsert(Box::new(root))],
+                    target: TimelineTarget::Thread {
+                        channel_id: channel_id.to_string(),
+                        thread_ts: root.ts.clone(),
+                    },
+                    changes: vec![MessageChange::Upsert(Box::new(thread_root))],
                 });
-                if !changed_targets.contains(&channel_target) {
-                    changed_targets.push(channel_target);
-                }
             }
         }
 
-        let mut store_changes = changed_targets
-            .iter()
-            .filter_map(|target| {
-                self.timeline(target)
-                    .map(|timeline| store_timeline_replacement(target, timeline.messages()))
-            })
-            .collect::<Vec<_>>();
+        if patch_changes.is_empty() {
+            return None;
+        }
+        if matches!(
+            kind,
+            MessageMutationKind::Changed | MessageMutationKind::Deleted
+        ) {
+            let mut authority_messages = vec![message.clone()];
+            authority_messages.extend(previous_channel_message);
+            authority_messages.extend(previous_thread_root_message);
+            authority_messages.extend(previous_catalog_root_message);
+            authority_messages.extend(
+                previous_replies
+                    .iter()
+                    .map(|(_, previous)| previous.clone()),
+            );
+            self.record_message_projection_authority(
+                channel_id,
+                &message,
+                &authority_messages,
+                retained_targets,
+                revision,
+            );
+        }
+        let mut store_changes = vec![StoreChange::MessageDelta {
+            channel_id: channel_id.to_string(),
+            message: message.clone(),
+            kind,
+        }];
         if kind == MessageMutationKind::Posted {
             if let Some(effect) = attention_effect.as_ref() {
                 let self_authored = effect
@@ -1495,87 +1744,172 @@ impl WorkspaceCoordinator {
         }
     }
 
-    fn update_channel_root_for_reply(
+    fn reconcile_channel_roots_for_message(
         &mut self,
         channel_id: &str,
-        root_ts: &str,
-        reply: &SlackMessage,
+        message: &SlackMessage,
         kind: MessageMutationKind,
-        reply_was_known: bool,
+        previous_channel_known: bool,
+        previous_replies: &[(String, SlackMessage)],
         revision: WorkspaceRevision,
-    ) -> Option<SlackMessage> {
-        let remaining_replies = self
-            .threads
-            .get(&(channel_id.to_string(), root_ts.to_string()))
-            .map(TimelineState::messages)
-            .unwrap_or_default();
-        let root = self
-            .histories
-            .get_mut(channel_id)?
-            .messages
-            .get_mut(root_ts)?;
-        let before = root.value.clone();
+    ) -> Vec<(SlackMessage, Option<SlackMessage>)> {
+        let incoming_root = message.thread_root_ts().map(str::to_string);
+        let mut root_timestamps = if kind == MessageMutationKind::Posted {
+            Vec::new()
+        } else {
+            previous_replies
+                .iter()
+                .map(|(root_ts, _)| root_ts.clone())
+                .collect::<Vec<_>>()
+        };
+        if let Some(root_ts) = incoming_root.as_ref() {
+            root_timestamps.push(root_ts.clone());
+        }
+        root_timestamps.sort();
+        root_timestamps.dedup();
 
-        match kind {
-            MessageMutationKind::Posted => {
-                let not_reflected = root
+        let transition_was_known = previous_channel_known || !previous_replies.is_empty();
+        let mut changed_roots = Vec::new();
+        for root_ts in root_timestamps {
+            let previous = if kind == MessageMutationKind::Posted {
+                None
+            } else {
+                previous_replies
+                    .iter()
+                    .find(|(known_root_ts, _)| known_root_ts == &root_ts)
+                    .map(|(_, message)| message)
+            };
+            let next = (kind != MessageMutationKind::Deleted
+                && incoming_root.as_deref() == Some(root_ts.as_str()))
+            .then_some(message);
+            let deletion_fallback = (kind == MessageMutationKind::Deleted
+                && previous.is_none()
+                && incoming_root.as_deref() == Some(root_ts.as_str()))
+            .then_some(message);
+            let old = previous.or(deletion_fallback);
+            if old.is_none() && next.is_none() {
+                continue;
+            }
+
+            let remaining_replies = self
+                .threads
+                .get(&(channel_id.to_string(), root_ts.clone()))
+                .map(TimelineState::messages)
+                .unwrap_or_default();
+            let latest_remaining = remaining_replies
+                .iter()
+                .filter(|reply| reply.ts != root_ts)
+                .map(|reply| reply.ts.as_str())
+                .max()
+                .map(str::to_string);
+            let Some(root) = self
+                .histories
+                .get_mut(channel_id)
+                .and_then(|timeline| timeline.messages.get_mut(&root_ts))
+            else {
+                continue;
+            };
+            let before = root.value.clone();
+
+            match (old, next) {
+                (Some(old), None) => {
+                    let removal_was_reflected = previous.is_some()
+                        || root.value.latest_reply.as_deref() == Some(old.ts.as_str());
+                    if removal_was_reflected {
+                        root.value.reply_count =
+                            Some(root.value.reply_count.unwrap_or_default().saturating_sub(1));
+                    }
+                }
+                (None, Some(_next)) => {
+                    let addition_is_new = match kind {
+                        MessageMutationKind::Posted => true,
+                        MessageMutationKind::Changed => transition_was_known,
+                        MessageMutationKind::Deleted => false,
+                    };
+                    if addition_is_new {
+                        root.value.reply_count =
+                            Some(root.value.reply_count.unwrap_or_default().saturating_add(1));
+                    }
+                }
+                (Some(_), Some(_)) | (None, None) => {}
+            }
+
+            if old.is_some_and(|old| root.value.latest_reply.as_deref() == Some(old.ts.as_str())) {
+                root.value.latest_reply.clone_from(&latest_remaining);
+            }
+            if let Some(next) = next {
+                if root
                     .value
                     .latest_reply
                     .as_deref()
-                    .is_none_or(|latest| latest < reply.ts.as_str());
-                if not_reflected {
-                    root.value.reply_count =
-                        Some(root.value.reply_count.unwrap_or_default().saturating_add(1));
-                    root.value.latest_reply = Some(reply.ts.clone());
-                }
-                if let Some(user_id) = reply.user.as_deref() {
-                    let users = root.value.reply_users.get_or_insert_with(Vec::new);
-                    if !users.iter().any(|known| known == user_id) {
-                        users.push(user_id.to_string());
-                    }
+                    .is_none_or(|latest| slack_timestamp_is_after(&next.ts, latest))
+                {
+                    root.value.latest_reply = Some(next.ts.clone());
                 }
             }
-            MessageMutationKind::Changed => {
-                if let Some(user_id) = reply.user.as_deref() {
-                    let users = root.value.reply_users.get_or_insert_with(Vec::new);
-                    if !users.iter().any(|known| known == user_id) {
-                        users.push(user_id.to_string());
-                    }
-                }
-            }
-            MessageMutationKind::Deleted => {
-                let deletion_is_reflected = reply_was_known
-                    || root.value.latest_reply.as_deref() == Some(reply.ts.as_str());
-                if deletion_is_reflected {
-                    root.value.reply_count =
-                        Some(root.value.reply_count.unwrap_or_default().saturating_sub(1));
-                }
-                if root.value.latest_reply.as_deref() == Some(reply.ts.as_str()) {
-                    root.value.latest_reply = remaining_replies
-                        .iter()
-                        .filter(|message| message.ts != root_ts)
-                        .map(|message| message.ts.as_str())
-                        .max()
-                        .map(str::to_string);
-                }
-                if let Some(user_id) = reply.user.as_deref() {
-                    let user_still_replied = remaining_replies
-                        .iter()
-                        .any(|message| message.user.as_deref() == Some(user_id));
-                    if !user_still_replied {
-                        if let Some(users) = root.value.reply_users.as_mut() {
-                            users.retain(|known| known != user_id);
-                        }
-                    }
-                }
-            }
-        }
 
-        if root.value == before {
-            return None;
+            let cached_replies = remaining_replies
+                .iter()
+                .filter(|reply| reply.thread_root_ts() == Some(root_ts.as_str()))
+                .collect::<Vec<_>>();
+            if root.value.reply_count == Some(0) {
+                root.value.reply_users = Some(Vec::new());
+            } else if root.value.reply_count == Some(cached_replies.len() as u64) {
+                let mut users = Vec::new();
+                for user_id in cached_replies
+                    .iter()
+                    .filter_map(|reply| reply.user.as_ref())
+                {
+                    if !users.iter().any(|known| known == user_id) {
+                        users.push(user_id.clone());
+                    }
+                }
+                root.value.reply_users = Some(users);
+            } else if let Some(next_user_id) = next.and_then(|next| next.user.as_deref()) {
+                let users = root.value.reply_users.get_or_insert_with(Vec::new);
+                if !users.iter().any(|known| known == next_user_id) {
+                    users.push(next_user_id.to_string());
+                }
+            }
+
+            if root.value != before {
+                root.revision = revision;
+                let updated = root.value.clone();
+                let thread_root_change = self
+                    .threads
+                    .get_mut(&(channel_id.to_string(), root_ts.clone()))
+                    .and_then(|timeline| timeline.messages.get_mut(&root_ts))
+                    .and_then(|thread_root| {
+                        let before = (
+                            thread_root.value.reply_count,
+                            thread_root.value.latest_reply.clone(),
+                            thread_root.value.reply_users.clone(),
+                        );
+                        thread_root.value.reply_count = updated.reply_count;
+                        thread_root
+                            .value
+                            .latest_reply
+                            .clone_from(&updated.latest_reply);
+                        thread_root
+                            .value
+                            .reply_users
+                            .clone_from(&updated.reply_users);
+                        if before
+                            == (
+                                thread_root.value.reply_count,
+                                thread_root.value.latest_reply.clone(),
+                                thread_root.value.reply_users.clone(),
+                            )
+                        {
+                            return None;
+                        }
+                        thread_root.revision = revision;
+                        Some(thread_root.value.clone())
+                    });
+                changed_roots.push((updated, thread_root_change));
+            }
         }
-        root.revision = revision;
-        Some(root.value.clone())
+        changed_roots
     }
 
     fn apply_thread_catalog(
@@ -1687,11 +2021,54 @@ fn store_timeline_replacement(target: &TimelineTarget, messages: Vec<SlackMessag
     }
 }
 
-fn same_message_identity(left: &SlackMessage, right: &SlackMessage) -> bool {
+fn message_belongs_in_target(message: &SlackMessage, target: &TimelineTarget) -> bool {
+    match target {
+        TimelineTarget::Channel(_) => message.belongs_in_channel_timeline(),
+        TimelineTarget::Thread { thread_ts, .. } => message.belongs_to_thread(thread_ts),
+    }
+}
+
+pub(crate) fn same_message_identity(left: &SlackMessage, right: &SlackMessage) -> bool {
     (!left.ts.trim().is_empty() && left.ts == right.ts)
         || left.client_msg_id.as_deref().is_some_and(|left_id| {
             !left_id.trim().is_empty() && right.client_msg_id.as_deref() == Some(left_id)
         })
+}
+
+fn preserve_missing_root_aggregates<'a>(
+    message: &mut SlackMessage,
+    previous: impl IntoIterator<Item = &'a SlackMessage>,
+) {
+    let previous = previous.into_iter().collect::<Vec<_>>();
+    if message.reply_count.is_none() {
+        message.reply_count = previous.iter().filter_map(|root| root.reply_count).max();
+    }
+    if message.latest_reply.is_none() {
+        message.latest_reply = previous
+            .iter()
+            .filter_map(|root| root.latest_reply.as_ref())
+            .max_by(|left, right| left.cmp(right))
+            .cloned();
+    }
+    if message.reply_users.is_none() {
+        let mut users = Vec::new();
+        for user_id in previous
+            .iter()
+            .filter_map(|root| root.reply_users.as_ref())
+            .flatten()
+        {
+            if !users.iter().any(|known| known == user_id) {
+                users.push(user_id.clone());
+            }
+        }
+        if !users.is_empty()
+            || previous
+                .iter()
+                .any(|root| root.reply_users.as_ref().is_some())
+        {
+            message.reply_users = Some(users);
+        }
+    }
 }
 
 fn merge_conversation_metadata(current: &mut SlackConversation, incoming: &SlackConversation) {
@@ -1771,6 +2148,8 @@ impl Default for WorkspaceCoordinator {
             users: HashMap::new(),
             histories: HashMap::new(),
             threads: HashMap::new(),
+            message_authority_by_ts: HashMap::new(),
+            message_authority_by_client_id: HashMap::new(),
             thread_catalog: Vec::new(),
             attention_context: WorkspaceAttentionContext::default(),
             attention_preferences: AttentionPreferences::default(),
@@ -2900,5 +3279,976 @@ mod tests {
             .is_none());
         assert_eq!(coordinator.revision(), revision);
         assert_eq!(coordinator.history("C1")[0].reply_count, Some(1));
+    }
+
+    #[test]
+    fn message_changes_emit_store_deltas_instead_of_unhydrated_replacements() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let posted = message("10.0", "posted");
+        let post = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: posted.clone(),
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(matches!(
+            post.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Posted,
+            }] if channel_id == "C1"
+                && message.ts == "10.0"
+                && message.text.as_deref() == Some("posted")
+        ));
+
+        let edited = message("10.0", "edited");
+        let edit = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: edited,
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(matches!(
+            edit.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Changed,
+            }] if channel_id == "C1"
+                && message.ts == "10.0"
+                && message.text.as_deref() == Some("edited")
+        ));
+
+        let delete = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: posted,
+                kind: MessageMutationKind::Deleted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(matches!(
+            delete.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Deleted,
+            }] if channel_id == "C1" && message.ts == "10.0"
+        ));
+    }
+
+    #[test]
+    fn timeline_snapshots_and_pages_keep_full_store_replacements() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let history = coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    WorkspaceRevision::INITIAL,
+                    MessagePage {
+                        messages: vec![message("10.0", "history")],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .unwrap();
+        assert!(matches!(
+            history.store_batch().unwrap().changes(),
+            [StoreChange::HistoryReplaced {
+                channel_id,
+                messages,
+            }] if channel_id == "C1"
+                && matches!(messages.as_slice(), [message] if message.ts == "10.0")
+        ));
+
+        let mut reply = message("11.0", "reply");
+        reply.thread_ts = Some("10.0".to_string());
+        let thread = coordinator
+            .apply(WorkspaceMutation::ThreadPage {
+                channel_id: "C1".to_string(),
+                thread_ts: "10.0".to_string(),
+                page: MessagePage {
+                    messages: vec![reply],
+                    complete: false,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            thread.store_batch().unwrap().changes(),
+            [StoreChange::ThreadReplaced {
+                channel_id,
+                thread_ts,
+                messages,
+            }] if channel_id == "C1"
+                && thread_ts == "10.0"
+                && matches!(messages.as_slice(), [message] if message.ts == "11.0")
+        ));
+    }
+
+    #[test]
+    fn reply_patches_preserve_target_order_while_store_uses_one_message_delta() {
+        let new_coordinator = || {
+            let mut coordinator = WorkspaceCoordinator::default();
+            coordinator.apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    WorkspaceRevision::INITIAL,
+                    MessagePage {
+                        messages: vec![message("10.0", "root")],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            });
+            coordinator
+        };
+
+        let mut coordinator = new_coordinator();
+        let mut reply = message("11.0", "reply");
+        reply.thread_ts = Some("10.0".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: reply,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Posted,
+            }] if channel_id == "C1" && message.ts == "11.0"
+        ));
+        assert!(matches!(
+            reduction.patch().changes(),
+            [
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Thread { thread_ts, .. },
+                    changes: thread_changes,
+                },
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel(_),
+                    changes: root_changes,
+                },
+            ] if thread_ts == "10.0"
+                && matches!(
+                    thread_changes.as_slice(),
+                    [MessageChange::Upsert(message)] if message.ts == "11.0"
+                )
+                && matches!(
+                    root_changes.as_slice(),
+                    [MessageChange::Upsert(root)]
+                        if root.ts == "10.0" && root.reply_count == Some(1)
+                )
+        ));
+
+        let mut coordinator = new_coordinator();
+        let mut broadcast = message("12.0", "broadcast");
+        broadcast.thread_ts = Some("10.0".to_string());
+        broadcast.subtype = Some("thread_broadcast".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: broadcast,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Posted,
+            }] if channel_id == "C1" && message.ts == "12.0"
+        ));
+        assert!(matches!(
+            reduction.patch().changes(),
+            [
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel(_),
+                    changes: channel_changes,
+                },
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Thread { thread_ts, .. },
+                    changes: thread_changes,
+                },
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel(_),
+                    changes: root_changes,
+                },
+            ] if thread_ts == "10.0"
+                && matches!(
+                    channel_changes.as_slice(),
+                    [MessageChange::Upsert(message)] if message.ts == "12.0"
+                )
+                && matches!(
+                    thread_changes.as_slice(),
+                    [MessageChange::Upsert(message)] if message.ts == "12.0"
+                )
+                && matches!(
+                    root_changes.as_slice(),
+                    [MessageChange::Upsert(root)]
+                        if root.ts == "10.0" && root.reply_count == Some(1)
+                )
+        ));
+    }
+
+    #[test]
+    fn changed_replies_remove_old_channel_and_thread_projections() {
+        let new_coordinator = || {
+            let mut coordinator = WorkspaceCoordinator::default();
+            coordinator.apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    WorkspaceRevision::INITIAL,
+                    MessagePage {
+                        messages: vec![
+                            message("10.0", "first root"),
+                            message("20.0", "second root"),
+                        ],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            });
+            coordinator
+        };
+
+        let mut coordinator = new_coordinator();
+        let mut broadcast = message("11.0", "broadcast");
+        broadcast.thread_ts = Some("10.0".to_string());
+        broadcast.subtype = Some("thread_broadcast".to_string());
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: broadcast.clone(),
+            kind: MessageMutationKind::Posted,
+            origin: MutationOrigin::Realtime,
+        });
+
+        let mut normal = broadcast;
+        normal.subtype = None;
+        normal.text = Some("normal".to_string());
+        let removal = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: normal.clone(),
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(!coordinator
+            .history("C1")
+            .iter()
+            .any(|message| message.ts == "11.0"));
+        assert!(matches!(
+            removal.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Changed,
+            }] if channel_id == "C1"
+                && message.ts == "11.0"
+                && message.subtype.is_none()
+        ));
+
+        let mut restored = normal;
+        restored.subtype = Some("thread_broadcast".to_string());
+        let restoration = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: restored,
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(coordinator
+            .history("C1")
+            .iter()
+            .any(|message| message.ts == "11.0"));
+        assert!(matches!(
+            restoration.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Changed,
+            }] if channel_id == "C1"
+                && message.ts == "11.0"
+                && message.subtype.as_deref() == Some("thread_broadcast")
+        ));
+
+        let mut coordinator = new_coordinator();
+        let mut reply = message("11.0", "first thread");
+        reply.thread_ts = Some("10.0".to_string());
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: reply.clone(),
+            kind: MessageMutationKind::Posted,
+            origin: MutationOrigin::Realtime,
+        });
+        reply.thread_ts = Some("20.0".to_string());
+        reply.text = Some("second thread".to_string());
+        let moved = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: reply,
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(matches!(
+            moved.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Changed,
+            }] if channel_id == "C1"
+                && message.ts == "11.0"
+                && message.thread_ts.as_deref() == Some("20.0")
+        ));
+        assert!(coordinator
+            .threads
+            .get(&("C1".to_string(), "10.0".to_string()))
+            .unwrap()
+            .messages()
+            .is_empty());
+        assert_eq!(
+            coordinator
+                .threads
+                .get(&("C1".to_string(), "20.0".to_string()))
+                .unwrap()
+                .messages()[0]
+                .text
+                .as_deref(),
+            Some("second thread")
+        );
+    }
+
+    #[test]
+    fn reply_identity_transitions_reconcile_root_aggregates() {
+        let new_coordinator = || {
+            let mut coordinator = WorkspaceCoordinator::default();
+            coordinator.apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    WorkspaceRevision::INITIAL,
+                    MessagePage {
+                        messages: vec![
+                            message("10.0", "first root"),
+                            message("20.0", "second root"),
+                        ],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            });
+            coordinator
+        };
+        let root = |coordinator: &WorkspaceCoordinator, root_ts: &str| {
+            coordinator
+                .histories
+                .get("C1")
+                .unwrap()
+                .messages
+                .get(root_ts)
+                .unwrap()
+                .value
+                .clone()
+        };
+
+        let mut coordinator = new_coordinator();
+        let mut reply = message("11.0", "reply");
+        reply.thread_ts = Some("10.0".to_string());
+        reply.client_msg_id = Some("reply-1".to_string());
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: reply.clone(),
+            kind: MessageMutationKind::Posted,
+            origin: MutationOrigin::Realtime,
+        });
+        reply.ts = "12.0".to_string();
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: reply.clone(),
+            kind: MessageMutationKind::Changed,
+            origin: MutationOrigin::Realtime,
+        });
+        assert_eq!(root(&coordinator, "10.0").reply_count, Some(1));
+        assert_eq!(
+            root(&coordinator, "10.0").latest_reply.as_deref(),
+            Some("12.0")
+        );
+
+        reply.thread_ts = Some("20.0".to_string());
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: reply.clone(),
+            kind: MessageMutationKind::Changed,
+            origin: MutationOrigin::Realtime,
+        });
+        assert_eq!(root(&coordinator, "10.0").reply_count, Some(0));
+        assert_eq!(root(&coordinator, "10.0").latest_reply, None);
+        assert_eq!(root(&coordinator, "20.0").reply_count, Some(1));
+        assert_eq!(
+            root(&coordinator, "20.0").latest_reply.as_deref(),
+            Some("12.0")
+        );
+
+        reply.thread_ts = None;
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: reply,
+            kind: MessageMutationKind::Changed,
+            origin: MutationOrigin::Realtime,
+        });
+        assert_eq!(root(&coordinator, "20.0").reply_count, Some(0));
+        assert_eq!(root(&coordinator, "20.0").latest_reply, None);
+
+        let mut coordinator = new_coordinator();
+        let mut reply = message("11.0", "reply");
+        reply.thread_ts = Some("10.0".to_string());
+        reply.client_msg_id = Some("reply-2".to_string());
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: reply.clone(),
+            kind: MessageMutationKind::Posted,
+            origin: MutationOrigin::Realtime,
+        });
+        reply.thread_ts = None;
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: reply,
+            kind: MessageMutationKind::Deleted,
+            origin: MutationOrigin::Realtime,
+        });
+        assert_eq!(root(&coordinator, "10.0").reply_count, Some(0));
+        assert_eq!(root(&coordinator, "10.0").latest_reply, None);
+    }
+
+    #[test]
+    fn older_posted_reply_increments_count_and_updates_loaded_root_copies() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut root = message("10.0", "root");
+        root.reply_count = Some(2);
+        root.latest_reply = Some("20.0".to_string());
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![root.clone()],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        coordinator.apply(WorkspaceMutation::ThreadSnapshot {
+            channel_id: "C1".to_string(),
+            thread_ts: "10.0".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                coordinator.revision(),
+                MessagePage {
+                    messages: vec![root],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+
+        let mut reply = message("15.0", "older reply");
+        reply.thread_ts = Some("10.0".to_string());
+        reply.user = Some("U1".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: reply,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        let channel_root = coordinator
+            .history("C1")
+            .into_iter()
+            .find(|message| message.ts == "10.0")
+            .unwrap();
+        let thread_root = coordinator
+            .threads
+            .get(&("C1".to_string(), "10.0".to_string()))
+            .unwrap()
+            .messages()
+            .into_iter()
+            .find(|message| message.ts == "10.0")
+            .unwrap();
+        assert_eq!(channel_root.reply_count, Some(3));
+        assert_eq!(channel_root.latest_reply.as_deref(), Some("20.0"));
+        assert_eq!(thread_root, channel_root);
+        assert!(matches!(
+            reduction.patch().changes(),
+            [
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Thread { .. },
+                    changes: reply_changes,
+                },
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel(_),
+                    changes: channel_root_changes,
+                },
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Thread { .. },
+                    changes: thread_root_changes,
+                },
+            ] if matches!(
+                    reply_changes.as_slice(),
+                    [MessageChange::Upsert(message)] if message.ts == "15.0"
+                )
+                && matches!(
+                    channel_root_changes.as_slice(),
+                    [MessageChange::Upsert(message)] if message.reply_count == Some(3)
+                )
+                && matches!(
+                    thread_root_changes.as_slice(),
+                    [MessageChange::Upsert(message)] if message.reply_count == Some(3)
+                )
+        ));
+    }
+
+    #[test]
+    fn reply_aggregate_patch_preserves_projection_specific_root_content() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut channel_root = message("10.0", "channel snapshot");
+        channel_root.reply_count = Some(0);
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![channel_root.clone()],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let mut thread_root = channel_root;
+        thread_root.text = Some("newer thread snapshot".to_string());
+        coordinator.apply(WorkspaceMutation::ThreadSnapshot {
+            channel_id: "C1".to_string(),
+            thread_ts: "10.0".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                coordinator.revision(),
+                MessagePage {
+                    messages: vec![thread_root],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+
+        let mut reply = message("11.0", "reply");
+        reply.thread_ts = Some("10.0".to_string());
+        reply.user = Some("U1".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: reply,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        let channel_root = coordinator
+            .history("C1")
+            .into_iter()
+            .find(|message| message.ts == "10.0")
+            .unwrap();
+        let thread_root = coordinator
+            .threads
+            .get(&("C1".to_string(), "10.0".to_string()))
+            .unwrap()
+            .messages()
+            .into_iter()
+            .find(|message| message.ts == "10.0")
+            .unwrap();
+        assert_eq!(channel_root.text.as_deref(), Some("channel snapshot"));
+        assert_eq!(thread_root.text.as_deref(), Some("newer thread snapshot"));
+        assert_eq!(channel_root.reply_count, thread_root.reply_count);
+        assert_eq!(channel_root.latest_reply, thread_root.latest_reply);
+        assert_eq!(channel_root.reply_users, thread_root.reply_users);
+        assert!(matches!(
+            reduction.patch().changes().last(),
+            Some(WorkspaceChange::TimelineChanged {
+                target: TimelineTarget::Thread { .. },
+                changes,
+            }) if matches!(
+                changes.as_slice(),
+                [MessageChange::Upsert(root)]
+                    if root.text.as_deref() == Some("newer thread snapshot")
+            )
+        ));
+    }
+
+    #[test]
+    fn partial_loaded_reply_delete_preserves_users_in_both_root_copies() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut channel_root = message("10.0", "channel root");
+        channel_root.reply_count = Some(3);
+        channel_root.latest_reply = Some("12.0".to_string());
+        channel_root.reply_users = Some(vec!["U1".to_string(), "U2".to_string(), "U3".to_string()]);
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![channel_root.clone()],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let mut thread_root = channel_root;
+        thread_root.text = Some("thread root".to_string());
+        let mut first_reply = message("11.0", "first");
+        first_reply.thread_ts = Some("10.0".to_string());
+        first_reply.user = Some("U1".to_string());
+        let mut second_reply = message("12.0", "second");
+        second_reply.thread_ts = Some("10.0".to_string());
+        second_reply.user = Some("U2".to_string());
+        coordinator.apply(WorkspaceMutation::ThreadSnapshot {
+            channel_id: "C1".to_string(),
+            thread_ts: "10.0".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                coordinator.revision(),
+                MessagePage {
+                    messages: vec![thread_root, first_reply.clone(), second_reply],
+                    complete: false,
+                    ..Default::default()
+                },
+            ),
+        });
+
+        coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: first_reply,
+                kind: MessageMutationKind::Deleted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        let channel_root = coordinator
+            .history("C1")
+            .into_iter()
+            .find(|message| message.ts == "10.0")
+            .unwrap();
+        let thread_root = coordinator
+            .threads
+            .get(&("C1".to_string(), "10.0".to_string()))
+            .unwrap()
+            .messages()
+            .into_iter()
+            .find(|message| message.ts == "10.0")
+            .unwrap();
+        assert_eq!(channel_root.reply_count, Some(2));
+        assert_eq!(channel_root.latest_reply.as_deref(), Some("12.0"));
+        assert_eq!(
+            channel_root.reply_users.as_deref(),
+            Some(&["U1".to_string(), "U2".to_string(), "U3".to_string()][..])
+        );
+        assert_eq!(channel_root.reply_count, thread_root.reply_count);
+        assert_eq!(channel_root.latest_reply, thread_root.latest_reply);
+        assert_eq!(channel_root.reply_users, thread_root.reply_users);
+        assert_eq!(thread_root.text.as_deref(), Some("thread root"));
+    }
+
+    #[test]
+    fn edited_thread_root_survives_older_thread_snapshot() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let snapshot_base = coordinator.revision();
+        let mut old_root = message("10.0", "old root");
+        old_root.thread_ts = Some("10.0".to_string());
+        let mut current_root = old_root.clone();
+        current_root.text = Some("current root".to_string());
+        coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: current_root,
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+
+        let mut stale_reply = message("11.0", "stale page reply");
+        stale_reply.thread_ts = Some("10.0".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::ThreadSnapshot {
+                channel_id: "C1".to_string(),
+                thread_ts: "10.0".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    snapshot_base,
+                    MessagePage {
+                        messages: vec![old_root, stale_reply],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .unwrap();
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::ThreadReplaced { messages, .. }]
+                if messages.iter().any(|message| {
+                    message.ts == "10.0"
+                        && message.text.as_deref() == Some("current root")
+                })
+        ));
+    }
+
+    #[test]
+    fn unhydrated_sparse_root_edit_survives_older_thread_snapshot() {
+        let old_root = message("10.0", "old root");
+        let mut stale_reply = message("11.0", "stale page reply");
+        stale_reply.thread_ts = Some("10.0".to_string());
+        let mut catalog = crate::thread_catalog::ThreadCatalog::default();
+        catalog.observe_history("C1", std::slice::from_ref(&stale_reply));
+
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            histories: HashMap::from([("C1".to_string(), vec![old_root.clone()])]),
+            threads: catalog.into_records(),
+            ..Default::default()
+        }));
+        let snapshot_base = coordinator.revision();
+
+        coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: message("10.0", "current root"),
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        let reduction = coordinator
+            .apply(WorkspaceMutation::ThreadSnapshot {
+                channel_id: "C1".to_string(),
+                thread_ts: "10.0".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    snapshot_base,
+                    MessagePage {
+                        messages: vec![old_root, stale_reply],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::ThreadReplaced { messages, .. }]
+                if messages.iter().any(|message| {
+                    message.ts == "10.0"
+                        && message.text.as_deref() == Some("current root")
+                })
+        ));
+    }
+
+    #[test]
+    fn root_edit_without_thread_ts_updates_loaded_thread_projection() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut root = message("10.0", "old root");
+        root.reply_count = Some(2);
+        root.latest_reply = Some("12.0".to_string());
+        root.reply_users = Some(vec!["U1".to_string(), "U2".to_string()]);
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![root.clone()],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        coordinator.apply(WorkspaceMutation::ThreadSnapshot {
+            channel_id: "C1".to_string(),
+            thread_ts: "10.0".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                coordinator.revision(),
+                MessagePage {
+                    messages: vec![root],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+
+        let current_root = message("10.0", "current root");
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: current_root,
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .threads
+                .get(&("C1".to_string(), "10.0".to_string()))
+                .unwrap()
+                .messages()
+                .into_iter()
+                .find(|message| message.ts == "10.0")
+                .and_then(|message| message.text),
+            Some("current root".to_string())
+        );
+        for root in [
+            coordinator
+                .history("C1")
+                .into_iter()
+                .find(|message| message.ts == "10.0")
+                .unwrap(),
+            coordinator
+                .threads
+                .get(&("C1".to_string(), "10.0".to_string()))
+                .unwrap()
+                .messages()
+                .into_iter()
+                .find(|message| message.ts == "10.0")
+                .unwrap(),
+        ] {
+            assert_eq!(root.reply_count, Some(2));
+            assert_eq!(root.latest_reply.as_deref(), Some("12.0"));
+            assert_eq!(
+                root.reply_users.as_deref(),
+                Some(&["U1".to_string(), "U2".to_string()][..])
+            );
+        }
+        assert!(matches!(
+            reduction.patch().changes(),
+            [
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel(_),
+                    ..
+                },
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Thread { thread_ts, .. },
+                    ..
+                },
+            ] if thread_ts == "10.0"
+        ));
+    }
+
+    #[test]
+    fn same_identity_delete_removes_and_tombstones_known_and_incoming_timestamps() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let snapshot_base = coordinator.revision();
+        let mut optimistic = message("10.0", "optimistic");
+        optimistic.client_msg_id = Some("client-1".to_string());
+        coordinator.apply(WorkspaceMutation::MessageChanged {
+            channel_id: "C1".to_string(),
+            message: optimistic,
+            kind: MessageMutationKind::Posted,
+            origin: MutationOrigin::Local,
+        });
+
+        let mut deleted = message("11.0", "deleted");
+        deleted.client_msg_id = Some("client-1".to_string());
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: deleted.clone(),
+                kind: MessageMutationKind::Deleted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::MessageDelta {
+                channel_id,
+                message,
+                kind: MessageMutationKind::Deleted,
+            }] if channel_id == "C1" && message.ts == "11.0"
+        ));
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::TimelineChanged { changes, .. }]
+                if matches!(
+                    changes.as_slice(),
+                    [
+                        MessageChange::Remove { message_ts: known },
+                        MessageChange::Remove { message_ts: incoming },
+                    ] if known == "10.0" && incoming == "11.0"
+                )
+        ));
+
+        assert!(coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    snapshot_base,
+                    MessagePage {
+                        messages: vec![deleted],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .is_none());
+        assert!(coordinator.history("C1").is_empty());
+    }
+
+    #[test]
+    fn unhydrated_projection_mutations_reject_older_cross_projection_snapshots() {
+        for kind in [MessageMutationKind::Changed, MessageMutationKind::Deleted] {
+            let mut coordinator = WorkspaceCoordinator::default();
+            let snapshot_base = coordinator.revision();
+            let mut stale_broadcast = message("11.0", "stale broadcast");
+            stale_broadcast.thread_ts = Some("10.0".to_string());
+            stale_broadcast.subtype = Some("thread_broadcast".to_string());
+            stale_broadcast.client_msg_id = Some("client-1".to_string());
+
+            let mut current = stale_broadcast.clone();
+            current.subtype = if kind == MessageMutationKind::Changed {
+                None
+            } else {
+                Some("message_deleted".to_string())
+            };
+            current.text = Some("current".to_string());
+            coordinator
+                .apply(WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".to_string(),
+                    message: current,
+                    kind,
+                    origin: MutationOrigin::Realtime,
+                })
+                .unwrap();
+
+            assert!(coordinator
+                .apply(WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".to_string(),
+                    snapshot: SnapshotEnvelope::new(
+                        snapshot_base,
+                        MessagePage {
+                            messages: vec![stale_broadcast],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                })
+                .is_none());
+            assert!(coordinator.history("C1").is_empty());
+        }
     }
 }

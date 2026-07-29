@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,7 +24,9 @@ use crate::models::{
 };
 use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
-use crate::workspace_pipeline::{StoreBatch, StoreChange, WorkspaceRevision};
+use crate::workspace_pipeline::{
+    same_message_identity, MessageMutationKind, StoreBatch, StoreChange, WorkspaceRevision,
+};
 
 pub(crate) const CACHE_VERSION: u32 = 1;
 const DATABASE_SCHEMA_VERSION: u32 = 2;
@@ -2751,6 +2753,15 @@ fn apply_store_change(
         }
         StoreChange::UsersReplaced(users) => sync_users(transaction, workspace_key, users),
         StoreChange::UserUpsert(user) => upsert_user_projection(transaction, workspace_key, user),
+        StoreChange::MessageDelta {
+            channel_id,
+            message,
+            kind,
+        } => {
+            require_store_key("message channel", &channel_id)?;
+            require_store_key("message timestamp", &message.ts)?;
+            apply_message_delta(transaction, workspace_key, &channel_id, message, kind)
+        }
         StoreChange::HistoryReplaced {
             channel_id,
             messages,
@@ -2791,6 +2802,439 @@ fn apply_store_change(
             sync_thread_records(transaction, workspace_key, records)
         }
     }
+}
+
+#[derive(Clone)]
+struct StoredThreadTimeline {
+    item_key: String,
+    root_ts: String,
+    messages: Vec<SlackMessage>,
+    original: Vec<SlackMessage>,
+    existed: bool,
+}
+
+fn apply_message_delta(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    channel_id: &str,
+    message: SlackMessage,
+    kind: MessageMutationKind,
+) -> Result<bool> {
+    let mut message = normalize_cached_messages(vec![message])
+        .pop()
+        .expect("one normalized message");
+    let existing_history = load_sqlite_item::<Vec<SlackMessage>>(
+        transaction,
+        workspace_key,
+        "channel_history",
+        channel_id,
+    )?;
+    let original_history = existing_history
+        .clone()
+        .map(normalize_cached_messages)
+        .map(channel_timeline_messages)
+        .unwrap_or_default();
+    let mut history = original_history.clone();
+    let mut threads = if kind == MessageMutationKind::Posted {
+        load_sqlite_posted_message_thread(transaction, workspace_key, channel_id, &message)?
+    } else {
+        load_sqlite_channel_threads(transaction, workspace_key, channel_id)?
+    };
+
+    let previous_identity_messages = history
+        .iter()
+        .chain(threads.iter().flat_map(|thread| thread.messages.iter()))
+        .filter(|known| same_message_identity(known, &message))
+        .cloned()
+        .collect::<Vec<_>>();
+    let previous_identity_found = !previous_identity_messages.is_empty();
+    if kind == MessageMutationKind::Changed && message.thread_root_ts().is_none() {
+        if let Some(previous_root) = canonical_root_message(&history, &threads, &message.ts) {
+            preserve_missing_store_root_aggregates(&mut message, &previous_root);
+        }
+    }
+    let mut previous_replies = BTreeMap::<String, Vec<SlackMessage>>::new();
+    for previous in &previous_identity_messages {
+        if let Some(root_ts) = previous.thread_root_ts() {
+            previous_replies
+                .entry(root_ts.to_string())
+                .or_default()
+                .push(previous.clone());
+        }
+    }
+
+    let next_root = if kind == MessageMutationKind::Deleted {
+        None
+    } else {
+        message.thread_root_ts().map(str::to_string)
+    };
+    let mut affected_roots = previous_replies.keys().cloned().collect::<BTreeSet<_>>();
+    affected_roots.extend(next_root.iter().cloned());
+    let roots_before = affected_roots
+        .iter()
+        .filter_map(|root_ts| {
+            canonical_root_message(&history, &threads, root_ts).map(|root| (root_ts.clone(), root))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    history.retain(|known| !same_message_identity(known, &message));
+    for thread in &mut threads {
+        thread
+            .messages
+            .retain(|known| !same_message_identity(known, &message));
+    }
+
+    if kind != MessageMutationKind::Deleted {
+        if message.belongs_in_channel_timeline() {
+            history.push(message.clone());
+        }
+        if let Some(root_ts) = next_root.as_deref() {
+            let thread = ensure_stored_thread(&mut threads, channel_id, root_ts);
+            thread.messages.push(message.clone());
+        } else {
+            let own_thread_exists = threads.iter().any(|thread| thread.root_ts == message.ts);
+            let has_thread_root_aggregate = message.reply_count.is_some()
+                || message.latest_reply.is_some()
+                || message.reply_users.is_some();
+            if own_thread_exists
+                || message.thread_ts.as_deref() == Some(message.ts.as_str())
+                || has_thread_root_aggregate
+            {
+                let thread = ensure_stored_thread(&mut threads, channel_id, &message.ts);
+                thread.messages.push(message.clone());
+            }
+        }
+    }
+
+    for root_ts in affected_roots {
+        let Some(mut root) = canonical_root_message(&history, &threads, &root_ts)
+            .or_else(|| roots_before.get(&root_ts).cloned())
+        else {
+            continue;
+        };
+        if let Some(before) = roots_before.get(&root_ts) {
+            merge_root_aggregates(&mut root, before);
+        }
+
+        let previous = previous_replies.get(&root_ts);
+        let old_present = previous.is_some_and(|messages| !messages.is_empty());
+        let new_present = next_root.as_deref() == Some(root_ts.as_str());
+        match (old_present, new_present) {
+            (true, false) => {
+                root.reply_count = Some(root.reply_count.unwrap_or_default().saturating_sub(1));
+            }
+            (false, true) => {
+                let addition_is_proven = match kind {
+                    MessageMutationKind::Posted => !previous_identity_found,
+                    MessageMutationKind::Changed => previous_identity_found,
+                    MessageMutationKind::Deleted => false,
+                };
+                if addition_is_proven {
+                    root.reply_count = Some(root.reply_count.unwrap_or_default().saturating_add(1));
+                }
+            }
+            (true, true) | (false, false) => {}
+        }
+
+        let removed_timestamps = previous
+            .into_iter()
+            .flatten()
+            .map(|previous| previous.ts.as_str())
+            .collect::<BTreeSet<_>>();
+        let removed_latest = root
+            .latest_reply
+            .as_deref()
+            .is_some_and(|latest| removed_timestamps.contains(latest))
+            && (!new_present || root.latest_reply.as_deref() != Some(message.ts.as_str()));
+        if removed_latest {
+            root.latest_reply = latest_cached_reply(&threads, &root_ts);
+        }
+        if new_present
+            && root
+                .latest_reply
+                .as_deref()
+                .is_none_or(|latest| slack_timestamp_is_after(&message.ts, latest))
+        {
+            root.latest_reply = Some(message.ts.clone());
+        }
+
+        if root.reply_count == Some(0) {
+            root.latest_reply = None;
+            root.reply_users = Some(Vec::new());
+        } else if let Some(reply_users) =
+            complete_cached_reply_users(&threads, &root_ts, root.reply_count)
+        {
+            root.reply_users = Some(reply_users);
+        } else if new_present {
+            if let Some(user_id) = message.user.as_deref() {
+                let users = root.reply_users.get_or_insert_with(Vec::new);
+                if !users.iter().any(|known| known == user_id) {
+                    users.push(user_id.to_string());
+                }
+            }
+        }
+        replace_root_aggregates(&mut history, &mut threads, &root_ts, &root);
+    }
+
+    history = channel_timeline_messages(history);
+    for thread in &mut threads {
+        thread.messages = pruned_history(std::mem::take(&mut thread.messages));
+    }
+    threads.sort_by(|left, right| left.item_key.cmp(&right.item_key));
+
+    let mut changed = false;
+    if history != original_history || existing_history.is_some_and(|_| history.is_empty()) {
+        changed |= replace_timeline_item(
+            transaction,
+            workspace_key,
+            "channel_history",
+            channel_id,
+            history,
+        )?;
+    }
+    for thread in threads {
+        if thread.messages != thread.original || (thread.existed && thread.messages.is_empty()) {
+            changed |= replace_timeline_item(
+                transaction,
+                workspace_key,
+                "thread_replies",
+                &thread.item_key,
+                thread.messages,
+            )?;
+        }
+    }
+    Ok(changed)
+}
+
+fn load_sqlite_channel_threads(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    channel_id: &str,
+) -> Result<Vec<StoredThreadTimeline>> {
+    let key_prefix = format!("{channel_id}:");
+    let key_upper_bound = format!("{channel_id};");
+    let mut statement = transaction.prepare(
+        "SELECT item_key, payload_json
+         FROM workspace_items
+         WHERE workspace_key = ?1
+           AND kind = 'thread_replies'
+           AND item_key >= ?2
+           AND item_key < ?3
+         ORDER BY item_key",
+    )?;
+    let rows = statement.query_map(params![workspace_key, key_prefix, key_upper_bound], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut threads = Vec::new();
+    for row in rows {
+        let (item_key, payload) = row?;
+        let Some(root_ts) = item_key.strip_prefix(&key_prefix) else {
+            continue;
+        };
+        if root_ts.trim().is_empty() {
+            continue;
+        }
+        let root_ts = root_ts.to_string();
+        let messages = serde_json::from_str::<Vec<SlackMessage>>(&payload)
+            .context("invalid cached thread_replies item")?;
+        let messages = pruned_history(normalize_cached_messages(messages));
+        threads.push(StoredThreadTimeline {
+            item_key,
+            root_ts,
+            original: messages.clone(),
+            messages,
+            existed: true,
+        });
+    }
+    Ok(threads)
+}
+
+fn load_sqlite_posted_message_thread(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    channel_id: &str,
+    message: &SlackMessage,
+) -> Result<Vec<StoredThreadTimeline>> {
+    let root_ts = message.thread_root_ts().or_else(|| {
+        (message.thread_ts.as_deref() == Some(message.ts.as_str())
+            || message.reply_count.is_some()
+            || message.latest_reply.is_some()
+            || message.reply_users.is_some())
+        .then_some(message.ts.as_str())
+    });
+    let Some(root_ts) = root_ts else {
+        return Ok(Vec::new());
+    };
+    let item_key = thread_key(channel_id, root_ts);
+    let Some(messages) = load_sqlite_item::<Vec<SlackMessage>>(
+        transaction,
+        workspace_key,
+        "thread_replies",
+        &item_key,
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    let messages = pruned_history(normalize_cached_messages(messages));
+    Ok(vec![StoredThreadTimeline {
+        item_key,
+        root_ts: root_ts.to_string(),
+        original: messages.clone(),
+        messages,
+        existed: true,
+    }])
+}
+
+fn ensure_stored_thread<'a>(
+    threads: &'a mut Vec<StoredThreadTimeline>,
+    channel_id: &str,
+    root_ts: &str,
+) -> &'a mut StoredThreadTimeline {
+    if let Some(index) = threads.iter().position(|thread| thread.root_ts == root_ts) {
+        return &mut threads[index];
+    }
+    threads.push(StoredThreadTimeline {
+        item_key: thread_key(channel_id, root_ts),
+        root_ts: root_ts.to_string(),
+        messages: Vec::new(),
+        original: Vec::new(),
+        existed: false,
+    });
+    threads
+        .last_mut()
+        .expect("a newly inserted thread timeline must exist")
+}
+
+fn canonical_root_message(
+    history: &[SlackMessage],
+    threads: &[StoredThreadTimeline],
+    root_ts: &str,
+) -> Option<SlackMessage> {
+    let mut candidates = history
+        .iter()
+        .filter(|message| message.ts == root_ts)
+        .chain(
+            threads
+                .iter()
+                .filter(|thread| thread.root_ts == root_ts)
+                .flat_map(|thread| thread.messages.iter())
+                .filter(|message| message.ts == root_ts),
+        );
+    let mut root = candidates.next()?.clone();
+    for candidate in candidates {
+        merge_root_aggregates(&mut root, candidate);
+    }
+    Some(root)
+}
+
+fn merge_root_aggregates(root: &mut SlackMessage, candidate: &SlackMessage) {
+    if candidate.reply_count > root.reply_count {
+        root.reply_count = candidate.reply_count;
+    }
+    if candidate
+        .latest_reply
+        .as_deref()
+        .is_some_and(|candidate_ts| {
+            root.latest_reply
+                .as_deref()
+                .is_none_or(|current_ts| slack_timestamp_is_after(candidate_ts, current_ts))
+        })
+    {
+        root.latest_reply.clone_from(&candidate.latest_reply);
+    }
+    if let Some(candidate_users) = candidate.reply_users.as_ref() {
+        let users = root.reply_users.get_or_insert_with(Vec::new);
+        for user_id in candidate_users {
+            if !users.iter().any(|known| known == user_id) {
+                users.push(user_id.clone());
+            }
+        }
+    }
+}
+
+fn preserve_missing_store_root_aggregates(message: &mut SlackMessage, previous: &SlackMessage) {
+    if message.reply_count.is_none() {
+        message.reply_count = previous.reply_count;
+    }
+    if message.latest_reply.is_none() {
+        message.latest_reply.clone_from(&previous.latest_reply);
+    }
+    if message.reply_users.is_none() {
+        message.reply_users.clone_from(&previous.reply_users);
+    }
+}
+
+fn latest_cached_reply(threads: &[StoredThreadTimeline], root_ts: &str) -> Option<String> {
+    threads
+        .iter()
+        .filter(|thread| thread.root_ts == root_ts)
+        .flat_map(|thread| thread.messages.iter())
+        .filter(|message| message.thread_root_ts() == Some(root_ts))
+        .max_by(|left, right| left.ts.cmp(&right.ts))
+        .map(|message| message.ts.clone())
+}
+
+fn complete_cached_reply_users(
+    threads: &[StoredThreadTimeline],
+    root_ts: &str,
+    authoritative_reply_count: Option<u64>,
+) -> Option<Vec<String>> {
+    let replies = threads
+        .iter()
+        .filter(|thread| thread.root_ts == root_ts)
+        .flat_map(|thread| thread.messages.iter())
+        .filter(|message| message.thread_root_ts() == Some(root_ts))
+        .collect::<Vec<_>>();
+    if authoritative_reply_count != Some(replies.len() as u64) {
+        return None;
+    }
+    let mut users = Vec::new();
+    for user_id in replies.iter().filter_map(|message| message.user.as_ref()) {
+        if !users.iter().any(|known| known == user_id) {
+            users.push(user_id.clone());
+        }
+    }
+    Some(users)
+}
+
+fn replace_root_aggregates(
+    history: &mut [SlackMessage],
+    threads: &mut [StoredThreadTimeline],
+    root_ts: &str,
+    root: &SlackMessage,
+) {
+    for message in history.iter_mut().filter(|message| message.ts == root_ts) {
+        message.reply_count = root.reply_count;
+        message.latest_reply.clone_from(&root.latest_reply);
+        message.reply_users.clone_from(&root.reply_users);
+    }
+    for message in threads
+        .iter_mut()
+        .filter(|thread| thread.root_ts == root_ts)
+        .flat_map(|thread| thread.messages.iter_mut())
+        .filter(|message| message.ts == root_ts)
+    {
+        message.reply_count = root.reply_count;
+        message.latest_reply.clone_from(&root.latest_reply);
+        message.reply_users.clone_from(&root.reply_users);
+    }
+}
+
+fn replace_timeline_item(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    item_key: &str,
+    messages: Vec<SlackMessage>,
+) -> Result<bool> {
+    if messages.is_empty() {
+        return Ok(transaction.execute(
+            "DELETE FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+            params![workspace_key, kind, item_key],
+        )? > 0);
+    }
+    upsert_sqlite_item(transaction, workspace_key, kind, item_key, &messages)
 }
 
 fn sync_conversations(
@@ -3573,7 +4017,8 @@ mod tests {
 
     use super::*;
     use crate::workspace_pipeline::{
-        StoreBatch, StoreChange, WorkspaceBootstrapData, WorkspaceRevision,
+        MessageMutationKind, MutationOrigin, StoreBatch, StoreChange, WorkspaceBootstrapData,
+        WorkspaceCoordinator, WorkspaceMutation, WorkspaceRevision,
     };
 
     #[test]
@@ -3898,6 +4343,962 @@ mod tests {
             let conversations = store.load_conversations().await.unwrap().unwrap();
             assert_eq!(conversations.len(), 1);
             assert_eq!(conversations[0].name.as_deref(), Some("retry-commits"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_message_deltas_merge_with_unhydrated_sqlite_timelines() {
+        let directory = temp_cache_dir("coordinator-message-delta-merge");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            let mut optimistic = SlackMessage {
+                ts: "3.0".into(),
+                text: Some("optimistic".into()),
+                client_msg_id: Some("client-1".into()),
+                ..Default::default()
+            };
+            optimistic.refresh_canonical_content();
+            let root = SlackMessage {
+                ts: "1.0".into(),
+                text: Some("root".into()),
+                ..Default::default()
+            };
+            let older = SlackMessage {
+                ts: "2.0".into(),
+                text: Some("older".into()),
+                ..Default::default()
+            };
+            let older_reply = SlackMessage {
+                ts: "1.1".into(),
+                thread_ts: Some("1.0".into()),
+                text: Some("older reply".into()),
+                ..Default::default()
+            };
+            let cached_broadcast = SlackMessage {
+                ts: "1.4".into(),
+                thread_ts: Some("1.0".into()),
+                subtype: Some("thread_broadcast".into()),
+                client_msg_id: Some("projection-1".into()),
+                text: Some("cached broadcast".into()),
+                ..Default::default()
+            };
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![
+                            StoreChange::HistoryReplaced {
+                                channel_id: "C1".into(),
+                                messages: vec![
+                                    root.clone(),
+                                    older.clone(),
+                                    optimistic,
+                                    cached_broadcast,
+                                ],
+                            },
+                            StoreChange::ThreadReplaced {
+                                channel_id: "C1".into(),
+                                thread_ts: "1.0".into(),
+                                messages: vec![root.clone(), older_reply.clone()],
+                            },
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let mut authoritative = SlackMessage {
+                ts: "4.0".into(),
+                text: Some("authoritative".into()),
+                client_msg_id: Some("client-1".into()),
+                ..Default::default()
+            };
+            authoritative.refresh_canonical_content();
+            let new_reply = SlackMessage {
+                ts: "1.2".into(),
+                thread_ts: Some("1.0".into()),
+                text: Some("new reply".into()),
+                ..Default::default()
+            };
+            let mut normal_reply_in_channel = new_reply.clone();
+            normal_reply_in_channel.text = Some("must be filtered".into());
+            normal_reply_in_channel.client_msg_id = Some("projection-1".into());
+            let mut broadcast = new_reply.clone();
+            broadcast.ts = "1.3".into();
+            broadcast.subtype = Some("thread_broadcast".into());
+            broadcast.text = Some("broadcast".into());
+            let mutations = [
+                (authoritative, MessageMutationKind::Changed),
+                (normal_reply_in_channel, MessageMutationKind::Changed),
+                (broadcast, MessageMutationKind::Posted),
+                (
+                    SlackMessage {
+                        ts: "2.0".into(),
+                        text: Some("edited older".into()),
+                        ..Default::default()
+                    },
+                    MessageMutationKind::Changed,
+                ),
+                (older_reply.clone(), MessageMutationKind::Deleted),
+            ];
+            let mut revision = first_revision;
+            for (message, kind) in mutations {
+                revision = revision.successor();
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            revision,
+                            vec![StoreChange::MessageDelta {
+                                channel_id: "C1".into(),
+                                message,
+                                kind,
+                            }],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["4.0", "2.0", "1.3", "1.0"]
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .find(|message| message.ts == "2.0")
+                    .and_then(|message| message.text.as_deref()),
+                Some("edited older")
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|message| message.client_msg_id.as_deref() == Some("client-1"))
+                    .count(),
+                1,
+                "the authoritative response must replace its optimistic identity"
+            );
+            assert!(!history.iter().any(|message| message.ts == "1.2"));
+
+            let thread = store.load_thread("C1", "1.0").await.unwrap().unwrap();
+            assert_eq!(
+                thread
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["1.3", "1.2", "1.0"]
+            );
+            assert!(!thread.iter().any(|message| message.ts == older_reply.ts));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_message_reductions_merge_into_unhydrated_store_timelines() {
+        let directory = temp_cache_dir("coordinator-message-reduction-merge");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_history(
+                    "C1",
+                    &[SlackMessage {
+                        ts: "1.0".into(),
+                        text: Some("persisted history".into()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+            store
+                .store_thread(
+                    "C1",
+                    "10.0",
+                    &[SlackMessage {
+                        ts: "10.1".into(),
+                        thread_ts: Some("10.0".into()),
+                        text: Some("persisted reply".into()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let mut coordinator = WorkspaceCoordinator::default();
+            let history_reduction = coordinator
+                .apply(WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".into(),
+                    message: SlackMessage {
+                        ts: "2.0".into(),
+                        text: Some("new history".into()),
+                        ..Default::default()
+                    },
+                    kind: MessageMutationKind::Posted,
+                    origin: MutationOrigin::Realtime,
+                })
+                .unwrap();
+            store
+                .execute_store_batch(history_reduction.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let thread_reduction = coordinator
+                .apply(WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".into(),
+                    message: SlackMessage {
+                        ts: "10.2".into(),
+                        thread_ts: Some("10.0".into()),
+                        text: Some("new reply".into()),
+                        ..Default::default()
+                    },
+                    kind: MessageMutationKind::Posted,
+                    origin: MutationOrigin::Realtime,
+                })
+                .unwrap();
+            store
+                .execute_store_batch(thread_reduction.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .load_history("C1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["2.0", "1.0"]
+            );
+            assert_eq!(
+                store
+                    .load_thread("C1", "10.0")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["10.2", "10.1"]
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_same_identity_delete_removes_authoritative_unhydrated_timestamp() {
+        let directory = temp_cache_dir("coordinator-message-identity-delete");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let mut coordinator = WorkspaceCoordinator::default();
+            let mut optimistic = SlackMessage {
+                ts: "10.0".into(),
+                text: Some("optimistic".into()),
+                client_msg_id: Some("client-1".into()),
+                ..Default::default()
+            };
+            optimistic.refresh_canonical_content();
+            coordinator.apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".into(),
+                message: optimistic,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Local,
+            });
+
+            let mut authoritative = SlackMessage {
+                ts: "11.0".into(),
+                text: Some("authoritative".into()),
+                client_msg_id: Some("client-1".into()),
+                ..Default::default()
+            };
+            authoritative.refresh_canonical_content();
+            store
+                .store_history("C1", std::slice::from_ref(&authoritative))
+                .await
+                .unwrap();
+
+            let deletion = coordinator
+                .apply(WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".into(),
+                    message: authoritative,
+                    kind: MessageMutationKind::Deleted,
+                    origin: MutationOrigin::Realtime,
+                })
+                .unwrap();
+            store
+                .execute_store_batch(deletion.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            assert!(store.load_history("C1").await.unwrap().is_none());
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_projection_edit_removes_authoritative_unhydrated_identity() {
+        let directory = temp_cache_dir("coordinator-message-projection-edit");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let mut authoritative = SlackMessage {
+                ts: "11.0".into(),
+                thread_ts: Some("1.0".into()),
+                subtype: Some("thread_broadcast".into()),
+                text: Some("authoritative broadcast".into()),
+                client_msg_id: Some("client-1".into()),
+                ..Default::default()
+            };
+            authoritative.refresh_canonical_content();
+            store
+                .store_history("C1", std::slice::from_ref(&authoritative))
+                .await
+                .unwrap();
+            store
+                .store_thread("C1", "1.0", std::slice::from_ref(&authoritative))
+                .await
+                .unwrap();
+
+            let mut coordinator = WorkspaceCoordinator::default();
+            authoritative.subtype = None;
+            authoritative.text = Some("normal reply".into());
+            let edit = coordinator
+                .apply(WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".into(),
+                    message: authoritative,
+                    kind: MessageMutationKind::Changed,
+                    origin: MutationOrigin::Realtime,
+                })
+                .unwrap();
+            store
+                .execute_store_batch(edit.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            assert!(store.load_history("C1").await.unwrap().is_none());
+            let thread = store.load_thread("C1", "1.0").await.unwrap().unwrap();
+            assert_eq!(thread.len(), 1);
+            assert_eq!(thread[0].ts, "11.0");
+            assert_eq!(thread[0].text.as_deref(), Some("normal reply"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn sqlite_only_reply_deletes_reconcile_both_root_copies_without_drift() {
+        let directory = temp_cache_dir("coordinator-message-root-delete");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let root = |ts: &str, latest_reply: &str| SlackMessage {
+                ts: ts.into(),
+                text: Some("root".into()),
+                reply_count: Some(2),
+                latest_reply: Some(latest_reply.into()),
+                reply_users: Some(vec!["U1".into(), "U2".into()]),
+                ..Default::default()
+            };
+            let reply = |ts: &str, root_ts: &str, user: &str| SlackMessage {
+                ts: ts.into(),
+                thread_ts: Some(root_ts.into()),
+                user: Some(user.into()),
+                text: Some("reply".into()),
+                ..Default::default()
+            };
+            let root_one = root("10.0", "12.0");
+            let root_two = root("20.0", "22.0");
+            let reply_11 = reply("11.0", "10.0", "U1");
+            let reply_12 = reply("12.0", "10.0", "U2");
+            let reply_21 = reply("21.0", "20.0", "U1");
+            let reply_22 = reply("22.0", "20.0", "U2");
+            store
+                .store_history("C1", &[root_one.clone(), root_two.clone()])
+                .await
+                .unwrap();
+            store
+                .store_thread(
+                    "C1",
+                    "10.0",
+                    &[root_one.clone(), reply_11.clone(), reply_12],
+                )
+                .await
+                .unwrap();
+            store
+                .store_thread(
+                    "C1",
+                    "20.0",
+                    &[root_two.clone(), reply_21.clone(), reply_22.clone()],
+                )
+                .await
+                .unwrap();
+
+            let mut coordinator = WorkspaceCoordinator::default();
+            for deleted in [reply_11.clone(), reply_22.clone()] {
+                let reduction = coordinator
+                    .apply(WorkspaceMutation::MessageChanged {
+                        channel_id: "C1".into(),
+                        message: deleted,
+                        kind: MessageMutationKind::Deleted,
+                        origin: MutationOrigin::Realtime,
+                    })
+                    .unwrap();
+                store
+                    .execute_store_batch(reduction.store_batch().unwrap().clone())
+                    .await
+                    .unwrap();
+            }
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        coordinator.revision().successor(),
+                        vec![StoreChange::MessageDelta {
+                            channel_id: "C1".into(),
+                            message: reply_22,
+                            kind: MessageMutationKind::Deleted,
+                        }],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            let thread_one = store.load_thread("C1", "10.0").await.unwrap().unwrap();
+            let thread_two = store.load_thread("C1", "20.0").await.unwrap().unwrap();
+            for root in [
+                history.iter().find(|message| message.ts == "10.0").unwrap(),
+                thread_one
+                    .iter()
+                    .find(|message| message.ts == "10.0")
+                    .unwrap(),
+            ] {
+                assert_eq!(root.reply_count, Some(1));
+                assert_eq!(root.latest_reply.as_deref(), Some("12.0"));
+                assert_eq!(root.reply_users.as_deref(), Some(&["U2".to_string()][..]));
+            }
+            for root in [
+                history.iter().find(|message| message.ts == "20.0").unwrap(),
+                thread_two
+                    .iter()
+                    .find(|message| message.ts == "20.0")
+                    .unwrap(),
+            ] {
+                assert_eq!(root.reply_count, Some(1));
+                assert_eq!(root.latest_reply.as_deref(), Some("21.0"));
+                assert_eq!(root.reply_users.as_deref(), Some(&["U1".to_string()][..]));
+            }
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn partial_cached_reply_delete_preserves_users_and_unknown_delete_is_count_neutral() {
+        let directory = temp_cache_dir("coordinator-message-partial-root-delete");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let root = SlackMessage {
+                ts: "10.0".into(),
+                reply_count: Some(3),
+                latest_reply: Some("12.0".into()),
+                reply_users: Some(vec!["U1".into(), "U2".into(), "U3".into()]),
+                ..Default::default()
+            };
+            let reply = |ts: &str, user: &str| SlackMessage {
+                ts: ts.into(),
+                thread_ts: Some("10.0".into()),
+                user: Some(user.into()),
+                ..Default::default()
+            };
+            let persisted = reply("11.0", "U1");
+            store
+                .store_history("C1", std::slice::from_ref(&root))
+                .await
+                .unwrap();
+            store
+                .store_thread(
+                    "C1",
+                    "10.0",
+                    &[root.clone(), persisted.clone(), reply("12.0", "U2")],
+                )
+                .await
+                .unwrap();
+
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![StoreChange::MessageDelta {
+                            channel_id: "C1".into(),
+                            message: persisted,
+                            kind: MessageMutationKind::Deleted,
+                        }],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision.successor(),
+                        vec![StoreChange::MessageDelta {
+                            channel_id: "C1".into(),
+                            message: reply("13.0", "U4"),
+                            kind: MessageMutationKind::Deleted,
+                        }],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            let thread = store.load_thread("C1", "10.0").await.unwrap().unwrap();
+            let history_root = history.iter().find(|message| message.ts == "10.0").unwrap();
+            let thread_root = thread.iter().find(|message| message.ts == "10.0").unwrap();
+            assert_eq!(history_root, thread_root);
+            assert_eq!(history_root.reply_count, Some(2));
+            assert_eq!(history_root.latest_reply.as_deref(), Some("12.0"));
+            assert_eq!(
+                history_root.reply_users.as_deref(),
+                Some(&["U1".to_string(), "U2".to_string(), "U3".to_string()][..])
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn sqlite_only_post_edit_and_move_reconcile_both_root_copies() {
+        let directory = temp_cache_dir("coordinator-message-root-transitions");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_root = SlackMessage {
+                ts: "10.0".into(),
+                reply_count: Some(1),
+                latest_reply: Some("11.0".into()),
+                reply_users: Some(vec!["U1".into()]),
+                ..Default::default()
+            };
+            let second_root = SlackMessage {
+                ts: "20.0".into(),
+                reply_count: Some(0),
+                reply_users: Some(Vec::new()),
+                ..Default::default()
+            };
+            let existing = SlackMessage {
+                ts: "11.0".into(),
+                thread_ts: Some("10.0".into()),
+                user: Some("U1".into()),
+                ..Default::default()
+            };
+            store
+                .store_history("C1", &[first_root.clone(), second_root.clone()])
+                .await
+                .unwrap();
+            store
+                .store_thread("C1", "10.0", &[first_root.clone(), existing.clone()])
+                .await
+                .unwrap();
+            store
+                .store_thread("C1", "20.0", std::slice::from_ref(&second_root))
+                .await
+                .unwrap();
+
+            let mut coordinator = WorkspaceCoordinator::default();
+            let mut reply = SlackMessage {
+                ts: "12.0".into(),
+                thread_ts: Some("10.0".into()),
+                client_msg_id: Some("reply-2".into()),
+                user: Some("U2".into()),
+                text: Some("posted".into()),
+                ..Default::default()
+            };
+            for kind in [
+                MessageMutationKind::Posted,
+                MessageMutationKind::Changed,
+                MessageMutationKind::Changed,
+            ] {
+                if kind == MessageMutationKind::Changed && reply.user.as_deref() == Some("U2") {
+                    reply.user = Some("U3".into());
+                    reply.text = Some("edited".into());
+                } else if kind == MessageMutationKind::Changed {
+                    reply.thread_ts = Some("20.0".into());
+                    reply.text = Some("moved".into());
+                }
+                let reduction = coordinator
+                    .apply(WorkspaceMutation::MessageChanged {
+                        channel_id: "C1".into(),
+                        message: reply.clone(),
+                        kind,
+                        origin: MutationOrigin::Realtime,
+                    })
+                    .unwrap();
+                store
+                    .execute_store_batch(reduction.store_batch().unwrap().clone())
+                    .await
+                    .unwrap();
+            }
+
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            let first_thread = store.load_thread("C1", "10.0").await.unwrap().unwrap();
+            let second_thread = store.load_thread("C1", "20.0").await.unwrap().unwrap();
+            let root_copy = |messages: &[SlackMessage], root_ts: &str| {
+                messages
+                    .iter()
+                    .find(|message| message.ts == root_ts)
+                    .cloned()
+                    .unwrap()
+            };
+            assert_eq!(
+                root_copy(&history, "10.0"),
+                root_copy(&first_thread, "10.0")
+            );
+            assert_eq!(root_copy(&history, "10.0").reply_count, Some(1));
+            assert_eq!(
+                root_copy(&history, "10.0").latest_reply.as_deref(),
+                Some("11.0")
+            );
+            assert_eq!(
+                root_copy(&history, "10.0").reply_users.as_deref(),
+                Some(&["U1".to_string()][..])
+            );
+            assert_eq!(
+                root_copy(&history, "20.0"),
+                root_copy(&second_thread, "20.0")
+            );
+            assert_eq!(root_copy(&history, "20.0").reply_count, Some(1));
+            assert_eq!(
+                root_copy(&history, "20.0").latest_reply.as_deref(),
+                Some("12.0")
+            );
+            assert_eq!(
+                root_copy(&history, "20.0").reply_users.as_deref(),
+                Some(&["U3".to_string()][..])
+            );
+            assert!(!first_thread.iter().any(|message| message.ts == "12.0"));
+            assert_eq!(
+                second_thread
+                    .iter()
+                    .find(|message| message.ts == "12.0")
+                    .and_then(|message| message.text.as_deref()),
+                Some("moved")
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn changed_thread_root_updates_its_cached_copy_without_cross_channel_scan() {
+        let directory = temp_cache_dir("coordinator-message-root-edit-scope");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let root = SlackMessage {
+                ts: "10.0".into(),
+                thread_ts: Some("10.0".into()),
+                text: Some("old root".into()),
+                reply_count: Some(2),
+                latest_reply: Some("12.0".into()),
+                reply_users: Some(vec!["U1".into(), "U2".into()]),
+                ..Default::default()
+            };
+            let other_root = SlackMessage {
+                ts: "10.0".into(),
+                thread_ts: Some("10.0".into()),
+                text: Some("other channel".into()),
+                ..Default::default()
+            };
+            store
+                .store_history("C1", std::slice::from_ref(&root))
+                .await
+                .unwrap();
+            store
+                .store_thread("C1", "10.0", std::slice::from_ref(&root))
+                .await
+                .unwrap();
+            store
+                .store_thread("C10", "10.0", std::slice::from_ref(&other_root))
+                .await
+                .unwrap();
+
+            let current = SlackMessage {
+                ts: "10.0".into(),
+                text: Some("current root".into()),
+                ..Default::default()
+            };
+            let mut coordinator = WorkspaceCoordinator::default();
+            let reduction = coordinator
+                .apply(WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".into(),
+                    message: current,
+                    kind: MessageMutationKind::Changed,
+                    origin: MutationOrigin::Realtime,
+                })
+                .unwrap();
+            store
+                .execute_store_batch(reduction.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            let thread = store.load_thread("C1", "10.0").await.unwrap().unwrap();
+            assert_eq!(history[0], thread[0]);
+            assert_eq!(history[0].text.as_deref(), Some("current root"));
+            assert_eq!(history[0].reply_count, Some(2));
+            assert_eq!(history[0].latest_reply.as_deref(), Some("12.0"));
+            assert_eq!(
+                history[0].reply_users.as_deref(),
+                Some(&["U1".to_string(), "U2".to_string()][..])
+            );
+            assert_eq!(
+                store.load_thread("C10", "10.0").await.unwrap().unwrap()[0]
+                    .text
+                    .as_deref(),
+                Some("other channel")
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn reply_aggregate_delta_preserves_projection_specific_root_content() {
+        let directory = temp_cache_dir("coordinator-message-root-content");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let history_root = SlackMessage {
+                ts: "10.0".into(),
+                text: Some("channel snapshot".into()),
+                reply_count: Some(0),
+                ..Default::default()
+            };
+            let thread_root = SlackMessage {
+                text: Some("newer thread snapshot".into()),
+                ..history_root.clone()
+            };
+            store
+                .store_history("C1", std::slice::from_ref(&history_root))
+                .await
+                .unwrap();
+            store
+                .store_thread("C1", "10.0", std::slice::from_ref(&thread_root))
+                .await
+                .unwrap();
+
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        WorkspaceRevision::INITIAL.successor(),
+                        vec![StoreChange::MessageDelta {
+                            channel_id: "C1".into(),
+                            message: SlackMessage {
+                                ts: "11.0".into(),
+                                thread_ts: Some("10.0".into()),
+                                user: Some("U1".into()),
+                                ..Default::default()
+                            },
+                            kind: MessageMutationKind::Posted,
+                        }],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            let thread = store.load_thread("C1", "10.0").await.unwrap().unwrap();
+            let history_root = history.iter().find(|message| message.ts == "10.0").unwrap();
+            let thread_root = thread.iter().find(|message| message.ts == "10.0").unwrap();
+            assert_eq!(history_root.text.as_deref(), Some("channel snapshot"));
+            assert_eq!(thread_root.text.as_deref(), Some("newer thread snapshot"));
+            assert_eq!(history_root.reply_count, Some(1));
+            assert_eq!(thread_root.reply_count, Some(1));
+            assert_eq!(history_root.latest_reply, thread_root.latest_reply);
+            assert_eq!(history_root.reply_users, thread_root.reply_users);
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ordinary_post_skips_unrelated_same_channel_thread_payloads() {
+        let directory = temp_cache_dir("coordinator-message-post-thread-scope");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_thread(
+                    "C1",
+                    "10.0",
+                    &[SlackMessage {
+                        ts: "10.0".into(),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+        });
+        Connection::open(store.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE workspace_items SET payload_json = '{broken'
+                 WHERE workspace_key = ?1
+                   AND kind = 'thread_replies'
+                   AND item_key = 'C1:10.0'",
+                [&store.workspace_key],
+            )
+            .unwrap();
+
+        runtime().block_on(async {
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            WorkspaceRevision::INITIAL.successor(),
+                            vec![StoreChange::MessageDelta {
+                                channel_id: "C1".into(),
+                                message: SlackMessage {
+                                    ts: "20.0".into(),
+                                    text: Some("ordinary post".into()),
+                                    ..Default::default()
+                                },
+                                kind: MessageMutationKind::Posted,
+                            }],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+            assert_eq!(
+                store.load_history("C1").await.unwrap().unwrap()[0]
+                    .text
+                    .as_deref(),
+                Some("ordinary post")
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_message_delta_batch_rolls_back_wholly_and_can_recover() {
+        let directory = temp_cache_dir("coordinator-message-delta-rollback");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            let root = SlackMessage {
+                ts: "1.0".into(),
+                text: Some("root".into()),
+                ..Default::default()
+            };
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![
+                            StoreChange::HistoryReplaced {
+                                channel_id: "C1".into(),
+                                messages: vec![root.clone()],
+                            },
+                            StoreChange::ThreadReplaced {
+                                channel_id: "C1".into(),
+                                thread_ts: "1.0".into(),
+                                messages: vec![root.clone()],
+                            },
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let reply = SlackMessage {
+                ts: "2.0".into(),
+                thread_ts: Some("1.0".into()),
+                text: Some("reply".into()),
+                ..Default::default()
+            };
+            let revision = first_revision.successor();
+            let deltas = vec![
+                StoreChange::MessageDelta {
+                    channel_id: "C1".into(),
+                    message: SlackMessage {
+                        ts: "3.0".into(),
+                        text: Some("new history".into()),
+                        ..Default::default()
+                    },
+                    kind: MessageMutationKind::Posted,
+                },
+                StoreChange::MessageDelta {
+                    channel_id: "C1".into(),
+                    message: reply.clone(),
+                    kind: MessageMutationKind::Posted,
+                },
+            ];
+            let mut failing_changes = deltas.clone();
+            failing_changes.push(StoreChange::ConversationRemoved {
+                channel_id: String::new(),
+            });
+            assert!(store
+                .execute_store_batch(StoreBatch::new(revision, failing_changes).unwrap())
+                .await
+                .is_err());
+            assert_eq!(
+                store
+                    .load_history("C1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["1.0"]
+            );
+            assert_eq!(
+                store
+                    .load_thread("C1", "1.0")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["1.0"]
+            );
+
+            assert_eq!(
+                store
+                    .execute_store_batch(StoreBatch::new(revision, deltas).unwrap())
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+            assert_eq!(
+                store
+                    .load_history("C1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["3.0", "1.0"]
+            );
+            assert_eq!(
+                store
+                    .load_thread("C1", "1.0")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["2.0", "1.0"]
+            );
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -4246,6 +5647,15 @@ mod tests {
                             ..Default::default()
                         }],
                     },
+                    StoreChange::MessageDelta {
+                        channel_id: "C3".into(),
+                        message: SlackMessage {
+                            ts: "2.100".into(),
+                            text: Some("delta-history".into()),
+                            ..Default::default()
+                        },
+                        kind: MessageMutationKind::Posted,
+                    },
                     StoreChange::HistoryRemoved {
                         channel_id: "C1".into(),
                     },
@@ -4281,7 +5691,7 @@ mod tests {
             assert!(store.load_history("C1").await.unwrap().is_none());
             assert_eq!(
                 store.load_history("C3").await.unwrap().unwrap()[0].body_text(),
-                "replacement-history"
+                "delta-history"
             );
             assert_eq!(
                 store.load_thread("C3", "2.000").await.unwrap().unwrap()[0].body_text(),
