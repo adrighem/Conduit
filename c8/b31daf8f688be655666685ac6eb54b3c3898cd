@@ -1,0 +1,20 @@
+Conductor task follow-up: Harden coordinator batch recovery
+
+Summary:
+- Journaled complete reductions across cancellation and consecutive write failures.
+- Added StoreBatch-only cache repair without a presentation revision.
+- Preserved read/unread and star overlays during transitional metadata writes.
+- Added tri-state user status persistence so explicit clears delete stale cache rows.
+
+Modified files:
+- src/runtime.rs
+- src/store.rs
+- src/workspace_pipeline.rs
+
+Verification:
+- Regression-first coverage exercised cancellation, consecutive failures, corruption repair, read interleaving, status clear, and star behavior.
+- Sanitized full suite passed: 736 passed, 2 ignored.
+- cargo check, cargo fmt --check, and git diff --check passed.
+
+Rationale:
+The compatibility period must retain patches and newer overlays even when writes fail, are cancelled, or race cache repair.
