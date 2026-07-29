@@ -51,6 +51,7 @@ mod slack_link;
 mod slack_message_wire;
 mod socket_mode;
 mod store;
+mod sync_scheduler;
 mod thread_catalog;
 mod thread_pane;
 mod window;
