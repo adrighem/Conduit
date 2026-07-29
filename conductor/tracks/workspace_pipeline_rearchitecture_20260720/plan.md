@@ -9,13 +9,13 @@
 - [x] Task: Add write batching, immediate user flushes, unchanged suppression, and store tracing counters 2b255e6
 - [x] Task: Conductor - User Manual Verification 'Guardrails and persistent storage' (Protocol in workflow.md) 7c8428e
 
-## Phase 2: Canonical reducer pipeline
+## Phase 2: Canonical reducer pipeline [checkpoint: 854789b]
 
 - [x] Task: Define and test workspace mutations, patches, store batches, revisions, and snapshot envelopes 918ae95
 - [x] Task: Extract WorkspaceCoordinator and its pure reducer from the runtime 5ab1767
 - [x] Task: Route cache, Web API, local actions, and realtime transports through the reducer adapter 67c3a5a
 - [x] Task: Preserve read overlays and deduplicate message/send/echo identities with timeline invariants a7e44a2
-- [~] Task: Conductor - User Manual Verification 'Canonical reducer pipeline' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Canonical reducer pipeline' (Protocol in workflow.md) 854789b
 
 ## Phase 3: Bounded synchronization and backpressure
 

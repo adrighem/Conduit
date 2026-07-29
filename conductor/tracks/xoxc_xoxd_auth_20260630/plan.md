@@ -11,10 +11,10 @@
   - [x] Sub-task: Wire UI input through runtime validation and keyring storage
 - [x] Task: Conductor - User Manual Verification 'XOXC/XOXD Browser Session Authentication' (Protocol in workflow.md) b3c064d
 
-## Phase 2: Browser-session import compatibility
+## Phase 2: Browser-session import compatibility [checkpoint: 854789b]
 - [x] Task: Align browser-session requests and recovery guidance with the upstream workaround 98d41a8
   - [x] Sub-task: Add request-level coverage for XOXC form authentication and browser cookies
   - [x] Sub-task: Stop substituting an unrelated browser User-Agent
   - [x] Sub-task: Surface actionable browser-session import failures without exposing credentials
   - [x] Sub-task: Document Enterprise User-Agent and TLS-fingerprint requirements
-- [ ] Task: Conductor - User Manual Verification 'Browser-session import compatibility' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Browser-session import compatibility' (Protocol in workflow.md) 854789b

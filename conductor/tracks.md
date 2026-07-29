@@ -4,7 +4,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Support authentication using XOXC/XOXD tokens
+## [x] Track: Support authentication using XOXC/XOXD tokens
 *Link: [./conductor/tracks/xoxc_xoxd_auth_20260630/](./conductor/tracks/xoxc_xoxd_auth_20260630/)*
 
 ---
@@ -24,12 +24,12 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Unread sidebar bold text
+## [x] Track: Unread sidebar bold text
 *Link: [./conductor/tracks/unread_sidebar_bold_20260707/](./conductor/tracks/unread_sidebar_bold_20260707/)*
 
 ---
 
-## [~] Track: Desktop notifications for notify-worthy messages
+## [x] Track: Desktop notifications for notify-worthy messages
 *Link: [./conductor/tracks/desktop_notifications_20260707/](./conductor/tracks/desktop_notifications_20260707/)*
 
 ---
@@ -54,7 +54,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Automated releases and Linux packages
+## [x] Track: Automated releases and Linux packages
 *Link: [./conductor/tracks/release_automation_20260720/](./conductor/tracks/release_automation_20260720/)*
 
 ---
@@ -89,10 +89,10 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Current user status management
+## [x] Track: Current user status management
 *Link: [./conductor/tracks/status_management_20260728/](./conductor/tracks/status_management_20260728/)*
 
 ---
 
-## [~] Track: Installed branding consistency
+## [x] Track: Installed branding consistency
 *Link: [./conductor/tracks/branding_install_20260728/](./conductor/tracks/branding_install_20260728/)*
