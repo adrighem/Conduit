@@ -3,8 +3,8 @@
 ## Phase 1: Scheduler contracts and deterministic core
 
 - [x] Task: Add failing tests for SyncJob identity, durability, priority, freshness, and replacement a5b6742
-- [~] Task: Implement bounded pre-spawn admission with priority and starvation protection
-- [ ] Task: Add target-aware coalescing, cancellation, retry, and shutdown behavior
+- [x] Task: Implement bounded pre-spawn admission with priority and starvation protection cded7d7
+- [~] Task: Add target-aware coalescing, cancellation, retry, and shutdown behavior
 - [ ] Task: Add redacted queue counters and saturation regression coverage
 - [ ] Task: Conductor - User Manual Verification 'Scheduler contracts and deterministic core' (Protocol in workflow.md)
 
