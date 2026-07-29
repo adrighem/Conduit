@@ -20,8 +20,8 @@
 ## Phase 3: Authoritative conversation adoption
 
 - [x] Task: Define failing end-to-end tests for authoritative conversation membership and metadata e113608
-- [~] Task: Execute each coordinator StoreBatch atomically and in revision order
-- [ ] Task: Deliver revisioned conversation WorkspacePatch values to presentation
+- [x] Task: Execute each coordinator StoreBatch atomically and in revision order 640658d
+- [~] Task: Deliver revisioned conversation WorkspacePatch values to presentation
 - [ ] Task: Route cache, API, and realtime conversation changes through the coordinator
 - [ ] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations
 - [ ] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md)
