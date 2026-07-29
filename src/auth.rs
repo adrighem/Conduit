@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 use url::Url;
 
-use crate::{config, models::StoredToken};
+use crate::{config, http_client, models::StoredToken};
 
 const KEYRING_SERVICE: &str = "eu.vanadrighem.conduit";
 const KEYRING_USER: &str = "slack-user-token";
@@ -171,7 +171,7 @@ pub struct SlackOAuthClient {
 impl SlackOAuthClient {
     pub fn new() -> Self {
         Self {
-            http: Client::builder()
+            http: http_client::builder()
                 .connect_timeout(OAUTH_HTTP_CONNECT_TIMEOUT)
                 .timeout(OAUTH_HTTP_REQUEST_TIMEOUT)
                 .build()

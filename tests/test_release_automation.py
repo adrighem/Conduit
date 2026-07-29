@@ -528,6 +528,34 @@ def test_flatpak_cargo_sources_match_the_lockfile() -> None:
     )
 
 
+def test_unstable_http3_stack_is_not_locked_or_vendored() -> None:
+    manifest = tomllib.loads(read("Cargo.toml"))
+    reqwest = manifest["dependencies"]["reqwest"]
+    rustls = manifest["dependencies"]["rustls"]
+    assert "rustls-no-provider" in reqwest["features"]
+    assert "http2" in reqwest["features"]
+    assert "rustls" not in reqwest["features"]
+    assert "http3" not in reqwest["features"]
+    assert rustls["features"] == ["aws-lc-rs"]
+
+    lockfile = tomllib.loads(read("Cargo.lock"))
+    locked_packages = {package["name"] for package in lockfile["package"]}
+    unused_http3_packages = {
+        "h3",
+        "h3-quinn",
+        "quinn",
+        "quinn-proto",
+        "quinn-udp",
+    }
+    assert locked_packages.isdisjoint(unused_http3_packages)
+
+    sources = read("packaging/flatpak/cargo-sources.json")
+    assert all(
+        f"/{package}/" not in sources and f"/{package}-" not in sources
+        for package in unused_http3_packages
+    )
+
+
 def main() -> None:
     tests = [
         test_release_versions_are_synchronized,
@@ -539,6 +567,7 @@ def main() -> None:
         test_release_packages_disable_nonproduction_features,
         test_release_flatpak_uses_current_checkout_without_debug_logging,
         test_flatpak_cargo_sources_match_the_lockfile,
+        test_unstable_http3_stack_is_not_locked_or_vendored,
     ]
     for test in tests:
         test()

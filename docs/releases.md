@@ -41,6 +41,12 @@ python3 flatpak-cargo-generator.py Cargo.lock \
 
 The generator is maintained in [flatpak-builder-tools](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo). Commit the lockfile and generated source manifest together.
 
+## HTTP transport policy
+
+Conduit uses Reqwest's stable HTTP/1.1 and HTTP/2 transports. Slack's public endpoints accept HTTP/3, but Reqwest 0.13 marks its HTTP/3 implementation as experimental, requires the global `reqwest_unstable` compiler configuration, and does not provide the automatic negotiation and fallback Conduit needs for proxies and networks that block QUIC.
+
+Reqwest is therefore configured with `rustls-no-provider`, and Conduit selects the AWS-LC Rustls provider directly. Do not replace this with Reqwest's `rustls` convenience feature unless HTTP/3 is deliberately implemented: that feature records the optional Quinn stack in `Cargo.lock` and the Flatpak source manifest even when HTTP/3 is disabled.
+
 ## Flatpak publication
 
 The GitHub Release `.flatpak` is a directly installable bundle, not an update repository. Flatpak repositories or Flathub are needed for automatic updates.

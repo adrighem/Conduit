@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::auth::browser_session_cookie_header;
+use crate::http_client;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
     SlackUser, SlackUserGroup, SlackUserProfile, SlackUserStatus, StoredToken,
@@ -361,7 +362,7 @@ impl SlackApi {
     pub fn new(token: StoredToken) -> Self {
         let scopes = token_scope_set(token.scope.as_deref());
         Self {
-            http: Client::builder()
+            http: http_client::builder()
                 .connect_timeout(HTTP_CONNECT_TIMEOUT)
                 .read_timeout(HTTP_READ_TIMEOUT)
                 .build()

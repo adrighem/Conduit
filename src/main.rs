@@ -31,6 +31,7 @@ mod debug;
 mod drafts;
 mod emoji;
 mod gnome_search_provider;
+mod http_client;
 mod huddles;
 mod message_handoff;
 mod message_html;
@@ -66,6 +67,8 @@ use gtk::{gio, glib};
 use std::path::PathBuf;
 
 fn main() -> glib::ExitCode {
+    http_client::ensure_tls_crypto_provider();
+
     if let Err(error) = debug::init() {
         eprintln!("Failed to initialize diagnostics: {error}");
     }

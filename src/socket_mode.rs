@@ -9,6 +9,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth::browser_session_cookie_header;
+use crate::http_client;
 use crate::models::{SlackMessage, SlackUser};
 use crate::realtime::RealtimeTransport;
 use crate::slack_message_wire::SlackMessageWire;
@@ -420,7 +421,7 @@ struct SocketModeApi {
 impl SocketModeApi {
     fn new(credentials: SocketModeCredentials) -> Self {
         Self {
-            http: Client::builder()
+            http: http_client::builder()
                 .connect_timeout(HTTP_CONNECT_TIMEOUT)
                 .timeout(HTTP_REQUEST_TIMEOUT)
                 .build()
