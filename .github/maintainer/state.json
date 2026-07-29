@@ -1,28 +1,29 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-29-v0.3.0-release-closeout",
+  "last_manual_run": "2026-07-29-parallel-performance-foundations",
   "last_known_open_issues": 5,
   "last_known_open_pull_requests": 0,
   "last_known_total_issues": 13,
   "last_known_total_pull_requests": 5,
   "last_checks": {
-    "github_actions": "exact-main CI 30474603232 and release workflow 30476872634 passed on 64f3fd8",
+    "github_actions": "CI 30487430972, CodeQL 30487430875, and release workflow 30487954538 passed on 3835c4d",
     "pr_18": "merged as 64f3fd8 at 2026-07-29T17:16:50Z",
     "dependabot": "alert 1 for quinn-proto 0.11.14 fixed automatically at 2026-07-29T11:32:04Z without dismissal",
     "dependency_reachability": "Quinn is absent from the remote main lockfile, Flatpak sources, and compiled Cargo tree; stable HTTP/2 is active",
     "issue_14_evidence": "controlled graph 33/400/434 to 30/361/392; six offline clean builds show 9.53% lower median user CPU and overlapping elapsed ranges",
     "attention_release_measurement": "three exact-head runs passed; classifier 547-649 ns per decision, ordered actor 2855-3407 ms, final queue depth zero",
-    "cargo_test": "pass: 722 passed and 2 ignored",
+    "cargo_test": "safe remote boundary pass: 782 passed and 3 ignored",
     "release_metadata": "v0.3.0 published at 2026-07-29T18:02:29Z with validated Debian, RPM, Flatpak, and checksum assets",
-    "meson": "compile pass; 16 tests pass",
+    "meson": "integrated compile pass; production WebKitGTK bounded-picker test 1/1 passed",
     "flatpak_manifest": "expansion pass",
     "optional_features": "blocked locally by missing gstreamer-webrtc-1.0 development metadata",
-    "cargo_clippy": "unavailable locally: cargo-clippy 1.87 does not match rustc 1.95; exact-main strict default and native-feature Clippy pass remotely"
+    "cargo_clippy": "unavailable locally: cargo-clippy 1.87 does not match rustc 1.95; exact-main strict default and native-feature Clippy passed remotely",
+    "security_alerts": "0 open Dependabot alerts and 0 open code-scanning alerts after 3835c4d"
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
-    "priority": "implement ISSUE:11 authority first while ISSUE:10 WebKit memory work and ISSUE:12 scheduler contracts proceed at isolated boundaries",
-    "worktree": "main contains the verified v0.3.0 closeout checkpoint; implementation lanes are being established",
+    "priority": "finish ISSUE:11 typed conversation patch delivery; ISSUE:10 picker and ISSUE:12 scheduler foundations await explicit manual phase checkpoints",
+    "worktree": "remote main through 3835c4d is green; local main also contains reviewed ISSUE:11 atomic persistence while typed patch delivery remains isolated",
     "public_actions": "PR:18 merged and v0.3.0 published after explicit checklist approval; no alert dismissal"
   }
 }
