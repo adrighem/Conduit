@@ -181,3 +181,11 @@
 - Report the overlapping elapsed-time ranges without claiming a speedup. The supported improvement is a smaller graph, 9.53% lower median compiler user CPU, and 29 fewer Cargo `Compiling` entries.
 - Correct PR:18 directly after all remaining main-branch content is final. This follows the proven PR:8 approach and avoids another generated closing reference.
 - Keep PR:18 unmerged until the maintainer confirms the real-workspace, installed-desktop, sandbox, and privacy checks that CI cannot perform.
+
+## 2026-07-29 Message Send Responsiveness
+
+- Slack HTTP, Socket Mode, startup authentication, and initial synchronization already run outside GTK on the Tokio runtime. Do not create a second network architecture for this symptom.
+- Remove local GTK work from the Enter-to-WebView path: do not synchronously flush GSettings, clone base64 asset caches, deep-copy workspace render catalogs, or rebuild message history for one realtime insertion.
+- Publish Slack's accepted message to GTK before awaiting recoverable SQLite and thread-catalog persistence.
+- Keep deferred draft deletion durable by marking it pending until GSettings confirms the write and forcing pending state through the close flush.
+- Defer optimistic message rows until Conduit has a server-reconcilable `client_msg_id` design covering API responses, Socket Mode races, retries, and visible error state.

@@ -410,3 +410,44 @@
 - The automated and conditional portions of the pre-tag checklist are recorded in `notes/release-0.3.0.md`.
 - PR:18 remains deferred pending live maintainer confirmation, the two release-note additions, non-closing ISSUE:14 linkage, and corrected-head validation.
 - No issue closure, pull request merge, tag, release, or package publication was performed in this preparation phase.
+
+## 2026-07-29 ISSUE:14 Completion
+
+- Pushed dependency evidence commit `1b1b972`.
+- Exact-main CI `30464468686`, CodeQL `30464466642`, and guarded release automation `30465162150` passed.
+- Closed ISSUE:14 as completed with a link to `docs/dependency-audit.md`.
+- Dependabot alert 1 remains fixed without dismissal.
+
+## 2026-07-29 Message Send Responsiveness
+
+- Confirmed that Slack HTTP, Socket Mode, authentication, initial sync, file transfer, and SQLite store work already run outside GTK.
+- Identified the perceived send stall as synchronous local work around the async request:
+  - GSettings draft serialization before dispatch
+  - complete base64 image-cache copies
+  - deep copies of large render catalogs
+  - full history normalization for one realtime insertion
+  - waiting for recoverable cache persistence before the accepted-message event
+  - unnecessary DOM anchor scans while pinned to the bottom
+- Implemented commit `bbf9539`:
+  - deferred draft writes outside the Enter critical path while preserving close-time durability
+  - shared immutable render catalogs through `Arc`
+  - borrowed image-cache membership data and returned early when no assets are requested
+  - applied realtime message updates in place with timestamp-position lookup
+  - emitted `MessagePosted` before best-effort cache persistence
+  - skipped bottom-pinned DOM anchor discovery
+  - stabilized the initial-sync interaction probe without timing-sensitive double-clicks
+- Added focused tests for event-before-persistence ordering, realtime ordering and cleanup, shared render catalogs, pending draft deletion, and initial-sync interaction.
+- Local sanitized validation:
+  - `cargo fmt --all -- --check`: pass
+  - default `cargo check --locked --all-targets`: pass
+  - Cargo tests: 722 passed and 2 ignored
+  - Meson compile: pass
+  - Meson tests: 16 passed
+  - window-state test: three consecutive isolated passes
+  - optional native-media build remains unavailable locally because `gstreamer-webrtc-1.0` development metadata is absent
+  - local Clippy remains unavailable because Debian's `cargo-clippy` 1.87 does not match Rust 1.95
+- Remote exact-main validation:
+  - CI `30467743525`: pass, including strict default/native Clippy and both Meson configurations
+  - CodeQL `30467741674`: pass for Actions, JavaScript/TypeScript, Python, and Rust
+  - guarded release automation `30468441555`: pass
+- PR:18 regenerated at `41107f0` and includes the send-responsiveness release note. Exact-head CI `30468524296` and CodeQL `30468505063` pass. It remains unmerged pending final note correction, validation of that corrected head, and live checklist confirmation.

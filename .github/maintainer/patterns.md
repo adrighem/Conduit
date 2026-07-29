@@ -123,3 +123,12 @@
 - Weak optional dependency feature edges may still enter `Cargo.lock` and generated offline source manifests without entering the compiled graph. Prefer a supported lower-level feature that makes provider ownership explicit when it removes that unused supply-chain surface.
 - Interleave repeated clean builds and report CPU time separately from wall time. On an interactive laptop, overlapping elapsed ranges can hide a clear reduction in compiler work.
 - Make manual corrections to a generated Release Please branch only after main-branch content is final, because a later generation pass can overwrite both the branch and pull request body.
+
+## 2026-07-29 Message Send Responsiveness
+
+- An asynchronous network request can still feel blocking when GTK performs expensive local work immediately before dispatch or before presenting the response.
+- Never clone a cache whose values contain base64 media merely to test key membership. Borrow the map or maintain a key-only index.
+- Share large immutable render catalogs with copy-on-write snapshots. A one-message DOM patch should not deep-copy the full user, status, group, avatar, or emoji catalog.
+- Best-effort cache persistence should follow the authoritative UI event when a later sync can reconstruct the cache.
+- Deferred persistence needs a shutdown path. Mark pending mutations explicitly, clear the marker only after a successful write, and make close-time flush honor it even when visible editor state is unchanged.
+- Bottom-pinned timeline updates do not need anchor discovery. Avoid whole-timeline scans and forced layout unless preserving a scrolled-up reading position.

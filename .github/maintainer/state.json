@@ -1,28 +1,28 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-29-release-0.3.0-preparation",
-  "last_known_open_issues": 6,
+  "last_manual_run": "2026-07-29-message-send-responsiveness",
+  "last_known_open_issues": 5,
   "last_known_open_pull_requests": 1,
   "last_known_total_issues": 13,
   "last_known_total_pull_requests": 5,
   "last_checks": {
-    "github_actions": "exact-main CI 30450808700, CodeQL 30450808613, and guarded release automation 30451386445 passed on 30e4149",
-    "pr_18": "regenerated and mergeable at 332addb; exact-head CodeQL 30448699855 and replacement CI 30450146868 passed",
+    "github_actions": "exact-main CI 30467743525, CodeQL 30467741674, and guarded release automation 30468441555 passed on bbf9539",
+    "pr_18": "regenerated and mergeable at 41107f0; exact-head CI 30468524296 and CodeQL 30468505063 passed",
     "dependabot": "alert 1 for quinn-proto 0.11.14 fixed automatically at 2026-07-29T11:32:04Z without dismissal",
     "dependency_reachability": "Quinn is absent from the remote main lockfile, Flatpak sources, and compiled Cargo tree; stable HTTP/2 is active",
     "issue_14_evidence": "controlled graph 33/400/434 to 30/361/392; six offline clean builds show 9.53% lower median user CPU and overlapping elapsed ranges",
     "attention_release_measurement": "three exact-head runs passed; classifier 547-649 ns per decision, ordered actor 2855-3407 ms, final queue depth zero",
-    "cargo_test": "pass: 716 passed and 2 ignored",
+    "cargo_test": "pass: 722 passed and 2 ignored",
     "release_metadata": "pass: 10 tests",
     "meson": "compile pass; 16 tests pass",
     "flatpak_manifest": "expansion pass",
     "optional_features": "blocked locally by missing gstreamer-webrtc-1.0 development metadata",
-    "cargo_clippy": "unavailable locally: cargo-clippy 1.87 does not match rustc 1.95"
+    "cargo_clippy": "unavailable locally: cargo-clippy 1.87 does not match rustc 1.95; exact-main strict default and native-feature Clippy pass remotely"
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
-    "priority": "push ISSUE:14 evidence and close it after remote validation; defer PR:18 until live manual checks, release notes, linkage correction, and exact-head validation are complete",
-    "worktree": "no user-owned changes; the maintainer record is kept separate from implementation changes",
-    "public_actions": "pushed the approved dependency cleanup and maintainer records; release automation regenerated PR:18; no issue comment, label, closure, pull request merge, tag, release, or alert dismissal"
+    "priority": "finish the last main documentation push, correct PR:18 notes and ISSUE:14 linkage, validate the exact head, then defer merge until live manual checks are confirmed",
+    "worktree": "message send responsiveness is committed and pushed; only the maintainer record is being updated",
+    "public_actions": "pushed ISSUE:14 evidence and send responsiveness, closed ISSUE:14 as completed, and allowed release automation to regenerate PR:18; no pull request merge, tag, release, or alert dismissal"
   }
 }
