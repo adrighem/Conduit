@@ -114,6 +114,10 @@ pub(crate) enum WorkspaceMutation {
     Hydrate(WorkspaceBootstrapData),
     MembershipSnapshot(SnapshotEnvelope<Vec<SlackConversation>>),
     ConversationUpsert(SlackConversation),
+    ConversationStarChanged {
+        channel_id: String,
+        starred: bool,
+    },
     ConversationRemove {
         channel_id: String,
     },
@@ -228,9 +232,14 @@ impl WorkspacePatch {
 pub(crate) enum StoreChange {
     BootstrapReplaced(WorkspaceBootstrapData),
     ConversationsReplaced(Vec<SlackConversation>),
+    ConversationsRepaired(Vec<SlackConversation>),
     ConversationUpsert(SlackConversation),
     ConversationMetadataUpsert(SlackConversation),
     ConversationMembershipUpsert(SlackConversation),
+    ConversationStarChanged {
+        channel_id: String,
+        starred: bool,
+    },
     ConversationRemoved {
         channel_id: String,
     },
@@ -410,6 +419,10 @@ impl WorkspaceCoordinator {
             WorkspaceMutation::ConversationUpsert(conversation) => {
                 self.apply_conversation_upsert(conversation)
             }
+            WorkspaceMutation::ConversationStarChanged {
+                channel_id,
+                starred,
+            } => self.apply_conversation_star_changed(&channel_id, starred),
             WorkspaceMutation::ConversationRemove { channel_id } => {
                 self.apply_conversation_remove(&channel_id)
             }
@@ -590,11 +603,14 @@ impl WorkspaceCoordinator {
 
     fn apply_conversation_upsert(
         &mut self,
-        conversation: SlackConversation,
+        mut conversation: SlackConversation,
     ) -> Option<WorkspaceReduction> {
         if conversation.id.trim().is_empty() {
             return None;
         }
+        // Generic join/open/invite/details responses do not carry an
+        // authoritative star projection and may finish after a newer toggle.
+        conversation.is_starred = None;
         let revision = self.next_revision();
         let changed = match self.conversations.get_mut(&conversation.id) {
             Some(entry) => {
@@ -643,6 +659,45 @@ impl WorkspaceCoordinator {
             }],
             vec![StoreChange::ConversationRemoved {
                 channel_id: channel_id.to_string(),
+            }],
+        )
+    }
+
+    fn apply_conversation_star_changed(
+        &mut self,
+        channel_id: &str,
+        starred: bool,
+    ) -> Option<WorkspaceReduction> {
+        if channel_id.trim().is_empty()
+            || self
+                .conversations
+                .get(channel_id)
+                .is_some_and(|entry| entry.value.is_starred == Some(starred))
+        {
+            return None;
+        }
+        let revision = self.next_revision();
+        let entry = self
+            .conversations
+            .entry(channel_id.to_string())
+            .or_insert_with(|| RevisionedConversation {
+                value: SlackConversation {
+                    id: channel_id.to_string(),
+                    ..Default::default()
+                },
+                membership_revision: revision,
+                metadata_revision: revision,
+                unread_revision: revision,
+            });
+        entry.value.is_starred = Some(starred);
+        entry.metadata_revision = revision;
+        let conversation = entry.value.clone();
+        self.commit(
+            revision,
+            vec![WorkspaceChange::ConversationUpsert(conversation)],
+            vec![StoreChange::ConversationStarChanged {
+                channel_id: channel_id.to_string(),
+                starred,
             }],
         )
     }
@@ -1786,6 +1841,46 @@ mod tests {
             )))
             .is_none());
         assert_eq!(coordinator.revision().value(), 1);
+    }
+
+    #[test]
+    fn generic_conversation_upsert_cannot_roll_back_an_authoritative_star() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut initial = conversation("C1", "general");
+        initial.is_starred = Some(false);
+        coordinator.apply(WorkspaceMutation::MembershipSnapshot(
+            SnapshotEnvelope::new(WorkspaceRevision::INITIAL, vec![initial]),
+        ));
+        coordinator.apply(WorkspaceMutation::ConversationStarChanged {
+            channel_id: "C1".to_string(),
+            starred: true,
+        });
+
+        let mut delayed = conversation("C1", "renamed");
+        delayed.is_starred = Some(false);
+        let reduction = coordinator
+            .apply(WorkspaceMutation::ConversationUpsert(delayed.clone()))
+            .expect("new metadata should still be applied");
+
+        let current = coordinator.conversation("C1").unwrap();
+        assert_eq!(current.name.as_deref(), Some("renamed"));
+        assert!(current.is_starred());
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::ConversationUpsert(conversation)]
+                if conversation.is_starred()
+        ));
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::ConversationMetadataUpsert(conversation)]
+                if conversation.is_starred()
+        ));
+
+        let revision = coordinator.revision();
+        assert!(coordinator
+            .apply(WorkspaceMutation::ConversationUpsert(delayed))
+            .is_none());
+        assert_eq!(coordinator.revision(), revision);
     }
 
     #[test]

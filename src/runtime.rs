@@ -1352,8 +1352,9 @@ impl WorkspaceReducerAdapter {
         reduction
     }
 
-    /// Returns persisted reductions in revision order, including a recovered
-    /// reduction whose previous store attempt failed.
+    /// Returns persisted reductions in revision order, including recovered
+    /// reductions whose previous store attempts failed. A pending failure does
+    /// not prevent the current mutation from entering the ordered journal.
     async fn apply_persisted(
         &self,
         store: Option<&WorkspaceStore>,
@@ -1361,7 +1362,7 @@ impl WorkspaceReducerAdapter {
         mutation: WorkspaceMutation,
     ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
         let _admission = self.store_batch_admission.lock().await;
-        self.persist_pending_writes(store).await?;
+        let pending_error = self.persist_pending_writes(store).await.err();
 
         let reduction = self.apply(origin, mutation);
         if let Some(reduction) = reduction {
@@ -1376,8 +1377,14 @@ impl WorkspaceReducerAdapter {
                     persisted,
                     repair: false,
                 });
-            self.persist_pending_writes(store).await?;
         }
+
+        // An externally confirmed mutation must enter the coordinator journal
+        // even while an older accepted batch remains temporarily unavailable.
+        if let Some(error) = pending_error {
+            return Err(error);
+        }
+        self.persist_pending_writes(store).await?;
 
         let mut pending = self
             .pending_writes
@@ -1405,7 +1412,7 @@ impl WorkspaceReducerAdapter {
         };
         let Some(batch) = StoreBatch::new(
             revision,
-            vec![StoreChange::ConversationsReplaced(conversations)],
+            vec![StoreChange::ConversationsRepaired(conversations)],
         ) else {
             store.mark_conversation_cache_repaired(recovery_generation);
             return Ok(());
@@ -3929,18 +3936,24 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             api.set_conversation_starred(&channel_id, starred).await?;
             let conversation = SlackConversation {
-                id: channel_id,
+                id: channel_id.clone(),
                 is_starred: Some(starred),
                 ..Default::default()
             };
-            let persistence_error = if let Some(store) = context.workspace_store.as_ref() {
-                store.store_conversation(&conversation).await.err()
-            } else {
-                None
-            };
+            let persistence_error = context
+                .workspace
+                .apply_persisted(
+                    context.workspace_store.as_ref(),
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ConversationStarChanged {
+                        channel_id,
+                        starred,
+                    },
+                )
+                .await
+                .err();
             publish_confirmed_conversation_star(
                 context.events,
-                context.workspace,
                 conversation,
                 persistence_error.as_ref(),
             );
@@ -5079,7 +5092,6 @@ async fn resolve_user_group_display_data(
 
 fn publish_confirmed_conversation_star(
     events: &RuntimeEventSender,
-    workspace: &WorkspaceReducerAdapter,
     conversation: SlackConversation,
     persistence_error: Option<&StoreError>,
 ) {
@@ -5092,10 +5104,6 @@ fn publish_confirmed_conversation_star(
             ),
         );
     }
-    workspace.apply(
-        MutationOrigin::Local,
-        WorkspaceMutation::ConversationUpsert(conversation.clone()),
-    );
     events.send_event(RuntimeEventKind::ConversationStarUpdated(conversation));
 }
 
@@ -6781,6 +6789,166 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![1, 2]
             );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_adapter_journals_an_opposite_confirmed_star_during_consecutive_failure() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-star-retry-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let events = RuntimeEventSender {
+            sender,
+            session: SessionId::default().next(),
+            request: None,
+            fallback: OperationContext::new(
+                RuntimeOperation::ConversationStar,
+                RuntimeTarget::Channel("C1".to_string()),
+            ),
+        };
+
+        runtime.block_on(async {
+            let initial = SlackConversation {
+                id: "C1".into(),
+                is_channel: Some(true),
+                is_starred: Some(false),
+                ..Default::default()
+            };
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![initial.clone()],
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            store
+                .store_conversations(std::slice::from_ref(&initial))
+                .await
+                .unwrap();
+            store
+                .install_conversation_batch_failure_trigger_for("C1")
+                .await
+                .unwrap();
+
+            let first_error = workspace
+                .apply_persisted(
+                    Some(&store),
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ConversationStarChanged {
+                        channel_id: "C1".into(),
+                        starred: true,
+                    },
+                )
+                .await
+                .unwrap_err();
+            publish_confirmed_conversation_star(
+                &events,
+                SlackConversation {
+                    id: "C1".into(),
+                    is_starred: Some(true),
+                    ..Default::default()
+                },
+                Some(&first_error),
+            );
+            assert!(workspace
+                .coordinator
+                .lock()
+                .unwrap()
+                .conversation("C1")
+                .unwrap()
+                .is_starred());
+            assert!(!store.load_conversations().await.unwrap().unwrap()[0].is_starred());
+
+            let second_error = workspace
+                .apply_persisted(
+                    Some(&store),
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ConversationStarChanged {
+                        channel_id: "C1".into(),
+                        starred: false,
+                    },
+                )
+                .await
+                .unwrap_err();
+            publish_confirmed_conversation_star(
+                &events,
+                SlackConversation {
+                    id: "C1".into(),
+                    is_starred: Some(false),
+                    ..Default::default()
+                },
+                Some(&second_error),
+            );
+            assert!(!workspace
+                .coordinator
+                .lock()
+                .unwrap()
+                .conversation("C1")
+                .unwrap()
+                .is_starred());
+            assert!(!store.load_conversations().await.unwrap().unwrap()[0].is_starred());
+            assert!(matches!(
+                receiver.try_recv().unwrap().kind,
+                RuntimeEventKind::ConversationStarUpdated(conversation)
+                    if conversation.is_starred()
+            ));
+            assert!(matches!(
+                receiver.try_recv().unwrap().kind,
+                RuntimeEventKind::ConversationStarUpdated(conversation)
+                    if !conversation.is_starred()
+            ));
+
+            store
+                .clear_conversation_batch_failure_trigger()
+                .await
+                .unwrap();
+            let reductions = workspace
+                .apply_persisted(
+                    Some(&store),
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ConversationStarChanged {
+                        channel_id: "C1".into(),
+                        starred: false,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                reductions
+                    .iter()
+                    .map(|reduction| reduction.patch().revision().value())
+                    .collect::<Vec<_>>(),
+                vec![2, 3]
+            );
+            assert_eq!(
+                reductions
+                    .iter()
+                    .flat_map(|reduction| reduction.patch().changes())
+                    .filter_map(|change| match change {
+                        WorkspaceChange::ConversationUpsert(conversation) => {
+                            conversation.is_starred
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![true, false]
+            );
+            assert!(!store.load_conversations().await.unwrap().unwrap()[0].is_starred());
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -9465,10 +9633,16 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "test cache is read-only",
         ));
+        workspace.apply(
+            MutationOrigin::Local,
+            WorkspaceMutation::ConversationStarChanged {
+                channel_id: "C1".to_string(),
+                starred: true,
+            },
+        );
 
         publish_confirmed_conversation_star(
             &events,
-            &workspace,
             SlackConversation {
                 id: "C1".to_string(),
                 is_starred: Some(true),
@@ -9543,10 +9717,19 @@ mod tests {
                     is_starred: Some(true),
                     ..Default::default()
                 };
-                let persistence_error = toggle_store.store_conversation(&update).await.err();
+                let persistence_error = toggle_workspace
+                    .apply_persisted(
+                        Some(&toggle_store),
+                        MutationOrigin::Local,
+                        WorkspaceMutation::ConversationStarChanged {
+                            channel_id: "C1".to_string(),
+                            starred: true,
+                        },
+                    )
+                    .await
+                    .err();
                 publish_confirmed_conversation_star(
                     &toggle_events,
-                    &toggle_workspace,
                     update,
                     persistence_error.as_ref(),
                 );

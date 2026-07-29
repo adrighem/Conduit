@@ -2681,6 +2681,9 @@ fn apply_store_change(
         StoreChange::ConversationsReplaced(conversations) => {
             sync_conversations(transaction, workspace_key, conversations.into_iter())
         }
+        StoreChange::ConversationsRepaired(conversations) => {
+            sync_repaired_conversations(transaction, workspace_key, workspace_id, conversations)
+        }
         StoreChange::ConversationUpsert(conversation) => {
             require_store_key("conversation", &conversation.id)?;
             upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
@@ -2693,6 +2696,7 @@ fn apply_store_change(
                 workspace_id,
                 conversation,
                 true,
+                false,
             )
         }
         StoreChange::ConversationMembershipUpsert(conversation) => {
@@ -2703,7 +2707,23 @@ fn apply_store_change(
                 workspace_id,
                 conversation,
                 false,
+                true,
             )
+        }
+        StoreChange::ConversationStarChanged {
+            channel_id,
+            starred,
+        } => {
+            require_store_key("conversation star", &channel_id)?;
+            let mut conversation =
+                load_sqlite_conversation(transaction, workspace_key, &channel_id)?.unwrap_or_else(
+                    || SlackConversation {
+                        id: channel_id,
+                        ..Default::default()
+                    },
+                );
+            conversation.is_starred = Some(starred);
+            upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
         }
         StoreChange::ConversationRemoved { channel_id } => {
             require_store_key("conversation", &channel_id)?;
@@ -2784,8 +2804,12 @@ fn upsert_sqlite_conversation_metadata(
     workspace_id: &str,
     conversation: SlackConversation,
     preserve_existing_star: bool,
+    insert_full_if_missing: bool,
 ) -> Result<bool> {
     let existing = load_sqlite_conversation(transaction, workspace_key, &conversation.id)?;
+    if existing.is_none() && insert_full_if_missing {
+        return upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation);
+    }
     let existing_star = if preserve_existing_star {
         existing
             .as_ref()
@@ -2822,6 +2846,49 @@ fn upsert_sqlite_conversation_metadata(
         conversation.is_starred = Some(existing_star);
     }
     upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
+}
+
+fn sync_repaired_conversations(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    workspace_id: &str,
+    conversations: Vec<SlackConversation>,
+) -> Result<bool> {
+    let mut desired = HashSet::new();
+    let mut changed = false;
+    for conversation in conversations {
+        require_store_key("conversation", &conversation.id)?;
+        desired.insert(conversation.id.clone());
+        changed |= upsert_sqlite_conversation_metadata(
+            transaction,
+            workspace_key,
+            workspace_id,
+            conversation,
+            false,
+            true,
+        )?;
+    }
+
+    let existing = {
+        let mut statement = transaction.prepare(
+            "SELECT item_key FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = 'conversation'",
+        )?;
+        let existing = statement
+            .query_map([workspace_key], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        existing
+    };
+    for channel_id in existing {
+        if !desired.contains(&channel_id) {
+            changed |= transaction.execute(
+                "DELETE FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = ?2",
+                params![workspace_key, channel_id],
+            )? > 0;
+        }
+    }
+    Ok(changed)
 }
 
 fn sync_users(
@@ -3662,7 +3729,7 @@ mod tests {
 
             let repair = StoreBatch::new(
                 revision,
-                vec![StoreChange::ConversationsReplaced(vec![
+                vec![StoreChange::ConversationsRepaired(vec![
                     SlackConversation {
                         id: "C1".into(),
                         ..Default::default()
@@ -3701,6 +3768,75 @@ mod tests {
                 store.execute_store_batch(stale).await.unwrap(),
                 StoreBatchExecution::SkippedStale
             );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_store_repair_preserves_a_read_queued_ahead_of_its_transaction() {
+        let directory = temp_cache_dir("coordinator-store-repair-read-race");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let revision = WorkspaceRevision::INITIAL.successor();
+            let stale = SlackConversation {
+                id: "C1".into(),
+                name: Some("general".into()),
+                unread_count: Some(5),
+                extra: HashMap::from([
+                    ("has_unreads".into(), serde_json::json!(true)),
+                    ("last_read".into(), serde_json::json!("1.000")),
+                ]),
+                ..Default::default()
+            };
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![StoreChange::ConversationsReplaced(vec![stale.clone()])],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let repair = StoreBatch::new(
+                revision,
+                vec![StoreChange::ConversationsRepaired(vec![stale])],
+            )
+            .unwrap();
+
+            let (started, writer_started) = tokio::sync::oneshot::channel();
+            let (release_writer, release) = std::sync::mpsc::channel();
+            let blocking_store = store.clone();
+            let blocker = tokio::spawn(async move {
+                blocking_store
+                    .occupy_writer_until(started, release)
+                    .await
+                    .unwrap();
+            });
+            writer_started.await.unwrap();
+
+            let legacy_read = store.advance_conversation_read_cursor("C1", "20.000");
+            tokio::pin!(legacy_read);
+            assert!(matches!(
+                futures_util::poll!(&mut legacy_read),
+                std::task::Poll::Pending
+            ));
+            let repair_write = store.execute_store_repair_batch(repair);
+            tokio::pin!(repair_write);
+            assert!(matches!(
+                futures_util::poll!(&mut repair_write),
+                std::task::Poll::Pending
+            ));
+
+            release_writer.send(()).unwrap();
+            assert!(legacy_read.await.unwrap());
+            repair_write.await.unwrap();
+            blocker.await.unwrap();
+
+            let stored = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(stored[0].last_read_ts(), Some("20.000"));
+            assert_eq!(stored[0].unread_activity_count(), 0);
+            assert!(!stored[0].has_unread_activity());
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -3822,6 +3958,39 @@ mod tests {
             let stored = store.load_conversations().await.unwrap().unwrap();
             assert_eq!(stored[0].is_starred, Some(false));
             assert_eq!(stored[0].last_read_ts(), Some("20.000"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_membership_upsert_inserts_full_unread_state_for_a_new_row() {
+        let directory = temp_cache_dir("coordinator-membership-new-unread");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let batch = StoreBatch::new(
+                WorkspaceRevision::INITIAL.successor(),
+                vec![StoreChange::ConversationMembershipUpsert(
+                    SlackConversation {
+                        id: "D1".into(),
+                        is_im: Some(true),
+                        unread_count: Some(3),
+                        extra: HashMap::from([
+                            ("has_unreads".into(), serde_json::json!(true)),
+                            ("unread_count_display".into(), serde_json::json!(3)),
+                            ("last_read".into(), serde_json::json!("10.000")),
+                        ]),
+                        ..Default::default()
+                    },
+                )],
+            )
+            .unwrap();
+            store.execute_store_batch(batch).await.unwrap();
+
+            let stored = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(stored[0].id, "D1");
+            assert_eq!(stored[0].unread_activity_count(), 3);
+            assert!(stored[0].has_unread_activity());
+            assert_eq!(stored[0].last_read_ts(), Some("10.000"));
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -4012,6 +4181,11 @@ mod tests {
                         name: Some("replace".into()),
                         ..Default::default()
                     }]),
+                    StoreChange::ConversationsRepaired(vec![SlackConversation {
+                        id: "C2".into(),
+                        name: Some("replace".into()),
+                        ..Default::default()
+                    }]),
                     StoreChange::ConversationUpsert(SlackConversation {
                         id: "C3".into(),
                         name: Some("upsert".into()),
@@ -4022,6 +4196,10 @@ mod tests {
                         name: Some("metadata".into()),
                         ..Default::default()
                     }),
+                    StoreChange::ConversationStarChanged {
+                        channel_id: "C3".into(),
+                        starred: false,
+                    },
                     StoreChange::ConversationMembershipUpsert(SlackConversation {
                         id: "C3".into(),
                         is_starred: Some(true),
