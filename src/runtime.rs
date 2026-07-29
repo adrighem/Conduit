@@ -1298,7 +1298,7 @@ impl WorkspaceReducerAdapter {
             .revision()
     }
 
-    fn reduce(
+    fn apply(
         &self,
         origin: MutationOrigin,
         mutation: WorkspaceMutation,
@@ -1355,10 +1355,6 @@ impl WorkspaceReducerAdapter {
     #[cfg(test)]
     fn attention_metrics_snapshot(&self) -> crate::attention_metrics::AttentionMetricsSnapshot {
         self.attention_metrics.snapshot()
-    }
-
-    fn apply(&self, origin: MutationOrigin, mutation: WorkspaceMutation) -> bool {
-        self.reduce(origin, mutation).is_some()
     }
 
     fn update_attention_context(&self, context: WorkspaceAttentionContext) {
@@ -3193,7 +3189,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .load(&channel_id, |progress| {
                     if let ConversationHistoryProgress::Cached(messages) = &progress {
                         cached_attention.extend(snapshot_attention_effects(
-                            context.workspace.reduce(
+                            context.workspace.apply(
                                 MutationOrigin::Cache,
                                 WorkspaceMutation::HistorySnapshot {
                                     channel_id: channel_id.clone(),
@@ -3244,7 +3240,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     page.next_cursor.is_some()
                 ),
             );
-            let attention = snapshot_attention_effects(context.workspace.reduce(
+            let attention = snapshot_attention_effects(context.workspace.apply(
                 MutationOrigin::WebApi,
                 WorkspaceMutation::HistorySnapshot {
                     channel_id: channel_id.clone(),
@@ -3285,7 +3281,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             )
             .await;
             store_merged_history(context.workspace_store, &channel_id, &page.messages).await;
-            let attention = snapshot_attention_effects(context.workspace.reduce(
+            let attention = snapshot_attention_effects(context.workspace.apply(
                 MutationOrigin::WebApi,
                 WorkspaceMutation::HistorySnapshot {
                     channel_id: channel_id.clone(),
@@ -3326,7 +3322,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             )
             .await;
             store_thread(context.workspace_store, &channel_id, &ts, &page.messages).await;
-            let attention = snapshot_attention_effects(context.workspace.reduce(
+            let attention = snapshot_attention_effects(context.workspace.apply(
                 MutationOrigin::WebApi,
                 WorkspaceMutation::ThreadSnapshot {
                     channel_id: channel_id.clone(),
@@ -3380,7 +3376,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 !page.has_more && page.next_cursor.is_none(),
             )
             .await;
-            let attention = snapshot_attention_effects(context.workspace.reduce(
+            let attention = snapshot_attention_effects(context.workspace.apply(
                 MutationOrigin::WebApi,
                 WorkspaceMutation::ThreadSnapshot {
                     channel_id: channel_id.clone(),
@@ -4080,7 +4076,7 @@ fn apply_realtime_workspace_event(
         | SocketModeEvent::Reaction(_)
         | SocketModeEvent::RefreshConversations => None,
     };
-    let reduction = workspace.reduce(MutationOrigin::Realtime, mutation?)?;
+    let reduction = workspace.apply(MutationOrigin::Realtime, mutation?)?;
     reduction
         .effects()
         .iter()
@@ -4625,7 +4621,7 @@ async fn persist_realtime_events(
                     }
                 };
                 let applied_attention = workspace
-                    .reduce(
+                    .apply(
                         MutationOrigin::Realtime,
                         realtime_message_mutation(&outcome.event, delivery),
                     )
@@ -5216,7 +5212,7 @@ async fn apply_browser_unread_snapshot_best_effort(
                 base_revision,
             },
         );
-        if reduced && store_conversation_unread_state(workspace_store, &snapshot).await {
+        if reduced.is_some() && store_conversation_unread_state(workspace_store, &snapshot).await {
             accepted.push(snapshot);
         }
     }
@@ -5334,13 +5330,15 @@ async fn refresh_conversation_unread_states_best_effort(
                         ),
                     );
                     let unread_accepted = unread_state.known
-                        && workspace.apply(
-                            MutationOrigin::WebApi,
-                            WorkspaceMutation::UnreadChanged {
-                                snapshot: unread_snapshot.clone(),
-                                base_revision: unread_base_revision,
-                            },
-                        );
+                        && workspace
+                            .apply(
+                                MutationOrigin::WebApi,
+                                WorkspaceMutation::UnreadChanged {
+                                    snapshot: unread_snapshot.clone(),
+                                    base_revision: unread_base_revision,
+                                },
+                            )
+                            .is_some();
                     if unread_accepted
                         && store_conversation_unread_state(workspace_store, &unread_snapshot).await
                     {
@@ -5453,7 +5451,7 @@ async fn prefetch_channel_histories_best_effort(
         let base_revision = workspace.reducer.revision();
         match api.history(&channel_id).await {
             Ok(page) => {
-                let attention = snapshot_attention_effects(workspace.reducer.reduce(
+                let attention = snapshot_attention_effects(workspace.reducer.apply(
                     MutationOrigin::WebApi,
                     WorkspaceMutation::HistorySnapshot {
                         channel_id: channel_id.clone(),
@@ -5474,13 +5472,16 @@ async fn prefetch_channel_histories_best_effort(
                     unread_state: page.unread_state,
                     ..Default::default()
                 };
-                let unread_accepted = workspace.reducer.apply(
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::UnreadChanged {
-                        snapshot: unread_snapshot.clone(),
-                        base_revision,
-                    },
-                );
+                let unread_accepted = workspace
+                    .reducer
+                    .apply(
+                        MutationOrigin::WebApi,
+                        WorkspaceMutation::UnreadChanged {
+                            snapshot: unread_snapshot.clone(),
+                            base_revision,
+                        },
+                    )
+                    .is_some();
                 if unread_accepted
                     && store_conversation_unread_state(workspace.store, &unread_snapshot).await
                 {
@@ -6020,7 +6021,7 @@ async fn load_cached_thread(
                     messages.len()
                 ),
             );
-            let attention = snapshot_attention_effects(workspace.reduce(
+            let attention = snapshot_attention_effects(workspace.apply(
                 MutationOrigin::Cache,
                 WorkspaceMutation::ThreadSnapshot {
                     channel_id: channel_id.to_string(),
@@ -6181,6 +6182,146 @@ mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::workspace_pipeline::{StoreChange, WorkspaceChange};
+
+    fn conversation_patch_summary(
+        changes: &[WorkspaceChange],
+    ) -> Vec<(&'static str, String, Option<String>)> {
+        let mut summary = changes
+            .iter()
+            .filter_map(|change| match change {
+                WorkspaceChange::ConversationUpsert(conversation) => {
+                    Some(("upsert", conversation.id.clone(), conversation.name.clone()))
+                }
+                WorkspaceChange::ConversationRemoved { channel_id } => {
+                    Some(("remove", channel_id.clone(), None))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        summary.sort();
+        summary
+    }
+
+    fn conversation_store_summary(
+        changes: &[StoreChange],
+    ) -> Vec<(&'static str, String, Option<String>)> {
+        let mut summary = changes
+            .iter()
+            .filter_map(|change| match change {
+                StoreChange::ConversationUpsert(conversation) => {
+                    Some(("upsert", conversation.id.clone(), conversation.name.clone()))
+                }
+                StoreChange::ConversationRemoved { channel_id } => {
+                    Some(("remove", channel_id.clone(), None))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        summary.sort();
+        summary
+    }
+
+    #[test]
+    fn workspace_adapter_returns_authoritative_conversation_membership_commit() {
+        let workspace = WorkspaceReducerAdapter::default();
+        let general = SlackConversation {
+            id: "C1".into(),
+            name: Some("general".into()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let removable = SlackConversation {
+            id: "C_OLD".into(),
+            name: Some("old".into()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        workspace
+            .apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    conversations: vec![general.clone(), removable],
+                    ..Default::default()
+                }),
+            )
+            .expect("cache hydration should return its authoritative commit");
+        let snapshot_base = workspace.revision();
+
+        let mut renamed = general.clone();
+        renamed.name = Some("announcements".into());
+        workspace
+            .apply(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::ConversationUpsert(renamed.clone()),
+            )
+            .expect("realtime metadata should return its authoritative commit");
+        let local_membership = SlackConversation {
+            id: "C_LOCAL".into(),
+            name: Some("joined-during-request".into()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        workspace
+            .apply(
+                MutationOrigin::Local,
+                WorkspaceMutation::ConversationUpsert(local_membership.clone()),
+            )
+            .expect("local membership should return its authoritative commit");
+
+        let discovered = SlackConversation {
+            id: "C2".into(),
+            name: Some("new-channel".into()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let reduction = workspace
+            .apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
+                    snapshot_base,
+                    vec![general, discovered],
+                )),
+            )
+            .expect("membership changes should return one authoritative commit");
+
+        let expected = vec![
+            ("remove", "C_OLD".to_string(), None),
+            ("upsert", "C2".to_string(), Some("new-channel".to_string())),
+        ];
+        assert_eq!(
+            conversation_patch_summary(reduction.patch().changes()),
+            expected
+        );
+        let store_batch = reduction
+            .store_batch()
+            .expect("conversation membership must be persisted");
+        assert_eq!(store_batch.revision(), reduction.patch().revision());
+        assert_eq!(
+            conversation_store_summary(store_batch.changes()),
+            expected,
+            "the patch and store batch must describe the same authority change"
+        );
+
+        assert!(
+            workspace
+                .apply(
+                    MutationOrigin::Realtime,
+                    WorkspaceMutation::ConversationUpsert(renamed),
+                )
+                .is_none(),
+            "a stale snapshot must not overwrite newer realtime metadata"
+        );
+        assert!(
+            workspace
+                .apply(
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ConversationUpsert(local_membership),
+                )
+                .is_none(),
+            "a stale snapshot must not remove newer local membership"
+        );
+    }
 
     #[test]
     fn workspace_adapter_orders_cache_web_local_and_realtime_mutations() {
@@ -6191,61 +6332,71 @@ mod tests {
             is_channel: Some(true),
             ..Default::default()
         };
-        assert!(workspace.apply(
-            MutationOrigin::Cache,
-            WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
-                conversations: vec![conversation.clone()],
-                ..Default::default()
-            }),
-        ));
+        assert!(workspace
+            .apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    conversations: vec![conversation.clone()],
+                    ..Default::default()
+                }),
+            )
+            .is_some());
 
         let base_revision = workspace.revision();
         let mut renamed = conversation;
         renamed.name = Some("announcements".into());
-        assert!(workspace.apply(
-            MutationOrigin::WebApi,
-            WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
-                base_revision,
-                vec![renamed],
-            )),
-        ));
+        assert!(workspace
+            .apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
+                    base_revision,
+                    vec![renamed],
+                )),
+            )
+            .is_some());
 
         let posted = SlackMessage {
             ts: "1.000".into(),
             text: Some("sent".into()),
             ..Default::default()
         };
-        assert!(workspace.apply(
-            MutationOrigin::Local,
-            WorkspaceMutation::MessageChanged {
-                channel_id: "C1".into(),
-                message: posted.clone(),
-                kind: MessageMutationKind::Posted,
-                origin: MutationOrigin::Local,
-            },
-        ));
+        assert!(workspace
+            .apply(
+                MutationOrigin::Local,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".into(),
+                    message: posted.clone(),
+                    kind: MessageMutationKind::Posted,
+                    origin: MutationOrigin::Local,
+                },
+            )
+            .is_some());
 
         let mut edited = posted;
         edited.text = Some("edited".into());
-        assert!(workspace.apply(
-            MutationOrigin::Realtime,
-            WorkspaceMutation::MessageChanged {
-                channel_id: "C1".into(),
-                message: edited.clone(),
-                kind: MessageMutationKind::Changed,
-                origin: MutationOrigin::Realtime,
-            },
-        ));
+        assert!(workspace
+            .apply(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".into(),
+                    message: edited.clone(),
+                    kind: MessageMutationKind::Changed,
+                    origin: MutationOrigin::Realtime,
+                },
+            )
+            .is_some());
         assert_eq!(workspace.revision().value(), 4);
-        assert!(!workspace.apply(
-            MutationOrigin::Realtime,
-            WorkspaceMutation::MessageChanged {
-                channel_id: "C1".into(),
-                message: edited,
-                kind: MessageMutationKind::Changed,
-                origin: MutationOrigin::Realtime,
-            },
-        ));
+        assert!(workspace
+            .apply(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".into(),
+                    message: edited,
+                    kind: MessageMutationKind::Changed,
+                    origin: MutationOrigin::Realtime,
+                },
+            )
+            .is_none());
         assert_eq!(workspace.revision().value(), 4);
     }
 
@@ -6352,15 +6503,17 @@ mod tests {
             0
         );
 
-        assert!(workspace.apply(
-            MutationOrigin::Realtime,
-            WorkspaceMutation::MessageChanged {
-                channel_id: "D1".into(),
-                message,
-                kind: MessageMutationKind::Posted,
-                origin: MutationOrigin::Realtime,
-            },
-        ));
+        assert!(workspace
+            .apply(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: "D1".into(),
+                    message,
+                    kind: MessageMutationKind::Posted,
+                    origin: MutationOrigin::Realtime,
+                },
+            )
+            .is_some());
         let metrics = workspace.attention_metrics_snapshot();
         assert_eq!(metrics.committed_decisions, 1);
         assert_eq!(metrics.unread_decisions, 1);
@@ -6406,7 +6559,7 @@ mod tests {
             ..AttentionPreferences::default()
         });
         let reduction = workspace
-            .reduce(
+            .apply(
                 MutationOrigin::Realtime,
                 WorkspaceMutation::MessageChanged {
                     channel_id: "D1".into(),
@@ -7826,7 +7979,7 @@ mod tests {
                 reply_users: Some(vec!["U_SELF".into()]),
                 ..Default::default()
             };
-            workspace.reduce(
+            workspace.apply(
                 MutationOrigin::Cache,
                 WorkspaceMutation::HistorySnapshot {
                     channel_id: "C1".into(),
@@ -7998,7 +8151,7 @@ mod tests {
                 .unread_activity_count();
             assert_eq!(before_reconciliation, 700);
             assert!(workspace
-                .reduce(
+                .apply(
                     MutationOrigin::WebApi,
                     WorkspaceMutation::HistorySnapshot {
                         channel_id: "C1".into(),
@@ -8014,7 +8167,7 @@ mod tests {
                 )
                 .is_none());
             assert!(workspace
-                .reduce(
+                .apply(
                     MutationOrigin::WebApi,
                     WorkspaceMutation::HistorySnapshot {
                         channel_id: "D1".into(),
@@ -8030,7 +8183,7 @@ mod tests {
                 )
                 .is_none());
             assert!(workspace
-                .reduce(
+                .apply(
                     MutationOrigin::WebApi,
                     WorkspaceMutation::ThreadSnapshot {
                         channel_id: "C1".into(),
