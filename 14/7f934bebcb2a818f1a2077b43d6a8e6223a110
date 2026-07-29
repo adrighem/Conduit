@@ -1,0 +1,20 @@
+Conductor task: Add redacted queue counters and saturation regression coverage
+
+Summary:
+- Added redacted scalar counters for admission, live depths, coalescing, cancellation, completion, failure, retry, freshness skips, rejection reasons, high-water marks, and shutdown phase.
+- Defined and tested exact admission conservation without exposing job, target, or cancellation identities.
+- Added saturation, full-capacity replacement, invalid-operation neutrality, and durable shutdown burst coverage.
+
+Modified files:
+- src/sync_scheduler.rs
+
+Verification:
+- Red phase: 13 missing counter API errors.
+- Sanitized scheduler suite passed: 50 passed.
+- Sanitized full suite passed: 782 passed, 3 ignored.
+- cargo check, cargo fmt --check, and git diff --check passed.
+- Independent counter review found no remaining accounting or redaction issues.
+- No coverage tool is configured.
+
+Rationale:
+Bounded work must be observable and auditable without leaking target identities or private workspace content.
