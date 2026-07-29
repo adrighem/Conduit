@@ -1,0 +1,24 @@
+Conductor task: Execute each coordinator StoreBatch atomically and in revision order
+
+Summary:
+- Completed transaction-time membership and repair merging so new rows retain unread state and newer legacy read overlays survive.
+- Routed confirmed star changes through a dedicated authoritative mutation and ordered persistence journal.
+- Admitted newer confirmed intents behind failed older batches and stripped star changes from generic metadata upserts.
+- Preserved atomic removal, repair, no-op, and revision rules.
+
+Modified files:
+- src/runtime.rs
+- src/store.rs
+- src/workspace_pipeline.rs
+
+Verification:
+- Red phase caught missing membership unread, repair/star contracts, delayed generic star rollback, and opposite-toggle ordering.
+- Sanitized focused suites passed: workspace adapter 9, conversation star 8, coordinator/store 17.
+- Sanitized full suite passed: 740 passed, 2 ignored.
+- cargo check, cargo fmt --check, and git diff --check passed.
+- Final independent review found no high or medium findings.
+- Strict Clippy was unavailable locally because the installed driver is Rust 1.87 and the project requires 1.88; CI provides the strict lint gate.
+- No coverage tool is configured.
+
+Rationale:
+The final authority boundary must keep coordinator, cache, and presentation revisions ordered through failures, cancellation, recovery, and overlapping Slack responses.
