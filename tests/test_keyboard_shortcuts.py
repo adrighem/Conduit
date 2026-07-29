@@ -93,14 +93,17 @@ def focus_window(window_id: str) -> None:
         if active.returncode == 0 and active.stdout.strip() == window_id:
             break
         try:
-            subprocess.run(
-                ["xdotool", "windowactivate", window_id],
+            activation = subprocess.run(
+                ["xdotool", "windowactivate", "--sync", window_id],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=1,
+                timeout=2,
             )
         except subprocess.TimeoutExpired:
-            pass
+            activation = None
+        if activation is not None and activation.returncode != 0:
+            time.sleep(0.1)
+            continue
         time.sleep(0.1)
     else:
         raise AssertionError(f"window {window_id} did not become activatable")
