@@ -1,0 +1,3 @@
+Issue #11 Phase 3 task 3: revisioned conversation WorkspacePatch delivery.
+
+Validated with sanitized full suite: 807 passed, 3 ignored; focused workspace adapter, star, request, typed removal, formatting, cargo check, diff check; independent review found no high or medium findings.
