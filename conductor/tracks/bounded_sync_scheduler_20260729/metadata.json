@@ -1,0 +1,8 @@
+{
+  "track_id": "bounded_sync_scheduler_20260729",
+  "type": "performance",
+  "status": "in_progress",
+  "created_at": "2026-07-29T18:55:04Z",
+  "updated_at": "2026-07-29T18:55:04Z",
+  "description": "Define bounded, prioritized, coalescing synchronization admission before runtime integration."
+}

@@ -1,0 +1,17 @@
+# Bounded Synchronization Scheduler Plan
+
+## Phase 1: Scheduler contracts and deterministic core
+
+- [~] Task: Add failing tests for SyncJob identity, durability, priority, freshness, and replacement
+- [ ] Task: Implement bounded pre-spawn admission with priority and starvation protection
+- [ ] Task: Add target-aware coalescing, cancellation, retry, and shutdown behavior
+- [ ] Task: Add redacted queue counters and saturation regression coverage
+- [ ] Task: Conductor - User Manual Verification 'Scheduler contracts and deterministic core' (Protocol in workflow.md)
+
+## Phase 2: Authoritative runtime integration
+
+- [ ] Task: Integrate the scheduler after the issue #11 conversation-authority slice
+- [ ] Task: Move startup, navigation, refresh, and membership scheduling onto bounded admission
+- [ ] Task: Enforce exact startup enrichment, history, and user-directory limits
+- [ ] Task: Validate supersession, durable actions, read markers, retries, and clean shutdown
+- [ ] Task: Conductor - User Manual Verification 'Authoritative runtime scheduler integration' (Protocol in workflow.md)

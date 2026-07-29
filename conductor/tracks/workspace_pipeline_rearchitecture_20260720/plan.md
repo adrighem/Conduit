@@ -17,15 +17,24 @@
 - [x] Task: Preserve read overlays and deduplicate message/send/echo identities with timeline invariants a7e44a2
 - [x] Task: Conductor - User Manual Verification 'Canonical reducer pipeline' (Protocol in workflow.md) 854789b
 
-## Phase 3: Bounded synchronization and backpressure
+## Phase 3: Authoritative conversation adoption
 
-- [ ] Task: Define and test SyncJob priorities, freshness, coalescing, cancellation, and bounded lanes
+- [~] Task: Define failing end-to-end tests for authoritative conversation membership and metadata
+- [ ] Task: Execute each coordinator StoreBatch atomically and in revision order
+- [ ] Task: Deliver revisioned conversation WorkspacePatch values to presentation
+- [ ] Task: Route cache, API, and realtime conversation changes through the coordinator
+- [ ] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations
+- [ ] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md)
+
+## Phase 4: Bounded synchronization and backpressure
+
+- [ ] Task: Integrate the validated bounded SyncJob scheduler after authoritative conversation adoption
 - [ ] Task: Move startup, manual refresh, navigation, and membership-event scheduling onto the bounded scheduler
 - [ ] Task: Enforce startup enrichment/history limits and lazy 24-hour user-directory loading
 - [ ] Task: Add scheduler/API tracing counters and no-realtime stale-check behavior
 - [ ] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md)
 
-## Phase 4: Incremental GTK and WebKit presentation
+## Phase 5: Incremental GTK and WebKit presentation
 
 - [ ] Task: Define SidebarProjection keyed splice/update/reset behavior with 1,430-row regression tests
 - [ ] Task: Migrate the sidebar to GtkListView, gio::ListStore, and stable single selection
@@ -34,7 +43,7 @@
 - [ ] Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers
 - [ ] Task: Conductor - User Manual Verification 'Incremental GTK and WebKit presentation' (Protocol in workflow.md)
 
-## Phase 5: Expansion and cleanup
+## Phase 6: Expansion and cleanup
 
 - [ ] Task: Migrate remaining workspace surfaces onto coordinator intents and projections
 - [ ] Task: Remove whole-state storage, raw realtime UI events, broad invalidations, and routine reload adapters
