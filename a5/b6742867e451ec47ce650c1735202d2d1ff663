@@ -1,0 +1,20 @@
+Conductor task: Add failing tests for SyncJob identity, durability, priority, freshness, and replacement
+
+Summary:
+- Added opaque typed scheduler identities and targets.
+- Defined interactive, foreground, and maintenance priorities.
+- Enforced durable action/read-marker contracts against replacement and freshness skipping.
+- Added deterministic freshness and bounded retry decisions.
+
+Modified files:
+- src/main.rs
+- src/sync_scheduler.rs
+
+Verification:
+- Red phase: 54 E0425/E0433 errors proved all scheduler contracts were absent.
+- Sanitized focused scheduler tests passed: 4 passed.
+- Sanitized cargo check --no-default-features passed.
+- cargo fmt passed.
+
+Rationale:
+These pure contracts establish safety invariants before any capacity or runtime integration is introduced.
