@@ -45,7 +45,7 @@ use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::emoji::{
     emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
-    EmojiPickerModel, EmojiPickerMove, EmojiValue,
+    EmojiPickerGenerationGate, EmojiPickerModel, EmojiPickerMove, EmojiPickerQuery, EmojiValue,
 };
 use crate::huddles::fallback::external_huddle_url;
 use crate::huddles::presentation::{present_huddle, HuddlePrimaryAction};
@@ -364,6 +364,7 @@ mod imp {
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
         pub custom_emojis: RefCell<Arc<HashMap<String, String>>>,
+        pub reaction_emoji_picker_model: RefCell<Option<Arc<EmojiPickerModel>>>,
         pub realtime_status: Cell<RealtimeStatus>,
         pub(super) message_composer_completion: RefCell<Option<ComposerCompletion>>,
         pub(super) thread_composer_completion: RefCell<Option<ComposerCompletion>>,
@@ -704,6 +705,9 @@ const UI_EVENT_BATCH_LIMIT: usize = 8;
 const MAX_PENDING_SLACK_URIS: usize = 16;
 const MAX_PENDING_MESSAGE_NOTIFICATIONS: usize = 128;
 const PICKER_POPULATION_BATCH_SIZE: usize = 24;
+const EMOJI_PICKER_MESSAGE_HANDLER: &str = "conduitEmojiPicker";
+const APPLY_EMOJI_PICKER_RESULT_SCRIPT: &str =
+    "window.conduitReceiveEmojiPickerResult(JSON.parse(payload));";
 const CANCEL_REACTION_PICKER_SCRIPT: &str = r#"(function () {
   const picker = document.getElementById("emoji-picker");
   if (!picker || !picker.open) return false;
@@ -2540,6 +2544,17 @@ fn query_param(url: &url::Url, name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+fn emoji_picker_query_from_json(json: &str) -> Option<EmojiPickerQuery> {
+    serde_json::from_str(json).ok()
+}
+
+fn emoji_picker_query_from_value(
+    value: &webkit6::javascriptcore::Value,
+) -> Option<EmojiPickerQuery> {
+    let json = value.to_json(0)?;
+    emoji_picker_query_from_json(json.as_str())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimelineLifecycleAction {
     Positioned(u64),
@@ -3640,14 +3655,37 @@ impl ConduitWindow {
     ) -> webkit6::WebView {
         let settings = webkit6::Settings::new();
         configure_message_web_view_settings(&settings);
+        let user_content_manager = webkit6::UserContentManager::new();
+        let picker_handler_registered = user_content_manager
+            .register_script_message_handler(EMOJI_PICKER_MESSAGE_HANDLER, None);
 
         let web_view = webkit6::WebView::builder()
             .network_session(network_session)
             .settings(&settings)
+            .user_content_manager(&user_content_manager)
             .build();
         web_view.set_hexpand(true);
         web_view.set_vexpand(true);
         web_view.set_zoom_level(text_zoom);
+
+        if picker_handler_registered {
+            let weak_window = self.downgrade();
+            let weak_web_view = web_view.downgrade();
+            let generation_gate = Rc::new(RefCell::new(EmojiPickerGenerationGate::default()));
+            user_content_manager.connect_script_message_received(
+                Some(EMOJI_PICKER_MESSAGE_HANDLER),
+                move |_, value| {
+                    let Some(window) = weak_window.upgrade() else {
+                        return;
+                    };
+                    let Some(web_view) = weak_web_view.upgrade() else {
+                        return;
+                    };
+                    let mut generation_gate = generation_gate.borrow_mut();
+                    window.handle_emoji_picker_query(&web_view, &mut generation_gate, value);
+                },
+            );
+        }
 
         let weak_window = self.downgrade();
         web_view.connect_decide_policy(move |_, decision, decision_type| {
@@ -3673,6 +3711,48 @@ impl ConduitWindow {
         });
 
         web_view
+    }
+
+    fn reaction_emoji_picker_model(&self) -> Arc<EmojiPickerModel> {
+        if let Some(model) = self.imp().reaction_emoji_picker_model.borrow().as_ref() {
+            return model.clone();
+        }
+        let model = Arc::new(EmojiPickerModel::new(
+            EmojiCatalog::new(&self.imp().custom_emojis.borrow()).entries(),
+        ));
+        *self.imp().reaction_emoji_picker_model.borrow_mut() = Some(model.clone());
+        model
+    }
+
+    fn handle_emoji_picker_query(
+        &self,
+        web_view: &webkit6::WebView,
+        generation_gate: &mut EmojiPickerGenerationGate,
+        value: &webkit6::javascriptcore::Value,
+    ) {
+        let Some(query) = emoji_picker_query_from_value(value) else {
+            return;
+        };
+        let Some(result) = self.reaction_emoji_picker_model().query(&query) else {
+            return;
+        };
+        if !generation_gate.accept(query.generation) {
+            return;
+        }
+        let Ok(payload) = serde_json::to_string(&result) else {
+            return;
+        };
+        let arguments = glib::VariantDict::new(None);
+        arguments.insert("payload", payload.as_str());
+        let arguments = arguments.end();
+        web_view.call_async_javascript_function(
+            APPLY_EMOJI_PICKER_RESULT_SCRIPT,
+            Some(&arguments),
+            None,
+            None,
+            None::<&gio::Cancellable>,
+            |_| {},
+        );
     }
 
     fn setup_reaction_picker_escape_fallback(&self) {
@@ -6835,6 +6915,7 @@ impl ConduitWindow {
 
     fn replace_custom_emojis(&self, emojis: HashMap<String, String>) {
         *self.imp().custom_emojis.borrow_mut() = Arc::new(emojis);
+        self.imp().reaction_emoji_picker_model.borrow_mut().take();
         if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
             state
                 .emoji_picker
@@ -10925,6 +11006,35 @@ mod tests {
         assert!(CANCEL_REACTION_PICKER_SCRIPT.contains("picker.open"));
         assert!(CANCEL_REACTION_PICKER_SCRIPT
             .contains("picker.dispatchEvent(new Event(\"cancel\", { cancelable: true }))"));
+    }
+
+    #[test]
+    fn emoji_picker_bridge_accepts_only_the_typed_query_shape() {
+        let query = emoji_picker_query_from_json(
+            r#"{"version":1,"generation":42,"query":"party parr","category":null,"offset":64}"#,
+        )
+        .unwrap();
+
+        assert_eq!(query.version, 1);
+        assert_eq!(query.generation, 42);
+        assert_eq!(query.query, "party parr");
+        assert_eq!(query.category, None);
+        assert_eq!(query.offset, 64);
+        assert!(emoji_picker_query_from_json(
+            r#"{"version":1,"generation":42,"query":"","category":null,"offset":0,"extra":true}"#
+        )
+        .is_none());
+        assert!(emoji_picker_query_from_json("not-json").is_none());
+    }
+
+    #[test]
+    fn emoji_picker_bridge_passes_serialized_data_as_a_function_argument() {
+        assert_eq!(
+            APPLY_EMOJI_PICKER_RESULT_SCRIPT,
+            "window.conduitReceiveEmojiPickerResult(JSON.parse(payload));"
+        );
+        assert!(!APPLY_EMOJI_PICKER_RESULT_SCRIPT.contains("${"));
+        assert!(!APPLY_EMOJI_PICKER_RESULT_SCRIPT.contains("entries"));
     }
 
     #[test]

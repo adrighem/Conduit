@@ -1,6 +1,24 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::search::{SearchField, SearchQuery, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT};
+
+pub const EMOJI_PICKER_PROTOCOL_VERSION: u8 = 1;
+pub const EMOJI_PICKER_RESULT_LIMIT: usize = 64;
+pub const EMOJI_PICKER_MAX_QUERY_CHARS: usize = 128;
+pub const EMOJI_PICKER_CATEGORIES: &[&str] = &[
+    "Smileys",
+    "People",
+    "Nature",
+    "Food",
+    "Travel",
+    "Activities",
+    "Objects",
+    "Symbols",
+    "Flags",
+    "Workspace",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmojiValue {
@@ -77,6 +95,83 @@ pub struct EmojiPickerModel {
     entries: Vec<EmojiEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmojiPickerQuery {
+    pub version: u8,
+    pub generation: u64,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EmojiPickerResult {
+    pub version: u8,
+    pub generation: u64,
+    pub offset: usize,
+    pub total: usize,
+    pub has_previous: bool,
+    pub has_more: bool,
+    pub entries: Vec<EmojiPickerResultEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EmojiPickerResultEntry {
+    pub name: String,
+    pub label: String,
+    pub category: &'static str,
+    pub accessible_label: String,
+    pub value_kind: EmojiPickerResultValueKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmojiPickerResultValueKind {
+    Unicode,
+    CustomImage,
+}
+
+impl From<&EmojiEntry> for EmojiPickerResultEntry {
+    fn from(entry: &EmojiEntry) -> Self {
+        let (value_kind, value) = match &entry.value {
+            EmojiValue::Unicode(value) => {
+                (EmojiPickerResultValueKind::Unicode, (*value).to_string())
+            }
+            EmojiValue::CustomImage(value) => {
+                (EmojiPickerResultValueKind::CustomImage, value.clone())
+            }
+        };
+        Self {
+            name: entry.name.clone(),
+            label: entry.label.clone(),
+            category: entry.category,
+            accessible_label: emoji_picker_accessible_label(entry),
+            value_kind,
+            value,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct EmojiPickerGenerationGate {
+    latest: u64,
+}
+
+impl EmojiPickerGenerationGate {
+    pub fn accept(&mut self, generation: u64) -> bool {
+        if generation == 0 || generation <= self.latest {
+            return false;
+        }
+        self.latest = generation;
+        true
+    }
+}
+
 impl EmojiPickerModel {
     pub fn new(entries: Vec<EmojiEntry>) -> Self {
         Self { entries }
@@ -87,11 +182,57 @@ impl EmojiPickerModel {
     }
 
     pub fn search(&self, query: &str) -> Vec<EmojiEntry> {
+        self.ranked_entries(query).into_iter().cloned().collect()
+    }
+
+    pub fn query(&self, request: &EmojiPickerQuery) -> Option<EmojiPickerResult> {
+        if request.version != EMOJI_PICKER_PROTOCOL_VERSION
+            || request.generation == 0
+            || request.query.chars().count() > EMOJI_PICKER_MAX_QUERY_CHARS
+            || request
+                .category
+                .as_deref()
+                .is_some_and(|category| !EMOJI_PICKER_CATEGORIES.contains(&category))
+        {
+            return None;
+        }
+
+        let query = request.query.trim();
+        let mut matches = if query.is_empty() {
+            self.entries.iter().collect::<Vec<_>>()
+        } else {
+            self.ranked_entries(query)
+        };
+        if let Some(category) = request.category.as_deref() {
+            matches.retain(|entry| entry.category == category);
+        }
+
+        let total = matches.len();
+        let offset = request.offset.min(total);
+        let entries = matches
+            .into_iter()
+            .skip(offset)
+            .take(EMOJI_PICKER_RESULT_LIMIT)
+            .map(EmojiPickerResultEntry::from)
+            .collect::<Vec<_>>();
+        let has_more = offset + entries.len() < total;
+
+        Some(EmojiPickerResult {
+            version: EMOJI_PICKER_PROTOCOL_VERSION,
+            generation: request.generation,
+            offset,
+            total,
+            has_previous: offset > 0,
+            has_more,
+            entries,
+        })
+    }
+
+    fn ranked_entries(&self, query: &str) -> Vec<&EmojiEntry> {
         let query = SearchQuery::parse(query);
         let mut matches = self
             .entries()
             .iter()
-            .cloned()
             .enumerate()
             .filter_map(|(index, entry)| {
                 let score = query.score([
@@ -279,6 +420,166 @@ mod tests {
         assert_eq!(
             move_emoji_picker_selection(Some(0), 0, EmojiPickerMove::Next),
             None
+        );
+    }
+
+    #[test]
+    fn picker_queries_are_generation_scoped_and_bounded() {
+        let custom = (0..(EMOJI_PICKER_RESULT_LIMIT + 20))
+            .map(|index| {
+                (
+                    format!("workspace_{index:03}"),
+                    format!("https://emoji.example/{index:03}.png"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let model = EmojiPickerModel::new(EmojiCatalog::new(&custom).entries());
+        let request = EmojiPickerQuery {
+            version: EMOJI_PICKER_PROTOCOL_VERSION,
+            generation: 7,
+            query: String::new(),
+            category: Some("Workspace".to_string()),
+            offset: 0,
+        };
+
+        let result = model
+            .query(&request)
+            .expect("valid picker query should return a result");
+
+        assert_eq!(result.generation, 7);
+        assert_eq!(result.entries.len(), EMOJI_PICKER_RESULT_LIMIT);
+        assert_eq!(result.total, EMOJI_PICKER_RESULT_LIMIT + 20);
+        assert!(result.has_more);
+        assert!(result
+            .entries
+            .iter()
+            .all(|entry| entry.category == "Workspace"));
+
+        let next_page = model
+            .query(&EmojiPickerQuery {
+                offset: EMOJI_PICKER_RESULT_LIMIT,
+                generation: 8,
+                ..request
+            })
+            .unwrap();
+        assert_eq!(next_page.entries.len(), 20);
+        assert!(next_page.has_previous);
+        assert!(!next_page.has_more);
+    }
+
+    #[test]
+    fn picker_query_pages_preserve_search_and_custom_emoji() {
+        let custom = HashMap::from([
+            (
+                "party_parrot".to_string(),
+                "https://emoji.example/parrot.gif".to_string(),
+            ),
+            (
+                "party_penguin".to_string(),
+                "https://emoji.example/penguin.gif".to_string(),
+            ),
+        ]);
+        let model = EmojiPickerModel::new(EmojiCatalog::new(&custom).entries());
+        let request = EmojiPickerQuery {
+            version: EMOJI_PICKER_PROTOCOL_VERSION,
+            generation: 9,
+            query: "party parr".to_string(),
+            category: None,
+            offset: 0,
+        };
+
+        let result = model.query(&request).unwrap();
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["party_parrot"]
+        );
+        assert_eq!(
+            result.entries[0].value_kind,
+            EmojiPickerResultValueKind::CustomImage
+        );
+        assert_eq!(result.entries[0].value, "https://emoji.example/parrot.gif");
+    }
+
+    #[test]
+    fn picker_generation_gate_rejects_zero_repeated_and_stale_requests() {
+        let mut gate = EmojiPickerGenerationGate::default();
+
+        assert!(!gate.accept(0));
+        assert!(gate.accept(4));
+        assert!(!gate.accept(4));
+        assert!(!gate.accept(3));
+        assert!(gate.accept(5));
+    }
+
+    #[test]
+    fn picker_query_rejects_invalid_protocol_inputs() {
+        let model = EmojiPickerModel::new(EmojiCatalog::new(&HashMap::new()).entries());
+        let valid = EmojiPickerQuery {
+            version: EMOJI_PICKER_PROTOCOL_VERSION,
+            generation: 1,
+            query: String::new(),
+            category: Some("Smileys".to_string()),
+            offset: 0,
+        };
+
+        assert!(model
+            .query(&EmojiPickerQuery {
+                version: EMOJI_PICKER_PROTOCOL_VERSION + 1,
+                ..valid.clone()
+            })
+            .is_none());
+        assert!(model
+            .query(&EmojiPickerQuery {
+                generation: 0,
+                ..valid.clone()
+            })
+            .is_none());
+        assert!(model
+            .query(&EmojiPickerQuery {
+                query: "x".repeat(EMOJI_PICKER_MAX_QUERY_CHARS + 1),
+                ..valid.clone()
+            })
+            .is_none());
+        assert!(model
+            .query(&EmojiPickerQuery {
+                category: Some("Unknown".to_string()),
+                ..valid
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn picker_results_serialize_untrusted_fields_as_typed_data() {
+        let unsafe_name = "workspace_\"</script><script>alert(1)</script>";
+        let custom = HashMap::from([(
+            unsafe_name.to_string(),
+            "https://emoji.example/image.png?label=\"quoted\"".to_string(),
+        )]);
+        let model = EmojiPickerModel::new(EmojiCatalog::new(&custom).entries());
+        let result = model
+            .query(&EmojiPickerQuery {
+                version: EMOJI_PICKER_PROTOCOL_VERSION,
+                generation: 2,
+                query: String::new(),
+                category: Some("Workspace".to_string()),
+                offset: 0,
+            })
+            .unwrap();
+
+        let serialized = serde_json::to_string(&result).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(decoded["generation"], 2);
+        assert_eq!(decoded["entries"][0]["name"], unsafe_name);
+        assert_eq!(decoded["entries"][0]["value_kind"], "custom-image");
+        assert_eq!(
+            decoded["entries"][0]["value"],
+            "https://emoji.example/image.png?label=\"quoted\""
         );
     }
 }
