@@ -20,10 +20,11 @@ use crate::conversation_catalog::ConversationCatalog;
 use crate::models::SlackUnreadState;
 use crate::models::{
     slack_timestamp_is_after, SlackConversation, SlackConversationUnreadSnapshot, SlackMessage,
-    SlackUserStatus,
+    SlackUser, SlackUserStatus,
 };
 use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
+use crate::workspace_pipeline::{StoreBatch, StoreChange, WorkspaceRevision};
 
 pub(crate) const CACHE_VERSION: u32 = 1;
 const DATABASE_SCHEMA_VERSION: u32 = 2;
@@ -152,6 +153,13 @@ pub(crate) struct StoreMetricsSnapshot {
     changed_rows: u64,
     skipped_rows: u64,
     pub(crate) rolled_back_batches: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StoreBatchExecution {
+    Committed,
+    Unchanged,
+    SkippedStale,
 }
 
 /// Owns the bounded, persistent SQLite connections for one derived cache.
@@ -380,15 +388,20 @@ fn spawn_store_worker(
                 };
                 match request {
                     StoreWorkerRequest::Task { task, response } => {
+                        let before = connection.total_changes();
                         let result = task(&mut connection);
                         if kind == StoreConnectionKind::Writer {
-                            let changed = connection.changes();
-                            record_store_work(
-                                &metrics,
-                                u64::from(changed > 0),
-                                changed,
-                                u64::from(changed == 0),
-                            );
+                            let changed = connection.total_changes().saturating_sub(before);
+                            if result.is_ok() {
+                                record_store_work(
+                                    &metrics,
+                                    u64::from(changed > 0),
+                                    changed,
+                                    u64::from(changed == 0),
+                                );
+                            } else if changed > 0 {
+                                metrics.rolled_back_batches.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         let _ = response.send(result);
                     }
@@ -595,6 +608,7 @@ pub struct WorkspaceStore {
     workspace_key: String,
     update_lock: Arc<Mutex<()>>,
     hub: Arc<tokio::sync::OnceCell<StoreHub>>,
+    store_batch_revision: Arc<std::sync::Mutex<WorkspaceRevision>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -646,6 +660,7 @@ impl WorkspaceStore {
             workspace_key: cache_key(workspace_id),
             update_lock: Arc::new(Mutex::new(())),
             hub: Arc::new(tokio::sync::OnceCell::new()),
+            store_batch_revision: Arc::new(std::sync::Mutex::new(WorkspaceRevision::INITIAL)),
         }
     }
 
@@ -665,6 +680,54 @@ impl WorkspaceStore {
             .await
     }
 
+    /// Executes one coordinator batch on the existing writer queue.
+    ///
+    /// The gate is strictly increasing rather than contiguous while compatibility
+    /// surfaces still produce unsubmitted revisions. Migrated runtime paths must
+    /// serialize reducer assignment and this submission.
+    pub(crate) async fn execute_store_batch(
+        &self,
+        batch: StoreBatch,
+    ) -> Result<StoreBatchExecution> {
+        let revision = batch.revision();
+        let changes = batch.changes().to_vec();
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let store_batch_revision = Arc::clone(&self.store_batch_revision);
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let mut persisted_revision = store_batch_revision.lock().map_err(|_| {
+                    StoreError::Other(anyhow::anyhow!("store batch revision lock poisoned"))
+                })?;
+                if revision <= *persisted_revision {
+                    return Ok(StoreBatchExecution::SkippedStale);
+                }
+
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                for change in changes {
+                    match apply_store_change(&transaction, &workspace_key, &workspace_id, change) {
+                        Ok(change_applied) => changed |= change_applied,
+                        Err(error) => {
+                            let _ = transaction.rollback();
+                            return Err(error);
+                        }
+                    }
+                }
+                let outcome = if finish_sqlite_transaction(transaction, changed)? {
+                    StoreBatchExecution::Committed
+                } else {
+                    StoreBatchExecution::Unchanged
+                };
+                *persisted_revision = revision;
+                Ok(outcome)
+            })
+            .await
+    }
+
     async fn query_or_reset<T, F>(&self, empty: T, query: F) -> Result<T>
     where
         T: Send + 'static,
@@ -674,8 +737,16 @@ impl WorkspaceStore {
         match hub.query(query).await {
             Err(error) if error.category() == StoreErrorCategory::CorruptData => {
                 let workspace_key = self.workspace_key.clone();
-                hub.write(move |connection| reset_sqlite_workspace(connection, &workspace_key))
-                    .await?;
+                let store_batch_revision = Arc::clone(&self.store_batch_revision);
+                hub.write(move |connection| {
+                    let mut persisted_revision = store_batch_revision.lock().map_err(|_| {
+                        StoreError::Other(anyhow::anyhow!("store batch revision lock poisoned"))
+                    })?;
+                    reset_sqlite_workspace(connection, &workspace_key)?;
+                    *persisted_revision = WorkspaceRevision::INITIAL;
+                    Ok(())
+                })
+                .await?;
                 Ok(empty)
             }
             result => result,
@@ -930,6 +1001,7 @@ impl WorkspaceStore {
     /// Reconciles an authoritative membership response in one locked cache
     /// transaction, so concurrent realtime/read overlays cannot be replaced by
     /// an older read-modify-write cycle.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn reconcile_conversations(
         &self,
         fresh: Vec<SlackConversation>,
@@ -1883,6 +1955,37 @@ impl WorkspaceStore {
     fn database_path(&self) -> PathBuf {
         database_path(&self.directory)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn install_conversation_batch_failure_trigger(&self) -> Result<()> {
+        self.hub()
+            .await?
+            .write(|connection| {
+                connection.execute_batch(
+                    "CREATE TEMP TRIGGER conduit_test_fail_conversation_batch
+                     BEFORE INSERT ON workspace_items
+                     WHEN NEW.kind = 'conversation'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected conversation batch failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clear_conversation_batch_failure_trigger(&self) -> Result<()> {
+        self.hub()
+            .await?
+            .write(|connection| {
+                connection.execute_batch(
+                    "DROP TRIGGER IF EXISTS conduit_test_fail_conversation_batch;",
+                )?;
+                Ok(())
+            })
+            .await
+    }
 }
 
 fn normalized_pending_unread_queue(channel_ids: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -2437,6 +2540,318 @@ fn store_sqlite_state(
     Ok(())
 }
 
+fn apply_store_change(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    workspace_id: &str,
+    change: StoreChange,
+) -> Result<bool> {
+    match change {
+        StoreChange::BootstrapReplaced(data) => {
+            let mut changed =
+                sync_conversations(transaction, workspace_key, data.conversations.into_iter())?;
+            changed |= sync_users(transaction, workspace_key, data.users.into_iter())?;
+            changed |= sync_sqlite_kind(
+                transaction,
+                workspace_key,
+                "channel_history",
+                data.histories
+                    .into_iter()
+                    .map(|(channel_id, messages)| {
+                        require_store_key("channel history", &channel_id)?;
+                        Ok((
+                            channel_id,
+                            channel_timeline_messages(normalize_cached_messages(messages)),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+            changed |= sync_thread_records(transaction, workspace_key, data.threads)?;
+            Ok(changed)
+        }
+        StoreChange::ConversationsReplaced(conversations) => {
+            sync_conversations(transaction, workspace_key, conversations.into_iter())
+        }
+        StoreChange::ConversationUpsert(conversation) => {
+            require_store_key("conversation", &conversation.id)?;
+            upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
+        }
+        StoreChange::ConversationRemoved { channel_id } => {
+            require_store_key("conversation", &channel_id)?;
+            Ok(transaction.execute(
+                "DELETE FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = ?2",
+                params![workspace_key, channel_id],
+            )? > 0)
+        }
+        StoreChange::UnreadChanged { snapshot } => {
+            apply_store_unread_snapshot(transaction, workspace_key, workspace_id, snapshot)
+        }
+        StoreChange::UsersReplaced(users) => {
+            sync_users(transaction, workspace_key, users.into_iter())
+        }
+        StoreChange::UserUpsert(user) => upsert_user_projection(transaction, workspace_key, user),
+        StoreChange::HistoryReplaced {
+            channel_id,
+            messages,
+        } => {
+            require_store_key("channel history", &channel_id)?;
+            upsert_sqlite_item(
+                transaction,
+                workspace_key,
+                "channel_history",
+                &channel_id,
+                &channel_timeline_messages(normalize_cached_messages(messages)),
+            )
+        }
+        StoreChange::HistoryRemoved { channel_id } => {
+            require_store_key("channel history", &channel_id)?;
+            Ok(transaction.execute(
+                "DELETE FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = 'channel_history' AND item_key = ?2",
+                params![workspace_key, channel_id],
+            )? > 0)
+        }
+        StoreChange::ThreadReplaced {
+            channel_id,
+            thread_ts,
+            messages,
+        } => {
+            require_store_key("thread channel", &channel_id)?;
+            require_store_key("thread timestamp", &thread_ts)?;
+            upsert_sqlite_item(
+                transaction,
+                workspace_key,
+                "thread_replies",
+                &thread_key(&channel_id, &thread_ts),
+                &pruned_history(normalize_cached_messages(messages)),
+            )
+        }
+        StoreChange::ThreadCatalogReplaced(records) => {
+            sync_thread_records(transaction, workspace_key, records)
+        }
+    }
+}
+
+fn sync_conversations(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    conversations: impl IntoIterator<Item = SlackConversation>,
+) -> Result<bool> {
+    let conversations = conversations
+        .into_iter()
+        .map(|conversation| {
+            require_store_key("conversation", &conversation.id)?;
+            let conversation = conversation_for_cache(&conversation);
+            Ok((conversation.id.clone(), conversation))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sync_sqlite_kind(transaction, workspace_key, "conversation", conversations)
+}
+
+fn sync_users(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    users: impl IntoIterator<Item = SlackUser>,
+) -> Result<bool> {
+    let mut projections = CachedUserProjections::default();
+    for user in users {
+        projections.insert(user)?;
+    }
+    let mut changed = sync_sqlite_kind(
+        transaction,
+        workspace_key,
+        "user_name",
+        projections.display_names,
+    )?;
+    changed |= sync_sqlite_kind(
+        transaction,
+        workspace_key,
+        "user_full_name",
+        projections.full_names,
+    )?;
+    changed |= sync_sqlite_kind(
+        transaction,
+        workspace_key,
+        "user_avatar_url",
+        projections.avatar_urls,
+    )?;
+    changed |= sync_sqlite_kind(
+        transaction,
+        workspace_key,
+        "user_aliases",
+        projections.aliases,
+    )?;
+    changed |= sync_sqlite_kind(
+        transaction,
+        workspace_key,
+        "user_status",
+        projections.statuses,
+    )?;
+    Ok(changed)
+}
+
+#[derive(Default)]
+struct CachedUserProjections {
+    display_names: HashMap<String, String>,
+    full_names: HashMap<String, String>,
+    avatar_urls: HashMap<String, String>,
+    aliases: HashMap<String, Vec<String>>,
+    statuses: HashMap<String, SlackUserStatus>,
+}
+
+impl CachedUserProjections {
+    fn insert(&mut self, user: SlackUser) -> Result<()> {
+        let user_id = user
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|user_id| !user_id.is_empty())
+            .ok_or_else(|| StoreError::rejected_update("user id must not be empty"))?
+            .to_string();
+        if let Some(display_name) = user.display_name() {
+            self.display_names.insert(user_id.clone(), display_name);
+        }
+        if let Some(full_name) = user.full_name() {
+            self.full_names.insert(user_id.clone(), full_name);
+        }
+        if let Some(avatar_url) = user.avatar_url() {
+            self.avatar_urls.insert(user_id.clone(), avatar_url);
+        }
+        let aliases = user.search_aliases();
+        if !aliases.is_empty() {
+            self.aliases.insert(user_id.clone(), aliases);
+        }
+        if let Some(status) = user.status() {
+            self.statuses.insert(user_id, status);
+        }
+        Ok(())
+    }
+}
+
+fn upsert_user_projection(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    user: SlackUser,
+) -> Result<bool> {
+    let mut projections = CachedUserProjections::default();
+    projections.insert(user)?;
+    let mut changed = false;
+    for (user_id, display_name) in projections.display_names {
+        changed |= upsert_sqlite_item(
+            transaction,
+            workspace_key,
+            "user_name",
+            &user_id,
+            &display_name,
+        )?;
+    }
+    for (user_id, full_name) in projections.full_names {
+        changed |= upsert_sqlite_item(
+            transaction,
+            workspace_key,
+            "user_full_name",
+            &user_id,
+            &full_name,
+        )?;
+    }
+    for (user_id, avatar_url) in projections.avatar_urls {
+        changed |= upsert_sqlite_item(
+            transaction,
+            workspace_key,
+            "user_avatar_url",
+            &user_id,
+            &avatar_url,
+        )?;
+    }
+    for (user_id, aliases) in projections.aliases {
+        changed |= upsert_sqlite_item(
+            transaction,
+            workspace_key,
+            "user_aliases",
+            &user_id,
+            &aliases,
+        )?;
+    }
+    for (user_id, status) in projections.statuses {
+        changed |=
+            upsert_sqlite_item(transaction, workspace_key, "user_status", &user_id, &status)?;
+    }
+    Ok(changed)
+}
+
+fn sync_thread_records(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    records: Vec<ThreadRecord>,
+) -> Result<bool> {
+    let records = records
+        .into_iter()
+        .map(|record| {
+            require_store_key("thread channel", &record.key.channel_id)?;
+            require_store_key("thread timestamp", &record.key.root_ts)?;
+            Ok((
+                thread_key(&record.key.channel_id, &record.key.root_ts),
+                record,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sync_sqlite_kind(transaction, workspace_key, "thread_record", records)
+}
+
+fn apply_store_unread_snapshot(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    workspace_id: &str,
+    snapshot: SlackConversationUnreadSnapshot,
+) -> Result<bool> {
+    require_store_key("conversation unread", &snapshot.channel_id)?;
+    if !snapshot.unread_state.known {
+        return Err(StoreError::rejected_update(
+            "conversation unread state must be known",
+        ));
+    }
+
+    let mut conversation =
+        load_sqlite_conversation(transaction, workspace_key, &snapshot.channel_id)?.unwrap_or_else(
+            || SlackConversation {
+                id: snapshot.channel_id.clone(),
+                ..Default::default()
+            },
+        );
+    let local_read = conversation
+        .extra
+        .get(LOCAL_READ_TS_KEY)
+        .and_then(serde_json::Value::as_str);
+    let newer_local_read = local_read.is_some_and(|local| {
+        snapshot
+            .last_read
+            .as_deref()
+            .is_none_or(|server| slack_timestamp_is_after(local, server))
+    });
+    let newer_cached_read = conversation.last_read_ts().is_some_and(|current| {
+        snapshot
+            .last_read
+            .as_deref()
+            .is_some_and(|server| slack_timestamp_is_after(current, server))
+    });
+    if newer_local_read || newer_cached_read {
+        return Ok(false);
+    }
+    conversation.extra.remove(LOCAL_READ_TS_KEY);
+    conversation.apply_unread_snapshot(&snapshot);
+    upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
+}
+
+fn require_store_key(kind: &str, key: &str) -> Result<()> {
+    if key.trim().is_empty() {
+        return Err(StoreError::rejected_update(format!(
+            "{kind} key must not be empty"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_sqlite_workspace(
     transaction: &Transaction<'_>,
     workspace_key: &str,
@@ -2889,6 +3304,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::workspace_pipeline::{
+        StoreBatch, StoreChange, WorkspaceBootstrapData, WorkspaceRevision,
+    };
 
     #[test]
     fn store_errors_classify_recovery_relevant_failures() {
@@ -2930,6 +3348,354 @@ mod tests {
             .enable_all()
             .build()
             .expect("failed to build test runtime")
+    }
+
+    #[test]
+    fn coordinator_store_batches_commit_in_revision_order_and_suppress_replays() {
+        let directory = temp_cache_dir("coordinator-store-order");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            let first = StoreBatch::new(
+                first_revision,
+                vec![
+                    StoreChange::ConversationUpsert(SlackConversation {
+                        id: "C1".into(),
+                        name: Some("general".into()),
+                        ..Default::default()
+                    }),
+                    StoreChange::ConversationUpsert(SlackConversation {
+                        id: "C2".into(),
+                        name: Some("random".into()),
+                        ..Default::default()
+                    }),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(first.clone()).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+            let after_first = store.hub().await.unwrap().metrics();
+
+            assert_eq!(
+                store.execute_store_batch(first).await.unwrap(),
+                StoreBatchExecution::SkippedStale
+            );
+            let after_replay = store.hub().await.unwrap().metrics();
+            assert_eq!(after_replay.transactions, after_first.transactions);
+
+            let second_revision = first_revision.successor();
+            let unchanged = StoreBatch::new(
+                second_revision,
+                vec![StoreChange::ConversationUpsert(SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(unchanged).await.unwrap(),
+                StoreBatchExecution::Unchanged
+            );
+            let after_unchanged = store.hub().await.unwrap().metrics();
+            assert_eq!(after_unchanged.transactions, after_replay.transactions);
+
+            let stale = StoreBatch::new(
+                second_revision,
+                vec![StoreChange::ConversationRemoved {
+                    channel_id: "C1".into(),
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(stale).await.unwrap(),
+                StoreBatchExecution::SkippedStale
+            );
+            let delayed_revision = second_revision.successor();
+            let forward_revision = delayed_revision.successor();
+            let forward = StoreBatch::new(
+                forward_revision,
+                vec![StoreChange::ConversationUpsert(SlackConversation {
+                    id: "C4".into(),
+                    name: Some("forward".into()),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(forward).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+            let delayed = StoreBatch::new(
+                delayed_revision,
+                vec![StoreChange::ConversationRemoved {
+                    channel_id: "C2".into(),
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(delayed).await.unwrap(),
+                StoreBatchExecution::SkippedStale
+            );
+            let conversations = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(
+                conversations
+                    .iter()
+                    .map(|conversation| conversation.id.as_str())
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["C1", "C2", "C4"])
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_store_batch_failure_rolls_back_data_and_revision() {
+        let directory = temp_cache_dir("coordinator-store-rollback");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let baseline = store.hub().await.unwrap().metrics();
+            let revision = WorkspaceRevision::INITIAL.successor();
+            let invalid = StoreBatch::new(
+                revision,
+                vec![
+                    StoreChange::ConversationUpsert(SlackConversation {
+                        id: "C1".into(),
+                        name: Some("must-roll-back".into()),
+                        ..Default::default()
+                    }),
+                    StoreChange::ConversationRemoved {
+                        channel_id: String::new(),
+                    },
+                ],
+            )
+            .unwrap();
+            assert!(store.execute_store_batch(invalid).await.is_err());
+            let after_failure = store.hub().await.unwrap().metrics();
+            assert_eq!(after_failure.transactions, baseline.transactions);
+            assert_eq!(
+                after_failure.rolled_back_batches,
+                baseline.rolled_back_batches + 1
+            );
+            assert!(store.load_conversations().await.unwrap().is_none());
+
+            let retry = StoreBatch::new(
+                revision,
+                vec![StoreChange::ConversationUpsert(SlackConversation {
+                    id: "C1".into(),
+                    name: Some("retry-commits".into()),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(retry).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+            let conversations = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].name.as_deref(), Some("retry-commits"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_user_store_changes_persist_only_safe_projections() {
+        let directory = temp_cache_dir("coordinator-user-projection");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let revision = WorkspaceRevision::INITIAL.successor();
+            let batch = StoreBatch::new(
+                revision,
+                vec![StoreChange::UsersReplaced(vec![SlackUser {
+                    id: Some("U1".into()),
+                    name: Some("ada".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        display_name: Some("Ada".into()),
+                        real_name: Some("Ada Lovelace".into()),
+                        phone: Some("PrivatePhoneCanary".into()),
+                        email: Some("PrivateEmailCanary".into()),
+                        huddle_state_call_id: Some("PrivateHuddleCanary".into()),
+                        fields: HashMap::from([(
+                            "private".into(),
+                            crate::models::SlackProfileField {
+                                value: Some("PrivateCustomFieldCanary".into()),
+                                ..Default::default()
+                            },
+                        )]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }])],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(batch).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            assert_eq!(
+                store.load_user_names().await.unwrap().get("U1"),
+                Some(&"Ada".to_string())
+            );
+            let payloads = store
+                .hub()
+                .await
+                .unwrap()
+                .query(|connection| {
+                    let mut statement = connection.prepare(
+                        "SELECT payload_json FROM workspace_items ORDER BY kind, item_key",
+                    )?;
+                    let payloads = statement
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    Ok(payloads.join("\n"))
+                })
+                .await
+                .unwrap();
+            for private_value in [
+                "PrivatePhoneCanary",
+                "PrivateEmailCanary",
+                "PrivateHuddleCanary",
+                "PrivateCustomFieldCanary",
+            ] {
+                assert!(!payloads.contains(private_value));
+            }
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_store_executor_handles_every_change_variant() {
+        let directory = temp_cache_dir("coordinator-all-store-changes");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let root = SlackMessage {
+                ts: "1.000".into(),
+                reply_count: Some(1),
+                ..Default::default()
+            };
+            let mut thread_catalog = ThreadCatalog::default();
+            thread_catalog.observe_history("C1", std::slice::from_ref(&root));
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            let bootstrap = StoreBatch::new(
+                first_revision,
+                vec![StoreChange::BootstrapReplaced(WorkspaceBootstrapData {
+                    conversations: vec![SlackConversation {
+                        id: "C1".into(),
+                        name: Some("bootstrap".into()),
+                        ..Default::default()
+                    }],
+                    users: vec![SlackUser {
+                        id: Some("U1".into()),
+                        name: Some("bootstrap-user".into()),
+                        ..Default::default()
+                    }],
+                    histories: HashMap::from([(
+                        "C1".into(),
+                        vec![SlackMessage {
+                            ts: "1.000".into(),
+                            text: Some("bootstrap-history".into()),
+                            ..Default::default()
+                        }],
+                    )]),
+                    threads: thread_catalog.into_records(),
+                })],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(bootstrap).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            let second_revision = first_revision.successor();
+            let replacement = StoreBatch::new(
+                second_revision,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![SlackConversation {
+                        id: "C2".into(),
+                        name: Some("replace".into()),
+                        ..Default::default()
+                    }]),
+                    StoreChange::ConversationUpsert(SlackConversation {
+                        id: "C3".into(),
+                        name: Some("upsert".into()),
+                        ..Default::default()
+                    }),
+                    StoreChange::ConversationRemoved {
+                        channel_id: "C2".into(),
+                    },
+                    StoreChange::UnreadChanged {
+                        snapshot: SlackConversationUnreadSnapshot {
+                            channel_id: "C3".into(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 2),
+                            last_read: Some("1.000".into()),
+                            latest: Some("2.000".into()),
+                            ..Default::default()
+                        },
+                    },
+                    StoreChange::UsersReplaced(vec![SlackUser {
+                        id: Some("U2".into()),
+                        name: Some("replace-user".into()),
+                        ..Default::default()
+                    }]),
+                    StoreChange::UserUpsert(SlackUser {
+                        id: Some("U3".into()),
+                        name: Some("upsert-user".into()),
+                        ..Default::default()
+                    }),
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C3".into(),
+                        messages: vec![SlackMessage {
+                            ts: "2.000".into(),
+                            text: Some("replacement-history".into()),
+                            ..Default::default()
+                        }],
+                    },
+                    StoreChange::HistoryRemoved {
+                        channel_id: "C1".into(),
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C3".into(),
+                        thread_ts: "2.000".into(),
+                        messages: vec![SlackMessage {
+                            ts: "2.001".into(),
+                            thread_ts: Some("2.000".into()),
+                            text: Some("replacement-thread".into()),
+                            ..Default::default()
+                        }],
+                    },
+                    StoreChange::ThreadCatalogReplaced(Vec::new()),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                store.execute_store_batch(replacement).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            let conversations = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].id, "C3");
+            assert_eq!(conversations[0].unread_activity_count(), 2);
+            let names = store.load_user_names().await.unwrap();
+            assert_eq!(names.get("U2"), Some(&"replace-user".to_string()));
+            assert_eq!(names.get("U3"), Some(&"upsert-user".to_string()));
+            assert!(!names.contains_key("U1"));
+            assert!(store.load_history("C1").await.unwrap().is_none());
+            assert_eq!(
+                store.load_history("C3").await.unwrap().unwrap()[0].body_text(),
+                "replacement-history"
+            );
+            assert_eq!(
+                store.load_thread("C3", "2.000").await.unwrap().unwrap()[0].body_text(),
+                "replacement-thread"
+            );
+            assert!(store.load_thread_catalog().await.unwrap().is_empty());
+        });
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

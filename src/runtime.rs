@@ -1288,6 +1288,8 @@ impl UserStatusSync {
 struct WorkspaceReducerAdapter {
     coordinator: Arc<Mutex<WorkspaceCoordinator>>,
     attention_metrics: Arc<AttentionMetrics>,
+    store_batch_admission: Arc<tokio::sync::Mutex<()>>,
+    pending_reduction: Arc<Mutex<Option<WorkspaceReduction>>>,
 }
 
 impl WorkspaceReducerAdapter {
@@ -1333,6 +1335,60 @@ impl WorkspaceReducerAdapter {
             );
         }
         reduction
+    }
+
+    /// Returns persisted reductions in revision order, including a recovered
+    /// reduction whose previous store attempt failed.
+    async fn apply_persisted(
+        &self,
+        store: Option<&WorkspaceStore>,
+        origin: MutationOrigin,
+        mutation: WorkspaceMutation,
+    ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
+        let _admission = self.store_batch_admission.lock().await;
+        let pending = {
+            self.pending_reduction
+                .lock()
+                .expect("pending workspace reduction lock poisoned")
+                .take()
+        };
+        let mut completed = Vec::new();
+        if let Some(pending) = pending {
+            let Some(store) = store else {
+                *self
+                    .pending_reduction
+                    .lock()
+                    .expect("pending workspace reduction lock poisoned") = Some(pending);
+                return Err(StoreError::HubClosed);
+            };
+            let batch = pending
+                .store_batch()
+                .expect("failed pending reduction must contain a store batch")
+                .clone();
+            if let Err(error) = store.execute_store_batch(batch).await {
+                *self
+                    .pending_reduction
+                    .lock()
+                    .expect("pending workspace reduction lock poisoned") = Some(pending);
+                return Err(error);
+            }
+            completed.push(pending);
+        }
+
+        let reduction = self.apply(origin, mutation);
+        if let Some(reduction) = reduction {
+            if let (Some(store), Some(batch)) = (store, reduction.store_batch().cloned()) {
+                if let Err(error) = store.execute_store_batch(batch).await {
+                    *self
+                        .pending_reduction
+                        .lock()
+                        .expect("pending workspace reduction lock poisoned") = Some(reduction);
+                    return Err(error);
+                }
+            }
+            completed.push(reduction);
+        }
+        Ok(completed)
     }
 
     fn record_attention_persistence(
@@ -3079,13 +3135,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             context.events.send_status("Joining conversation");
             let conversation = api.join_conversation(&channel_id).await?;
-            if let Some(store) = context.workspace_store.as_ref() {
-                store.store_conversation(&conversation).await?;
-            }
-            context.workspace.apply(
-                MutationOrigin::WebApi,
-                WorkspaceMutation::ConversationUpsert(conversation.clone()),
-            );
+            context
+                .workspace
+                .apply_persisted(
+                    context.workspace_store.as_ref(),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(conversation.clone()),
+                )
+                .await?;
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -3094,15 +3151,16 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             context.events.send_status("Leaving channel");
             api.leave_conversation(&channel_id).await?;
-            if let Some(store) = context.workspace_store.as_ref() {
-                store.remove_conversation(&channel_id).await?;
-            }
-            context.workspace.apply(
-                MutationOrigin::WebApi,
-                WorkspaceMutation::ConversationRemove {
-                    channel_id: channel_id.clone(),
-                },
-            );
+            context
+                .workspace
+                .apply_persisted(
+                    context.workspace_store.as_ref(),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationRemove {
+                        channel_id: channel_id.clone(),
+                    },
+                )
+                .await?;
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationLeft { channel_id });
@@ -3113,13 +3171,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let mut conversation = api.open_direct_message(&user_id).await?;
             conversation.user = Some(user_id);
             conversation.is_im = Some(true);
-            if let Some(store) = context.workspace_store.as_ref() {
-                store.store_conversation(&conversation).await?;
-            }
-            context.workspace.apply(
-                MutationOrigin::WebApi,
-                WorkspaceMutation::ConversationUpsert(conversation.clone()),
-            );
+            context
+                .workspace
+                .apply_persisted(
+                    context.workspace_store.as_ref(),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(conversation.clone()),
+                )
+                .await?;
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -3133,13 +3192,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     .extra
                     .insert("users".to_string(), serde_json::json!(user_ids));
             }
-            if let Some(store) = context.workspace_store.as_ref() {
-                store.store_conversation(&conversation).await?;
-            }
-            context.workspace.apply(
-                MutationOrigin::WebApi,
-                WorkspaceMutation::ConversationUpsert(conversation.clone()),
-            );
+            context
+                .workspace
+                .apply_persisted(
+                    context.workspace_store.as_ref(),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(conversation.clone()),
+                )
+                .await?;
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -3148,13 +3208,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             context.events.send_status("Creating channel");
             let conversation = api.create_channel(&name, is_private).await?;
-            if let Some(store) = context.workspace_store.as_ref() {
-                store.store_conversation(&conversation).await?;
-            }
-            context.workspace.apply(
-                MutationOrigin::WebApi,
-                WorkspaceMutation::ConversationUpsert(conversation.clone()),
-            );
+            context
+                .workspace
+                .apply_persisted(
+                    context.workspace_store.as_ref(),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(conversation.clone()),
+                )
+                .await?;
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationOpened(conversation));
@@ -3166,13 +3227,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             context.events.send_status("Adding people");
             let conversation = api.invite_to_channel(&channel_id, &user_ids).await?;
-            if let Some(store) = context.workspace_store.as_ref() {
-                store.store_conversation(&conversation).await?;
-            }
-            context.workspace.apply(
-                MutationOrigin::WebApi,
-                WorkspaceMutation::ConversationUpsert(conversation.clone()),
-            );
+            context
+                .workspace
+                .apply_persisted(
+                    context.workspace_store.as_ref(),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(conversation.clone()),
+                )
+                .await?;
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationUpdated(conversation));
@@ -4977,22 +5039,26 @@ async fn load_conversations_with_api(
             );
         }
     }
-    let conversations = if let Some(store) = workspace_store.as_ref() {
-        store.reconcile_conversations(fresh).await?
+    let cached = if let Some(store) = workspace_store.as_ref() {
+        store.load_conversations().await?.unwrap_or_default()
     } else {
-        reconcile_conversation_snapshot(Vec::new(), fresh)?
+        Vec::new()
     };
+    let conversations = reconcile_conversation_snapshot(cached, fresh)?;
     crate::debug::log(
         "runtime",
         &format!("ConversationsLoaded count={}", conversations.len()),
     );
-    workspace.apply(
-        MutationOrigin::WebApi,
-        WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
-            base_revision,
-            conversations.clone(),
-        )),
-    );
+    workspace
+        .apply_persisted(
+            workspace_store.as_ref(),
+            MutationOrigin::WebApi,
+            WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
+                base_revision,
+                conversations.clone(),
+            )),
+        )
+        .await?;
     events.send_event(RuntimeEventKind::ConversationsLoaded(conversations.clone()));
     Ok(conversations)
 }
@@ -6321,6 +6387,140 @@ mod tests {
                 .is_none(),
             "a stale snapshot must not remove newer local membership"
         );
+    }
+
+    #[test]
+    fn workspace_adapter_submits_each_conversation_store_batch_once() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-batch-submit-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                name: Some("general".into()),
+                ..Default::default()
+            };
+            assert!(
+                workspace
+                    .apply_persisted(
+                        Some(&store),
+                        MutationOrigin::WebApi,
+                        WorkspaceMutation::ConversationUpsert(conversation.clone()),
+                    )
+                    .await
+                    .unwrap()
+                    .len()
+                    == 1
+            );
+            assert!(workspace
+                .apply_persisted(
+                    Some(&store),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(conversation),
+                )
+                .await
+                .unwrap()
+                .is_empty());
+
+            let stored = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].id, "C1");
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_adapter_retries_failed_batch_before_accepting_the_next_mutation() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-batch-retry-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let first = SlackConversation {
+                id: "C1".into(),
+                name: Some("first".into()),
+                ..Default::default()
+            };
+            store
+                .install_conversation_batch_failure_trigger()
+                .await
+                .unwrap();
+            assert!(workspace
+                .apply_persisted(
+                    Some(&store),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(first.clone()),
+                )
+                .await
+                .is_err());
+            assert!(store.load_conversations().await.unwrap().is_none());
+            store
+                .clear_conversation_batch_failure_trigger()
+                .await
+                .unwrap();
+
+            let second = SlackConversation {
+                id: "C2".into(),
+                name: Some("second".into()),
+                ..Default::default()
+            };
+            let (retry, next) = futures_util::future::join(
+                workspace.apply_persisted(
+                    Some(&store),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(first),
+                ),
+                workspace.apply_persisted(
+                    Some(&store),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(second),
+                ),
+            )
+            .await;
+            let mut reductions = retry.unwrap();
+            reductions.extend(next.unwrap());
+            assert_eq!(
+                reductions
+                    .iter()
+                    .map(|reduction| reduction.patch().revision().value())
+                    .collect::<Vec<_>>(),
+                vec![1, 2],
+                "the recovered patch must remain ahead of the next mutation patch"
+            );
+
+            let stored = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(
+                stored
+                    .iter()
+                    .map(|conversation| conversation.id.as_str())
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["C1", "C2"])
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

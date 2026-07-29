@@ -391,7 +391,7 @@ impl WorkspaceCoordinator {
                 }
                 None
             }
-            WorkspaceMutation::Hydrate(data) => self.apply_hydration(data),
+            WorkspaceMutation::Hydrate(data) => self.apply_hydration(data, origin),
             WorkspaceMutation::MembershipSnapshot(snapshot) => {
                 self.apply_membership_snapshot(snapshot)
             }
@@ -494,7 +494,11 @@ impl WorkspaceCoordinator {
         Some(reduction)
     }
 
-    fn apply_hydration(&mut self, data: WorkspaceBootstrapData) -> Option<WorkspaceReduction> {
+    fn apply_hydration(
+        &mut self,
+        data: WorkspaceBootstrapData,
+        origin: MutationOrigin,
+    ) -> Option<WorkspaceReduction> {
         let unchanged = self.conversations.len() == data.conversations.len()
             && data
                 .conversations
@@ -560,10 +564,15 @@ impl WorkspaceCoordinator {
             })
             .collect();
         self.thread_catalog = data.threads.clone();
+        let store_changes = if origin == MutationOrigin::Cache {
+            Vec::new()
+        } else {
+            vec![StoreChange::BootstrapReplaced(data.clone())]
+        };
         self.commit(
             revision,
-            vec![WorkspaceChange::BootstrapReset(data.clone())],
-            vec![StoreChange::BootstrapReplaced(data)],
+            vec![WorkspaceChange::BootstrapReset(data)],
+            store_changes,
         )
     }
 
@@ -1716,6 +1725,29 @@ mod tests {
         assert_eq!(patch.revision(), batch.revision());
         assert_eq!(patch.changes().len(), 1);
         assert_eq!(batch.changes().len(), 1);
+    }
+
+    #[test]
+    fn cache_hydration_never_rewrites_an_incomplete_bootstrap_projection() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let reduction = coordinator
+            .apply_from(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    conversations: vec![conversation("C1", "general")],
+                    ..Default::default()
+                }),
+            )
+            .expect("cache hydration should update the coordinator");
+
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::BootstrapReset(_)]
+        ));
+        assert!(
+            reduction.store_batch().is_none(),
+            "the startup projection omits histories and must not replace persistent cache domains"
+        );
     }
 
     #[test]
