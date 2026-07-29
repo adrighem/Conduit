@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.3.0](https://github.com/adrighem/Conduit/compare/v0.2.0...v0.3.0) (2026-07-29)
+
+
+### Features
+
+* **composer:** Complete person mentions ([7c88040](https://github.com/adrighem/Conduit/commit/7c88040fe45e5674c48376c951a147b4e3685e96))
+* improve unread navigation and sidebar sections ([acca7a0](https://github.com/adrighem/Conduit/commit/acca7a01db6033bbb36a452d601188d69c21c833))
+* **messages:** model conversation open sessions ([a9d9af3](https://github.com/adrighem/Conduit/commit/a9d9af3ddf9ff0b25fade46eb28357cfefcaf7a3))
+* **messages:** reconcile conversation snapshots ([3e8c95f](https://github.com/adrighem/Conduit/commit/3e8c95f87a0c21d4959eace6762a2a9c55d40e3d))
+* **messages:** route opens through immutable intent ([70eb68e](https://github.com/adrighem/Conduit/commit/70eb68e9525bf1357e7e4e1cea8629135a9034d2))
+* **messages:** support rich bot messages ([15509ae](https://github.com/adrighem/Conduit/commit/15509aeaedd52bce6450d661bbfb43a9491a2269))
+* **messages:** unify initial viewport control ([d96cb25](https://github.com/adrighem/Conduit/commit/d96cb253c5ba37625c307caa9017a6819b14fce1))
+* **sidebar:** Add priority conversations section ([161cecd](https://github.com/adrighem/Conduit/commit/161cecdee48a2f447d0ebfda2b42f880a6ea4957))
+* **sidebar:** Open DM profiles ([8947521](https://github.com/adrighem/Conduit/commit/89475215a474341e75aa042f97035024b07f9c20))
+* **sidebar:** Toggle priority conversations ([8c4b604](https://github.com/adrighem/Conduit/commit/8c4b6043bb3a7afb5ff271d29925ea31532cea7f))
+* **slack:** Add conversation star state ([924854d](https://github.com/adrighem/Conduit/commit/924854d356a6f3cdfcb22472d47e891ebd455a22))
+* **status:** Add native status editor ([740212a](https://github.com/adrighem/Conduit/commit/740212a19b695322ea58435d29aa590587099c7a))
+* **status:** Add Slack status mutation ([0b8e6d9](https://github.com/adrighem/Conduit/commit/0b8e6d949b3804a96e7373f3479cac1aae5d1c21))
+
+
+### Bug Fixes
+
+* **branding:** Remove obsolete installed icons ([f5654ef](https://github.com/adrighem/Conduit/commit/f5654ef258bc661671122e542cce6a5ea69fd141))
+* **ci:** clarify collapsed section branch ([5458004](https://github.com/adrighem/Conduit/commit/54580046e3f5feacb156e955229a3286cb5f3197))
+* **ci:** validate main before release automation ([abd93fc](https://github.com/adrighem/Conduit/commit/abd93fc625502de819d29895701d81ea99d0bba6))
+* **deps:** remove unused HTTP/3 stack ([280bec6](https://github.com/adrighem/Conduit/commit/280bec60fcf36a40fc3b69ded60cdb1381e04994)), closes [#14](https://github.com/adrighem/Conduit/issues/14)
+* **messages:** satisfy strict architecture lint ([2628864](https://github.com/adrighem/Conduit/commit/26288645711383c6bb130ba56cb2a7c1f04a5095))
+* **sidebar:** Keep priority stars consistent ([16a774b](https://github.com/adrighem/Conduit/commit/16a774bcf45218a630b201309a178e874f0897ee))
+* **ui:** keep message sends responsive ([bbf9539](https://github.com/adrighem/Conduit/commit/bbf9539ca5f0b6d790adcd88d7964b19a1e44d67))
+
 ## [0.2.0](https://github.com/adrighem/Conduit/compare/v0.1.2...v0.2.0) (2026-07-23)
 
 
