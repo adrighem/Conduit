@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SyncJobId(u64);
 
 impl SyncJobId {
@@ -21,7 +21,7 @@ impl SyncJobId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CancellationId(u64);
 
 impl CancellationId {
@@ -288,9 +288,32 @@ pub(crate) enum SchedulerConfigError {
     ZeroStarvationBound,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AdmissionToken {
+    job_id: SyncJobId,
+    generation: u64,
+}
+
+impl AdmissionToken {
+    fn new(job_id: SyncJobId, generation: u64) -> Self {
+        Self { job_id, generation }
+    }
+
+    pub(crate) fn job_id(self) -> SyncJobId {
+        self.job_id
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AdmissionOutcome {
-    Accepted { job_id: SyncJobId },
+    Accepted {
+        token: AdmissionToken,
+        coalesced: Option<ReleasedJob>,
+    },
     SkippedFresh(SyncJob),
 }
 
@@ -298,6 +321,7 @@ pub(crate) enum AdmissionOutcome {
 pub(crate) enum AdmissionRejectionReason {
     AtCapacity,
     DuplicateIdentity,
+    ShuttingDown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +340,63 @@ impl AdmissionRejection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleasedJob {
+    job: SyncJob,
+    attempt: u32,
+}
+
+impl ReleasedJob {
+    pub(crate) fn new(job: SyncJob, attempt: u32) -> Self {
+        Self { job, attempt }
+    }
+
+    pub(crate) fn job(&self) -> &SyncJob {
+        &self.job
+    }
+
+    pub(crate) fn attempt(&self) -> u32 {
+        self.attempt
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CancellationDirective {
+    run: JobRun,
+    cancellation_id: CancellationId,
+}
+
+impl CancellationDirective {
+    fn from_running(running: &RunningJob) -> Self {
+        Self {
+            run: JobRun {
+                job_id: running.job.id,
+                attempt: running.attempt,
+                generation: running.generation,
+            },
+            cancellation_id: running.job.cancellation_id,
+        }
+    }
+
+    pub(crate) fn run(&self) -> JobRun {
+        self.run
+    }
+
+    pub(crate) fn cancellation_id(&self) -> CancellationId {
+        self.cancellation_id
+    }
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CancellationOutcome {
+    Cancelled(ReleasedJob),
+    Requested(CancellationDirective),
+    AlreadyRequested(CancellationDirective),
+    Protected { job_id: SyncJobId },
+    NotFound,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct JobRun {
     job_id: SyncJobId,
@@ -326,6 +407,7 @@ pub(crate) struct JobRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DispatchedJob {
     job: SyncJob,
+    admission: AdmissionToken,
     attempt: u32,
     generation: u64,
 }
@@ -337,6 +419,10 @@ impl DispatchedJob {
 
     pub(crate) fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    pub(crate) fn admission(&self) -> AdmissionToken {
+        self.admission
     }
 
     pub(crate) fn run(&self) -> JobRun {
@@ -351,11 +437,26 @@ impl DispatchedJob {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobOutcome {
     Succeeded,
+    RetryableFailure,
+    PermanentFailure,
+    Cancelled,
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletionOutcome {
     Completed,
+    Retried {
+        job_id: SyncJobId,
+        attempt: u32,
+        ready_at_ms: u64,
+    },
+    Failed(ReleasedJob),
+    Cancelled(ReleasedJob),
+    Superseded {
+        released: ReleasedJob,
+        superseding: AdmissionToken,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,11 +464,43 @@ pub(crate) enum CompletionError {
     UnknownJob,
     StaleRun,
     StaleAttempt,
+    DurableCancellationForbidden,
+    CancellationNotRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownPhase {
+    Open,
+    Draining,
+    Drained,
+}
+
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShutdownReport {
+    phase: ShutdownPhase,
+    cancelled: Vec<ReleasedJob>,
+    cancellation_requested: Vec<CancellationDirective>,
+}
+
+impl ShutdownReport {
+    pub(crate) fn phase(&self) -> ShutdownPhase {
+        self.phase
+    }
+
+    pub(crate) fn cancelled(&self) -> &[ReleasedJob] {
+        &self.cancelled
+    }
+
+    pub(crate) fn cancellation_requested(&self) -> &[CancellationDirective] {
+        &self.cancellation_requested
+    }
 }
 
 #[derive(Debug, Clone)]
 struct QueuedJob {
     job: SyncJob,
+    admission: AdmissionToken,
     attempt: u32,
     ready_at_ms: u64,
 }
@@ -375,18 +508,23 @@ struct QueuedJob {
 #[derive(Debug, Clone)]
 struct RunningJob {
     job: SyncJob,
+    admission: AdmissionToken,
     attempt: u32,
     generation: u64,
+    cancellation_requested: bool,
+    retry_superseded_by: Option<AdmissionToken>,
 }
 
 /// A pure state machine. A caller may spawn work only after `dispatch_next`
 /// returns it; at that point both admission and running capacity are reserved.
 pub(crate) struct SyncScheduler {
     config: SchedulerConfig,
+    shutdown_phase: ShutdownPhase,
     interactive: VecDeque<QueuedJob>,
     foreground: VecDeque<QueuedJob>,
     maintenance: VecDeque<QueuedJob>,
     running: HashMap<SyncJobId, RunningJob>,
+    next_admission_generation: u64,
     next_run_generation: u64,
     foreground_wait_dispatches: u64,
     maintenance_wait_dispatches: u64,
@@ -396,10 +534,12 @@ impl SyncScheduler {
     pub(crate) fn new(config: SchedulerConfig) -> Self {
         Self {
             config,
+            shutdown_phase: ShutdownPhase::Open,
             interactive: VecDeque::new(),
             foreground: VecDeque::new(),
             maintenance: VecDeque::new(),
             running: HashMap::new(),
+            next_admission_generation: 1,
             next_run_generation: 1,
             foreground_wait_dispatches: 0,
             maintenance_wait_dispatches: 0,
@@ -412,6 +552,12 @@ impl SyncScheduler {
         now_ms: u64,
         last_success_at_ms: Option<u64>,
     ) -> Result<AdmissionOutcome, AdmissionRejection> {
+        if self.shutdown_phase != ShutdownPhase::Open {
+            return Err(AdmissionRejection {
+                reason: AdmissionRejectionReason::ShuttingDown,
+                job,
+            });
+        }
         if self.has_active_identity(job.id, job.cancellation_id) {
             return Err(AdmissionRejection {
                 reason: AdmissionRejectionReason::DuplicateIdentity,
@@ -421,20 +567,41 @@ impl SyncScheduler {
         if job.freshness.decision(now_ms, last_success_at_ms) == FreshnessDecision::SkipFresh {
             return Ok(AdmissionOutcome::SkippedFresh(job));
         }
-        if self.active_len() >= self.config.admission_capacity {
+        let replacement = self.queued_replacement_for(&job);
+        if replacement.is_none() && self.active_len() >= self.config.admission_capacity {
             return Err(AdmissionRejection {
                 reason: AdmissionRejectionReason::AtCapacity,
                 job,
             });
         }
 
-        let job_id = job.id;
+        let token = AdmissionToken::new(job.id, self.next_admission_generation);
+        self.next_admission_generation = self
+            .next_admission_generation
+            .checked_add(1)
+            .expect("scheduler admission generation space exhausted");
+        if matches!(job.replacement, ReplacementClass::Refresh(_)) {
+            for running in self.running.values_mut() {
+                if running.job.target == job.target && running.job.replacement == job.replacement {
+                    running.retry_superseded_by = Some(token);
+                }
+            }
+        }
+        let coalesced = replacement.map(|(priority, position)| {
+            let replaced = self
+                .queue_mut(priority)
+                .remove(position)
+                .expect("replacement queue position exists");
+            self.reset_wait_if_ineligible(priority, now_ms);
+            ReleasedJob::new(replaced.job, replaced.attempt)
+        });
         self.queue_mut(job.priority).push_back(QueuedJob {
             job,
+            admission: token,
             attempt: 1,
             ready_at_ms: now_ms,
         });
-        Ok(AdmissionOutcome::Accepted { job_id })
+        Ok(AdmissionOutcome::Accepted { token, coalesced })
     }
 
     pub(crate) fn dispatch_next(&mut self, now_ms: u64) -> Option<DispatchedJob> {
@@ -500,6 +667,7 @@ impl SyncScheduler {
             .expect("scheduler run generation space exhausted");
         let dispatched = DispatchedJob {
             job: queued.job.clone(),
+            admission: queued.admission,
             attempt: queued.attempt,
             generation,
         };
@@ -507,8 +675,11 @@ impl SyncScheduler {
             queued.job.id,
             RunningJob {
                 job: queued.job,
+                admission: queued.admission,
                 attempt: queued.attempt,
                 generation,
+                cancellation_requested: false,
+                retry_superseded_by: None,
             },
         );
         Some(dispatched)
@@ -518,7 +689,7 @@ impl SyncScheduler {
         &mut self,
         run: JobRun,
         outcome: JobOutcome,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> Result<CompletionOutcome, CompletionError> {
         let Some(running) = self.running.get(&run.job_id) else {
             return Err(CompletionError::UnknownJob);
@@ -529,13 +700,171 @@ impl SyncScheduler {
         if running.attempt != run.attempt {
             return Err(CompletionError::StaleAttempt);
         }
+        if running.job.durability.is_durable() && outcome == JobOutcome::Cancelled {
+            return Err(CompletionError::DurableCancellationForbidden);
+        }
+        if outcome == JobOutcome::Cancelled && !running.cancellation_requested {
+            return Err(CompletionError::CancellationNotRequested);
+        }
 
-        match outcome {
-            JobOutcome::Succeeded => {
-                self.running.remove(&run.job_id);
-                Ok(CompletionOutcome::Completed)
+        let running = self
+            .running
+            .remove(&run.job_id)
+            .expect("validated running job exists");
+        let completion = match outcome {
+            JobOutcome::Succeeded => CompletionOutcome::Completed,
+            JobOutcome::Cancelled => {
+                CompletionOutcome::Cancelled(ReleasedJob::new(running.job, running.attempt))
+            }
+            JobOutcome::PermanentFailure => {
+                if running.cancellation_requested {
+                    CompletionOutcome::Cancelled(ReleasedJob::new(running.job, running.attempt))
+                } else {
+                    CompletionOutcome::Failed(ReleasedJob::new(running.job, running.attempt))
+                }
+            }
+            JobOutcome::RetryableFailure if running.cancellation_requested => {
+                CompletionOutcome::Cancelled(ReleasedJob::new(running.job, running.attempt))
+            }
+            JobOutcome::RetryableFailure
+                if self.shutdown_phase != ShutdownPhase::Open
+                    && !running.job.durability.is_durable() =>
+            {
+                CompletionOutcome::Cancelled(ReleasedJob::new(running.job, running.attempt))
+            }
+            JobOutcome::RetryableFailure => match running.job.retry.decision(run.attempt, now_ms) {
+                RetryDecision::RetryAt { ready_at_ms } => {
+                    if let Some(superseding) = running.retry_superseded_by.or_else(|| {
+                        self.queued_replacement_for(&running.job)
+                            .map(|(priority, position)| self.queue(priority)[position].admission)
+                    }) {
+                        CompletionOutcome::Superseded {
+                            released: ReleasedJob::new(running.job, running.attempt),
+                            superseding,
+                        }
+                    } else {
+                        let attempt = run
+                            .attempt
+                            .checked_add(1)
+                            .expect("scheduler retry attempt space exhausted");
+                        let job_id = running.job.id;
+                        self.queue_mut(running.job.priority).push_back(QueuedJob {
+                            job: running.job,
+                            admission: running.admission,
+                            attempt,
+                            ready_at_ms,
+                        });
+                        CompletionOutcome::Retried {
+                            job_id,
+                            attempt,
+                            ready_at_ms,
+                        }
+                    }
+                }
+                RetryDecision::Exhausted => {
+                    CompletionOutcome::Failed(ReleasedJob::new(running.job, running.attempt))
+                }
+            },
+        };
+        self.update_drained();
+        Ok(completion)
+    }
+
+    pub(crate) fn cancel(
+        &mut self,
+        cancellation_id: CancellationId,
+        now_ms: u64,
+    ) -> CancellationOutcome {
+        for priority in [
+            SyncPriority::Interactive,
+            SyncPriority::Foreground,
+            SyncPriority::Maintenance,
+        ] {
+            let Some(position) = self
+                .queue(priority)
+                .iter()
+                .position(|queued| queued.job.cancellation_id == cancellation_id)
+            else {
+                continue;
+            };
+            let queued = &self.queue(priority)[position];
+            if queued.job.durability.is_durable() {
+                return CancellationOutcome::Protected {
+                    job_id: queued.job.id,
+                };
+            }
+            let queued = self
+                .queue_mut(priority)
+                .remove(position)
+                .expect("located cancellation queue position exists");
+            self.reset_wait_if_ineligible(priority, now_ms);
+            let cancelled = ReleasedJob::new(queued.job, queued.attempt);
+            self.update_drained();
+            return CancellationOutcome::Cancelled(cancelled);
+        }
+
+        let Some(job_id) = self.running.iter().find_map(|(job_id, running)| {
+            (running.job.cancellation_id == cancellation_id).then_some(*job_id)
+        }) else {
+            return CancellationOutcome::NotFound;
+        };
+        let running = self
+            .running
+            .get_mut(&job_id)
+            .expect("located running cancellation exists");
+        if running.job.durability.is_durable() {
+            return CancellationOutcome::Protected {
+                job_id: running.job.id,
+            };
+        }
+        let directive = CancellationDirective::from_running(running);
+        if running.cancellation_requested {
+            CancellationOutcome::AlreadyRequested(directive)
+        } else {
+            running.cancellation_requested = true;
+            CancellationOutcome::Requested(directive)
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&mut self, now_ms: u64) -> ShutdownReport {
+        if self.shutdown_phase != ShutdownPhase::Open {
+            return ShutdownReport {
+                phase: self.shutdown_phase,
+                cancelled: Vec::new(),
+                cancellation_requested: Vec::new(),
+            };
+        }
+
+        self.shutdown_phase = ShutdownPhase::Draining;
+        let mut cancelled = Vec::new();
+        Self::cancel_ephemeral_queue(&mut self.interactive, &mut cancelled);
+        Self::cancel_ephemeral_queue(&mut self.foreground, &mut cancelled);
+        Self::cancel_ephemeral_queue(&mut self.maintenance, &mut cancelled);
+        self.reset_wait_if_ineligible(SyncPriority::Foreground, now_ms);
+        self.reset_wait_if_ineligible(SyncPriority::Maintenance, now_ms);
+        let mut cancellation_requested = Vec::new();
+        for running in self.running.values_mut() {
+            if !running.job.durability.is_durable() && !running.cancellation_requested {
+                cancellation_requested.push(CancellationDirective::from_running(running));
+                running.cancellation_requested = true;
             }
         }
+        cancelled.sort_unstable_by_key(|released| released.job.id);
+        cancellation_requested.sort_unstable_by_key(|directive| directive.run.job_id);
+        self.update_drained();
+        ShutdownReport {
+            phase: self.shutdown_phase,
+            cancelled,
+            cancellation_requested,
+        }
+    }
+
+    pub(crate) fn shutdown_phase(&self) -> ShutdownPhase {
+        self.shutdown_phase
+    }
+
+    pub(crate) fn is_drained(&self) -> bool {
+        self.shutdown_phase == ShutdownPhase::Drained
     }
 
     fn active_len(&self) -> usize {
@@ -553,6 +882,57 @@ impl SyncScheduler {
             .any(|queued| queued.job.id == job_id || queued.job.cancellation_id == cancellation_id)
     }
 
+    fn queued_replacement_for(&self, job: &SyncJob) -> Option<(SyncPriority, usize)> {
+        if !matches!(job.replacement, ReplacementClass::Refresh(_)) {
+            return None;
+        }
+        [
+            SyncPriority::Interactive,
+            SyncPriority::Foreground,
+            SyncPriority::Maintenance,
+        ]
+        .into_iter()
+        .find_map(|priority| {
+            self.queue(priority)
+                .iter()
+                .position(|queued| {
+                    queued.job.target == job.target
+                        && queued.job.replacement == job.replacement
+                        && !queued.job.durability.is_durable()
+                })
+                .map(|position| (priority, position))
+        })
+    }
+
+    fn cancel_ephemeral_queue(queue: &mut VecDeque<QueuedJob>, cancelled: &mut Vec<ReleasedJob>) {
+        let mut retained = VecDeque::with_capacity(queue.len());
+        while let Some(queued) = queue.pop_front() {
+            if queued.job.durability.is_durable() {
+                retained.push_back(queued);
+            } else {
+                cancelled.push(ReleasedJob::new(queued.job, queued.attempt));
+            }
+        }
+        *queue = retained;
+    }
+
+    fn update_drained(&mut self) {
+        if self.shutdown_phase == ShutdownPhase::Draining && self.active_len() == 0 {
+            self.shutdown_phase = ShutdownPhase::Drained;
+        }
+    }
+
+    fn reset_wait_if_ineligible(&mut self, priority: SyncPriority, now_ms: u64) {
+        if Self::eligible_position(self.queue(priority), now_ms).is_some() {
+            return;
+        }
+        match priority {
+            SyncPriority::Interactive => {}
+            SyncPriority::Foreground => self.foreground_wait_dispatches = 0,
+            SyncPriority::Maintenance => self.maintenance_wait_dispatches = 0,
+        }
+    }
+
     fn eligible_position(queue: &VecDeque<QueuedJob>, now_ms: u64) -> Option<usize> {
         queue.iter().position(|queued| queued.ready_at_ms <= now_ms)
     }
@@ -562,6 +942,14 @@ impl SyncScheduler {
             SyncPriority::Interactive => &mut self.interactive,
             SyncPriority::Foreground => &mut self.foreground,
             SyncPriority::Maintenance => &mut self.maintenance,
+        }
+    }
+
+    fn queue(&self, priority: SyncPriority) -> &VecDeque<QueuedJob> {
+        match priority {
+            SyncPriority::Interactive => &self.interactive,
+            SyncPriority::Foreground => &self.foreground,
+            SyncPriority::Maintenance => &self.maintenance,
         }
     }
 }
@@ -746,7 +1134,11 @@ mod tests {
         assert!(matches!(
             admit(&mut scheduler, first),
             AdmissionOutcome::Accepted {
-                job_id: SyncJobId(1)
+                token: AdmissionToken {
+                    job_id: SyncJobId(1),
+                    generation: 1,
+                },
+                coalesced: None
             }
         ));
         admit(&mut scheduler, second);
@@ -1083,5 +1475,808 @@ mod tests {
             dispatch_and_complete(&mut scheduler, 10_000),
             SyncJobId::new(2)
         );
+    }
+
+    fn replaceable_job(id: u64, target_id: u64, refresh_class: RefreshClass) -> SyncJob {
+        SyncJob::new(
+            SyncJobId::new(id),
+            CancellationId::new(id + 1_000),
+            conversation_target(target_id),
+            SyncPriority::Foreground,
+            SyncDurability::Ephemeral,
+            FreshnessPolicy::Always,
+            ReplacementClass::Refresh(refresh_class),
+            RetryPolicy::Never,
+        )
+        .unwrap()
+    }
+
+    fn durable_job(id: u64, durability: SyncDurability, retry: RetryPolicy) -> SyncJob {
+        SyncJob::new(
+            SyncJobId::new(id),
+            CancellationId::new(id + 1_000),
+            conversation_target(id),
+            SyncPriority::Foreground,
+            durability,
+            FreshnessPolicy::Always,
+            ReplacementClass::Never,
+            retry,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn full_capacity_replacement_matches_both_target_and_refresh_class() {
+        let mut scheduler = scheduler(3, 1, 3);
+        admit(
+            &mut scheduler,
+            replaceable_job(1, 10, RefreshClass::ConversationHistory),
+        );
+        admit(
+            &mut scheduler,
+            replaceable_job(2, 10, RefreshClass::Presence),
+        );
+        admit(
+            &mut scheduler,
+            replaceable_job(3, 20, RefreshClass::ConversationHistory),
+        );
+
+        assert_eq!(
+            scheduler
+                .admit(
+                    replaceable_job(4, 10, RefreshClass::ConversationHistory),
+                    10_000,
+                    None,
+                )
+                .unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(SyncJobId::new(4), 4),
+                coalesced: Some(ReleasedJob::new(
+                    replaceable_job(1, 10, RefreshClass::ConversationHistory),
+                    1,
+                )),
+            }
+        );
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(5), 10_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::AtCapacity
+        );
+
+        let dispatched = (0..3)
+            .map(|_| dispatch_and_complete(&mut scheduler, 10_000))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dispatched,
+            vec![SyncJobId::new(2), SyncJobId::new(3), SyncJobId::new(4),]
+        );
+    }
+
+    #[test]
+    fn running_refresh_is_not_coalesced_or_cancelled_by_a_new_generation() {
+        let mut scheduler = scheduler(2, 1, 3);
+        admit(
+            &mut scheduler,
+            replaceable_job(1, 10, RefreshClass::ConversationHistory),
+        );
+        let running = scheduler.dispatch_next(10_000).unwrap();
+
+        assert_eq!(
+            scheduler
+                .admit(
+                    replaceable_job(2, 10, RefreshClass::ConversationHistory),
+                    10_000,
+                    None,
+                )
+                .unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(SyncJobId::new(2), 2),
+                coalesced: None,
+            }
+        );
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Succeeded, 10_000),
+            Ok(CompletionOutcome::Completed)
+        );
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            SyncJobId::new(2)
+        );
+    }
+
+    #[test]
+    fn queued_cancellation_releases_capacity_but_durable_work_is_protected() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let ephemeral = ephemeral_job(1);
+        let durable = durable_job(2, SyncDurability::ReadMarker, RetryPolicy::Never);
+        admit(&mut scheduler, ephemeral.clone());
+        admit(&mut scheduler, durable.clone());
+
+        assert_eq!(
+            scheduler.cancel(ephemeral.cancellation_id(), 10_000),
+            CancellationOutcome::Cancelled(ReleasedJob::new(ephemeral.clone(), 1))
+        );
+        admit(&mut scheduler, ephemeral_job(3));
+        assert_eq!(
+            scheduler.cancel(durable.cancellation_id(), 10_000),
+            CancellationOutcome::Protected {
+                job_id: durable.id()
+            }
+        );
+        assert_eq!(
+            scheduler.cancel(CancellationId::new(99_999), 10_000),
+            CancellationOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn cancelling_the_last_waiting_job_resets_that_lanes_fairness_credit() {
+        let mut scheduler = scheduler(4, 1, 1);
+        let old_maintenance = with_priority(ephemeral_job(1), SyncPriority::Maintenance);
+        scheduler
+            .admit(old_maintenance.clone(), 10_000, None)
+            .unwrap();
+        scheduler
+            .admit(
+                with_priority(ephemeral_job(2), SyncPriority::Interactive),
+                10_000,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            SyncJobId::new(2)
+        );
+        assert!(matches!(
+            scheduler.cancel(old_maintenance.cancellation_id(), 10_000),
+            CancellationOutcome::Cancelled(_)
+        ));
+
+        scheduler
+            .admit(
+                with_priority(ephemeral_job(3), SyncPriority::Maintenance),
+                10_000,
+                None,
+            )
+            .unwrap();
+        scheduler
+            .admit(
+                with_priority(ephemeral_job(4), SyncPriority::Interactive),
+                10_000,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            SyncJobId::new(4)
+        );
+    }
+
+    #[test]
+    fn cancelling_the_only_eligible_job_does_not_transfer_credit_to_a_delayed_retry() {
+        let mut scheduler = scheduler(4, 1, 1);
+        let mut delayed_retry = with_priority(ephemeral_job(1), SyncPriority::Maintenance);
+        delayed_retry.retry = RetryPolicy::fixed(2, 250).unwrap();
+        scheduler.admit(delayed_retry.clone(), 1_000, None).unwrap();
+        let first_attempt = scheduler.dispatch_next(1_000).unwrap();
+        assert!(matches!(
+            scheduler.complete(first_attempt.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried {
+                ready_at_ms: 1_250,
+                ..
+            })
+        ));
+
+        let eligible_maintenance = with_priority(ephemeral_job(2), SyncPriority::Maintenance);
+        scheduler
+            .admit(eligible_maintenance.clone(), 1_001, None)
+            .unwrap();
+        scheduler
+            .admit(
+                with_priority(ephemeral_job(3), SyncPriority::Interactive),
+                1_001,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 1_001),
+            SyncJobId::new(3)
+        );
+        assert!(matches!(
+            scheduler.cancel(eligible_maintenance.cancellation_id(), 1_001),
+            CancellationOutcome::Cancelled(_)
+        ));
+
+        scheduler
+            .admit(
+                with_priority(ephemeral_job(4), SyncPriority::Interactive),
+                1_002,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 1_250),
+            SyncJobId::new(4)
+        );
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 1_250),
+            delayed_retry.id()
+        );
+    }
+
+    #[test]
+    fn cross_lane_coalescing_does_not_transfer_stale_fairness_credit() {
+        let mut scheduler = scheduler(4, 1, 1);
+        let old = with_priority(
+            replaceable_job(1, 10, RefreshClass::ConversationHistory),
+            SyncPriority::Maintenance,
+        );
+        scheduler.admit(old, 10_000, None).unwrap();
+        scheduler
+            .admit(
+                with_priority(ephemeral_job(2), SyncPriority::Interactive),
+                10_000,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            SyncJobId::new(2)
+        );
+        let replacement = with_priority(
+            replaceable_job(3, 10, RefreshClass::ConversationHistory),
+            SyncPriority::Foreground,
+        );
+        assert!(matches!(
+            scheduler.admit(replacement, 10_000, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                coalesced: Some(_),
+                ..
+            }
+        ));
+        scheduler
+            .admit(
+                with_priority(ephemeral_job(4), SyncPriority::Maintenance),
+                10_000,
+                None,
+            )
+            .unwrap();
+        scheduler
+            .admit(
+                with_priority(ephemeral_job(5), SyncPriority::Interactive),
+                10_000,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            SyncJobId::new(5)
+        );
+    }
+
+    #[test]
+    fn running_cancellation_keeps_capacity_until_the_worker_acknowledges_it() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let job = ephemeral_job(1);
+        admit(&mut scheduler, job.clone());
+        let running = scheduler.dispatch_next(10_000).unwrap();
+        let directive = CancellationDirective {
+            run: running.run(),
+            cancellation_id: job.cancellation_id(),
+        };
+
+        assert_eq!(
+            scheduler.cancel(job.cancellation_id(), 10_000),
+            CancellationOutcome::Requested(directive)
+        );
+        assert_eq!(
+            scheduler.cancel(job.cancellation_id(), 10_000),
+            CancellationOutcome::AlreadyRequested(directive)
+        );
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(2), 10_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::AtCapacity
+        );
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Cancelled, 10_000),
+            Ok(CompletionOutcome::Cancelled(ReleasedJob::new(job, 1)))
+        );
+        admit(&mut scheduler, ephemeral_job(2));
+    }
+
+    #[test]
+    fn unrequested_running_cancellation_is_rejected_without_releasing_capacity() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let job = ephemeral_job(1);
+        admit(&mut scheduler, job.clone());
+        let running = scheduler.dispatch_next(10_000).unwrap();
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Cancelled, 10_000),
+            Err(CompletionError::CancellationNotRequested)
+        );
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(2), 10_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::AtCapacity
+        );
+        assert!(matches!(
+            scheduler.cancel(job.cancellation_id(), 10_000),
+            CancellationOutcome::Requested(_)
+        ));
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Cancelled, 10_000),
+            Ok(CompletionOutcome::Cancelled(ReleasedJob::new(job, 1)))
+        );
+    }
+
+    #[test]
+    fn durable_running_work_rejects_cancellation_without_releasing_capacity() {
+        for durability in [SyncDurability::DurableAction, SyncDurability::ReadMarker] {
+            let mut scheduler = scheduler(1, 1, 3);
+            let job = durable_job(1, durability, RetryPolicy::Never);
+            admit(&mut scheduler, job.clone());
+            let running = scheduler.dispatch_next(10_000).unwrap();
+
+            assert_eq!(
+                scheduler.cancel(job.cancellation_id(), 10_000),
+                CancellationOutcome::Protected { job_id: job.id() }
+            );
+            assert_eq!(
+                scheduler.complete(running.run(), JobOutcome::Cancelled, 10_000),
+                Err(CompletionError::DurableCancellationForbidden)
+            );
+            assert_eq!(
+                scheduler
+                    .admit(ephemeral_job(2), 10_000, None)
+                    .unwrap_err()
+                    .reason(),
+                AdmissionRejectionReason::AtCapacity
+            );
+            assert_eq!(
+                scheduler.complete(running.run(), JobOutcome::Succeeded, 10_000),
+                Ok(CompletionOutcome::Completed)
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_retry_retains_admission_and_exhausts_at_the_exact_attempt_limit() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let mut job = ephemeral_job(1);
+        job.retry = RetryPolicy::fixed(3, 250).unwrap();
+        scheduler.admit(job.clone(), 1_000, None).unwrap();
+
+        let first = scheduler.dispatch_next(1_000).unwrap();
+        assert_eq!(
+            scheduler.complete(first.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried {
+                job_id: job.id(),
+                attempt: 2,
+                ready_at_ms: 1_250,
+            })
+        );
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(2), 1_001, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::AtCapacity
+        );
+        assert!(scheduler.dispatch_next(1_249).is_none());
+
+        let second = scheduler.dispatch_next(1_250).unwrap();
+        assert_eq!(second.attempt(), 2);
+        assert_eq!(
+            scheduler.complete(first.run(), JobOutcome::Succeeded, 1_250),
+            Err(CompletionError::StaleRun)
+        );
+        assert_eq!(
+            scheduler.complete(second.run(), JobOutcome::RetryableFailure, 1_250),
+            Ok(CompletionOutcome::Retried {
+                job_id: job.id(),
+                attempt: 3,
+                ready_at_ms: 1_500,
+            })
+        );
+
+        let third = scheduler.dispatch_next(1_500).unwrap();
+        assert_eq!(third.attempt(), 3);
+        assert_eq!(
+            scheduler.complete(third.run(), JobOutcome::RetryableFailure, 1_500),
+            Ok(CompletionOutcome::Failed(ReleasedJob::new(job, 3)))
+        );
+        admit(&mut scheduler, ephemeral_job(2));
+    }
+
+    #[test]
+    fn newer_queued_refresh_supersedes_an_older_running_retry() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
+        older.retry = RetryPolicy::fixed(2, 250).unwrap();
+        let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+        scheduler.admit(older.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+        scheduler.admit(newer.clone(), 1_001, None).unwrap();
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::RetryableFailure, 1_010),
+            Ok(CompletionOutcome::Superseded {
+                released: ReleasedJob::new(older, 1),
+                superseding: AdmissionToken::new(newer.id(), 2),
+            })
+        );
+        assert_eq!(dispatch_and_complete(&mut scheduler, 1_010), newer.id());
+        assert!(scheduler.dispatch_next(1_010).is_none());
+    }
+
+    #[test]
+    fn newer_running_refresh_supersedes_an_older_concurrent_retry() {
+        let mut scheduler = scheduler(2, 2, 3);
+        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
+        older.retry = RetryPolicy::fixed(2, 250).unwrap();
+        let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+        scheduler.admit(older.clone(), 1_000, None).unwrap();
+        let older_run = scheduler.dispatch_next(1_000).unwrap();
+        scheduler.admit(newer.clone(), 1_001, None).unwrap();
+        let newer_run = scheduler.dispatch_next(1_001).unwrap();
+
+        assert_eq!(
+            scheduler.complete(older_run.run(), JobOutcome::RetryableFailure, 1_010),
+            Ok(CompletionOutcome::Superseded {
+                released: ReleasedJob::new(older, 1),
+                superseding: AdmissionToken::new(newer.id(), 2),
+            })
+        );
+        assert_eq!(
+            scheduler.complete(newer_run.run(), JobOutcome::Succeeded, 1_010),
+            Ok(CompletionOutcome::Completed)
+        );
+    }
+
+    #[test]
+    fn completed_newer_refresh_still_supersedes_an_older_concurrent_retry() {
+        let mut scheduler = scheduler(2, 2, 3);
+        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
+        older.retry = RetryPolicy::fixed(2, 250).unwrap();
+        let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+        scheduler.admit(older.clone(), 1_000, None).unwrap();
+        let older_run = scheduler.dispatch_next(1_000).unwrap();
+        scheduler.admit(newer.clone(), 1_001, None).unwrap();
+        let newer_run = scheduler.dispatch_next(1_001).unwrap();
+        assert_eq!(
+            scheduler.complete(newer_run.run(), JobOutcome::Succeeded, 1_005),
+            Ok(CompletionOutcome::Completed)
+        );
+
+        assert_eq!(
+            scheduler.complete(older_run.run(), JobOutcome::RetryableFailure, 1_010),
+            Ok(CompletionOutcome::Superseded {
+                released: ReleasedJob::new(older, 1),
+                superseding: AdmissionToken::new(newer.id(), 2),
+            })
+        );
+        assert!(scheduler.dispatch_next(1_500).is_none());
+    }
+
+    #[test]
+    fn reused_job_id_does_not_change_the_admission_that_superseded_a_retry() {
+        let mut scheduler = scheduler(2, 2, 3);
+        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
+        older.retry = RetryPolicy::fixed(2, 250).unwrap();
+        let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+        scheduler.admit(older.clone(), 1_000, None).unwrap();
+        let older_run = scheduler.dispatch_next(1_000).unwrap();
+        let AdmissionOutcome::Accepted {
+            token: newer_admission,
+            ..
+        } = scheduler.admit(newer, 1_001, None).unwrap()
+        else {
+            unreachable!("newer refresh must be admitted");
+        };
+        let newer_run = scheduler.dispatch_next(1_001).unwrap();
+        assert_eq!(
+            scheduler.complete(newer_run.run(), JobOutcome::Succeeded, 1_005),
+            Ok(CompletionOutcome::Completed)
+        );
+
+        let unrelated_reuse = replaceable_job(2, 20, RefreshClass::ConversationHistory);
+        let AdmissionOutcome::Accepted {
+            token: reused_admission,
+            ..
+        } = scheduler.admit(unrelated_reuse, 1_006, None).unwrap()
+        else {
+            unreachable!("unrelated reuse must be admitted");
+        };
+        assert_ne!(newer_admission, reused_admission);
+        assert_eq!(
+            scheduler.complete(older_run.run(), JobOutcome::RetryableFailure, 1_010),
+            Ok(CompletionOutcome::Superseded {
+                released: ReleasedJob::new(older, 1),
+                superseding: newer_admission,
+            })
+        );
+    }
+
+    #[test]
+    fn delayed_retry_can_be_cancelled_with_its_attempt_handed_back() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let mut job = ephemeral_job(1);
+        job.retry = RetryPolicy::fixed(2, 250).unwrap();
+        scheduler.admit(job.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+        assert!(matches!(
+            scheduler.complete(running.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried { attempt: 2, .. })
+        ));
+
+        assert_eq!(
+            scheduler.cancel(job.cancellation_id(), 1_000),
+            CancellationOutcome::Cancelled(ReleasedJob::new(job, 2))
+        );
+        admit(&mut scheduler, ephemeral_job(2));
+    }
+
+    #[test]
+    fn delayed_retry_does_not_head_block_ready_work_in_the_same_lane() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let mut delayed = ephemeral_job(1);
+        delayed.retry = RetryPolicy::fixed(2, 250).unwrap();
+        scheduler.admit(delayed, 1_000, None).unwrap();
+        let first = scheduler.dispatch_next(1_000).unwrap();
+        assert!(matches!(
+            scheduler.complete(first.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried {
+                ready_at_ms: 1_250,
+                ..
+            })
+        ));
+        scheduler.admit(ephemeral_job(2), 1_001, None).unwrap();
+
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 1_001),
+            SyncJobId::new(2)
+        );
+        assert!(scheduler.dispatch_next(1_249).is_none());
+        assert_eq!(
+            scheduler.dispatch_next(1_250).unwrap().job().id(),
+            SyncJobId::new(1)
+        );
+    }
+
+    #[test]
+    fn exact_replacement_of_a_delayed_retry_returns_its_attempt_at_full_capacity() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
+        older.retry = RetryPolicy::fixed(2, 250).unwrap();
+        scheduler.admit(older.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+        assert!(matches!(
+            scheduler.complete(running.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried { attempt: 2, .. })
+        ));
+        let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+
+        assert_eq!(
+            scheduler.admit(newer.clone(), 1_001, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(newer.id(), 2),
+                coalesced: Some(ReleasedJob::new(older, 2)),
+            }
+        );
+        assert_eq!(
+            scheduler.dispatch_next(1_001).unwrap().job().id(),
+            newer.id()
+        );
+    }
+
+    #[test]
+    fn cancellation_request_races_never_retry_or_release_before_completion() {
+        for (outcome, expected) in [
+            (JobOutcome::Succeeded, None),
+            (
+                JobOutcome::PermanentFailure,
+                Some(JobOutcome::PermanentFailure),
+            ),
+            (
+                JobOutcome::RetryableFailure,
+                Some(JobOutcome::RetryableFailure),
+            ),
+        ] {
+            let mut scheduler = scheduler(1, 1, 3);
+            let mut job = ephemeral_job(1);
+            job.retry = RetryPolicy::fixed(2, 250).unwrap();
+            scheduler.admit(job.clone(), 1_000, None).unwrap();
+            let running = scheduler.dispatch_next(1_000).unwrap();
+            assert!(matches!(
+                scheduler.cancel(job.cancellation_id(), 1_000),
+                CancellationOutcome::Requested(_)
+            ));
+
+            let completion = scheduler.complete(running.run(), outcome, 1_000);
+            if expected.is_some() {
+                assert_eq!(
+                    completion,
+                    Ok(CompletionOutcome::Cancelled(ReleasedJob::new(job, 1)))
+                );
+            } else {
+                assert_eq!(completion, Ok(CompletionOutcome::Completed));
+            }
+            scheduler.admit(ephemeral_job(2), 1_001, None).unwrap();
+            assert_eq!(
+                scheduler.dispatch_next(1_500).unwrap().job().id(),
+                SyncJobId::new(2)
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_cancels_best_effort_and_drains_durable_work() {
+        let mut scheduler = scheduler(4, 1, 3);
+        let running_ephemeral = with_priority(ephemeral_job(1), SyncPriority::Interactive);
+        let queued_ephemeral = ephemeral_job(2);
+        let durable_action = durable_job(3, SyncDurability::DurableAction, RetryPolicy::Never);
+        let read_marker = durable_job(4, SyncDurability::ReadMarker, RetryPolicy::Never);
+        admit(&mut scheduler, running_ephemeral.clone());
+        let running = scheduler.dispatch_next(10_000).unwrap();
+        admit(&mut scheduler, queued_ephemeral.clone());
+        admit(&mut scheduler, durable_action.clone());
+        admit(&mut scheduler, read_marker.clone());
+
+        let report = scheduler.begin_shutdown(10_000);
+        assert_eq!(report.phase(), ShutdownPhase::Draining);
+        assert_eq!(
+            report.cancelled(),
+            &[ReleasedJob::new(queued_ephemeral.clone(), 1)]
+        );
+        assert_eq!(
+            report.cancellation_requested(),
+            &[CancellationDirective {
+                run: running.run(),
+                cancellation_id: running_ephemeral.cancellation_id(),
+            }]
+        );
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(5), 10_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::ShuttingDown
+        );
+        assert!(scheduler.dispatch_next(10_000).is_none());
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Cancelled, 10_000),
+            Ok(CompletionOutcome::Cancelled(ReleasedJob::new(
+                running_ephemeral,
+                1,
+            )))
+        );
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            durable_action.id()
+        );
+        assert_eq!(scheduler.shutdown_phase(), ShutdownPhase::Draining);
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            read_marker.id()
+        );
+        assert_eq!(scheduler.shutdown_phase(), ShutdownPhase::Drained);
+        assert!(scheduler.is_drained());
+
+        let repeated = scheduler.begin_shutdown(10_000);
+        assert_eq!(repeated.phase(), ShutdownPhase::Drained);
+        assert!(repeated.cancelled().is_empty());
+        assert!(repeated.cancellation_requested().is_empty());
+    }
+
+    #[test]
+    fn shutdown_allows_durable_delayed_retry_to_finish() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let job = durable_job(
+            1,
+            SyncDurability::DurableAction,
+            RetryPolicy::fixed(2, 250).unwrap(),
+        );
+        scheduler.admit(job.clone(), 1_000, None).unwrap();
+        let first = scheduler.dispatch_next(1_000).unwrap();
+        assert_eq!(
+            scheduler.begin_shutdown(1_000).phase(),
+            ShutdownPhase::Draining
+        );
+
+        assert_eq!(
+            scheduler.complete(first.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried {
+                job_id: job.id(),
+                attempt: 2,
+                ready_at_ms: 1_250,
+            })
+        );
+        assert!(scheduler.dispatch_next(1_249).is_none());
+        let retry = scheduler.dispatch_next(1_250).unwrap();
+        assert_eq!(
+            scheduler.complete(retry.run(), JobOutcome::Succeeded, 1_250),
+            Ok(CompletionOutcome::Completed)
+        );
+        assert_eq!(scheduler.shutdown_phase(), ShutdownPhase::Drained);
+    }
+
+    #[test]
+    fn shutdown_releases_ephemeral_delayed_retry_with_its_attempt() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let mut job = ephemeral_job(1);
+        job.retry = RetryPolicy::fixed(2, 250).unwrap();
+        scheduler.admit(job.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+        assert!(matches!(
+            scheduler.complete(running.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried { attempt: 2, .. })
+        ));
+
+        let report = scheduler.begin_shutdown(1_000);
+        assert_eq!(report.phase(), ShutdownPhase::Drained);
+        assert_eq!(report.cancelled(), &[ReleasedJob::new(job, 2)]);
+    }
+
+    #[test]
+    fn repeated_shutdown_while_draining_does_not_repeat_cancellation_directives() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let job = ephemeral_job(1);
+        scheduler.admit(job.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+
+        let first = scheduler.begin_shutdown(1_000);
+        assert_eq!(first.phase(), ShutdownPhase::Draining);
+        assert_eq!(first.cancellation_requested().len(), 1);
+        let repeated = scheduler.begin_shutdown(1_000);
+        assert_eq!(repeated.phase(), ShutdownPhase::Draining);
+        assert!(repeated.cancelled().is_empty());
+        assert!(repeated.cancellation_requested().is_empty());
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Cancelled, 1_000),
+            Ok(CompletionOutcome::Cancelled(ReleasedJob::new(job, 1)))
+        );
+        assert_eq!(scheduler.shutdown_phase(), ShutdownPhase::Drained);
+    }
+
+    #[test]
+    fn durable_terminal_failure_is_handed_back_before_shutdown_drains() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let job = durable_job(1, SyncDurability::ReadMarker, RetryPolicy::Never);
+        scheduler.admit(job.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+        assert_eq!(
+            scheduler.begin_shutdown(1_000).phase(),
+            ShutdownPhase::Draining
+        );
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::PermanentFailure, 1_000),
+            Ok(CompletionOutcome::Failed(ReleasedJob::new(job, 1)))
+        );
+        assert_eq!(scheduler.shutdown_phase(), ShutdownPhase::Drained);
+    }
+
+    #[test]
+    fn empty_shutdown_is_immediately_drained_and_rejects_new_work() {
+        let mut scheduler = scheduler(1, 1, 3);
+
+        assert_eq!(
+            scheduler.begin_shutdown(10_000).phase(),
+            ShutdownPhase::Drained
+        );
+        let rejection = scheduler.admit(ephemeral_job(1), 10_000, None).unwrap_err();
+        assert_eq!(rejection.reason(), AdmissionRejectionReason::ShuttingDown);
+        assert_eq!(rejection.into_job().id(), SyncJobId::new(1));
     }
 }
