@@ -15,9 +15,11 @@ use std::collections::HashMap;
 
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
-    SavedItem, SearchMatch, SearchMessageLocation, SlackFile, SlackMessage, SlackReaction,
+    SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile, SlackMessage,
+    SlackReaction,
 };
 use crate::thread_catalog::ThreadCatalog;
+use crate::workspace_pipeline::{WorkspaceChange, WorkspacePatch, WorkspaceRevision};
 
 /// Authoritative connection lifecycle for one workspace session.
 ///
@@ -88,6 +90,49 @@ pub(crate) struct WorkspaceSessionState {
     pub(crate) conversations: RefCell<ConversationCatalog>,
     pub(crate) view: RefCell<WorkspaceViewState>,
     pub(crate) threads: RefCell<ThreadCatalog>,
+    conversation_patches: RefCell<ConversationPatchConsumer>,
+}
+
+#[derive(Debug, Default)]
+struct ConversationPatchConsumer {
+    revision: WorkspaceRevision,
+}
+
+#[derive(Debug)]
+pub(crate) struct ConversationPatchRemoval {
+    channel_id: String,
+    conversation: Option<SlackConversation>,
+    was_visible: bool,
+}
+
+impl ConversationPatchRemoval {
+    pub(crate) fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    pub(crate) fn conversation(&self) -> Option<&SlackConversation> {
+        self.conversation.as_ref()
+    }
+
+    pub(crate) fn was_visible(&self) -> bool {
+        self.was_visible
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ConversationPatchApplication {
+    conversation_changed: bool,
+    removals: Vec<ConversationPatchRemoval>,
+}
+
+impl ConversationPatchApplication {
+    pub(crate) fn conversation_changed(&self) -> bool {
+        self.conversation_changed
+    }
+
+    pub(crate) fn removals(&self) -> &[ConversationPatchRemoval] {
+        &self.removals
+    }
 }
 
 impl WorkspaceSessionState {
@@ -108,7 +153,95 @@ impl WorkspaceSessionState {
         *self.conversations.borrow_mut() = ConversationCatalog::default();
         self.view.borrow_mut().reset();
         *self.threads.borrow_mut() = ThreadCatalog::default();
+        *self.conversation_patches.borrow_mut() = ConversationPatchConsumer::default();
     }
+
+    pub(crate) fn conversation_patch_revision(&self) -> WorkspaceRevision {
+        self.conversation_patches.borrow().revision
+    }
+
+    pub(crate) fn has_conversation_patch(&self) -> bool {
+        self.conversation_patch_revision() > WorkspaceRevision::INITIAL
+    }
+
+    pub(crate) fn apply_conversation_patch(
+        &self,
+        patch: &WorkspacePatch,
+    ) -> Option<ConversationPatchApplication> {
+        let mut consumer = self.conversation_patches.borrow_mut();
+        if patch.revision() <= consumer.revision {
+            return None;
+        }
+
+        let mut catalog = self.conversations.borrow_mut();
+        let mut view = self.view.borrow_mut();
+        let mut application = ConversationPatchApplication::default();
+        for change in patch.changes() {
+            match change {
+                WorkspaceChange::BootstrapReset(data) => replace_patch_conversations(
+                    &mut catalog,
+                    &mut view,
+                    &data.conversations,
+                    &mut application,
+                ),
+                WorkspaceChange::ConversationsReset(conversations) => {
+                    replace_patch_conversations(
+                        &mut catalog,
+                        &mut view,
+                        conversations,
+                        &mut application,
+                    );
+                }
+                WorkspaceChange::ConversationUpsert(conversation) => {
+                    catalog.upsert_authoritative(conversation.clone());
+                    application.conversation_changed = true;
+                }
+                WorkspaceChange::ConversationRemoved { channel_id } => {
+                    application.removals.push(ConversationPatchRemoval {
+                        channel_id: channel_id.clone(),
+                        conversation: catalog.remove(channel_id),
+                        was_visible: view.visible_channel_id() == Some(channel_id),
+                    });
+                    view.remove_conversation(channel_id);
+                    application.conversation_changed = true;
+                }
+                WorkspaceChange::UnreadChanged { .. }
+                | WorkspaceChange::UsersReset(_)
+                | WorkspaceChange::UserUpsert(_)
+                | WorkspaceChange::TimelineChanged { .. }
+                | WorkspaceChange::ThreadCatalogChanged(_) => {}
+            }
+        }
+        consumer.revision = patch.revision();
+        Some(application)
+    }
+}
+
+fn replace_patch_conversations(
+    catalog: &mut ConversationCatalog,
+    view: &mut WorkspaceViewState,
+    conversations: &[SlackConversation],
+    application: &mut ConversationPatchApplication,
+) {
+    let incoming_ids = conversations
+        .iter()
+        .map(|conversation| conversation.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for conversation in catalog
+        .conversations()
+        .into_iter()
+        .filter(|conversation| !incoming_ids.contains(conversation.id.as_str()))
+    {
+        let channel_id = conversation.id.clone();
+        application.removals.push(ConversationPatchRemoval {
+            was_visible: view.visible_channel_id() == Some(channel_id.as_str()),
+            channel_id: channel_id.clone(),
+            conversation: Some(conversation),
+        });
+        view.remove_conversation(&channel_id);
+    }
+    *catalog = ConversationCatalog::from_cached(conversations.iter().cloned());
+    application.conversation_changed = true;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1452,6 +1585,9 @@ fn apply_reaction_to_message(message: &mut SlackMessage, update: &ReactionUpdate
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_pipeline::{
+        WorkspaceBootstrapData, WorkspaceChange, WorkspacePatch, WorkspaceRevision,
+    };
 
     fn message(ts: &str, text: &str) -> SlackMessage {
         SlackMessage {
@@ -1474,6 +1610,90 @@ mod tests {
         messages: Vec<SlackMessage>,
     ) -> HistoryApplyOutcome {
         state.apply_history(channel_id, messages, false, None, false, false)
+    }
+
+    fn conversation(id: &str, name: &str) -> crate::models::SlackConversation {
+        crate::models::SlackConversation {
+            id: id.to_string(),
+            name: Some(name.to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn conversation_patch(revision: WorkspaceRevision, change: WorkspaceChange) -> WorkspacePatch {
+        WorkspacePatch::new(revision, vec![change]).unwrap()
+    }
+
+    #[test]
+    fn conversation_patch_consumer_accepts_gaps_and_rejects_stale_or_duplicate_rollbacks() {
+        let state = WorkspaceSessionState::default();
+        let revision_one = WorkspaceRevision::INITIAL.successor();
+        let revision_two = revision_one.successor();
+        let revision_three = revision_two.successor();
+        let revision_four = revision_three.successor();
+
+        let bootstrap = conversation_patch(
+            revision_one,
+            WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                conversations: vec![conversation("C1", "old")],
+                ..Default::default()
+            }),
+        );
+        assert!(state
+            .apply_conversation_patch(&bootstrap)
+            .unwrap()
+            .conversation_changed());
+        state.view.borrow_mut().select_conversation("C1");
+
+        let newer = conversation_patch(
+            revision_three,
+            WorkspaceChange::ConversationUpsert(conversation("C1", "new")),
+        );
+        assert!(state
+            .apply_conversation_patch(&newer)
+            .unwrap()
+            .conversation_changed());
+        assert_eq!(state.conversation_patch_revision(), revision_three);
+
+        let duplicate = conversation_patch(
+            revision_three,
+            WorkspaceChange::ConversationRemoved {
+                channel_id: "C1".to_string(),
+            },
+        );
+        assert!(state.apply_conversation_patch(&duplicate).is_none());
+        let stale = conversation_patch(
+            revision_two,
+            WorkspaceChange::ConversationUpsert(conversation("C1", "rollback")),
+        );
+        assert!(state.apply_conversation_patch(&stale).is_none());
+        assert_eq!(
+            state
+                .conversations
+                .borrow()
+                .get("C1")
+                .and_then(|conversation| conversation.name.as_deref()),
+            Some("new")
+        );
+        assert_eq!(
+            state.view.borrow().visible_channel_id(),
+            Some("C1"),
+            "rejected patches must not mutate navigation"
+        );
+
+        let removal = conversation_patch(
+            revision_four,
+            WorkspaceChange::ConversationRemoved {
+                channel_id: "C1".to_string(),
+            },
+        );
+        let application = state.apply_conversation_patch(&removal).unwrap();
+        assert_eq!(application.removals().len(), 1);
+        assert_eq!(application.removals()[0].channel_id(), "C1");
+        assert!(application.removals()[0].was_visible());
+        assert!(state.conversations.borrow().get("C1").is_none());
+        assert_eq!(state.view.borrow().visible_channel_id(), None);
     }
 
     #[test]

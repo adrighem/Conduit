@@ -59,6 +59,21 @@ impl ConversationCatalog {
         conversations
     }
 
+    /// Replaces one presentation row with the coordinator's complete
+    /// revisioned value.
+    pub(crate) fn upsert_authoritative(&mut self, conversation: SlackConversation) {
+        let revision = self.next_revision();
+        self.entries.insert(
+            conversation.id.clone(),
+            CatalogEntry {
+                conversation,
+                membership_revision: revision,
+                metadata_revision: revision,
+                unread_revision: revision,
+            },
+        );
+    }
+
     /// Removes a conversation after membership has ended locally or remotely.
     pub(crate) fn remove(&mut self, id: &str) -> Option<SlackConversation> {
         let revision = self.next_revision();

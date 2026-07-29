@@ -207,7 +207,7 @@ pub(crate) enum WorkspaceChange {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WorkspacePatch {
+pub struct WorkspacePatch {
     revision: WorkspaceRevision,
     changes: Vec<WorkspaceChange>,
 }

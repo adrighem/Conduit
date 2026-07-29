@@ -91,10 +91,10 @@ use crate::thread_catalog::ThreadCatalog;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_state::{
     resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
-    ConversationOpenPosition, ConversationOpenRenderAction, ConversationSelectionDecision,
-    MainMessageView, ReactionUpdate, RealtimeMessageKind, RealtimeMessageOutcome,
-    ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle, WorkspaceLifecycleEvent,
-    WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
+    ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
+    ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
+    RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle,
+    WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -1246,6 +1246,24 @@ fn sidebar_conversation_profile_action(
 fn sidebar_context_menu_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
     key == gtk::gdk::Key::Menu
         || (key == gtk::gdk::Key::F10 && state.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+}
+
+fn legacy_conversation_catalog_mutation_allowed(workspace: &WorkspaceSessionState) -> bool {
+    !workspace.has_conversation_patch()
+}
+
+fn remove_patch_departures_from_discovery(
+    discovered: &mut Vec<SlackConversation>,
+    removals: &[ConversationPatchRemoval],
+) {
+    for removal in removals {
+        if removal
+            .conversation()
+            .is_some_and(sidebar_conversation_leave_requires_confirmation)
+        {
+            discovered.retain(|conversation| conversation.id != removal.channel_id());
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4873,9 +4891,19 @@ impl ConduitWindow {
                     self.send_command(RuntimeCommand::DiscoverConversations);
                 }
             }
+            RuntimeEventKind::WorkspacePatch(patch) => {
+                self.apply_conversation_workspace_patch(&patch);
+            }
             RuntimeEventKind::ConversationsLoaded(conversations) => {
                 if !self.imp().connect_requested.get() {
-                    self.populate_conversations(conversations);
+                    if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
+                        self.populate_conversations(conversations);
+                    } else {
+                        self.imp()
+                            .pending_opened_conversation_ids
+                            .borrow_mut()
+                            .clear();
+                    }
                     self.restore_workspace_status();
                 }
             }
@@ -4912,34 +4940,40 @@ impl ConduitWindow {
                     &imp.user_names.borrow(),
                     imp.current_user_id.borrow().as_deref(),
                 );
-                imp.workspace
-                    .conversations
-                    .borrow_mut()
-                    .upsert_metadata(conversation);
-                imp.pending_opened_conversation_ids
-                    .borrow_mut()
-                    .insert(channel_id.clone());
-                self.sync_conversations_from_catalog();
+                if legacy_conversation_catalog_mutation_allowed(&imp.workspace) {
+                    imp.workspace
+                        .conversations
+                        .borrow_mut()
+                        .upsert_metadata(conversation);
+                    imp.pending_opened_conversation_ids
+                        .borrow_mut()
+                        .insert(channel_id.clone());
+                    self.sync_conversations_from_catalog();
+                }
                 self.select_conversation(&channel_id, &title);
             }
             RuntimeEventKind::ConversationUpdated(conversation) => {
-                self.imp()
-                    .workspace
-                    .conversations
-                    .borrow_mut()
-                    .upsert_metadata(conversation);
-                self.sync_conversations_from_catalog();
+                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
+                    self.imp()
+                        .workspace
+                        .conversations
+                        .borrow_mut()
+                        .upsert_metadata(conversation);
+                    self.sync_conversations_from_catalog();
+                }
                 self.refresh_current_conversation_title();
                 self.set_status(&gettext("People added"));
             }
             RuntimeEventKind::ConversationStarUpdated(conversation) => {
                 let starred = conversation.is_starred();
-                self.imp()
-                    .workspace
-                    .conversations
-                    .borrow_mut()
-                    .upsert_metadata(conversation);
-                self.sync_conversations_from_catalog();
+                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
+                    self.imp()
+                        .workspace
+                        .conversations
+                        .borrow_mut()
+                        .upsert_metadata(conversation);
+                    self.sync_conversations_from_catalog();
+                }
                 self.set_status(&gettext(if starred {
                     "Conversation starred"
                 } else {
@@ -4964,7 +4998,11 @@ impl ConduitWindow {
                 }));
             }
             RuntimeEventKind::ConversationLeft { channel_id } => {
-                self.apply_conversation_left(&channel_id);
+                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
+                    self.apply_conversation_left(&channel_id);
+                } else {
+                    self.set_status(&gettext("Left channel"));
+                }
             }
             RuntimeEventKind::ConversationsPatched {
                 conversations,
@@ -7153,6 +7191,49 @@ impl ConduitWindow {
 
     fn show_conversation_load_error(&self, error: &str) {
         self.set_sidebar_error(error);
+    }
+
+    fn apply_conversation_workspace_patch(
+        &self,
+        patch: &crate::workspace_pipeline::WorkspacePatch,
+    ) {
+        let revision = patch.revision();
+        let Some(application) = self.imp().workspace.apply_conversation_patch(patch) else {
+            crate::debug::log(
+                "ui",
+                &format!(
+                    "WorkspacePatchIgnored reason=stale revision={}",
+                    revision.value()
+                ),
+            );
+            return;
+        };
+        if !application.conversation_changed() {
+            return;
+        }
+
+        remove_patch_departures_from_discovery(
+            &mut self.imp().discovered_channels.borrow_mut(),
+            application.removals(),
+        );
+        for removal in application.removals() {
+            let channel_id = removal.channel_id();
+            self.imp()
+                .pending_opened_conversation_ids
+                .borrow_mut()
+                .remove(channel_id);
+            self.imp()
+                .local_read_ts_by_channel
+                .borrow_mut()
+                .remove(channel_id);
+            if removal.was_visible() {
+                let title = gettext("Select a conversation");
+                self.imp().message_title.set_title(&title);
+                self.show_message_placeholder(&title);
+                self.render_closed_thread();
+            }
+        }
+        self.sync_conversations_from_catalog();
     }
 
     fn set_sidebar_error(&self, error: &str) {
@@ -11382,6 +11463,193 @@ mod tests {
 
         assert!(coordinator.accepts(&cached));
         assert!(coordinator.accepts(&fresh));
+    }
+
+    #[test]
+    fn request_coordinator_accepts_a_session_scoped_recovered_workspace_patch() {
+        let mut coordinator = RequestCoordinator::default();
+        let first = coordinator.begin_session(&RuntimeCommand::RefreshConversations);
+        let second = coordinator.issue(&RuntimeCommand::RefreshConversations);
+        let patch = crate::workspace_pipeline::WorkspacePatch::new(
+            crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor(),
+            vec![
+                crate::workspace_pipeline::WorkspaceChange::ConversationUpsert(SlackConversation {
+                    id: "C1".to_string(),
+                    ..Default::default()
+                }),
+            ],
+        )
+        .unwrap();
+        let recovered = RuntimeEvent {
+            meta: RuntimeEventMeta {
+                session: first.session,
+                request: None,
+                context: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+            },
+            kind: RuntimeEventKind::WorkspacePatch(patch),
+        };
+
+        assert!(!coordinator.accepts(&RuntimeEventMeta::new(
+            first,
+            OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
+        )));
+        assert!(coordinator.accepts(&RuntimeEventMeta::new(
+            second,
+            OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
+        )));
+        assert!(coordinator.accepts(&recovered.meta));
+        let state = WorkspaceSessionState::default();
+        let RuntimeEventKind::WorkspacePatch(patch) = recovered.kind else {
+            unreachable!();
+        };
+        state.apply_conversation_patch(&patch).unwrap();
+        assert!(state.conversations.borrow().get("C1").is_some());
+    }
+
+    #[test]
+    fn typed_workspace_patch_applies_on_its_owning_main_context() {
+        let context = glib::MainContext::new();
+        context.block_on(async {
+            assert!(context.is_owner());
+            let state = WorkspaceSessionState::default();
+            let patch = crate::workspace_pipeline::WorkspacePatch::new(
+                crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor(),
+                vec![
+                    crate::workspace_pipeline::WorkspaceChange::ConversationUpsert(
+                        SlackConversation {
+                            id: "C1".to_string(),
+                            name: Some("general".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+            let event = RuntimeEventKind::WorkspacePatch(patch);
+            let RuntimeEventKind::WorkspacePatch(patch) = event else {
+                unreachable!();
+            };
+
+            assert!(state
+                .apply_conversation_patch(&patch)
+                .unwrap()
+                .conversation_changed());
+            assert_eq!(
+                state
+                    .conversations
+                    .borrow()
+                    .get("C1")
+                    .and_then(|conversation| conversation.name.as_deref()),
+                Some("general")
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_conversation_catalog_mutations_stop_after_typed_patch_adoption() {
+        let state = WorkspaceSessionState::default();
+        assert!(legacy_conversation_catalog_mutation_allowed(&state));
+        state
+            .conversations
+            .borrow_mut()
+            .upsert_metadata(SlackConversation {
+                id: "C1".to_string(),
+                name: Some("legacy".to_string()),
+                ..Default::default()
+            });
+
+        let patch = crate::workspace_pipeline::WorkspacePatch::new(
+            crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor(),
+            vec![
+                crate::workspace_pipeline::WorkspaceChange::ConversationUpsert(SlackConversation {
+                    id: "C1".to_string(),
+                    name: Some("authoritative".to_string()),
+                    ..Default::default()
+                }),
+            ],
+        )
+        .unwrap();
+        state.apply_conversation_patch(&patch).unwrap();
+        assert!(!legacy_conversation_catalog_mutation_allowed(&state));
+
+        if legacy_conversation_catalog_mutation_allowed(&state) {
+            state
+                .conversations
+                .borrow_mut()
+                .upsert_metadata(SlackConversation {
+                    id: "C1".to_string(),
+                    name: Some("rollback".to_string()),
+                    ..Default::default()
+                });
+        }
+        state.view.borrow_mut().select_conversation("C1");
+        assert_eq!(
+            state
+                .conversations
+                .borrow()
+                .get("C1")
+                .and_then(|conversation| conversation.name.as_deref()),
+            Some("authoritative")
+        );
+        assert_eq!(state.view.borrow().visible_channel_id(), Some("C1"));
+    }
+
+    #[test]
+    fn typed_private_conversation_removal_preserves_discovery_cleanup() {
+        let state = WorkspaceSessionState::default();
+        let private = SlackConversation {
+            id: "C_PRIVATE".to_string(),
+            is_channel: Some(true),
+            is_private: Some(true),
+            ..Default::default()
+        };
+        let public = SlackConversation {
+            id: "C_PUBLIC".to_string(),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let first_revision = crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor();
+        state
+            .apply_conversation_patch(
+                &crate::workspace_pipeline::WorkspacePatch::new(
+                    first_revision,
+                    vec![
+                        crate::workspace_pipeline::WorkspaceChange::ConversationsReset(vec![
+                            private.clone(),
+                            public.clone(),
+                        ]),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let removal = state
+            .apply_conversation_patch(
+                &crate::workspace_pipeline::WorkspacePatch::new(
+                    first_revision.successor(),
+                    vec![
+                        crate::workspace_pipeline::WorkspaceChange::ConversationRemoved {
+                            channel_id: private.id.clone(),
+                        },
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut discovered = vec![private, public];
+
+        remove_patch_departures_from_discovery(&mut discovered, removal.removals());
+
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C_PUBLIC"]
+        );
     }
 
     #[test]
