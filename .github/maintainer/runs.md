@@ -342,3 +342,55 @@
   - trigger automatic release work only after successful main CI
 - Repository rules remain unchanged; requiring PRs and the `build` check on `main` is a separate
   administrative recommendation.
+
+## 2026-07-29 Maintainer Pass
+
+- Scope: manual Maintain-mode review of the live backlog, release PR, security alerts, and current implementation state.
+- GitHub backlog: 6 open issues (ISSUE:9-14), 1 open pull request (PR:18), 0 unread notifications, 1 high Dependabot alert, 0 code-scanning alerts, and 0 secret-scanning alerts.
+- Branch state: clean `main` at `80887f8`, aligned with `origin/main`.
+- Remote validation:
+  - exact-main CI runs `30441969310` and `30441968524`: pass
+  - exact-main release automation runs `30442561913` and `30442526172`: pass
+  - PR:18 dispatched CI `30442577106` and CodeQL suite `30442568173`: pass at `48ee243`
+- PR:18 is clean, mergeable, and limited to expected 0.3.0 metadata, but its generated notes omit two user-visible fixes and the 0.3.0 manual pre-tag checklist has no completion record.
+- Dependabot alert 1 flags `quinn-proto` 0.11.14. The crate is inactive optional Reqwest HTTP/3 lock metadata and absent from default and all-feature compiled trees. A dry-run update to patched 0.11.15 succeeds.
+- Backlog order remains ISSUE:11 into ISSUE:12, with ISSUE:13 extraction inside those slices. ISSUE:10 is the best separate memory win; ISSUE:9 remains the Phase 4 asset pipeline.
+- ISSUE:14 remains open for the advisory update plus dependency-count and clean-build timing evidence.
+- The installed maintainer package still lacks its referenced script and guides, so this run used the documented manual fallback.
+- No public GitHub action was taken.
+
+## 2026-07-29 HTTP Transport Cleanup
+
+- Sanitized public probes negotiated HTTP/3 with Slack Web API, workspace, app, and file edge endpoints.
+- Reqwest 0.13 documents HTTP/3 as experimental, requires `reqwest_unstable`, does not consume Slack's Alt-Svc advertisement, and offers a forced HTTP/3 client without safe general fallback.
+- Local implementation:
+  - replaced Reqwest `rustls` with `rustls-no-provider`
+  - selected the existing AWS-LC provider directly through one idempotent client-builder helper
+  - explicitly enabled stable HTTP/2
+  - removed Quinn and five related unused packages from the lockfile and Flatpak source list
+  - added release metadata regression coverage for the transport policy
+- Dependency evidence: direct dependencies 29 to 30; total locked packages 392 to 388 after replacing six unused packages with `h2` and `fnv`.
+- Validation:
+  - public Slack HTTP/3 probes: pass
+  - Reqwest Slack HTTP/2 negotiation probe: pass
+  - Cargo tests: pass, 716 passed and 2 ignored
+  - release automation metadata: pass, 10 tests
+  - Meson compile: pass
+  - Meson test: pass, 16 tests
+  - Flatpak manifest expansion: pass
+  - optional native-media tests: blocked by the previously known missing local `gstreamer-webrtc-1.0` development metadata
+  - strict Clippy: unavailable locally because `cargo-clippy` 1.87 does not match Rust 1.95
+- One parallel headless run exposed repeated asynchronous activation requests in the keyboard harness. Retrying `windowactivate --sync` instead avoids flooding the window manager; the isolated test passed three times and the final full parallel suite passed.
+- Approved remote action:
+  - pushed `280bec6` (`fix(deps): remove unused HTTP/3 stack`) and `f0fe9ec` (`test(ui): synchronize headless window activation`) to `main`
+  - exact-main CI `30447931041`: pass
+  - exact-main CodeQL `30447929399`: pass
+  - guarded release automation `30448656955`: pass and regenerated PR:18 at `332addb`
+  - Dependabot alert 1: fixed automatically at 2026-07-29T11:32:04Z without dismissal
+- PR:18 exact-head validation:
+  - CodeQL `30448699855`: pass
+  - CI `30448709555`: cancelled after its external GNOME dependency install made no progress for 20 minutes; no code validation step ran
+  - default-branch dispatch `30450112171`: cancelled before execution after the wrong ref was detected
+  - replacement exact-head CI `30450146868`: pass in 8 minutes, including strict Clippy and both Meson configurations
+- PR:18 remains deferred because two user-facing changes are omitted from its notes, the manual pre-tag checklist is incomplete, and its generated body prematurely says it closes ISSUE:14.
+- No issue comment, label, closure, pull request merge, tag, or release was performed.

@@ -114,3 +114,10 @@
   `-D warnings`; make lint upgrades deliberate rather than weakening the quality gate.
 - Release packaging failures were confined to first-release RPM stabilization and already have
   regression assertions. CodeQL has no recorded failures and should remain unchanged.
+
+## 2026-07-29 Maintainer Pass
+
+- Cargo lockfiles can retain vulnerable optional packages that are absent from every compiled feature graph. Record reachability separately from alert severity, then prefer the isolated patch when it is cheap.
+- Generated release notes can omit user-visible work whose commit subjects do not follow the configured conventional-commit categories. Compare the release range against the generated changelog before publication.
+- A green release metadata PR is not sufficient release approval when merging automatically creates a tag and publishes packages. Require a current manual checklist record as a separate gate.
+- Weak optional dependency feature edges may still enter `Cargo.lock` and generated offline source manifests without entering the compiled graph. Prefer a supported lower-level feature that makes provider ownership explicit when it removes that unused supply-chain surface.

@@ -1,26 +1,26 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-21-first-release-publication",
+  "last_manual_run": "2026-07-29-http-transport-cleanup",
   "last_known_open_issues": 6,
   "last_known_open_pull_requests": 1,
   "last_known_total_issues": 13,
-  "last_known_total_pull_requests": 2,
+  "last_known_total_pull_requests": 5,
   "last_checks": {
-    "cargo_fmt_check": "pass",
-    "cargo_test": "pass: 546 tests",
-    "meson_test": "pass: 14 tests with sanitized environment",
-    "git_diff_check": "pass",
-    "github_actions": "CI 29835081152 and CodeQL 29835080623 passed on 8c16452; guarded Release 29835203473 passed every build, validator, checksum, and publication job",
-    "release_metadata": "pass: v0.1.0 is public and its tag and release target resolve to 8c16452; PR:8 is merged without closing ISSUE:14",
-    "release_artifacts": "pass: Debian, RPM, and Flatpak were built and installed in clean jobs; all downloaded package hashes match SHA256SUMS",
-    "flatpak_manifest": "pass: release Flatpak built, installed, and validated without native-media permission",
-    "optional_features": "pass in final main CI; general release packages remain deliberately disabled while external Slack fallback stays available",
-    "cargo_clippy": "pass in final main CI for default and opt-in configurations; unavailable locally"
+    "github_actions": "exact-main CI 30447931041, CodeQL 30447929399, and guarded release automation 30448656955 passed on f0fe9ec",
+    "pr_18": "regenerated and mergeable at 332addb; exact-head CodeQL 30448699855 and replacement CI 30450146868 passed",
+    "dependabot": "alert 1 for quinn-proto 0.11.14 fixed automatically at 2026-07-29T11:32:04Z without dismissal",
+    "dependency_reachability": "Quinn is absent from the remote main lockfile, Flatpak sources, and compiled Cargo tree; stable HTTP/2 is active",
+    "cargo_test": "pass: 716 passed and 2 ignored",
+    "release_metadata": "pass: 10 tests",
+    "meson": "compile pass; 16 tests pass",
+    "flatpak_manifest": "expansion pass",
+    "optional_features": "blocked locally by missing gstreamer-webrtc-1.0 development metadata",
+    "cargo_clippy": "unavailable locally: cargo-clippy 1.87 does not match rustc 1.95"
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
-    "priority": "v0.1.0 is published; keep ISSUE:14 open until dependency-count and clean-build timing evidence is recorded, and do not merge the generated PR:15 as part of this release",
-    "worktree": "release fixes and memory are isolated from user-owned eu.vanadrighem.conduit.json and untracked research/backup files",
-    "public_actions": "merged PR:8, pushed release fixes, ran guarded recovery, published v0.1.0, and cleared one low-risk inbox notification; no issue comment, label, or closure"
+    "priority": "defer PR:18 until release notes and ISSUE:14 linkage are corrected and the 0.3.0 manual checklist is complete; keep ISSUE:14 open through timing evidence",
+    "worktree": "no user-owned changes; the maintainer record is kept separate from implementation changes",
+    "public_actions": "pushed 280bec6 and f0fe9ec; release automation regenerated PR:18; no issue comment, label, closure, pull request merge, tag, release, or alert dismissal"
   }
 }

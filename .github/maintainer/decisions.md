@@ -158,3 +158,19 @@
   cannot update and dispatch a second failing release-PR validation run.
 - Make no packaging or CodeQL change: their historical failures do not show a current recurring
   defect.
+
+## 2026-07-29 Maintainer Pass
+
+- Defer PR:18 even though provenance, diff, mergeability, CI, and CodeQL are clean. Add the two omitted user-facing fixes to release notes and complete the manual 0.3.0 checklist before merging.
+- Remove inactive `quinn-proto` and the Quinn stack before release. Slack accepts HTTP/3, but Reqwest 0.13 exposes it as an experimental forced transport without the automatic fallback Conduit needs.
+- Keep ISSUE:9-14 open. Finish coordinator authority through ISSUE:11 before dependent ISSUE:12 presentation work, and perform ISSUE:13 extractions only inside those ownership migrations.
+- Treat ISSUE:10 as a separate measured optimization and ISSUE:9 as the planned Phase 4 asset slice.
+- No issue, pull request, comment, label, closure, merge, release, or push action was taken.
+
+## 2026-07-29 HTTP Transport Cleanup
+
+- Keep HTTP/3 disabled until Reqwest offers stable negotiation and safe fallback for blocked UDP and proxy environments.
+- Replace Reqwest's provider-selecting `rustls` feature with `rustls-no-provider`, explicitly retain AWS-LC through Rustls, and centralize idempotent provider setup for every HTTP client constructor.
+- Enable stable HTTP/2 explicitly. `default-features = false` had unintentionally limited Conduit's Reqwest traffic to HTTP/1.1.
+- Remove Quinn rather than carrying or patching an unused transport stack.
+- Keep PR:18 deferred. Its regenerated body still omits two user-facing fixes, lacks a completed manual pre-tag checklist, and now says it closes ISSUE:14 even though only the advisory portion is complete.
