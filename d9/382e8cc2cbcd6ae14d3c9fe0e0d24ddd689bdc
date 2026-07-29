@@ -1,0 +1,21 @@
+Conductor task: Define a generation-scoped native picker query and result protocol
+
+Summary:
+- Added versioned typed picker query/result payloads.
+- Bounded results to 64 entries and queries to 128 characters with validated categories and paging metadata.
+- Added per-WebView monotonic generation rejection and a cached shared EmojiPickerModel.
+- Delivered serde JSON as a GVariant JavaScript-function argument without code interpolation.
+
+Modified files:
+- src/emoji.rs
+- src/window.rs
+
+Verification:
+- Red phase: 10 compile errors proved the protocol contracts were absent.
+- Sanitized model tests passed: 7 passed.
+- Sanitized bridge tests passed: 2 passed.
+- Sanitized full release suite passed: 734 passed, 3 ignored.
+- cargo check --release --all-targets, cargo fmt --check, and git diff --check passed.
+
+Rationale:
+The native bridge must be typed, bounded, generation-scoped, and injection-safe before the eager document markup can be removed.
