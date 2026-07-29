@@ -1,0 +1,3 @@
+Issue #11 Phase 3 task 4 authority slice: typed cache hydration and Web API membership/star publication, revision-aware unread presentation, ordered corrupt-cache repair, and empty-workspace readiness.
+
+Validated with sanitized full suite: 813 passed, 3 ignored; focused authority groups, warning-free cargo check, formatting and diff checks; independent reviews found no remaining high or medium findings.
