@@ -38,3 +38,18 @@ Commit: `f8d8007`
 
 Generation time is a single cold release-test sample and is directional. Document bytes and picker
 choice count are deterministic for the fixture.
+
+### After bounded picker shell
+
+Implementation base: `bfe6e22`
+
+| Measurement | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Initial document bytes | 748,787 | 58,762 | -92.2% |
+| Eager picker choices | 2,126 | 0 | -100% |
+| Rust document generation | 5,531 us | 407 us | -92.6% |
+
+The after-state keeps only the picker shell and category tabs in the initial document. Emoji
+choices are requested from the native model when the picker opens and each result page is bounded
+to 64 entries. The generation time remains a single cold release-test sample; document bytes and
+picker choice count remain deterministic.

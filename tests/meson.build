@@ -165,6 +165,25 @@ if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() a
       suite: 'headless',
       timeout: 90,
     )
+
+    test(
+      'Bounded emoji picker',
+      gi_python,
+      args: [
+        files('run_headless.py'),
+        files('test_emoji_picker.py'),
+        meson.project_source_root() / 'src' / 'emoji_picker.js',
+      ],
+      env: [
+        'GDK_DEBUG=no-portals',
+        'GDK_BACKEND=x11',
+        'GSK_RENDERER=cairo',
+        'GTK_A11Y=none',
+        'XDG_SESSION_TYPE=x11',
+      ],
+      suite: 'headless',
+      timeout: 90,
+    )
   else
     warning('Skipping WebKit headless tests: PyGObject Gtk 4/WebKit 6 introspection is unavailable')
   endif

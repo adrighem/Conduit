@@ -7,7 +7,8 @@ use serde::Serialize;
 use crate::activity::ActivityItem;
 use crate::debug;
 use crate::emoji::{
-    emoji_picker_accessible_label, EmojiCatalog, EmojiEntry, EmojiPickerModel, EmojiValue,
+    EmojiCatalog, EmojiEntry, EmojiValue, EMOJI_PICKER_CATEGORIES, EMOJI_PICKER_MAX_QUERY_CHARS,
+    EMOJI_PICKER_PROTOCOL_VERSION, EMOJI_PICKER_RESULT_LIMIT,
 };
 use crate::message_handoff::{MessageControlHandle, MessageRef};
 use crate::models::{
@@ -428,16 +429,8 @@ fn document_heading(title: &str) -> String {
     )
 }
 
-fn emoji_picker_html(context: &MessageHtmlContext) -> String {
-    let catalog = EmojiCatalog::new(&context.custom_emojis);
-    let model = EmojiPickerModel::new(catalog.entries());
-    let entries = model.entries();
-    let mut categories = entries
-        .iter()
-        .map(|emoji| emoji.category)
-        .collect::<Vec<_>>();
-    categories.dedup();
-    let category_buttons = categories
+fn emoji_picker_html(_context: &MessageHtmlContext) -> String {
+    let category_buttons = EMOJI_PICKER_CATEGORIES
         .iter()
         .enumerate()
         .map(|(index, category)| {
@@ -448,25 +441,9 @@ fn emoji_picker_html(context: &MessageHtmlContext) -> String {
             )
         })
         .collect::<String>();
-    let emoji_buttons = entries
-        .iter()
-        .enumerate()
-        .map(|(index, emoji)| {
-            format!(
-                "<button id=\"emoji-choice-{index}\" type=\"button\" class=\"emoji-choice\" role=\"gridcell\" tabindex=\"-1\" aria-selected=\"false\" data-emoji-name=\"{}\" data-emoji-label=\"{}\" data-category=\"{}\" data-original-index=\"{}\" title=\":{}:\" aria-label=\"{}\">{}</button>",
-                escape_html(&emoji.name),
-                escape_html(&emoji.label),
-                escape_html(emoji.category),
-                index,
-                escape_html(&emoji.name),
-                escape_html(&emoji_picker_accessible_label(emoji)),
-                emoji_value_html(&emoji.value, true),
-            )
-        })
-        .collect::<String>();
 
     format!(
-        "<dialog id=\"emoji-picker\" class=\"emoji-picker\" aria-labelledby=\"emoji-picker-title\"><header><h2 id=\"emoji-picker-title\">{}</h2><button type=\"button\" class=\"picker-close\" aria-label=\"{}\">×</button></header><label class=\"emoji-search-label\" for=\"emoji-search\">{}</label><input id=\"emoji-search\" class=\"emoji-search\" type=\"search\" role=\"combobox\" aria-controls=\"emoji-grid\" aria-expanded=\"true\" autocomplete=\"off\" placeholder=\"{}\"><nav class=\"emoji-categories\" role=\"tablist\" aria-label=\"{}\">{category_buttons}</nav><div id=\"emoji-grid\" class=\"emoji-grid\" role=\"grid\" aria-label=\"{}\">{emoji_buttons}</div><p class=\"emoji-empty\" role=\"status\" hidden>{}</p></dialog>",
+        "<dialog id=\"emoji-picker\" class=\"emoji-picker\" aria-labelledby=\"emoji-picker-title\" data-emoji-protocol-version=\"{EMOJI_PICKER_PROTOCOL_VERSION}\" data-emoji-result-limit=\"{EMOJI_PICKER_RESULT_LIMIT}\" data-emoji-max-query-chars=\"{EMOJI_PICKER_MAX_QUERY_CHARS}\"><header><h2 id=\"emoji-picker-title\">{}</h2><button type=\"button\" class=\"picker-close\" aria-label=\"{}\">×</button></header><label class=\"emoji-search-label\" for=\"emoji-search\">{}</label><input id=\"emoji-search\" class=\"emoji-search\" type=\"search\" role=\"combobox\" aria-controls=\"emoji-grid\" aria-expanded=\"true\" autocomplete=\"off\" placeholder=\"{}\"><nav class=\"emoji-categories\" role=\"tablist\" aria-label=\"{}\">{category_buttons}</nav><div id=\"emoji-grid\" class=\"emoji-grid\" role=\"grid\" aria-label=\"{}\"></div><p class=\"emoji-empty\" role=\"status\" hidden>{}</p><footer class=\"emoji-page-controls\" hidden><button type=\"button\" data-emoji-previous aria-label=\"{}\">&larr;</button><p class=\"emoji-page-status\" aria-live=\"polite\"></p><button type=\"button\" data-emoji-next aria-label=\"{}\">&rarr;</button></footer></dialog>",
         escape_html(&gettext("Add reaction")),
         escape_html(&gettext("Close emoji picker")),
         escape_html(&gettext("Search emoji by name")),
@@ -474,197 +451,13 @@ fn emoji_picker_html(context: &MessageHtmlContext) -> String {
         escape_html(&gettext("Emoji categories")),
         escape_html(&gettext("Emoji")),
         escape_html(&gettext("No emoji found")),
+        escape_html(&gettext("Previous emoji page")),
+        escape_html(&gettext("Next emoji page")),
     )
 }
 
 fn emoji_picker_script() -> &'static str {
-    r##"(function () {
-  const picker = document.getElementById("emoji-picker");
-  if (!picker) return;
-  const search = picker.querySelector("#emoji-search");
-  const choices = Array.from(picker.querySelectorAll(".emoji-choice"));
-  const grid = picker.querySelector(".emoji-grid");
-  const categories = picker.querySelector(".emoji-categories");
-  const tabs = Array.from(picker.querySelectorAll("[data-emoji-category]"));
-  const empty = picker.querySelector(".emoji-empty");
-  let activeCategory = "Smileys";
-  let reactionTemplate = "";
-  let opener = null;
-  let selectedChoice = null;
-
-  function visibleChoices() {
-    return choices.filter(function (choice) { return !choice.hidden; });
-  }
-
-  function selectChoice(choice, focus) {
-    selectedChoice = choice || null;
-    choices.forEach(function (item) {
-      const selected = item === selectedChoice;
-      item.setAttribute("aria-selected", String(selected));
-      item.tabIndex = selected ? 0 : -1;
-    });
-    if (selectedChoice) {
-      search.setAttribute("aria-activedescendant", selectedChoice.id);
-      selectedChoice.scrollIntoView({ block: "nearest" });
-      if (focus) selectedChoice.focus();
-    } else {
-      search.removeAttribute("aria-activedescendant");
-    }
-  }
-
-  function moveSelection(offset) {
-    const visible = visibleChoices();
-    if (visible.length === 0) return;
-    const current = Math.max(0, visible.indexOf(selectedChoice));
-    const next = Math.max(0, Math.min(visible.length - 1, current + offset));
-    selectChoice(visible[next], false);
-  }
-
-  function activateChoice(choice) {
-    if (!choice) return;
-    const url = reactionTemplate.replace("__REACTION__", encodeURIComponent(choice.dataset.emojiName));
-    picker.close();
-    window.location.href = url;
-  }
-
-  function fieldTokens(term, value) {
-    const normalized = value.toLocaleLowerCase();
-    const alphanumericTerm = Array.from(term).every(function (character) {
-      return /[\p{L}\p{N}]/u.test(character);
-    });
-    return alphanumericTerm ? normalized.match(/[\p{L}\p{N}]+/gu) || [] : [normalized];
-  }
-
-  function termFieldScore(term, value, fieldWeight) {
-    return fieldTokens(term, value).reduce(function (best, token) {
-      const position = token.indexOf(term);
-      if (position < 0) return best;
-      const termLength = Array.from(term).length;
-      const tokenLength = Math.max(Array.from(token).length, 1);
-      const matchScore = token === term
-        ? 100
-        : position === 0
-          ? Math.min(90, 50 + termLength * 10)
-          : Math.floor(Math.floor(termLength * 100 / tokenLength) * 75 / 100);
-      const score = Math.floor(matchScore * fieldWeight / 100);
-      return Math.max(best, score);
-    }, -1);
-  }
-
-  function choiceMatchScore(choice, terms) {
-    if (terms.length === 0) return 0;
-    const termScores = terms.map(function (term) {
-      return Math.max(
-        termFieldScore(term, choice.dataset.emojiName, 100),
-        termFieldScore(term, choice.dataset.emojiLabel, 85)
-      );
-    });
-    if (termScores.some(function (score) { return score < 0; })) return null;
-    const mean = Math.floor(termScores.reduce(function (sum, score) { return sum + score; }, 0) / termScores.length);
-    return Math.floor((70 * mean + 30 * Math.min(...termScores)) / 100);
-  }
-
-  function filterChoices() {
-    const terms = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
-    categories.hidden = terms.length > 0;
-    let visible = 0;
-    choices.forEach(function (choice) {
-      const score = choiceMatchScore(choice, terms);
-      const matchesQuery = score !== null;
-      const matchesCategory = terms.length > 0 || choice.dataset.category === activeCategory;
-      choice.hidden = !(matchesQuery && matchesCategory);
-      choice.dataset.matchBand = String(Math.min(Math.floor((score || 0) / 5), 19));
-      if (!choice.hidden) {
-        const image = choice.querySelector("img[data-src]");
-        if (image) {
-          image.src = image.dataset.src;
-          image.removeAttribute("data-src");
-        }
-        visible += 1;
-      }
-    });
-    choices
-      .slice()
-      .sort(function (left, right) {
-        if (left.hidden !== right.hidden) return left.hidden ? 1 : -1;
-        if (terms.length > 0 && !left.hidden) {
-          const bandDifference = Number(right.dataset.matchBand) - Number(left.dataset.matchBand);
-          if (bandDifference !== 0) return bandDifference;
-        }
-        return Number(left.dataset.originalIndex) - Number(right.dataset.originalIndex);
-      })
-      .forEach(function (choice) { grid.appendChild(choice); });
-    empty.hidden = visible !== 0;
-    selectChoice(visibleChoices()[0] || null, false);
-  }
-
-  function cancelPicker(event) {
-    if (event) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
-    if (picker.open) picker.close("cancel");
-  }
-
-  document.addEventListener("click", function (event) {
-    const menuAction = event.target.closest(".more-actions-menu a");
-    if (menuAction) {
-      const menu = menuAction.closest("details");
-      if (menu) menu.open = false;
-    }
-    const trigger = event.target.closest("[data-open-emoji-picker]");
-    if (!trigger) return;
-    event.preventDefault();
-    opener = trigger;
-    reactionTemplate = trigger.dataset.reactionTemplate;
-    search.value = "";
-    filterChoices();
-    picker.showModal();
-    search.focus();
-  });
-
-  picker.querySelector(".picker-close").addEventListener("click", cancelPicker);
-  picker.addEventListener("cancel", cancelPicker);
-  document.addEventListener("keydown", function (event) {
-    if (!picker.open || (event.key !== "Escape" && event.key !== "Esc")) return;
-    cancelPicker(event);
-  }, true);
-  picker.addEventListener("keydown", function (event) {
-    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-      event.preventDefault();
-      event.stopPropagation();
-      moveSelection(event.key === "ArrowUp" ? -1 : 1);
-    } else if (event.key === "Enter" && selectedChoice) {
-      event.preventDefault();
-      event.stopPropagation();
-      activateChoice(selectedChoice);
-    }
-  }, true);
-  picker.addEventListener("click", function (event) {
-    if (event.target !== picker) return;
-    const bounds = picker.getBoundingClientRect();
-    const inside = event.clientX >= bounds.left && event.clientX <= bounds.right
-      && event.clientY >= bounds.top && event.clientY <= bounds.bottom;
-    if (!inside) cancelPicker(event);
-  });
-  picker.addEventListener("close", function () { if (opener) opener.focus(); });
-  search.addEventListener("input", filterChoices);
-  tabs.forEach(function (tab) {
-    tab.addEventListener("click", function () {
-      activeCategory = tab.dataset.emojiCategory;
-      tabs.forEach(function (item) { item.setAttribute("aria-selected", String(item === tab)); });
-      search.value = "";
-      filterChoices();
-      const first = choices.find(function (choice) { return !choice.hidden; });
-      if (first) selectChoice(first, true);
-    });
-  });
-  choices.forEach(function (choice) {
-    choice.addEventListener("click", function () {
-      activateChoice(choice);
-    });
-  });
-})();"##
+    include_str!("emoji_picker.js")
 }
 
 fn author_actions_script() -> &'static str {
@@ -1853,7 +1646,8 @@ pre code {{
 
 .picker-close,
 .emoji-categories button,
-.emoji-choice {{
+.emoji-choice,
+.emoji-page-controls button {{
   border: 0;
   background: transparent;
   color: inherit;
@@ -1960,6 +1754,42 @@ pre code {{
   margin: 0;
   padding-block: 24px;
   padding-inline: 16px;
+  color: var(--muted);
+  text-align: center;
+}}
+
+.emoji-page-controls {{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-block-size: 42px;
+  padding-inline: 12px;
+  border-block-start: 1px solid var(--line);
+}}
+
+.emoji-page-controls[hidden] {{
+  display: none;
+}}
+
+.emoji-page-controls button {{
+  min-inline-size: 36px;
+  min-block-size: 30px;
+  border-radius: 6px;
+}}
+
+.emoji-page-controls button:hover:not(:disabled) {{
+  background: var(--soft);
+}}
+
+.emoji-page-controls button:disabled {{
+  color: var(--muted);
+  cursor: default;
+}}
+
+.emoji-page-status {{
+  min-inline-size: 92px;
+  margin: 0;
   color: var(--muted);
   text-align: center;
 }}
@@ -4799,7 +4629,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_emoji_are_shared_by_messages_quick_actions_and_picker() {
+    fn workspace_emoji_render_in_messages_and_quick_actions_without_eager_picker_data() {
         let context = MessageHtmlContext {
             custom_emojis: Arc::new(HashMap::from([
                 (
@@ -4817,10 +4647,10 @@ mod tests {
         assert!(html.contains("title=\":parrot_alias:\" role=\"img\""));
         assert!(html.contains("src=\"https://emoji.example/party-parrot.gif\""));
         assert!(html.contains("name=party_parrot"));
-        assert!(html.contains("data-emoji-name=\"party_parrot\""));
-        assert!(html.contains("data-category=\"Workspace\""));
-        assert!(html.contains("data-src=\"https://emoji.example/party-parrot.gif\""));
-        assert!(html.contains("data-category=\"Flags\""));
+        assert!(!html.contains("data-emoji-name=\"party_parrot\""));
+        assert!(!html.contains("data-src=\"https://emoji.example/party-parrot.gif\""));
+        assert!(html.contains("data-emoji-category=\"Workspace\""));
+        assert!(html.contains("data-emoji-category=\"Flags\""));
     }
 
     #[test]
@@ -5428,11 +5258,9 @@ mod tests {
         assert_eq!(html.matches("id=\"emoji-picker\"").count(), 1);
         assert!(html.contains("aria-labelledby=\"emoji-picker-title\""));
         assert!(html.contains("id=\"emoji-search\""));
-        assert!(html.contains("split(/\\s+/).filter(Boolean)"));
-        assert!(html.contains("function choiceMatchScore(choice, terms)"));
-        assert!(html.contains("70 * mean + 30 * Math.min(...termScores)"));
-        assert!(html.contains("data-original-index="));
-        assert!(html.contains("grid.appendChild(choice)"));
+        assert!(html.contains("conduitEmojiPicker.postMessage"));
+        assert!(html.contains("window.conduitReceiveEmojiPickerResult"));
+        assert!(html.contains("grid.replaceChildren(...choices)"));
         assert!(html.contains("role=\"tablist\""));
         assert!(html.contains("class=\"emoji-grid\""));
         assert!(html.contains("role=\"menu\""));
@@ -5526,8 +5354,8 @@ mod tests {
 
         assert!(html.contains("role=\"combobox\""));
         assert!(html.contains("aria-controls=\"emoji-grid\""));
-        assert!(html.contains("role=\"gridcell\""));
-        assert!(html.contains("aria-selected=\"false\""));
+        assert!(html.contains("choice.setAttribute(\"role\", \"gridcell\")"));
+        assert!(html.contains("choice.setAttribute(\"aria-selected\", \"false\")"));
         assert!(html.contains("function moveSelection(offset)"));
         assert!(html.contains("event.key === \"ArrowUp\" || event.key === \"ArrowDown\""));
         assert!(html.contains("moveSelection(event.key === \"ArrowUp\" ? -1 : 1)"));
@@ -5535,6 +5363,44 @@ mod tests {
         assert!(html.contains("activateChoice(selectedChoice)"));
         assert!(html.contains("search.setAttribute(\"aria-activedescendant\", selectedChoice.id)"));
         assert!(html.contains(".emoji-choice[aria-selected=\"true\"]"));
+    }
+
+    #[test]
+    fn initial_emoji_picker_document_is_a_lightweight_native_query_shell() {
+        let custom_emojis = (0..256)
+            .map(|index| {
+                (
+                    format!("private_workspace_emoji_{index:03}"),
+                    format!("https://emoji.example/private-{index:03}.png"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let context = MessageHtmlContext {
+            custom_emojis: Arc::new(custom_emojis),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("Pick a reaction")], &context);
+
+        assert_eq!(html.matches("class=\"emoji-choice\"").count(), 0);
+        assert!(!html.contains("private_workspace_emoji_000"));
+        assert!(!html.contains("https://emoji.example/private-000.png"));
+        assert!(html.contains("id=\"emoji-grid\""));
+        assert!(html.contains("data-emoji-protocol-version=\"1\""));
+        assert!(html.contains("data-emoji-result-limit=\"64\""));
+        assert!(html.contains("data-emoji-max-query-chars=\"128\""));
+        assert!(html.contains("window.webkit.messageHandlers.conduitEmojiPicker.postMessage"));
+    }
+
+    #[test]
+    fn picker_script_discards_stale_results_and_materializes_data_as_dom_nodes() {
+        let script = emoji_picker_script();
+
+        assert!(script.contains("window.conduitReceiveEmojiPickerResult"));
+        assert!(script.contains("result.generation !== activeGeneration"));
+        assert!(script.contains("document.createElement(\"button\")"));
+        assert!(script.contains("textContent"));
+        assert!(!script.contains("innerHTML"));
     }
 
     #[test]
