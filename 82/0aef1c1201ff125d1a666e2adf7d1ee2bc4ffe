@@ -1,0 +1,19 @@
+Conductor task: Execute each coordinator StoreBatch atomically and in revision order (implementation)
+
+Summary:
+- Added one transactional executor for every StoreChange variant on StoreHub writer queue.
+- Serialized reducer admission and persistence, retained failed reductions, and migrated core conversation commands off duplicate direct writes.
+- Added rollback, replay, stale-revision, unchanged, safe-user-projection, and all-variant coverage.
+
+Modified files:
+- src/runtime.rs
+- src/store.rs
+- src/workspace_pipeline.rs
+
+Verification:
+- Red phase began with 11 missing executor errors and exposed replay metrics, lost failed writes, and cache hydration writes.
+- Initial sanitized full suite passed: 730 passed, 2 ignored.
+- cargo check, cargo fmt --check, and git diff --check passed.
+
+Rationale:
+Coordinator state must not advance independently from an ordered atomic derived-cache batch.
