@@ -1,15 +1,17 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-07-29-http-transport-cleanup",
+  "last_manual_run": "2026-07-29-release-0.3.0-preparation",
   "last_known_open_issues": 6,
   "last_known_open_pull_requests": 1,
   "last_known_total_issues": 13,
   "last_known_total_pull_requests": 5,
   "last_checks": {
-    "github_actions": "exact-main CI 30447931041, CodeQL 30447929399, and guarded release automation 30448656955 passed on f0fe9ec",
+    "github_actions": "exact-main CI 30450808700, CodeQL 30450808613, and guarded release automation 30451386445 passed on 30e4149",
     "pr_18": "regenerated and mergeable at 332addb; exact-head CodeQL 30448699855 and replacement CI 30450146868 passed",
     "dependabot": "alert 1 for quinn-proto 0.11.14 fixed automatically at 2026-07-29T11:32:04Z without dismissal",
     "dependency_reachability": "Quinn is absent from the remote main lockfile, Flatpak sources, and compiled Cargo tree; stable HTTP/2 is active",
+    "issue_14_evidence": "controlled graph 33/400/434 to 30/361/392; six offline clean builds show 9.53% lower median user CPU and overlapping elapsed ranges",
+    "attention_release_measurement": "three exact-head runs passed; classifier 547-649 ns per decision, ordered actor 2855-3407 ms, final queue depth zero",
     "cargo_test": "pass: 716 passed and 2 ignored",
     "release_metadata": "pass: 10 tests",
     "meson": "compile pass; 16 tests pass",
@@ -19,8 +21,8 @@
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
-    "priority": "defer PR:18 until release notes and ISSUE:14 linkage are corrected and the 0.3.0 manual checklist is complete; keep ISSUE:14 open through timing evidence",
+    "priority": "push ISSUE:14 evidence and close it after remote validation; defer PR:18 until live manual checks, release notes, linkage correction, and exact-head validation are complete",
     "worktree": "no user-owned changes; the maintainer record is kept separate from implementation changes",
-    "public_actions": "pushed 280bec6 and f0fe9ec; release automation regenerated PR:18; no issue comment, label, closure, pull request merge, tag, release, or alert dismissal"
+    "public_actions": "pushed the approved dependency cleanup and maintainer records; release automation regenerated PR:18; no issue comment, label, closure, pull request merge, tag, release, or alert dismissal"
   }
 }

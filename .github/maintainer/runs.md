@@ -369,7 +369,7 @@
   - explicitly enabled stable HTTP/2
   - removed Quinn and five related unused packages from the lockfile and Flatpak source list
   - added release metadata regression coverage for the transport policy
-- Dependency evidence: direct dependencies 29 to 30; total locked packages 392 to 388 after replacing six unused packages with `h2` and `fnv`.
+- Dependency evidence: direct declarations 30 to 31; total locked packages 392 to 388 after replacing six unused packages with `h2` and `fnv`.
 - Validation:
   - public Slack HTTP/3 probes: pass
   - Reqwest Slack HTTP/2 negotiation probe: pass
@@ -394,3 +394,19 @@
   - replacement exact-head CI `30450146868`: pass in 8 minutes, including strict Clippy and both Meson configurations
 - PR:18 remains deferred because two user-facing changes are omitted from its notes, the manual pre-tag checklist is incomplete, and its generated body prematurely says it closes ISSUE:14.
 - No issue comment, label, closure, pull request merge, tag, or release was performed.
+
+## 2026-07-29 Release 0.3.0 Preparation
+
+- Full PR:18 provenance, six-file diff, dependency metadata, workflow permissions, package gates, and exact-head checks were reviewed without unexplained risk.
+- ISSUE:14 controlled comparison:
+  - before `1e6828c`: 33 direct, 400 transitive, 434 total packages
+  - after `af7ed57`: 30 direct, 361 transitive, 392 total packages
+  - three offline clean builds per ref: median user CPU falls 9.53%, system CPU falls 6.28%, and Cargo emits 29 fewer `Compiling` entries
+  - elapsed ranges overlap, so no reliable wall-clock improvement is claimed
+- Three sanitized release-mode attention runs at exact PR head `332addb` pass all semantic assertions:
+  - classifier range: 5,470,152 to 6,494,439 ns per 10,000 decisions
+  - ordered-actor range: 2,855 to 3,407 ms for 1,200 events
+  - queue peak range: 1,193 to 1,196; final depth zero in every run
+- The automated and conditional portions of the pre-tag checklist are recorded in `notes/release-0.3.0.md`.
+- PR:18 remains deferred pending live maintainer confirmation, the two release-note additions, non-closing ISSUE:14 linkage, and corrected-head validation.
+- No issue closure, pull request merge, tag, release, or package publication was performed in this preparation phase.

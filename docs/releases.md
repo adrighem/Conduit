@@ -41,6 +41,8 @@ python3 flatpak-cargo-generator.py Cargo.lock \
 
 The generator is maintained in [flatpak-builder-tools](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo). Commit the lockfile and generated source manifest together.
 
+The controlled dependency-count and clean-build measurements used to validate dependency cleanup are recorded in [dependency-audit.md](dependency-audit.md).
+
 ## HTTP transport policy
 
 Conduit uses Reqwest's stable HTTP/1.1 and HTTP/2 transports. Slack's public endpoints accept HTTP/3, but Reqwest 0.13 marks its HTTP/3 implementation as experimental, requires the global `reqwest_unstable` compiler configuration, and does not provide the automatic negotiation and fallback Conduit needs for proxies and networks that block QUIC.

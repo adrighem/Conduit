@@ -156,3 +156,21 @@ Two consecutive Phase 4 runs on 2026-07-23 provide an illustrative reference ran
   peaks of 1,196–1,198 and a final depth of zero.
 
 These values are a host-specific regression reference, not a performance guarantee.
+
+Three 0.3.0 pre-tag runs on 2026-07-29 at release PR head `332addb` provide the
+current release reference:
+
+- Linux 7.1.4-native-xanmod1 on x86_64, 13th Gen Intel Core i7-1355U, rustc
+  1.95.0, build target on Btrfs, and runtime SQLite files on `/tmp` tmpfs.
+- Classifier median: 5,470,152 to 6,494,439 ns per 10,000-decision batch, or
+  547 to 649 ns per decision.
+- Ordered actor: 2,855 to 3,407 ms to enqueue and drain 1,200 events, with
+  observed queue peaks of 1,193 to 1,196 and a final depth of zero.
+- Every run accepted 1,000 unique observations, rejected 200 redeliveries as
+  `already_observed`, recorded 900 unread decisions, and created 500
+  notification claims and candidates. Durable channel and direct-message
+  counts remained 700 and 200.
+
+The repository CI pin is Rust 1.97.1. These local timing values use the host's
+Rust 1.95.0 toolchain and are informational; the strict semantic assertions
+also pass in pinned CI.

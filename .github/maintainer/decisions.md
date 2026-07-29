@@ -174,3 +174,10 @@
 - Enable stable HTTP/2 explicitly. `default-features = false` had unintentionally limited Conduit's Reqwest traffic to HTTP/1.1.
 - Remove Quinn rather than carrying or patching an unused transport stack.
 - Keep PR:18 deferred. Its regenerated body still omits two user-facing fixes, lacks a completed manual pre-tag checklist, and now says it closes ISSUE:14 even though only the advisory portion is complete.
+
+## 2026-07-29 Release 0.3.0 Preparation
+
+- Measure ISSUE:14 with `1e6828c` and `af7ed57`. Their Rust source is identical, while their Cargo files isolate the three-dependency removal requested by the issue.
+- Report the overlapping elapsed-time ranges without claiming a speedup. The supported improvement is a smaller graph, 9.53% lower median compiler user CPU, and 29 fewer Cargo `Compiling` entries.
+- Correct PR:18 directly after all remaining main-branch content is final. This follows the proven PR:8 approach and avoids another generated closing reference.
+- Keep PR:18 unmerged until the maintainer confirms the real-workspace, installed-desktop, sandbox, and privacy checks that CI cannot perform.
