@@ -1,0 +1,24 @@
+Conductor tasks: Replace eager emoji markup with a lightweight picker shell and bounded materialization; preserve picker behavior
+
+Summary:
+- Removed the full emoji catalog from initial timeline HTML and materialized at most 64 results per native query.
+- Added versioned paging, stale-generation rejection, safe DOM construction, and custom emoji URL validation.
+- Preserved search, categories, custom emoji, keyboard selection, Escape cancellation, focus restoration, reaction navigation, and scroll position.
+- Added a production WebKitGTK headless regression and updated release measurements.
+
+Modified files:
+- src/message_html.rs
+- src/emoji_picker.js
+- tests/test_emoji_picker.py
+- tests/meson.build
+- conductor/tracks/lazy_webview_emoji_20260729/measurements.md
+
+Verification:
+- Red phase exposed eager-markup assumptions, paging fixture drift, and a close/reopen generation race.
+- Sanitized full release suite passed: 736 passed, 3 ignored.
+- Sanitized production WebKitGTK headless test passed: 1 of 1.
+- cargo check --release --all-targets, cargo fmt --check, Meson compile, and git diff --check passed.
+- After: 58762 bytes, 0 eager choices, 407 us sampled generation time.
+
+Rationale:
+On-demand bounded materialization removes the full catalog from every timeline document while retaining the interaction and safety contracts of the existing picker.
