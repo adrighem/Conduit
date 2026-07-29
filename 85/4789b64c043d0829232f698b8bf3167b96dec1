@@ -1,0 +1,18 @@
+Conductor verification checkpoint
+
+Verified phases:
+- XOXC/XOXD browser-session compatibility
+- unread sidebar presentation
+- desktop notification behavior
+- automated release and package publication
+- status management and emoji search
+- installed branding consistency
+- workspace canonical reducer pipeline
+
+Evidence:
+- User approved the v0.3.0 live checklist and this portfolio closeout.
+- v0.3.0 is published from the verified tree.
+- Sanitized cargo test --locked passed: 722 passed, 2 ignored.
+
+Rationale:
+One shared checkpoint records the single release-level verification event without creating redundant empty commits.
