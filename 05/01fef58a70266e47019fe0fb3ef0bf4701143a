@@ -1,0 +1,3 @@
+CI root-cause fix for Issue #11 store batch work: Rust 1.97 Clippy rejected four explicit into_iter calls accepted by the older local tool.
+
+Validated with 62 focused store tests and formatting/diff checks; remote strict Clippy must confirm.
