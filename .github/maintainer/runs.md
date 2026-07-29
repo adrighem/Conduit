@@ -451,3 +451,13 @@
   - CodeQL `30467741674`: pass for Actions, JavaScript/TypeScript, Python, and Rust
   - guarded release automation `30468441555`: pass
 - PR:18 regenerated at `41107f0` and includes the send-responsiveness release note. Exact-head CI `30468524296` and CodeQL `30468505063` pass. It remains unmerged pending final note correction, validation of that corrected head, and live checklist confirmation.
+
+## 2026-07-29 Corrected Release Candidate
+
+- Pushed PR:18 correction `8c8bf67`.
+- Added the omitted status emoji search and startup interaction plus sent-message animation notes to `CHANGELOG.md` and the matching public PR body.
+- Changed ISSUE:14 attribution from `closes` to `references`; GitHub reports no closing issue references.
+- The complete PR diff remains limited to the six expected release metadata files and is mergeable.
+- Exact-head CI `30470145716` passes strict default/native Clippy and both Meson configurations.
+- Exact-head CodeQL `30470043566` passes for Actions, JavaScript/TypeScript, Python, and Rust.
+- PR:18 remains unmerged. The live desktop, Slack, sandbox, and privacy checklist is the only remaining release gate.

@@ -1,7 +1,7 @@
 # Release 0.3.0
 
 - Status: preparation in progress; do not merge until the live manual checks are confirmed
-- Candidate: PR:18 at generated head `41107f0`
+- Candidate: PR:18 at corrected head `8c8bf67`
 - Confidence: high in source, metadata, automation, and package gates; live desktop and Slack behavior still requires maintainer confirmation
 - Provenance and risk: same-repository GitHub-signed Release Please commit; six expected text files only; no source, workflow, installer, permission, binary, credential, or dependency-graph changes
 
@@ -11,6 +11,7 @@
 - Exact-main CodeQL `30467741674`: Actions, Rust, JavaScript/TypeScript, and Python pass
 - Guarded release automation `30468441555`: pass and regenerated PR:18 with the send-responsiveness release note
 - Refreshed exact-head CI `30468524296` and CodeQL `30468505063`: pass
+- Corrected exact-head CI `30470145716` and CodeQL `30470043566`: pass
 - Release workflow structure: package publication waits for clean Debian, RPM, and Flatpak build/install validators and checksum generation
 - ISSUE:14: controlled dependency counts and six offline clean-build samples are recorded in `docs/dependency-audit.md`
 - Attention release measurements: three sanitized exact-head runs pass every semantic assertion; ranges are recorded in `docs/attention-and-notifications.md`
@@ -36,8 +37,5 @@
 
 ## Remaining release work
 
-- Finish and validate the last main-branch maintainer-record push
-- Correct the two omitted user-facing changelog entries on PR:18
-- Replace PR:18's generated ISSUE:14 closing link with a non-closing reference
-- Revalidate the corrected exact PR head
-- Merge and monitor package publication only after the required maintainer confirmation
+- Obtain the required maintainer confirmation
+- Merge and monitor package publication only after that confirmation

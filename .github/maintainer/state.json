@@ -7,7 +7,7 @@
   "last_known_total_pull_requests": 5,
   "last_checks": {
     "github_actions": "exact-main CI 30467743525, CodeQL 30467741674, and guarded release automation 30468441555 passed on bbf9539",
-    "pr_18": "regenerated and mergeable at 41107f0; exact-head CI 30468524296 and CodeQL 30468505063 passed",
+    "pr_18": "corrected and mergeable at 8c8bf67; exact-head CI 30470145716 and CodeQL 30470043566 passed; closing issue references are empty",
     "dependabot": "alert 1 for quinn-proto 0.11.14 fixed automatically at 2026-07-29T11:32:04Z without dismissal",
     "dependency_reachability": "Quinn is absent from the remote main lockfile, Flatpak sources, and compiled Cargo tree; stable HTTP/2 is active",
     "issue_14_evidence": "controlled graph 33/400/434 to 30/361/392; six offline clean builds show 9.53% lower median user CPU and overlapping elapsed ranges",
@@ -21,8 +21,8 @@
   },
   "notes": {
     "skill_package": "manual fallback; referenced triage script and guides are absent",
-    "priority": "finish the last main documentation push, correct PR:18 notes and ISSUE:14 linkage, validate the exact head, then defer merge until live manual checks are confirmed",
+    "priority": "defer PR:18 merge and package publication until the live manual release checklist is confirmed",
     "worktree": "message send responsiveness is committed and pushed; only the maintainer record is being updated",
-    "public_actions": "pushed ISSUE:14 evidence and send responsiveness, closed ISSUE:14 as completed, and allowed release automation to regenerate PR:18; no pull request merge, tag, release, or alert dismissal"
+    "public_actions": "pushed ISSUE:14 evidence and send responsiveness, closed ISSUE:14, corrected PR:18 notes and non-closing linkage, and validated its exact head; no pull request merge, tag, release, or alert dismissal"
   }
 }
