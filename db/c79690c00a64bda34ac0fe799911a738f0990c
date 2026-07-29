@@ -1,0 +1,18 @@
+Conductor task: Record release-build baselines and add failing bounded-picker document tests
+
+Summary:
+- Added a credential-free ignored release measurement fixture for a synthetic timeline document with 256 workspace emoji.
+- Recorded deterministic initial HTML size and eager picker choice count plus one directional generation-time sample.
+
+Modified files:
+- src/message_html.rs
+- conductor/tracks/lazy_webview_emoji_20260729/measurements.md
+
+Verification:
+- Sanitized release measurement test passed: 1 passed, 724 filtered.
+- Baseline: 748787 document bytes, 2126 eager choices, 256 custom emoji, 5531 us generation.
+- The release measurement command compiled the changed code successfully.
+- git diff --check passed after integration cleanup.
+
+Rationale:
+A reproducible credential-free baseline is required before replacing eager picker markup so the change can be measured rather than inferred.
