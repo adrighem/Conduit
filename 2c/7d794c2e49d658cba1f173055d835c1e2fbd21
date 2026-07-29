@@ -1,0 +1,13 @@
+Conductor verification checkpoint
+
+Verified phase:
+- Immediate shell and incremental conversation-switcher results
+
+Evidence:
+- User approved the focused Ctrl+K smoke-check closeout.
+- Sanitized cargo test --locked passed: 722 passed, 2 ignored.
+- Sanitized Meson headless Keyboard shortcuts and composer completion test passed.
+- The test opens and closes Ctrl+K twice and verifies the application remains responsive.
+
+Rationale:
+The focused live-widget smoke covers the only remaining phase gate.
