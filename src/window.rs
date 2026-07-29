@@ -58,8 +58,8 @@ use crate::message_handoff::{
     MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
 use crate::message_html::{
-    self, MessageHtmlContext, TimelineDomPatch, TimelineInsertPosition, TimelineMessageRegion,
-    TimelineScrollBehavior,
+    self, MessageHtmlContext, TimelineDomPatch, TimelineInsertPosition, TimelineMessageArrival,
+    TimelineMessageRegion, TimelineScrollBehavior,
 };
 use crate::models::{
     slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
@@ -416,6 +416,7 @@ mod imp {
             if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
                 let huddle_test = std::env::var_os("CONDUIT_TEST_HUDDLE").is_some();
                 let status_test = std::env::var_os("CONDUIT_TEST_STATUS_DIALOG").is_some();
+                let initial_sync_test = std::env::var_os("CONDUIT_TEST_INITIAL_SYNC").is_some();
                 if status_test && std::env::var_os("CONDUIT_TEST_STATUS_NARROW").is_some() {
                     obj.set_default_size(360, 720);
                 }
@@ -429,6 +430,9 @@ mod imp {
                     user_id: (huddle_test || status_test).then(|| "UTEST".to_string()),
                     ..AuthInfo::default()
                 });
+                if initial_sync_test {
+                    return;
+                }
                 obj.populate_conversations(vec![SlackConversation {
                     id: test_channel_id.to_string(),
                     name: Some("general".to_string()),
@@ -595,6 +599,7 @@ struct RealtimeMessagePatch<'a> {
     channel_id: &'a str,
     message: &'a SlackMessage,
     kind: RealtimeMessageKind,
+    arrival: Option<TimelineMessageArrival>,
     unread_start: bool,
     thread_ts: Option<&'a str>,
     fallback: UiInvalidations,
@@ -2424,7 +2429,7 @@ fn workspace_lifecycle_presentation(
             workspace_interactive: false,
         },
         Lifecycle::Syncing => WorkspaceLifecyclePresentation {
-            surface: if workspace_available {
+            surface: if workspace_available && initial_sync_complete {
                 Surface::Workspace
             } else {
                 Surface::Loading
@@ -2438,8 +2443,10 @@ fn workspace_lifecycle_presentation(
             workspace_interactive: true,
         },
         Lifecycle::Degraded => WorkspaceLifecyclePresentation {
-            surface: if workspace_available {
+            surface: if workspace_available && initial_sync_complete {
                 Surface::Workspace
+            } else if workspace_available {
+                Surface::Loading
             } else {
                 Surface::Connect
             },
@@ -2687,6 +2694,14 @@ fn realtime_dom_patch_kind(
         .first()
         .is_none_or(|newest| message.ts > newest.ts)
         .then_some(RealtimeMessageKind::Posted)
+}
+
+fn timeline_patch_needed(
+    state_changed: bool,
+    arrival: Option<TimelineMessageArrival>,
+    surface_contains_message: bool,
+) -> bool {
+    state_changed || (arrival.is_some() && surface_contains_message)
 }
 
 fn create_cache_directory(path: &Path) {
@@ -5229,6 +5244,7 @@ impl ConduitWindow {
                     &message,
                     RealtimeMessageKind::Posted,
                     false,
+                    Some(TimelineMessageArrival::Sent),
                 );
                 if outcome.refresh_unreads {
                     self.populate_unreads(self.unread_items());
@@ -5426,12 +5442,14 @@ impl ConduitWindow {
                     request.message,
                     &context,
                     TimelineInsertPosition::Append,
+                    request.arrival,
                 )
             }
             RealtimeMessageKind::Changed => message_html::replace_message_patch(
                 request.channel_id,
                 request.message,
                 &self.message_patch_context(request.thread_ts, request.message),
+                request.arrival,
             ),
             // Slack retains a tombstone for deleted messages. Replacing the existing
             // article keeps the incremental path consistent with a complete render.
@@ -5439,6 +5457,7 @@ impl ConduitWindow {
                 request.channel_id,
                 request.message,
                 &self.message_patch_context(request.thread_ts, request.message),
+                None,
             ),
         };
         self.apply_timeline_patch(request.surface, patch, request.fallback);
@@ -9245,7 +9264,7 @@ impl ConduitWindow {
             SocketModeMessageKind::Changed => RealtimeMessageKind::Changed,
             SocketModeMessageKind::Deleted => RealtimeMessageKind::Deleted,
         };
-        let outcome = self.apply_timeline_message(&channel_id, &message, kind, became_unread);
+        let outcome = self.apply_timeline_message(&channel_id, &message, kind, became_unread, None);
 
         if outcome.refresh_unreads {
             self.populate_unreads(self.unread_items());
@@ -9287,17 +9306,24 @@ impl ConduitWindow {
         message: &SlackMessage,
         kind: RealtimeMessageKind,
         unread_start: bool,
+        arrival: Option<TimelineMessageArrival>,
     ) -> RealtimeMessageOutcome {
-        let (channel_dom_kind, thread_dom_kind) = {
+        let (channel_dom_kind, thread_dom_kind, channel_contains_message, thread_contains_message) = {
             let state = self.imp().workspace.view.borrow();
+            let selected_thread_ts = state.selected_thread_ts();
             let channel_kind =
                 realtime_dom_patch_kind(kind, state.channel_messages(channel_id), message);
-            let thread_kind = state
-                .selected_thread_ts()
+            let thread_kind = selected_thread_ts
                 .filter(|thread_ts| message.belongs_to_thread(thread_ts))
                 .map(|_| realtime_dom_patch_kind(kind, state.current_thread_messages(), message))
                 .unwrap_or(Some(kind));
-            (channel_kind, thread_kind)
+            (
+                channel_kind,
+                thread_kind,
+                state.visible_channel_id() == Some(channel_id)
+                    && message.belongs_in_channel_timeline(),
+                selected_thread_ts.is_some_and(|thread_ts| message.belongs_to_thread(thread_ts)),
+            )
         };
 
         let outcome = self
@@ -9307,7 +9333,7 @@ impl ConduitWindow {
             .borrow_mut()
             .apply_realtime_message(channel_id, message.clone(), kind);
 
-        if outcome.render_channel {
+        if timeline_patch_needed(outcome.render_channel, arrival, channel_contains_message) {
             if self
                 .imp()
                 .workspace
@@ -9322,6 +9348,7 @@ impl ConduitWindow {
                     channel_id,
                     message,
                     kind: dom_kind,
+                    arrival,
                     unread_start,
                     thread_ts: None,
                     fallback: UiInvalidations::MAIN,
@@ -9331,7 +9358,7 @@ impl ConduitWindow {
             }
         }
 
-        if outcome.render_thread {
+        if timeline_patch_needed(outcome.render_thread, arrival, thread_contains_message) {
             if let Some(thread_ts) = self.selected_thread_ts() {
                 if self
                     .imp()
@@ -9347,6 +9374,7 @@ impl ConduitWindow {
                         channel_id,
                         message,
                         kind: dom_kind,
+                        arrival,
                         unread_start: false,
                         thread_ts: Some(&thread_ts),
                         fallback: UiInvalidations::THREAD,
@@ -10881,7 +10909,7 @@ mod tests {
             ),
             (
                 WorkspaceLifecycle::Syncing,
-                WorkspaceLifecycleSurface::Workspace,
+                WorkspaceLifecycleSurface::Loading,
                 "Syncing workspace…",
                 false,
                 false,
@@ -10934,10 +10962,10 @@ mod tests {
     }
 
     #[test]
-    fn initial_sync_blocks_workspace_until_ready_but_recovery_does_not() {
+    fn initial_sync_uses_movable_loading_surface_but_recovery_keeps_workspace() {
         let initial_sync =
             workspace_lifecycle_presentation(WorkspaceLifecycle::Syncing, true, false);
-        assert_eq!(initial_sync.surface, WorkspaceLifecycleSurface::Workspace);
+        assert_eq!(initial_sync.surface, WorkspaceLifecycleSurface::Loading);
         assert!(!initial_sync.workspace_interactive);
 
         let ready = workspace_lifecycle_presentation(WorkspaceLifecycle::Ready, true, false);
@@ -10947,6 +10975,11 @@ mod tests {
         assert!(recovery.workspace_interactive);
         let degraded = workspace_lifecycle_presentation(WorkspaceLifecycle::Degraded, true, true);
         assert!(degraded.workspace_interactive);
+
+        let initial_failure =
+            workspace_lifecycle_presentation(WorkspaceLifecycle::Degraded, true, false);
+        assert_eq!(initial_failure.surface, WorkspaceLifecycleSurface::Loading);
+        assert!(!initial_failure.workspace_interactive);
     }
 
     #[test]
@@ -12730,6 +12763,22 @@ mod tests {
             realtime_dom_patch_kind(RealtimeMessageKind::Deleted, &existing, &redelivery),
             Some(RealtimeMessageKind::Deleted)
         );
+    }
+
+    #[test]
+    fn local_arrival_repatches_a_socket_first_duplicate_on_the_visible_surface() {
+        assert!(timeline_patch_needed(
+            false,
+            Some(TimelineMessageArrival::Sent),
+            true
+        ));
+        assert!(!timeline_patch_needed(
+            false,
+            Some(TimelineMessageArrival::Sent),
+            false
+        ));
+        assert!(!timeline_patch_needed(false, None, true));
+        assert!(timeline_patch_needed(true, None, false));
     }
 
     #[test]

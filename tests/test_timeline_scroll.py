@@ -61,9 +61,81 @@ START_PROBE = r"""
     await waitForBottom(false);
     const delayedExpansionGap = bottomGap();
 
+    await waitForBottom(true);
+    const sentApplied = window.conduitApplyTimelinePatch({
+      type: "insert-message",
+      position: "append",
+      message_ts: "22",
+      arrival: "sent",
+      html: '<li><article class="message" data-message-ts="22">Sent message</article></li>'
+    });
+    const sentMessage = document.querySelector('[data-message-ts="22"]');
+    const sentArrivalClass = sentMessage.classList.contains("sent-message-arrival");
+    await nextFrame();
+    await nextFrame();
+    const sentAppendGap = bottomGap();
+    sentMessage.dispatchEvent(new Event("animationend"));
+    const sentArrivalCleared = !sentMessage.classList.contains("sent-message-arrival");
+
+    const sentReplacementApplied = window.conduitApplyTimelinePatch({
+      type: "replace-message",
+      message_ts: "22",
+      arrival: "sent",
+      html: '<article class="message" data-message-ts="22">Sent replacement</article>',
+      part_html: ""
+    });
+    const sentReplacement = document.querySelector('[data-message-ts="22"]');
+    const sentReplacementArrivalClass =
+      sentReplacement.classList.contains("sent-message-arrival");
+    sentReplacement.dispatchEvent(new Event("animationend"));
+
+    const incomingApplied = window.conduitApplyTimelinePatch({
+      type: "insert-message",
+      position: "append",
+      message_ts: "23",
+      html: '<li><article class="message" data-message-ts="23">Incoming message</article></li>'
+    });
+    const incomingMessage = document.querySelector('[data-message-ts="23"]');
+    const incomingArrivalClass =
+      incomingMessage.classList.contains("sent-message-arrival");
+
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = () => ({ matches: true });
+    const reducedMotionApplied = window.conduitApplyTimelinePatch({
+      type: "insert-message",
+      position: "append",
+      message_ts: "24",
+      arrival: "sent",
+      html: '<li><article class="message" data-message-ts="24">Reduced motion</article></li>'
+    });
+    const reducedMotionArrivalClass = document
+      .querySelector('[data-message-ts="24"]')
+      .classList.contains("sent-message-arrival");
+    window.matchMedia = originalMatchMedia;
+
+    await nextFrame();
+    await nextFrame();
     const anchor = document.querySelector('[data-message-ts="10"]');
     anchor.scrollIntoView({ block: "start" });
+    window.dispatchEvent(new Event("scroll"));
+    await nextFrame();
+    await nextFrame();
     await wait(80);
+    const sentAwayAnchorTop = anchor.getBoundingClientRect().top;
+    const sentAwayApplied = window.conduitApplyTimelinePatch({
+      type: "insert-message",
+      position: "append",
+      message_ts: "25",
+      arrival: "sent",
+      html: '<li><article class="message" data-message-ts="25">Sent while reading</article></li>'
+    });
+    await wait(100);
+    const sentAwayMessage = document.querySelector('[data-message-ts="25"]');
+    const sentAwayArrivalClass =
+      sentAwayMessage.classList.contains("sent-message-arrival");
+    const sentAwayAnchorDelta =
+      anchor.getBoundingClientRect().top - sentAwayAnchorTop;
+
     const anchorTop = anchor.getBoundingClientRect().top;
     const replaced = window.conduitApplyTimelinePatch({
       type: "replace-message",
@@ -99,6 +171,19 @@ START_PROBE = r"""
       initialGap,
       reflowGap,
       delayedExpansionGap,
+      sentApplied,
+      sentArrivalClass,
+      sentAppendGap,
+      sentArrivalCleared,
+      sentReplacementApplied,
+      sentReplacementArrivalClass,
+      incomingApplied,
+      incomingArrivalClass,
+      reducedMotionApplied,
+      reducedMotionArrivalClass,
+      sentAwayApplied,
+      sentAwayArrivalClass,
+      sentAwayAnchorDelta,
       replaced,
       replacementText: replacement.textContent,
       replacementInlineHeight: replacement.style.height,
@@ -213,6 +298,19 @@ html, body {{ margin: 0; padding: 0; }}
     assert abs(payload["initialGap"]) <= 2, payload
     assert abs(payload["reflowGap"]) <= 2, payload
     assert abs(payload["delayedExpansionGap"]) <= 2, payload
+    assert payload["sentApplied"] is True, payload
+    assert payload["sentArrivalClass"] is True, payload
+    assert abs(payload["sentAppendGap"]) <= 2, payload
+    assert payload["sentArrivalCleared"] is True, payload
+    assert payload["sentReplacementApplied"] is True, payload
+    assert payload["sentReplacementArrivalClass"] is True, payload
+    assert payload["incomingApplied"] is True, payload
+    assert payload["incomingArrivalClass"] is False, payload
+    assert payload["reducedMotionApplied"] is True, payload
+    assert payload["reducedMotionArrivalClass"] is False, payload
+    assert payload["sentAwayApplied"] is True, payload
+    assert payload["sentAwayArrivalClass"] is False, payload
+    assert abs(payload["sentAwayAnchorDelta"]) <= 2, payload
     assert payload["replaced"] is True, payload
     assert payload["replacementText"] == "replacement", payload
     assert payload["replacementInlineHeight"] == "240px", payload

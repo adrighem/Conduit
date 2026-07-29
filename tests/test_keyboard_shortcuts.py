@@ -81,19 +81,29 @@ def visible_window_ids(name: str) -> list[str]:
 
 def focus_window(window_id: str) -> None:
     # Ask the window manager first so GTK receives normal activation state.
-    # Fall back to direct X input focus while the WM is still registering a
-    # newly mapped window.
-    try:
-        activated = subprocess.run(
-            ["xdotool", "windowactivate", "--sync", window_id],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
+    # A newly mapped window or dialog transition can briefly leave the target
+    # unmapped. Retry instead of issuing a direct X focus request that races it.
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        active = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            capture_output=True,
+            text=True,
         )
-    except subprocess.TimeoutExpired:
-        activated = None
-    if activated is None or activated.returncode != 0:
-        subprocess.run(["xdotool", "windowfocus", "--sync", window_id], check=True)
+        if active.returncode == 0 and active.stdout.strip() == window_id:
+            break
+        try:
+            subprocess.run(
+                ["xdotool", "windowactivate", window_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(0.1)
+    else:
+        raise AssertionError(f"window {window_id} did not become activatable")
     # Give GTK one main-loop iteration to apply the activation transition.
     time.sleep(0.1)
 

@@ -85,10 +85,15 @@ pub enum TimelineDomPatch {
     },
     InsertMessage {
         position: TimelineInsertPosition,
+        message_ts: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arrival: Option<TimelineMessageArrival>,
         html: String,
     },
     ReplaceMessage {
         message_ts: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arrival: Option<TimelineMessageArrival>,
         html: String,
         part_html: String,
     },
@@ -121,6 +126,12 @@ pub enum TimelineInsertPosition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum TimelineMessageArrival {
+    Sent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 #[allow(dead_code)]
 pub enum TimelineMessageRegion {
     Body,
@@ -136,12 +147,15 @@ pub fn insert_message_patch(
     message: &SlackMessage,
     context: &MessageHtmlContext,
     position: TimelineInsertPosition,
+    arrival: Option<TimelineMessageArrival>,
 ) -> TimelineDomPatch {
     let unread_separator = (context.first_unread_ts.as_deref() == Some(message.ts.as_str()))
         .then(unread_separator_html)
         .unwrap_or_default();
     TimelineDomPatch::InsertMessage {
         position,
+        message_ts: message.ts.clone(),
+        arrival,
         html: format!(
             "{unread_separator}<li class=\"message-list-item\">{}</li>",
             message_article(Some(channel_id), message, context)
@@ -170,9 +184,11 @@ pub fn replace_message_patch(
     channel_id: &str,
     message: &SlackMessage,
     context: &MessageHtmlContext,
+    arrival: Option<TimelineMessageArrival>,
 ) -> TimelineDomPatch {
     TimelineDomPatch::ReplaceMessage {
         message_ts: message.ts.clone(),
+        arrival,
         html: message_article(Some(channel_id), message, context),
         part_html: message_part_html(Some(channel_id), message, context),
     }
@@ -1996,6 +2012,22 @@ pre code {{
   padding-block: 14px;
   padding-inline: 0;
   color: var(--muted);
+}}
+
+@keyframes sent-message-arrival {{
+  from {{
+    opacity: 0.25;
+    transform: translateY(16px);
+  }}
+  to {{
+    opacity: 1;
+    transform: translateY(0);
+  }}
+}}
+
+.sent-message-arrival {{
+  animation: sent-message-arrival 220ms cubic-bezier(0.2, 0, 0, 1);
+  will-change: opacity, transform;
 }}
 
 @media (hover: hover) and (pointer: fine) {{
@@ -4484,6 +4516,8 @@ mod tests {
 
         assert!(css.contains(":focus-visible"));
         assert!(css.contains(".quick-actions:has(:focus-visible)"));
+        assert!(css.contains("@keyframes sent-message-arrival"));
+        assert!(css.contains(".sent-message-arrival"));
         assert!(css.contains("@media (prefers-reduced-motion: reduce)"));
         assert!(css.contains("padding-inline:"));
         assert!(css.contains("inset-inline-end:"));
@@ -6053,16 +6087,46 @@ mod tests {
             .insert("U123".into(), "Ada <Admin>".into());
         let message = message("Hello <everyone>");
 
-        let inserted =
-            insert_message_patch("C123", &message, &context, TimelineInsertPosition::Append);
-        let TimelineDomPatch::InsertMessage { position, html } = inserted else {
+        let inserted = insert_message_patch(
+            "C123",
+            &message,
+            &context,
+            TimelineInsertPosition::Append,
+            Some(TimelineMessageArrival::Sent),
+        );
+        let TimelineDomPatch::InsertMessage {
+            position,
+            message_ts,
+            arrival,
+            html,
+        } = inserted
+        else {
             panic!("expected insert patch");
         };
         assert_eq!(position, TimelineInsertPosition::Append);
+        assert_eq!(message_ts, message.ts);
+        assert_eq!(arrival, Some(TimelineMessageArrival::Sent));
         assert!(html.starts_with("<li class=\"message-list-item\"><article"));
         assert!(html.contains("Ada &lt;Admin&gt;"));
         assert!(html.contains("Hello &lt;everyone&gt;"));
         assert!(html.contains("<time class=\"metadata\""));
+
+        let ordinary = insert_message_patch(
+            "C123",
+            &message,
+            &context,
+            TimelineInsertPosition::Append,
+            None,
+        );
+        assert!(!timeline_dom_patch_call(&ordinary).contains("\"arrival\""));
+
+        let replacement = replace_message_patch(
+            "C123",
+            &message,
+            &context,
+            Some(TimelineMessageArrival::Sent),
+        );
+        assert!(timeline_dom_patch_call(&replacement).contains("\"arrival\":\"sent\""));
 
         let reactions =
             message_region_patch("C123", &message, &context, TimelineMessageRegion::Responses);

@@ -290,5 +290,7 @@ if not headless_tests_option.disabled() and xvfb_run.found() and xdotool.found()
     depends: [cargo_build],
     suite: 'headless',
     timeout: 90,
+    # Synthetic input focus races concurrent Xvfb and xfwm4 startup.
+    is_parallel: false,
   )
 endif

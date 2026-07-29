@@ -36,6 +36,36 @@
     return template.content;
   }
 
+  function messageElementIn(root, messageTs) {
+    return Array.from(root.querySelectorAll("[data-message-ts]")).find(function (element) {
+      return element.dataset.messageTs === messageTs;
+    }) || null;
+  }
+
+  function animateSentMessage(root, messageTs, arrivalVisible) {
+    if (!arrivalVisible || !root || !messageTs) return;
+    if (
+      window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) return;
+    const target = messageElementIn(root, messageTs);
+    if (!target) return;
+    target.classList.add("sent-message-arrival");
+    let cleanupTimer = 0;
+    function clearArrival() {
+      target.removeEventListener("animationend", onAnimationFinished);
+      target.removeEventListener("animationcancel", onAnimationFinished);
+      window.clearTimeout(cleanupTimer);
+      target.classList.remove("sent-message-arrival");
+    }
+    function onAnimationFinished(event) {
+      if (event.target === target) clearArrival();
+    }
+    target.addEventListener("animationend", onAnimationFinished);
+    target.addEventListener("animationcancel", onAnimationFinished);
+    cleanupTimer = window.setTimeout(clearArrival, 1000);
+  }
+
   function visibleAnchor() {
     const messages = Array.from(document.querySelectorAll("[data-message-ts]"));
     const fullyEntered = messages.find(function (element) {
@@ -361,12 +391,13 @@
 
   function withPreservedScroll(mutate) {
     const root = timelineRoot();
+    const arrivalVisible = isNearBottom();
     const wasAtBottom = viewportPinnedToBottom || isNearBottom();
     const anchor = visibleAnchor();
     const anchorTs = anchor ? anchor.dataset.messageTs : null;
     const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
     const oldScrollTop = root.scrollTop;
-    const changed = mutate();
+    const changed = mutate(arrivalVisible);
     if (!changed) return false;
     const generation = ++scrollMutationGeneration;
     function restore() {
@@ -394,7 +425,7 @@
 
   window.conduitApplyTimelinePatch = function (patch) {
     if (!patch || typeof patch.type !== "string") return false;
-    return withPreservedScroll(function () {
+    return withPreservedScroll(function (arrivalVisible) {
       if (patch.type === "replace-snapshot") {
         const list = document.querySelector(".message-list");
         if (
@@ -411,9 +442,17 @@
 
       if (patch.type === "insert-message") {
         const list = document.querySelector(".message-list");
-        if (!list || typeof patch.html !== "string") return false;
-        if (patch.position === "prepend") list.prepend(fragment(patch.html));
-        else list.append(fragment(patch.html));
+        if (
+          !list ||
+          typeof patch.html !== "string" ||
+          typeof patch.message_ts !== "string"
+        ) return false;
+        const content = fragment(patch.html);
+        if (patch.arrival === "sent") {
+          animateSentMessage(content, patch.message_ts, arrivalVisible);
+        }
+        if (patch.position === "prepend") list.prepend(content);
+        else list.append(content);
         return true;
       }
 
@@ -422,7 +461,11 @@
         if (!target || typeof patch.html !== "string") return false;
         const html = target.classList.contains("message-part") ? patch.part_html : patch.html;
         if (typeof html !== "string") return false;
-        target.replaceWith(fragment(html));
+        const content = fragment(html);
+        if (patch.arrival === "sent") {
+          animateSentMessage(content, patch.message_ts, arrivalVisible);
+        }
+        target.replaceWith(content);
         return true;
       }
 

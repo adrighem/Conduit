@@ -35,6 +35,7 @@ PROBE = r"""
   const inserted = window.conduitApplyTimelinePatch({
     type: "insert-message",
     position: "append",
+    message_ts: "dynamic-ts",
     html: '<li class="message-list-item"><article data-message-ts="dynamic-ts"><time id="dynamic" class="metadata" datetime="2026-07-09T13:00:00+02:00">dynamic fallback</time></article></li>'
   });
 

@@ -45,6 +45,11 @@ def wait_for_window(process: subprocess.Popen[str]) -> str:
 
 
 def window_size(window_id: str) -> tuple[int, int]:
+    values = window_geometry(window_id)
+    return int(values["WIDTH"]), int(values["HEIGHT"])
+
+
+def window_geometry(window_id: str) -> dict[str, str]:
     result = subprocess.run(
         ["xdotool", "getwindowgeometry", "--shell", window_id],
         check=True,
@@ -54,7 +59,7 @@ def window_size(window_id: str) -> tuple[int, int]:
     values = dict(
         line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
     )
-    return int(values["WIDTH"]), int(values["HEIGHT"])
+    return values
 
 
 def wait_for_size(
@@ -123,6 +128,18 @@ def toggle_maximized(window_id: str) -> None:
         ],
         check=True,
     )
+
+
+def verify_header_bar_interactive(window_id: str) -> None:
+    subprocess.run(
+        ["xdotool", "windowactivate", "--sync", window_id],
+        check=True,
+    )
+    toggle_maximized(window_id)
+    wait_until(lambda: window_is_maximized(window_id))
+    time.sleep(0.75)
+    toggle_maximized(window_id)
+    wait_until(lambda: not window_is_maximized(window_id))
 
 
 def quit_application(environment: dict[str, str]) -> None:
@@ -210,6 +227,13 @@ def main() -> None:
 
         process: subprocess.Popen[str] | None = None
         try:
+            environment["CONDUIT_TEST_INITIAL_SYNC"] = "1"
+            process, window_id = run_application(binary, environment)
+            verify_header_bar_interactive(window_id)
+            stop_application(process, environment)
+            process = None
+            environment.pop("CONDUIT_TEST_INITIAL_SYNC")
+
             process, window_id = run_application(binary, environment)
             resize_window(window_id, EXPECTED_SIZE)
             stop_application(process, environment)
