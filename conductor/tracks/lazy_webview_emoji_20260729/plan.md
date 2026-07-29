@@ -2,8 +2,8 @@
 
 ## Phase 1: Bounded on-demand emoji picker
 
-- [~] Task: Record release-build baselines and add failing bounded-picker document tests
-- [ ] Task: Define a generation-scoped native picker query and result protocol
+- [x] Task: Record release-build baselines and add failing bounded-picker document tests dbc7969
+- [~] Task: Define a generation-scoped native picker query and result protocol
 - [ ] Task: Replace eager emoji markup with a lightweight picker shell and bounded materialization
 - [ ] Task: Preserve search, categories, custom emoji, keyboard, cancellation, focus, and reactions
 - [ ] Task: Conductor - User Manual Verification 'Bounded on-demand emoji picker' (Protocol in workflow.md)
