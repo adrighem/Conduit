@@ -2657,9 +2657,8 @@ fn apply_store_change(
 ) -> Result<bool> {
     match change {
         StoreChange::BootstrapReplaced(data) => {
-            let mut changed =
-                sync_conversations(transaction, workspace_key, data.conversations.into_iter())?;
-            changed |= sync_users(transaction, workspace_key, data.users.into_iter())?;
+            let mut changed = sync_conversations(transaction, workspace_key, data.conversations)?;
+            changed |= sync_users(transaction, workspace_key, data.users)?;
             changed |= sync_sqlite_kind(
                 transaction,
                 workspace_key,
@@ -2679,7 +2678,7 @@ fn apply_store_change(
             Ok(changed)
         }
         StoreChange::ConversationsReplaced(conversations) => {
-            sync_conversations(transaction, workspace_key, conversations.into_iter())
+            sync_conversations(transaction, workspace_key, conversations)
         }
         StoreChange::ConversationsRepaired(conversations) => {
             sync_repaired_conversations(transaction, workspace_key, workspace_id, conversations)
@@ -2736,9 +2735,7 @@ fn apply_store_change(
         StoreChange::UnreadChanged { snapshot } => {
             apply_store_unread_snapshot(transaction, workspace_key, workspace_id, snapshot)
         }
-        StoreChange::UsersReplaced(users) => {
-            sync_users(transaction, workspace_key, users.into_iter())
-        }
+        StoreChange::UsersReplaced(users) => sync_users(transaction, workspace_key, users),
         StoreChange::UserUpsert(user) => upsert_user_projection(transaction, workspace_key, user),
         StoreChange::HistoryReplaced {
             channel_id,
