@@ -2512,17 +2512,7 @@ fn spawn_workspace_tasks(
             ));
             spawn_session_task(state, identity.session, async move {
                 let _ = hydration_ready_receiver.await;
-                run_socket_mode(
-                    credentials,
-                    socket_events,
-                    connection.workspace_store.clone(),
-                    connection.workspace.clone(),
-                    connection.current_user_id.clone(),
-                    connection.team_id.clone(),
-                    connection.huddles.clone(),
-                    connection.user_status_sync.clone(),
-                )
-                .await;
+                run_socket_mode(credentials, socket_events, connection).await;
             });
         }
         Ok(None) => socket_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
@@ -3885,13 +3875,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
 async fn run_socket_mode(
     credentials: socket_mode::SocketModeCredentials,
     events: RuntimeEventSender,
-    workspace_store: Option<WorkspaceStore>,
-    workspace: WorkspaceReducerAdapter,
-    current_user_id: Option<String>,
-    team_id: Option<String>,
-    huddles: HuddleActorHandle,
-    user_status_sync: UserStatusSync,
+    connection: RuntimeConnection,
 ) {
+    let RuntimeConnection {
+        workspace_store,
+        workspace,
+        current_user_id,
+        team_id,
+        huddles,
+        user_status_sync,
+        ..
+    } = connection;
     let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
     let transport = credentials.transport();
 
