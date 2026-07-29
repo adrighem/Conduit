@@ -1,0 +1,3 @@
+Issue #11 Phase 3 task 4 message-delta foundation: semantic transactional MessageDelta persistence across channel/thread projections, cross-projection snapshot authority, and root aggregate reconciliation without requiring hydrated timelines.
+
+Validated on 0bff772 with sanitized full suite: 837 passed, 3 ignored; cargo check, formatting and diff checks; independent review found no remaining high or medium correctness or performance findings. Remote Rust 1.97 strict Clippy remains the final toolchain check.
