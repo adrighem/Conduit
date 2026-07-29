@@ -1,0 +1,19 @@
+Conductor task: Define failing end-to-end tests for authoritative conversation membership and metadata
+
+Summary:
+- Replaced the adapter's bool-only apply path with one typed Option<WorkspaceReduction> result.
+- Added end-to-end conversation membership and metadata coverage across cache, realtime, local, and stale Web API inputs.
+- Proved matching patch/store revisions and unchanged suppression.
+
+Modified files:
+- src/runtime.rs
+
+Verification:
+- Red phase: six E0599 failures showed callers could not inspect patch or store results.
+- Sanitized focused test passed.
+- Sanitized cargo check passed.
+- Sanitized full cargo test passed: 723 passed, 2 ignored.
+- cargo fmt --check passed.
+
+Rationale:
+The typed reduction is the minimum seam required to make coordinator output authoritative without adding a second persistence or presentation path.
