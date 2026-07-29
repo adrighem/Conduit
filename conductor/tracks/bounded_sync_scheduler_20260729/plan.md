@@ -4,8 +4,8 @@
 
 - [x] Task: Add failing tests for SyncJob identity, durability, priority, freshness, and replacement a5b6742
 - [x] Task: Implement bounded pre-spawn admission with priority and starvation protection cded7d7
-- [~] Task: Add target-aware coalescing, cancellation, retry, and shutdown behavior
-- [ ] Task: Add redacted queue counters and saturation regression coverage
+- [x] Task: Add target-aware coalescing, cancellation, retry, and shutdown behavior 841d550
+- [~] Task: Add redacted queue counters and saturation regression coverage
 - [ ] Task: Conductor - User Manual Verification 'Scheduler contracts and deterministic core' (Protocol in workflow.md)
 
 ## Phase 2: Authoritative runtime integration
