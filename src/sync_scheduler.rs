@@ -475,6 +475,113 @@ pub(crate) enum ShutdownPhase {
     Drained,
 }
 
+/// Aggregate scheduler observability without job, target, or cancellation
+/// identities. Cumulative counters saturate instead of affecting scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SchedulerCounters {
+    admitted: u64,
+    queued_depth: usize,
+    running_depth: usize,
+    coalesced: u64,
+    cancellation_requested: u64,
+    cancellation_completed: u64,
+    completed: u64,
+    failed: u64,
+    retried: u64,
+    skipped_fresh: u64,
+    rejected_at_capacity: u64,
+    rejected_duplicate_identity: u64,
+    rejected_shutting_down: u64,
+    queue_high_water: usize,
+    running_high_water: usize,
+    shutdown_phase: ShutdownPhase,
+}
+
+impl SchedulerCounters {
+    pub(crate) fn admitted(self) -> u64 {
+        self.admitted
+    }
+
+    pub(crate) fn queued_depth(self) -> usize {
+        self.queued_depth
+    }
+
+    pub(crate) fn running_depth(self) -> usize {
+        self.running_depth
+    }
+
+    pub(crate) fn coalesced(self) -> u64 {
+        self.coalesced
+    }
+
+    /// First-time cancellation directives sent to already running work.
+    ///
+    /// This and `cancellation_completed` describe different populations and
+    /// must not be subtracted to derive pending cancellation work.
+    pub(crate) fn cancellation_requested(self) -> u64 {
+        self.cancellation_requested
+    }
+
+    /// Terminally cancelled admissions, including synchronous queued
+    /// cancellation where no running directive was necessary.
+    pub(crate) fn cancellation_completed(self) -> u64 {
+        self.cancellation_completed
+    }
+
+    pub(crate) fn completed(self) -> u64 {
+        self.completed
+    }
+
+    pub(crate) fn failed(self) -> u64 {
+        self.failed
+    }
+
+    pub(crate) fn retried(self) -> u64 {
+        self.retried
+    }
+
+    pub(crate) fn skipped_fresh(self) -> u64 {
+        self.skipped_fresh
+    }
+
+    pub(crate) fn rejected(self, reason: AdmissionRejectionReason) -> u64 {
+        match reason {
+            AdmissionRejectionReason::AtCapacity => self.rejected_at_capacity,
+            AdmissionRejectionReason::DuplicateIdentity => self.rejected_duplicate_identity,
+            AdmissionRejectionReason::ShuttingDown => self.rejected_shutting_down,
+        }
+    }
+
+    pub(crate) fn queue_high_water(self) -> usize {
+        self.queue_high_water
+    }
+
+    pub(crate) fn running_high_water(self) -> usize {
+        self.running_high_water
+    }
+
+    pub(crate) fn shutdown_phase(self) -> ShutdownPhase {
+        self.shutdown_phase
+    }
+}
+
+#[derive(Debug, Default)]
+struct SchedulerCounterState {
+    admitted: u64,
+    coalesced: u64,
+    cancellation_requested: u64,
+    cancellation_completed: u64,
+    completed: u64,
+    failed: u64,
+    retried: u64,
+    skipped_fresh: u64,
+    rejected_at_capacity: u64,
+    rejected_duplicate_identity: u64,
+    rejected_shutting_down: u64,
+    queue_high_water: usize,
+    running_high_water: usize,
+}
+
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShutdownReport {
@@ -524,6 +631,7 @@ pub(crate) struct SyncScheduler {
     foreground: VecDeque<QueuedJob>,
     maintenance: VecDeque<QueuedJob>,
     running: HashMap<SyncJobId, RunningJob>,
+    counters: SchedulerCounterState,
     next_admission_generation: u64,
     next_run_generation: u64,
     foreground_wait_dispatches: u64,
@@ -539,6 +647,7 @@ impl SyncScheduler {
             foreground: VecDeque::new(),
             maintenance: VecDeque::new(),
             running: HashMap::new(),
+            counters: SchedulerCounterState::default(),
             next_admission_generation: 1,
             next_run_generation: 1,
             foreground_wait_dispatches: 0,
@@ -553,26 +662,18 @@ impl SyncScheduler {
         last_success_at_ms: Option<u64>,
     ) -> Result<AdmissionOutcome, AdmissionRejection> {
         if self.shutdown_phase != ShutdownPhase::Open {
-            return Err(AdmissionRejection {
-                reason: AdmissionRejectionReason::ShuttingDown,
-                job,
-            });
+            return self.reject_admission(job, AdmissionRejectionReason::ShuttingDown);
         }
         if self.has_active_identity(job.id, job.cancellation_id) {
-            return Err(AdmissionRejection {
-                reason: AdmissionRejectionReason::DuplicateIdentity,
-                job,
-            });
+            return self.reject_admission(job, AdmissionRejectionReason::DuplicateIdentity);
         }
         if job.freshness.decision(now_ms, last_success_at_ms) == FreshnessDecision::SkipFresh {
+            self.counters.skipped_fresh = self.counters.skipped_fresh.saturating_add(1);
             return Ok(AdmissionOutcome::SkippedFresh(job));
         }
         let replacement = self.queued_replacement_for(&job);
         if replacement.is_none() && self.active_len() >= self.config.admission_capacity {
-            return Err(AdmissionRejection {
-                reason: AdmissionRejectionReason::AtCapacity,
-                job,
-            });
+            return self.reject_admission(job, AdmissionRejectionReason::AtCapacity);
         }
 
         let token = AdmissionToken::new(job.id, self.next_admission_generation);
@@ -601,6 +702,12 @@ impl SyncScheduler {
             attempt: 1,
             ready_at_ms: now_ms,
         });
+        self.counters.admitted = self.counters.admitted.saturating_add(1);
+        self.counters.coalesced = self
+            .counters
+            .coalesced
+            .saturating_add(u64::from(coalesced.is_some()));
+        self.record_depth_high_water();
         Ok(AdmissionOutcome::Accepted { token, coalesced })
     }
 
@@ -682,6 +789,7 @@ impl SyncScheduler {
                 retry_superseded_by: None,
             },
         );
+        self.record_depth_high_water();
         Some(dispatched)
     }
 
@@ -766,6 +874,7 @@ impl SyncScheduler {
                 }
             },
         };
+        self.record_completion_outcome(&completion);
         self.update_drained();
         Ok(completion)
     }
@@ -799,6 +908,8 @@ impl SyncScheduler {
                 .expect("located cancellation queue position exists");
             self.reset_wait_if_ineligible(priority, now_ms);
             let cancelled = ReleasedJob::new(queued.job, queued.attempt);
+            self.counters.cancellation_completed =
+                self.counters.cancellation_completed.saturating_add(1);
             self.update_drained();
             return CancellationOutcome::Cancelled(cancelled);
         }
@@ -822,6 +933,8 @@ impl SyncScheduler {
             CancellationOutcome::AlreadyRequested(directive)
         } else {
             running.cancellation_requested = true;
+            self.counters.cancellation_requested =
+                self.counters.cancellation_requested.saturating_add(1);
             CancellationOutcome::Requested(directive)
         }
     }
@@ -851,6 +964,14 @@ impl SyncScheduler {
         }
         cancelled.sort_unstable_by_key(|released| released.job.id);
         cancellation_requested.sort_unstable_by_key(|directive| directive.run.job_id);
+        self.counters.cancellation_completed = self
+            .counters
+            .cancellation_completed
+            .saturating_add(u64::try_from(cancelled.len()).unwrap_or(u64::MAX));
+        self.counters.cancellation_requested = self
+            .counters
+            .cancellation_requested
+            .saturating_add(u64::try_from(cancellation_requested.len()).unwrap_or(u64::MAX));
         self.update_drained();
         ShutdownReport {
             phase: self.shutdown_phase,
@@ -867,8 +988,78 @@ impl SyncScheduler {
         self.shutdown_phase == ShutdownPhase::Drained
     }
 
+    pub(crate) fn counters(&self) -> SchedulerCounters {
+        SchedulerCounters {
+            admitted: self.counters.admitted,
+            queued_depth: self.queued_len(),
+            running_depth: self.running.len(),
+            coalesced: self.counters.coalesced,
+            cancellation_requested: self.counters.cancellation_requested,
+            cancellation_completed: self.counters.cancellation_completed,
+            completed: self.counters.completed,
+            failed: self.counters.failed,
+            retried: self.counters.retried,
+            skipped_fresh: self.counters.skipped_fresh,
+            rejected_at_capacity: self.counters.rejected_at_capacity,
+            rejected_duplicate_identity: self.counters.rejected_duplicate_identity,
+            rejected_shutting_down: self.counters.rejected_shutting_down,
+            queue_high_water: self.counters.queue_high_water,
+            running_high_water: self.counters.running_high_water,
+            shutdown_phase: self.shutdown_phase,
+        }
+    }
+
+    fn reject_admission(
+        &mut self,
+        job: SyncJob,
+        reason: AdmissionRejectionReason,
+    ) -> Result<AdmissionOutcome, AdmissionRejection> {
+        let rejected = match reason {
+            AdmissionRejectionReason::AtCapacity => &mut self.counters.rejected_at_capacity,
+            AdmissionRejectionReason::DuplicateIdentity => {
+                &mut self.counters.rejected_duplicate_identity
+            }
+            AdmissionRejectionReason::ShuttingDown => &mut self.counters.rejected_shutting_down,
+        };
+        *rejected = rejected.saturating_add(1);
+        Err(AdmissionRejection { reason, job })
+    }
+
+    fn record_completion_outcome(&mut self, outcome: &CompletionOutcome) {
+        let counter = match outcome {
+            CompletionOutcome::Completed => &mut self.counters.completed,
+            CompletionOutcome::Retried { .. } => &mut self.counters.retried,
+            CompletionOutcome::Failed(_) => &mut self.counters.failed,
+            CompletionOutcome::Cancelled(_) => &mut self.counters.cancellation_completed,
+            CompletionOutcome::Superseded { .. } => &mut self.counters.coalesced,
+        };
+        *counter = counter.saturating_add(1);
+        if matches!(outcome, CompletionOutcome::Retried { .. }) {
+            self.record_depth_high_water();
+        }
+    }
+
+    fn record_depth_high_water(&mut self) {
+        let queued = self.queued_len();
+        let running = self.running.len();
+        debug_assert!(
+            queued + running <= self.config.admission_capacity,
+            "scheduler admission capacity exceeded"
+        );
+        debug_assert!(
+            running <= self.config.running_capacity,
+            "scheduler running capacity exceeded"
+        );
+        self.counters.queue_high_water = self.counters.queue_high_water.max(queued);
+        self.counters.running_high_water = self.counters.running_high_water.max(running);
+    }
+
+    fn queued_len(&self) -> usize {
+        self.interactive.len() + self.foreground.len() + self.maintenance.len()
+    }
+
     fn active_len(&self) -> usize {
-        self.interactive.len() + self.foreground.len() + self.maintenance.len() + self.running.len()
+        self.queued_len() + self.running.len()
     }
 
     fn has_active_identity(&self, job_id: SyncJobId, cancellation_id: CancellationId) -> bool {
@@ -2278,5 +2469,632 @@ mod tests {
         let rejection = scheduler.admit(ephemeral_job(1), 10_000, None).unwrap_err();
         assert_eq!(rejection.reason(), AdmissionRejectionReason::ShuttingDown);
         assert_eq!(rejection.into_job().id(), SyncJobId::new(1));
+    }
+
+    fn assert_admission_counters_reconcile(counters: SchedulerCounters) {
+        let accounted = counters
+            .completed()
+            .saturating_add(counters.failed())
+            .saturating_add(counters.cancellation_completed())
+            .saturating_add(counters.coalesced())
+            .saturating_add(counters.queued_depth() as u64)
+            .saturating_add(counters.running_depth() as u64);
+        assert_eq!(counters.admitted(), accounted);
+    }
+
+    #[test]
+    fn scheduler_counters_are_redacted_and_empty_at_start() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let initial = scheduler.counters();
+
+        assert_eq!(initial.admitted(), 0);
+        assert_eq!(initial.queued_depth(), 0);
+        assert_eq!(initial.running_depth(), 0);
+        assert_eq!(initial.coalesced(), 0);
+        assert_eq!(initial.cancellation_requested(), 0);
+        assert_eq!(initial.cancellation_completed(), 0);
+        assert_eq!(initial.completed(), 0);
+        assert_eq!(initial.failed(), 0);
+        assert_eq!(initial.retried(), 0);
+        assert_eq!(initial.skipped_fresh(), 0);
+        assert_eq!(initial.rejected(AdmissionRejectionReason::AtCapacity), 0);
+        assert_eq!(
+            initial.rejected(AdmissionRejectionReason::DuplicateIdentity),
+            0
+        );
+        assert_eq!(initial.rejected(AdmissionRejectionReason::ShuttingDown), 0);
+        assert_eq!(initial.queue_high_water(), 0);
+        assert_eq!(initial.running_high_water(), 0);
+        assert_eq!(initial.shutdown_phase(), ShutdownPhase::Open);
+
+        let mut fresh = ephemeral_job(123);
+        fresh.freshness = FreshnessPolicy::IfOlderThan { max_age_ms: 500 };
+        assert!(matches!(
+            scheduler.admit(fresh, 1_000, Some(900)),
+            Ok(AdmissionOutcome::SkippedFresh(_))
+        ));
+        assert_eq!(scheduler.counters().skipped_fresh(), 1);
+        assert_eq!(scheduler.counters().admitted(), 0);
+        scheduler
+            .admit(ephemeral_job(987_654_321), 1_000, None)
+            .unwrap();
+        let rendered = format!("{:?}", scheduler.counters());
+        for forbidden in [
+            "987654321",
+            "SyncJobId",
+            "CancellationId",
+            "SyncTarget",
+            "opaque_id",
+            "target",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "counter snapshot exposed {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn burst_admission_and_dispatch_never_exceed_configured_bounds() {
+        const ADMISSION_CAPACITY: usize = 32;
+        const RUNNING_CAPACITY: usize = 3;
+        const BURST_SIZE: u64 = 100;
+        let mut scheduler = scheduler(ADMISSION_CAPACITY, RUNNING_CAPACITY, 3);
+
+        for id in 1..=BURST_SIZE {
+            let result = scheduler.admit(ephemeral_job(id), 1_000, None);
+            if id <= ADMISSION_CAPACITY as u64 {
+                assert!(matches!(result, Ok(AdmissionOutcome::Accepted { .. })));
+            } else {
+                assert_eq!(
+                    result.unwrap_err().reason(),
+                    AdmissionRejectionReason::AtCapacity
+                );
+            }
+            let counters = scheduler.counters();
+            assert!(counters.queued_depth() + counters.running_depth() <= ADMISSION_CAPACITY);
+        }
+
+        loop {
+            let mut batch = Vec::new();
+            while let Some(dispatched) = scheduler.dispatch_next(1_000) {
+                batch.push(dispatched);
+                let counters = scheduler.counters();
+                assert!(counters.running_depth() <= RUNNING_CAPACITY);
+                assert!(counters.queued_depth() + counters.running_depth() <= ADMISSION_CAPACITY);
+            }
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= RUNNING_CAPACITY);
+            for dispatched in batch {
+                assert_eq!(
+                    scheduler.complete(dispatched.run(), JobOutcome::Succeeded, 1_000),
+                    Ok(CompletionOutcome::Completed)
+                );
+            }
+        }
+
+        let counters = scheduler.counters();
+        assert_eq!(counters.admitted(), ADMISSION_CAPACITY as u64);
+        assert_eq!(counters.completed(), ADMISSION_CAPACITY as u64);
+        assert_eq!(
+            counters.rejected(AdmissionRejectionReason::AtCapacity),
+            BURST_SIZE - ADMISSION_CAPACITY as u64
+        );
+        assert_eq!(counters.queue_high_water(), ADMISSION_CAPACITY);
+        assert_eq!(counters.running_high_water(), RUNNING_CAPACITY);
+        assert_eq!(counters.queued_depth(), 0);
+        assert_eq!(counters.running_depth(), 0);
+        assert_admission_counters_reconcile(counters);
+    }
+
+    #[test]
+    fn counters_account_exactly_through_coalescing_retry_cancellation_and_shutdown() {
+        let mut scheduler = scheduler(5, 2, 3);
+        let old_refresh = replaceable_job(1, 10, RefreshClass::ConversationHistory);
+        let running_cancel = ephemeral_job(2);
+        let durable_retry = durable_job(
+            3,
+            SyncDurability::DurableAction,
+            RetryPolicy::fixed(2, 250).unwrap(),
+        );
+        let durable_failure = durable_job(4, SyncDurability::ReadMarker, RetryPolicy::Never);
+        let shutdown_cancel = ephemeral_job(5);
+        for job in [
+            old_refresh.clone(),
+            running_cancel.clone(),
+            durable_retry.clone(),
+            durable_failure.clone(),
+            shutdown_cancel.clone(),
+        ] {
+            scheduler.admit(job, 1_000, None).unwrap();
+        }
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(6), 1_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::AtCapacity
+        );
+        assert_eq!(
+            scheduler
+                .admit(old_refresh.clone(), 1_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::DuplicateIdentity
+        );
+
+        let new_refresh = replaceable_job(7, 10, RefreshClass::ConversationHistory);
+        assert!(matches!(
+            scheduler.admit(new_refresh.clone(), 1_000, None),
+            Ok(AdmissionOutcome::Accepted {
+                coalesced: Some(_),
+                ..
+            })
+        ));
+        let counters = scheduler.counters();
+        assert_eq!(counters.admitted(), 6);
+        assert_eq!(counters.coalesced(), 1);
+        assert_eq!(counters.queued_depth(), 5);
+        assert_eq!(counters.queue_high_water(), 5);
+        assert_eq!(counters.rejected(AdmissionRejectionReason::AtCapacity), 1);
+        assert_eq!(
+            counters.rejected(AdmissionRejectionReason::DuplicateIdentity),
+            1
+        );
+        assert_admission_counters_reconcile(counters);
+
+        let cancel_run = scheduler.dispatch_next(1_000).unwrap();
+        let retry_run = scheduler.dispatch_next(1_000).unwrap();
+        assert_eq!(cancel_run.job().id(), running_cancel.id());
+        assert_eq!(retry_run.job().id(), durable_retry.id());
+        assert!(scheduler.dispatch_next(1_000).is_none());
+        assert!(matches!(
+            scheduler.cancel(running_cancel.cancellation_id(), 1_000),
+            CancellationOutcome::Requested(_)
+        ));
+        assert!(matches!(
+            scheduler.cancel(running_cancel.cancellation_id(), 1_000),
+            CancellationOutcome::AlreadyRequested(_)
+        ));
+        assert_eq!(
+            scheduler.complete(cancel_run.run(), JobOutcome::Cancelled, 1_000),
+            Ok(CompletionOutcome::Cancelled(ReleasedJob::new(
+                running_cancel,
+                1
+            )))
+        );
+        assert!(matches!(
+            scheduler.complete(retry_run.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried {
+                attempt: 2,
+                ready_at_ms: 1_250,
+                ..
+            })
+        ));
+
+        let failure_run = scheduler.dispatch_next(1_000).unwrap();
+        let shutdown_run = scheduler.dispatch_next(1_000).unwrap();
+        assert_eq!(failure_run.job().id(), durable_failure.id());
+        assert_eq!(shutdown_run.job().id(), shutdown_cancel.id());
+        assert_eq!(
+            scheduler.complete(failure_run.run(), JobOutcome::PermanentFailure, 1_000),
+            Ok(CompletionOutcome::Failed(ReleasedJob::new(
+                durable_failure,
+                1
+            )))
+        );
+
+        let report = scheduler.begin_shutdown(1_000);
+        assert_eq!(report.phase(), ShutdownPhase::Draining);
+        assert_eq!(
+            report.cancelled(),
+            &[ReleasedJob::new(new_refresh.clone(), 1)]
+        );
+        assert_eq!(report.cancellation_requested().len(), 1);
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(8), 1_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::ShuttingDown
+        );
+        assert_eq!(
+            scheduler.complete(shutdown_run.run(), JobOutcome::Cancelled, 1_000),
+            Ok(CompletionOutcome::Cancelled(ReleasedJob::new(
+                shutdown_cancel,
+                1
+            )))
+        );
+        assert!(scheduler.dispatch_next(1_249).is_none());
+        let durable_retry_run = scheduler.dispatch_next(1_250).unwrap();
+        assert_eq!(durable_retry_run.job().id(), durable_retry.id());
+        assert_eq!(durable_retry_run.attempt(), 2);
+        assert_eq!(
+            scheduler.complete(durable_retry_run.run(), JobOutcome::Succeeded, 1_250),
+            Ok(CompletionOutcome::Completed)
+        );
+
+        let counters = scheduler.counters();
+        assert_eq!(counters.admitted(), 6);
+        assert_eq!(counters.coalesced(), 1);
+        assert_eq!(counters.cancellation_requested(), 2);
+        assert_eq!(counters.cancellation_completed(), 3);
+        assert_eq!(counters.completed(), 1);
+        assert_eq!(counters.failed(), 1);
+        assert_eq!(counters.retried(), 1);
+        assert_eq!(counters.rejected(AdmissionRejectionReason::AtCapacity), 1);
+        assert_eq!(
+            counters.rejected(AdmissionRejectionReason::DuplicateIdentity),
+            1
+        );
+        assert_eq!(counters.rejected(AdmissionRejectionReason::ShuttingDown), 1);
+        assert_eq!(counters.queue_high_water(), 5);
+        assert_eq!(counters.running_high_water(), 2);
+        assert_eq!(counters.queued_depth(), 0);
+        assert_eq!(counters.running_depth(), 0);
+        assert_eq!(counters.shutdown_phase(), ShutdownPhase::Drained);
+        assert_admission_counters_reconcile(counters);
+    }
+
+    #[test]
+    fn running_refresh_supersession_counts_as_one_coalesced_admission() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
+        older.retry = RetryPolicy::fixed(2, 250).unwrap();
+        scheduler.admit(older.clone(), 1_000, None).unwrap();
+        let older_run = scheduler.dispatch_next(1_000).unwrap();
+        let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+        scheduler.admit(newer.clone(), 1_001, None).unwrap();
+
+        assert_eq!(scheduler.counters().coalesced(), 0);
+        assert!(matches!(
+            scheduler.complete(older_run.run(), JobOutcome::RetryableFailure, 1_010),
+            Ok(CompletionOutcome::Superseded { .. })
+        ));
+        let counters = scheduler.counters();
+        assert_eq!(counters.coalesced(), 1);
+        assert_eq!(counters.retried(), 0);
+        assert_admission_counters_reconcile(counters);
+
+        let newer_run = scheduler.dispatch_next(1_010).unwrap();
+        assert_eq!(
+            scheduler.complete(newer_run.run(), JobOutcome::Succeeded, 1_010),
+            Ok(CompletionOutcome::Completed)
+        );
+        let counters = scheduler.counters();
+        assert_eq!(counters.completed(), 1);
+        assert_eq!(counters.queued_depth(), 0);
+        assert_eq!(counters.running_depth(), 0);
+        assert_admission_counters_reconcile(counters);
+    }
+
+    #[test]
+    fn shutdown_drains_a_durable_burst_without_silent_discard() {
+        const ADMISSION_CAPACITY: usize = 24;
+        const RUNNING_CAPACITY: usize = 4;
+        let mut scheduler = scheduler(ADMISSION_CAPACITY, RUNNING_CAPACITY, 3);
+        for id in 1..=ADMISSION_CAPACITY as u64 {
+            let durability = if id % 2 == 0 {
+                SyncDurability::DurableAction
+            } else {
+                SyncDurability::ReadMarker
+            };
+            scheduler
+                .admit(durable_job(id, durability, RetryPolicy::Never), 1_000, None)
+                .unwrap();
+        }
+
+        let report = scheduler.begin_shutdown(1_000);
+        assert_eq!(report.phase(), ShutdownPhase::Draining);
+        assert!(report.cancelled().is_empty());
+        assert!(report.cancellation_requested().is_empty());
+        while !scheduler.is_drained() {
+            let mut batch = Vec::new();
+            while let Some(dispatched) = scheduler.dispatch_next(1_000) {
+                batch.push(dispatched);
+                assert!(scheduler.counters().running_depth() <= RUNNING_CAPACITY);
+            }
+            assert!(!batch.is_empty());
+            for dispatched in batch {
+                assert_eq!(
+                    scheduler.complete(dispatched.run(), JobOutcome::Succeeded, 1_000),
+                    Ok(CompletionOutcome::Completed)
+                );
+            }
+        }
+
+        let counters = scheduler.counters();
+        assert_eq!(counters.admitted(), ADMISSION_CAPACITY as u64);
+        assert_eq!(counters.completed(), ADMISSION_CAPACITY as u64);
+        assert_eq!(counters.failed(), 0);
+        assert_eq!(counters.coalesced(), 0);
+        assert_eq!(counters.cancellation_requested(), 0);
+        assert_eq!(counters.cancellation_completed(), 0);
+        assert_eq!(counters.queued_depth(), 0);
+        assert_eq!(counters.running_depth(), 0);
+        assert_eq!(counters.queue_high_water(), ADMISSION_CAPACITY);
+        assert_eq!(counters.running_high_water(), RUNNING_CAPACITY);
+        assert_eq!(counters.shutdown_phase(), ShutdownPhase::Drained);
+        assert_admission_counters_reconcile(counters);
+    }
+
+    #[test]
+    fn invalid_and_idempotent_operations_are_counter_neutral() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let job = ephemeral_job(1);
+        scheduler.admit(job.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+
+        let before_invalid = scheduler.counters();
+        assert!(scheduler.dispatch_next(1_000).is_none());
+        assert_eq!(
+            scheduler.cancel(CancellationId::new(99_999), 1_000),
+            CancellationOutcome::NotFound
+        );
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Cancelled, 1_000),
+            Err(CompletionError::CancellationNotRequested)
+        );
+        let run = running.run();
+        assert_eq!(
+            scheduler.complete(
+                JobRun {
+                    generation: run.generation + 1,
+                    ..run
+                },
+                JobOutcome::Succeeded,
+                1_000
+            ),
+            Err(CompletionError::StaleRun)
+        );
+        assert_eq!(
+            scheduler.complete(
+                JobRun {
+                    attempt: run.attempt + 1,
+                    ..run
+                },
+                JobOutcome::Succeeded,
+                1_000
+            ),
+            Err(CompletionError::StaleAttempt)
+        );
+        assert_eq!(
+            scheduler.complete(
+                JobRun {
+                    job_id: SyncJobId::new(99_999),
+                    ..run
+                },
+                JobOutcome::Succeeded,
+                1_000
+            ),
+            Err(CompletionError::UnknownJob)
+        );
+        assert_eq!(scheduler.counters(), before_invalid);
+
+        assert!(matches!(
+            scheduler.cancel(job.cancellation_id(), 1_000),
+            CancellationOutcome::Requested(_)
+        ));
+        let after_request = scheduler.counters();
+        assert_eq!(after_request.cancellation_requested(), 1);
+        assert!(matches!(
+            scheduler.cancel(job.cancellation_id(), 1_000),
+            CancellationOutcome::AlreadyRequested(_)
+        ));
+        assert_eq!(scheduler.counters(), after_request);
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Succeeded, 1_000),
+            Ok(CompletionOutcome::Completed)
+        );
+        let counters = scheduler.counters();
+        assert_eq!(counters.completed(), 1);
+        assert_eq!(counters.cancellation_requested(), 1);
+        assert_eq!(counters.cancellation_completed(), 0);
+        assert_admission_counters_reconcile(counters);
+
+        let mut durable_scheduler = SyncScheduler::new(SchedulerConfig::new(1, 1, 3).unwrap());
+        let durable = durable_job(2, SyncDurability::ReadMarker, RetryPolicy::Never);
+        durable_scheduler
+            .admit(durable.clone(), 1_000, None)
+            .unwrap();
+        let queued = durable_scheduler.counters();
+        assert_eq!(
+            durable_scheduler.cancel(durable.cancellation_id(), 1_000),
+            CancellationOutcome::Protected {
+                job_id: durable.id()
+            }
+        );
+        assert_eq!(durable_scheduler.counters(), queued);
+        let durable_run = durable_scheduler.dispatch_next(1_000).unwrap();
+        let running = durable_scheduler.counters();
+        assert_eq!(
+            durable_scheduler.cancel(durable.cancellation_id(), 1_000),
+            CancellationOutcome::Protected {
+                job_id: durable.id()
+            }
+        );
+        assert_eq!(
+            durable_scheduler.complete(durable_run.run(), JobOutcome::Cancelled, 1_000),
+            Err(CompletionError::DurableCancellationForbidden)
+        );
+        assert_eq!(durable_scheduler.counters(), running);
+        assert_eq!(
+            durable_scheduler.complete(durable_run.run(), JobOutcome::Succeeded, 1_000),
+            Ok(CompletionOutcome::Completed)
+        );
+        assert_admission_counters_reconcile(durable_scheduler.counters());
+    }
+
+    #[test]
+    fn rejection_counters_follow_scheduler_precedence() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let job = ephemeral_job(1);
+        scheduler.admit(job.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+
+        let mut duplicate_fresh = job.clone();
+        duplicate_fresh.freshness = FreshnessPolicy::IfOlderThan { max_age_ms: 500 };
+        assert_eq!(
+            scheduler
+                .admit(duplicate_fresh, 1_000, Some(900))
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::DuplicateIdentity
+        );
+        let mut distinct_fresh = ephemeral_job(2);
+        distinct_fresh.freshness = FreshnessPolicy::IfOlderThan { max_age_ms: 500 };
+        assert!(matches!(
+            scheduler.admit(distinct_fresh, 1_000, Some(900)),
+            Ok(AdmissionOutcome::SkippedFresh(_))
+        ));
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(3), 1_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::AtCapacity
+        );
+
+        assert_eq!(
+            scheduler.begin_shutdown(1_000).phase(),
+            ShutdownPhase::Draining
+        );
+        assert_eq!(
+            scheduler
+                .admit(job.clone(), 1_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::ShuttingDown
+        );
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Cancelled, 1_000),
+            Ok(CompletionOutcome::Cancelled(ReleasedJob::new(job, 1)))
+        );
+
+        let counters = scheduler.counters();
+        assert_eq!(counters.admitted(), 1);
+        assert_eq!(counters.skipped_fresh(), 1);
+        assert_eq!(
+            counters.rejected(AdmissionRejectionReason::DuplicateIdentity),
+            1
+        );
+        assert_eq!(counters.rejected(AdmissionRejectionReason::AtCapacity), 1);
+        assert_eq!(counters.rejected(AdmissionRejectionReason::ShuttingDown), 1);
+        assert_eq!(counters.cancellation_requested(), 1);
+        assert_eq!(counters.cancellation_completed(), 1);
+        assert_eq!(counters.shutdown_phase(), ShutdownPhase::Drained);
+        assert_admission_counters_reconcile(counters);
+    }
+
+    #[test]
+    fn full_capacity_replacement_burst_never_spikes_queue_depth() {
+        const CAPACITY: usize = 8;
+        const RUNNING_CAPACITY: usize = 2;
+        const REPLACEMENTS: u64 = 64;
+        let mut scheduler = scheduler(CAPACITY, RUNNING_CAPACITY, 3);
+        for slot in 0..CAPACITY {
+            scheduler
+                .admit(
+                    replaceable_job(
+                        slot as u64 + 1,
+                        slot as u64 + 10_000,
+                        RefreshClass::ConversationHistory,
+                    ),
+                    1_000,
+                    None,
+                )
+                .unwrap();
+        }
+
+        for replacement in 0..REPLACEMENTS {
+            let slot = replacement as usize % CAPACITY;
+            assert!(matches!(
+                scheduler.admit(
+                    replaceable_job(
+                        replacement + 1_000,
+                        slot as u64 + 10_000,
+                        RefreshClass::ConversationHistory,
+                    ),
+                    1_001 + replacement,
+                    None,
+                ),
+                Ok(AdmissionOutcome::Accepted {
+                    coalesced: Some(_),
+                    ..
+                })
+            ));
+            let counters = scheduler.counters();
+            assert_eq!(counters.queued_depth(), CAPACITY);
+            assert_eq!(counters.running_depth(), 0);
+            assert_eq!(counters.queue_high_water(), CAPACITY);
+            assert_admission_counters_reconcile(counters);
+        }
+
+        loop {
+            let mut batch = Vec::new();
+            while let Some(dispatched) = scheduler.dispatch_next(u64::MAX) {
+                batch.push(dispatched);
+            }
+            if batch.is_empty() {
+                break;
+            }
+            for dispatched in batch {
+                assert_eq!(
+                    scheduler.complete(dispatched.run(), JobOutcome::Succeeded, u64::MAX),
+                    Ok(CompletionOutcome::Completed)
+                );
+            }
+        }
+        let counters = scheduler.counters();
+        assert_eq!(counters.admitted(), CAPACITY as u64 + REPLACEMENTS);
+        assert_eq!(counters.coalesced(), REPLACEMENTS);
+        assert_eq!(counters.completed(), CAPACITY as u64);
+        assert_eq!(counters.queue_high_water(), CAPACITY);
+        assert_eq!(counters.running_high_water(), RUNNING_CAPACITY);
+        assert_admission_counters_reconcile(counters);
+    }
+
+    #[test]
+    fn retry_then_replacement_counts_retry_and_coalescing_once_each() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
+        older.retry = RetryPolicy::fixed(2, 250).unwrap();
+        scheduler.admit(older, 1_000, None).unwrap();
+        let first = scheduler.dispatch_next(1_000).unwrap();
+        assert!(matches!(
+            scheduler.complete(first.run(), JobOutcome::RetryableFailure, 1_000),
+            Ok(CompletionOutcome::Retried { .. })
+        ));
+        let counters = scheduler.counters();
+        assert_eq!(counters.retried(), 1);
+        assert_eq!(counters.coalesced(), 0);
+        assert_admission_counters_reconcile(counters);
+
+        let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+        assert!(matches!(
+            scheduler.admit(newer, 1_001, None),
+            Ok(AdmissionOutcome::Accepted {
+                coalesced: Some(_),
+                ..
+            })
+        ));
+        let counters = scheduler.counters();
+        assert_eq!(counters.retried(), 1);
+        assert_eq!(counters.coalesced(), 1);
+        assert_eq!(counters.queued_depth(), 1);
+        assert_admission_counters_reconcile(counters);
+
+        let replacement = scheduler.dispatch_next(1_001).unwrap();
+        assert_eq!(
+            scheduler.complete(replacement.run(), JobOutcome::Succeeded, 1_001),
+            Ok(CompletionOutcome::Completed)
+        );
+        let counters = scheduler.counters();
+        assert_eq!(counters.completed(), 1);
+        assert_eq!(counters.retried(), 1);
+        assert_eq!(counters.coalesced(), 1);
+        assert_admission_counters_reconcile(counters);
     }
 }
