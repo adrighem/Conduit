@@ -4265,6 +4265,7 @@ mod tests {
     use crate::activity::{ActivityItem, ActivityKind};
     use crate::message_handoff::{MessageControlRegistry, TimelineSurfaceId};
     use crate::models::{SavedItem, SlackFile, SlackReaction};
+    use std::time::Instant;
 
     fn message(text: &str) -> SlackMessage {
         SlackMessage {
@@ -4324,6 +4325,38 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("</style>"))
             .map(|(css, _)| css)
             .expect("generated document should contain CSS")
+    }
+
+    #[test]
+    #[ignore = "release measurement fixture; run explicitly with --ignored --nocapture"]
+    fn measure_credential_free_emoji_picker_document_cost() {
+        let custom_emojis = (0..256)
+            .map(|index| {
+                (
+                    format!("workspace_emoji_{index:03}"),
+                    format!("https://emoji.example/workspace-{index:03}.png"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let context = MessageHtmlContext {
+            custom_emojis: Arc::new(custom_emojis),
+            ..Default::default()
+        };
+
+        let started = Instant::now();
+        let html = conversation_document(
+            "C_MEASUREMENT",
+            &[message("Credential-free measurement fixture")],
+            &context,
+        );
+        let generation_micros = started.elapsed().as_micros();
+
+        println!(
+            "emoji_picker_measurement html_bytes={} picker_choices={} custom_emojis={} generation_micros={generation_micros}",
+            html.len(),
+            html.matches("class=\"emoji-choice\"").count(),
+            context.custom_emojis.len(),
+        );
     }
 
     fn root_css_variables(css: &str) -> Vec<HashMap<String, String>> {
