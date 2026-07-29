@@ -25,9 +25,11 @@
 * **branding:** Remove obsolete installed icons ([f5654ef](https://github.com/adrighem/Conduit/commit/f5654ef258bc661671122e542cce6a5ea69fd141))
 * **ci:** clarify collapsed section branch ([5458004](https://github.com/adrighem/Conduit/commit/54580046e3f5feacb156e955229a3286cb5f3197))
 * **ci:** validate main before release automation ([abd93fc](https://github.com/adrighem/Conduit/commit/abd93fc625502de819d29895701d81ea99d0bba6))
-* **deps:** remove unused HTTP/3 stack ([280bec6](https://github.com/adrighem/Conduit/commit/280bec60fcf36a40fc3b69ded60cdb1381e04994)), closes [#14](https://github.com/adrighem/Conduit/issues/14)
+* **deps:** remove unused HTTP/3 stack ([280bec6](https://github.com/adrighem/Conduit/commit/280bec60fcf36a40fc3b69ded60cdb1381e04994)), references [#14](https://github.com/adrighem/Conduit/issues/14)
 * **messages:** satisfy strict architecture lint ([2628864](https://github.com/adrighem/Conduit/commit/26288645711383c6bb130ba56cb2a7c1f04a5095))
 * **sidebar:** Keep priority stars consistent ([16a774b](https://github.com/adrighem/Conduit/commit/16a774bcf45218a630b201309a178e874f0897ee))
+* **status:** Fix emoji picker search and load the full catalog ([0b074b2](https://github.com/adrighem/Conduit/commit/0b074b201f9dc9950cc98c4b2daef61828385530))
+* **ui:** Fix startup interaction and animate sent messages ([982f628](https://github.com/adrighem/Conduit/commit/982f628582421ef8f87010033e84782c9f066337))
 * **ui:** keep message sends responsive ([bbf9539](https://github.com/adrighem/Conduit/commit/bbf9539ca5f0b6d790adcd88d7964b19a1e44d67))
 
 ## [0.2.0](https://github.com/adrighem/Conduit/compare/v0.1.2...v0.2.0) (2026-07-23)
