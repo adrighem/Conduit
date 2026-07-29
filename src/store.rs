@@ -961,6 +961,20 @@ impl WorkspaceStore {
             .await
     }
 
+    pub(crate) async fn validate_conversation_cache(&self) -> Result<()> {
+        let workspace_key = self.workspace_key.clone();
+        self.query_or_reset((), move |connection| {
+            let _ = load_sqlite_kind_values::<SlackConversation>(
+                connection,
+                &workspace_key,
+                "conversation",
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn load_conversations(&self) -> Result<Option<Vec<SlackConversation>>> {
         let workspace_key = self.workspace_key.clone();
         let conversations = self

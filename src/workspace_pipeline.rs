@@ -84,6 +84,12 @@ pub(crate) struct WorkspaceBootstrapData {
     pub(crate) threads: Vec<ThreadRecord>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConversationMembershipSnapshot {
+    pub(crate) conversations: Vec<SlackConversation>,
+    pub(crate) starred_ids: Option<HashSet<String>>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct MessagePage {
     pub(crate) messages: Vec<SlackMessage>,
@@ -112,7 +118,7 @@ pub(crate) enum WorkspaceMutation {
     AttentionContextChanged(WorkspaceAttentionContext),
     AttentionPreferencesChanged(AttentionPreferences),
     Hydrate(WorkspaceBootstrapData),
-    MembershipSnapshot(SnapshotEnvelope<Vec<SlackConversation>>),
+    MembershipSnapshot(SnapshotEnvelope<ConversationMembershipSnapshot>),
     ConversationUpsert(SlackConversation),
     ConversationStarChanged {
         channel_id: String,
@@ -315,6 +321,7 @@ struct RevisionedConversation {
     membership_revision: WorkspaceRevision,
     metadata_revision: WorkspaceRevision,
     unread_revision: WorkspaceRevision,
+    star_revision: WorkspaceRevision,
 }
 
 #[derive(Debug, Clone)]
@@ -559,6 +566,7 @@ impl WorkspaceCoordinator {
                         membership_revision: revision,
                         metadata_revision: revision,
                         unread_revision: revision,
+                        star_revision: revision,
                     },
                 )
             })
@@ -633,6 +641,7 @@ impl WorkspaceCoordinator {
                         membership_revision: revision,
                         metadata_revision: revision,
                         unread_revision: revision,
+                        star_revision: WorkspaceRevision::INITIAL,
                     },
                 );
                 true
@@ -688,9 +697,10 @@ impl WorkspaceCoordinator {
                 membership_revision: revision,
                 metadata_revision: revision,
                 unread_revision: revision,
+                star_revision: WorkspaceRevision::INITIAL,
             });
         entry.value.is_starred = Some(starred);
-        entry.metadata_revision = revision;
+        entry.star_revision = revision;
         let conversation = entry.value.clone();
         self.commit(
             revision,
@@ -704,15 +714,27 @@ impl WorkspaceCoordinator {
 
     fn apply_membership_snapshot(
         &mut self,
-        snapshot: SnapshotEnvelope<Vec<SlackConversation>>,
+        snapshot: SnapshotEnvelope<ConversationMembershipSnapshot>,
     ) -> Option<WorkspaceReduction> {
         let base_revision = snapshot.base_revision();
-        let incoming = snapshot
-            .into_data()
+        let snapshot = snapshot.into_data();
+        let starred_ids = snapshot.starred_ids;
+        let mut incoming = HashMap::<String, SlackConversation>::new();
+        for mut conversation in snapshot
+            .conversations
             .into_iter()
             .filter(|conversation| !conversation.id.trim().is_empty())
-            .map(|conversation| (conversation.id.clone(), conversation))
-            .collect::<HashMap<_, _>>();
+        {
+            conversation.is_starred = None;
+            match incoming.entry(conversation.id.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    merge_conversation_metadata(entry.get_mut(), &conversation);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(conversation);
+                }
+            }
+        }
         let revision = self.next_revision();
         let mut patch_changes = Vec::new();
         let mut store_changes = Vec::new();
@@ -738,6 +760,7 @@ impl WorkspaceCoordinator {
                             membership_revision: revision,
                             metadata_revision: revision,
                             unread_revision: revision,
+                            star_revision: WorkspaceRevision::INITIAL,
                         },
                     );
                     patch_changes.push(WorkspaceChange::ConversationUpsert(conversation.clone()));
@@ -762,6 +785,26 @@ impl WorkspaceCoordinator {
                 channel_id: channel_id.clone(),
             });
             store_changes.push(StoreChange::ConversationRemoved { channel_id });
+        }
+
+        if let Some(starred_ids) = starred_ids {
+            for entry in self.conversations.values_mut() {
+                if entry.star_revision > base_revision || !conversation_supports_stars(&entry.value)
+                {
+                    continue;
+                }
+                let starred = starred_ids.contains(&entry.value.id);
+                if entry.value.is_starred == Some(starred) {
+                    continue;
+                }
+                entry.value.is_starred = Some(starred);
+                entry.star_revision = revision;
+                patch_changes.push(WorkspaceChange::ConversationUpsert(entry.value.clone()));
+                store_changes.push(StoreChange::ConversationStarChanged {
+                    channel_id: entry.value.id.clone(),
+                    starred,
+                });
+            }
         }
 
         self.commit(revision, patch_changes, store_changes)
@@ -807,6 +850,7 @@ impl WorkspaceCoordinator {
                 membership_revision: revision,
                 metadata_revision: revision,
                 unread_revision: revision,
+                star_revision: WorkspaceRevision::INITIAL,
             });
         let before = entry.value.clone();
         entry.value.apply_unread_snapshot(&snapshot);
@@ -1674,6 +1718,14 @@ fn merge_conversation_metadata(current: &mut SlackConversation, incoming: &Slack
     }
 }
 
+fn conversation_supports_stars(conversation: &SlackConversation) -> bool {
+    conversation.is_channel.unwrap_or(false)
+        || conversation.is_group.unwrap_or(false)
+        || conversation.is_private.unwrap_or(false)
+        || conversation.is_im.unwrap_or(false)
+        || conversation.is_mpim.unwrap_or(false)
+}
+
 impl WorkspaceReduction {
     pub(crate) fn new(
         revision: WorkspaceRevision,
@@ -1849,7 +1901,13 @@ mod tests {
         let mut initial = conversation("C1", "general");
         initial.is_starred = Some(false);
         coordinator.apply(WorkspaceMutation::MembershipSnapshot(
-            SnapshotEnvelope::new(WorkspaceRevision::INITIAL, vec![initial]),
+            SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                ConversationMembershipSnapshot {
+                    conversations: vec![initial],
+                    starred_ids: Some(HashSet::new()),
+                },
+            ),
         ));
         coordinator.apply(WorkspaceMutation::ConversationStarChanged {
             channel_id: "C1".to_string(),
@@ -1884,6 +1942,115 @@ mod tests {
     }
 
     #[test]
+    fn membership_star_projection_is_independent_of_metadata_and_newer_local_stars() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut initial = conversation("C1", "cached");
+        initial.is_starred = Some(false);
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![initial],
+            ..Default::default()
+        }));
+        let response_base = coordinator.revision();
+
+        coordinator.apply_from(
+            MutationOrigin::Realtime,
+            WorkspaceMutation::ConversationUpsert(conversation("C1", "realtime rename")),
+        );
+        let mut opened = conversation("D1", "opened locally");
+        opened.is_channel = Some(false);
+        opened.is_im = Some(true);
+        coordinator.apply_from(
+            MutationOrigin::Local,
+            WorkspaceMutation::ConversationUpsert(opened),
+        );
+        coordinator.apply(WorkspaceMutation::MembershipSnapshot(
+            SnapshotEnvelope::new(
+                response_base,
+                ConversationMembershipSnapshot {
+                    conversations: vec![conversation("C1", "stale membership")],
+                    starred_ids: Some(HashSet::from(["C1".to_string(), "D1".to_string()])),
+                },
+            ),
+        ));
+
+        let current = coordinator.conversation("C1").unwrap();
+        assert_eq!(current.name.as_deref(), Some("realtime rename"));
+        assert!(current.is_starred());
+        assert!(coordinator.conversation("D1").unwrap().is_starred());
+
+        let next_response_base = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::ConversationStarChanged {
+            channel_id: "C1".to_string(),
+            starred: false,
+        });
+        coordinator.apply(WorkspaceMutation::MembershipSnapshot(
+            SnapshotEnvelope::new(
+                next_response_base,
+                ConversationMembershipSnapshot {
+                    conversations: vec![conversation("C1", "membership"), {
+                        let mut direct = conversation("D1", "direct");
+                        direct.is_channel = Some(false);
+                        direct.is_im = Some(true);
+                        direct
+                    }],
+                    starred_ids: Some(HashSet::from(["C1".to_string(), "D1".to_string()])),
+                },
+            ),
+        ));
+        assert!(
+            !coordinator.conversation("C1").unwrap().is_starred(),
+            "a star projection older than a local toggle must not roll it back"
+        );
+    }
+
+    #[test]
+    fn missing_star_projection_preserves_state_while_an_empty_projection_clears_it() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut initial = conversation("C1", "general");
+        initial.is_starred = Some(true);
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![initial],
+            ..Default::default()
+        }));
+
+        let base_revision = coordinator.revision();
+        let mut untrusted = conversation("C1", "general");
+        untrusted.is_starred = Some(false);
+        assert!(coordinator
+            .apply(WorkspaceMutation::MembershipSnapshot(
+                SnapshotEnvelope::new(
+                    base_revision,
+                    ConversationMembershipSnapshot {
+                        conversations: vec![untrusted.clone()],
+                        starred_ids: None,
+                    },
+                ),
+            ))
+            .is_none());
+        assert!(coordinator.conversation("C1").unwrap().is_starred());
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::MembershipSnapshot(
+                SnapshotEnvelope::new(
+                    coordinator.revision(),
+                    ConversationMembershipSnapshot {
+                        conversations: vec![untrusted],
+                        starred_ids: Some(HashSet::new()),
+                    },
+                ),
+            ))
+            .expect("an authoritative empty star projection should clear the star");
+        assert!(!coordinator.conversation("C1").unwrap().is_starred());
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::ConversationStarChanged {
+                channel_id,
+                starred: false,
+            }] if channel_id == "C1"
+        ));
+    }
+
+    #[test]
     fn stale_membership_snapshot_updates_metadata_without_replacing_unread_overlay() {
         let mut coordinator = WorkspaceCoordinator::default();
         coordinator.apply(WorkspaceMutation::ConversationUpsert(conversation(
@@ -1902,7 +2069,13 @@ mod tests {
         stale.apply_unread_state(SlackUnreadState::from_parts(true, true, 99));
 
         coordinator.apply(WorkspaceMutation::MembershipSnapshot(
-            SnapshotEnvelope::new(snapshot_revision, vec![stale]),
+            SnapshotEnvelope::new(
+                snapshot_revision,
+                ConversationMembershipSnapshot {
+                    conversations: vec![stale],
+                    starred_ids: None,
+                },
+            ),
         ));
 
         let current = coordinator.conversation("C1").unwrap();

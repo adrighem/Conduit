@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
-    SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile, SlackMessage,
-    SlackReaction,
+    slack_timestamp_is_after, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
+    SlackFile, SlackMessage, SlackReaction,
 };
 use crate::thread_catalog::ThreadCatalog;
 use crate::workspace_pipeline::{WorkspaceChange, WorkspacePatch, WorkspaceRevision};
@@ -123,6 +123,7 @@ impl ConversationPatchRemoval {
 pub(crate) struct ConversationPatchApplication {
     conversation_changed: bool,
     removals: Vec<ConversationPatchRemoval>,
+    acknowledged_local_reads: Vec<String>,
 }
 
 impl ConversationPatchApplication {
@@ -132,6 +133,10 @@ impl ConversationPatchApplication {
 
     pub(crate) fn removals(&self) -> &[ConversationPatchRemoval] {
         &self.removals
+    }
+
+    pub(crate) fn acknowledged_local_reads(&self) -> &[String] {
+        &self.acknowledged_local_reads
     }
 }
 
@@ -164,9 +169,18 @@ impl WorkspaceSessionState {
         self.conversation_patch_revision() > WorkspaceRevision::INITIAL
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_conversation_patch(
         &self,
         patch: &WorkspacePatch,
+    ) -> Option<ConversationPatchApplication> {
+        self.apply_conversation_patch_with_local_reads(patch, &HashMap::new())
+    }
+
+    pub(crate) fn apply_conversation_patch_with_local_reads(
+        &self,
+        patch: &WorkspacePatch,
+        local_read_ts_by_channel: &HashMap<String, String>,
     ) -> Option<ConversationPatchApplication> {
         let mut consumer = self.conversation_patches.borrow_mut();
         if patch.revision() <= consumer.revision {
@@ -205,8 +219,28 @@ impl WorkspaceSessionState {
                     view.remove_conversation(channel_id);
                     application.conversation_changed = true;
                 }
-                WorkspaceChange::UnreadChanged { .. }
-                | WorkspaceChange::UsersReset(_)
+                WorkspaceChange::UnreadChanged { snapshot } => {
+                    if !snapshot.unread_state.known || snapshot.channel_id.trim().is_empty() {
+                        continue;
+                    }
+                    let local_read = local_read_ts_by_channel.get(&snapshot.channel_id);
+                    let newer_local_read = local_read.is_some_and(|local| {
+                        snapshot
+                            .last_read
+                            .as_deref()
+                            .is_none_or(|server| slack_timestamp_is_after(local.as_str(), server))
+                    });
+                    if newer_local_read {
+                        continue;
+                    }
+                    if local_read.is_some() && snapshot.last_read.is_some() {
+                        application
+                            .acknowledged_local_reads
+                            .push(snapshot.channel_id.clone());
+                    }
+                    application.conversation_changed |= catalog.apply_unread_snapshot(snapshot);
+                }
+                WorkspaceChange::UsersReset(_)
                 | WorkspaceChange::UserUpsert(_)
                 | WorkspaceChange::TimelineChanged { .. }
                 | WorkspaceChange::ThreadCatalogChanged(_) => {}
@@ -1585,6 +1619,7 @@ fn apply_reaction_to_message(message: &mut SlackMessage, update: &ReactionUpdate
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{SlackConversationUnreadSnapshot, SlackUnreadState};
     use crate::workspace_pipeline::{
         WorkspaceBootstrapData, WorkspaceChange, WorkspacePatch, WorkspaceRevision,
     };
@@ -1694,6 +1729,146 @@ mod tests {
         assert!(application.removals()[0].was_visible());
         assert!(state.conversations.borrow().get("C1").is_none());
         assert_eq!(state.view.borrow().visible_channel_id(), None);
+    }
+
+    #[test]
+    fn conversation_patch_consumer_applies_unread_gaps_without_rolling_back_a_local_read() {
+        let state = WorkspaceSessionState::default();
+        let revision_one = WorkspaceRevision::INITIAL.successor();
+        let revision_two = revision_one.successor();
+        let revision_three = revision_two.successor();
+        let revision_four = revision_three.successor();
+        let revision_five = revision_four.successor();
+        let mut initial = conversation("C1", "general");
+        initial.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
+            channel_id: "C1".to_string(),
+            unread_state: SlackUnreadState::from_parts(true, true, 5),
+            last_read: Some("10.0".to_string()),
+            latest: Some("15.0".to_string()),
+            mention_count: Some(1),
+            is_open: None,
+        });
+        state
+            .apply_conversation_patch(&conversation_patch(
+                revision_one,
+                WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                    conversations: vec![initial],
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+
+        state
+            .conversations
+            .borrow_mut()
+            .advance_read_cursor("C1", "20.0", 0);
+        let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
+        let delayed_unread = conversation_patch(
+            revision_three,
+            WorkspaceChange::UnreadChanged {
+                snapshot: SlackConversationUnreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 9),
+                    last_read: Some("11.0".to_string()),
+                    latest: Some("19.0".to_string()),
+                    mention_count: Some(3),
+                    is_open: None,
+                },
+            },
+        );
+        let delayed = state
+            .apply_conversation_patch_with_local_reads(&delayed_unread, &local_reads)
+            .unwrap();
+        assert!(!delayed.conversation_changed());
+        assert!(delayed.acknowledged_local_reads().is_empty());
+        assert_eq!(state.conversation_patch_revision(), revision_three);
+        assert!(state
+            .apply_conversation_patch_with_local_reads(
+                &conversation_patch(
+                    revision_three,
+                    WorkspaceChange::ConversationRemoved {
+                        channel_id: "C1".to_string(),
+                    },
+                ),
+                &local_reads,
+            )
+            .is_none());
+        assert!(state
+            .apply_conversation_patch_with_local_reads(
+                &conversation_patch(
+                    revision_two,
+                    WorkspaceChange::UnreadChanged {
+                        snapshot: SlackConversationUnreadSnapshot {
+                            channel_id: "C1".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 7),
+                            last_read: None,
+                            latest: Some("18.0".to_string()),
+                            mention_count: Some(2),
+                            is_open: None,
+                        },
+                    },
+                ),
+                &local_reads,
+            )
+            .is_none());
+
+        {
+            let catalog = state.conversations.borrow();
+            let current = catalog.get("C1").unwrap();
+            assert_eq!(current.unread_state().display_count, 0);
+            assert_eq!(current.raw_unread_state().display_count, 0);
+            assert_eq!(current.raw_unread_activity_count(), 0);
+            assert_eq!(current.last_read_ts(), Some("20.0"));
+        }
+
+        let cursorless = state
+            .apply_conversation_patch_with_local_reads(
+                &conversation_patch(
+                    revision_four,
+                    WorkspaceChange::UnreadChanged {
+                        snapshot: SlackConversationUnreadSnapshot {
+                            channel_id: "C1".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 8),
+                            last_read: None,
+                            latest: Some("21.0".to_string()),
+                            mention_count: Some(4),
+                            is_open: None,
+                        },
+                    },
+                ),
+                &local_reads,
+            )
+            .unwrap();
+        assert!(!cursorless.conversation_changed());
+        assert!(cursorless.acknowledged_local_reads().is_empty());
+        {
+            let catalog = state.conversations.borrow();
+            let current = catalog.get("C1").unwrap();
+            assert_eq!(current.raw_unread_state().display_count, 0);
+            assert_eq!(current.last_read_ts(), Some("20.0"));
+        }
+
+        let acknowledged = state
+            .apply_conversation_patch_with_local_reads(
+                &conversation_patch(
+                    revision_five,
+                    WorkspaceChange::UnreadChanged {
+                        snapshot: SlackConversationUnreadSnapshot {
+                            channel_id: "C1".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, false, 0),
+                            last_read: Some("20.0".to_string()),
+                            ..Default::default()
+                        },
+                    },
+                ),
+                &local_reads,
+            )
+            .unwrap();
+        assert!(
+            !acknowledged.conversation_changed(),
+            "a marker-only acknowledgement must not rebuild the sidebar"
+        );
+        assert_eq!(acknowledged.acknowledged_local_reads(), &["C1".to_string()]);
     }
 
     #[test]

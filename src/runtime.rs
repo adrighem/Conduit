@@ -20,7 +20,6 @@ use crate::auth::{
     OAuthConfig, SlackOAuthClient, TokenStore,
 };
 use crate::config;
-use crate::conversation_catalog::ConversationCatalog;
 use crate::huddles::coordinator::{CoordinatorInput, HuddleCoordinator, HuddleEffect};
 use crate::huddles::model::{ActiveHuddle, HuddlePresence};
 use crate::huddles::signaling::{production_native_join_capability, NativeJoinCapability};
@@ -47,9 +46,10 @@ use crate::store::{
 };
 use crate::thread_catalog::ThreadRecord;
 use crate::workspace_pipeline::{
-    MessageAttentionEffect, MessageMutationKind, MutationOrigin, SnapshotEnvelope, StoreBatch,
-    StoreChange, WorkspaceAttentionContext, WorkspaceBootstrapData, WorkspaceCoordinator,
-    WorkspaceEffect, WorkspaceMutation, WorkspacePatch, WorkspaceReduction, WorkspaceRevision,
+    ConversationMembershipSnapshot, MessageAttentionEffect, MessageMutationKind, MutationOrigin,
+    SnapshotEnvelope, StoreBatch, StoreChange, WorkspaceAttentionContext, WorkspaceBootstrapData,
+    WorkspaceCoordinator, WorkspaceEffect, WorkspaceMutation, WorkspacePatch, WorkspaceReduction,
+    WorkspaceRevision,
 };
 use crate::workspace_state::WorkspaceLifecycleEvent;
 
@@ -809,6 +809,7 @@ pub enum RuntimeEventKind {
     SignedOut,
     Authenticated(AuthInfo),
     WorkspacePatch(WorkspacePatch),
+    ConversationsSynchronized,
     ConversationsLoaded(Vec<SlackConversation>),
     ConversationsLoadFailed(RuntimeFailure),
     ConversationChannelsDiscovered(Vec<SlackConversation>),
@@ -966,6 +967,7 @@ impl RuntimeEventKind {
                 OperationContext::new(RuntimeOperation::Authenticate, RuntimeTarget::Workspace)
             }
             Self::WorkspacePatch(_)
+            | Self::ConversationsSynchronized
             | Self::ConversationsLoaded(_)
             | Self::ConversationsPatched { .. }
             | Self::ConversationsLoadFailed(_)
@@ -1211,6 +1213,8 @@ struct RuntimeConnection {
     user_status_sync: UserStatusSync,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
+    #[cfg(test)]
+    cached_bootstrap_load_gate: Option<Arc<TestWorkspacePatchSendGate>>,
 }
 
 type ConversationStarSyncGate = Arc<tokio::sync::Mutex<()>>;
@@ -1444,6 +1448,20 @@ impl WorkspaceReducerAdapter {
         completion: Option<RuntimeEventKind>,
     ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
         let _admission = self.store_batch_admission.lock().await;
+        self.apply_persisted_and_publish_admitted(store, events, origin, mutation, completion)
+            .await
+    }
+
+    /// Applies and publishes while the caller retains store admission across
+    /// work that must precede the mutation, such as reading cache hydration.
+    async fn apply_persisted_and_publish_admitted(
+        &self,
+        store: Option<&WorkspaceStore>,
+        events: &RuntimeEventSender,
+        origin: MutationOrigin,
+        mutation: WorkspaceMutation,
+        completion: Option<RuntimeEventKind>,
+    ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
         let reductions = self
             .apply_persisted_admitted(store, origin, mutation)
             .await?;
@@ -1456,11 +1474,10 @@ impl WorkspaceReducerAdapter {
         Ok(reductions)
     }
 
-    async fn repair_conversation_cache(
+    async fn repair_conversation_cache_admitted(
         &self,
         store: &WorkspaceStore,
     ) -> std::result::Result<(), StoreError> {
-        let _admission = self.store_batch_admission.lock().await;
         let recovery_generation = store.recovery_generation();
         let (revision, conversations) = {
             let coordinator = self
@@ -2533,6 +2550,8 @@ fn spawn_authentication_task<F>(
                             user_status_sync: UserStatusSync::default(),
                             team_id: auth.team_id.clone(),
                             huddles,
+                            #[cfg(test)]
+                            cached_bootstrap_load_gate: None,
                         };
                         runtime_state.connection = Some(connection.clone());
                         connection
@@ -2737,6 +2756,11 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     let Some(store) = connection.workspace_store.as_ref() else {
         return;
     };
+    let _admission = connection.workspace.store_batch_admission.lock().await;
+    #[cfg(test)]
+    if let Some(gate) = connection.cached_bootstrap_load_gate.as_ref() {
+        gate.wait_before_send();
+    }
     let bootstrap = match store.load_bootstrap().await {
         Ok(Some(bootstrap)) => bootstrap,
         Ok(None) => return,
@@ -2771,14 +2795,6 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             thread_catalog.len()
         ),
     );
-    connection.workspace.apply(
-        MutationOrigin::Cache,
-        WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
-            conversations: conversations.clone(),
-            threads: thread_catalog.clone(),
-            ..Default::default()
-        }),
-    );
     if !user_names.is_empty() {
         connection
             .user_cache
@@ -2805,8 +2821,25 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             preserve_user_ids: HashSet::new(),
         });
     }
-    if !conversations.is_empty() {
-        events.send_event(RuntimeEventKind::ConversationsLoaded(conversations));
+    if let Err(error) = connection
+        .workspace
+        .apply_persisted_and_publish_admitted(
+            Some(store),
+            events,
+            MutationOrigin::Cache,
+            WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                conversations: conversations.clone(),
+                threads: thread_catalog.clone(),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!("WorkspaceBootstrapPublishFailed error={error:#}"),
+        );
     }
     if !thread_catalog.is_empty() {
         events.send_event(RuntimeEventKind::ThreadCatalogLoaded(thread_catalog));
@@ -5166,11 +5199,9 @@ async fn load_conversations_with_api(
     let _star_sync_guard = conversation_star_sync.lock().await;
     events.send_status("Loading conversations");
     let base_revision = workspace.revision();
-    let mut fresh = api.conversations().await?;
-    match api.starred_conversation_ids().await {
-        Ok(starred_ids) => {
-            apply_authoritative_conversation_stars(&mut fresh, &starred_ids);
-        }
+    let fresh = api.conversations().await?;
+    let starred_ids = match api.starred_conversation_ids().await {
+        Ok(starred_ids) => Some(starred_ids),
         Err(error) => {
             crate::debug::log(
                 "runtime",
@@ -5179,77 +5210,66 @@ async fn load_conversations_with_api(
                     error.category()
                 ),
             );
+            None
         }
-    }
-    let (cached, cache_recovered) = if let Some(store) = workspace_store.as_ref() {
-        let cached = store.load_conversations().await?.unwrap_or_default();
-        (cached, store.conversation_cache_needs_repair())
-    } else {
-        (Vec::new(), false)
     };
-    let cached = if cache_recovered && cached.is_empty() {
-        workspace.conversations()
-    } else {
-        cached
-    };
-    if cache_recovered {
-        if let Some(store) = workspace_store.as_ref() {
-            workspace.repair_conversation_cache(store).await?;
-        }
-    }
-    let conversations = reconcile_conversation_snapshot(cached, fresh)?;
+    let conversations = apply_conversation_membership_snapshot(
+        events,
+        workspace_store.as_ref(),
+        workspace,
+        base_revision,
+        fresh,
+        starred_ids,
+    )
+    .await?;
     crate::debug::log(
         "runtime",
-        &format!("ConversationsLoaded count={}", conversations.len()),
+        &format!("ConversationsSynchronized count={}", conversations.len()),
     );
-    workspace
-        .apply_persisted_and_publish_with_completion(
-            workspace_store.as_ref(),
-            events,
-            MutationOrigin::WebApi,
-            WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
-                base_revision,
-                conversations.clone(),
-            )),
-            RuntimeEventKind::ConversationsLoaded(conversations.clone()),
-        )
-        .await?;
     Ok(conversations)
 }
 
-fn apply_authoritative_conversation_stars(
-    conversations: &mut [SlackConversation],
-    starred_ids: &HashSet<String>,
-) {
-    for conversation in conversations {
-        let supports_stars = conversation.is_channel.unwrap_or(false)
-            || conversation.is_group.unwrap_or(false)
-            || conversation.is_private.unwrap_or(false)
-            || conversation.is_im.unwrap_or(false)
-            || conversation.is_mpim.unwrap_or(false);
-        if supports_stars {
-            conversation.set_starred(starred_ids.contains(&conversation.id));
-        }
-    }
-}
-
-fn reconcile_conversation_snapshot(
-    cached: Vec<SlackConversation>,
-    fresh: Vec<SlackConversation>,
+async fn apply_conversation_membership_snapshot(
+    events: &RuntimeEventSender,
+    workspace_store: Option<&WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+    base_revision: WorkspaceRevision,
+    conversations: Vec<SlackConversation>,
+    starred_ids: Option<HashSet<String>>,
 ) -> Result<Vec<SlackConversation>> {
-    if fresh.is_empty() && !cached.is_empty() {
+    let has_membership = conversations
+        .iter()
+        .any(|conversation| !conversation.id.trim().is_empty());
+    if !has_membership && !workspace.conversations().is_empty() {
         return Err(anyhow!(
             "Slack returned an unexpectedly empty conversation membership snapshot"
         ));
     }
 
-    let mut catalog = ConversationCatalog::from_cached(cached);
-    let mut snapshot = catalog.begin_membership_snapshot();
-    for conversation in fresh {
-        snapshot.upsert(conversation);
+    let _admission = workspace.store_batch_admission.lock().await;
+    if let Some(store) = workspace_store {
+        store.validate_conversation_cache().await?;
+        if store.conversation_cache_needs_repair() {
+            workspace.repair_conversation_cache_admitted(store).await?;
+        }
     }
-    catalog.commit_membership_snapshot(snapshot);
-    Ok(catalog.conversations())
+
+    workspace
+        .apply_persisted_and_publish_admitted(
+            workspace_store,
+            events,
+            MutationOrigin::WebApi,
+            WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
+                base_revision,
+                ConversationMembershipSnapshot {
+                    conversations,
+                    starred_ids,
+                },
+            )),
+            Some(RuntimeEventKind::ConversationsSynchronized),
+        )
+        .await?;
+    Ok(workspace.conversations())
 }
 
 async fn load_conversations_best_effort_with_api(
@@ -5298,21 +5318,7 @@ async fn load_conversations_best_effort_with_api(
                 unread_refresh_candidates,
             )
             .await;
-            let refreshed_conversations = if let Some(store) = workspace.store.as_ref() {
-                match store.load_conversations().await {
-                    Ok(Some(refreshed)) => refreshed,
-                    Ok(None) => conversations.clone(),
-                    Err(error) => {
-                        crate::debug::log(
-                            "store",
-                            &format!("ConversationPrefetchCatalogLoadFailed error={error:#}"),
-                        );
-                        conversations.clone()
-                    }
-                }
-            } else {
-                conversations.clone()
-            };
+            let refreshed_conversations = workspace.reducer.conversations();
             prefetch_channel_histories_best_effort(
                 events,
                 api,
@@ -5327,7 +5333,7 @@ async fn load_conversations_best_effort_with_api(
                 events,
                 api,
                 workspace.store,
-                &conversations,
+                &refreshed_conversations,
                 &cached_user_names,
             )
             .await;
@@ -6545,7 +6551,10 @@ mod tests {
                 MutationOrigin::WebApi,
                 WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
                     snapshot_base,
-                    vec![general, discovered],
+                    ConversationMembershipSnapshot {
+                        conversations: vec![general, discovered],
+                        starred_ids: None,
+                    },
                 )),
             )
             .expect("membership changes should return one authoritative commit");
@@ -6703,6 +6712,324 @@ mod tests {
             assert!(receiver.try_recv().is_err());
         });
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cached_bootstrap_publishes_one_typed_patch_and_keeps_other_projections() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-cached-bootstrap-event-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let conversation = SlackConversation {
+                id: "C1".to_string(),
+                name: Some("general".to_string()),
+                is_channel: Some(true),
+                ..Default::default()
+            };
+            store
+                .store_conversations(std::slice::from_ref(&conversation))
+                .await
+                .unwrap();
+            let user_names = HashMap::from([("U1".to_string(), "Ada".to_string())]);
+            store.store_user_names(&user_names).await.unwrap();
+            let custom_emojis = HashMap::from([(
+                "shipit".to_string(),
+                "https://example.test/shipit.png".to_string(),
+            )]);
+            store.store_custom_emojis(&custom_emojis).await.unwrap();
+            let root = SlackMessage {
+                ts: "1.0".to_string(),
+                reply_count: Some(1),
+                latest_reply: Some("2.0".to_string()),
+                ..Default::default()
+            };
+            let reply = SlackMessage {
+                ts: "2.0".to_string(),
+                thread_ts: Some("1.0".to_string()),
+                ..Default::default()
+            };
+            let mut threads = crate::thread_catalog::ThreadCatalog::default();
+            threads.observe_history("C1", &[root, reply]);
+            let thread_records = threads.into_records();
+            assert_eq!(thread_records.len(), 1);
+            store.store_thread_catalog(&thread_records).await.unwrap();
+
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Startup,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+            let (huddles, _huddle_receiver) = huddle_actor_channel();
+            let connection = RuntimeConnection {
+                slack: SlackApi::new(StoredToken {
+                    access_token: "test-token".to_string(),
+                    token_type: None,
+                    scope: None,
+                    refresh_token: None,
+                    expires_in: None,
+                    expires_at: None,
+                    team_id: None,
+                    team_name: None,
+                    user_id: None,
+                    client_id: None,
+                    browser_cookie_d: None,
+                    user_agent: None,
+                }),
+                workspace_url: None,
+                workspace_store: Some(store.clone()),
+                workspace: workspace.clone(),
+                current_user_id: None,
+                user_cache: Arc::new(Mutex::new(HashMap::new())),
+                read_marks: Arc::new(Mutex::new(HashMap::new())),
+                message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
+                conversation_star_sync: ConversationStarSyncGate::default(),
+                user_status_sync: UserStatusSync::default(),
+                team_id: None,
+                huddles,
+                cached_bootstrap_load_gate: None,
+            };
+
+            load_cached_bootstrap(&events, &connection).await;
+
+            let delivered = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(
+                delivered
+                    .iter()
+                    .map(|event| match &event.kind {
+                        RuntimeEventKind::UserNamesLoaded(_) => "users",
+                        RuntimeEventKind::WorkspacePatch(_) => "patch",
+                        RuntimeEventKind::ThreadCatalogLoaded(_) => "threads",
+                        RuntimeEventKind::EmojiCatalogLoaded(_) => "emoji",
+                        other => panic!("unexpected cache projection event {other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+                vec!["users", "patch", "threads", "emoji"]
+            );
+            let patches = delivered
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    RuntimeEventKind::WorkspacePatch(patch) => Some(patch),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(patches.len(), 1);
+            assert_eq!(patches[0].revision().value(), 1);
+            assert!(matches!(
+                patches[0].changes(),
+                [WorkspaceChange::BootstrapReset(data)]
+                    if data.conversations == vec![conversation.clone()]
+                        && data.threads == thread_records
+            ));
+            assert!(!delivered
+                .iter()
+                .any(|event| matches!(event.kind, RuntimeEventKind::ConversationsLoaded(_))));
+            assert!(delivered.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    RuntimeEventKind::UserNamesLoaded(names) if names == &user_names
+                )
+            }));
+            assert!(delivered.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    RuntimeEventKind::ThreadCatalogLoaded(records) if records == &thread_records
+                )
+            }));
+            assert!(delivered.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    RuntimeEventKind::EmojiCatalogLoaded(emojis) if emojis == &custom_emojis
+                )
+            }));
+            assert_eq!(
+                workspace
+                    .conversations()
+                    .iter()
+                    .map(|conversation| conversation.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["C1"]
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cached_bootstrap_admission_preserves_opened_conversations_for_empty_and_nonempty_cache() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(3)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            for cache_has_conversation in [false, true] {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let directory = std::env::temp_dir().join(format!(
+                    "conduit-workspace-cache-open-race-{}-{nonce}-{cache_has_conversation}",
+                    std::process::id()
+                ));
+                let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+                let cached = SlackConversation {
+                    id: "C_CACHE".to_string(),
+                    name: Some("cached".to_string()),
+                    is_channel: Some(true),
+                    ..Default::default()
+                };
+                if cache_has_conversation {
+                    store
+                        .store_conversations(std::slice::from_ref(&cached))
+                        .await
+                        .unwrap();
+                }
+                store
+                    .store_user_names(&HashMap::from([("U1".to_string(), "Ada".to_string())]))
+                    .await
+                    .unwrap();
+
+                let workspace = WorkspaceReducerAdapter::default();
+                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let events = RuntimeEventSender {
+                    sender,
+                    session: SessionId::default().next(),
+                    request: None,
+                    fallback: OperationContext::new(
+                        RuntimeOperation::Startup,
+                        RuntimeTarget::Workspace,
+                    ),
+                    workspace_patch_send_gate: None,
+                };
+                let (load_started, load_reached) = std::sync::mpsc::channel();
+                let (release_load, load_release) = std::sync::mpsc::channel();
+                let (huddles, _huddle_receiver) = huddle_actor_channel();
+                let connection = RuntimeConnection {
+                    slack: SlackApi::new(StoredToken {
+                        access_token: "test-token".to_string(),
+                        token_type: None,
+                        scope: None,
+                        refresh_token: None,
+                        expires_in: None,
+                        expires_at: None,
+                        team_id: None,
+                        team_name: None,
+                        user_id: None,
+                        client_id: None,
+                        browser_cookie_d: None,
+                        user_agent: None,
+                    }),
+                    workspace_url: None,
+                    workspace_store: Some(store.clone()),
+                    workspace: workspace.clone(),
+                    current_user_id: None,
+                    user_cache: Arc::new(Mutex::new(HashMap::new())),
+                    read_marks: Arc::new(Mutex::new(HashMap::new())),
+                    message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
+                    conversation_star_sync: ConversationStarSyncGate::default(),
+                    user_status_sync: UserStatusSync::default(),
+                    team_id: None,
+                    huddles,
+                    cached_bootstrap_load_gate: Some(Arc::new(TestWorkspacePatchSendGate {
+                        started: load_started,
+                        release: Mutex::new(load_release),
+                    })),
+                };
+                let load_events = events.clone();
+                let loading = tokio::spawn(async move {
+                    load_cached_bootstrap(&load_events, &connection).await;
+                });
+                load_reached
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("cache load did not retain admission at the test gate");
+
+                let open_workspace = workspace.clone();
+                let open_store = store.clone();
+                let open_events = events.clone();
+                let (open_started, open_reached) = tokio::sync::oneshot::channel();
+                let opening = tokio::spawn(async move {
+                    let _ = open_started.send(());
+                    open_workspace
+                        .apply_persisted_and_publish(
+                            Some(&open_store),
+                            &open_events,
+                            MutationOrigin::Local,
+                            WorkspaceMutation::ConversationUpsert(SlackConversation {
+                                id: "C_LOCAL".to_string(),
+                                name: Some("opened".to_string()),
+                                is_channel: Some(true),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                });
+                open_reached.await.unwrap();
+                tokio::task::yield_now().await;
+                assert!(!opening.is_finished());
+                assert_eq!(workspace.revision(), WorkspaceRevision::INITIAL);
+
+                release_load.send(()).unwrap();
+                loading.await.unwrap();
+                opening.await.unwrap().unwrap();
+
+                let ids = workspace
+                    .conversations()
+                    .into_iter()
+                    .map(|conversation| conversation.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    if cache_has_conversation {
+                        vec!["C_CACHE".to_string(), "C_LOCAL".to_string()]
+                    } else {
+                        vec!["C_LOCAL".to_string()]
+                    }
+                );
+                let delivered = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+                assert!(matches!(
+                    delivered.first().map(|event| &event.kind),
+                    Some(RuntimeEventKind::UserNamesLoaded(_))
+                ));
+                assert_eq!(
+                    delivered
+                        .iter()
+                        .filter_map(|event| match &event.kind {
+                            RuntimeEventKind::WorkspacePatch(patch) => {
+                                Some(patch.revision().value())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    if cache_has_conversation {
+                        vec![1, 2]
+                    } else {
+                        vec![1]
+                    }
+                );
+                assert!(!delivered
+                    .iter()
+                    .any(|event| matches!(event.kind, RuntimeEventKind::ConversationsLoaded(_))));
+                let _ = std::fs::remove_dir_all(directory);
+            }
+        });
     }
 
     #[test]
@@ -7381,28 +7708,43 @@ mod tests {
             store.corrupt_conversation_payload("C1").await.unwrap();
 
             let generation = store.recovery_generation();
-            assert!(store.load_conversations().await.unwrap().is_none());
-            assert!(store.recovery_generation() > generation);
-            assert!(store.conversation_cache_needs_repair());
             let base_revision = workspace.revision();
-            workspace.repair_conversation_cache(&store).await.unwrap();
             assert!(!store.conversation_cache_needs_repair());
-            let reductions = workspace
-                .apply_persisted(
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: Some(RequestId::new(11)),
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+
+            assert_eq!(
+                apply_conversation_membership_snapshot(
+                    &events,
                     Some(&store),
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
-                        base_revision,
-                        vec![conversation.clone()],
-                    )),
+                    &workspace,
+                    base_revision,
+                    vec![conversation.clone()],
+                    None,
                 )
                 .await
-                .unwrap();
-            assert!(
-                reductions.is_empty(),
-                "cache repair must not invent a presentation patch"
+                .unwrap(),
+                vec![conversation.clone()]
             );
+            assert!(store.recovery_generation() > generation);
+            assert!(!store.conversation_cache_needs_repair());
             assert_eq!(workspace.revision(), base_revision);
+            let completion = receiver.recv().await.unwrap();
+            assert_eq!(completion.meta.request, Some(RequestId::new(11)));
+            assert!(matches!(
+                completion.kind,
+                RuntimeEventKind::ConversationsSynchronized
+            ));
+            assert!(receiver.try_recv().is_err());
             assert_eq!(
                 store.load_conversations().await.unwrap().unwrap(),
                 vec![conversation]
@@ -7438,7 +7780,10 @@ mod tests {
                 MutationOrigin::WebApi,
                 WorkspaceMutation::MembershipSnapshot(SnapshotEnvelope::new(
                     base_revision,
-                    vec![renamed],
+                    ConversationMembershipSnapshot {
+                        conversations: vec![renamed],
+                        starred_ids: None,
+                    },
                 )),
             )
             .is_some());
@@ -9558,6 +9903,7 @@ mod tests {
             user_status_sync: UserStatusSync::default(),
             team_id: None,
             huddles,
+            cached_bootstrap_load_gate: None,
         });
         let disabled = AttentionPreferences {
             direct_messages: false,
@@ -9963,37 +10309,6 @@ mod tests {
             descriptor.context,
             OperationContext::new(RuntimeOperation::UserStatus, RuntimeTarget::Workspace,)
         );
-    }
-
-    #[test]
-    fn authoritative_conversation_stars_set_current_values_and_clear_stale_values() {
-        let mut conversations = vec![
-            SlackConversation {
-                id: "C1".to_string(),
-                is_channel: Some(true),
-                is_starred: Some(true),
-                ..Default::default()
-            },
-            SlackConversation {
-                id: "D1".to_string(),
-                is_im: Some(true),
-                is_starred: Some(false),
-                ..Default::default()
-            },
-            SlackConversation {
-                id: "UNKNOWN".to_string(),
-                ..Default::default()
-            },
-        ];
-
-        apply_authoritative_conversation_stars(
-            &mut conversations,
-            &HashSet::from(["D1".to_string()]),
-        );
-
-        assert_eq!(conversations[0].is_starred, Some(false));
-        assert_eq!(conversations[1].is_starred, Some(true));
-        assert_eq!(conversations[2].is_starred, None);
     }
 
     #[test]
@@ -10882,34 +11197,293 @@ mod tests {
     }
 
     #[test]
-    fn membership_reconciliation_preserves_enriched_unread_fields() {
-        let mut cached = channel("C1", 5, Some("1710000000.000000"));
-        cached
-            .extra
-            .insert("unread_count_display".to_string(), serde_json::json!(3));
-        let fresh = SlackConversation {
-            id: "C1".to_string(),
-            name: Some("renamed".to_string()),
-            is_channel: Some(true),
-            ..Default::default()
-        };
+    fn membership_snapshot_uses_raw_api_state_and_returns_the_coordinator_projection() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-raw-membership-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        let reconciled = reconcile_conversation_snapshot(vec![cached], vec![fresh])
-            .expect("snapshot should reconcile");
+        runtime.block_on(async {
+            let mut cached = channel("C1", 5, Some("10.0"));
+            cached.name = Some("cached".to_string());
+            cached.is_starred = Some(false);
+            cached
+                .extra
+                .insert("topic".to_string(), serde_json::json!("Cached topic"));
+            cached
+                .extra
+                .insert("unread_count_display".to_string(), serde_json::json!(3));
+            let removed = SlackConversation {
+                id: "C_OLD".to_string(),
+                name: Some("removed".to_string()),
+                is_channel: Some(true),
+                ..Default::default()
+            };
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![cached.clone(), removed.clone()],
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            store
+                .store_conversations(&[cached.clone(), removed])
+                .await
+                .unwrap();
+            let base_revision = workspace.revision();
 
-        assert_eq!(reconciled[0].name.as_deref(), Some("renamed"));
-        assert_eq!(reconciled[0].unread_activity_count(), 5);
-        assert_eq!(reconciled[0].unread_state().display_count, 3);
+            for (origin, conversation) in [
+                (
+                    MutationOrigin::Local,
+                    SlackConversation {
+                        id: "C_LOCAL".to_string(),
+                        name: Some("joined locally".to_string()),
+                        is_channel: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    MutationOrigin::Realtime,
+                    SlackConversation {
+                        id: "C_REALTIME".to_string(),
+                        name: Some("realtime membership".to_string()),
+                        is_channel: Some(true),
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                workspace
+                    .apply_persisted(
+                        Some(&store),
+                        origin,
+                        WorkspaceMutation::ConversationUpsert(conversation),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let fresh = vec![
+                SlackConversation {
+                    id: "C1".to_string(),
+                    name: Some("renamed".to_string()),
+                    is_channel: Some(true),
+                    is_starred: Some(false),
+                    ..Default::default()
+                },
+                SlackConversation {
+                    id: "C2".to_string(),
+                    name: Some("new".to_string()),
+                    is_channel: Some(true),
+                    is_starred: Some(true),
+                    ..Default::default()
+                },
+            ];
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: Some(RequestId::new(7)),
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+
+            let conversations = apply_conversation_membership_snapshot(
+                &events,
+                Some(&store),
+                &workspace,
+                base_revision,
+                fresh,
+                Some(HashSet::from(["C1".to_string(), "C_LOCAL".to_string()])),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                conversations
+                    .iter()
+                    .map(|conversation| conversation.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["C1", "C2", "C_LOCAL", "C_REALTIME"]
+            );
+            let current = conversations
+                .iter()
+                .find(|conversation| conversation.id == "C1")
+                .unwrap();
+            assert_eq!(current.name.as_deref(), Some("renamed"));
+            assert!(current.is_starred());
+            assert_eq!(current.unread_activity_count(), 5);
+            assert_eq!(current.unread_state().display_count, 3);
+            assert_eq!(current.extra["topic"], serde_json::json!("Cached topic"));
+            assert!(conversations
+                .iter()
+                .find(|conversation| conversation.id == "C_LOCAL")
+                .unwrap()
+                .is_starred());
+            assert!(!conversations
+                .iter()
+                .find(|conversation| conversation.id == "C2")
+                .unwrap()
+                .is_starred());
+            let mut persisted = store.load_conversations().await.unwrap().unwrap();
+            persisted.sort_by(|left, right| left.id.cmp(&right.id));
+            assert_eq!(persisted, conversations);
+
+            let event = receiver.recv().await.unwrap();
+            assert_eq!(event.meta.request, None);
+            assert!(matches!(
+                event.kind,
+                RuntimeEventKind::WorkspacePatch(ref patch)
+                    if patch.changes().iter().any(|change| matches!(
+                        change,
+                        WorkspaceChange::ConversationRemoved { channel_id }
+                            if channel_id == "C_OLD"
+                    ))
+            ));
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::ConversationsSynchronized
+            ));
+            assert!(receiver.try_recv().is_err());
+        });
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn suspicious_empty_membership_snapshot_does_not_erase_cache() {
-        let cached = vec![channel("C1", 0, None)];
+    fn suspicious_empty_raw_membership_snapshot_does_not_erase_coordinator_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let workspace = WorkspaceReducerAdapter::default();
+            let retained = channel("C1", 0, None);
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![retained.clone()],
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+            assert!(apply_conversation_membership_snapshot(
+                &events,
+                None,
+                &workspace,
+                workspace.revision(),
+                vec![SlackConversation {
+                    id: "   ".to_string(),
+                    ..Default::default()
+                }],
+                Some(HashSet::new()),
+            )
+            .await
+            .is_err());
+            assert_eq!(workspace.conversations(), vec![retained]);
+            assert!(receiver.try_recv().is_err());
 
-        assert!(reconcile_conversation_snapshot(cached, Vec::new()).is_err());
-        assert!(reconcile_conversation_snapshot(Vec::new(), Vec::new())
-            .expect("an empty first workspace snapshot is valid")
+            let empty = WorkspaceReducerAdapter::default();
+            assert!(apply_conversation_membership_snapshot(
+                &events,
+                None,
+                &empty,
+                empty.revision(),
+                Vec::new(),
+                Some(HashSet::new()),
+            )
+            .await
+            .unwrap()
             .is_empty());
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::ConversationsSynchronized
+            ));
+            assert!(receiver.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn unchanged_membership_snapshot_emits_only_a_state_free_completion() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let workspace = WorkspaceReducerAdapter::default();
+            let conversation = SlackConversation {
+                id: "C1".to_string(),
+                name: Some("general".to_string()),
+                is_channel: Some(true),
+                ..Default::default()
+            };
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![conversation.clone()],
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: Some(RequestId::new(3)),
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+
+            assert_eq!(
+                apply_conversation_membership_snapshot(
+                    &events,
+                    None,
+                    &workspace,
+                    workspace.revision(),
+                    vec![conversation.clone()],
+                    None,
+                )
+                .await
+                .unwrap(),
+                vec![conversation]
+            );
+            let event = receiver.recv().await.unwrap();
+            assert_eq!(event.meta.request, Some(RequestId::new(3)));
+            assert!(matches!(
+                event.kind,
+                RuntimeEventKind::ConversationsSynchronized
+            ));
+            assert!(receiver.try_recv().is_err());
+        });
     }
 
     #[test]

@@ -1252,6 +1252,10 @@ fn legacy_conversation_catalog_mutation_allowed(workspace: &WorkspaceSessionStat
     !workspace.has_conversation_patch()
 }
 
+fn conversation_sync_completion_needs_catalog_sync(workspace_ready: bool) -> bool {
+    !workspace_ready
+}
+
 fn remove_patch_departures_from_discovery(
     discovered: &mut Vec<SlackConversation>,
     removals: &[ConversationPatchRemoval],
@@ -4894,6 +4898,16 @@ impl ConduitWindow {
             RuntimeEventKind::WorkspacePatch(patch) => {
                 self.apply_conversation_workspace_patch(&patch);
             }
+            RuntimeEventKind::ConversationsSynchronized => {
+                if !self.imp().connect_requested.get() {
+                    if conversation_sync_completion_needs_catalog_sync(
+                        self.imp().workspace_ready.get(),
+                    ) {
+                        self.sync_conversations_from_catalog();
+                    }
+                    self.restore_workspace_status();
+                }
+            }
             RuntimeEventKind::ConversationsLoaded(conversations) => {
                 if !self.imp().connect_requested.get() {
                     if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
@@ -7198,7 +7212,13 @@ impl ConduitWindow {
         patch: &crate::workspace_pipeline::WorkspacePatch,
     ) {
         let revision = patch.revision();
-        let Some(application) = self.imp().workspace.apply_conversation_patch(patch) else {
+        let application = {
+            let local_reads = self.imp().local_read_ts_by_channel.borrow();
+            self.imp()
+                .workspace
+                .apply_conversation_patch_with_local_reads(patch, &local_reads)
+        };
+        let Some(application) = application else {
             crate::debug::log(
                 "ui",
                 &format!(
@@ -7208,6 +7228,12 @@ impl ConduitWindow {
             );
             return;
         };
+        {
+            let mut local_reads = self.imp().local_read_ts_by_channel.borrow_mut();
+            for channel_id in application.acknowledged_local_reads() {
+                local_reads.remove(channel_id);
+            }
+        }
         if !application.conversation_changed() {
             return;
         }
@@ -11546,6 +11572,12 @@ mod tests {
                 Some("general")
             );
         });
+    }
+
+    #[test]
+    fn conversation_sync_completion_initializes_an_empty_workspace_once() {
+        assert!(conversation_sync_completion_needs_catalog_sync(false));
+        assert!(!conversation_sync_completion_needs_catalog_sync(true));
     }
 
     #[test]

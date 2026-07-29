@@ -241,11 +241,15 @@ impl ConversationCatalog {
         existed
     }
 
-    pub(crate) fn apply_unread_snapshot(&mut self, snapshot: &SlackConversationUnreadSnapshot) {
+    pub(crate) fn apply_unread_snapshot(
+        &mut self,
+        snapshot: &SlackConversationUnreadSnapshot,
+    ) -> bool {
         if !snapshot.unread_state.known || snapshot.channel_id.trim().is_empty() {
-            return;
+            return false;
         }
 
+        let before = self.get(&snapshot.channel_id).cloned();
         let revision = self.next_revision();
         let entry = self
             .entries
@@ -262,6 +266,7 @@ impl ConversationCatalog {
         entry.conversation.apply_unread_snapshot(snapshot);
         entry.unread_revision = revision;
         entry.membership_revision = entry.membership_revision.max(revision);
+        before.as_ref() != Some(&entry.conversation)
     }
 
     pub(crate) fn advance_read_cursor(&mut self, id: &str, ts: &str, remaining_unread: u64) {
