@@ -86,6 +86,15 @@ pub(crate) struct WorkspaceBootstrapData {
     pub(crate) threads: Vec<ThreadRecord>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct WorkspaceStoreProjection {
+    pub(crate) conversations: Vec<SlackConversation>,
+    pub(crate) users: Vec<SlackUser>,
+    pub(crate) histories: HashMap<String, Vec<SlackMessage>>,
+    pub(crate) thread_timelines: HashMap<(String, String), Vec<SlackMessage>>,
+    pub(crate) thread_catalog: Vec<ThreadRecord>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConversationMembershipSnapshot {
     pub(crate) conversations: Vec<SlackConversation>,
@@ -308,6 +317,7 @@ impl WorkspacePatch {
 #[derive(Debug, Clone)]
 pub(crate) enum StoreChange {
     BootstrapReplaced(WorkspaceBootstrapData),
+    WorkspaceRepaired(WorkspaceStoreProjection),
     ConversationsReplaced(Vec<SlackConversation>),
     ConversationsRepaired(Vec<SlackConversation>),
     ConversationUpsert(SlackConversation),
@@ -352,14 +362,61 @@ pub(crate) enum StoreChange {
     ThreadCatalogReplaced(Vec<ThreadRecord>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceRepairDisposition {
+    SubsumedByProjection,
+    /// Replay is permitted only for an idempotent change whose durable result
+    /// is independent of its ordering relative to the repaired projection.
+    #[allow(dead_code)]
+    ReplayProjectionIndependent,
+}
+
 impl StoreChange {
-    /// Whether a full cache projection can durably replace this change.
-    ///
-    /// Notification claims are delivery ledger mutations, not projections.
-    /// A cache repair must replay them and retain their keyed outcomes rather
-    /// than treating a newer projected revision as persistence.
-    pub(crate) const fn is_repair_projectable(&self) -> bool {
-        !matches!(self, Self::AttentionNotificationClaim { .. })
+    fn workspace_repair_disposition(&self) -> WorkspaceRepairDisposition {
+        // Keep this exhaustive. A new non-projection side effect must not be
+        // acknowledged merely because a cache repair advanced the store gate.
+        // The replay arm requires a keyed, idempotent operation whose result is
+        // independent of projection ordering and therefore safe across retry.
+        match self {
+            Self::AttentionNotificationClaim { identity: _ } => {
+                WorkspaceRepairDisposition::ReplayProjectionIndependent
+            }
+            Self::BootstrapReplaced(_)
+            | Self::WorkspaceRepaired(_)
+            | Self::ConversationsReplaced(_)
+            | Self::ConversationsRepaired(_)
+            | Self::ConversationUpsert(_)
+            | Self::ConversationMetadataUpsert(_)
+            | Self::ConversationMembershipUpsert(_)
+            | Self::ConversationStarChanged {
+                channel_id: _,
+                starred: _,
+            }
+            | Self::ConversationAttentionObserved {
+                channel_id: _,
+                observations: _,
+            }
+            | Self::ConversationRemoved { channel_id: _ }
+            | Self::UnreadChanged { snapshot: _ }
+            | Self::UsersReplaced(_)
+            | Self::UserUpsert(_)
+            | Self::MessageDelta {
+                channel_id: _,
+                message: _,
+                kind: _,
+            }
+            | Self::HistoryReplaced {
+                channel_id: _,
+                messages: _,
+            }
+            | Self::HistoryRemoved { channel_id: _ }
+            | Self::ThreadReplaced {
+                channel_id: _,
+                thread_ts: _,
+                messages: _,
+            }
+            | Self::ThreadCatalogReplaced(_) => WorkspaceRepairDisposition::SubsumedByProjection,
+        }
     }
 }
 
@@ -398,8 +455,15 @@ impl StoreBatch {
             .collect()
     }
 
-    pub(crate) fn is_repair_subsumable(&self) -> bool {
-        self.changes.iter().all(StoreChange::is_repair_projectable)
+    pub(crate) fn workspace_repair_replay_changes(&self) -> Vec<StoreChange> {
+        self.changes
+            .iter()
+            .filter(|change| {
+                change.workspace_repair_disposition()
+                    == WorkspaceRepairDisposition::ReplayProjectionIndependent
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -549,6 +613,32 @@ impl WorkspaceCoordinator {
             .collect::<Vec<_>>();
         conversations.sort_by(|left, right| left.id.cmp(&right.id));
         conversations
+    }
+
+    pub(crate) fn store_projection(&self) -> WorkspaceStoreProjection {
+        let mut users = self
+            .users
+            .values()
+            .map(|entry| entry.value.clone())
+            .collect::<Vec<_>>();
+        users.sort_by(|left, right| left.id.cmp(&right.id));
+        WorkspaceStoreProjection {
+            conversations: self.conversations(),
+            users,
+            histories: self
+                .histories
+                .iter()
+                .map(|(channel_id, timeline)| (channel_id.clone(), timeline.messages()))
+                .collect(),
+            thread_timelines: self
+                .threads
+                .iter()
+                .map(|((channel_id, thread_ts), timeline)| {
+                    ((channel_id.clone(), thread_ts.clone()), timeline.messages())
+                })
+                .collect(),
+            thread_catalog: self.thread_catalog.clone(),
+        }
     }
 
     pub(crate) fn history(&self, channel_id: &str) -> Vec<SlackMessage> {
@@ -2513,6 +2603,31 @@ impl Default for WorkspaceCoordinator {
 mod tests {
     use super::*;
 
+    #[test]
+    fn store_projection_subsumption_patterns_name_every_field() {
+        let source = include_str!("workspace_pipeline.rs");
+        let classifier = source
+            .split_once("enum WorkspaceRepairDisposition")
+            .unwrap()
+            .1
+            .split_once("#[derive(Debug, Clone)]\npub(crate) struct StoreBatch")
+            .unwrap()
+            .0;
+
+        assert!(
+            !classifier.contains(".."),
+            "named StoreChange variants must reject every struct-rest pattern"
+        );
+        assert!(
+            classifier.contains("ReplayProjectionIndependent"),
+            "nonprojectable repair replay must require an explicit disposition"
+        );
+        assert!(
+            classifier.contains("idempotent") && classifier.contains("independent"),
+            "the replay disposition must state its ordering and retry contract"
+        );
+    }
+
     fn conversation(id: &str, name: &str) -> SlackConversation {
         SlackConversation {
             id: id.to_string(),
@@ -3822,7 +3937,11 @@ mod tests {
                 StoreChange::AttentionNotificationClaim { identity },
             ] if identity.channel_id == "D1" && identity.message_ts == "10.0"
         ));
-        assert!(!batch.is_repair_subsumable());
+        assert!(matches!(
+            batch.workspace_repair_replay_changes().as_slice(),
+            [StoreChange::AttentionNotificationClaim { identity }]
+                if identity.channel_id == "D1" && identity.message_ts == "10.0"
+        ));
         assert_eq!(
             coordinator
                 .conversation("D1")

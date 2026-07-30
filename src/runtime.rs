@@ -41,7 +41,9 @@ use crate::slack::{
     SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
-use crate::store::{StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore};
+use crate::store::{
+    StoreBatchExecution, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
+};
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
@@ -1297,6 +1299,8 @@ struct WorkspaceReducerAdapter {
     pending_writes: Arc<Mutex<std::collections::VecDeque<PendingWorkspaceWrite>>>,
     #[cfg(test)]
     history_completion_send_gate: Arc<Mutex<Option<Arc<TestWorkspacePatchSendGate>>>>,
+    #[cfg(test)]
+    workspace_repair_ack_gate: Arc<Mutex<Option<Arc<TestWorkspaceRepairAckGate>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1304,7 +1308,6 @@ struct PendingWorkspaceWrite {
     batch: Option<StoreBatch>,
     reduction: Option<WorkspaceReduction>,
     persisted: bool,
-    repair: bool,
     notification_claimed: bool,
 }
 
@@ -1375,6 +1378,26 @@ impl WorkspaceReducerAdapter {
             .clone();
         if let Some(gate) = gate {
             gate.wait_before_send();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_workspace_repair_ack_gate(&self, gate: Arc<TestWorkspaceRepairAckGate>) {
+        *self
+            .workspace_repair_ack_gate
+            .lock()
+            .expect("workspace repair acknowledgment gate lock poisoned") = Some(gate);
+    }
+
+    #[cfg(test)]
+    async fn wait_before_workspace_repair_ack(&self) {
+        let gate = self
+            .workspace_repair_ack_gate
+            .lock()
+            .expect("workspace repair acknowledgment gate lock poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.wait().await;
         }
     }
 
@@ -1474,7 +1497,6 @@ impl WorkspaceReducerAdapter {
                 batch,
                 reduction: Some(reduction.clone()),
                 persisted,
-                repair: false,
                 notification_claimed: false,
             });
         Some(reduction)
@@ -1487,8 +1509,17 @@ impl WorkspaceReducerAdapter {
         &self,
         store: Option<&WorkspaceStore>,
     ) -> std::result::Result<Vec<PersistedWorkspaceWrite>, StoreError> {
-        self.persist_pending_writes(store).await?;
-        Ok(self.drain_persisted_admitted())
+        loop {
+            self.persist_pending_writes(store).await?;
+            let Some(store) = store else {
+                return Ok(self.drain_persisted_admitted());
+            };
+            let _recovery = store.lock_recovery_linearization().await;
+            if store.workspace_cache_needs_repair() {
+                continue;
+            }
+            return Ok(self.drain_persisted_admitted());
+        }
     }
 
     /// Drains only after the caller has completed any awaited compatibility
@@ -1573,51 +1604,125 @@ impl WorkspaceReducerAdapter {
             .collect())
     }
 
-    async fn repair_conversation_cache_admitted(
+    async fn repair_workspace_cache_admitted(
         &self,
         store: &WorkspaceStore,
     ) -> std::result::Result<(), StoreError> {
-        let recovery_generation = store.recovery_generation();
-        let (revision, conversations) = {
+        loop {
+            let recovery_generation = store.recovery_generation();
+            let (revision, projection) = {
+                let coordinator = self
+                    .coordinator
+                    .lock()
+                    .expect("workspace coordinator lock poisoned");
+                (coordinator.revision(), coordinator.store_projection())
+            };
+            let replay_changes = self
+                .pending_writes
+                .lock()
+                .expect("pending workspace writes lock poisoned")
+                .iter()
+                .filter_map(|entry| entry.batch.as_ref())
+                .filter(|batch| batch.revision() <= revision)
+                .flat_map(StoreBatch::workspace_repair_replay_changes)
+                .collect::<Vec<_>>();
+            let mut repair_changes = vec![StoreChange::WorkspaceRepaired(projection)];
+            repair_changes.extend(replay_changes);
+            if let Some(batch) = StoreBatch::new(revision, repair_changes) {
+                let expected_claims = batch.notification_claims();
+                let outcome = store.execute_store_repair_batch_with_claims(batch).await?;
+                if !expected_claims.iter().all(|expected| {
+                    outcome
+                        .notification_claims
+                        .iter()
+                        .any(|claim| claim.identity == *expected)
+                }) {
+                    return Err(StoreError::rejected_update(
+                        "notification delivery claim was not persisted or replayed",
+                    ));
+                }
+                let mut pending = self
+                    .pending_writes
+                    .lock()
+                    .expect("pending workspace writes lock poisoned");
+                for claim in outcome
+                    .notification_claims
+                    .iter()
+                    .filter(|claim| claim.notification_claimed)
+                {
+                    if let Some(target) = pending.iter_mut().find(|entry| {
+                        entry.reduction.is_some()
+                            && entry.batch.as_ref().is_some_and(|batch| {
+                                batch.revision() <= revision
+                                    && batch
+                                        .notification_claims()
+                                        .iter()
+                                        .any(|identity| identity == &claim.identity)
+                            })
+                    }) {
+                        target.notification_claimed = true;
+                    }
+                }
+                drop(pending);
+                match outcome.execution {
+                    StoreBatchExecution::Committed | StoreBatchExecution::Unchanged => {}
+                    StoreBatchExecution::SkippedStale => {
+                        return Err(StoreError::rejected_update(
+                            "workspace cache repair revision was stale",
+                        ));
+                    }
+                }
+            }
+            #[cfg(test)]
+            self.wait_before_workspace_repair_ack().await;
+
+            let _recovery = store.lock_recovery_linearization().await;
             let coordinator = self
                 .coordinator
                 .lock()
                 .expect("workspace coordinator lock poisoned");
-            (coordinator.revision(), coordinator.conversations())
-        };
-        let Some(batch) = StoreBatch::new(
-            revision,
-            vec![StoreChange::ConversationsRepaired(conversations)],
-        ) else {
-            store.mark_conversation_cache_repaired(recovery_generation);
-            return Ok(());
-        };
+            if store.recovery_generation() != recovery_generation
+                || coordinator.revision() != revision
+            {
+                continue;
+            }
 
-        // A full recovery projection at the current coordinator revision
-        // subsumes any older admitted deltas that the cache reset removed.
-        self.pending_writes
-            .lock()
-            .expect("pending workspace writes lock poisoned")
-            .push_front(PendingWorkspaceWrite {
-                batch: Some(batch),
-                reduction: None,
-                persisted: false,
-                repair: true,
-                notification_claimed: false,
-            });
-        self.persist_pending_writes(Some(store)).await?;
-        self.pending_writes
-            .lock()
-            .expect("pending workspace writes lock poisoned")
-            .retain(|entry| entry.reduction.is_some() || !entry.persisted);
-        store.mark_conversation_cache_repaired(recovery_generation);
-        Ok(())
+            // The exact current projection durably includes every older
+            // projectable delta. Explicit projection-independent, idempotent
+            // changes were replayed in journal order in the same transaction,
+            // so retry cannot change their durable result. Keep each complete
+            // journal entry replayable until the final recovery-locked drain.
+            let mut pending = self
+                .pending_writes
+                .lock()
+                .expect("pending workspace writes lock poisoned");
+            for entry in pending.iter_mut().take_while(|entry| {
+                entry
+                    .reduction
+                    .as_ref()
+                    .map_or_else(
+                        || entry.batch.as_ref().map(StoreBatch::revision),
+                        |reduction| Some(reduction.patch().revision()),
+                    )
+                    .is_none_or(|entry_revision| entry_revision <= revision)
+            }) {
+                entry.persisted = true;
+            }
+            drop(pending);
+            store.mark_workspace_cache_repaired(recovery_generation);
+            return Ok(());
+        }
     }
 
     async fn persist_pending_writes(
         &self,
         store: Option<&WorkspaceStore>,
     ) -> std::result::Result<(), StoreError> {
+        if let Some(store) = store {
+            if store.workspace_cache_needs_repair() {
+                self.repair_workspace_cache_admitted(store).await?;
+            }
+        }
         loop {
             let next = self
                 .pending_writes
@@ -1632,9 +1737,9 @@ impl WorkspaceReducerAdapter {
                         .as_ref()
                         .expect("unpersisted workspace write must contain a store batch")
                         .clone();
-                    (position, batch, entry.repair)
+                    (position, batch)
                 });
-            let Some((position, batch, repair)) = next else {
+            let Some((position, batch)) = next else {
                 return Ok(());
             };
             let Some(store) = store else {
@@ -1644,17 +1749,10 @@ impl WorkspaceReducerAdapter {
 
             // The queue entry deliberately remains installed across this await.
             // Cancellation can therefore only cause a harmless stale replay.
-            let notification_claims = if repair {
-                store
-                    .execute_store_repair_batch_with_claims(batch)
-                    .await?
-                    .notification_claims
-            } else {
-                store
-                    .execute_store_batch_with_claims(batch)
-                    .await?
-                    .notification_claims
-            };
+            let notification_claims = store
+                .execute_store_batch_with_claims(batch)
+                .await?
+                .notification_claims;
             let complete_claim_results = expected_claims.iter().all(|expected| {
                 notification_claims
                     .iter()
@@ -1669,32 +1767,15 @@ impl WorkspaceReducerAdapter {
                 .pending_writes
                 .lock()
                 .expect("pending workspace writes lock poisoned");
-            for outcome in notification_claims
-                .iter()
-                .filter(|outcome| outcome.notification_claimed)
-            {
-                let target = if repair {
-                    pending.iter_mut().enumerate().find_map(|(index, entry)| {
-                        (index != position
-                            && entry.reduction.is_some()
-                            && entry.batch.as_ref().is_some_and(|batch| {
-                                batch
-                                    .notification_claims()
-                                    .iter()
-                                    .any(|identity| identity == &outcome.identity)
-                            }))
-                        .then_some(entry)
-                    })
-                } else {
-                    pending.get_mut(position)
-                };
-                if let Some(target) = target {
-                    target.notification_claimed = true;
-                }
-            }
             let entry = pending
                 .get_mut(position)
                 .expect("persisted reduction disappeared while admission was held");
+            if notification_claims
+                .iter()
+                .any(|outcome| outcome.notification_claimed)
+            {
+                entry.notification_claimed = true;
+            }
             entry.persisted = true;
         }
     }
@@ -5777,8 +5858,8 @@ async fn apply_conversation_membership_snapshot(
     let _admission = workspace.store_batch_admission.lock().await;
     if let Some(store) = workspace_store {
         store.validate_conversation_cache().await?;
-        if store.conversation_cache_needs_repair() {
-            workspace.repair_conversation_cache_admitted(store).await?;
+        if store.workspace_cache_needs_repair() {
+            workspace.repair_workspace_cache_admitted(store).await?;
         }
     }
 
@@ -7018,6 +7099,30 @@ struct RuntimeEventSender {
 struct TestWorkspacePatchSendGate {
     started: std::sync::mpsc::Sender<()>,
     release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestWorkspaceRepairAckGate {
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl TestWorkspaceRepairAckGate {
+    async fn wait(&self) {
+        if let Some(started) = self
+            .started
+            .lock()
+            .expect("workspace repair acknowledgment start gate lock poisoned")
+            .take()
+        {
+            let _ = started.send(());
+        }
+        if let Some(release) = self.release.lock().await.take() {
+            let _ = release.await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10742,7 +10847,7 @@ mod tests {
 
             let generation = store.recovery_generation();
             let base_revision = workspace.revision();
-            assert!(!store.conversation_cache_needs_repair());
+            assert!(!store.workspace_cache_needs_repair());
             let (sender, mut receiver) = mpsc::unbounded_channel();
             let events = RuntimeEventSender {
                 sender,
@@ -10769,7 +10874,7 @@ mod tests {
                 vec![conversation.clone()]
             );
             assert!(store.recovery_generation() > generation);
-            assert!(!store.conversation_cache_needs_repair());
+            assert!(!store.workspace_cache_needs_repair());
             assert_eq!(workspace.revision(), base_revision);
             let completion = receiver.recv().await.unwrap();
             assert_eq!(completion.meta.request, Some(RequestId::new(11)));
@@ -10781,6 +10886,631 @@ mod tests {
             assert_eq!(
                 store.load_conversations().await.unwrap().unwrap(),
                 vec![conversation]
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_adapter_repairs_the_complete_projection_after_cache_recovery() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-complete-recovery-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                name: Some("general".into()),
+                unread_count: Some(2),
+                extra: HashMap::from([
+                    ("has_unreads".into(), serde_json::json!(true)),
+                    ("last_read".into(), serde_json::json!("1.0")),
+                ]),
+                ..Default::default()
+            };
+            let user = SlackUser {
+                id: Some("U1".into()),
+                name: Some("ada".into()),
+                real_name: Some("Ada Lovelace".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Ada".into()),
+                    real_name: Some("Ada Lovelace".into()),
+                    status_text: Some("Working remotely".into()),
+                    status_emoji: Some(":house_with_garden:".into()),
+                    status_expiration: Some(0),
+                    image_72: Some("https://example.test/ada.png".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let root = SlackMessage {
+                ts: "2.0".into(),
+                user: Some("U1".into()),
+                text: Some("root".into()),
+                reply_count: Some(1),
+                latest_reply: Some("3.0".into()),
+                reply_users: Some(vec!["U1".into()]),
+                ..Default::default()
+            };
+            let cached_reply = SlackMessage {
+                ts: "3.0".into(),
+                thread_ts: Some("2.0".into()),
+                user: Some("U1".into()),
+                text: Some("cached reply".into()),
+                ..Default::default()
+            };
+            let mut catalog = crate::thread_catalog::ThreadCatalog::default();
+            catalog.observe_history("C1", &[root.clone(), cached_reply.clone()]);
+            let thread_records = catalog.into_records();
+
+            workspace.update_attention_context(WorkspaceAttentionContext {
+                current_user_id: Some("U1".into()),
+            });
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![conversation.clone()],
+                        users: vec![user],
+                        histories: HashMap::from([("C1".into(), vec![root.clone()])]),
+                        threads: thread_records.clone(),
+                    }),
+                )
+                .unwrap();
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::ThreadSnapshot {
+                        channel_id: "C1".into(),
+                        thread_ts: "2.0".into(),
+                        snapshot: SnapshotEnvelope::new(
+                            workspace.revision(),
+                            crate::workspace_pipeline::MessagePage {
+                                messages: vec![root.clone(), cached_reply.clone()],
+                                complete: true,
+                                ..Default::default()
+                            },
+                        ),
+                    },
+                )
+                .unwrap();
+
+            store
+                .store_conversations(std::slice::from_ref(&conversation))
+                .await
+                .unwrap();
+            store
+                .store_user_names(&HashMap::from([("U1".to_string(), "Ada".to_string())]))
+                .await
+                .unwrap();
+            store
+                .store_user_full_names(&HashMap::from([(
+                    "U1".to_string(),
+                    "Ada Lovelace".to_string(),
+                )]))
+                .await
+                .unwrap();
+            store
+                .store_history("C1", std::slice::from_ref(&root))
+                .await
+                .unwrap();
+            store
+                .store_thread("C1", "2.0", &[root.clone(), cached_reply.clone()])
+                .await
+                .unwrap();
+            store.store_thread_catalog(&thread_records).await.unwrap();
+
+            store
+                .install_history_batch_failure_trigger_for("C1")
+                .await
+                .unwrap();
+            let fresh_message = SlackMessage {
+                ts: "4.0".into(),
+                user: Some("U1".into()),
+                text: Some("fresh history".into()),
+                ..Default::default()
+            };
+            workspace
+                .apply_persisted(
+                    Some(&store),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::HistorySnapshot {
+                        channel_id: "C1".into(),
+                        snapshot: SnapshotEnvelope::new(
+                            workspace.revision(),
+                            crate::workspace_pipeline::MessagePage {
+                                messages: vec![root.clone(), fresh_message],
+                                complete: true,
+                                ..Default::default()
+                            },
+                        ),
+                    },
+                )
+                .await
+                .unwrap_err();
+            let pending_reply = SlackMessage {
+                ts: "5.0".into(),
+                thread_ts: Some("2.0".into()),
+                user: Some("U1".into()),
+                text: Some("pending realtime reply".into()),
+                ..Default::default()
+            };
+            workspace
+                .apply_persisted(
+                    Some(&store),
+                    MutationOrigin::Realtime,
+                    WorkspaceMutation::MessageChanged {
+                        channel_id: "C1".into(),
+                        message: pending_reply.clone(),
+                        kind: MessageMutationKind::Posted,
+                        origin: MutationOrigin::Realtime,
+                    },
+                )
+                .await
+                .unwrap_err();
+
+            let pending_revisions = {
+                let pending = workspace.pending_writes.lock().unwrap();
+                assert_eq!(pending.len(), 2);
+                assert!(pending[0]
+                    .batch
+                    .as_ref()
+                    .unwrap()
+                    .changes()
+                    .iter()
+                    .any(|change| matches!(change, StoreChange::HistoryReplaced { .. })));
+                assert!(pending[1]
+                    .batch
+                    .as_ref()
+                    .unwrap()
+                    .changes()
+                    .iter()
+                    .any(|change| matches!(change, StoreChange::MessageDelta { .. })));
+                pending
+                    .iter()
+                    .map(|entry| entry.batch.as_ref().unwrap().revision())
+                    .collect::<Vec<_>>()
+            };
+            let canonical_conversations = workspace.conversations();
+            let mut canonical_history =
+                crate::slack_message_wire::normalize_cached_messages(workspace.history("C1"));
+            canonical_history.sort_by(|left, right| left.ts.cmp(&right.ts));
+            let canonical_root = canonical_history
+                .iter()
+                .find(|message| message.ts == "2.0")
+                .unwrap()
+                .clone();
+            let mut canonical_thread = crate::slack_message_wire::normalize_cached_messages(vec![
+                canonical_root,
+                cached_reply,
+                pending_reply,
+            ]);
+            canonical_thread.sort_by(|left, right| left.ts.cmp(&right.ts));
+
+            store.corrupt_conversation_payload("C1").await.unwrap();
+            store.validate_conversation_cache().await.unwrap();
+            assert!(store.workspace_cache_needs_repair());
+
+            {
+                let _admission = workspace.store_batch_admission.lock().await;
+                workspace
+                    .repair_workspace_cache_admitted(&store)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    store.workspace_cache_needs_repair(),
+                    "a failed atomic repair must leave its generation pending"
+                );
+                assert!(workspace
+                    .pending_writes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|entry| !entry.persisted));
+            }
+            assert!(
+                store.load_conversations().await.unwrap().is_none(),
+                "a failed repair transaction must not leave a partial projection"
+            );
+            store.clear_history_batch_failure_trigger().await.unwrap();
+
+            let (repair_started, repair_started_receiver) = oneshot::channel();
+            let (release_repair, repair_release_receiver) = oneshot::channel();
+            workspace.set_workspace_repair_ack_gate(Arc::new(TestWorkspaceRepairAckGate {
+                started: Mutex::new(Some(repair_started)),
+                release: tokio::sync::Mutex::new(Some(repair_release_receiver)),
+            }));
+            let recovering_workspace = workspace.clone();
+            let recovering_store = store.clone();
+            let recovery = tokio::spawn(async move {
+                let _admission = recovering_workspace.store_batch_admission.lock().await;
+                recovering_workspace
+                    .recover_persisted_admitted(Some(&recovering_store))
+                    .await
+            });
+            repair_started_receiver.await.unwrap();
+
+            let first_recovery_generation = store.recovery_generation();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+            store.validate_conversation_cache().await.unwrap();
+            assert!(store.recovery_generation() > first_recovery_generation);
+            release_repair.send(()).unwrap();
+
+            assert_eq!(
+                recovery
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_iter()
+                    .map(|write| write.reduction.patch().revision())
+                    .collect::<Vec<_>>(),
+                pending_revisions,
+                "subsumed reductions must retain FIFO publication order"
+            );
+            assert!(!store.workspace_cache_needs_repair());
+
+            drop(store);
+            let reopened = WorkspaceStore::new(directory.clone(), "T1:U1");
+            assert_eq!(
+                reopened.load_conversations().await.unwrap().unwrap(),
+                canonical_conversations,
+                "unread-bearing conversations must match coordinator authority"
+            );
+
+            let mut reopened_history = reopened.load_history("C1").await.unwrap().unwrap();
+            reopened_history.sort_by(|left, right| left.ts.cmp(&right.ts));
+            assert_eq!(reopened_history, canonical_history);
+
+            let mut reopened_thread = reopened.load_thread("C1", "2.0").await.unwrap().unwrap();
+            reopened_thread.sort_by(|left, right| left.ts.cmp(&right.ts));
+            assert_eq!(reopened_thread, canonical_thread);
+
+            let bootstrap = reopened.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(
+                bootstrap.user_names.get("U1").map(String::as_str),
+                Some("Ada")
+            );
+            assert_eq!(
+                bootstrap.user_full_names.get("U1").map(String::as_str),
+                Some("Ada Lovelace")
+            );
+            assert_eq!(
+                bootstrap.user_avatar_urls.get("U1").map(String::as_str),
+                Some("https://example.test/ada.png")
+            );
+            assert_eq!(
+                bootstrap.user_search_aliases.get("U1"),
+                Some(&vec!["Ada".to_string(), "Ada Lovelace".to_string(),])
+            );
+            assert_eq!(
+                bootstrap.user_statuses.get("U1"),
+                Some(&SlackUserStatus {
+                    text: "Working remotely".into(),
+                    emoji: ":house_with_garden:".into(),
+                    expiration: 0,
+                })
+            );
+            assert_eq!(bootstrap.thread_catalog, thread_records);
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_repair_retries_when_coordinator_advances_before_acknowledgment() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-revision-recovery-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                name: Some("before repair".into()),
+                ..Default::default()
+            };
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![conversation.clone()],
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            store
+                .store_conversations(std::slice::from_ref(&conversation))
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+            store.validate_conversation_cache().await.unwrap();
+
+            let (repair_started, repair_started_receiver) = oneshot::channel();
+            let (release_repair, repair_release_receiver) = oneshot::channel();
+            workspace.set_workspace_repair_ack_gate(Arc::new(TestWorkspaceRepairAckGate {
+                started: Mutex::new(Some(repair_started)),
+                release: tokio::sync::Mutex::new(Some(repair_release_receiver)),
+            }));
+            let recovering_workspace = workspace.clone();
+            let recovering_store = store.clone();
+            let recovery = tokio::spawn(async move {
+                let _admission = recovering_workspace.store_batch_admission.lock().await;
+                recovering_workspace
+                    .recover_persisted_admitted(Some(&recovering_store))
+                    .await
+            });
+            repair_started_receiver.await.unwrap();
+
+            workspace
+                .apply(
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ConversationUpsert(SlackConversation {
+                        name: Some("advanced during repair".into()),
+                        ..conversation
+                    }),
+                )
+                .unwrap();
+            release_repair.send(()).unwrap();
+            assert!(recovery.await.unwrap().unwrap().is_empty());
+            assert!(!store.workspace_cache_needs_repair());
+            assert_eq!(
+                store.load_conversations().await.unwrap().unwrap()[0]
+                    .name
+                    .as_deref(),
+                Some("advanced during repair")
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_repair_retry_replaces_only_prior_attempt_user_fields() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-user-revision-recovery-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                ..Default::default()
+            };
+            let first_user = SlackUser {
+                id: Some("U1".into()),
+                name: Some("attempt-one".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Attempt One Display".into()),
+                    real_name: Some("Attempt One Full".into()),
+                    image_72: Some("https://example.test/attempt-one.png".into()),
+                    status_text: Some("Attempt one status".into()),
+                    status_emoji: Some(":one:".into()),
+                    status_expiration: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![conversation.clone()],
+                        users: vec![first_user],
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            store
+                .store_conversations(std::slice::from_ref(&conversation))
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+            store.validate_conversation_cache().await.unwrap();
+
+            let (repair_started, repair_started_receiver) = oneshot::channel();
+            let (release_repair, repair_release_receiver) = oneshot::channel();
+            workspace.set_workspace_repair_ack_gate(Arc::new(TestWorkspaceRepairAckGate {
+                started: Mutex::new(Some(repair_started)),
+                release: tokio::sync::Mutex::new(Some(repair_release_receiver)),
+            }));
+            let recovering_workspace = workspace.clone();
+            let recovering_store = store.clone();
+            let recovery = tokio::spawn(async move {
+                let _admission = recovering_workspace.store_batch_admission.lock().await;
+                recovering_workspace
+                    .recover_persisted_admitted(Some(&recovering_store))
+                    .await
+            });
+            repair_started_receiver.await.unwrap();
+
+            store
+                .store_user_name("U1", "Interleaved Compatibility Display")
+                .await
+                .unwrap();
+            workspace
+                .apply(
+                    MutationOrigin::Realtime,
+                    WorkspaceMutation::UserUpsert(SlackUser {
+                        id: Some("U1".into()),
+                        name: Some("attempt-two".into()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            display_name: Some("Attempt Two Display".into()),
+                            real_name: Some("Attempt Two Full".into()),
+                            image_72: Some("https://example.test/attempt-two.png".into()),
+                            status_text: Some(String::new()),
+                            status_emoji: Some(String::new()),
+                            status_expiration: Some(0),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            release_repair.send(()).unwrap();
+            assert!(recovery.await.unwrap().unwrap().is_empty());
+
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(
+                bootstrap.user_names.get("U1").map(String::as_str),
+                Some("Interleaved Compatibility Display"),
+                "retry must preserve a compatibility write that replaced attempt one"
+            );
+            assert_eq!(
+                bootstrap.user_full_names.get("U1").map(String::as_str),
+                Some("Attempt Two Full"),
+                "retry must replace an untouched field written by attempt one"
+            );
+            assert_eq!(
+                bootstrap.user_avatar_urls.get("U1").map(String::as_str),
+                Some("https://example.test/attempt-two.png")
+            );
+            assert_eq!(
+                bootstrap.user_search_aliases.get("U1"),
+                Some(&vec![
+                    "Attempt Two Display".to_string(),
+                    "Attempt Two Full".to_string(),
+                    "attempt-two".to_string(),
+                ])
+            );
+            assert!(
+                !bootstrap.user_statuses.contains_key("U1"),
+                "retry must apply an explicit clear to a status written by attempt one"
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_repair_retains_journal_batches_across_a_second_reset_before_drain() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-workspace-repair-journal-retention-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let initial = SlackConversation {
+                id: "C1".into(),
+                name: Some("initial".into()),
+                ..Default::default()
+            };
+            workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![initial.clone()],
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            store
+                .store_conversations(std::slice::from_ref(&initial))
+                .await
+                .unwrap();
+
+            let first = workspace
+                .apply_and_enqueue(
+                    Some(&store),
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(SlackConversation {
+                        name: Some("first pending".into()),
+                        ..initial.clone()
+                    }),
+                )
+                .unwrap();
+            let second = workspace
+                .apply_and_enqueue(
+                    Some(&store),
+                    MutationOrigin::Realtime,
+                    WorkspaceMutation::ConversationUpsert(SlackConversation {
+                        name: Some("second pending".into()),
+                        ..initial
+                    }),
+                )
+                .unwrap();
+            let expected_revisions = vec![first.patch().revision(), second.patch().revision()];
+
+            store.corrupt_conversation_payload("C1").await.unwrap();
+            store.validate_conversation_cache().await.unwrap();
+            {
+                let _admission = workspace.store_batch_admission.lock().await;
+                workspace
+                    .repair_workspace_cache_admitted(&store)
+                    .await
+                    .unwrap();
+                let pending = workspace
+                    .pending_writes
+                    .lock()
+                    .expect("pending workspace writes lock poisoned");
+                assert_eq!(pending.len(), 2);
+                assert!(pending.iter().all(|entry| entry.persisted));
+                assert!(
+                    pending.iter().all(|entry| entry.batch.is_some()),
+                    "stable repair must retain replayable batches until recovery-locked drain"
+                );
+            }
+
+            store.corrupt_conversation_payload("C1").await.unwrap();
+            store.validate_conversation_cache().await.unwrap();
+            let drained = {
+                let _admission = workspace.store_batch_admission.lock().await;
+                workspace
+                    .recover_persisted_admitted(Some(&store))
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(
+                drained
+                    .into_iter()
+                    .map(|write| write.reduction.patch().revision())
+                    .collect::<Vec<_>>(),
+                expected_revisions,
+                "a second reset must preserve FIFO publication"
+            );
+            assert!(!store.workspace_cache_needs_repair());
+            assert_eq!(
+                store.load_conversations().await.unwrap().unwrap()[0]
+                    .name
+                    .as_deref(),
+                Some("second pending")
             );
         });
         let _ = std::fs::remove_dir_all(directory);
@@ -14288,14 +15018,22 @@ mod tests {
             workspace.update_attention_context(WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".into()),
             });
+            let conversation = SlackConversation {
+                id: "D1".into(),
+                is_im: Some(true),
+                ..Default::default()
+            };
             workspace.apply(
                 MutationOrigin::Cache,
-                WorkspaceMutation::ConversationUpsert(SlackConversation {
-                    id: "D1".into(),
-                    is_im: Some(true),
-                    ..Default::default()
-                }),
+                WorkspaceMutation::ConversationUpsert(conversation.clone()),
             );
+            store
+                .store_conversations(std::slice::from_ref(&conversation))
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("D1").await.unwrap();
+            store.validate_conversation_cache().await.unwrap();
+            assert!(store.workspace_cache_needs_repair());
             let identity =
                 crate::workspace_pipeline::AttentionDeliveryIdentity::new("D1", "1.0").unwrap();
 
@@ -14322,65 +15060,38 @@ mod tests {
                 [identity.clone()]
             );
 
-            let repair_batch = StoreBatch::new(
-                workspace.revision(),
-                vec![
-                    StoreChange::ConversationsRepaired(workspace.conversations()),
-                    StoreChange::AttentionNotificationClaim {
-                        identity: identity.clone(),
-                    },
-                ],
-            )
-            .unwrap();
-            assert!(!repair_batch.is_repair_subsumable());
-            workspace
-                .pending_writes
-                .lock()
-                .expect("pending workspace writes lock poisoned")
-                .push_front(PendingWorkspaceWrite {
-                    batch: Some(repair_batch),
-                    reduction: None,
-                    persisted: false,
-                    repair: true,
-                    notification_claimed: false,
-                });
-
+            let (repair_started, repair_started_receiver) = oneshot::channel();
+            let (release_repair, repair_release_receiver) = oneshot::channel();
+            workspace.set_workspace_repair_ack_gate(Arc::new(TestWorkspaceRepairAckGate {
+                started: Mutex::new(Some(repair_started)),
+                release: tokio::sync::Mutex::new(Some(repair_release_receiver)),
+            }));
             let transaction_baseline = store.committed_transaction_count().await.unwrap();
-            workspace
-                .persist_pending_writes(Some(&store))
-                .await
-                .unwrap();
+            let repairing_workspace = workspace.clone();
+            let repairing_store = store.clone();
+            let repair = tokio::spawn(async move {
+                let _admission = repairing_workspace.store_batch_admission.lock().await;
+                repairing_workspace
+                    .persist_pending_writes(Some(&repairing_store))
+                    .await
+            });
+            repair_started_receiver.await.unwrap();
+            workspace.apply(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::ConversationUpsert(SlackConversation {
+                    id: "D1".into(),
+                    is_im: Some(true),
+                    name: Some("advanced during claim repair".into()),
+                    ..Default::default()
+                }),
+            );
+            release_repair.send(()).unwrap();
+            repair.await.unwrap().unwrap();
             assert_eq!(
                 store.committed_transaction_count().await.unwrap() - transaction_baseline,
-                1,
-                "the repair projection and replayed claim must share one transaction"
+                2,
+                "each retry must atomically repair the projection and replay the claim"
             );
-
-            let retry_batch = StoreBatch::new(
-                workspace.revision(),
-                vec![
-                    StoreChange::ConversationsRepaired(workspace.conversations()),
-                    StoreChange::AttentionNotificationClaim {
-                        identity: identity.clone(),
-                    },
-                ],
-            )
-            .unwrap();
-            workspace
-                .pending_writes
-                .lock()
-                .expect("pending workspace writes lock poisoned")
-                .push_front(PendingWorkspaceWrite {
-                    batch: Some(retry_batch),
-                    reduction: None,
-                    persisted: false,
-                    repair: true,
-                    notification_claimed: false,
-                });
-            workspace
-                .persist_pending_writes(Some(&store))
-                .await
-                .unwrap();
             assert!(
                 workspace
                     .pending_writes
@@ -14390,7 +15101,7 @@ mod tests {
                     .find(|entry| entry.reduction.is_some())
                     .unwrap()
                     .notification_claimed,
-                "a duplicate repair result must not erase an earlier successful claim"
+                "a duplicate retry result must not erase the first successful claim"
             );
 
             let persisted = workspace.drain_persisted_admitted();

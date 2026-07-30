@@ -26,7 +26,7 @@ use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 use crate::workspace_pipeline::{
     same_message_identity, AttentionDeliveryIdentity, ConversationAttentionObservation,
-    MessageMutationKind, StoreBatch, StoreChange, WorkspaceRevision,
+    MessageMutationKind, StoreBatch, StoreChange, WorkspaceRevision, WorkspaceStoreProjection,
 };
 
 pub(crate) const CACHE_VERSION: u32 = 1;
@@ -35,6 +35,8 @@ const DATABASE_FILENAME: &str = "state.sqlite3";
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 const ATTENTION_DELIVERY_KIND: &str = "attention_delivery";
 const ATTENTION_DELIVERY_LEDGER_KEY: &str = "__ledger__";
+const WORKSPACE_REPAIR_KIND: &str = "workspace_repair";
+const WORKSPACE_REPAIR_USER_BASELINE_KEY: &str = "user_projection_baseline";
 const MAX_ATTENTION_DELIVERIES: usize = 512;
 const STORE_WRITER_QUEUE_CAPACITY: usize = 64;
 const STORE_READER_QUEUE_CAPACITY: usize = 32;
@@ -624,7 +626,8 @@ pub struct WorkspaceStore {
     hub: Arc<tokio::sync::OnceCell<StoreHub>>,
     store_batch_revision: Arc<std::sync::Mutex<WorkspaceRevision>>,
     recovery_generation: Arc<AtomicU64>,
-    conversation_repair_generation: Arc<AtomicU64>,
+    workspace_repair_generation: Arc<AtomicU64>,
+    recovery_linearization: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -680,7 +683,8 @@ impl WorkspaceStore {
             hub: Arc::new(tokio::sync::OnceCell::new()),
             store_batch_revision: Arc::new(std::sync::Mutex::new(WorkspaceRevision::INITIAL)),
             recovery_generation: Arc::new(AtomicU64::new(0)),
-            conversation_repair_generation: Arc::new(AtomicU64::new(0)),
+            workspace_repair_generation: Arc::new(AtomicU64::new(0)),
+            recovery_linearization: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -757,6 +761,7 @@ impl WorkspaceStore {
         let workspace_key = self.workspace_key.clone();
         let workspace_id = self.workspace_id.clone();
         let store_batch_revision = Arc::clone(&self.store_batch_revision);
+        let recovery_generation = Arc::clone(&self.recovery_generation);
         self.hub()
             .await?
             .write(move |connection| {
@@ -782,6 +787,8 @@ impl WorkspaceStore {
                 let mut changed =
                     ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
                 let mut notification_claims = Vec::new();
+                let repair_generation =
+                    accept_equal_revision.then(|| recovery_generation.load(Ordering::Acquire));
                 for change in changes {
                     match change {
                         StoreChange::AttentionNotificationClaim { identity } => {
@@ -808,6 +815,7 @@ impl WorkspaceStore {
                                 &transaction,
                                 &workspace_key,
                                 &workspace_id,
+                                repair_generation,
                                 change,
                             ) {
                                 Ok(change_applied) => changed |= change_applied,
@@ -839,8 +847,13 @@ impl WorkspaceStore {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
         let hub = self.hub().await?;
+        let observed_generation = self.recovery_generation();
         match hub.query(query).await {
             Err(error) if error.category() == StoreErrorCategory::CorruptData => {
+                let _recovery = Arc::clone(&self.recovery_linearization).lock_owned().await;
+                if self.recovery_generation() != observed_generation {
+                    return Ok(empty);
+                }
                 let workspace_key = self.workspace_key.clone();
                 let store_batch_revision = Arc::clone(&self.store_batch_revision);
                 let recovery_generation = Arc::clone(&self.recovery_generation);
@@ -864,13 +877,17 @@ impl WorkspaceStore {
         self.recovery_generation.load(Ordering::Acquire)
     }
 
-    pub(crate) fn conversation_cache_needs_repair(&self) -> bool {
-        self.conversation_repair_generation.load(Ordering::Acquire) < self.recovery_generation()
+    pub(crate) fn workspace_cache_needs_repair(&self) -> bool {
+        self.workspace_repair_generation.load(Ordering::Acquire) < self.recovery_generation()
     }
 
-    pub(crate) fn mark_conversation_cache_repaired(&self, recovery_generation: u64) {
-        self.conversation_repair_generation
+    pub(crate) fn mark_workspace_cache_repaired(&self, recovery_generation: u64) {
+        self.workspace_repair_generation
             .fetch_max(recovery_generation, Ordering::AcqRel);
+    }
+
+    pub(crate) async fn lock_recovery_linearization(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.recovery_linearization).lock_owned().await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2766,6 +2783,7 @@ fn apply_store_change(
     transaction: &Transaction<'_>,
     workspace_key: &str,
     workspace_id: &str,
+    repair_generation: Option<u64>,
     change: StoreChange,
 ) -> Result<bool> {
     match change {
@@ -2788,6 +2806,82 @@ fn apply_store_change(
                     .collect::<Result<Vec<_>>>()?,
             )?;
             changed |= sync_thread_records(transaction, workspace_key, data.threads)?;
+            Ok(changed)
+        }
+        StoreChange::WorkspaceRepaired(WorkspaceStoreProjection {
+            conversations,
+            users,
+            histories,
+            thread_timelines,
+            thread_catalog,
+        }) => {
+            let repair_generation = repair_generation.ok_or_else(|| {
+                StoreError::rejected_update(
+                    "workspace repair changes require the repair execution path",
+                )
+            })?;
+            let mut changed = sync_conversations(transaction, workspace_key, conversations)?;
+            let mut user_projections = CachedUserProjections::default();
+            for user in users {
+                user_projections.insert(user)?;
+            }
+            let prior_user_baseline = load_sqlite_item::<WorkspaceRepairUserBaseline>(
+                transaction,
+                workspace_key,
+                WORKSPACE_REPAIR_KIND,
+                WORKSPACE_REPAIR_USER_BASELINE_KEY,
+            )?
+            .filter(|baseline| baseline.recovery_generation == repair_generation);
+            changed |= merge_repaired_user_projections(
+                transaction,
+                workspace_key,
+                &user_projections,
+                prior_user_baseline
+                    .as_ref()
+                    .map(|baseline| &baseline.projections),
+            )?;
+            changed |= sync_sqlite_kind(
+                transaction,
+                workspace_key,
+                "channel_history",
+                histories
+                    .into_iter()
+                    .map(|(channel_id, messages)| {
+                        require_store_key("channel history", &channel_id)?;
+                        Ok((
+                            channel_id,
+                            channel_timeline_messages(normalize_cached_messages(messages)),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+            changed |= sync_sqlite_kind(
+                transaction,
+                workspace_key,
+                "thread_replies",
+                thread_timelines
+                    .into_iter()
+                    .map(|((channel_id, thread_ts), messages)| {
+                        require_store_key("thread channel", &channel_id)?;
+                        require_store_key("thread timestamp", &thread_ts)?;
+                        Ok((
+                            thread_key(&channel_id, &thread_ts),
+                            pruned_history(normalize_cached_messages(messages)),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+            changed |= sync_thread_records(transaction, workspace_key, thread_catalog)?;
+            changed |= upsert_sqlite_item(
+                transaction,
+                workspace_key,
+                WORKSPACE_REPAIR_KIND,
+                WORKSPACE_REPAIR_USER_BASELINE_KEY,
+                &WorkspaceRepairUserBaseline {
+                    recovery_generation: repair_generation,
+                    projections: user_projections,
+                },
+            )?;
             Ok(changed)
         }
         StoreChange::ConversationsReplaced(conversations) => {
@@ -3497,13 +3591,19 @@ fn sync_users(
     Ok(changed)
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct CachedUserProjections {
-    display_names: HashMap<String, String>,
-    full_names: HashMap<String, String>,
-    avatar_urls: HashMap<String, String>,
-    aliases: HashMap<String, Vec<String>>,
-    statuses: HashMap<String, SlackUserStatus>,
+    display_names: BTreeMap<String, String>,
+    full_names: BTreeMap<String, String>,
+    avatar_urls: BTreeMap<String, String>,
+    aliases: BTreeMap<String, Vec<String>>,
+    statuses: BTreeMap<String, SlackUserStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkspaceRepairUserBaseline {
+    recovery_generation: u64,
+    projections: CachedUserProjections,
 }
 
 impl CachedUserProjections {
@@ -3590,6 +3690,150 @@ fn upsert_user_projection(
         )? > 0;
     }
     Ok(changed)
+}
+
+fn merge_repaired_user_projections(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    desired: &CachedUserProjections,
+    previous: Option<&CachedUserProjections>,
+) -> Result<bool> {
+    let mut changed = merge_repaired_user_kind(
+        transaction,
+        workspace_key,
+        "user_name",
+        &desired.display_names,
+        previous.map(|projections| &projections.display_names),
+    )?;
+    changed |= merge_repaired_user_kind(
+        transaction,
+        workspace_key,
+        "user_full_name",
+        &desired.full_names,
+        previous.map(|projections| &projections.full_names),
+    )?;
+    changed |= merge_repaired_user_kind(
+        transaction,
+        workspace_key,
+        "user_avatar_url",
+        &desired.avatar_urls,
+        previous.map(|projections| &projections.avatar_urls),
+    )?;
+    changed |= merge_repaired_user_kind(
+        transaction,
+        workspace_key,
+        "user_aliases",
+        &desired.aliases,
+        previous.map(|projections| &projections.aliases),
+    )?;
+    changed |= merge_repaired_user_kind(
+        transaction,
+        workspace_key,
+        "user_status",
+        &desired.statuses,
+        previous.map(|projections| &projections.statuses),
+    )?;
+    Ok(changed)
+}
+
+fn merge_repaired_user_kind<T: Serialize>(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    desired: &BTreeMap<String, T>,
+    previous: Option<&BTreeMap<String, T>>,
+) -> Result<bool> {
+    let desired = serialize_repaired_user_kind(desired)?;
+    let previous = previous.map(serialize_repaired_user_kind).transpose()?;
+    let keys = desired
+        .keys()
+        .chain(previous.iter().flat_map(|values| values.keys()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut changed = false;
+    for item_key in keys {
+        let current = transaction
+            .query_row(
+                "SELECT payload_json FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+                params![workspace_key, kind, item_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let desired_payload = desired.get(&item_key);
+        let Some(previous) = previous.as_ref() else {
+            if let (None, Some(desired_payload)) = (current.as_ref(), desired_payload) {
+                changed |= insert_sqlite_payload_if_absent(
+                    transaction,
+                    workspace_key,
+                    kind,
+                    &item_key,
+                    desired_payload,
+                )?;
+            }
+            continue;
+        };
+        let Some(previous_payload) = previous.get(&item_key) else {
+            if let (None, Some(desired_payload)) = (current.as_ref(), desired_payload) {
+                changed |= insert_sqlite_payload_if_absent(
+                    transaction,
+                    workspace_key,
+                    kind,
+                    &item_key,
+                    desired_payload,
+                )?;
+            }
+            continue;
+        };
+        if current.as_ref() != Some(previous_payload) {
+            continue;
+        }
+        changed |= match desired_payload {
+            Some(desired_payload) if desired_payload != previous_payload => {
+                transaction.execute(
+                    "UPDATE workspace_items
+                     SET payload_json = ?4
+                     WHERE workspace_key = ?1
+                       AND kind = ?2
+                       AND item_key = ?3
+                       AND payload_json = ?5",
+                    params![
+                        workspace_key,
+                        kind,
+                        item_key,
+                        desired_payload,
+                        previous_payload
+                    ],
+                )? > 0
+            }
+            Some(_) => false,
+            None => {
+                transaction.execute(
+                    "DELETE FROM workspace_items
+                     WHERE workspace_key = ?1
+                       AND kind = ?2
+                       AND item_key = ?3
+                       AND payload_json = ?4",
+                    params![workspace_key, kind, item_key, previous_payload],
+                )? > 0
+            }
+        };
+    }
+    Ok(changed)
+}
+
+fn serialize_repaired_user_kind<T: Serialize>(
+    values: &BTreeMap<String, T>,
+) -> Result<BTreeMap<String, String>> {
+    values
+        .iter()
+        .map(|(item_key, value)| {
+            Ok((
+                item_key.clone(),
+                serde_json::to_string(value).context("failed to serialize cached user item")?,
+            ))
+        })
+        .collect()
 }
 
 fn user_projection_id(user: &SlackUser) -> Result<String> {
@@ -3816,6 +4060,21 @@ fn upsert_sqlite_item<T: Serialize>(
         params![workspace_key, kind, item_key, payload],
     )? > 0;
     Ok(changed)
+}
+
+fn insert_sqlite_payload_if_absent(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    item_key: &str,
+    payload: &str,
+) -> Result<bool> {
+    Ok(transaction.execute(
+        "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(workspace_key, kind, item_key) DO NOTHING",
+        params![workspace_key, kind, item_key, payload],
+    )? > 0)
 }
 
 fn sync_sqlite_kind<T: Serialize>(
@@ -4218,7 +4477,7 @@ mod tests {
     use super::*;
     use crate::workspace_pipeline::{
         MessageMutationKind, MutationOrigin, StoreBatch, StoreChange, WorkspaceBootstrapData,
-        WorkspaceCoordinator, WorkspaceMutation, WorkspaceRevision,
+        WorkspaceCoordinator, WorkspaceMutation, WorkspaceRevision, WorkspaceStoreProjection,
     };
 
     #[test]
@@ -4424,6 +4683,184 @@ mod tests {
                 store.execute_store_batch(stale).await.unwrap(),
                 StoreBatchExecution::SkippedStale
             );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_workspace_repair_exactly_replaces_timelines_and_merges_users() {
+        let directory = temp_cache_dir("coordinator-complete-store-repair");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let stale_root = SlackMessage {
+                ts: "10.0".into(),
+                ..Default::default()
+            };
+            let stale_reply = SlackMessage {
+                ts: "11.0".into(),
+                thread_ts: Some("10.0".into()),
+                ..Default::default()
+            };
+            let mut stale_catalog = ThreadCatalog::default();
+            stale_catalog.observe_history("C_STALE", &[stale_root.clone(), stale_reply.clone()]);
+            store
+                .store_conversations(&[SlackConversation {
+                    id: "C_STALE".into(),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store
+                .store_user_names(&HashMap::from([(
+                    "U_COMPAT".to_string(),
+                    "Compatibility User".to_string(),
+                )]))
+                .await
+                .unwrap();
+            store
+                .store_user_name("U1", "Newer Compatibility Name")
+                .await
+                .unwrap();
+            let newer_status = SlackUserStatus {
+                text: "Newer compatibility status".into(),
+                emoji: ":wave:".into(),
+                expiration: 0,
+            };
+            store
+                .store_user_status("U1", Some(newer_status.clone()))
+                .await
+                .unwrap();
+            store
+                .store_history("C_STALE", std::slice::from_ref(&stale_root))
+                .await
+                .unwrap();
+            store
+                .store_thread("C_STALE", "10.0", &[stale_root.clone(), stale_reply])
+                .await
+                .unwrap();
+            store
+                .store_thread_catalog(&stale_catalog.into_records())
+                .await
+                .unwrap();
+
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                unread_count: Some(3),
+                extra: HashMap::from([
+                    ("has_unreads".into(), serde_json::json!(true)),
+                    ("last_read".into(), serde_json::json!("1.0")),
+                ]),
+                ..Default::default()
+            };
+            let user = SlackUser {
+                id: Some("U1".into()),
+                real_name: Some("Ada Lovelace".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Stale Coordinator Name".into()),
+                    real_name: Some("Ada Lovelace".into()),
+                    image_72: Some("https://example.test/coordinator.png".into()),
+                    status_text: Some(String::new()),
+                    status_emoji: Some(String::new()),
+                    status_expiration: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let root = SlackMessage {
+                ts: "2.0".into(),
+                reply_count: Some(1),
+                latest_reply: Some("3.0".into()),
+                ..Default::default()
+            };
+            let reply = SlackMessage {
+                ts: "3.0".into(),
+                thread_ts: Some("2.0".into()),
+                ..Default::default()
+            };
+            let mut catalog = ThreadCatalog::default();
+            catalog.observe_history("C1", &[root.clone(), reply.clone()]);
+            let thread_catalog = catalog.into_records();
+            let repair = StoreBatch::new(
+                WorkspaceRevision::INITIAL.successor(),
+                vec![StoreChange::WorkspaceRepaired(WorkspaceStoreProjection {
+                    conversations: vec![conversation.clone()],
+                    users: vec![user],
+                    histories: HashMap::from([("C1".into(), vec![root.clone()])]),
+                    thread_timelines: HashMap::from([(
+                        ("C1".into(), "2.0".into()),
+                        vec![root, reply],
+                    )]),
+                    thread_catalog: thread_catalog.clone(),
+                })],
+            )
+            .unwrap();
+
+            assert_eq!(
+                store.execute_store_repair_batch(repair).await.unwrap(),
+                StoreBatchExecution::Committed
+            );
+            assert_eq!(
+                store.load_conversations().await.unwrap().unwrap(),
+                vec![conversation]
+            );
+            assert!(store.load_history("C_STALE").await.unwrap().is_none());
+            assert!(store
+                .load_thread("C_STALE", "10.0")
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store
+                    .load_history("C1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["2.0"]
+            );
+            assert_eq!(
+                store
+                    .load_thread("C1", "2.0")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["3.0", "2.0"]
+            );
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(
+                bootstrap.user_names,
+                HashMap::from([
+                    ("U1".to_string(), "Newer Compatibility Name".to_string()),
+                    ("U_COMPAT".to_string(), "Compatibility User".to_string(),),
+                ])
+            );
+            assert_eq!(
+                bootstrap.user_full_names.get("U1").map(String::as_str),
+                Some("Ada Lovelace"),
+                "repair must still add coordinator fields missing from the compatibility cache"
+            );
+            assert_eq!(
+                bootstrap.user_avatar_urls.get("U1").map(String::as_str),
+                Some("https://example.test/coordinator.png")
+            );
+            assert_eq!(
+                bootstrap.user_search_aliases.get("U1"),
+                Some(&vec![
+                    "Stale Coordinator Name".to_string(),
+                    "Ada Lovelace".to_string(),
+                ])
+            );
+            assert_eq!(
+                bootstrap.user_statuses.get("U1"),
+                Some(&newer_status),
+                "an explicit stale coordinator clear must not erase a newer compatibility status"
+            );
+            assert_eq!(bootstrap.thread_catalog, thread_catalog);
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -6477,6 +6914,49 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_corrupt_reads_reset_one_observed_generation_once() {
+        let directory = temp_cache_dir("workspace-concurrent-corrupt-read-reset");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let readers_observed_corruption = Arc::new(std::sync::Barrier::new(2));
+            let first_store = store.clone();
+            let first_barrier = Arc::clone(&readers_observed_corruption);
+            let first = async move {
+                first_store
+                    .query_or_reset((), move |_| {
+                        first_barrier.wait();
+                        Err(StoreError::from(
+                            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                        ))
+                    })
+                    .await
+            };
+            let second_store = store.clone();
+            let second_barrier = Arc::clone(&readers_observed_corruption);
+            let second = async move {
+                second_store
+                    .query_or_reset((), move |_| {
+                        second_barrier.wait();
+                        Err(StoreError::from(
+                            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                        ))
+                    })
+                    .await
+            };
+
+            let (first, second) = futures_util::future::join(first, second).await;
+            first.unwrap();
+            second.unwrap();
+            assert_eq!(
+                store.recovery_generation(),
+                1,
+                "readers that observed the same generation must coalesce their reset"
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn store_hub_reuses_one_writer_and_two_query_only_readers() {
         let directory = temp_cache_dir("store-hub-connections");
         runtime().block_on(async {
@@ -7849,7 +8329,11 @@ mod tests {
                 ],
             )
             .unwrap();
-            assert!(!duplicate_batch.is_repair_subsumable());
+            assert!(matches!(
+                duplicate_batch.workspace_repair_replay_changes().as_slice(),
+                [StoreChange::AttentionNotificationClaim { identity }]
+                    if identity == &duplicate_identity
+            ));
             let duplicate = store
                 .execute_store_batch_with_claims(duplicate_batch)
                 .await
