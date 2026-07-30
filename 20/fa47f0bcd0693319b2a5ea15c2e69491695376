@@ -1,0 +1,3 @@
+Issue #11 Phase 3 task 4 CI follow-up: materialize the UI conversation projection before awaiting the persisted projection, satisfying the pinned Rust 1.97 await-holding-refcell-ref lint without changing behavior.
+
+Validated with the sanitized end-to-end recovery regression (1 passed), cargo check for all targets, formatting, and diff checks. Remote CI remains the exact pinned Clippy verification.
