@@ -12999,31 +12999,32 @@ mod tests {
                     .unread_activity_count(),
                 1
             );
-            let pending = workspace
-                .pending_writes
-                .lock()
-                .expect("pending workspace writes lock poisoned");
-            assert_eq!(pending.len(), 1);
-            let changes = pending[0].batch.as_ref().unwrap().changes();
-            assert!(changes.iter().any(|change| matches!(
-                change,
-                StoreChange::MessageDelta {
-                    channel_id,
-                    message,
-                    kind: MessageMutationKind::Posted,
-                } if channel_id == "D1" && message.ts == "1.0"
-            )));
-            assert!(changes.iter().any(|change| matches!(
-                change,
-                StoreChange::ConversationAttentionObserved {
-                    channel_id,
-                    observations,
-                } if channel_id == "D1"
-                    && observations.iter().any(|observation| {
-                        observation.message_ts == "1.0" && observation.record_unread
-                    })
-            )));
-            drop(pending);
+            {
+                let pending = workspace
+                    .pending_writes
+                    .lock()
+                    .expect("pending workspace writes lock poisoned");
+                assert_eq!(pending.len(), 1);
+                let changes = pending[0].batch.as_ref().unwrap().changes();
+                assert!(changes.iter().any(|change| matches!(
+                    change,
+                    StoreChange::MessageDelta {
+                        channel_id,
+                        message,
+                        kind: MessageMutationKind::Posted,
+                    } if channel_id == "D1" && message.ts == "1.0"
+                )));
+                assert!(changes.iter().any(|change| matches!(
+                    change,
+                    StoreChange::ConversationAttentionObserved {
+                        channel_id,
+                        observations,
+                    } if channel_id == "D1"
+                        && observations.iter().any(|observation| {
+                            observation.message_ts == "1.0" && observation.record_unread
+                        })
+                )));
+            }
             let event = receiver.recv().await.unwrap();
             assert!(matches!(
                 event.kind,
