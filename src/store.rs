@@ -1858,6 +1858,7 @@ impl WorkspaceStore {
         .map(|_| ())
     }
 
+    #[allow(dead_code)]
     pub async fn observe_thread_history(
         &self,
         channel_id: &str,
@@ -2884,7 +2885,7 @@ fn apply_store_change(
                     })
                     .collect::<Result<Vec<_>>>()?,
             )?;
-            changed |= sync_thread_records(transaction, workspace_key, thread_catalog)?;
+            changed |= sync_thread_catalog(transaction, workspace_key, thread_catalog)?;
             changed |=
                 sync_reaction_actor_states(transaction, workspace_key, reaction_actor_states)?;
             changed |= upsert_sqlite_item(
@@ -3021,16 +3022,16 @@ fn apply_store_change(
         } => {
             require_store_key("thread channel", &channel_id)?;
             require_store_key("thread timestamp", &thread_ts)?;
-            upsert_sqlite_item(
+            replace_thread_and_channel_root(
                 transaction,
                 workspace_key,
-                "thread_replies",
-                &thread_key(&channel_id, &thread_ts),
-                &pruned_history(normalize_cached_messages(messages)),
+                &channel_id,
+                &thread_ts,
+                messages,
             )
         }
         StoreChange::ThreadCatalogReplaced(records) => {
-            sync_thread_records(transaction, workspace_key, records)
+            sync_thread_catalog(transaction, workspace_key, records)
         }
     }
 }
@@ -3109,6 +3110,55 @@ fn apply_reaction_delta(
     }
     if records_changed {
         changed |= sync_thread_records(transaction, workspace_key, records)?;
+    }
+    Ok(changed)
+}
+
+fn replace_thread_and_channel_root(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    channel_id: &str,
+    thread_ts: &str,
+    messages: Vec<SlackMessage>,
+) -> Result<bool> {
+    let messages = pruned_history(normalize_cached_messages(messages));
+    let mut changed = upsert_sqlite_item(
+        transaction,
+        workspace_key,
+        "thread_replies",
+        &thread_key(channel_id, thread_ts),
+        &messages,
+    )?;
+    let Some(root) = messages.iter().find(|message| message.ts == thread_ts) else {
+        return Ok(changed);
+    };
+    let Some(history) = load_sqlite_item::<Vec<SlackMessage>>(
+        transaction,
+        workspace_key,
+        "channel_history",
+        channel_id,
+    )?
+    else {
+        return Ok(changed);
+    };
+    let mut history = channel_timeline_messages(normalize_cached_messages(history));
+    let original = history.clone();
+    for channel_root in history.iter_mut().filter(|message| message.ts == thread_ts) {
+        channel_root.reply_count = root.reply_count;
+        channel_root.latest_reply.clone_from(&root.latest_reply);
+        channel_root.reply_users.clone_from(&root.reply_users);
+        channel_root.subscribed = root.subscribed;
+        channel_root.unread_count = root.unread_count;
+        channel_root.last_read.clone_from(&root.last_read);
+    }
+    if history != original {
+        changed |= upsert_sqlite_item(
+            transaction,
+            workspace_key,
+            "channel_history",
+            channel_id,
+            &history,
+        )?;
     }
     Ok(changed)
 }
@@ -3975,6 +4025,104 @@ fn sync_reaction_actor_states(
         })
         .collect::<Result<Vec<_>>>()?;
     sync_sqlite_kind(transaction, workspace_key, "reaction_actor_state", states)
+}
+
+fn sync_thread_catalog(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    records: Vec<ThreadRecord>,
+) -> Result<bool> {
+    let root_projections_changed =
+        sync_thread_catalog_root_projections(transaction, workspace_key, &records)?;
+    let records_changed = sync_thread_records(transaction, workspace_key, records)?;
+    Ok(root_projections_changed || records_changed)
+}
+
+fn sync_thread_catalog_root_projections(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    records: &[ThreadRecord],
+) -> Result<bool> {
+    let mut records_by_channel = BTreeMap::<&str, Vec<&ThreadRecord>>::new();
+    for record in records {
+        records_by_channel
+            .entry(record.key.channel_id.as_str())
+            .or_default()
+            .push(record);
+    }
+
+    let mut changed = false;
+    for (channel_id, channel_records) in records_by_channel {
+        let existing_history = load_sqlite_item::<Vec<SlackMessage>>(
+            transaction,
+            workspace_key,
+            "channel_history",
+            channel_id,
+        )?;
+        let original_history = existing_history
+            .clone()
+            .map(normalize_cached_messages)
+            .map(channel_timeline_messages)
+            .unwrap_or_default();
+        let mut history = original_history.clone();
+        let mut threads = load_sqlite_channel_threads(transaction, workspace_key, channel_id)?;
+
+        for record in channel_records {
+            let Some(root) = record.root.as_ref() else {
+                continue;
+            };
+            replace_root_catalog_metadata(&mut history, &mut threads, &record.key.root_ts, root);
+        }
+
+        if history != original_history {
+            changed |= replace_timeline_item(
+                transaction,
+                workspace_key,
+                "channel_history",
+                channel_id,
+                history,
+            )?;
+        }
+        for thread in threads {
+            if thread.messages != thread.original {
+                changed |= replace_timeline_item(
+                    transaction,
+                    workspace_key,
+                    "thread_replies",
+                    &thread.item_key,
+                    thread.messages,
+                )?;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn replace_root_catalog_metadata(
+    history: &mut [SlackMessage],
+    threads: &mut [StoredThreadTimeline],
+    root_ts: &str,
+    root: &SlackMessage,
+) {
+    let replace = |message: &mut SlackMessage| {
+        message.reply_count = root.reply_count;
+        message.latest_reply.clone_from(&root.latest_reply);
+        message.reply_users.clone_from(&root.reply_users);
+        message.subscribed = root.subscribed;
+        message.unread_count = root.unread_count;
+        message.last_read.clone_from(&root.last_read);
+    };
+    for message in history.iter_mut().filter(|message| message.ts == root_ts) {
+        replace(message);
+    }
+    for message in threads
+        .iter_mut()
+        .filter(|thread| thread.root_ts == root_ts)
+        .flat_map(|thread| thread.messages.iter_mut())
+        .filter(|message| message.ts == root_ts)
+    {
+        replace(message);
+    }
 }
 
 fn apply_store_attention_observations(
