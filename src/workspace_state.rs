@@ -210,6 +210,10 @@ impl WorkspaceSessionState {
                     catalog.upsert_authoritative(conversation.clone());
                     application.conversation_changed = true;
                 }
+                WorkspaceChange::ConversationMetadataUpsert(conversation) => {
+                    catalog.upsert_metadata(conversation.clone());
+                    application.conversation_changed = true;
+                }
                 WorkspaceChange::ConversationRemoved { channel_id } => {
                     application.removals.push(ConversationPatchRemoval {
                         channel_id: channel_id.clone(),

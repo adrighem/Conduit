@@ -1,4 +1,7 @@
-use crate::models::{SlackConversation, SlackConversationUnreadSnapshot, SlackUnreadState};
+use crate::models::{
+    conversation_metadata_key_is_unread_owned, SlackConversation, SlackConversationUnreadSnapshot,
+    SlackUnreadState,
+};
 use std::collections::HashMap;
 
 /// The canonical, revision-aware set of conversations for a workspace.
@@ -391,7 +394,7 @@ fn merge_option<T: Clone>(current: &mut Option<T>, incoming: &Option<T>) {
 }
 
 fn is_unread_key(key: &str) -> bool {
-    key.to_ascii_lowercase().contains("unread")
+    conversation_metadata_key_is_unread_owned(key)
 }
 
 #[cfg(test)]
@@ -557,20 +560,37 @@ mod tests {
         let mut cached = conversation("C1");
         cached.name = Some("old".into());
         cached.unread_count = Some(0);
-        cached.extra.insert("has_unreads".to_string(), json!(false));
+        cached.extra.extend(HashMap::from([
+            ("has_unreads".to_string(), json!(false)),
+            ("last_read".to_string(), json!("20.0")),
+            ("latest".to_string(), json!("21.0")),
+            ("mention_count".to_string(), json!(2)),
+            ("is_open".to_string(), json!(true)),
+            (crate::models::LOCAL_READ_TS_KEY.to_string(), json!("20.0")),
+        ]));
         let mut catalog = ConversationCatalog::from_cached([cached]);
 
         let mut stale_details = conversation("C1");
         stale_details.name = Some("renamed".into());
         stale_details.unread_count = Some(9);
-        stale_details
-            .extra
-            .insert("has_unreads".to_string(), json!(true));
+        stale_details.extra.extend(HashMap::from([
+            ("has_unreads".to_string(), json!(true)),
+            ("last_read".to_string(), json!("10.0")),
+            ("latest".to_string(), json!("11.0")),
+            ("mention_count".to_string(), json!(9)),
+            ("is_open".to_string(), json!(false)),
+            (crate::models::LOCAL_READ_TS_KEY.to_string(), json!("10.0")),
+        ]));
         catalog.upsert_metadata(stale_details);
 
         let merged = catalog.get("C1").unwrap();
         assert_eq!(merged.name.as_deref(), Some("renamed"));
         assert_eq!(merged.unread_activity_count(), 0);
+        assert_eq!(merged.last_read_ts(), Some("20.0"));
+        assert_eq!(merged.latest_message_ts(), Some("21.0"));
+        assert_eq!(merged.extra["mention_count"], json!(2));
+        assert_eq!(merged.extra["is_open"], json!(true));
+        assert_eq!(merged.local_read_ts(), Some("20.0"));
 
         let mut new_details = conversation("D1");
         new_details.unread_count = Some(4);

@@ -16,12 +16,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::conversation_catalog::ConversationCatalog;
-#[cfg(test)]
-use crate::models::SlackUnreadState;
 use crate::models::{
     slack_timestamp_is_after, SlackConversation, SlackConversationUnreadSnapshot, SlackMessage,
     SlackUser, SlackUserStatus,
 };
+#[cfg(test)]
+use crate::models::{SlackUnreadState, LOCAL_READ_TS_KEY};
 use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 use crate::workspace_pipeline::{
@@ -32,7 +32,6 @@ pub(crate) const CACHE_VERSION: u32 = 1;
 const DATABASE_SCHEMA_VERSION: u32 = 2;
 const DATABASE_FILENAME: &str = "state.sqlite3";
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
-const LOCAL_READ_TS_KEY: &str = "conduit_local_read_ts";
 const ATTENTION_DELIVERY_KIND: &str = "attention_delivery";
 const ATTENTION_DELIVERY_LEDGER_KEY: &str = "__ledger__";
 const MAX_ATTENTION_DELIVERIES: usize = 512;
@@ -1101,6 +1100,7 @@ impl WorkspaceStore {
 
     /// Merges one cached conversation without replacing newer unread/read
     /// overlays or the rest of the workspace snapshot.
+    #[cfg(test)]
     pub async fn store_conversation(&self, conversation: &SlackConversation) -> Result<()> {
         if conversation.id.trim().is_empty() {
             return Ok(());
@@ -1120,6 +1120,7 @@ impl WorkspaceStore {
         .await
     }
 
+    #[cfg(test)]
     pub async fn merge_conversation(&self, conversation: &SlackConversation) -> Result<()> {
         self.store_conversation(conversation).await
     }
@@ -1145,6 +1146,7 @@ impl WorkspaceStore {
 
     /// Applies a complete server unread snapshot to one cached conversation
     /// atomically, without allowing it to roll back a newer local read.
+    #[cfg(test)]
     pub async fn apply_conversation_unread_snapshot(
         &self,
         snapshot: &SlackConversationUnreadSnapshot,
@@ -1159,28 +1161,10 @@ impl WorkspaceStore {
             let Some(mut conversation) = conversation else {
                 return ConversationRowMutation::Unchanged(false);
             };
-            let local_read = conversation
-                .extra
-                .get(LOCAL_READ_TS_KEY)
-                .and_then(serde_json::Value::as_str);
-            let newer_local_read = local_read.is_some_and(|local| {
-                snapshot
-                    .last_read
-                    .as_deref()
-                    .is_none_or(|server| slack_timestamp_is_after(local, server))
-            });
-            let newer_cached_read = conversation.last_read_ts().is_some_and(|current| {
-                snapshot
-                    .last_read
-                    .as_deref()
-                    .is_some_and(|server| slack_timestamp_is_after(current, server))
-            });
-            if newer_local_read || newer_cached_read {
+            if conversation.unread_snapshot_rewinds_read(&snapshot) {
                 return ConversationRowMutation::Unchanged(false);
             }
-            if local_read.is_some() {
-                conversation.extra.remove(LOCAL_READ_TS_KEY);
-            }
+            conversation.clear_local_read_ts();
             conversation.apply_unread_snapshot(&snapshot);
             ConversationRowMutation::Upsert(conversation, true)
         })
@@ -1210,10 +1194,7 @@ impl WorkspaceStore {
                 "last_read".to_string(),
                 serde_json::Value::String(last_read.clone()),
             );
-            conversation.extra.insert(
-                LOCAL_READ_TS_KEY.to_string(),
-                serde_json::Value::String(last_read),
-            );
+            conversation.set_local_read_ts(&last_read);
         })
         .await
     }
@@ -1257,9 +1238,7 @@ impl WorkspaceStore {
                 ..Default::default()
             });
             if conversation
-                .extra
-                .get(LOCAL_READ_TS_KEY)
-                .and_then(serde_json::Value::as_str)
+                .local_read_ts()
                 .is_some_and(|last_read| !slack_timestamp_is_after(message_ts.as_str(), last_read))
             {
                 return ConversationRowMutation::Unchanged(false);
@@ -1296,11 +1275,7 @@ impl WorkspaceStore {
                             id: channel_id.clone(),
                             ..Default::default()
                         });
-                let local_read = conversation
-                    .extra
-                    .get(LOCAL_READ_TS_KEY)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
+                let local_read = conversation.local_read_ts().map(str::to_string);
                 let mut accepted = Vec::new();
                 for (message_ts, record_unread) in observations {
                     if message_ts.trim().is_empty()
@@ -1362,14 +1337,9 @@ impl WorkspaceStore {
                             id: channel_id.clone(),
                             ..Default::default()
                         });
-                if conversation
-                    .extra
-                    .get(LOCAL_READ_TS_KEY)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|last_read| {
-                        !slack_timestamp_is_after(message_ts.as_str(), last_read)
-                    })
-                {
+                if conversation.local_read_ts().is_some_and(|last_read| {
+                    !slack_timestamp_is_after(message_ts.as_str(), last_read)
+                }) {
                     transaction.rollback()?;
                     return Ok(AttentionDeliveryOutcome {
                         observation: AttentionObservationStatus::AtOrBeforeReadCursor,
@@ -3278,8 +3248,8 @@ fn upsert_sqlite_conversation_metadata(
         .cloned();
     let existing_local_read = existing
         .as_ref()
-        .and_then(|conversation| conversation.extra.get(LOCAL_READ_TS_KEY))
-        .cloned();
+        .and_then(|conversation| conversation.local_read_ts())
+        .map(str::to_string);
     let mut catalog = ConversationCatalog::from_cached(existing);
     catalog.upsert_metadata(conversation);
     let mut conversation = catalog
@@ -3293,9 +3263,7 @@ fn upsert_sqlite_conversation_metadata(
             .insert("last_read".to_string(), last_read);
     }
     if let Some(local_read) = existing_local_read {
-        conversation
-            .extra
-            .insert(LOCAL_READ_TS_KEY.to_string(), local_read);
+        conversation.set_local_read_ts(&local_read);
     }
     if let Some(existing_star) = existing_star {
         conversation.is_starred = Some(existing_star);
@@ -3531,26 +3499,10 @@ fn apply_store_unread_snapshot(
                 ..Default::default()
             },
         );
-    let local_read = conversation
-        .extra
-        .get(LOCAL_READ_TS_KEY)
-        .and_then(serde_json::Value::as_str);
-    let newer_local_read = local_read.is_some_and(|local| {
-        snapshot
-            .last_read
-            .as_deref()
-            .is_none_or(|server| slack_timestamp_is_after(local, server))
-    });
-    let newer_cached_read = conversation.last_read_ts().is_some_and(|current| {
-        snapshot
-            .last_read
-            .as_deref()
-            .is_some_and(|server| slack_timestamp_is_after(current, server))
-    });
-    if newer_local_read || newer_cached_read {
+    if conversation.unread_snapshot_rewinds_read(&snapshot) {
         return Ok(false);
     }
-    conversation.extra.remove(LOCAL_READ_TS_KEY);
+    conversation.clear_local_read_ts();
     conversation.apply_unread_snapshot(&snapshot);
     upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
 }
@@ -4343,6 +4295,80 @@ mod tests {
             let conversations = store.load_conversations().await.unwrap().unwrap();
             assert_eq!(conversations.len(), 1);
             assert_eq!(conversations[0].name.as_deref(), Some("retry-commits"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn conversation_refresh_store_batch_rolls_back_and_recovers_as_one_unit() {
+        let directory = temp_cache_dir("conversation-refresh-store-rollback");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![StoreChange::ConversationUpsert(SlackConversation {
+                            id: "C1".into(),
+                            name: Some("old".into()),
+                            is_starred: Some(true),
+                            unread_count: Some(0),
+                            extra: HashMap::from([("last_read".into(), serde_json::json!("1.0"))]),
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let revision = first_revision.successor();
+            let refresh_changes = vec![
+                StoreChange::ConversationMetadataUpsert(SlackConversation {
+                    id: "C1".into(),
+                    name: Some("renamed".into()),
+                    is_starred: Some(false),
+                    ..Default::default()
+                }),
+                StoreChange::UnreadChanged {
+                    snapshot: SlackConversationUnreadSnapshot {
+                        channel_id: "C1".into(),
+                        unread_state: SlackUnreadState::from_parts(true, true, 3),
+                        last_read: Some("2.0".into()),
+                        latest: Some("3.0".into()),
+                        ..Default::default()
+                    },
+                },
+            ];
+            let mut failing_changes = refresh_changes.clone();
+            failing_changes.push(StoreChange::ConversationRemoved {
+                channel_id: String::new(),
+            });
+            assert!(store
+                .execute_store_batch(StoreBatch::new(revision, failing_changes).unwrap())
+                .await
+                .is_err());
+
+            let rolled_back = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(rolled_back[0].name.as_deref(), Some("old"));
+            assert_eq!(rolled_back[0].is_starred, Some(true));
+            assert_eq!(rolled_back[0].unread_activity_count(), 0);
+            assert_eq!(rolled_back[0].last_read_ts(), Some("1.0"));
+
+            assert_eq!(
+                store
+                    .execute_store_batch(StoreBatch::new(revision, refresh_changes).unwrap())
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+            let recovered = store.load_conversations().await.unwrap().unwrap();
+            assert_eq!(recovered[0].name.as_deref(), Some("renamed"));
+            assert_eq!(recovered[0].is_starred, Some(true));
+            assert_eq!(recovered[0].unread_activity_count(), 3);
+            assert_eq!(recovered[0].last_read_ts(), Some("2.0"));
+            assert_eq!(recovered[0].latest_message_ts(), Some("3.0"));
         });
         let _ = std::fs::remove_dir_all(directory);
     }

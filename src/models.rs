@@ -10,6 +10,17 @@ use crate::rich_message::{MessageAuthor, MessageDocument, MESSAGE_CONTENT_VERSIO
 const CONVERSATION_MEMBER_KEYS: [&str; 2] = ["members", "users"];
 const SEEN_ATTENTION_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
 const MAX_SEEN_ATTENTION_MESSAGES: usize = 512;
+pub(crate) const LOCAL_READ_TS_KEY: &str = "conduit_local_read_ts";
+
+pub(crate) fn conversation_metadata_key_is_unread_owned(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("unread")
+        || matches!(
+            key.as_str(),
+            "last_read" | "latest" | "mention_count" | "is_open"
+        )
+        || key == LOCAL_READ_TS_KEY
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredToken {
@@ -138,6 +149,38 @@ impl SlackConversation {
 
     pub fn last_read_ts(&self) -> Option<&str> {
         self.extra.get("last_read").and_then(Value::as_str)
+    }
+
+    pub(crate) fn local_read_ts(&self) -> Option<&str> {
+        self.extra.get(LOCAL_READ_TS_KEY).and_then(Value::as_str)
+    }
+
+    pub(crate) fn set_local_read_ts(&mut self, ts: &str) {
+        self.extra
+            .insert(LOCAL_READ_TS_KEY.to_string(), Value::String(ts.to_string()));
+    }
+
+    pub(crate) fn clear_local_read_ts(&mut self) {
+        self.extra.remove(LOCAL_READ_TS_KEY);
+    }
+
+    pub(crate) fn unread_snapshot_rewinds_read(
+        &self,
+        snapshot: &SlackConversationUnreadSnapshot,
+    ) -> bool {
+        let newer_local_read = self.local_read_ts().is_some_and(|local| {
+            snapshot
+                .last_read
+                .as_deref()
+                .is_none_or(|server| slack_timestamp_is_after(local, server))
+        });
+        let newer_cached_read = self.last_read_ts().is_some_and(|current| {
+            snapshot
+                .last_read
+                .as_deref()
+                .is_some_and(|server| slack_timestamp_is_after(current, server))
+        });
+        newer_local_read || newer_cached_read
     }
 
     pub fn latest_message_ts(&self) -> Option<&str> {

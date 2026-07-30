@@ -20,9 +20,11 @@ use crate::attention::{
 };
 #[cfg(test)]
 use crate::models::SlackUnreadState;
+#[cfg(test)]
+use crate::models::LOCAL_READ_TS_KEY;
 use crate::models::{
-    slack_timestamp_is_after, SlackConversation, SlackConversationUnreadSnapshot, SlackMessage,
-    SlackUser,
+    conversation_metadata_key_is_unread_owned, slack_timestamp_is_after, SlackConversation,
+    SlackConversationUnreadSnapshot, SlackMessage, SlackUser,
 };
 use crate::thread_catalog::{ThreadRecord, ThreadUnreadState};
 
@@ -90,6 +92,41 @@ pub(crate) struct ConversationMembershipSnapshot {
     pub(crate) starred_ids: Option<HashSet<String>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConversationRefresh {
+    pub(crate) metadata: Option<SlackConversation>,
+    pub(crate) unread: Option<SlackConversationUnreadSnapshot>,
+}
+
+impl ConversationRefresh {
+    pub(crate) fn potential_change_count(&self) -> usize {
+        usize::from(self.metadata.is_some()) + usize::from(self.unread.is_some())
+    }
+
+    fn channel_id(&self) -> Option<&str> {
+        let metadata_id = self
+            .metadata
+            .as_ref()
+            .map(|conversation| conversation.id.as_str());
+        let unread_id = self
+            .unread
+            .as_ref()
+            .map(|snapshot| snapshot.channel_id.as_str());
+        match (metadata_id, unread_id) {
+            (Some(metadata_id), Some(unread_id))
+                if !metadata_id.trim().is_empty()
+                    && !unread_id.trim().is_empty()
+                    && metadata_id == unread_id =>
+            {
+                Some(metadata_id)
+            }
+            (Some(metadata_id), None) if !metadata_id.trim().is_empty() => Some(metadata_id),
+            (None, Some(unread_id)) if !unread_id.trim().is_empty() => Some(unread_id),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct MessagePage {
     pub(crate) messages: Vec<SlackMessage>,
@@ -119,6 +156,7 @@ pub(crate) enum WorkspaceMutation {
     AttentionPreferencesChanged(AttentionPreferences),
     Hydrate(WorkspaceBootstrapData),
     MembershipSnapshot(SnapshotEnvelope<ConversationMembershipSnapshot>),
+    ConversationRefreshBatch(Vec<SnapshotEnvelope<ConversationRefresh>>),
     ConversationUpsert(SlackConversation),
     ConversationStarChanged {
         channel_id: String,
@@ -197,6 +235,7 @@ pub(crate) enum WorkspaceChange {
     BootstrapReset(WorkspaceBootstrapData),
     ConversationsReset(Vec<SlackConversation>),
     ConversationUpsert(SlackConversation),
+    ConversationMetadataUpsert(SlackConversation),
     ConversationRemoved {
         channel_id: String,
     },
@@ -455,6 +494,9 @@ impl WorkspaceCoordinator {
             WorkspaceMutation::Hydrate(data) => self.apply_hydration(data, origin),
             WorkspaceMutation::MembershipSnapshot(snapshot) => {
                 self.apply_membership_snapshot(snapshot)
+            }
+            WorkspaceMutation::ConversationRefreshBatch(refreshes) => {
+                self.apply_conversation_refresh_batch(refreshes)
             }
             WorkspaceMutation::ConversationUpsert(conversation) => {
                 self.apply_conversation_upsert(conversation)
@@ -845,6 +887,66 @@ impl WorkspaceCoordinator {
         self.commit(revision, patch_changes, store_changes)
     }
 
+    fn apply_conversation_refresh_batch(
+        &mut self,
+        refreshes: Vec<SnapshotEnvelope<ConversationRefresh>>,
+    ) -> Option<WorkspaceReduction> {
+        let revision = self.next_revision();
+        let mut patch_changes = Vec::new();
+        let mut store_changes = Vec::new();
+
+        for refresh in refreshes {
+            let base_revision = refresh.base_revision();
+            let mut refresh = refresh.into_data();
+            let Some(channel_id) = refresh.channel_id().map(str::to_string) else {
+                continue;
+            };
+            let Some(entry) = self.conversations.get_mut(&channel_id) else {
+                continue;
+            };
+
+            match refresh.metadata.take() {
+                Some(mut metadata) if entry.metadata_revision <= base_revision => {
+                    sanitize_conversation_refresh_metadata(&mut metadata);
+                    let mut merged = entry.value.clone();
+                    merge_conversation_metadata(&mut merged, &metadata);
+                    if merged != entry.value {
+                        entry.value = merged;
+                        entry.metadata_revision = revision;
+                        patch_changes.push(WorkspaceChange::ConversationMetadataUpsert(
+                            metadata.clone(),
+                        ));
+                        store_changes.push(StoreChange::ConversationMetadataUpsert(metadata));
+                    }
+                }
+                _ => {}
+            }
+
+            match refresh.unread.take() {
+                Some(unread)
+                    if entry.unread_revision <= base_revision
+                        && unread.unread_state.known
+                        && !entry.value.unread_snapshot_rewinds_read(&unread) =>
+                {
+                    let before = entry.value.clone();
+                    entry.value.clear_local_read_ts();
+                    entry.value.apply_unread_snapshot(&unread);
+                    if entry.value != before {
+                        entry.unread_revision = revision;
+                        entry.membership_revision = entry.membership_revision.max(revision);
+                        patch_changes.push(WorkspaceChange::UnreadChanged {
+                            snapshot: unread.clone(),
+                        });
+                        store_changes.push(StoreChange::UnreadChanged { snapshot: unread });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.commit(revision, patch_changes, store_changes)
+    }
+
     fn apply_unread(
         &mut self,
         snapshot: SlackConversationUnreadSnapshot,
@@ -863,13 +965,7 @@ impl WorkspaceCoordinator {
         if self
             .conversations
             .get(&snapshot.channel_id)
-            .and_then(|entry| entry.value.last_read_ts())
-            .is_some_and(|current| {
-                snapshot
-                    .last_read
-                    .as_deref()
-                    .is_some_and(|incoming| slack_timestamp_is_after(current, incoming))
-            })
+            .is_some_and(|entry| entry.value.unread_snapshot_rewinds_read(&snapshot))
         {
             return None;
         }
@@ -888,6 +984,7 @@ impl WorkspaceCoordinator {
                 star_revision: WorkspaceRevision::INITIAL,
             });
         let before = entry.value.clone();
+        entry.value.clear_local_read_ts();
         entry.value.apply_unread_snapshot(&snapshot);
         if entry.value == before {
             return None;
@@ -914,6 +1011,7 @@ impl WorkspaceCoordinator {
         let entry = self.conversations.get_mut(channel_id).unwrap();
         let before = entry.value.clone();
         entry.value.advance_read_cursor(ts, remaining_unread);
+        entry.value.set_local_read_ts(ts);
         if entry.value == before {
             return None;
         }
@@ -2089,10 +2187,19 @@ fn merge_conversation_metadata(current: &mut SlackConversation, incoming: &Slack
     merge_option!(is_archived);
     merge_option!(is_starred);
     for (key, value) in &incoming.extra {
-        if !key.to_ascii_lowercase().contains("unread") && key != "last_read" {
+        if !conversation_metadata_key_is_unread_owned(key) {
             current.extra.insert(key.clone(), value.clone());
         }
     }
+}
+
+fn sanitize_conversation_refresh_metadata(conversation: &mut SlackConversation) {
+    conversation.is_starred = None;
+    conversation.unread_count = None;
+    conversation.attention = None;
+    conversation
+        .extra
+        .retain(|key, _| !conversation_metadata_key_is_unread_owned(key));
 }
 
 fn conversation_supports_stars(conversation: &SlackConversation) -> bool {
@@ -2534,6 +2641,548 @@ mod tests {
         assert_eq!(
             coordinator.conversation("C1").unwrap().latest_message_ts(),
             Some("30.0")
+        );
+    }
+
+    #[test]
+    fn cursorless_unread_snapshot_cannot_bypass_a_newer_local_read_marker() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(conversation(
+            "C1", "general",
+        )));
+        coordinator.apply(WorkspaceMutation::ReadAdvanced {
+            channel_id: "C1".to_string(),
+            ts: "20.0".to_string(),
+            remaining_unread: 0,
+        });
+        let response_base = coordinator.revision();
+
+        assert!(coordinator
+            .apply(WorkspaceMutation::UnreadChanged {
+                snapshot: SlackConversationUnreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 5),
+                    latest: Some("30.0".to_string()),
+                    ..Default::default()
+                },
+                base_revision: response_base,
+            })
+            .is_none());
+        assert_eq!(coordinator.revision(), response_base);
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            0
+        );
+        assert_eq!(
+            coordinator.conversation("C1").unwrap().local_read_ts(),
+            Some("20.0")
+        );
+
+        let acknowledgement = coordinator
+            .apply(WorkspaceMutation::UnreadChanged {
+                snapshot: SlackConversationUnreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, false, 0),
+                    last_read: Some("20.0".to_string()),
+                    latest: Some("30.0".to_string()),
+                    ..Default::default()
+                },
+                base_revision: response_base,
+            })
+            .expect("the server acknowledgement should clear the local marker");
+        assert!(matches!(
+            acknowledgement.patch().changes(),
+            [WorkspaceChange::UnreadChanged { .. }]
+        ));
+        assert_eq!(
+            coordinator.conversation("C1").unwrap().local_read_ts(),
+            None
+        );
+    }
+
+    #[test]
+    fn conversation_refresh_batch_commits_metadata_and_unread_once_without_smuggling_state() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut initial = conversation("C1", "old");
+        initial.is_starred = Some(true);
+        initial.unread_count = Some(1);
+        initial.extra.extend(HashMap::from([
+            ("has_unreads".to_string(), serde_json::json!(true)),
+            ("last_read".to_string(), serde_json::json!("1.0")),
+            ("latest".to_string(), serde_json::json!("2.0")),
+            ("mention_count".to_string(), serde_json::json!(1)),
+            ("is_open".to_string(), serde_json::json!(true)),
+            (LOCAL_READ_TS_KEY.to_string(), serde_json::json!("1.5")),
+        ]));
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![initial],
+            ..Default::default()
+        }));
+        let base_revision = coordinator.revision();
+
+        let metadata = SlackConversation {
+            id: "C1".to_string(),
+            name: Some("renamed".to_string()),
+            is_starred: Some(false),
+            unread_count: Some(99),
+            attention: Some(Default::default()),
+            extra: HashMap::from([
+                ("has_unreads".to_string(), serde_json::json!(true)),
+                ("unread_count_display".to_string(), serde_json::json!(99)),
+                ("last_read".to_string(), serde_json::json!("0.5")),
+                ("latest".to_string(), serde_json::json!("99.0")),
+                ("mention_count".to_string(), serde_json::json!(99)),
+                ("is_open".to_string(), serde_json::json!(true)),
+                (LOCAL_READ_TS_KEY.to_string(), serde_json::json!("99.0")),
+            ]),
+            ..Default::default()
+        };
+        let unread = SlackConversationUnreadSnapshot {
+            channel_id: "C1".to_string(),
+            unread_state: SlackUnreadState::from_parts(true, true, 4),
+            last_read: Some("3.0".to_string()),
+            latest: Some("4.0".to_string()),
+            mention_count: Some(2),
+            is_open: Some(false),
+            ..Default::default()
+        };
+        let reduction = coordinator
+            .apply(WorkspaceMutation::ConversationRefreshBatch(vec![
+                SnapshotEnvelope::new(
+                    base_revision,
+                    ConversationRefresh {
+                        metadata: Some(metadata),
+                        unread: Some(unread.clone()),
+                    },
+                ),
+            ]))
+            .expect("the refresh should update both independent domains");
+
+        assert_eq!(reduction.patch().revision(), base_revision.successor());
+        assert_eq!(coordinator.revision(), base_revision.successor());
+        let [WorkspaceChange::ConversationMetadataUpsert(metadata_patch), WorkspaceChange::UnreadChanged {
+            snapshot: unread_patch,
+        }] = reduction.patch().changes()
+        else {
+            panic!("one refresh should produce one ordered metadata/unread patch");
+        };
+        assert_eq!(metadata_patch.name.as_deref(), Some("renamed"));
+        assert_eq!(metadata_patch.is_starred, None);
+        assert_eq!(metadata_patch.unread_count, None);
+        assert_eq!(metadata_patch.attention, None);
+        for protected in [
+            "has_unreads",
+            "unread_count_display",
+            "last_read",
+            "latest",
+            "mention_count",
+            "is_open",
+            LOCAL_READ_TS_KEY,
+        ] {
+            assert!(
+                !metadata_patch.extra.contains_key(protected),
+                "metadata patch leaked unread-owned key {protected}"
+            );
+        }
+        assert_eq!(unread_patch, &unread);
+
+        let store_batch = reduction
+            .store_batch()
+            .expect("metadata and unread should share one atomic store batch");
+        assert_eq!(store_batch.revision(), reduction.patch().revision());
+        let [StoreChange::ConversationMetadataUpsert(stored_metadata), StoreChange::UnreadChanged {
+            snapshot: stored_unread,
+        }] = store_batch.changes()
+        else {
+            panic!("one refresh should produce one ordered metadata/unread store batch");
+        };
+        assert_eq!(stored_metadata, metadata_patch);
+        assert_eq!(stored_unread, &unread);
+
+        let current = coordinator.conversation("C1").unwrap();
+        assert_eq!(current.name.as_deref(), Some("renamed"));
+        assert!(current.is_starred());
+        assert_eq!(current.raw_unread_activity_count(), 4);
+        assert_eq!(current.last_read_ts(), Some("3.0"));
+        assert_eq!(current.local_read_ts(), None);
+        assert_eq!(current.latest_message_ts(), Some("4.0"));
+        assert_eq!(
+            current
+                .extra
+                .get("is_open")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            current
+                .extra
+                .get("mention_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn conversation_refresh_rejects_blank_or_mismatched_component_ids_as_one_noop() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![conversation("C1", "one"), conversation("C2", "two")],
+            ..Default::default()
+        }));
+        let base_revision = coordinator.revision();
+
+        let invalid = vec![
+            ConversationRefresh {
+                metadata: Some(conversation("C1", "blank unread id")),
+                unread: Some(SlackConversationUnreadSnapshot {
+                    channel_id: " ".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 1),
+                    ..Default::default()
+                }),
+            },
+            ConversationRefresh {
+                metadata: Some(conversation("", "blank metadata id")),
+                unread: Some(SlackConversationUnreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 2),
+                    ..Default::default()
+                }),
+            },
+            ConversationRefresh {
+                metadata: Some(conversation("C1", "mismatched")),
+                unread: Some(SlackConversationUnreadSnapshot {
+                    channel_id: "C2".to_string(),
+                    unread_state: SlackUnreadState::from_parts(true, true, 3),
+                    ..Default::default()
+                }),
+            },
+        ];
+        assert!(coordinator
+            .apply(WorkspaceMutation::ConversationRefreshBatch(
+                invalid
+                    .into_iter()
+                    .map(|refresh| SnapshotEnvelope::new(base_revision, refresh))
+                    .collect(),
+            ))
+            .is_none());
+        assert_eq!(coordinator.revision(), base_revision);
+        assert_eq!(
+            coordinator.conversation("C1").unwrap().name.as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            0
+        );
+        assert_eq!(
+            coordinator.conversation("C2").unwrap().name.as_deref(),
+            Some("two")
+        );
+        assert_eq!(
+            coordinator
+                .conversation("C2")
+                .unwrap()
+                .unread_activity_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn stale_or_unknown_refresh_unread_cannot_apply_metadata_is_open() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut initial = conversation("D1", "direct");
+        initial.is_im = Some(true);
+        initial
+            .extra
+            .insert("is_open".to_string(), serde_json::json!(true));
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![initial],
+            ..Default::default()
+        }));
+        let stale_unread_base = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::ReadAdvanced {
+            channel_id: "D1".to_string(),
+            ts: "20.0".to_string(),
+            remaining_unread: 0,
+        });
+
+        let stale_unread = coordinator
+            .apply(WorkspaceMutation::ConversationRefreshBatch(vec![
+                SnapshotEnvelope::new(
+                    stale_unread_base,
+                    ConversationRefresh {
+                        metadata: Some(SlackConversation {
+                            id: "D1".to_string(),
+                            name: Some("stale unread details".to_string()),
+                            extra: HashMap::from([(
+                                "is_open".to_string(),
+                                serde_json::json!(false),
+                            )]),
+                            ..Default::default()
+                        }),
+                        unread: Some(SlackConversationUnreadSnapshot {
+                            channel_id: "D1".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 9),
+                            last_read: Some("10.0".to_string()),
+                            is_open: Some(false),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+            ]))
+            .expect("fresh metadata should apply independently from stale unread");
+        assert!(matches!(
+            stale_unread.patch().changes(),
+            [WorkspaceChange::ConversationMetadataUpsert(metadata)]
+                if metadata.name.as_deref() == Some("stale unread details")
+                    && !metadata.extra.contains_key("is_open")
+        ));
+
+        let unknown_base = coordinator.revision();
+        let unknown_unread = coordinator
+            .apply(WorkspaceMutation::ConversationRefreshBatch(vec![
+                SnapshotEnvelope::new(
+                    unknown_base,
+                    ConversationRefresh {
+                        metadata: Some(SlackConversation {
+                            id: "D1".to_string(),
+                            name: Some("unknown unread details".to_string()),
+                            extra: HashMap::from([(
+                                "is_open".to_string(),
+                                serde_json::json!(false),
+                            )]),
+                            ..Default::default()
+                        }),
+                        unread: Some(SlackConversationUnreadSnapshot {
+                            channel_id: "D1".to_string(),
+                            unread_state: SlackUnreadState::default(),
+                            is_open: Some(false),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+            ]))
+            .expect("metadata should still apply when unread state is unknown");
+        assert!(matches!(
+            unknown_unread.patch().changes(),
+            [WorkspaceChange::ConversationMetadataUpsert(metadata)]
+                if metadata.name.as_deref() == Some("unknown unread details")
+                    && !metadata.extra.contains_key("is_open")
+        ));
+
+        let current = coordinator.conversation("D1").unwrap();
+        assert_eq!(current.name.as_deref(), Some("unknown unread details"));
+        assert_eq!(
+            current
+                .extra
+                .get("is_open")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(current.last_read_ts(), Some("20.0"));
+        assert_eq!(current.local_read_ts(), Some("20.0"));
+        assert_eq!(current.unread_activity_count(), 0);
+    }
+
+    #[test]
+    fn conversation_refresh_domains_accept_independently_and_never_resurrect_removals() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![
+                conversation("C1", "cached"),
+                conversation("C2", "remove me"),
+            ],
+            ..Default::default()
+        }));
+        let stale_metadata_base = coordinator.revision();
+        coordinator.apply_from(
+            MutationOrigin::Realtime,
+            WorkspaceMutation::ConversationUpsert(conversation("C1", "realtime")),
+        );
+
+        let unread = SlackConversationUnreadSnapshot {
+            channel_id: "C1".to_string(),
+            unread_state: SlackUnreadState::from_parts(true, true, 5),
+            last_read: Some("2.0".to_string()),
+            ..Default::default()
+        };
+        let unread_only = coordinator
+            .apply(WorkspaceMutation::ConversationRefreshBatch(vec![
+                SnapshotEnvelope::new(
+                    stale_metadata_base,
+                    ConversationRefresh {
+                        metadata: Some(conversation("C1", "stale details")),
+                        unread: Some(unread.clone()),
+                    },
+                ),
+            ]))
+            .expect("stale metadata must not block fresh unread state");
+        assert!(matches!(
+            unread_only.patch().changes(),
+            [WorkspaceChange::UnreadChanged { snapshot }] if snapshot == &unread
+        ));
+        assert!(matches!(
+            unread_only.store_batch().unwrap().changes(),
+            [StoreChange::UnreadChanged { snapshot }] if snapshot == &unread
+        ));
+        assert_eq!(
+            coordinator.conversation("C1").unwrap().name.as_deref(),
+            Some("realtime")
+        );
+
+        let stale_unread_base = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::ReadAdvanced {
+            channel_id: "C1".to_string(),
+            ts: "20.0".to_string(),
+            remaining_unread: 0,
+        });
+        let metadata_only = coordinator
+            .apply(WorkspaceMutation::ConversationRefreshBatch(vec![
+                SnapshotEnvelope::new(
+                    stale_unread_base,
+                    ConversationRefresh {
+                        metadata: Some(conversation("C1", "fresh details")),
+                        unread: Some(SlackConversationUnreadSnapshot {
+                            channel_id: "C1".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 9),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+            ]))
+            .expect("stale unread state must not block fresh metadata");
+        assert!(matches!(
+            metadata_only.patch().changes(),
+            [WorkspaceChange::ConversationMetadataUpsert(conversation)]
+                if conversation.name.as_deref() == Some("fresh details")
+                    && conversation.unread_count.is_none()
+        ));
+        assert!(matches!(
+            metadata_only.store_batch().unwrap().changes(),
+            [StoreChange::ConversationMetadataUpsert(conversation)]
+                if conversation.name.as_deref() == Some("fresh details")
+                    && conversation.unread_activity_count() == 0
+        ));
+
+        let removed_base = coordinator.revision();
+        coordinator.apply(WorkspaceMutation::ConversationRemove {
+            channel_id: "C2".to_string(),
+        });
+        let removal_revision = coordinator.revision();
+        assert!(coordinator
+            .apply(WorkspaceMutation::ConversationRefreshBatch(vec![
+                SnapshotEnvelope::new(
+                    removed_base,
+                    ConversationRefresh {
+                        metadata: Some(conversation("C2", "resurrected")),
+                        unread: Some(SlackConversationUnreadSnapshot {
+                            channel_id: "C2".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 1),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+            ]))
+            .is_none());
+        assert_eq!(coordinator.revision(), removal_revision);
+        assert!(coordinator.conversation("C2").is_none());
+    }
+
+    #[test]
+    fn multi_conversation_refresh_uses_item_bases_and_resolves_duplicates_first() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![conversation("C1", "one"), conversation("C2", "two")],
+            ..Default::default()
+        }));
+        let stale_base = coordinator.revision();
+        coordinator.apply_from(
+            MutationOrigin::Realtime,
+            WorkspaceMutation::ConversationUpsert(conversation("C1", "realtime")),
+        );
+        let fresh_base = coordinator.revision();
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::ConversationRefreshBatch(vec![
+                SnapshotEnvelope::new(
+                    stale_base,
+                    ConversationRefresh {
+                        metadata: Some(conversation("C1", "stale")),
+                        unread: Some(SlackConversationUnreadSnapshot {
+                            channel_id: "C1".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 1),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+                SnapshotEnvelope::new(
+                    fresh_base,
+                    ConversationRefresh {
+                        metadata: Some(conversation("C2", "first")),
+                        unread: Some(SlackConversationUnreadSnapshot {
+                            channel_id: "C2".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 2),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+                SnapshotEnvelope::new(
+                    fresh_base,
+                    ConversationRefresh {
+                        metadata: Some(conversation("C2", "duplicate")),
+                        unread: Some(SlackConversationUnreadSnapshot {
+                            channel_id: "C2".to_string(),
+                            unread_state: SlackUnreadState::from_parts(true, true, 9),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+            ]))
+            .expect("the bounded refresh should commit all accepted items together");
+
+        assert_eq!(coordinator.revision(), fresh_base.successor());
+        assert_eq!(reduction.patch().revision(), fresh_base.successor());
+        assert_eq!(reduction.patch().changes().len(), 3);
+        assert_eq!(reduction.store_batch().unwrap().changes().len(), 3);
+        assert!(matches!(
+            reduction.patch().changes(),
+            [
+                WorkspaceChange::UnreadChanged { snapshot: first },
+                WorkspaceChange::ConversationMetadataUpsert(second),
+                WorkspaceChange::UnreadChanged { snapshot: third },
+            ] if first.channel_id == "C1"
+                && second.id == "C2"
+                && second.name.as_deref() == Some("first")
+                && third.channel_id == "C2"
+                && third.unread_state.display_count == 2
+        ));
+        assert_eq!(
+            coordinator.conversation("C1").unwrap().name.as_deref(),
+            Some("realtime")
+        );
+        assert_eq!(
+            coordinator
+                .conversation("C1")
+                .unwrap()
+                .unread_activity_count(),
+            1
+        );
+        assert_eq!(
+            coordinator.conversation("C2").unwrap().name.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            coordinator
+                .conversation("C2")
+                .unwrap()
+                .unread_activity_count(),
+            2
         );
     }
 
