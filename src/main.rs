@@ -41,6 +41,7 @@ mod rendering;
 mod rich_message;
 mod rich_message_normalize;
 mod runtime;
+mod runtime_sync;
 mod search;
 mod services;
 mod shortcuts;

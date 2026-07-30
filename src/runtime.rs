@@ -35,6 +35,7 @@ use crate::models::{
     SlackUserGroup, SlackUserStatus, StoredToken,
 };
 use crate::realtime::RealtimeStatus;
+use crate::runtime_sync::RuntimeSyncScheduler;
 use crate::services::conversation_history::{recent_history_preview, ConversationHistoryService};
 use crate::slack::{
     DownloadedPreviewAsset, SlackApi, SlackError, SlackErrorCategory, SlackMessagePage,
@@ -44,6 +45,7 @@ use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketMode
 use crate::store::{
     StoreBatchExecution, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
 };
+use crate::sync_scheduler::SchedulerConfig;
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
     MessageAttentionEffect, MessageChange, MessageMutationKind, MutationOrigin, ReactionMutation,
@@ -63,6 +65,9 @@ const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
 const BACKGROUND_TASK_CONCURRENCY: usize = 3;
 const IMAGE_TASK_CONCURRENCY: usize = 4;
 const UPLOAD_TASK_CONCURRENCY: usize = 2;
+const SYNC_TASK_ADMISSION_CAPACITY: usize = 64;
+const SYNC_TASK_RUNNING_CAPACITY: usize = 8;
+const SYNC_TASK_STARVATION_BOUND: u64 = 8;
 const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const ATTACHMENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -2187,10 +2192,46 @@ struct ActiveRequest {
     task_id: u64,
 }
 
+fn runtime_sync_scheduler() -> RuntimeSyncScheduler {
+    RuntimeSyncScheduler::new(
+        SchedulerConfig::new(
+            SYNC_TASK_ADMISSION_CAPACITY,
+            SYNC_TASK_RUNNING_CAPACITY,
+            SYNC_TASK_STARVATION_BOUND,
+        )
+        .expect("runtime sync scheduler configuration must be valid"),
+    )
+}
+
+fn combine_runtime_shutdown_completions(
+    mut completions: Vec<watch::Receiver<bool>>,
+) -> Option<watch::Receiver<bool>> {
+    completions.retain(|completion| !*completion.borrow());
+    match completions.len() {
+        0 => None,
+        1 => completions.pop(),
+        _ => {
+            let (completed, receiver) = watch::channel(false);
+            tokio::spawn(async move {
+                for mut completion in completions {
+                    while !*completion.borrow() {
+                        if completion.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                completed.send_replace(true);
+            });
+            Some(receiver)
+        }
+    }
+}
+
 struct RuntimeState {
     active_session: SessionId,
     connection: Option<RuntimeConnection>,
     attention_preferences: AttentionPreferences,
+    sync_scheduler: RuntimeSyncScheduler,
     socket_mode_supervisor: Option<SocketModeSupervisorHandle>,
     tasks: HashMap<u64, tokio::task::AbortHandle>,
     task_requests: HashMap<u64, TrackedRequest>,
@@ -2207,6 +2248,7 @@ impl RuntimeState {
             active_session,
             connection: None,
             attention_preferences: AttentionPreferences::default(),
+            sync_scheduler: runtime_sync_scheduler(),
             socket_mode_supervisor: None,
             tasks: HashMap::new(),
             task_requests: HashMap::new(),
@@ -2219,6 +2261,7 @@ impl RuntimeState {
     }
 
     fn begin_session_replacement(&mut self) -> Option<watch::Receiver<bool>> {
+        let sync_completion = self.sync_scheduler.begin_shutdown();
         for (_, task) in self.tasks.drain() {
             task.abort();
         }
@@ -2228,15 +2271,23 @@ impl RuntimeState {
         self.active_navigation.clear();
         self.latest_navigation.clear();
         self.connection = None;
-        self.socket_mode_supervisor
+        let socket_completion = self
+            .socket_mode_supervisor
             .as_ref()
-            .map(SocketModeSupervisorHandle::cancel)
+            .map(SocketModeSupervisorHandle::cancel);
+        combine_runtime_shutdown_completions(
+            socket_completion
+                .into_iter()
+                .chain([sync_completion])
+                .collect(),
+        )
     }
 
     fn finish_session_replacement(&mut self, session: SessionId) {
         if let Some(supervisor) = self.socket_mode_supervisor.take() {
             supervisor.task.abort();
         }
+        self.sync_scheduler = runtime_sync_scheduler();
         self.active_session = session;
     }
 
@@ -19133,6 +19184,90 @@ mod tests {
                     .expect("runtime state lock poisoned")
                     .active_session,
                 second_session
+            );
+        });
+    }
+
+    #[test]
+    fn replacing_session_drains_scheduled_durable_work_before_reopening() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let first_session = SessionId::default().next();
+            let second_session = first_session.next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(first_session)));
+            let scheduler = state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .sync_scheduler
+                .clone();
+            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let _ = scheduler
+                .admit(
+                    crate::sync_scheduler::SyncJob::new(
+                        crate::sync_scheduler::SyncJobId::new(1),
+                        crate::sync_scheduler::CancellationId::new(1),
+                        crate::sync_scheduler::SyncTargetKey::new(
+                            crate::sync_scheduler::SyncTargetKind::Workspace,
+                            1,
+                        ),
+                        crate::sync_scheduler::SyncPriority::Interactive,
+                        crate::sync_scheduler::SyncDurability::DurableAction,
+                        crate::sync_scheduler::FreshnessPolicy::Always,
+                        crate::sync_scheduler::ReplacementClass::Never,
+                        crate::sync_scheduler::RetryPolicy::Never,
+                    )
+                    .unwrap(),
+                    None,
+                    crate::runtime_sync::RuntimeSyncWork::new({
+                        let started = Arc::clone(&started);
+                        let gate = Arc::clone(&gate);
+                        move |_| {
+                            let started = Arc::clone(&started);
+                            let gate = Arc::clone(&gate);
+                            async move {
+                                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                gate.notified().await;
+                                crate::sync_scheduler::JobOutcome::Succeeded
+                            }
+                        }
+                    }),
+                )
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while started.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("durable scheduled work did not start");
+
+            let replacement = replace_runtime_session(&state, second_session);
+            tokio::pin!(replacement);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut replacement)
+                    .await
+                    .is_err(),
+                "session replacement must drain accepted durable sync work"
+            );
+            gate.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), replacement)
+                .await
+                .expect("session replacement did not drain durable sync work");
+
+            assert_eq!(
+                scheduler.shutdown_phase(),
+                crate::sync_scheduler::ShutdownPhase::Drained
+            );
+            let state = state.lock().expect("runtime state lock poisoned");
+            assert_eq!(state.active_session, second_session);
+            assert_eq!(
+                state.sync_scheduler.shutdown_phase(),
+                crate::sync_scheduler::ShutdownPhase::Open
             );
         });
     }
