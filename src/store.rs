@@ -25,7 +25,8 @@ use crate::models::{SlackUnreadState, LOCAL_READ_TS_KEY};
 use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 use crate::workspace_pipeline::{
-    same_message_identity, MessageMutationKind, StoreBatch, StoreChange, WorkspaceRevision,
+    same_message_identity, ConversationAttentionObservation, MessageMutationKind, StoreBatch,
+    StoreChange, WorkspaceRevision,
 };
 
 pub(crate) const CACHE_VERSION: u32 = 1;
@@ -1188,8 +1189,12 @@ impl WorkspaceStore {
                 .latest_message_ts()
                 .is_none_or(|latest| latest <= last_read.as_str());
             if reached_latest {
-                conversation.clear_unread_activity();
+                conversation.clear_raw_unread_activity();
+                if conversation.attention.is_none() {
+                    conversation.clear_attention_activity();
+                }
             }
+            conversation.acknowledge_attention_through(&last_read);
             conversation.extra.insert(
                 "last_read".to_string(),
                 serde_json::Value::String(last_read.clone()),
@@ -1256,7 +1261,21 @@ impl WorkspaceStore {
         channel_id: &str,
         observations: Vec<(String, bool)>,
     ) -> Result<Vec<String>> {
-        if channel_id.trim().is_empty() || observations.is_empty() {
+        if channel_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let observations = observations
+            .into_iter()
+            .filter(|(message_ts, _)| !message_ts.trim().is_empty())
+            .map(
+                |(message_ts, record_unread)| ConversationAttentionObservation {
+                    message_ts,
+                    record_unread,
+                },
+            )
+            .collect::<Vec<_>>();
+        if observations.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -1269,35 +1288,17 @@ impl WorkspaceStore {
             .write(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let mut conversation =
-                    load_sqlite_conversation(&transaction, &workspace_key, &channel_id)?
-                        .unwrap_or_else(|| SlackConversation {
-                            id: channel_id.clone(),
-                            ..Default::default()
-                        });
-                let local_read = conversation.local_read_ts().map(str::to_string);
-                let mut accepted = Vec::new();
-                for (message_ts, record_unread) in observations {
-                    if message_ts.trim().is_empty()
-                        || local_read.as_deref().is_some_and(|last_read| {
-                            !slack_timestamp_is_after(&message_ts, last_read)
-                        })
-                        || !conversation.observe_attention_message_at(&message_ts, record_unread)
-                    {
-                        continue;
-                    }
-                    accepted.push(message_ts);
-                }
+                let (changed, accepted) = apply_store_attention_observations(
+                    &transaction,
+                    &workspace_key,
+                    &workspace_id,
+                    &channel_id,
+                    &observations,
+                )?;
                 if accepted.is_empty() {
                     transaction.rollback()?;
                     return Ok(accepted);
                 }
-                let changed = upsert_sqlite_conversation(
-                    &transaction,
-                    &workspace_key,
-                    &workspace_id,
-                    &conversation,
-                )?;
                 finish_sqlite_transaction(transaction, changed)?;
                 Ok(accepted)
             })
@@ -2710,6 +2711,17 @@ fn apply_store_change(
             conversation.is_starred = Some(starred);
             upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)
         }
+        StoreChange::ConversationAttentionObserved {
+            channel_id,
+            observations,
+        } => apply_store_attention_observations(
+            transaction,
+            workspace_key,
+            workspace_id,
+            &channel_id,
+            &observations,
+        )
+        .map(|(changed, _)| changed),
         StoreChange::ConversationRemoved { channel_id } => {
             require_store_key("conversation", &channel_id)?;
             Ok(transaction.execute(
@@ -3477,6 +3489,54 @@ fn sync_thread_records(
         })
         .collect::<Result<Vec<_>>>()?;
     sync_sqlite_kind(transaction, workspace_key, "thread_record", records)
+}
+
+fn apply_store_attention_observations(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    workspace_id: &str,
+    channel_id: &str,
+    observations: &[ConversationAttentionObservation],
+) -> Result<(bool, Vec<String>)> {
+    require_store_key("conversation attention", channel_id)?;
+    if observations.is_empty() {
+        return Err(StoreError::rejected_update(
+            "conversation attention observations must not be empty",
+        ));
+    }
+    if observations
+        .iter()
+        .any(|observation| observation.message_ts.trim().is_empty())
+    {
+        return Err(StoreError::rejected_update(
+            "conversation attention message timestamp must not be empty",
+        ));
+    }
+
+    let mut conversation = load_sqlite_conversation(transaction, workspace_key, channel_id)?
+        .unwrap_or_else(|| SlackConversation {
+            id: channel_id.to_string(),
+            ..Default::default()
+        });
+    let local_read = conversation.local_read_ts().map(str::to_string);
+    let mut accepted = Vec::new();
+    for observation in observations {
+        if local_read
+            .as_deref()
+            .is_some_and(|last_read| !slack_timestamp_is_after(&observation.message_ts, last_read))
+            || !conversation
+                .observe_attention_message_at(&observation.message_ts, observation.record_unread)
+        {
+            continue;
+        }
+        accepted.push(observation.message_ts.clone());
+    }
+    if accepted.is_empty() {
+        return Ok((false, accepted));
+    }
+    let changed =
+        upsert_sqlite_conversation(transaction, workspace_key, workspace_id, &conversation)?;
+    Ok((changed, accepted))
 }
 
 fn apply_store_unread_snapshot(
@@ -4369,6 +4429,236 @@ mod tests {
             assert_eq!(recovered[0].unread_activity_count(), 3);
             assert_eq!(recovered[0].last_read_ts(), Some("2.0"));
             assert_eq!(recovered[0].latest_message_ts(), Some("3.0"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn conversation_attention_store_changes_are_idempotent_and_local_read_safe() {
+        let directory = temp_cache_dir("conversation-attention-semantic-store-change");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let mut revision = WorkspaceRevision::INITIAL.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![StoreChange::ConversationUpsert(SlackConversation {
+                            id: "C1".into(),
+                            name: Some("general".into()),
+                            is_starred: Some(true),
+                            unread_count: Some(5),
+                            extra: HashMap::from([
+                                ("has_unreads".into(), serde_json::json!(true)),
+                                ("last_read".into(), serde_json::json!("10.0")),
+                                ("topic".into(), serde_json::json!("Keep me")),
+                            ]),
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            revision = revision.successor();
+            let observation = StoreChange::ConversationAttentionObserved {
+                channel_id: "C1".into(),
+                observations: vec![ConversationAttentionObservation {
+                    message_ts: "11.0".into(),
+                    record_unread: true,
+                }],
+            };
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(revision, vec![observation.clone()]).unwrap()
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+            revision = revision.successor();
+            assert_eq!(
+                store
+                    .execute_store_batch(StoreBatch::new(revision, vec![observation]).unwrap())
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Unchanged
+            );
+            let after_duplicate = store.load_conversations().await.unwrap().unwrap();
+            let after_duplicate = &after_duplicate[0];
+            assert_eq!(after_duplicate.unread_activity_count(), 1);
+            assert_eq!(after_duplicate.raw_unread_activity_count(), 5);
+            assert!(after_duplicate.is_starred());
+            assert_eq!(after_duplicate.name.as_deref(), Some("general"));
+            assert_eq!(
+                after_duplicate.extra.get("topic"),
+                Some(&serde_json::json!("Keep me"))
+            );
+
+            store
+                .clear_conversation_unread_state("C1", "20.0")
+                .await
+                .unwrap();
+            revision = revision.successor();
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            revision,
+                            vec![StoreChange::ConversationAttentionObserved {
+                                channel_id: "C1".into(),
+                                observations: vec![ConversationAttentionObservation {
+                                    message_ts: "19.0".into(),
+                                    record_unread: true,
+                                }],
+                            }],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Unchanged
+            );
+            let after_stale = store.load_conversations().await.unwrap().unwrap();
+            let after_stale = &after_stale[0];
+            assert_eq!(after_stale.unread_activity_count(), 0);
+            assert_eq!(after_stale.raw_unread_activity_count(), 0);
+            assert_eq!(after_stale.last_read_ts(), Some("20.0"));
+            assert_eq!(after_stale.local_read_ts(), Some("20.0"));
+            assert!(after_stale.is_starred());
+            assert_eq!(after_stale.name.as_deref(), Some("general"));
+            assert_eq!(
+                after_stale.extra.get("topic"),
+                Some(&serde_json::json!("Keep me"))
+            );
+
+            revision = revision.successor();
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            revision,
+                            vec![StoreChange::ConversationAttentionObserved {
+                                channel_id: "C1".into(),
+                                observations: vec![ConversationAttentionObservation {
+                                    message_ts: "21.0".into(),
+                                    record_unread: true,
+                                }],
+                            }],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+            let after_new = store.load_conversations().await.unwrap().unwrap();
+            let after_new = &after_new[0];
+            assert_eq!(after_new.unread_activity_count(), 1);
+            assert_eq!(after_new.raw_unread_activity_count(), 0);
+            assert_eq!(after_new.last_read_ts(), Some("20.0"));
+            assert_eq!(after_new.local_read_ts(), Some("20.0"));
+            assert!(after_new.is_starred());
+            assert_eq!(after_new.name.as_deref(), Some("general"));
+
+            store
+                .clear_conversation_unread_state("C1", "20.0")
+                .await
+                .unwrap();
+            let after_partial_read = store.load_conversations().await.unwrap().unwrap();
+            let after_partial_read = &after_partial_read[0];
+            assert_eq!(
+                after_partial_read.unread_activity_count(),
+                1,
+                "a read cursor must preserve semantic unread observations after it"
+            );
+            assert_eq!(after_partial_read.raw_unread_activity_count(), 0);
+            assert_eq!(after_partial_read.last_read_ts(), Some("20.0"));
+            assert_eq!(after_partial_read.local_read_ts(), Some("20.0"));
+
+            revision = revision.successor();
+            assert!(store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![
+                            StoreChange::HistoryReplaced {
+                                channel_id: "C1".into(),
+                                messages: vec![SlackMessage {
+                                    ts: "22.0".into(),
+                                    text: Some("must roll back".into()),
+                                    ..Default::default()
+                                }],
+                            },
+                            StoreChange::ConversationAttentionObserved {
+                                channel_id: "C1".into(),
+                                observations: vec![ConversationAttentionObservation {
+                                    message_ts: " ".into(),
+                                    record_unread: true,
+                                }],
+                            },
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_err());
+            assert!(store.load_history("C1").await.unwrap().is_none());
+
+            assert!(store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![
+                            StoreChange::HistoryReplaced {
+                                channel_id: "C1".into(),
+                                messages: vec![SlackMessage {
+                                    ts: "23.0".into(),
+                                    text: Some("must also roll back".into()),
+                                    ..Default::default()
+                                }],
+                            },
+                            StoreChange::ConversationAttentionObserved {
+                                channel_id: " ".into(),
+                                observations: vec![ConversationAttentionObservation {
+                                    message_ts: "23.0".into(),
+                                    record_unread: true,
+                                }],
+                            },
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_err());
+            assert!(store.load_history("C1").await.unwrap().is_none());
+
+            assert!(store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![
+                            StoreChange::HistoryReplaced {
+                                channel_id: "C1".into(),
+                                messages: vec![SlackMessage {
+                                    ts: "24.0".into(),
+                                    text: Some("empty observations must roll back".into()),
+                                    ..Default::default()
+                                }],
+                            },
+                            StoreChange::ConversationAttentionObserved {
+                                channel_id: "C1".into(),
+                                observations: Vec::new(),
+                            },
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_err());
+            assert!(store.load_history("C1").await.unwrap().is_none());
         });
         let _ = std::fs::remove_dir_all(directory);
     }

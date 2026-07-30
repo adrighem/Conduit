@@ -219,10 +219,29 @@ impl ConversationCatalog {
         message_ts: &str,
         record_unread: bool,
     ) -> bool {
+        self.apply_attention_observation(id, message_ts, record_unread)
+            .0
+    }
+
+    /// Applies one semantic attention observation without replacing any
+    /// conversation fields. Returns `(conversation_existed, changed)`.
+    pub(crate) fn apply_attention_observation(
+        &mut self,
+        id: &str,
+        message_ts: &str,
+        record_unread: bool,
+    ) -> (bool, bool) {
         if id.trim().is_empty() || message_ts.trim().is_empty() {
-            return false;
+            return (false, false);
         }
         let existed = self.entries.contains_key(id);
+        if self.entries.get(id).is_some_and(|entry| {
+            entry
+                .conversation
+                .has_observed_attention_message(message_ts)
+        }) {
+            return (existed, false);
+        }
         let revision = self.next_revision();
         let entry = self
             .entries
@@ -236,12 +255,14 @@ impl ConversationCatalog {
                 metadata_revision: revision,
                 unread_revision: revision,
             });
-        entry
+        let changed = entry
             .conversation
             .observe_attention_message_at(message_ts, record_unread);
-        entry.unread_revision = revision;
-        entry.membership_revision = entry.membership_revision.max(revision);
-        existed
+        if changed {
+            entry.unread_revision = revision;
+            entry.membership_revision = entry.membership_revision.max(revision);
+        }
+        (existed, changed)
     }
 
     pub(crate) fn apply_unread_snapshot(

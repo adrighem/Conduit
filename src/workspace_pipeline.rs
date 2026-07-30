@@ -134,6 +134,12 @@ pub(crate) struct MessagePage {
     pub(crate) complete: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ConversationAttentionObservation {
+    pub(crate) message_ts: String,
+    pub(crate) record_unread: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MutationOrigin {
     Cache,
@@ -236,6 +242,10 @@ pub(crate) enum WorkspaceChange {
     ConversationsReset(Vec<SlackConversation>),
     ConversationUpsert(SlackConversation),
     ConversationMetadataUpsert(SlackConversation),
+    ConversationAttentionObserved {
+        channel_id: String,
+        observations: Vec<ConversationAttentionObservation>,
+    },
     ConversationRemoved {
         channel_id: String,
     },
@@ -284,6 +294,10 @@ pub(crate) enum StoreChange {
     ConversationStarChanged {
         channel_id: String,
         starred: bool,
+    },
+    ConversationAttentionObserved {
+        channel_id: String,
+        observations: Vec<ConversationAttentionObservation>,
     },
     ConversationRemoved {
         channel_id: String,
@@ -1264,6 +1278,7 @@ impl WorkspaceCoordinator {
         if changes.is_empty() {
             return None;
         }
+        accepted_messages.sort_by(|left, right| left.ts.cmp(&right.ts));
         let messages = timeline.messages();
         let store_change = store_timeline_replacement(&target, messages);
         let reconciled_message_ts =
@@ -1293,32 +1308,44 @@ impl WorkspaceCoordinator {
             TimelineTarget::Channel(channel_id) => channel_id.clone(),
             TimelineTarget::Thread { channel_id, .. } => channel_id.clone(),
         };
-        let mut attention_changed = false;
+        let mut attention_observations = Vec::new();
         if let Some(entry) = self.conversations.get_mut(&attention_channel_id) {
-            let before = entry.value.clone();
             for effect in attention_effects.iter().filter(|effect| {
                 !effect
                     .decision
                     .reasons
                     .contains(&crate::attention::AttentionReason::SelfAuthored)
             }) {
-                entry.value.observe_attention_message_at(
-                    &effect.message.ts,
-                    effect.decision.record_unread,
-                );
+                if entry.value.local_read_ts().is_some_and(|last_read| {
+                    !slack_timestamp_is_after(&effect.message.ts, last_read)
+                }) {
+                    continue;
+                }
+                if entry
+                    .value
+                    .observe_attention_message_at(&effect.message.ts, effect.decision.record_unread)
+                {
+                    attention_observations.push(ConversationAttentionObservation {
+                        message_ts: effect.message.ts.clone(),
+                        record_unread: effect.decision.record_unread,
+                    });
+                }
             }
-            if entry.value != before {
+            if !attention_observations.is_empty() {
                 entry.unread_revision = revision;
-                attention_changed = true;
             }
         }
         let mut patch_changes = vec![WorkspaceChange::TimelineChanged { target, changes }];
         let mut store_changes = vec![store_change];
-        if attention_changed {
-            if let Some(conversation) = self.conversation(&attention_channel_id).cloned() {
-                patch_changes.push(WorkspaceChange::ConversationUpsert(conversation.clone()));
-                store_changes.push(StoreChange::ConversationUpsert(conversation));
-            }
+        if !attention_observations.is_empty() {
+            patch_changes.push(WorkspaceChange::ConversationAttentionObserved {
+                channel_id: attention_channel_id.clone(),
+                observations: attention_observations.clone(),
+            });
+            store_changes.push(StoreChange::ConversationAttentionObserved {
+                channel_id: attention_channel_id,
+                observations: attention_observations,
+            });
         }
         let effects = attention_effects
             .into_iter()
@@ -1626,17 +1653,29 @@ impl WorkspaceCoordinator {
                     .contains(&crate::attention::AttentionReason::SelfAuthored);
                 if !self_authored {
                     if let Some(entry) = self.conversations.get_mut(channel_id) {
-                        let before = entry.value.clone();
-                        entry.value.observe_attention_message_at(
-                            &effect.message.ts,
-                            effect.decision.record_unread,
-                        );
-                        if entry.value != before {
+                        let at_or_before_local_read =
+                            entry.value.local_read_ts().is_some_and(|last_read| {
+                                !slack_timestamp_is_after(&effect.message.ts, last_read)
+                            });
+                        if !at_or_before_local_read
+                            && entry.value.observe_attention_message_at(
+                                &effect.message.ts,
+                                effect.decision.record_unread,
+                            )
+                        {
                             entry.unread_revision = revision;
-                            patch_changes
-                                .push(WorkspaceChange::ConversationUpsert(entry.value.clone()));
-                            store_changes
-                                .push(StoreChange::ConversationUpsert(entry.value.clone()));
+                            let observations = vec![ConversationAttentionObservation {
+                                message_ts: effect.message.ts.clone(),
+                                record_unread: effect.decision.record_unread,
+                            }];
+                            patch_changes.push(WorkspaceChange::ConversationAttentionObserved {
+                                channel_id: channel_id.to_string(),
+                                observations: observations.clone(),
+                            });
+                            store_changes.push(StoreChange::ConversationAttentionObserved {
+                                channel_id: channel_id.to_string(),
+                                observations,
+                            });
                         }
                     }
                 }
@@ -3718,6 +3757,166 @@ mod tests {
                 .unread_activity_count(),
             1
         );
+    }
+
+    #[test]
+    fn history_and_posted_attention_companions_are_minimal_and_idempotent() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        let mut channel = conversation("C1", "general");
+        channel.is_starred = Some(true);
+        channel.unread_count = Some(3);
+        channel
+            .extra
+            .insert("last_read".to_string(), serde_json::json!("10.0"));
+        channel
+            .extra
+            .insert("topic".to_string(), serde_json::json!("Keep me"));
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![channel],
+            ..Default::default()
+        }));
+
+        let mut history_messages = vec![
+            message("13.0", "history three"),
+            message("11.0", "history one"),
+            message("12.0", "history two"),
+        ];
+        for message in &mut history_messages {
+            message.user = Some("U_OTHER".to_string());
+        }
+        let history = coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".to_string(),
+                snapshot: SnapshotEnvelope::new(
+                    coordinator.revision(),
+                    MessagePage {
+                        messages: history_messages,
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .unwrap();
+        let [WorkspaceChange::TimelineChanged { .. }, WorkspaceChange::ConversationAttentionObserved {
+            channel_id,
+            observations,
+        }] = history.patch().changes()
+        else {
+            panic!("history attention must use one semantic patch companion");
+        };
+        assert_eq!(channel_id, "C1");
+        assert_eq!(
+            observations,
+            &[
+                ConversationAttentionObservation {
+                    message_ts: "11.0".to_string(),
+                    record_unread: true,
+                },
+                ConversationAttentionObservation {
+                    message_ts: "12.0".to_string(),
+                    record_unread: true,
+                },
+                ConversationAttentionObservation {
+                    message_ts: "13.0".to_string(),
+                    record_unread: true,
+                },
+            ]
+        );
+        assert_eq!(
+            history
+                .effects()
+                .iter()
+                .map(|effect| {
+                    let WorkspaceEffect::MessageAttention(effect) = effect;
+                    effect.message.ts.as_str()
+                })
+                .collect::<Vec<_>>(),
+            vec!["11.0", "12.0", "13.0"]
+        );
+        let [StoreChange::HistoryReplaced { .. }, StoreChange::ConversationAttentionObserved {
+            channel_id,
+            observations,
+        }] = history.store_batch().unwrap().changes()
+        else {
+            panic!("history attention must use one semantic store companion");
+        };
+        assert_eq!(channel_id, "C1");
+        assert_eq!(
+            observations,
+            &[
+                ConversationAttentionObservation {
+                    message_ts: "11.0".to_string(),
+                    record_unread: true,
+                },
+                ConversationAttentionObservation {
+                    message_ts: "12.0".to_string(),
+                    record_unread: true,
+                },
+                ConversationAttentionObservation {
+                    message_ts: "13.0".to_string(),
+                    record_unread: true,
+                },
+            ]
+        );
+
+        let mut posted_message = message("14.0", "posted");
+        posted_message.user = Some("U_OTHER".to_string());
+        let posted = coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: posted_message.clone(),
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .unwrap();
+        assert!(matches!(
+            posted.patch().changes(),
+            [
+                WorkspaceChange::TimelineChanged { .. },
+                WorkspaceChange::ConversationAttentionObserved {
+                    channel_id,
+                    observations,
+                },
+            ] if channel_id == "C1"
+                && observations == &[ConversationAttentionObservation {
+                    message_ts: "14.0".to_string(),
+                    record_unread: true,
+                }]
+        ));
+        assert!(matches!(
+            posted.store_batch().unwrap().changes(),
+            [
+                StoreChange::MessageDelta { .. },
+                StoreChange::ConversationAttentionObserved {
+                    channel_id,
+                    observations,
+                },
+            ] if channel_id == "C1"
+                && observations == &[ConversationAttentionObservation {
+                    message_ts: "14.0".to_string(),
+                    record_unread: true,
+                }]
+        ));
+        assert!(coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".to_string(),
+                message: posted_message,
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Realtime,
+            })
+            .is_none());
+
+        let current = coordinator.conversation("C1").unwrap();
+        assert!(current.is_starred());
+        assert_eq!(current.name.as_deref(), Some("general"));
+        assert_eq!(current.last_read_ts(), Some("10.0"));
+        assert_eq!(
+            current.extra.get("topic"),
+            Some(&serde_json::json!("Keep me"))
+        );
+        assert_eq!(current.raw_unread_activity_count(), 3);
+        assert_eq!(current.unread_activity_count(), 4);
     }
 
     #[test]

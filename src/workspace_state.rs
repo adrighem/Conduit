@@ -214,6 +214,35 @@ impl WorkspaceSessionState {
                     catalog.upsert_metadata(conversation.clone());
                     application.conversation_changed = true;
                 }
+                WorkspaceChange::ConversationAttentionObserved {
+                    channel_id,
+                    observations,
+                } => {
+                    let local_read =
+                        local_read_ts_by_channel
+                            .get(channel_id)
+                            .cloned()
+                            .or_else(|| {
+                                catalog
+                                    .get(channel_id)
+                                    .and_then(SlackConversation::local_read_ts)
+                                    .map(str::to_string)
+                            });
+                    for observation in observations {
+                        if local_read.as_deref().is_some_and(|last_read| {
+                            !slack_timestamp_is_after(&observation.message_ts, last_read)
+                        }) {
+                            continue;
+                        }
+                        application.conversation_changed |= catalog
+                            .apply_attention_observation(
+                                channel_id,
+                                &observation.message_ts,
+                                observation.record_unread,
+                            )
+                            .1;
+                    }
+                }
                 WorkspaceChange::ConversationRemoved { channel_id } => {
                     application.removals.push(ConversationPatchRemoval {
                         channel_id: channel_id.clone(),
@@ -1625,7 +1654,8 @@ mod tests {
     use super::*;
     use crate::models::{SlackConversationUnreadSnapshot, SlackUnreadState};
     use crate::workspace_pipeline::{
-        WorkspaceBootstrapData, WorkspaceChange, WorkspacePatch, WorkspaceRevision,
+        ConversationAttentionObservation, WorkspaceBootstrapData, WorkspaceChange, WorkspacePatch,
+        WorkspaceRevision,
     };
 
     fn message(ts: &str, text: &str) -> SlackMessage {
@@ -1873,6 +1903,161 @@ mod tests {
             "a marker-only acknowledgement must not rebuild the sidebar"
         );
         assert_eq!(acknowledged.acknowledged_local_reads(), &["C1".to_string()]);
+    }
+
+    #[test]
+    fn conversation_attention_patches_are_idempotent_and_local_read_safe() {
+        let state = WorkspaceSessionState::default();
+        let revision_one = WorkspaceRevision::INITIAL.successor();
+        let revision_two = revision_one.successor();
+        let revision_three = revision_two.successor();
+        let revision_four = revision_three.successor();
+        let revision_five = revision_four.successor();
+        let mut initial = conversation("C1", "general");
+        initial.is_starred = Some(true);
+        initial.unread_count = Some(5);
+        initial.extra.extend(HashMap::from([
+            ("has_unreads".to_string(), serde_json::json!(true)),
+            ("last_read".to_string(), serde_json::json!("10.0")),
+            ("topic".to_string(), serde_json::json!("Keep me")),
+        ]));
+        state
+            .apply_conversation_patch(&conversation_patch(
+                revision_one,
+                WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                    conversations: vec![initial],
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+
+        let observation = ConversationAttentionObservation {
+            message_ts: "11.0".to_string(),
+            record_unread: true,
+        };
+        let first = state
+            .apply_conversation_patch(&conversation_patch(
+                revision_two,
+                WorkspaceChange::ConversationAttentionObserved {
+                    channel_id: "C1".to_string(),
+                    observations: vec![observation.clone()],
+                },
+            ))
+            .unwrap();
+        assert!(first.conversation_changed());
+        let duplicate = state
+            .apply_conversation_patch(&conversation_patch(
+                revision_three,
+                WorkspaceChange::ConversationAttentionObserved {
+                    channel_id: "C1".to_string(),
+                    observations: vec![observation],
+                },
+            ))
+            .unwrap();
+        assert!(!duplicate.conversation_changed());
+        {
+            let conversations = state.conversations.borrow();
+            let current = conversations.get("C1").unwrap();
+            assert_eq!(current.unread_activity_count(), 1);
+            assert_eq!(current.raw_unread_activity_count(), 5);
+            assert!(current.is_starred());
+            assert_eq!(current.name.as_deref(), Some("general"));
+            assert_eq!(
+                current.extra.get("topic"),
+                Some(&serde_json::json!("Keep me"))
+            );
+        }
+
+        state
+            .conversations
+            .borrow_mut()
+            .advance_read_cursor("C1", "20.0", 0);
+        let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
+        let stale = state
+            .apply_conversation_patch_with_local_reads(
+                &conversation_patch(
+                    revision_four,
+                    WorkspaceChange::ConversationAttentionObserved {
+                        channel_id: "C1".to_string(),
+                        observations: vec![ConversationAttentionObservation {
+                            message_ts: "19.0".to_string(),
+                            record_unread: true,
+                        }],
+                    },
+                ),
+                &local_reads,
+            )
+            .unwrap();
+        assert!(!stale.conversation_changed());
+        {
+            let conversations = state.conversations.borrow();
+            let current = conversations.get("C1").unwrap();
+            assert_eq!(current.unread_activity_count(), 0);
+            assert_eq!(current.raw_unread_activity_count(), 0);
+            assert_eq!(current.last_read_ts(), Some("20.0"));
+            assert!(current.is_starred());
+            assert_eq!(current.name.as_deref(), Some("general"));
+            assert_eq!(
+                current.extra.get("topic"),
+                Some(&serde_json::json!("Keep me"))
+            );
+        }
+
+        let newer = state
+            .apply_conversation_patch_with_local_reads(
+                &conversation_patch(
+                    revision_five,
+                    WorkspaceChange::ConversationAttentionObserved {
+                        channel_id: "C1".to_string(),
+                        observations: vec![ConversationAttentionObservation {
+                            message_ts: "21.0".to_string(),
+                            record_unread: true,
+                        }],
+                    },
+                ),
+                &local_reads,
+            )
+            .unwrap();
+        assert!(newer.conversation_changed());
+        let conversations = state.conversations.borrow();
+        let current = conversations.get("C1").unwrap();
+        assert_eq!(current.unread_activity_count(), 1);
+        assert_eq!(current.raw_unread_activity_count(), 0);
+        assert_eq!(current.last_read_ts(), Some("20.0"));
+        assert!(current.is_starred());
+        assert_eq!(current.name.as_deref(), Some("general"));
+
+        let embedded_marker_state = WorkspaceSessionState::default();
+        let mut embedded_marker = conversation("C2", "embedded marker");
+        embedded_marker.advance_read_cursor("30.0", 0);
+        embedded_marker.set_local_read_ts("30.0");
+        embedded_marker_state
+            .apply_conversation_patch(&conversation_patch(
+                revision_one,
+                WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                    conversations: vec![embedded_marker],
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+        let embedded_stale = embedded_marker_state
+            .apply_conversation_patch(&conversation_patch(
+                revision_two,
+                WorkspaceChange::ConversationAttentionObserved {
+                    channel_id: "C2".to_string(),
+                    observations: vec![ConversationAttentionObservation {
+                        message_ts: "29.0".to_string(),
+                        record_unread: true,
+                    }],
+                },
+            ))
+            .unwrap();
+        assert!(!embedded_stale.conversation_changed());
+        let conversations = embedded_marker_state.conversations.borrow();
+        let embedded_current = conversations.get("C2").unwrap();
+        assert_eq!(embedded_current.unread_activity_count(), 0);
+        assert_eq!(embedded_current.last_read_ts(), Some("30.0"));
+        assert_eq!(embedded_current.local_read_ts(), Some("30.0"));
     }
 
     #[test]

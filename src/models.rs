@@ -199,7 +199,8 @@ impl SlackConversation {
             remaining_unread > 0,
             remaining_unread,
         ));
-        if remaining_unread == 0 {
+        self.acknowledge_attention_through(ts);
+        if remaining_unread == 0 && self.attention.is_none() {
             self.clear_attention_activity();
         }
     }
@@ -359,6 +360,32 @@ impl SlackConversation {
         self.attention = Some(ConversationAttentionState::default());
     }
 
+    /// Clears classified unread observations at or before a read cursor while
+    /// retaining newer observations and the bounded delivery ledger.
+    pub(crate) fn acknowledge_attention_through(&mut self, read_ts: &str) {
+        let Some(attention) = self.attention.as_mut() else {
+            return;
+        };
+        attention
+            .unread_message_ts
+            .retain(|message_ts| slack_timestamp_is_after(message_ts, read_ts));
+        let tracked_after = u64::try_from(attention.unread_message_ts.len()).unwrap_or(u64::MAX);
+        // Legacy untracked counts cannot be proven newer than the cursor.
+        attention.unread_count = tracked_after;
+        attention.has_unread = attention.unread_count > 0;
+    }
+
+    pub(crate) fn clear_raw_unread_activity(&mut self) {
+        self.unread_count = Some(0);
+
+        for (key, value) in &mut self.extra {
+            if is_unread_key(key) {
+                *value = cleared_unread_value(value);
+            }
+        }
+        self.reconcile_attention_with_raw(self.raw_unread_state());
+    }
+
     pub fn acknowledge_attention_messages(&mut self, message_ts: &[String]) -> u64 {
         let Some(attention) = self.attention.as_mut() else {
             return 0;
@@ -378,13 +405,7 @@ impl SlackConversation {
     }
 
     pub fn clear_unread_activity(&mut self) {
-        self.unread_count = Some(0);
-
-        for (key, value) in &mut self.extra {
-            if is_unread_key(key) {
-                *value = cleared_unread_value(value);
-            }
-        }
+        self.clear_raw_unread_activity();
         self.clear_attention_activity();
     }
 
@@ -2455,6 +2476,27 @@ mod tests {
         restored.advance_read_cursor("20.0", 0);
         assert_eq!(restored.unread_activity_count(), 0);
         assert!(!restored.has_unread_activity());
+    }
+
+    #[test]
+    fn read_cursor_preserves_newer_semantic_attention_and_seen_identity() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            unread_count: Some(2),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("19.0", true);
+        conversation.observe_attention_message_at("21.0", true);
+
+        conversation.advance_read_cursor("20.0", 0);
+
+        assert_eq!(conversation.raw_unread_activity_count(), 0);
+        assert_eq!(conversation.unread_activity_count(), 1);
+        assert!(conversation.has_unread_activity());
+        assert!(conversation.has_observed_attention_message("19.0"));
+        assert!(conversation.has_observed_attention_message("21.0"));
+        assert!(!conversation.observe_attention_message_at("21.0", true));
+        assert_eq!(conversation.unread_activity_count(), 1);
     }
 
     #[test]
