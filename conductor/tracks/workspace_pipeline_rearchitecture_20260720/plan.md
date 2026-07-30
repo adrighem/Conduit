@@ -24,7 +24,8 @@
 - [x] Task: Deliver revisioned conversation WorkspacePatch values to presentation 0e39acd
 - [x] Task: Route cache, API, and realtime conversation changes through the coordinator 52741ca
 - [x] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations 2a3c560
-- [ ] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md)
+- [x] Task: Prevent native reload of internal message WebViews from navigating away 03717c1
+- [~] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md)
 
 ## Phase 4: Bounded synchronization and backpressure
 
