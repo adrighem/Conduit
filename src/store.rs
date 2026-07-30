@@ -25,8 +25,10 @@ use crate::models::{SlackUnreadState, LOCAL_READ_TS_KEY};
 use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 use crate::workspace_pipeline::{
-    same_message_identity, AttentionDeliveryIdentity, ConversationAttentionObservation,
-    MessageMutationKind, StoreBatch, StoreChange, WorkspaceRevision, WorkspaceStoreProjection,
+    apply_reaction_projection_mutation, same_message_identity, AttentionDeliveryIdentity,
+    ConversationAttentionObservation, MessageMutationKind, ReactionMutation,
+    ReactionProjectionMutation, StoreBatch, StoreChange, WorkspaceRevision,
+    WorkspaceStoreProjection,
 };
 
 pub(crate) const CACHE_VERSION: u32 = 1;
@@ -641,6 +643,7 @@ pub(crate) struct WorkspaceBootstrap {
     pub(crate) user_statuses: HashMap<String, SlackUserStatus>,
     pub(crate) thread_catalog: Vec<ThreadRecord>,
     pub(crate) custom_emojis: HashMap<String, String>,
+    pub(crate) reaction_actor_states: Vec<ReactionMutation>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2265,6 +2268,8 @@ struct CachedWorkspaceState {
     custom_emojis: HashMap<String, String>,
     #[serde(default)]
     attention_deliveries: Vec<String>,
+    #[serde(default)]
+    reaction_actor_states: Vec<ReactionMutation>,
 }
 
 impl CachedWorkspaceState {
@@ -2284,6 +2289,7 @@ impl CachedWorkspaceState {
             pending_unread_refresh: Vec::new(),
             custom_emojis: HashMap::new(),
             attention_deliveries: Vec::new(),
+            reaction_actor_states: Vec::new(),
         }
     }
 }
@@ -2300,6 +2306,7 @@ impl From<CachedWorkspaceState> for WorkspaceBootstrap {
             user_statuses: state.user_statuses,
             thread_catalog: state.thread_catalog,
             custom_emojis: state.custom_emojis,
+            reaction_actor_states: state.reaction_actor_states,
         }
     }
 }
@@ -2566,6 +2573,9 @@ fn load_sqlite_state(
             "thread_record" => state
                 .thread_catalog
                 .push(serde_json::from_str(&payload).context("invalid cached thread record")?),
+            "reaction_actor_state" => state.reaction_actor_states.push(
+                serde_json::from_str(&payload).context("invalid cached reaction actor state")?,
+            ),
             "pending_unread" if item_key == PENDING_UNREAD_QUEUE_KEY => {
                 state.pending_unread_refresh.extend(
                     serde_json::from_str::<Vec<String>>(&payload)
@@ -2806,6 +2816,8 @@ fn apply_store_change(
                     .collect::<Result<Vec<_>>>()?,
             )?;
             changed |= sync_thread_records(transaction, workspace_key, data.threads)?;
+            changed |=
+                sync_reaction_actor_states(transaction, workspace_key, data.reaction_actor_states)?;
             Ok(changed)
         }
         StoreChange::WorkspaceRepaired(WorkspaceStoreProjection {
@@ -2814,6 +2826,7 @@ fn apply_store_change(
             histories,
             thread_timelines,
             thread_catalog,
+            reaction_actor_states,
         }) => {
             let repair_generation = repair_generation.ok_or_else(|| {
                 StoreError::rejected_update(
@@ -2872,6 +2885,8 @@ fn apply_store_change(
                     .collect::<Result<Vec<_>>>()?,
             )?;
             changed |= sync_thread_records(transaction, workspace_key, thread_catalog)?;
+            changed |=
+                sync_reaction_actor_states(transaction, workspace_key, reaction_actor_states)?;
             changed |= upsert_sqlite_item(
                 transaction,
                 workspace_key,
@@ -2967,6 +2982,17 @@ fn apply_store_change(
             require_store_key("message timestamp", &message.ts)?;
             apply_message_delta(transaction, workspace_key, &channel_id, message, kind)
         }
+        StoreChange::ReactionChanged(projection) => {
+            require_store_key("reaction channel", &projection.change.channel_id)?;
+            require_store_key("reaction message timestamp", &projection.change.message_ts)?;
+            require_store_key("reaction name", &projection.change.name)?;
+            require_store_key("reaction user", &projection.change.user_id)?;
+            apply_reaction_delta(transaction, workspace_key, projection)
+        }
+        StoreChange::ReactionActorStatesReplaced(states)
+        | StoreChange::ReactionActorStatesRepaired(states) => {
+            sync_reaction_actor_states(transaction, workspace_key, states)
+        }
         StoreChange::HistoryReplaced {
             channel_id,
             messages,
@@ -3016,6 +3042,75 @@ struct StoredThreadTimeline {
     messages: Vec<SlackMessage>,
     original: Vec<SlackMessage>,
     existed: bool,
+}
+
+fn apply_reaction_delta(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    projection: ReactionProjectionMutation,
+) -> Result<bool> {
+    let existing_history = load_sqlite_item::<Vec<SlackMessage>>(
+        transaction,
+        workspace_key,
+        "channel_history",
+        &projection.change.channel_id,
+    )?;
+    let mut changed = false;
+    if let Some(existing_history) = existing_history {
+        let mut history = channel_timeline_messages(normalize_cached_messages(existing_history));
+        let history_changed = history
+            .iter_mut()
+            .filter(|message| message.ts == projection.change.message_ts)
+            .fold(false, |changed, message| {
+                apply_reaction_projection_mutation(message, &projection) || changed
+            });
+        if history_changed {
+            changed |= replace_timeline_item(
+                transaction,
+                workspace_key,
+                "channel_history",
+                &projection.change.channel_id,
+                history,
+            )?;
+        }
+    }
+
+    for mut thread in
+        load_sqlite_channel_threads(transaction, workspace_key, &projection.change.channel_id)?
+    {
+        let thread_changed = thread
+            .messages
+            .iter_mut()
+            .filter(|message| message.ts == projection.change.message_ts)
+            .fold(false, |changed, message| {
+                apply_reaction_projection_mutation(message, &projection) || changed
+            });
+        if thread_changed {
+            changed |= replace_timeline_item(
+                transaction,
+                workspace_key,
+                "thread_replies",
+                &thread.item_key,
+                thread.messages,
+            )?;
+        }
+    }
+
+    let mut records =
+        load_sqlite_kind_values::<ThreadRecord>(transaction, workspace_key, "thread_record")?;
+    let mut records_changed = false;
+    for root in records
+        .iter_mut()
+        .filter(|record| record.key.channel_id == projection.change.channel_id)
+        .filter_map(|record| record.root.as_mut())
+        .filter(|root| root.ts == projection.change.message_ts)
+    {
+        records_changed |= apply_reaction_projection_mutation(root, &projection);
+    }
+    if records_changed {
+        changed |= sync_thread_records(transaction, workspace_key, records)?;
+    }
+    Ok(changed)
 }
 
 fn apply_message_delta(
@@ -3864,6 +3959,24 @@ fn sync_thread_records(
     sync_sqlite_kind(transaction, workspace_key, "thread_record", records)
 }
 
+fn sync_reaction_actor_states(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    states: Vec<ReactionMutation>,
+) -> Result<bool> {
+    let states = states
+        .into_iter()
+        .map(|state| {
+            require_store_key("reaction channel", &state.channel_id)?;
+            require_store_key("reaction message timestamp", &state.message_ts)?;
+            require_store_key("reaction name", &state.name)?;
+            require_store_key("reaction user", &state.user_id)?;
+            Ok((reaction_actor_state_key(&state), state))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sync_sqlite_kind(transaction, workspace_key, "reaction_actor_state", states)
+}
+
 fn apply_store_attention_observations(
     transaction: &Transaction<'_>,
     workspace_key: &str,
@@ -4179,6 +4292,14 @@ fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String),
             record,
         )?;
     }
+    for state in &state.reaction_actor_states {
+        insert_state_item(
+            &mut items,
+            "reaction_actor_state",
+            reaction_actor_state_key(state),
+            state,
+        )?;
+    }
     if !state.pending_unread_refresh.is_empty() {
         insert_state_item(
             &mut items,
@@ -4439,6 +4560,13 @@ fn thread_key(channel_id: &str, thread_ts: &str) -> String {
     format!("{channel_id}:{thread_ts}")
 }
 
+fn reaction_actor_state_key(state: &ReactionMutation) -> String {
+    cache_key(&format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}",
+        state.channel_id, state.message_ts, state.name, state.user_id
+    ))
+}
+
 fn merge_history_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
     // Incoming API/realtime data wins for duplicate timestamps while cached
     // messages missing from a bounded or in-flight page remain available.
@@ -4476,7 +4604,8 @@ mod tests {
 
     use super::*;
     use crate::workspace_pipeline::{
-        MessageMutationKind, MutationOrigin, StoreBatch, StoreChange, WorkspaceBootstrapData,
+        MessageMutationKind, MutationOrigin, ReactionMutation, ReactionProjectionCount,
+        ReactionProjectionMutation, StoreBatch, StoreChange, WorkspaceBootstrapData,
         WorkspaceCoordinator, WorkspaceMutation, WorkspaceRevision, WorkspaceStoreProjection,
     };
 
@@ -4791,6 +4920,7 @@ mod tests {
                         vec![root, reply],
                     )]),
                     thread_catalog: thread_catalog.clone(),
+                    reaction_actor_states: Vec::new(),
                 })],
             )
             .unwrap();
@@ -6517,6 +6647,7 @@ mod tests {
                         }],
                     )]),
                     threads: thread_catalog.into_records(),
+                    reaction_actor_states: Vec::new(),
                 })],
             )
             .unwrap();
@@ -6526,6 +6657,20 @@ mod tests {
             );
 
             let second_revision = first_revision.successor();
+            let authoritative_reaction = ReactionMutation {
+                channel_id: "C3".into(),
+                message_ts: "2.100".into(),
+                name: "wave".into(),
+                user_id: "U4".into(),
+                added: true,
+            };
+            let delta_reaction = ReactionMutation {
+                channel_id: "C3".into(),
+                message_ts: "2.100".into(),
+                name: "heart".into(),
+                user_id: "U5".into(),
+                added: true,
+            };
             let replacement = StoreBatch::new(
                 second_revision,
                 vec![
@@ -6597,6 +6742,19 @@ mod tests {
                         },
                         kind: MessageMutationKind::Posted,
                     },
+                    StoreChange::ReactionActorStatesReplaced(vec![authoritative_reaction.clone()]),
+                    StoreChange::ReactionChanged(ReactionProjectionMutation {
+                        change: authoritative_reaction.clone(),
+                        count: ReactionProjectionCount::Authoritative(1),
+                    }),
+                    StoreChange::ReactionActorStatesRepaired(vec![
+                        authoritative_reaction,
+                        delta_reaction.clone(),
+                    ]),
+                    StoreChange::ReactionChanged(ReactionProjectionMutation {
+                        change: delta_reaction,
+                        count: ReactionProjectionCount::Delta(1),
+                    }),
                     StoreChange::HistoryRemoved {
                         channel_id: "C1".into(),
                     },
@@ -6633,6 +6791,23 @@ mod tests {
             assert_eq!(
                 store.load_history("C3").await.unwrap().unwrap()[0].body_text(),
                 "delta-history"
+            );
+            assert_eq!(
+                store.load_history("C3").await.unwrap().unwrap()[0]
+                    .reactions
+                    .as_ref()
+                    .map(Vec::len),
+                Some(2)
+            );
+            assert_eq!(
+                store
+                    .load_bootstrap()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .reaction_actor_states
+                    .len(),
+                2
             );
             assert_eq!(
                 store.load_thread("C3", "2.000").await.unwrap().unwrap()[0].body_text(),
@@ -9391,6 +9566,562 @@ mod tests {
                 .pop()
                 .unwrap();
             assert_eq!(conversation.unread_activity_count(), 1);
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_reaction_batch_persists_all_known_projections_across_reopen() {
+        let directory = temp_cache_dir("coordinator-reaction-projections");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let mut broadcast = SlackMessage {
+                ts: "11.0".into(),
+                thread_ts: Some("10.0".into()),
+                subtype: Some("thread_broadcast".into()),
+                text: Some("broadcast".into()),
+                ..Default::default()
+            };
+            broadcast.refresh_canonical_content();
+            store
+                .store_history("C1", std::slice::from_ref(&broadcast))
+                .await
+                .unwrap();
+            store
+                .store_thread("C1", "10.0", std::slice::from_ref(&broadcast))
+                .await
+                .unwrap();
+
+            let change = ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            };
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            first_revision,
+                            vec![StoreChange::ReactionChanged(ReactionProjectionMutation {
+                                change: change.clone(),
+                                count: ReactionProjectionCount::Authoritative(1),
+                            })],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            first_revision.successor(),
+                            vec![StoreChange::ReactionChanged(ReactionProjectionMutation {
+                                change,
+                                count: ReactionProjectionCount::Authoritative(1),
+                            })],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Unchanged
+            );
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            for message in [
+                reopened
+                    .load_history("C1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_iter()
+                    .find(|message| message.ts == "11.0")
+                    .unwrap(),
+                reopened
+                    .load_thread("C1", "10.0")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_iter()
+                    .find(|message| message.ts == "11.0")
+                    .unwrap(),
+            ] {
+                assert!(matches!(
+                    message.reactions.as_deref(),
+                    Some([reaction])
+                        if reaction.name.as_deref() == Some("wave")
+                            && reaction.count == Some(1)
+                            && reaction.users.as_deref() == Some(&["U1".to_string()][..])
+                ));
+            }
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_reaction_batch_persists_thread_catalog_root_across_reopen() {
+        let directory = temp_cache_dir("coordinator-reaction-thread-root");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let mut root = SlackMessage {
+                ts: "10.0".into(),
+                reply_count: Some(1),
+                text: Some("root".into()),
+                ..Default::default()
+            };
+            root.refresh_canonical_content();
+            let mut catalog = ThreadCatalog::default();
+            catalog.observe_thread("C1", "10.0", std::slice::from_ref(&root), false);
+            store
+                .store_thread_catalog(&catalog.into_records())
+                .await
+                .unwrap();
+
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        WorkspaceRevision::INITIAL.successor(),
+                        vec![StoreChange::ReactionChanged(ReactionProjectionMutation {
+                            change: ReactionMutation {
+                                channel_id: "C1".into(),
+                                message_ts: "10.0".into(),
+                                name: "wave".into(),
+                                user_id: "U1".into(),
+                                added: true,
+                            },
+                            count: ReactionProjectionCount::Authoritative(1),
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let records = reopened.load_thread_catalog().await.unwrap();
+            assert!(matches!(
+                records[0].root.as_ref().unwrap().reactions.as_deref(),
+                Some([reaction])
+                    if reaction.name.as_deref() == Some("wave")
+                        && reaction.count == Some(1)
+                        && reaction.users.as_deref() == Some(&["U1".to_string()][..])
+            ));
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unknown_coordinator_reaction_applies_a_delta_to_loaded_store_projections() {
+        let directory = temp_cache_dir("coordinator-unknown-reaction-delta");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let mut cached = SlackMessage {
+                ts: "10.0".into(),
+                text: Some("cached but not coordinator-loaded".into()),
+                ..Default::default()
+            };
+            cached.refresh_canonical_content();
+            store
+                .store_history("C1", std::slice::from_ref(&cached))
+                .await
+                .unwrap();
+
+            let mut coordinator = WorkspaceCoordinator::default();
+            let reduction = coordinator
+                .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                    channel_id: "C1".into(),
+                    message_ts: "10.0".into(),
+                    name: "wave".into(),
+                    user_id: "U1".into(),
+                    added: true,
+                }))
+                .expect("the unknown effective event must produce a durable reduction");
+            assert!(
+                reduction
+                    .store_batch()
+                    .unwrap()
+                    .changes()
+                    .iter()
+                    .any(|change| matches!(change, StoreChange::ReactionChanged(_))),
+                "the store batch must carry a projection delta even without a loaded projection"
+            );
+            store
+                .execute_store_batch(reduction.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let history = reopened.load_history("C1").await.unwrap().unwrap();
+            assert!(matches!(
+                history[0].reactions.as_deref(),
+                Some([reaction])
+                    if reaction.name.as_deref() == Some("wave")
+                        && reaction.count == Some(1)
+                        && reaction.users.as_deref() == Some(&["U1".to_string()][..])
+            ));
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cold_coordinator_add_replay_does_not_double_an_explicit_cached_actor() {
+        let directory = temp_cache_dir("coordinator-explicit-reaction-replay");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let mut cached = SlackMessage {
+                ts: "10.0".into(),
+                text: Some("cached but not coordinator-loaded".into()),
+                reactions: Some(vec![crate::models::SlackReaction {
+                    name: Some("wave".into()),
+                    count: Some(1),
+                    users: Some(vec!["U1".into()]),
+                }]),
+                ..Default::default()
+            };
+            cached.refresh_canonical_content();
+            store
+                .store_history("C1", std::slice::from_ref(&cached))
+                .await
+                .unwrap();
+
+            let added = ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "10.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            };
+            let mut coordinator = WorkspaceCoordinator::default();
+            let reduction = coordinator
+                .apply(WorkspaceMutation::ReactionChanged(added.clone()))
+                .expect("the cold coordinator must persist actor idempotency");
+            store
+                .execute_store_batch(reduction.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let history = reopened.load_history("C1").await.unwrap().unwrap();
+            let reaction = &history[0].reactions.as_ref().unwrap()[0];
+            assert_eq!(reaction.count, Some(1));
+            assert_eq!(
+                reaction.users.as_deref(),
+                Some(&["U1".to_string()][..]),
+                "the explicit cached actor must remain unique"
+            );
+            let bootstrap = reopened.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(bootstrap.reaction_actor_states, vec![added.clone()]);
+            let mut restored = WorkspaceCoordinator::default();
+            restored.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                histories: HashMap::from([("C1".into(), history)]),
+                reaction_actor_states: bootstrap.reaction_actor_states,
+                ..Default::default()
+            }));
+            assert!(
+                restored
+                    .apply(WorkspaceMutation::ReactionChanged(added))
+                    .is_none(),
+                "the persisted actor fact must suppress another replay"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn snapshot_actor_reconciliation_survives_reopen_and_deletes_retired_rows() {
+        let directory = temp_cache_dir("reaction-snapshot-actor-reconciliation");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let mut reacted = SlackMessage {
+                ts: "10.0".into(),
+                text: Some("reacted".into()),
+                reactions: Some(vec![crate::models::SlackReaction {
+                    name: Some("wave".into()),
+                    count: Some(1),
+                    users: None,
+                }]),
+                ..Default::default()
+            };
+            reacted.refresh_canonical_content();
+            store
+                .store_history("C1", std::slice::from_ref(&reacted))
+                .await
+                .unwrap();
+
+            let mut coordinator = WorkspaceCoordinator::default();
+            coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                histories: HashMap::from([("C1".into(), vec![reacted])]),
+                ..Default::default()
+            }));
+            let removal = ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "10.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: false,
+            };
+            let removed = coordinator
+                .apply(WorkspaceMutation::ReactionChanged(removal.clone()))
+                .unwrap();
+            store
+                .execute_store_batch(removed.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let fresh_base = coordinator.revision();
+            let mut explicit = SlackMessage {
+                ts: "10.0".into(),
+                text: Some("reacted".into()),
+                reactions: Some(vec![crate::models::SlackReaction {
+                    name: Some("wave".into()),
+                    count: Some(1),
+                    users: Some(vec!["U1".into()]),
+                }]),
+                ..Default::default()
+            };
+            explicit.refresh_canonical_content();
+            let reconciled = coordinator
+                .apply_from(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::HistorySnapshot {
+                        channel_id: "C1".into(),
+                        snapshot: crate::workspace_pipeline::SnapshotEnvelope::new(
+                            fresh_base,
+                            crate::workspace_pipeline::MessagePage {
+                                messages: vec![explicit],
+                                complete: true,
+                                ..Default::default()
+                            },
+                        ),
+                    },
+                )
+                .unwrap();
+            store
+                .execute_store_batch(reconciled.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let bootstrap = reopened.load_bootstrap().await.unwrap().unwrap();
+            let added = ReactionMutation {
+                added: true,
+                ..removal.clone()
+            };
+            assert_eq!(bootstrap.reaction_actor_states, vec![added.clone()]);
+            let history = reopened.load_history("C1").await.unwrap().unwrap();
+            let mut restored = WorkspaceCoordinator::default();
+            restored.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                histories: HashMap::from([("C1".into(), history)]),
+                reaction_actor_states: bootstrap.reaction_actor_states,
+                ..Default::default()
+            }));
+            assert!(
+                restored
+                    .apply(WorkspaceMutation::ReactionChanged(added))
+                    .is_none(),
+                "the reconciled true fact must suppress an add replay after reopen"
+            );
+
+            let zero_base = restored.revision();
+            let retired = restored
+                .apply_from(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::HistorySnapshot {
+                        channel_id: "C1".into(),
+                        snapshot: crate::workspace_pipeline::SnapshotEnvelope::new(
+                            zero_base,
+                            crate::workspace_pipeline::MessagePage {
+                                messages: vec![SlackMessage {
+                                    ts: "10.0".into(),
+                                    text: Some("reacted".into()),
+                                    ..Default::default()
+                                }],
+                                complete: true,
+                                ..Default::default()
+                            },
+                        ),
+                    },
+                )
+                .unwrap();
+            reopened
+                .execute_store_batch(retired.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let final_store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let final_bootstrap = final_store.load_bootstrap().await.unwrap().unwrap();
+            assert!(final_bootstrap.reaction_actor_states.is_empty());
+            let final_history = final_store.load_history("C1").await.unwrap().unwrap();
+            let mut after_retirement = WorkspaceCoordinator::default();
+            after_retirement.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                histories: HashMap::from([("C1".into(), final_history)]),
+                reaction_actor_states: final_bootstrap.reaction_actor_states,
+                ..Default::default()
+            }));
+            assert!(
+                after_retirement
+                    .apply(WorkspaceMutation::ReactionChanged(removal))
+                    .is_some(),
+                "retiring the durable row must let one removal replay re-establish authority"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn reaction_actor_tombstone_survives_reopen_and_suppresses_duplicate_removal() {
+        let directory = temp_cache_dir("reaction-actor-tombstone");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let mut reacted = SlackMessage {
+                ts: "10.0".into(),
+                text: Some("reacted".into()),
+                reactions: Some(vec![crate::models::SlackReaction {
+                    name: Some("wave".into()),
+                    count: Some(3),
+                    users: Some(vec!["U_OTHER".into()]),
+                }]),
+                ..Default::default()
+            };
+            reacted.refresh_canonical_content();
+            store
+                .store_history("C1", std::slice::from_ref(&reacted))
+                .await
+                .unwrap();
+
+            let mut coordinator = WorkspaceCoordinator::default();
+            coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                histories: HashMap::from([("C1".into(), vec![reacted])]),
+                ..Default::default()
+            }));
+            let removal = ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "10.0".into(),
+                name: "wave".into(),
+                user_id: "U_OMITTED".into(),
+                added: false,
+            };
+            let reduction = coordinator
+                .apply(WorkspaceMutation::ReactionChanged(removal.clone()))
+                .expect("the first removal must produce a durable reduction");
+            store
+                .execute_store_batch(reduction.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let bootstrap = reopened.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(bootstrap.reaction_actor_states, vec![removal.clone()]);
+            let history = reopened.load_history("C1").await.unwrap().unwrap();
+            assert_eq!(history[0].reactions.as_ref().unwrap()[0].count, Some(2));
+
+            let mut restored = WorkspaceCoordinator::default();
+            restored.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                histories: HashMap::from([("C1".into(), history)]),
+                reaction_actor_states: bootstrap.reaction_actor_states,
+                ..Default::default()
+            }));
+            let revision = restored.revision();
+            assert!(
+                restored
+                    .apply(WorkspaceMutation::ReactionChanged(removal))
+                    .is_none(),
+                "the persisted actor tombstone must suppress a replayed removal"
+            );
+            assert_eq!(restored.revision(), revision);
+            assert_eq!(
+                restored.history("C1")[0].reactions.as_ref().unwrap()[0].count,
+                Some(2)
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn absent_reaction_authority_persists_with_later_stale_history() {
+        let directory = temp_cache_dir("coordinator-reaction-late-projection");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let mut coordinator = WorkspaceCoordinator::default();
+            let request_base = coordinator.revision();
+            let reaction_reduction = coordinator
+                .apply_from(
+                    MutationOrigin::Realtime,
+                    WorkspaceMutation::ReactionChanged(ReactionMutation {
+                        channel_id: "C1".into(),
+                        message_ts: "10.0".into(),
+                        name: "wave".into(),
+                        user_id: "U1".into(),
+                        added: true,
+                    }),
+                )
+                .expect("the unknown reaction must persist its actor authority");
+            assert!(reaction_reduction.patch().changes().is_empty());
+            store
+                .execute_store_batch(reaction_reduction.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+            let reduction = coordinator
+                .apply_from(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::HistorySnapshot {
+                        channel_id: "C1".into(),
+                        snapshot: crate::workspace_pipeline::SnapshotEnvelope::new(
+                            request_base,
+                            crate::workspace_pipeline::MessagePage {
+                                messages: vec![SlackMessage {
+                                    ts: "10.0".into(),
+                                    text: Some("late".into()),
+                                    ..Default::default()
+                                }],
+                                complete: true,
+                                ..Default::default()
+                            },
+                        ),
+                    },
+                )
+                .expect("the stale history must materialize retained reaction authority");
+            store
+                .execute_store_batch(reduction.store_batch().unwrap().clone())
+                .await
+                .unwrap();
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let history = reopened.load_history("C1").await.unwrap().unwrap();
+            assert!(matches!(
+                history[0].reactions.as_deref(),
+                Some([reaction])
+                    if reaction.name.as_deref() == Some("wave")
+                        && reaction.count == Some(1)
+                        && reaction.users.as_deref() == Some(&["U1".to_string()][..])
+            ));
         });
 
         let _ = std::fs::remove_dir_all(directory);

@@ -14,6 +14,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::attention::{
     AttentionCandidate, AttentionDecision, AttentionPolicy, AttentionPreferences, ConversationKind,
     DeliveryState, MessageMutation, ThreadRelationship,
@@ -24,7 +26,7 @@ use crate::models::SlackUnreadState;
 use crate::models::LOCAL_READ_TS_KEY;
 use crate::models::{
     conversation_metadata_key_is_unread_owned, slack_timestamp_is_after, SlackConversation,
-    SlackConversationUnreadSnapshot, SlackMessage, SlackUser,
+    SlackConversationUnreadSnapshot, SlackMessage, SlackReaction, SlackUser,
 };
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord, ThreadUnreadState};
 
@@ -84,6 +86,7 @@ pub(crate) struct WorkspaceBootstrapData {
     pub(crate) users: Vec<SlackUser>,
     pub(crate) histories: HashMap<String, Vec<SlackMessage>>,
     pub(crate) threads: Vec<ThreadRecord>,
+    pub(crate) reaction_actor_states: Vec<ReactionMutation>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -93,6 +96,7 @@ pub(crate) struct WorkspaceStoreProjection {
     pub(crate) histories: HashMap<String, Vec<SlackMessage>>,
     pub(crate) thread_timelines: HashMap<(String, String), Vec<SlackMessage>>,
     pub(crate) thread_catalog: Vec<ThreadRecord>,
+    pub(crate) reaction_actor_states: Vec<ReactionMutation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,6 +185,90 @@ pub(crate) enum MessageMutationKind {
     Deleted,
 }
 
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ReactionMutation {
+    pub(crate) channel_id: String,
+    pub(crate) message_ts: String,
+    pub(crate) name: String,
+    pub(crate) user_id: String,
+    pub(crate) added: bool,
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct ReactionActorKey {
+    reaction: ReactionAuthorityKey,
+    user_id: String,
+}
+
+impl ReactionActorKey {
+    fn from_mutation(change: &ReactionMutation) -> Self {
+        Self {
+            reaction: ReactionAuthorityKey::from_mutation(change),
+            user_id: change.user_id.clone(),
+        }
+    }
+
+    fn to_mutation(&self, added: bool) -> ReactionMutation {
+        ReactionMutation {
+            channel_id: self.reaction.channel_id.clone(),
+            message_ts: self.reaction.message_ts.clone(),
+            name: self.reaction.name.clone(),
+            user_id: self.user_id.clone(),
+            added,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ReactionActorState {
+    added: bool,
+    revision: WorkspaceRevision,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ReactionProjectionCount {
+    Authoritative(u64),
+    Delta(i8),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ReactionProjectionMutation {
+    pub(crate) change: ReactionMutation,
+    pub(crate) count: ReactionProjectionCount,
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct ReactionAuthorityKey {
+    channel_id: String,
+    message_ts: String,
+    name: String,
+}
+
+impl ReactionAuthorityKey {
+    fn from_mutation(change: &ReactionMutation) -> Self {
+        Self {
+            channel_id: change.channel_id.clone(),
+            message_ts: change.message_ts.clone(),
+            name: change.name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ReactionCountTransition {
+    revision: WorkspaceRevision,
+    delta: i8,
+    user_id: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ReactionAuthority {
+    snapshot_revision: WorkspaceRevision,
+    authoritative_count: Option<u64>,
+    count_transitions: Vec<ReactionCountTransition>,
+    user_states: HashMap<String, bool>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum WorkspaceMutation {
@@ -248,6 +336,7 @@ pub(crate) enum WorkspaceMutation {
         origin: MutationOrigin,
         delivery: DeliveryState,
     },
+    ReactionChanged(ReactionMutation),
     ThreadCatalogChanged(Vec<ThreadRecord>),
 }
 
@@ -304,6 +393,13 @@ impl WorkspacePatch {
             .then_some(Self { revision, changes })
     }
 
+    fn revision_only(revision: WorkspaceRevision) -> Option<Self> {
+        (revision > WorkspaceRevision::INITIAL).then_some(Self {
+            revision,
+            changes: Vec::new(),
+        })
+    }
+
     pub(crate) fn revision(&self) -> WorkspaceRevision {
         self.revision
     }
@@ -347,6 +443,9 @@ pub(crate) enum StoreChange {
         message: SlackMessage,
         kind: MessageMutationKind,
     },
+    ReactionChanged(ReactionProjectionMutation),
+    ReactionActorStatesReplaced(Vec<ReactionMutation>),
+    ReactionActorStatesRepaired(Vec<ReactionMutation>),
     HistoryReplaced {
         channel_id: String,
         messages: Vec<SlackMessage>,
@@ -367,7 +466,6 @@ enum WorkspaceRepairDisposition {
     SubsumedByProjection,
     /// Replay is permitted only for an idempotent change whose durable result
     /// is independent of its ordering relative to the repaired projection.
-    #[allow(dead_code)]
     ReplayProjectionIndependent,
 }
 
@@ -405,6 +503,9 @@ impl StoreChange {
                 message: _,
                 kind: _,
             }
+            | Self::ReactionChanged(_)
+            | Self::ReactionActorStatesReplaced(_)
+            | Self::ReactionActorStatesRepaired(_)
             | Self::HistoryReplaced {
                 channel_id: _,
                 messages: _,
@@ -590,6 +691,8 @@ pub(crate) struct WorkspaceCoordinator {
     threads: HashMap<(String, String), TimelineState>,
     message_authority_by_ts: HashMap<(String, String), MessageProjectionAuthority>,
     message_authority_by_client_id: HashMap<(String, String), MessageProjectionAuthority>,
+    reaction_authority: HashMap<ReactionAuthorityKey, ReactionAuthority>,
+    reaction_actor_states: HashMap<ReactionActorKey, ReactionActorState>,
     thread_catalog: Vec<ThreadRecord>,
     attention_context: WorkspaceAttentionContext,
     attention_preferences: AttentionPreferences,
@@ -638,6 +741,7 @@ impl WorkspaceCoordinator {
                 })
                 .collect(),
             thread_catalog: self.thread_catalog.clone(),
+            reaction_actor_states: self.reaction_actor_state_records(),
         }
     }
 
@@ -646,6 +750,10 @@ impl WorkspaceCoordinator {
             .get(channel_id)
             .map(TimelineState::messages)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn reaction_actor_state_records(&self) -> Vec<ReactionMutation> {
+        reaction_actor_state_records(&self.reaction_actor_states)
     }
 
     pub(crate) fn history_with_revisions(
@@ -752,7 +860,7 @@ impl WorkspaceCoordinator {
             }
             WorkspaceMutation::HistoryPage { channel_id, page } => self.apply_timeline_snapshot(
                 TimelineTarget::Channel(channel_id),
-                SnapshotEnvelope::new(self.revision, page),
+                SnapshotEnvelope::new(WorkspaceRevision::INITIAL, page),
                 origin,
             ),
             WorkspaceMutation::ThreadSnapshot {
@@ -776,7 +884,7 @@ impl WorkspaceCoordinator {
                     channel_id,
                     thread_ts,
                 },
-                SnapshotEnvelope::new(self.revision, page),
+                SnapshotEnvelope::new(WorkspaceRevision::INITIAL, page),
                 origin,
             ),
             WorkspaceMutation::MessageChanged {
@@ -792,6 +900,7 @@ impl WorkspaceCoordinator {
                 origin,
                 delivery,
             } => self.apply_message(&channel_id, message, kind, origin, Some(delivery)),
+            WorkspaceMutation::ReactionChanged(change) => self.apply_reaction(change),
             WorkspaceMutation::ThreadCatalogChanged(records) => self.apply_thread_catalog(records),
         }
     }
@@ -824,9 +933,50 @@ impl WorkspaceCoordinator {
 
     fn apply_hydration(
         &mut self,
-        data: WorkspaceBootstrapData,
+        mut data: WorkspaceBootstrapData,
         origin: MutationOrigin,
     ) -> Option<WorkspaceReduction> {
+        let revision = self.next_revision();
+        let reaction_actor_states = data
+            .reaction_actor_states
+            .iter()
+            .filter(|state| reaction_mutation_is_valid(state))
+            .map(|state| {
+                (
+                    ReactionActorKey::from_mutation(state),
+                    ReactionActorState {
+                        added: state.added,
+                        revision,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let reaction_actor_states_changed =
+            reaction_actor_state_records(&self.reaction_actor_states)
+                != reaction_actor_state_records(&reaction_actor_states);
+        let reaction_authority =
+            hydrated_reaction_authority(&reaction_actor_states, &data, revision);
+        for (channel_id, messages) in &mut data.histories {
+            for message in messages {
+                apply_reaction_authorities_to_message(
+                    &reaction_authority,
+                    channel_id,
+                    message,
+                    Some(WorkspaceRevision::INITIAL),
+                );
+            }
+        }
+        for record in &mut data.threads {
+            if let Some(root) = record.root.as_mut() {
+                apply_reaction_authorities_to_message(
+                    &reaction_authority,
+                    &record.key.channel_id,
+                    root,
+                    Some(WorkspaceRevision::INITIAL),
+                );
+            }
+        }
+        data.reaction_actor_states = reaction_actor_state_records(&reaction_actor_states);
         let unchanged = self.conversations.len() == data.conversations.len()
             && data
                 .conversations
@@ -844,12 +994,14 @@ impl WorkspaceCoordinator {
                 .histories
                 .iter()
                 .all(|(channel_id, messages)| self.history(channel_id) == *messages)
-            && self.thread_catalog == data.threads;
+            && self.thread_catalog == data.threads
+            && !reaction_actor_states_changed;
         if unchanged {
             return None;
         }
 
-        let revision = self.next_revision();
+        self.reaction_actor_states = reaction_actor_states;
+        self.reaction_authority = reaction_authority;
         self.conversations = data
             .conversations
             .iter()
@@ -1483,7 +1635,11 @@ impl WorkspaceCoordinator {
         let base_revision = snapshot.base_revision();
         let page = snapshot.into_data();
         let revision = self.next_revision();
-        let incoming = page
+        let channel_id = match &target {
+            TimelineTarget::Channel(channel_id) => channel_id.clone(),
+            TimelineTarget::Thread { channel_id, .. } => channel_id.clone(),
+        };
+        let mut incoming = page
             .messages
             .into_iter()
             .filter(|message| match &target {
@@ -1495,24 +1651,47 @@ impl WorkspaceCoordinator {
             })
             .map(|message| (message.ts.clone(), message))
             .collect::<HashMap<_, _>>();
+        let accepted_message_ts = {
+            let timeline = self.timeline(&target);
+            incoming
+                .iter()
+                .filter(|(message_ts, _)| {
+                    timeline.is_none_or(|timeline| {
+                        !timeline
+                            .tombstones
+                            .get(*message_ts)
+                            .is_some_and(|deleted_at| *deleted_at > base_revision)
+                            && !timeline
+                                .messages
+                                .get(*message_ts)
+                                .is_some_and(|entry| entry.revision > base_revision)
+                    })
+                })
+                .map(|(message_ts, _)| message_ts.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut reaction_authority_changed = false;
+        for message_ts in &accepted_message_ts {
+            let message = incoming
+                .get_mut(message_ts)
+                .expect("accepted incoming message must remain available");
+            reaction_authority_changed |= self.reconcile_reaction_authority_from_snapshot_message(
+                &channel_id,
+                message,
+                base_revision,
+                revision,
+            );
+        }
         let timeline = self.timeline_mut(&target);
         let mut changes = Vec::new();
         let mut accepted_messages = Vec::new();
-        for (message_ts, message) in &incoming {
-            if timeline
-                .tombstones
-                .get(message_ts)
-                .is_some_and(|deleted_at| *deleted_at > base_revision)
-                || timeline
-                    .messages
-                    .get(message_ts)
-                    .is_some_and(|entry| entry.revision > base_revision)
-            {
-                continue;
-            }
+        for message_ts in accepted_message_ts {
+            let message = incoming
+                .get(&message_ts)
+                .expect("accepted incoming message must remain available");
             if timeline
                 .messages
-                .get(message_ts)
+                .get(&message_ts)
                 .is_none_or(|entry| entry.value != *message)
             {
                 timeline.messages.insert(
@@ -1522,7 +1701,7 @@ impl WorkspaceCoordinator {
                         revision,
                     },
                 );
-                timeline.tombstones.remove(message_ts);
+                timeline.tombstones.remove(&message_ts);
                 changes.push(MessageChange::Upsert(Box::new(message.clone())));
                 accepted_messages.push(message.clone());
             }
@@ -1542,12 +1721,12 @@ impl WorkspaceCoordinator {
                 changes.push(MessageChange::Remove { message_ts });
             }
         }
-        if changes.is_empty() {
+        if changes.is_empty() && !reaction_authority_changed {
             return None;
         }
         accepted_messages.sort_by(|left, right| left.ts.cmp(&right.ts));
         let messages = timeline.messages();
-        let store_change = (origin != MutationOrigin::Cache)
+        let store_change = (origin != MutationOrigin::Cache && !changes.is_empty())
             .then(|| store_timeline_replacement(&target, messages));
         let reconciled_message_ts =
             self.reconciled_unread_message_ts(&target, &accepted_messages, origin);
@@ -1603,8 +1782,16 @@ impl WorkspaceCoordinator {
                 entry.unread_revision = revision;
             }
         }
-        let mut patch_changes = vec![WorkspaceChange::TimelineChanged { target, changes }];
+        let mut patch_changes = (!changes.is_empty())
+            .then(|| WorkspaceChange::TimelineChanged { target, changes })
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut store_changes = store_change.into_iter().collect::<Vec<_>>();
+        if reaction_authority_changed && origin != MutationOrigin::Cache {
+            store_changes.push(StoreChange::ReactionActorStatesReplaced(
+                self.reaction_actor_state_records(),
+            ));
+        }
         if !attention_observations.is_empty() {
             patch_changes.push(WorkspaceChange::ConversationAttentionObserved {
                 channel_id: attention_channel_id.clone(),
@@ -1651,6 +1838,13 @@ impl WorkspaceCoordinator {
     ) -> Option<WorkspaceReduction> {
         if channel_id.trim().is_empty() || message.ts.trim().is_empty() {
             return None;
+        }
+        if kind != MessageMutationKind::Deleted {
+            self.overlay_reaction_authority_onto_message(
+                channel_id,
+                &mut message,
+                WorkspaceRevision::INITIAL,
+            );
         }
         if kind == MessageMutationKind::Posted
             && origin == MutationOrigin::Realtime
@@ -1983,6 +2177,351 @@ impl WorkspaceCoordinator {
             .into_iter()
             .collect();
         self.commit_with_effects(revision, patch_changes, store_changes, effects)
+    }
+
+    fn apply_reaction(&mut self, change: ReactionMutation) -> Option<WorkspaceReduction> {
+        if !reaction_mutation_is_valid(&change) {
+            return None;
+        }
+
+        let key = ReactionAuthorityKey::from_mutation(&change);
+        let actor_key = ReactionActorKey::from_mutation(&change);
+        if self
+            .reaction_actor_states
+            .get(&actor_key)
+            .is_some_and(|state| state.added == change.added)
+        {
+            return None;
+        }
+        let (projection_count, projected_user_present) =
+            self.reaction_projection_evidence(&key, &change.user_id);
+        let revision = self.next_revision();
+        let previous_state = self
+            .reaction_actor_states
+            .get(&actor_key)
+            .map(|state| state.added);
+        let count_delta = match (change.added, previous_state, projected_user_present) {
+            (true, Some(false), _) | (true, None, false) => 1,
+            (false, Some(true), _) | (false, None, _) => -1,
+            (true, Some(true), _) | (false, Some(false), _) | (true, None, true) => 0,
+        };
+        {
+            let authority = self
+                .reaction_authority
+                .entry(key.clone())
+                .or_insert_with(|| ReactionAuthority {
+                    snapshot_revision: WorkspaceRevision::INITIAL,
+                    authoritative_count: None,
+                    count_transitions: Vec::new(),
+                    user_states: HashMap::new(),
+                });
+            let count_before = authority.authoritative_count.or_else(|| {
+                projection_count.map(|count| {
+                    apply_reaction_count_transitions(
+                        count,
+                        authority
+                            .count_transitions
+                            .iter()
+                            .map(|transition| transition.delta),
+                    )
+                })
+            });
+            if let Some(count_before) = count_before {
+                authority.authoritative_count =
+                    Some(apply_reaction_count_delta(count_before, count_delta));
+            }
+            if count_delta != 0 {
+                authority.count_transitions.push(ReactionCountTransition {
+                    revision,
+                    delta: count_delta,
+                    user_id: change.user_id.clone(),
+                });
+            }
+            authority
+                .user_states
+                .insert(change.user_id.clone(), change.added);
+        }
+        self.reaction_actor_states.insert(
+            actor_key,
+            ReactionActorState {
+                added: change.added,
+                revision,
+            },
+        );
+
+        let authority = self
+            .reaction_authority
+            .get(&key)
+            .expect("reaction authority was just installed")
+            .clone();
+        let mut targets = Vec::new();
+        if self
+            .histories
+            .get(&change.channel_id)
+            .is_some_and(|timeline| timeline.messages.contains_key(&change.message_ts))
+        {
+            targets.push(TimelineTarget::Channel(change.channel_id.clone()));
+        }
+        let mut thread_targets = self
+            .threads
+            .iter()
+            .filter_map(|((channel_id, thread_ts), timeline)| {
+                (channel_id == &change.channel_id
+                    && timeline.messages.contains_key(&change.message_ts))
+                .then(|| TimelineTarget::Thread {
+                    channel_id: channel_id.clone(),
+                    thread_ts: thread_ts.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        thread_targets.sort();
+        targets.extend(thread_targets);
+
+        let mut patch_changes = Vec::new();
+        for target in targets {
+            let timeline = self.timeline_mut(&target);
+            let Some(entry) = timeline.messages.get_mut(&change.message_ts) else {
+                continue;
+            };
+            if !apply_reaction_authority_to_message(&mut entry.value, &key, &authority, None) {
+                continue;
+            }
+            entry.revision = revision;
+            patch_changes.push(WorkspaceChange::TimelineChanged {
+                target,
+                changes: vec![MessageChange::Upsert(Box::new(entry.value.clone()))],
+            });
+        }
+
+        let mut catalog_changed = false;
+        for record in self.thread_catalog.iter_mut().filter(|record| {
+            record.key.channel_id == change.channel_id
+                && record
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| root.ts == change.message_ts)
+        }) {
+            let Some(root) = record.root.as_mut() else {
+                continue;
+            };
+            catalog_changed |= apply_reaction_authority_to_message(root, &key, &authority, None);
+        }
+        if catalog_changed {
+            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(
+                self.thread_catalog.clone(),
+            ));
+        }
+
+        let mut store_changes = vec![StoreChange::ReactionActorStatesReplaced(
+            self.reaction_actor_state_records(),
+        )];
+        let count = if patch_changes.is_empty() {
+            ReactionProjectionCount::Delta(count_delta)
+        } else {
+            let count = authority
+                .authoritative_count
+                .expect("a changed reaction projection must have an authoritative count");
+            ReactionProjectionCount::Authoritative(count)
+        };
+        store_changes.push(StoreChange::ReactionChanged(ReactionProjectionMutation {
+            change,
+            count,
+        }));
+        self.commit(revision, patch_changes, store_changes)
+    }
+
+    fn reaction_projection_evidence(
+        &self,
+        key: &ReactionAuthorityKey,
+        user_id: &str,
+    ) -> (Option<u64>, bool) {
+        let mut found_projection = false;
+        let mut count = 0;
+        let mut user_present = false;
+        let mut observe = |message: &SlackMessage| {
+            if message.ts != key.message_ts {
+                return;
+            }
+            found_projection = true;
+            let reaction = message.reactions.as_ref().and_then(|reactions| {
+                reactions
+                    .iter()
+                    .find(|reaction| reaction.name.as_deref() == Some(key.name.as_str()))
+            });
+            count = count.max(reaction.map_or(0, reaction_authoritative_count));
+            user_present |= reaction
+                .and_then(|reaction| reaction.users.as_ref())
+                .is_some_and(|users| users.iter().any(|user| user == user_id));
+        };
+        if let Some(timeline) = self.histories.get(&key.channel_id) {
+            for entry in timeline.messages.values() {
+                observe(&entry.value);
+            }
+        }
+        for ((channel_id, _), timeline) in &self.threads {
+            if channel_id != &key.channel_id {
+                continue;
+            }
+            for entry in timeline.messages.values() {
+                observe(&entry.value);
+            }
+        }
+        for record in self
+            .thread_catalog
+            .iter()
+            .filter(|record| record.key.channel_id == key.channel_id)
+        {
+            if let Some(root) = record.root.as_ref() {
+                observe(root);
+            }
+        }
+        (found_projection.then_some(count), user_present)
+    }
+
+    fn overlay_reaction_authority_onto_message(
+        &self,
+        channel_id: &str,
+        message: &mut SlackMessage,
+        base_revision: WorkspaceRevision,
+    ) -> bool {
+        apply_reaction_authorities_to_message(
+            &self.reaction_authority,
+            channel_id,
+            message,
+            Some(base_revision),
+        )
+    }
+
+    fn reconcile_reaction_authority_from_snapshot_message(
+        &mut self,
+        channel_id: &str,
+        message: &mut SlackMessage,
+        base_revision: WorkspaceRevision,
+        revision: WorkspaceRevision,
+    ) -> bool {
+        let keys =
+            reaction_authority_keys_for_message(&self.reaction_authority, channel_id, &message.ts);
+        let mut changed = false;
+        for key in keys {
+            let snapshot_is_new = self
+                .reaction_authority
+                .get(&key)
+                .expect("collected reaction authority must remain installed")
+                .snapshot_revision
+                <= base_revision;
+            if !snapshot_is_new {
+                let authority = self
+                    .reaction_authority
+                    .get(&key)
+                    .expect("collected reaction authority must remain installed");
+                apply_reaction_authority_to_message(message, &key, authority, Some(base_revision));
+                continue;
+            }
+
+            let incoming_reaction = message.reactions.as_ref().and_then(|reactions| {
+                reactions
+                    .iter()
+                    .find(|reaction| reaction.name.as_deref() == Some(key.name.as_str()))
+            });
+            let incoming_count = incoming_reaction
+                .map(reaction_authoritative_count)
+                .unwrap_or_default();
+            let incoming_users = incoming_reaction
+                .and_then(|reaction| reaction.users.as_ref())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let newer_true_actor_floor = self
+                .reaction_actor_states
+                .iter()
+                .filter(|(actor, state)| {
+                    actor.reaction == key && state.revision > base_revision && state.added
+                })
+                .count() as u64;
+
+            let actor_keys = self
+                .reaction_actor_states
+                .keys()
+                .filter(|actor| actor.reaction == key)
+                .cloned()
+                .collect::<Vec<_>>();
+            if incoming_count == 0 {
+                for actor_key in actor_keys {
+                    if self
+                        .reaction_actor_states
+                        .get(&actor_key)
+                        .is_some_and(|state| state.revision <= base_revision)
+                    {
+                        self.reaction_actor_states.remove(&actor_key);
+                    }
+                }
+            } else {
+                for actor_key in actor_keys {
+                    let Some(state) = self.reaction_actor_states.get(&actor_key) else {
+                        continue;
+                    };
+                    if state.revision <= base_revision
+                        && incoming_users.contains(&actor_key.user_id)
+                    {
+                        self.reaction_actor_states.insert(
+                            actor_key,
+                            ReactionActorState {
+                                added: true,
+                                revision,
+                            },
+                        );
+                    }
+                }
+            }
+            let user_states = self
+                .reaction_actor_states
+                .iter()
+                .filter(|(actor, _)| actor.reaction == key)
+                .map(|(actor, state)| (actor.user_id.clone(), state.added))
+                .collect::<HashMap<_, _>>();
+
+            let authority = self
+                .reaction_authority
+                .get_mut(&key)
+                .expect("collected reaction authority must remain installed");
+            let before_authority = authority.clone();
+            let transition_is_not_reflected = |transition: &ReactionCountTransition| {
+                transition.revision > base_revision
+                    && !(transition.delta > 0 && incoming_users.contains(&transition.user_id))
+            };
+            let count = apply_reaction_count_transitions(
+                incoming_count,
+                authority
+                    .count_transitions
+                    .iter()
+                    .filter(|transition| transition_is_not_reflected(transition))
+                    .map(|transition| transition.delta),
+            )
+            .max(newer_true_actor_floor);
+            authority.authoritative_count = Some(count);
+            authority
+                .count_transitions
+                .retain(transition_is_not_reflected);
+            authority.user_states = user_states;
+            authority.snapshot_revision = revision;
+            changed |= *authority != before_authority;
+            apply_reaction_authority_to_message(message, &key, authority, None);
+        }
+        changed
+    }
+
+    fn overlay_reaction_authority_onto_thread_records(
+        &self,
+        records: &mut [ThreadRecord],
+        base_revision: WorkspaceRevision,
+    ) {
+        for record in records {
+            let channel_id = record.key.channel_id.clone();
+            if let Some(root) = record.root.as_mut() {
+                self.overlay_reaction_authority_onto_message(&channel_id, root, base_revision);
+            }
+        }
     }
 
     fn message_delivery_state(
@@ -2348,6 +2887,10 @@ impl WorkspaceCoordinator {
         &mut self,
         mut records: Vec<ThreadRecord>,
     ) -> Option<WorkspaceReduction> {
+        self.overlay_reaction_authority_onto_thread_records(
+            &mut records,
+            WorkspaceRevision::INITIAL,
+        );
         records.sort_by(|left, right| {
             left.key
                 .channel_id
@@ -2460,6 +3003,248 @@ fn message_belongs_in_target(message: &SlackMessage, target: &TimelineTarget) ->
     }
 }
 
+fn reaction_mutation_is_valid(change: &ReactionMutation) -> bool {
+    [
+        change.channel_id.as_str(),
+        change.message_ts.as_str(),
+        change.name.as_str(),
+        change.user_id.as_str(),
+    ]
+    .into_iter()
+    .all(|value| !value.trim().is_empty())
+}
+
+fn reaction_actor_state_records(
+    states: &HashMap<ReactionActorKey, ReactionActorState>,
+) -> Vec<ReactionMutation> {
+    let mut records = states
+        .iter()
+        .map(|(key, state)| key.to_mutation(state.added))
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        left.channel_id
+            .cmp(&right.channel_id)
+            .then_with(|| left.message_ts.cmp(&right.message_ts))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.user_id.cmp(&right.user_id))
+    });
+    records
+}
+
+fn reaction_authority_keys_for_message(
+    authorities: &HashMap<ReactionAuthorityKey, ReactionAuthority>,
+    channel_id: &str,
+    message_ts: &str,
+) -> Vec<ReactionAuthorityKey> {
+    authorities
+        .keys()
+        .filter(|key| key.channel_id == channel_id && key.message_ts == message_ts)
+        .cloned()
+        .collect()
+}
+
+fn apply_reaction_authorities_to_message(
+    authorities: &HashMap<ReactionAuthorityKey, ReactionAuthority>,
+    channel_id: &str,
+    message: &mut SlackMessage,
+    source_base_revision: Option<WorkspaceRevision>,
+) -> bool {
+    let keys = reaction_authority_keys_for_message(authorities, channel_id, &message.ts);
+    keys.into_iter().fold(false, |changed, key| {
+        let authority = authorities
+            .get(&key)
+            .expect("collected reaction authority must remain installed");
+        apply_reaction_authority_to_message(message, &key, authority, source_base_revision)
+            || changed
+    })
+}
+
+fn hydrated_reaction_authority(
+    actor_states: &HashMap<ReactionActorKey, ReactionActorState>,
+    data: &WorkspaceBootstrapData,
+    revision: WorkspaceRevision,
+) -> HashMap<ReactionAuthorityKey, ReactionAuthority> {
+    let keys = actor_states
+        .keys()
+        .map(|actor| actor.reaction.clone())
+        .collect::<HashSet<_>>();
+    keys.into_iter()
+        .map(|key| {
+            let user_states = actor_states
+                .iter()
+                .filter(|(actor, _)| actor.reaction == key)
+                .map(|(actor, state)| (actor.user_id.clone(), state.added))
+                .collect::<HashMap<_, _>>();
+            let projection_count = data
+                .histories
+                .get(&key.channel_id)
+                .into_iter()
+                .flatten()
+                .chain(
+                    data.threads
+                        .iter()
+                        .filter(|record| record.key.channel_id == key.channel_id)
+                        .filter_map(|record| record.root.as_ref()),
+                )
+                .filter(|message| message.ts == key.message_ts)
+                .filter_map(|message| {
+                    message.reactions.as_ref().and_then(|reactions| {
+                        reactions
+                            .iter()
+                            .find(|reaction| reaction.name.as_deref() == Some(key.name.as_str()))
+                            .map(reaction_authoritative_count)
+                    })
+                })
+                .max();
+            (
+                key,
+                ReactionAuthority {
+                    snapshot_revision: revision,
+                    authoritative_count: projection_count,
+                    count_transitions: Vec::new(),
+                    user_states,
+                },
+            )
+        })
+        .collect()
+}
+
+fn reaction_authoritative_count(reaction: &SlackReaction) -> u64 {
+    reaction
+        .count
+        .unwrap_or_else(|| reaction.users.as_ref().map_or(0, Vec::len) as u64)
+}
+
+fn apply_reaction_count_delta(count: u64, delta: i8) -> u64 {
+    if delta >= 0 {
+        count.saturating_add(delta as u64)
+    } else {
+        count.saturating_sub(delta.unsigned_abs() as u64)
+    }
+}
+
+fn apply_reaction_count_transitions(count: u64, transitions: impl IntoIterator<Item = i8>) -> u64 {
+    transitions
+        .into_iter()
+        .fold(count, apply_reaction_count_delta)
+}
+
+fn apply_reaction_authority_to_message(
+    message: &mut SlackMessage,
+    key: &ReactionAuthorityKey,
+    authority: &ReactionAuthority,
+    source_base_revision: Option<WorkspaceRevision>,
+) -> bool {
+    if message.ts != key.message_ts {
+        return false;
+    }
+    let before = message.reactions.clone();
+    let reactions = message.reactions.get_or_insert_with(Vec::new);
+    let existing_index = reactions
+        .iter()
+        .position(|reaction| reaction.name.as_deref() == Some(key.name.as_str()));
+    let incoming_count = existing_index
+        .map(|index| reaction_authoritative_count(&reactions[index]))
+        .unwrap_or_default();
+    let count = if let Some(authoritative_count) = authority.authoritative_count {
+        authoritative_count
+    } else {
+        apply_reaction_count_transitions(
+            incoming_count,
+            authority
+                .count_transitions
+                .iter()
+                .filter(|transition| {
+                    source_base_revision.is_none_or(|base| transition.revision > base)
+                })
+                .map(|transition| transition.delta),
+        )
+    };
+
+    if count == 0 {
+        if let Some(index) = existing_index {
+            reactions.remove(index);
+        }
+    } else {
+        let index = existing_index.unwrap_or_else(|| {
+            reactions.push(SlackReaction {
+                name: Some(key.name.clone()),
+                count: Some(count),
+                users: None,
+            });
+            reactions.len() - 1
+        });
+        let reaction = &mut reactions[index];
+        reaction.count = Some(count);
+        for (user_id, added) in &authority.user_states {
+            if *added {
+                let users = reaction.users.get_or_insert_with(Vec::new);
+                if !users.iter().any(|user| user == user_id) {
+                    users.push(user_id.clone());
+                }
+            } else if let Some(users) = reaction.users.as_mut() {
+                users.retain(|user| user != user_id);
+            }
+        }
+    }
+    if message.reactions.as_ref().is_some_and(Vec::is_empty) {
+        message.reactions = None;
+    }
+    message.reactions != before
+}
+
+pub(crate) fn apply_reaction_projection_mutation(
+    message: &mut SlackMessage,
+    projection: &ReactionProjectionMutation,
+) -> bool {
+    if !reaction_mutation_is_valid(&projection.change) || message.ts != projection.change.message_ts
+    {
+        return false;
+    }
+    let key = ReactionAuthorityKey::from_mutation(&projection.change);
+    let current_count = message
+        .reactions
+        .as_ref()
+        .and_then(|reactions| {
+            reactions
+                .iter()
+                .find(|reaction| reaction.name.as_deref() == Some(key.name.as_str()))
+        })
+        .map(reaction_authoritative_count)
+        .unwrap_or_default();
+    let count = match projection.count {
+        ReactionProjectionCount::Authoritative(count) => count,
+        ReactionProjectionCount::Delta(delta) => {
+            let explicit_actor_is_present = projection.change.added
+                && message
+                    .reactions
+                    .as_ref()
+                    .and_then(|reactions| {
+                        reactions
+                            .iter()
+                            .find(|reaction| reaction.name.as_deref() == Some(key.name.as_str()))
+                    })
+                    .and_then(|reaction| reaction.users.as_ref())
+                    .is_some_and(|users| {
+                        users.iter().any(|user| user == &projection.change.user_id)
+                    });
+            let effective_delta = if delta > 0 && explicit_actor_is_present {
+                0
+            } else {
+                delta
+            };
+            apply_reaction_count_delta(current_count, effective_delta)
+        }
+    };
+    let authority = ReactionAuthority {
+        snapshot_revision: WorkspaceRevision::INITIAL,
+        authoritative_count: Some(count),
+        count_transitions: Vec::new(),
+        user_states: HashMap::from([(projection.change.user_id.clone(), projection.change.added)]),
+    };
+    apply_reaction_authority_to_message(message, &key, &authority, None)
+}
+
 pub(crate) fn same_message_identity(left: &SlackMessage, right: &SlackMessage) -> bool {
     (!left.ts.trim().is_empty() && left.ts == right.ts)
         || left.client_msg_id.as_deref().is_some_and(|left_id| {
@@ -2559,8 +3344,12 @@ impl WorkspaceReduction {
         store_changes: Vec<StoreChange>,
         effects: Vec<WorkspaceEffect>,
     ) -> Option<Self> {
-        let patch = WorkspacePatch::new(revision, patch_changes)?;
         let store_batch = StoreBatch::new(revision, store_changes);
+        let patch = WorkspacePatch::new(revision, patch_changes).or_else(|| {
+            store_batch
+                .as_ref()
+                .and_then(|_| WorkspacePatch::revision_only(revision))
+        })?;
         Some(Self {
             patch,
             store_batch,
@@ -2591,6 +3380,8 @@ impl Default for WorkspaceCoordinator {
             threads: HashMap::new(),
             message_authority_by_ts: HashMap::new(),
             message_authority_by_client_id: HashMap::new(),
+            reaction_authority: HashMap::new(),
+            reaction_actor_states: HashMap::new(),
             thread_catalog: Vec::new(),
             attention_context: WorkspaceAttentionContext::default(),
             attention_preferences: AttentionPreferences::default(),
@@ -5813,5 +6604,1298 @@ mod tests {
                 .is_none());
             assert!(coordinator.history("C1").is_empty());
         }
+    }
+
+    #[test]
+    fn reaction_mutation_updates_broadcast_projections_once() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut broadcast = message("11.0", "broadcast");
+        broadcast.thread_ts = Some("10.0".to_string());
+        broadcast.subtype = Some("thread_broadcast".to_string());
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![broadcast.clone()],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        coordinator.apply(WorkspaceMutation::ThreadSnapshot {
+            channel_id: "C1".to_string(),
+            thread_ts: "10.0".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                coordinator.revision(),
+                MessagePage {
+                    messages: vec![broadcast],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+
+        let change = ReactionMutation {
+            channel_id: "C1".to_string(),
+            message_ts: "11.0".to_string(),
+            name: "wave".to_string(),
+            user_id: "U1".to_string(),
+            added: true,
+        };
+        let reduction = coordinator
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::ReactionChanged(change.clone()),
+            )
+            .expect("the first local confirmation must update both projections");
+
+        assert_eq!(
+            reduction.patch().revision(),
+            reduction.store_batch().unwrap().revision()
+        );
+        assert!(matches!(
+            reduction.patch().changes(),
+            [
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel(channel_id),
+                    changes: channel_changes,
+                },
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Thread {
+                        channel_id: thread_channel_id,
+                        thread_ts,
+                    },
+                    changes: thread_changes,
+                },
+            ] if channel_id == "C1"
+                && thread_channel_id == "C1"
+                && thread_ts == "10.0"
+                && channel_changes.iter().all(message_change_has_one_wave)
+                && thread_changes.iter().all(message_change_has_one_wave)
+        ));
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [
+                StoreChange::ReactionActorStatesReplaced(_),
+                StoreChange::ReactionChanged(stored),
+            ]
+                if stored.change == change
+                    && stored.count == ReactionProjectionCount::Authoritative(1)
+        ));
+
+        let revision = coordinator.revision();
+        assert!(coordinator
+            .apply_from(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::ReactionChanged(change),
+            )
+            .is_none());
+        assert_eq!(
+            coordinator.revision(),
+            revision,
+            "the realtime echo must not create a second patch or store batch"
+        );
+    }
+
+    #[test]
+    fn reaction_mutation_routes_thread_replies_and_retains_unknown_identities() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut reply = message("11.0", "reply");
+        reply.thread_ts = Some("10.0".to_string());
+        coordinator.apply(WorkspaceMutation::ThreadSnapshot {
+            channel_id: "C1".to_string(),
+            thread_ts: "10.0".to_string(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![reply],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+
+        let added = ReactionMutation {
+            channel_id: "C1".to_string(),
+            message_ts: "11.0".to_string(),
+            name: "wave".to_string(),
+            user_id: "U1".to_string(),
+            added: true,
+        };
+        let reduction = coordinator
+            .apply(WorkspaceMutation::ReactionChanged(added.clone()))
+            .expect("known reply must change");
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::TimelineChanged {
+                target: TimelineTarget::Thread {
+                    channel_id,
+                    thread_ts,
+                },
+                changes,
+            }] if channel_id == "C1"
+                && thread_ts == "10.0"
+                && changes.iter().all(message_change_has_one_wave)
+        ));
+        assert!(coordinator.history("C1").is_empty());
+
+        let removed = ReactionMutation {
+            added: false,
+            ..added
+        };
+        assert!(coordinator
+            .apply(WorkspaceMutation::ReactionChanged(removed.clone()))
+            .is_some());
+        let revision = coordinator.revision();
+        assert!(coordinator
+            .apply(WorkspaceMutation::ReactionChanged(removed.clone()))
+            .is_none());
+        assert_eq!(coordinator.revision(), revision);
+
+        for retained in [
+            ReactionMutation {
+                message_ts: "unknown".to_string(),
+                added: true,
+                ..removed.clone()
+            },
+            ReactionMutation {
+                channel_id: "C2".to_string(),
+                added: true,
+                ..removed.clone()
+            },
+        ] {
+            let before = coordinator.revision();
+            let reduction = coordinator
+                .apply(WorkspaceMutation::ReactionChanged(retained))
+                .expect("unknown reaction identities still require a durable actor-state commit");
+            assert!(reduction.patch().changes().is_empty());
+            assert!(matches!(
+                reduction.store_batch().unwrap().changes(),
+                [
+                    StoreChange::ReactionActorStatesReplaced(_),
+                    StoreChange::ReactionChanged(ReactionProjectionMutation {
+                        count: ReactionProjectionCount::Delta(1),
+                        ..
+                    }),
+                ]
+            ));
+            assert!(coordinator.revision() > before);
+        }
+
+        let revision = coordinator.revision();
+        for malformed in [
+            ReactionMutation {
+                name: String::new(),
+                added: true,
+                ..removed.clone()
+            },
+            ReactionMutation {
+                user_id: String::new(),
+                added: true,
+                ..removed
+            },
+        ] {
+            assert!(coordinator
+                .apply(WorkspaceMutation::ReactionChanged(malformed))
+                .is_none());
+        }
+        assert_eq!(coordinator.revision(), revision);
+    }
+
+    #[test]
+    fn reaction_removal_uses_authoritative_count_when_actor_is_omitted() {
+        for users in [Some(vec!["U_OTHER".to_string()]), None] {
+            let mut coordinator = WorkspaceCoordinator::default();
+            let mut reacted = message("11.0", "reacted");
+            reacted.reactions = Some(vec![SlackReaction {
+                name: Some("wave".into()),
+                count: Some(3),
+                users,
+            }]);
+            coordinator.apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".into(),
+                snapshot: SnapshotEnvelope::new(
+                    WorkspaceRevision::INITIAL,
+                    MessagePage {
+                        messages: vec![reacted],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            });
+
+            let removal = ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U_OMITTED".into(),
+                added: false,
+            };
+            coordinator
+                .apply(WorkspaceMutation::ReactionChanged(removal.clone()))
+                .expect("an authoritative removal must not depend on Slack's partial user list");
+            let history = coordinator.history("C1");
+            let reaction = &history[0].reactions.as_ref().unwrap()[0];
+            assert_eq!(reaction.count, Some(2));
+            assert!(!reaction
+                .users
+                .as_ref()
+                .is_some_and(|users| users.iter().any(|user| user == "U_OMITTED")));
+
+            let revision = coordinator.revision();
+            assert!(coordinator
+                .apply_from(
+                    MutationOrigin::Realtime,
+                    WorkspaceMutation::ReactionChanged(removal),
+                )
+                .is_none());
+            assert_eq!(
+                coordinator.revision(),
+                revision,
+                "a duplicate removal must not decrement the authoritative count twice"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_actor_add_remove_add_cycle_is_idempotent() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut reacted = message("11.0", "reacted");
+        reacted.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(3),
+            users: Some(vec!["U_OTHER".into()]),
+        }]);
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![reacted],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let mutation = |added| ReactionMutation {
+            channel_id: "C1".into(),
+            message_ts: "11.0".into(),
+            name: "wave".into(),
+            user_id: "U_OMITTED".into(),
+            added,
+        };
+
+        for (added, expected_count) in [(true, 4), (false, 3), (true, 4)] {
+            coordinator
+                .apply(WorkspaceMutation::ReactionChanged(mutation(added)))
+                .expect("each actual actor transition must update the projection once");
+            assert_eq!(
+                coordinator.history("C1")[0].reactions.as_ref().unwrap()[0].count,
+                Some(expected_count)
+            );
+            let revision = coordinator.revision();
+            assert!(coordinator
+                .apply_from(
+                    MutationOrigin::Realtime,
+                    WorkspaceMutation::ReactionChanged(mutation(added)),
+                )
+                .is_none());
+            assert_eq!(coordinator.revision(), revision);
+        }
+    }
+
+    #[test]
+    fn fresh_snapshot_retires_older_reaction_actor_authority() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![message("11.0", "message")],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            }))
+            .expect("the reaction must be applied before the fresh snapshot");
+
+        let fresh_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".into(),
+                snapshot: SnapshotEnvelope::new(
+                    fresh_base,
+                    MessagePage {
+                        messages: vec![message("11.0", "message")],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .expect("a fresh authoritative snapshot must retire the older reaction");
+
+        assert!(
+            coordinator.history("C1")[0].reactions.is_none(),
+            "retired actor authority must not recreate a reaction missing from a fresh snapshot"
+        );
+    }
+
+    #[test]
+    fn fresh_snapshot_explicit_actor_supersedes_an_older_removal() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut reacted = message("11.0", "message");
+        reacted.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: None,
+        }]);
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![reacted],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: false,
+            }))
+            .expect("the removal must be applied before the fresh snapshot");
+
+        let fresh_base = coordinator.revision();
+        let mut fresh = message("11.0", "message");
+        fresh.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: Some(vec!["U1".into()]),
+        }]);
+        coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".into(),
+                snapshot: SnapshotEnvelope::new(
+                    fresh_base,
+                    MessagePage {
+                        messages: vec![fresh],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .expect("the fresh actor membership must supersede the older removal");
+
+        assert!(message_has_reaction(
+            &coordinator.history("C1")[0],
+            "wave",
+            1,
+            "U1"
+        ));
+        assert!(coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: false,
+            }))
+            .is_some());
+    }
+
+    #[test]
+    fn fresh_partial_user_snapshot_preserves_omitted_actor_fact_without_inflating_count() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![message("11.0", "message")],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let actor = ReactionMutation {
+            channel_id: "C1".into(),
+            message_ts: "11.0".into(),
+            name: "wave".into(),
+            user_id: "U1".into(),
+            added: true,
+        };
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(actor.clone()))
+            .expect("the actor add must be recorded");
+
+        let fresh_base = coordinator.revision();
+        let mut fresh = message("11.0", "message");
+        fresh.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: Some(vec!["U_OTHER".into()]),
+        }]);
+        coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".into(),
+                snapshot: SnapshotEnvelope::new(
+                    fresh_base,
+                    MessagePage {
+                        messages: vec![fresh],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .expect("the fresh count and partial users must be reconciled");
+
+        assert!(message_has_reaction(
+            &coordinator.history("C1")[0],
+            "wave",
+            1,
+            "U1"
+        ));
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::ReactionChanged(actor))
+                .is_none(),
+            "a preserved actor fact must still suppress its replay"
+        );
+    }
+
+    #[test]
+    fn fresh_explicit_users_do_not_inflate_the_authoritative_count() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let removal = |user_id: &str| ReactionMutation {
+            channel_id: "C1".into(),
+            message_ts: "11.0".into(),
+            name: "wave".into(),
+            user_id: user_id.into(),
+            added: false,
+        };
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(removal("U1")))
+            .unwrap();
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(removal("U2")))
+            .unwrap();
+        let fresh_base = coordinator.revision();
+        let mut fresh = message("11.0", "message");
+        fresh.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: Some(vec!["U1".into(), "U2".into()]),
+        }]);
+
+        coordinator
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        fresh_base,
+                        MessagePage {
+                            messages: vec![fresh],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .unwrap();
+        let history = coordinator.history("C1");
+        let reaction = &history[0].reactions.as_ref().unwrap()[0];
+        assert_eq!(reaction.count, Some(1));
+        assert_eq!(
+            reaction.users.as_ref().map(Vec::len),
+            Some(2),
+            "Slack's partial user evidence may be longer than its authoritative count"
+        );
+    }
+
+    #[test]
+    fn zero_count_snapshot_retires_old_actor_fact_from_the_durable_ledger() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![message("11.0", "message")],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let removal = ReactionMutation {
+            channel_id: "C1".into(),
+            message_ts: "11.0".into(),
+            name: "wave".into(),
+            user_id: "U1".into(),
+            added: false,
+        };
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(removal.clone()))
+            .expect("the first removal must create a durable actor fact");
+        let fresh_base = coordinator.revision();
+
+        coordinator
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        fresh_base,
+                        MessagePage {
+                            messages: vec![message("11.0", "message")],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .expect("the authoritative zero count must retire the old actor fact");
+        assert!(coordinator.reaction_actor_state_records().is_empty());
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::ReactionChanged(removal))
+                .is_some(),
+            "a replay after authoritative retirement must be able to self-correct"
+        );
+    }
+
+    #[test]
+    fn rejected_snapshot_does_not_reconcile_reaction_authority() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![message("11.0", "message")],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let actor = ReactionMutation {
+            channel_id: "C1".into(),
+            message_ts: "11.0".into(),
+            name: "wave".into(),
+            user_id: "U1".into(),
+            added: true,
+        };
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(actor.clone()))
+            .expect("the reaction must be accepted");
+        let stale_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::MessageChanged {
+                channel_id: "C1".into(),
+                message: message("11.0", "newer edit"),
+                kind: MessageMutationKind::Changed,
+                origin: MutationOrigin::Realtime,
+            })
+            .expect("the edit must supersede the pending snapshot");
+
+        assert!(
+            coordinator
+                .apply_from(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::HistorySnapshot {
+                        channel_id: "C1".into(),
+                        snapshot: SnapshotEnvelope::new(
+                            stale_base,
+                            MessagePage {
+                                messages: vec![message("11.0", "stale")],
+                                complete: true,
+                                ..Default::default()
+                            },
+                        ),
+                    },
+                )
+                .is_none(),
+            "the stale canonical message must be rejected"
+        );
+        assert_eq!(
+            coordinator.reaction_actor_state_records(),
+            vec![actor.clone()]
+        );
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::ReactionChanged(actor))
+                .is_none(),
+            "a rejected snapshot must not make a duplicate add effective again"
+        );
+    }
+
+    #[test]
+    fn stale_zero_snapshot_preserves_a_newer_zero_delta_actor_fact() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut reacted = message("11.0", "message");
+        reacted.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: Some(vec!["U1".into()]),
+        }]);
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![reacted],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let stale_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            }))
+            .expect("the explicit event must establish actor idempotency");
+
+        coordinator
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        stale_base,
+                        MessagePage {
+                            messages: vec![message("11.0", "message")],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .expect("the accepted stale response must retain the post-base actor fact");
+        assert!(message_has_reaction(
+            &coordinator.history("C1")[0],
+            "wave",
+            1,
+            "U1"
+        ));
+    }
+
+    #[test]
+    fn stale_snapshot_explicit_actor_does_not_reapply_its_newer_add_delta() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let request_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            }))
+            .expect("the post-request add must be retained");
+
+        let mut response = message("11.0", "message");
+        response.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: Some(vec!["U1".into()]),
+        }]);
+        coordinator
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        request_base,
+                        MessagePage {
+                            messages: vec![response],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .expect("the accepted response must materialize the reaction once");
+
+        assert!(message_has_reaction(
+            &coordinator.history("C1")[0],
+            "wave",
+            1,
+            "U1"
+        ));
+    }
+
+    #[test]
+    fn snapshot_reconciliation_respects_mixed_actor_revisions() {
+        let mut zero_count = WorkspaceCoordinator::default();
+        let mutation = |user_id: &str, added| ReactionMutation {
+            channel_id: "C1".into(),
+            message_ts: "11.0".into(),
+            name: "wave".into(),
+            user_id: user_id.into(),
+            added,
+        };
+        zero_count
+            .apply(WorkspaceMutation::ReactionChanged(mutation("U_OLD", true)))
+            .unwrap();
+        let zero_base = zero_count.revision();
+        zero_count
+            .apply(WorkspaceMutation::ReactionChanged(mutation("U_NEW", true)))
+            .unwrap();
+        zero_count
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        zero_base,
+                        MessagePage {
+                            messages: vec![message("11.0", "message")],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            zero_count.reaction_actor_state_records(),
+            vec![mutation("U_NEW", true)]
+        );
+        assert!(message_has_reaction(
+            &zero_count.history("C1")[0],
+            "wave",
+            1,
+            "U_NEW"
+        ));
+
+        let mut explicit_users = WorkspaceCoordinator::default();
+        explicit_users
+            .apply(WorkspaceMutation::ReactionChanged(mutation("U_OLD", false)))
+            .unwrap();
+        let explicit_base = explicit_users.revision();
+        explicit_users
+            .apply(WorkspaceMutation::ReactionChanged(mutation("U_NEW", false)))
+            .unwrap();
+        let mut response = message("11.0", "message");
+        response.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(2),
+            users: Some(vec!["U_OLD".into(), "U_NEW".into()]),
+        }]);
+        explicit_users
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        explicit_base,
+                        MessagePage {
+                            messages: vec![response],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            explicit_users.reaction_actor_state_records(),
+            vec![mutation("U_NEW", false), mutation("U_OLD", true)]
+        );
+        assert!(message_has_reaction(
+            &explicit_users.history("C1")[0],
+            "wave",
+            1,
+            "U_OLD"
+        ));
+        assert!(
+            !explicit_users.history("C1")[0].reactions.as_ref().unwrap()[0]
+                .users
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|user| user == "U_NEW")
+        );
+    }
+
+    #[test]
+    fn accepted_snapshot_advances_reaction_authority_for_same_base_idempotence() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![message("11.0", "message")],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            }))
+            .expect("the reaction must be accepted");
+        let response_base = coordinator.revision();
+        let exact_projection = coordinator.history("C1")[0].clone();
+
+        coordinator
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        response_base,
+                        MessagePage {
+                            messages: vec![exact_projection],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .expect("the first accepted response must establish snapshot authority");
+        let accepted_revision = coordinator.revision();
+        assert!(accepted_revision > response_base);
+
+        assert!(
+            coordinator
+                .apply_from(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::HistorySnapshot {
+                        channel_id: "C1".into(),
+                        snapshot: SnapshotEnvelope::new(
+                            response_base,
+                            MessagePage {
+                                messages: vec![message("11.0", "message")],
+                                complete: true,
+                                ..Default::default()
+                            },
+                        ),
+                    },
+                )
+                .is_none(),
+            "a conflicting second response at the same base must be stale"
+        );
+        assert_eq!(coordinator.revision(), accepted_revision);
+        assert!(message_has_reaction(
+            &coordinator.history("C1")[0],
+            "wave",
+            1,
+            "U1"
+        ));
+    }
+
+    #[test]
+    fn accepted_snapshot_revision_blocks_a_newer_base_started_before_its_commit() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut broadcast = message("11.0", "broadcast");
+        broadcast.thread_ts = Some("10.0".into());
+        broadcast.subtype = Some("thread_broadcast".into());
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![broadcast.clone()],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            }))
+            .unwrap();
+        let channel_response_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U_UNRELATED".into()),
+                name: Some("unrelated".into()),
+                ..Default::default()
+            }))
+            .unwrap();
+        let thread_response_base = coordinator.revision();
+
+        coordinator
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        channel_response_base,
+                        MessagePage {
+                            messages: vec![broadcast.clone()],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .expect("the first accepted response must retire the covered reaction");
+        let accepted_revision = coordinator.revision();
+        assert!(accepted_revision > thread_response_base);
+
+        let mut stale_thread = broadcast;
+        stale_thread.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: Some(vec!["U1".into()]),
+        }]);
+        coordinator
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ThreadSnapshot {
+                    channel_id: "C1".into(),
+                    thread_ts: "10.0".into(),
+                    snapshot: SnapshotEnvelope::new(
+                        thread_response_base,
+                        MessagePage {
+                            messages: vec![stale_thread],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .expect("the missing thread target must still materialize");
+        assert!(
+            coordinator
+                .threads
+                .get(&("C1".to_string(), "10.0".to_string()))
+                .unwrap()
+                .messages()[0]
+                .reactions
+                .is_none(),
+            "the later-arriving response predates the accepted snapshot commit"
+        );
+    }
+
+    #[test]
+    fn hydration_rebuilds_unknown_reaction_authority_for_later_projections() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let actor = ReactionMutation {
+            channel_id: "C1".into(),
+            message_ts: "11.0".into(),
+            name: "wave".into(),
+            user_id: "U1".into(),
+            added: true,
+        };
+        coordinator
+            .apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                reaction_actor_states: vec![actor],
+                ..Default::default()
+            }))
+            .expect("the durable actor fact must hydrate");
+        let response_base = coordinator.revision();
+
+        let mut broadcast = message("11.0", "broadcast");
+        broadcast.thread_ts = Some("10.0".into());
+        broadcast.subtype = Some("thread_broadcast".into());
+        broadcast.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: None,
+        }]);
+        coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".into(),
+                snapshot: SnapshotEnvelope::new(
+                    response_base,
+                    MessagePage {
+                        messages: vec![broadcast.clone()],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .expect("the hydrated fact must materialize in stale history");
+        coordinator
+            .apply(WorkspaceMutation::ThreadSnapshot {
+                channel_id: "C1".into(),
+                thread_ts: "10.0".into(),
+                snapshot: SnapshotEnvelope::new(
+                    response_base,
+                    MessagePage {
+                        messages: vec![broadcast],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .expect("the hydrated fact must materialize in a stale thread");
+
+        let mut catalog = crate::thread_catalog::ThreadCatalog::default();
+        let mut root = message("11.0", "root");
+        root.reply_count = Some(1);
+        root.reactions = Some(vec![SlackReaction {
+            name: Some("wave".into()),
+            count: Some(1),
+            users: None,
+        }]);
+        catalog.observe_thread("C1", "11.0", std::slice::from_ref(&root), false);
+        coordinator
+            .apply(WorkspaceMutation::ThreadCatalogChanged(
+                catalog.into_records(),
+            ))
+            .expect("the hydrated fact must materialize in the thread catalog");
+
+        assert!(message_has_reaction(
+            &coordinator.history("C1")[0],
+            "wave",
+            1,
+            "U1"
+        ));
+        assert!(message_has_reaction(
+            &coordinator
+                .threads
+                .get(&("C1".to_string(), "10.0".to_string()))
+                .unwrap()
+                .messages()[0],
+            "wave",
+            1,
+            "U1"
+        ));
+        assert!(message_has_reaction(
+            coordinator.thread_catalog[0].root.as_ref().unwrap(),
+            "wave",
+            1,
+            "U1"
+        ));
+    }
+
+    #[test]
+    fn unknown_reaction_authority_merges_into_later_stale_projections_and_catalog() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let request_base = coordinator.revision();
+        let reaction_reduction = coordinator
+            .apply_from(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::ReactionChanged(ReactionMutation {
+                    channel_id: "C1".into(),
+                    message_ts: "11.0".into(),
+                    name: "wave".into(),
+                    user_id: "U1".into(),
+                    added: true,
+                }),
+            )
+            .expect("the unknown reaction must persist its actor authority");
+        assert!(reaction_reduction.patch().changes().is_empty());
+        assert!(matches!(
+            reaction_reduction.store_batch().unwrap().changes(),
+            [
+                StoreChange::ReactionActorStatesReplaced(_),
+                StoreChange::ReactionChanged(ReactionProjectionMutation {
+                    count: ReactionProjectionCount::Delta(1),
+                    ..
+                }),
+            ]
+        ));
+        assert!(
+            coordinator.revision() > request_base,
+            "retained authority must participate in snapshot staleness"
+        );
+
+        let mut broadcast = message("11.0", "broadcast");
+        broadcast.thread_ts = Some("10.0".into());
+        broadcast.subtype = Some("thread_broadcast".into());
+        coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".into(),
+                snapshot: SnapshotEnvelope::new(
+                    request_base,
+                    MessagePage {
+                        messages: vec![broadcast.clone()],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .expect("the stale history must materialize retained reaction authority");
+        coordinator
+            .apply(WorkspaceMutation::ThreadSnapshot {
+                channel_id: "C1".into(),
+                thread_ts: "10.0".into(),
+                snapshot: SnapshotEnvelope::new(
+                    request_base,
+                    MessagePage {
+                        messages: vec![broadcast.clone()],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .expect("the stale thread must materialize retained reaction authority");
+
+        let mut catalog = crate::thread_catalog::ThreadCatalog::default();
+        let mut root = message("11.0", "root");
+        root.reply_count = Some(1);
+        catalog.observe_thread("C1", "11.0", std::slice::from_ref(&root), false);
+        coordinator
+            .apply(WorkspaceMutation::ThreadCatalogChanged(
+                catalog.into_records(),
+            ))
+            .expect("a later thread catalog must inherit retained reaction authority");
+
+        assert!(message_has_reaction(
+            &coordinator.history("C1")[0],
+            "wave",
+            1,
+            "U1"
+        ));
+        assert!(message_has_reaction(
+            &coordinator
+                .threads
+                .get(&("C1".to_string(), "10.0".to_string()))
+                .unwrap()
+                .messages()[0],
+            "wave",
+            1,
+            "U1"
+        ));
+        assert!(message_has_reaction(
+            coordinator.thread_catalog[0].root.as_ref().unwrap(),
+            "wave",
+            1,
+            "U1"
+        ));
+    }
+
+    #[test]
+    fn stale_thread_snapshot_inherits_reaction_from_existing_broadcast_projection() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut broadcast = message("11.0", "broadcast");
+        broadcast.thread_ts = Some("10.0".into());
+        broadcast.subtype = Some("thread_broadcast".into());
+        coordinator.apply(WorkspaceMutation::HistorySnapshot {
+            channel_id: "C1".into(),
+            snapshot: SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                MessagePage {
+                    messages: vec![broadcast.clone()],
+                    complete: true,
+                    ..Default::default()
+                },
+            ),
+        });
+        let thread_request_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "11.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            }))
+            .unwrap();
+
+        coordinator
+            .apply(WorkspaceMutation::ThreadSnapshot {
+                channel_id: "C1".into(),
+                thread_ts: "10.0".into(),
+                snapshot: SnapshotEnvelope::new(
+                    thread_request_base,
+                    MessagePage {
+                        messages: vec![broadcast],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .expect("the absent broadcast projection must inherit newer reaction authority");
+        let thread_message = &coordinator
+            .threads
+            .get(&("C1".to_string(), "10.0".to_string()))
+            .unwrap()
+            .messages()[0];
+        assert!(message_has_reaction(thread_message, "wave", 1, "U1"));
+    }
+
+    #[test]
+    fn reaction_mutation_updates_thread_catalog_root_without_loaded_timelines() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut catalog = crate::thread_catalog::ThreadCatalog::default();
+        let mut root = message("10.0", "root");
+        root.reply_count = Some(1);
+        catalog.observe_thread("C1", "10.0", std::slice::from_ref(&root), false);
+        coordinator.apply(WorkspaceMutation::ThreadCatalogChanged(
+            catalog.into_records(),
+        ));
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "10.0".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            }))
+            .expect("the thread inbox root is a canonical reaction projection");
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::ThreadCatalogChanged(records)]
+                if message_has_reaction(
+                    records[0].root.as_ref().unwrap(),
+                    "wave",
+                    1,
+                    "U1"
+                )
+        ));
+    }
+
+    fn message_change_has_one_wave(change: &MessageChange) -> bool {
+        let MessageChange::Upsert(message) = change else {
+            return false;
+        };
+        matches!(
+            message.reactions.as_deref(),
+            Some([reaction])
+                if reaction.name.as_deref() == Some("wave")
+                    && reaction.count == Some(1)
+                    && reaction.users.as_deref() == Some(&["U1".to_string()][..])
+        )
+    }
+
+    fn message_has_reaction(message: &SlackMessage, name: &str, count: u64, user_id: &str) -> bool {
+        message.reactions.as_ref().is_some_and(|reactions| {
+            reactions.iter().any(|reaction| {
+                reaction.name.as_deref() == Some(name)
+                    && reaction.count == Some(count)
+                    && reaction
+                        .users
+                        .as_ref()
+                        .is_some_and(|users| users.iter().any(|user| user == user_id))
+            })
+        })
     }
 }

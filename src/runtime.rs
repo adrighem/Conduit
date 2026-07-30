@@ -47,10 +47,10 @@ use crate::store::{
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
-    MessageAttentionEffect, MessageMutationKind, MutationOrigin, SnapshotEnvelope, StoreBatch,
-    StoreChange, WorkspaceAttentionContext, WorkspaceBootstrapData, WorkspaceChange,
-    WorkspaceCoordinator, WorkspaceEffect, WorkspaceMutation, WorkspacePatch, WorkspaceReduction,
-    WorkspaceRevision,
+    MessageAttentionEffect, MessageMutationKind, MutationOrigin, ReactionMutation,
+    SnapshotEnvelope, StoreBatch, StoreChange, WorkspaceAttentionContext, WorkspaceBootstrapData,
+    WorkspaceChange, WorkspaceCoordinator, WorkspaceEffect, WorkspaceMutation, WorkspacePatch,
+    WorkspaceReduction, WorkspaceRevision,
 };
 use crate::workspace_state::WorkspaceLifecycleEvent;
 
@@ -1295,7 +1295,7 @@ impl UserStatusSync {
 struct WorkspaceReducerAdapter {
     coordinator: Arc<Mutex<WorkspaceCoordinator>>,
     attention_metrics: Arc<AttentionMetrics>,
-    store_batch_admission: Arc<tokio::sync::Mutex<()>>,
+    publication_admission: Arc<tokio::sync::Mutex<()>>,
     pending_writes: Arc<Mutex<std::collections::VecDeque<PendingWorkspaceWrite>>>,
     #[cfg(test)]
     history_completion_send_gate: Arc<Mutex<Option<Arc<TestWorkspacePatchSendGate>>>>,
@@ -1449,7 +1449,7 @@ impl WorkspaceReducerAdapter {
         origin: MutationOrigin,
         mutation: WorkspaceMutation,
     ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
-        let _admission = self.store_batch_admission.lock().await;
+        let _admission = self.publication_admission.lock().await;
         Ok(self
             .apply_persisted_admitted(store, origin, mutation)
             .await?
@@ -1574,7 +1574,7 @@ impl WorkspaceReducerAdapter {
         mutation: WorkspaceMutation,
         completion: Option<RuntimeEventKind>,
     ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
-        let _admission = self.store_batch_admission.lock().await;
+        let _admission = self.publication_admission.lock().await;
         self.apply_persisted_and_publish_admitted(store, events, origin, mutation, completion)
             .await
     }
@@ -3128,7 +3128,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     let Some(store) = connection.workspace_store.as_ref() else {
         return;
     };
-    let _admission = connection.workspace.store_batch_admission.lock().await;
+    let _admission = connection.workspace.publication_admission.lock().await;
     #[cfg(test)]
     if let Some(gate) = connection.cached_bootstrap_load_gate.as_ref() {
         gate.wait_before_send();
@@ -3155,6 +3155,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
         user_statuses,
         thread_catalog,
         custom_emojis,
+        reaction_actor_states,
         ..
     } = bootstrap;
     crate::debug::log(
@@ -3202,6 +3203,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
                 conversations: conversations.clone(),
                 threads: thread_catalog.clone(),
+                reaction_actor_states,
                 ..Default::default()
             }),
             None,
@@ -4302,17 +4304,27 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             add,
             thread_ts,
         } => {
+            let current_user_id = context
+                .current_user_id
+                .filter(|user_id| !user_id.trim().is_empty())
+                .ok_or_else(|| anyhow!("current Slack user identity is unavailable"))?
+                .to_string();
             let api = require_slack(context.slack)?;
             api.set_reaction(&channel_id, &ts, &name, add).await?;
-            context
-                .events
-                .send_event(RuntimeEventKind::ReactionUpdated {
+            persist_confirmed_reaction(
+                context.events,
+                context.workspace,
+                context.workspace_store.as_ref(),
+                ReactionMutation {
                     channel_id,
-                    ts,
+                    message_ts: ts,
                     name,
+                    user_id: current_user_id,
                     added: add,
-                    thread_ts,
-                });
+                },
+                thread_ts,
+            )
+            .await;
         }
         RuntimeCommand::SetSaved {
             channel_id,
@@ -4449,22 +4461,19 @@ async fn run_socket_mode(
         let events_for_run = events.clone();
         let connected_events = events.clone();
         let mut persistence_tasks = tokio::task::JoinSet::new();
-        let persistence_sender = workspace_store.clone().map(|store| {
-            // The socket callback is synchronous, so awaiting bounded capacity
-            // would deadlock the transport. One session-scoped ordered actor is
-            // drained before reconnect instead of dropping classified messages.
-            let (sender, receiver) =
-                realtime_persistence_channel(workspace.attention_metrics_handle());
-            persistence_tasks.spawn(persist_realtime_events(
-                receiver,
-                store,
-                current_user_id.clone(),
-                events_for_run.clone(),
-                workspace.clone(),
-                user_status_sync.clone(),
-            ));
-            sender
-        });
+        // The socket callback is synchronous, so awaiting publication admission
+        // would deadlock the transport. One session-scoped ordered actor handles
+        // messages and reactions with or without a store and drains before reconnect.
+        let (persistence_sender, persistence_receiver) =
+            realtime_persistence_channel(workspace.attention_metrics_handle());
+        persistence_tasks.spawn(persist_realtime_events(
+            persistence_receiver,
+            workspace_store.clone(),
+            current_user_id.clone(),
+            events_for_run.clone(),
+            workspace.clone(),
+            user_status_sync.clone(),
+        ));
         let persistence_fallback = RealtimePersistenceFallback::new(
             workspace_store.clone(),
             current_user_id.clone(),
@@ -4474,6 +4483,7 @@ async fn run_socket_mode(
         );
         let persistence_for_run = persistence_sender.clone();
         let fallback_for_run = persistence_fallback.clone();
+        let has_store_for_run = workspace_store.is_some();
         let workspace_for_run = workspace.clone();
         let huddles_for_run = huddles.clone();
         let team_id_for_run = team_id.clone();
@@ -4526,7 +4536,9 @@ async fn run_socket_mode(
                 };
                 let persistence_event = match &event {
                     SocketModeEvent::UserChanged(user)
-                    | SocketModeEvent::UserHuddleChanged(user) => {
+                    | SocketModeEvent::UserHuddleChanged(user)
+                        if has_store_for_run =>
+                    {
                         Some(RealtimePersistenceEvent::UserChanged {
                             user: user.clone(),
                             status_revision,
@@ -4538,20 +4550,18 @@ async fn run_socket_mode(
                     SocketModeEvent::Reaction(_) => Some(RealtimePersistenceEvent::OrderedEvent {
                         event: event.clone(),
                     }),
-                    SocketModeEvent::RefreshConversations => None,
+                    SocketModeEvent::UserChanged(_)
+                    | SocketModeEvent::UserHuddleChanged(_)
+                    | SocketModeEvent::RefreshConversations => None,
                 };
-                if let Some(sender) = persistence_for_run.as_ref() {
-                    if let Some(persistence_event) = persistence_event {
-                        if let Err(returned) = sender.send(persistence_event) {
-                            crate::debug::log(
-                                "store",
-                                "RealtimePersistenceQueueRejected reason=worker_closed",
-                            );
-                            fallback_for_run.schedule(returned.0);
-                        }
+                if let Some(persistence_event) = persistence_event {
+                    if let Err(returned) = persistence_for_run.send(persistence_event) {
+                        crate::debug::log(
+                            "store",
+                            "RealtimePersistenceQueueRejected reason=worker_closed",
+                        );
+                        fallback_for_run.schedule(returned.0);
                     }
-                } else if let Some(persistence_event) = persistence_event {
-                    fallback_for_run.schedule(persistence_event);
                 }
             },
         );
@@ -4644,21 +4654,44 @@ async fn wait_for_socket_mode_cancellation(cancellation: &mut watch::Receiver<bo
     }
 }
 
+async fn publish_realtime_reaction_without_store(
+    workspace: &WorkspaceReducerAdapter,
+    events: &RuntimeEventSender,
+    event: SocketModeEvent,
+) {
+    let _publication = workspace.publication_admission.lock().await;
+    let SocketModeEvent::Reaction(event) = event else {
+        return;
+    };
+    persist_realtime_reaction_admitted(None, events, workspace, event).await;
+}
+
 fn apply_realtime_workspace_event(
     workspace: &WorkspaceReducerAdapter,
     event: &SocketModeEvent,
 ) -> Option<MessageAttentionEffect> {
     let mutation = match event {
         SocketModeEvent::Message(event) => Some(realtime_message_mutation(event, None)),
+        SocketModeEvent::Reaction(event) => Some(realtime_reaction_mutation(event)),
         SocketModeEvent::UserChanged(user) => Some(WorkspaceMutation::UserUpsert((**user).clone())),
-        SocketModeEvent::UserHuddleChanged(_)
-        | SocketModeEvent::Reaction(_)
-        | SocketModeEvent::RefreshConversations => None,
+        SocketModeEvent::UserHuddleChanged(_) | SocketModeEvent::RefreshConversations => None,
     };
     let reduction = workspace.apply(MutationOrigin::Realtime, mutation?)?;
     reduction.effects().iter().find_map(|effect| match effect {
         WorkspaceEffect::MessageAttention(effect) => Some(effect.clone()),
         WorkspaceEffect::ThreadRead(_) => None,
+    })
+}
+
+fn realtime_reaction_mutation(
+    event: &crate::socket_mode::SocketModeReactionEvent,
+) -> WorkspaceMutation {
+    WorkspaceMutation::ReactionChanged(ReactionMutation {
+        channel_id: event.channel_id.clone(),
+        message_ts: event.ts.clone(),
+        name: event.name.clone(),
+        user_id: event.user_id.clone(),
+        added: event.added,
     })
 }
 
@@ -5113,7 +5146,7 @@ fn claimed_notification_candidate(
 }
 
 fn publish_persisted_workspace_write(events: &RuntimeEventSender, write: &PersistedWorkspaceWrite) {
-    events.send_workspace_patch(write.reduction.patch().clone());
+    publish_workspace_reduction(events, &write.reduction);
     if let Some(notification) = write.notification() {
         // The ledger claim is already durable with the message projection.
         // Abrupt process exit before this native UI delivery is therefore an
@@ -5131,16 +5164,17 @@ fn publish_persisted_workspace_write(events: &RuntimeEventSender, write: &Persis
 
 async fn persist_realtime_events(
     mut receiver: RealtimePersistenceReceiver,
-    store: WorkspaceStore,
+    store: impl Into<Option<WorkspaceStore>>,
     current_user_id: Option<String>,
     events: RuntimeEventSender,
     workspace: WorkspaceReducerAdapter,
     user_status_sync: UserStatusSync,
 ) {
+    let store = store.into();
     while let Some(event) = receiver.recv().await {
         persist_realtime_event(
             event,
-            Some(&store),
+            store.as_ref(),
             current_user_id.as_deref(),
             &events,
             &workspace,
@@ -5224,12 +5258,99 @@ async fn persist_realtime_event(
                     .await;
             }
         }
-        RealtimePersistenceEvent::OrderedEvent { event } => {
-            apply_realtime_workspace_event(workspace, &event);
+        RealtimePersistenceEvent::OrderedEvent { event } => match event {
+            SocketModeEvent::Reaction(event) => {
+                if let Some(store) = store {
+                    persist_realtime_reaction(store, events, workspace, event).await;
+                } else {
+                    publish_realtime_reaction_without_store(
+                        workspace,
+                        events,
+                        SocketModeEvent::Reaction(event),
+                    )
+                    .await;
+                }
+            }
+            event => {
+                apply_realtime_workspace_event(workspace, &event);
+                events.send_event(RuntimeEventKind::SocketModeEvent {
+                    event,
+                    attention: None,
+                });
+            }
+        },
+    }
+}
+
+async fn persist_realtime_reaction(
+    store: &WorkspaceStore,
+    events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
+    event: crate::socket_mode::SocketModeReactionEvent,
+) {
+    let _admission = workspace.publication_admission.lock().await;
+    persist_realtime_reaction_admitted(Some(store), events, workspace, event).await;
+}
+
+async fn persist_realtime_reaction_admitted(
+    store: Option<&WorkspaceStore>,
+    events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
+    event: crate::socket_mode::SocketModeReactionEvent,
+) {
+    let recovered = match workspace.recover_persisted_admitted(store).await {
+        Ok(writes) => writes,
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "RealtimeReactionRecoveryDeferred channel_id={} category={:?}",
+                    event.channel_id,
+                    error.category()
+                ),
+            );
+            workspace.apply_and_enqueue(
+                store,
+                MutationOrigin::Realtime,
+                realtime_reaction_mutation(&event),
+            );
             events.send_event(RuntimeEventKind::SocketModeEvent {
-                event,
+                event: SocketModeEvent::Reaction(event),
                 attention: None,
             });
+            return;
+        }
+    };
+    for write in &recovered {
+        publish_persisted_workspace_write(events, write);
+    }
+
+    workspace.apply_and_enqueue(
+        store,
+        MutationOrigin::Realtime,
+        realtime_reaction_mutation(&event),
+    );
+    let persisted = match workspace.persist_pending_writes(store).await {
+        Ok(()) => Some(workspace.drain_persisted_admitted()),
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "RealtimeReactionDeltaDeferred channel_id={} category={:?}",
+                    event.channel_id,
+                    error.category()
+                ),
+            );
+            None
+        }
+    };
+    events.send_event(RuntimeEventKind::SocketModeEvent {
+        event: SocketModeEvent::Reaction(event),
+        attention: None,
+    });
+    if let Some(writes) = persisted {
+        for write in &writes {
+            publish_persisted_workspace_write(events, write);
         }
     }
 }
@@ -5260,7 +5381,7 @@ async fn publish_local_post_message(
     channel_id: String,
     message: SlackMessage,
 ) {
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = workspace.publication_admission.lock().await;
     workspace.apply_and_enqueue(
         store,
         MutationOrigin::Local,
@@ -5314,7 +5435,7 @@ async fn publish_local_thread_read(
         return;
     }
 
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = workspace.publication_admission.lock().await;
     let current = workspace.apply_and_enqueue(
         store,
         MutationOrigin::Local,
@@ -5359,8 +5480,7 @@ async fn persist_and_publish_local_reductions(
         return;
     }
     for write in workspace.drain_persisted_admitted() {
-        send_thread_catalog_compatibility_for_reduction(events, &write.reduction);
-        events.send_workspace_patch(write.reduction.patch().clone());
+        publish_persisted_workspace_write(events, &write);
     }
 }
 
@@ -5375,7 +5495,7 @@ async fn publish_socket_message_without_store(
     workspace: &WorkspaceReducerAdapter,
     message_event: crate::socket_mode::SocketModeMessageEvent,
 ) {
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = workspace.publication_admission.lock().await;
 
     let recovered = match workspace.recover_persisted_admitted(None).await {
         Ok(writes) => writes,
@@ -5439,7 +5559,7 @@ async fn publish_socket_message_without_store(
     // These reductions are immediately publishable in memory, but their
     // persistence-only claim intents were not durably claimed.
     for write in workspace.drain_persisted_admitted() {
-        events.send_workspace_patch(write.reduction.patch().clone());
+        publish_persisted_workspace_write(events, &write);
     }
     if attention_status == AttentionPersistenceStatus::Accepted {
         if let Some(notification) =
@@ -5496,7 +5616,7 @@ async fn persist_socket_message(
     workspace: &WorkspaceReducerAdapter,
     message_event: crate::socket_mode::SocketModeMessageEvent,
 ) {
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = workspace.publication_admission.lock().await;
 
     let recovered = match workspace.recover_persisted_admitted(Some(store)).await {
         Ok(writes) => writes,
@@ -5609,21 +5729,6 @@ async fn persist_socket_message(
         for write in &writes {
             publish_persisted_workspace_write(events, write);
         }
-    }
-}
-
-fn send_thread_catalog_compatibility_for_reduction(
-    events: &RuntimeEventSender,
-    reduction: &WorkspaceReduction,
-) {
-    if let Some(records) = reduction.patch().changes().iter().find_map(|change| {
-        if let WorkspaceChange::ThreadCatalogChanged(records) = change {
-            Some(records)
-        } else {
-            None
-        }
-    }) {
-        events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records.clone()));
     }
 }
 
@@ -5798,6 +5903,73 @@ async fn persist_confirmed_conversation_star(
     Ok(())
 }
 
+/// Slack has already accepted this action, so compatibility completion is
+/// independent of local cache availability. The typed patch remains in the
+/// ordered journal until its complete store batch is durable.
+async fn persist_confirmed_reaction(
+    events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
+    store: Option<&WorkspaceStore>,
+    change: ReactionMutation,
+    thread_ts: Option<String>,
+) {
+    if store.is_none() {
+        let _publication = workspace.publication_admission.lock().await;
+        for write in workspace
+            .recover_persisted_admitted(None)
+            .await
+            .expect("no-store workspace recovery cannot fail")
+        {
+            publish_persisted_workspace_write(events, &write);
+        }
+        workspace.apply_and_enqueue(
+            None,
+            MutationOrigin::Local,
+            WorkspaceMutation::ReactionChanged(change.clone()),
+        );
+        events.send_event(RuntimeEventKind::ReactionUpdated {
+            channel_id: change.channel_id,
+            ts: change.message_ts,
+            name: change.name,
+            added: change.added,
+            thread_ts,
+        });
+        for write in workspace.drain_persisted_admitted() {
+            publish_persisted_workspace_write(events, &write);
+        }
+        return;
+    }
+
+    let _admission = workspace.publication_admission.lock().await;
+    workspace.apply_and_enqueue(
+        store,
+        MutationOrigin::Local,
+        WorkspaceMutation::ReactionChanged(change.clone()),
+    );
+    events.send_event(RuntimeEventKind::ReactionUpdated {
+        channel_id: change.channel_id.clone(),
+        ts: change.message_ts.clone(),
+        name: change.name.clone(),
+        added: change.added,
+        thread_ts,
+    });
+
+    if let Err(error) = workspace.persist_pending_writes(store).await {
+        crate::debug::log(
+            "store",
+            &format!(
+                "ConfirmedReactionDeltaDeferred channel_id={} category={:?}",
+                change.channel_id,
+                error.category()
+            ),
+        );
+        return;
+    }
+    for write in workspace.drain_persisted_admitted() {
+        publish_persisted_workspace_write(events, &write);
+    }
+}
+
 async fn load_conversations_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
@@ -5855,7 +6027,7 @@ async fn apply_conversation_membership_snapshot(
         ));
     }
 
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = workspace.publication_admission.lock().await;
     if let Some(store) = workspace_store {
         store.validate_conversation_cache().await?;
         if store.workspace_cache_needs_repair() {
@@ -6499,7 +6671,7 @@ async fn publish_history_snapshot_with_completion(
     cached: bool,
 ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
     let requested_messages = messages.clone();
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = workspace.publication_admission.lock().await;
     let reductions = workspace
         .apply_persisted_and_publish_admitted(
             workspace_store.as_ref(),
@@ -6618,7 +6790,7 @@ async fn publish_thread_snapshot_with_completion(
 ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
     let requested_messages = page.messages.clone();
     let complete = !append_older && !page.has_more && page.next_cursor.is_none();
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = workspace.publication_admission.lock().await;
     let reductions = workspace
         .apply_persisted_and_publish_admitted(
             workspace_store.as_ref(),
@@ -6793,7 +6965,7 @@ async fn publish_local_conversation_read(
         return;
     }
 
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = workspace.publication_admission.lock().await;
     workspace.apply_and_enqueue(
         store,
         MutationOrigin::Local,
@@ -7137,6 +7309,15 @@ impl TestWorkspacePatchSendGate {
     }
 }
 
+fn publish_workspace_reduction(events: &RuntimeEventSender, reduction: &WorkspaceReduction) {
+    for change in reduction.patch().changes() {
+        if let WorkspaceChange::ThreadCatalogChanged(records) = change {
+            events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records.clone()));
+        }
+    }
+    events.send_workspace_patch(reduction.patch().clone());
+}
+
 impl RuntimeEventSender {
     fn new(
         sender: mpsc::UnboundedSender<RuntimeEvent>,
@@ -7225,7 +7406,7 @@ mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::workspace_pipeline::{StoreChange, WorkspaceChange};
+    use crate::workspace_pipeline::{ReactionMutation, StoreChange, WorkspaceChange};
     use crate::workspace_state::RealtimeMessageKind;
 
     fn thread_test_message(ts: &str, text: &str, thread_ts: Option<&str>) -> SlackMessage {
@@ -10200,7 +10381,7 @@ mod tests {
                 },
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
             );
-            let admission = workspace.store_batch_admission.lock().await;
+            let admission = workspace.publication_admission.lock().await;
             let workspace_store = Some(store.clone());
             let local_read = publish_local_conversation_read(
                 &events,
@@ -10965,6 +11146,7 @@ mod tests {
                         users: vec![user],
                         histories: HashMap::from([("C1".into(), vec![root.clone()])]),
                         threads: thread_records.clone(),
+                        reaction_actor_states: Vec::new(),
                     }),
                 )
                 .unwrap();
@@ -11103,7 +11285,7 @@ mod tests {
             assert!(store.workspace_cache_needs_repair());
 
             {
-                let _admission = workspace.store_batch_admission.lock().await;
+                let _admission = workspace.publication_admission.lock().await;
                 workspace
                     .repair_workspace_cache_admitted(&store)
                     .await
@@ -11134,7 +11316,7 @@ mod tests {
             let recovering_workspace = workspace.clone();
             let recovering_store = store.clone();
             let recovery = tokio::spawn(async move {
-                let _admission = recovering_workspace.store_batch_admission.lock().await;
+                let _admission = recovering_workspace.publication_admission.lock().await;
                 recovering_workspace
                     .recover_persisted_admitted(Some(&recovering_store))
                     .await
@@ -11254,7 +11436,7 @@ mod tests {
             let recovering_workspace = workspace.clone();
             let recovering_store = store.clone();
             let recovery = tokio::spawn(async move {
-                let _admission = recovering_workspace.store_batch_admission.lock().await;
+                let _admission = recovering_workspace.publication_admission.lock().await;
                 recovering_workspace
                     .recover_persisted_admitted(Some(&recovering_store))
                     .await
@@ -11345,7 +11527,7 @@ mod tests {
             let recovering_workspace = workspace.clone();
             let recovering_store = store.clone();
             let recovery = tokio::spawn(async move {
-                let _admission = recovering_workspace.store_batch_admission.lock().await;
+                let _admission = recovering_workspace.publication_admission.lock().await;
                 recovering_workspace
                     .recover_persisted_admitted(Some(&recovering_store))
                     .await
@@ -11471,7 +11653,7 @@ mod tests {
             store.corrupt_conversation_payload("C1").await.unwrap();
             store.validate_conversation_cache().await.unwrap();
             {
-                let _admission = workspace.store_batch_admission.lock().await;
+                let _admission = workspace.publication_admission.lock().await;
                 workspace
                     .repair_workspace_cache_admitted(&store)
                     .await
@@ -11491,7 +11673,7 @@ mod tests {
             store.corrupt_conversation_payload("C1").await.unwrap();
             store.validate_conversation_cache().await.unwrap();
             let drained = {
-                let _admission = workspace.store_batch_admission.lock().await;
+                let _admission = workspace.publication_admission.lock().await;
                 workspace
                     .recover_persisted_admitted(Some(&store))
                     .await
@@ -11512,6 +11694,98 @@ mod tests {
                     .as_deref(),
                 Some("second pending")
             );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_cache_repair_restores_reaction_actor_tombstones() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-reaction-actor-repair-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+        let workspace = WorkspaceReducerAdapter::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                name: Some("general".into()),
+                ..Default::default()
+            };
+            let reacted = SlackMessage {
+                ts: "1.0".into(),
+                text: Some("reacted".into()),
+                reactions: Some(vec![crate::models::SlackReaction {
+                    name: Some("wave".into()),
+                    count: Some(2),
+                    users: Some(vec!["U_OTHER".into()]),
+                }]),
+                ..Default::default()
+            };
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    conversations: vec![conversation.clone()],
+                    histories: HashMap::from([("C1".into(), vec![reacted.clone()])]),
+                    ..Default::default()
+                }),
+            );
+            store
+                .store_conversations(std::slice::from_ref(&conversation))
+                .await
+                .unwrap();
+            store
+                .store_history("C1", std::slice::from_ref(&reacted))
+                .await
+                .unwrap();
+            let removal = ReactionMutation {
+                channel_id: "C1".into(),
+                message_ts: "1.0".into(),
+                name: "wave".into(),
+                user_id: "U_SELF".into(),
+                added: false,
+            };
+            workspace
+                .apply_persisted(
+                    Some(&store),
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ReactionChanged(removal.clone()),
+                )
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+            assert!(store.load_conversations().await.unwrap().is_none());
+            assert!(store.workspace_cache_needs_repair());
+
+            let _admission = workspace.publication_admission.lock().await;
+            workspace
+                .repair_workspace_cache_admitted(&store)
+                .await
+                .unwrap();
+            assert!(!store.workspace_cache_needs_repair());
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+            let bootstrap = reopened.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(bootstrap.reaction_actor_states, vec![removal.clone()]);
+            let mut restored = WorkspaceCoordinator::default();
+            restored.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                reaction_actor_states: bootstrap.reaction_actor_states,
+                ..Default::default()
+            }));
+            let revision = restored.revision();
+            assert!(restored
+                .apply(WorkspaceMutation::ReactionChanged(removal))
+                .is_none());
+            assert_eq!(restored.revision(), revision);
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -11648,7 +11922,7 @@ mod tests {
             }),
         )
         .is_none());
-        assert_eq!(workspace.revision().value(), 2);
+        assert_eq!(workspace.revision().value(), 3);
     }
 
     #[test]
@@ -13214,7 +13488,7 @@ mod tests {
                 MutationOrigin::Cache,
                 WorkspaceMutation::ConversationUpsert(conversation),
             );
-            let admission = workspace.store_batch_admission.lock().await;
+            let admission = workspace.publication_admission.lock().await;
             let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
@@ -13772,7 +14046,7 @@ mod tests {
             .split_once("async fn publish_local_thread_read(")
             .unwrap()
             .0;
-        assert!(local_persistence.contains("store_batch_admission.lock().await"));
+        assert!(local_persistence.contains("publication_admission.lock().await"));
         assert!(local_persistence.contains("apply_and_enqueue("));
         assert!(local_persistence.contains("publish_posted_message_before_persistence("));
         assert!(!local_persistence.contains("store_merged_history("));
@@ -13785,7 +14059,7 @@ mod tests {
             .split_once("async fn observe_socket_thread_catalog(")
             .unwrap()
             .0;
-        assert!(socket_persistence.contains("store_batch_admission.lock().await"));
+        assert!(socket_persistence.contains("publication_admission.lock().await"));
         assert!(socket_persistence.contains("recover_persisted_admitted(Some(store))"));
         assert!(socket_persistence.contains("apply_and_enqueue("));
         assert!(!socket_persistence.contains("store_merged_history("));
@@ -13805,7 +14079,7 @@ mod tests {
             .split_once("RealtimePersistenceEvent::Message { event } => {")
             .unwrap()
             .1
-            .split_once("RealtimePersistenceEvent::OrderedEvent { event } => {")
+            .split_once("RealtimePersistenceEvent::OrderedEvent { event } =>")
             .unwrap()
             .0;
         assert!(worker_message_path.contains("persist_socket_message("));
@@ -13972,7 +14246,7 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let _admission = workspace.store_batch_admission.lock().await;
+                let _admission = workspace.publication_admission.lock().await;
                 persist_and_publish_local_reductions(
                     &events,
                     Some(&store),
@@ -14240,7 +14514,7 @@ mod tests {
                 .await
                 .unwrap();
             {
-                let _admission = workspace.store_batch_admission.lock().await;
+                let _admission = workspace.publication_admission.lock().await;
                 persist_and_publish_local_reductions(
                     &events,
                     Some(&store),
@@ -15070,7 +15344,7 @@ mod tests {
             let repairing_workspace = workspace.clone();
             let repairing_store = store.clone();
             let repair = tokio::spawn(async move {
-                let _admission = repairing_workspace.store_batch_admission.lock().await;
+                let _admission = repairing_workspace.publication_admission.lock().await;
                 repairing_workspace
                     .persist_pending_writes(Some(&repairing_store))
                     .await
@@ -15785,6 +16059,17 @@ mod tests {
                 })
                 .unwrap();
             sender
+                .send(RealtimePersistenceEvent::OrderedEvent {
+                    event: SocketModeEvent::Reaction(socket_mode::SocketModeReactionEvent {
+                        channel_id: "C1".into(),
+                        ts: "1.0".into(),
+                        name: "wave".into(),
+                        user_id: "U_OTHER".into(),
+                        added: true,
+                    }),
+                })
+                .unwrap();
+            sender
                 .send(RealtimePersistenceEvent::Message {
                     event: Box::new(crate::socket_mode::SocketModeMessageEvent {
                         channel_id: "C1".into(),
@@ -15802,20 +16087,54 @@ mod tests {
             worker.await.unwrap();
 
             let delivered = std::iter::from_fn(|| runtime_receiver.try_recv().ok())
-                .filter_map(|event| match event.kind {
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            let raw_events = delivered
+                .iter()
+                .filter_map(|kind| match kind {
                     RuntimeEventKind::SocketModeEvent { event, .. } => Some(event),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
             assert!(matches!(
-                delivered.as_slice(),
+                raw_events.as_slice(),
                 [
                     SocketModeEvent::Message(posted),
+                    SocketModeEvent::Reaction(_),
                     SocketModeEvent::Reaction(_),
                     SocketModeEvent::Message(deleted),
                 ] if posted.kind == SocketModeMessageKind::Posted
                     && deleted.kind == SocketModeMessageKind::Deleted
             ));
+            let reaction_raw_index = delivered
+                .iter()
+                .position(|kind| {
+                    matches!(
+                        kind,
+                        RuntimeEventKind::SocketModeEvent {
+                            event: SocketModeEvent::Reaction(_),
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            let reaction_patch_indices = delivered
+                .iter()
+                .enumerate()
+                .filter_map(|(index, kind)| match kind {
+                    RuntimeEventKind::WorkspacePatch(patch)
+                        if patch.changes().iter().any(workspace_change_has_wave) =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(reaction_patch_indices.len(), 1);
+            assert!(
+                reaction_raw_index < reaction_patch_indices[0],
+                "the legacy reaction event must retain raw-before-patch ordering"
+            );
             let coordinator = workspace
                 .coordinator
                 .lock()
@@ -16684,7 +17003,7 @@ mod tests {
                 MutationOrigin::Cache,
                 WorkspaceMutation::ConversationUpsert(conversation),
             );
-            let admission = workspace.store_batch_admission.lock().await;
+            let admission = workspace.publication_admission.lock().await;
             let first_session = SessionId::default().next();
             let second_session = first_session.next();
             let state = Arc::new(Mutex::new(RuntimeState::new(first_session)));
@@ -18569,5 +18888,733 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn local_reaction_confirmation_survives_store_failure_and_recovers_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-local-reaction-authority-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+            let message = SlackMessage {
+                ts: "1.0".into(),
+                text: Some("hello".into()),
+                ..Default::default()
+            };
+            store
+                .store_history("C1", std::slice::from_ref(&message))
+                .await
+                .unwrap();
+            store
+                .install_history_batch_failure_trigger_for("C1")
+                .await
+                .unwrap();
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    histories: HashMap::from([("C1".into(), vec![message])]),
+                    ..Default::default()
+                }),
+            );
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(
+                    RuntimeOperation::Reaction,
+                    RuntimeTarget::Message {
+                        channel_id: "C1".into(),
+                        thread_ts: None,
+                    },
+                ),
+            );
+
+            persist_confirmed_reaction(
+                &events,
+                &workspace,
+                Some(&store),
+                ReactionMutation {
+                    channel_id: "C1".into(),
+                    message_ts: "1.0".into(),
+                    name: "wave".into(),
+                    user_id: "U_SELF".into(),
+                    added: true,
+                },
+                None,
+            )
+            .await;
+
+            let completion = receiver.recv().await.unwrap();
+            assert!(matches!(
+                completion.kind,
+                RuntimeEventKind::ReactionUpdated {
+                    channel_id,
+                    ts,
+                    name,
+                    added: true,
+                    thread_ts: None,
+                } if channel_id == "C1" && ts == "1.0" && name == "wave"
+            ));
+            assert!(
+                receiver.try_recv().is_err(),
+                "a failed store batch must withhold only the typed patch"
+            );
+            assert!(!message_has_wave(
+                store
+                    .load_history("C1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .first()
+                    .unwrap()
+            ));
+
+            store.clear_history_batch_failure_trigger().await.unwrap();
+            persist_realtime_reaction(
+                &store,
+                &events,
+                &workspace,
+                socket_mode::SocketModeReactionEvent {
+                    channel_id: "C1".into(),
+                    ts: "1.0".into(),
+                    name: "wave".into(),
+                    user_id: "U_SELF".into(),
+                    added: true,
+                },
+            )
+            .await;
+
+            let recovered = std::iter::from_fn(|| receiver.try_recv().ok())
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                recovered
+                    .iter()
+                    .filter(|kind| matches!(kind, RuntimeEventKind::ReactionUpdated { .. }))
+                    .count(),
+                0,
+                "recovery and the realtime echo must not repeat local completion"
+            );
+            assert_eq!(
+                recovered
+                    .iter()
+                    .filter(|kind| {
+                        matches!(
+                            kind,
+                            RuntimeEventKind::WorkspacePatch(patch)
+                                if patch.changes().iter().any(workspace_change_has_wave)
+                        )
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                recovered
+                    .iter()
+                    .filter(|kind| {
+                        matches!(
+                            kind,
+                            RuntimeEventKind::SocketModeEvent {
+                                event: SocketModeEvent::Reaction(_),
+                                ..
+                            }
+                        )
+                    })
+                    .count(),
+                1
+            );
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+            let persisted = reopened
+                .load_history("C1")
+                .await
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .find(|message| message.ts == "1.0")
+                .unwrap();
+            assert!(message_has_wave(&persisted));
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn realtime_reaction_normalizes_to_the_same_coordinator_mutation() {
+        let event = socket_mode::SocketModeReactionEvent {
+            channel_id: "C1".into(),
+            ts: "1.0".into(),
+            name: "wave".into(),
+            user_id: "U1".into(),
+            added: true,
+        };
+
+        assert!(matches!(
+            realtime_reaction_mutation(&event),
+            WorkspaceMutation::ReactionChanged(ReactionMutation {
+                channel_id,
+                message_ts,
+                name,
+                user_id,
+                added: true,
+            }) if channel_id == "C1"
+                && message_ts == "1.0"
+                && name == "wave"
+                && user_id == "U1"
+        ));
+    }
+
+    #[test]
+    fn realtime_reaction_without_store_publishes_raw_before_typed_patch() {
+        let workspace = WorkspaceReducerAdapter::default();
+        workspace.apply(
+            MutationOrigin::Cache,
+            WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                histories: HashMap::from([(
+                    "C1".into(),
+                    vec![SlackMessage {
+                        ts: "1.0".into(),
+                        text: Some("hello".into()),
+                        ..Default::default()
+                    }],
+                )]),
+                ..Default::default()
+            }),
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let events = RuntimeEventSender::new(
+            sender,
+            RuntimeIdentity {
+                session: SessionId::default().next(),
+                request: RequestId::new(1),
+            },
+            OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
+        );
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(publish_realtime_reaction_without_store(
+                &workspace,
+                &events,
+                SocketModeEvent::Reaction(socket_mode::SocketModeReactionEvent {
+                    channel_id: "C1".into(),
+                    ts: "1.0".into(),
+                    name: "wave".into(),
+                    user_id: "U1".into(),
+                    added: true,
+                }),
+            ));
+
+        assert!(matches!(
+            receiver.try_recv().unwrap().kind,
+            RuntimeEventKind::SocketModeEvent {
+                event: SocketModeEvent::Reaction(_),
+                attention: None,
+            }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().kind,
+            RuntimeEventKind::WorkspacePatch(ref patch)
+                if patch.changes().iter().any(workspace_change_has_wave)
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn no_store_reaction_publication_serializes_raw_and_patch_pairs() {
+        let workspace = WorkspaceReducerAdapter::default();
+        workspace.apply(
+            MutationOrigin::Cache,
+            WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                histories: HashMap::from([(
+                    "C1".into(),
+                    vec![SlackMessage {
+                        ts: "1.0".into(),
+                        text: Some("hello".into()),
+                        ..Default::default()
+                    }],
+                )]),
+                ..Default::default()
+            }),
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let session = SessionId::default().next();
+        let (patch_started, patch_reached) = std::sync::mpsc::channel();
+        let (release_patch, release) = std::sync::mpsc::channel();
+        let mut first_events = RuntimeEventSender::new(
+            sender.clone(),
+            RuntimeIdentity {
+                session,
+                request: RequestId::new(1),
+            },
+            OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
+        );
+        first_events.workspace_patch_send_gate = Some(Arc::new(TestWorkspacePatchSendGate {
+            started: patch_started,
+            release: Mutex::new(release),
+        }));
+        let second_events = RuntimeEventSender::new(
+            sender,
+            RuntimeIdentity {
+                session,
+                request: RequestId::new(2),
+            },
+            OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
+        );
+
+        let first_workspace = workspace.clone();
+        let first = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(publish_realtime_reaction_without_store(
+                    &first_workspace,
+                    &first_events,
+                    SocketModeEvent::Reaction(socket_mode::SocketModeReactionEvent {
+                        channel_id: "C1".into(),
+                        ts: "1.0".into(),
+                        name: "wave".into(),
+                        user_id: "U1".into(),
+                        added: true,
+                    }),
+                ));
+        });
+        patch_reached
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first reaction patch did not reach its publication gate");
+
+        let second_workspace = workspace.clone();
+        let (second_finished, second_completion) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(publish_realtime_reaction_without_store(
+                    &second_workspace,
+                    &second_events,
+                    SocketModeEvent::Reaction(socket_mode::SocketModeReactionEvent {
+                        channel_id: "C1".into(),
+                        ts: "1.0".into(),
+                        name: "heart".into(),
+                        user_id: "U2".into(),
+                        added: true,
+                    }),
+                ));
+            second_finished.send(()).unwrap();
+        });
+        assert!(
+            second_completion
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "a later raw/patch pair must not pass a blocked earlier pair"
+        );
+
+        release_patch.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        second_completion.recv().unwrap();
+
+        let delivered = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            delivered.as_slice(),
+            [
+                RuntimeEventKind::SocketModeEvent {
+                    event: SocketModeEvent::Reaction(first),
+                    ..
+                },
+                RuntimeEventKind::WorkspacePatch(first_patch),
+                RuntimeEventKind::SocketModeEvent {
+                    event: SocketModeEvent::Reaction(second),
+                    ..
+                },
+                RuntimeEventKind::WorkspacePatch(second_patch),
+            ] if first.name == "wave"
+                && second.name == "heart"
+                && workspace_patch_has_reaction(first_patch, "wave")
+                && workspace_patch_has_reaction(second_patch, "heart")
+        ));
+    }
+
+    #[test]
+    fn no_store_reaction_waits_for_an_older_non_reaction_patch_publication() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    histories: HashMap::from([(
+                        "C1".into(),
+                        vec![SlackMessage {
+                            ts: "1.0".into(),
+                            text: Some("hello".into()),
+                            ..Default::default()
+                        }],
+                    )]),
+                    ..Default::default()
+                }),
+            );
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let session = SessionId::default().next();
+            let (patch_started, patch_reached) = std::sync::mpsc::channel();
+            let (release_patch, release) = std::sync::mpsc::channel();
+            let mut older_events = RuntimeEventSender::new(
+                sender.clone(),
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
+            );
+            older_events.workspace_patch_send_gate = Some(Arc::new(TestWorkspacePatchSendGate {
+                started: patch_started,
+                release: Mutex::new(release),
+            }));
+            let reaction_events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(2),
+                },
+                OperationContext::new(
+                    RuntimeOperation::Reaction,
+                    RuntimeTarget::Message {
+                        channel_id: "C1".into(),
+                        thread_ts: None,
+                    },
+                ),
+            );
+
+            let older_workspace = workspace.clone();
+            let older = tokio::spawn(async move {
+                older_workspace
+                    .apply_persisted_and_publish(
+                        None,
+                        &older_events,
+                        MutationOrigin::WebApi,
+                        WorkspaceMutation::ConversationUpsert(SlackConversation {
+                            id: "C2".into(),
+                            name: Some("older".into()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            patch_reached
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the older patch did not reach its publication gate");
+
+            let reaction_workspace = workspace.clone();
+            let reaction = tokio::spawn(async move {
+                persist_confirmed_reaction(
+                    &reaction_events,
+                    &reaction_workspace,
+                    None,
+                    ReactionMutation {
+                        channel_id: "C1".into(),
+                        message_ts: "1.0".into(),
+                        name: "wave".into(),
+                        user_id: "U_SELF".into(),
+                        added: true,
+                    },
+                    None,
+                )
+                .await;
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                    .await
+                    .is_err(),
+                "a newer reaction completion or patch must not pass an older blocked publisher"
+            );
+
+            release_patch.send(()).unwrap();
+            older.await.unwrap();
+            reaction.await.unwrap();
+
+            let delivered = std::iter::from_fn(|| receiver.try_recv().ok())
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                delivered.as_slice(),
+                [
+                    RuntimeEventKind::WorkspacePatch(older_patch),
+                    RuntimeEventKind::ReactionUpdated { .. },
+                    RuntimeEventKind::WorkspacePatch(reaction_patch),
+                ] if older_patch.revision() < reaction_patch.revision()
+            ));
+        });
+    }
+
+    #[test]
+    fn local_reaction_publishes_thread_catalog_compatibility_before_its_patch() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let workspace = WorkspaceReducerAdapter::default();
+            let mut root = SlackMessage {
+                ts: "1.0".into(),
+                text: Some("root".into()),
+                reply_count: Some(1),
+                ..Default::default()
+            };
+            root.refresh_canonical_content();
+            let mut catalog = crate::thread_catalog::ThreadCatalog::default();
+            catalog.observe_thread("C1", "1.0", std::slice::from_ref(&root), false);
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    threads: catalog.into_records(),
+                    ..Default::default()
+                }),
+            );
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(
+                    RuntimeOperation::Reaction,
+                    RuntimeTarget::Message {
+                        channel_id: "C1".into(),
+                        thread_ts: Some("1.0".into()),
+                    },
+                ),
+            );
+
+            persist_confirmed_reaction(
+                &events,
+                &workspace,
+                None,
+                ReactionMutation {
+                    channel_id: "C1".into(),
+                    message_ts: "1.0".into(),
+                    name: "wave".into(),
+                    user_id: "U_SELF".into(),
+                    added: true,
+                },
+                Some("1.0".into()),
+            )
+            .await;
+
+            let delivered = std::iter::from_fn(|| receiver.try_recv().ok())
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                delivered.as_slice(),
+                [
+                    RuntimeEventKind::ReactionUpdated { .. },
+                    RuntimeEventKind::ThreadCatalogLoaded(records),
+                    RuntimeEventKind::WorkspacePatch(patch),
+                ] if message_has_named_reaction(
+                    records[0].root.as_ref().unwrap(),
+                    "wave"
+                ) && patch.changes().iter().any(|change| {
+                    matches!(
+                        change,
+                        WorkspaceChange::ThreadCatalogChanged(records)
+                            if message_has_named_reaction(
+                                records[0].root.as_ref().unwrap(),
+                                "wave"
+                            )
+                    )
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn closed_worker_last_reaction_recovers_without_a_later_event() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-reaction-fallback-admission-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+            let message = SlackMessage {
+                ts: "1.0".into(),
+                text: Some("hello".into()),
+                ..Default::default()
+            };
+            store
+                .store_history("C1", std::slice::from_ref(&message))
+                .await
+                .unwrap();
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    histories: HashMap::from([("C1".into(), vec![message])]),
+                    ..Default::default()
+                }),
+            );
+            let base_revision = workspace.revision();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
+            );
+
+            let fallback = RealtimePersistenceFallback::new(
+                Some(store.clone()),
+                Some("U_SELF".into()),
+                events.clone(),
+                workspace.clone(),
+                UserStatusSync::default(),
+            );
+            let admission = workspace.publication_admission.lock().await;
+            fallback.schedule(RealtimePersistenceEvent::OrderedEvent {
+                event: SocketModeEvent::Reaction(socket_mode::SocketModeReactionEvent {
+                    channel_id: "C1".into(),
+                    ts: "1.0".into(),
+                    name: "wave".into(),
+                    user_id: "U1".into(),
+                    added: true,
+                }),
+            });
+            assert_eq!(
+                workspace.revision(),
+                base_revision,
+                "the synchronous fallback must defer coordinator admission"
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "the raw event must stay paired with persistence admission"
+            );
+            drop(admission);
+            fallback.drain().await;
+
+            let raw = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("the fallback reaction was not recovered autonomously")
+                .expect("the runtime event stream closed");
+            assert!(matches!(
+                raw.kind,
+                RuntimeEventKind::SocketModeEvent {
+                    event: SocketModeEvent::Reaction(ref event),
+                    ..
+                } if event.name == "wave"
+            ));
+            let patch = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("the fallback reaction patch was not published")
+                .expect("the runtime event stream closed");
+            assert!(matches!(
+                patch.kind,
+                RuntimeEventKind::WorkspacePatch(ref patch)
+                    if workspace_patch_has_reaction(patch, "wave")
+            ));
+            assert!(receiver.try_recv().is_err());
+            let persisted = store.load_history("C1").await.unwrap().unwrap();
+            assert!(message_has_named_reaction(&persisted[0], "wave"));
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn reaction_command_requires_identity_before_the_slack_call() {
+        let source = include_str!("runtime.rs");
+        let command = source
+            .split_once("RuntimeCommand::SetReaction {")
+            .unwrap()
+            .1
+            .split_once("RuntimeCommand::SetSaved {")
+            .unwrap()
+            .0;
+        let identity_check = command
+            .find("current Slack user identity is unavailable")
+            .unwrap();
+        let slack_call = command.find("api.set_reaction(").unwrap();
+        assert!(identity_check < slack_call);
+        assert!(!command.contains("unwrap_or_default()"));
+    }
+
+    fn workspace_change_has_wave(change: &WorkspaceChange) -> bool {
+        let WorkspaceChange::TimelineChanged { changes, .. } = change else {
+            return false;
+        };
+        changes.iter().any(|change| {
+            let crate::workspace_pipeline::MessageChange::Upsert(message) = change else {
+                return false;
+            };
+            message_has_wave(message)
+        })
+    }
+
+    fn message_has_wave(message: &SlackMessage) -> bool {
+        message_has_named_reaction(message, "wave")
+    }
+
+    fn workspace_patch_has_reaction(patch: &WorkspacePatch, name: &str) -> bool {
+        patch.changes().iter().any(|change| {
+            let WorkspaceChange::TimelineChanged { changes, .. } = change else {
+                return false;
+            };
+            changes.iter().any(|change| {
+                let crate::workspace_pipeline::MessageChange::Upsert(message) = change else {
+                    return false;
+                };
+                message_has_named_reaction(message, name)
+            })
+        })
+    }
+
+    fn message_has_named_reaction(message: &SlackMessage, name: &str) -> bool {
+        matches!(
+            message.reactions.as_deref(),
+            Some([reaction])
+                if reaction.name.as_deref() == Some(name)
+                    && reaction.count == Some(1)
+                    && reaction.users.as_ref().is_some_and(|users| users.len() == 1)
+        ) || message.reactions.as_ref().is_some_and(|reactions| {
+            reactions.iter().any(|reaction| {
+                reaction.name.as_deref() == Some(name)
+                    && reaction.count == Some(1)
+                    && reaction
+                        .users
+                        .as_ref()
+                        .is_some_and(|users| users.len() == 1)
+            })
+        })
     }
 }
