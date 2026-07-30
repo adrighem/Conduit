@@ -62,9 +62,8 @@ use crate::message_html::{
     TimelineMessageRegion, TimelineScrollBehavior,
 };
 use crate::models::{
-    slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
-    SlackConversation, SlackFile, SlackMessage, SlackUnreadState, SlackUser, SlackUserProfile,
-    SlackUserStatus,
+    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
+    SlackMessage, SlackUser, SlackUserProfile, SlackUserStatus,
 };
 use crate::realtime::{RealtimePhase, RealtimeStatus};
 use crate::rendering;
@@ -87,14 +86,13 @@ use crate::slack_link::{
 use crate::socket_mode::{
     SocketModeEvent, SocketModeMessageEvent, SocketModeMessageKind, SocketModeReactionEvent,
 };
-use crate::thread_catalog::ThreadCatalog;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_state::{
     resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
-    ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
-    ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
-    RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle,
-    WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
+    ConversationOpenPosition, ConversationOpenRenderAction, ConversationSelectionDecision,
+    MainMessageView, ReactionUpdate, RealtimeMessageKind, RealtimeMessageOutcome,
+    ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle, WorkspaceLifecycleEvent,
+    WorkspacePatchRemoval, WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -314,14 +312,12 @@ mod imp {
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
         pub(super) workspace: WorkspaceSessionState,
-        pub pending_opened_conversation_ids: RefCell<HashSet<String>>,
         pub discovered_channels: RefCell<Vec<SlackConversation>>,
         pub discovered_users: RefCell<Vec<SlackUser>>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
         pub(super) sidebar_section_actions: RefCell<HashMap<i32, SidebarSectionKind>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
-        pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<Arc<HashMap<String, String>>>,
         pub user_full_names: RefCell<Arc<HashMap<String, String>>>,
         pub user_avatar_urls: RefCell<Arc<HashMap<String, String>>>,
@@ -435,12 +431,21 @@ mod imp {
                 if initial_sync_test {
                     return;
                 }
-                obj.populate_conversations(vec![SlackConversation {
-                    id: test_channel_id.to_string(),
-                    name: Some("general".to_string()),
-                    is_channel: Some(true),
-                    ..SlackConversation::default()
-                }]);
+                let patch = crate::workspace_pipeline::WorkspacePatch::new(
+                    crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor(),
+                    vec![
+                        crate::workspace_pipeline::WorkspaceChange::ConversationsReset(vec![
+                            SlackConversation {
+                                id: test_channel_id.to_string(),
+                                name: Some("general".to_string()),
+                                is_channel: Some(true),
+                                ..SlackConversation::default()
+                            },
+                        ]),
+                    ],
+                )
+                .expect("test workspace patch must contain its conversation");
+                obj.apply_workspace_patch(&patch);
                 let test_users = vec![
                     SlackUser {
                         id: Some("UADA".to_string()),
@@ -1248,17 +1253,13 @@ fn sidebar_context_menu_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -
         || (key == gtk::gdk::Key::F10 && state.contains(gtk::gdk::ModifierType::SHIFT_MASK))
 }
 
-fn legacy_conversation_catalog_mutation_allowed(workspace: &WorkspaceSessionState) -> bool {
-    !workspace.has_conversation_patch()
-}
-
 fn conversation_sync_completion_needs_catalog_sync(workspace_ready: bool) -> bool {
     !workspace_ready
 }
 
 fn remove_patch_departures_from_discovery(
     discovered: &mut Vec<SlackConversation>,
-    removals: &[ConversationPatchRemoval],
+    removals: &[WorkspacePatchRemoval],
 ) {
     for removal in removals {
         if removal
@@ -4896,7 +4897,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::WorkspacePatch(patch) => {
-                self.apply_conversation_workspace_patch(&patch);
+                self.apply_workspace_patch(&patch);
             }
             RuntimeEventKind::ConversationsSynchronized => {
                 if !self.imp().connect_requested.get() {
@@ -4904,19 +4905,6 @@ impl ConduitWindow {
                         self.imp().workspace_ready.get(),
                     ) {
                         self.sync_conversations_from_catalog();
-                    }
-                    self.restore_workspace_status();
-                }
-            }
-            RuntimeEventKind::ConversationsLoaded(conversations) => {
-                if !self.imp().connect_requested.get() {
-                    if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
-                        self.populate_conversations(conversations);
-                    } else {
-                        self.imp()
-                            .pending_opened_conversation_ids
-                            .borrow_mut()
-                            .clear();
                     }
                     self.restore_workspace_status();
                 }
@@ -4947,47 +4935,18 @@ impl ConduitWindow {
                     self.refresh_composer_completion(target);
                 }
             }
-            RuntimeEventKind::ConversationOpened(conversation) => {
-                let channel_id = conversation.id.clone();
-                let imp = self.imp();
-                let title = conversation.display_name_with_users(
-                    &imp.user_names.borrow(),
-                    imp.current_user_id.borrow().as_deref(),
-                );
-                if legacy_conversation_catalog_mutation_allowed(&imp.workspace) {
-                    imp.workspace
-                        .conversations
-                        .borrow_mut()
-                        .upsert_metadata(conversation);
-                    imp.pending_opened_conversation_ids
-                        .borrow_mut()
-                        .insert(channel_id.clone());
-                    self.sync_conversations_from_catalog();
-                }
+            RuntimeEventKind::ConversationOpened { channel_id } => {
+                let title = self.conversation_title(&channel_id);
                 self.select_conversation(&channel_id, &title);
             }
-            RuntimeEventKind::ConversationUpdated(conversation) => {
-                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
-                    self.imp()
-                        .workspace
-                        .conversations
-                        .borrow_mut()
-                        .upsert_metadata(conversation);
-                    self.sync_conversations_from_catalog();
-                }
+            RuntimeEventKind::ConversationUpdated { channel_id: _ } => {
                 self.refresh_current_conversation_title();
                 self.set_status(&gettext("People added"));
             }
-            RuntimeEventKind::ConversationStarUpdated(conversation) => {
-                let starred = conversation.is_starred();
-                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
-                    self.imp()
-                        .workspace
-                        .conversations
-                        .borrow_mut()
-                        .upsert_metadata(conversation);
-                    self.sync_conversations_from_catalog();
-                }
+            RuntimeEventKind::ConversationStarUpdated {
+                channel_id: _,
+                starred,
+            } => {
                 self.set_status(&gettext(if starred {
                     "Conversation starred"
                 } else {
@@ -5011,99 +4970,14 @@ impl ConduitWindow {
                     "Status updated"
                 }));
             }
-            RuntimeEventKind::ConversationLeft { channel_id } => {
-                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
-                    self.apply_conversation_left(&channel_id);
-                } else {
-                    self.set_status(&gettext("Left channel"));
-                }
-            }
-            RuntimeEventKind::ConversationsPatched {
-                conversations,
-                unread_snapshots,
-            } => {
-                let mut catalog = self.imp().workspace.conversations.borrow_mut();
-                for conversation in conversations {
-                    catalog.upsert_metadata(conversation);
-                }
-                let mut acknowledged_local_reads = Vec::new();
-                for snapshot in unread_snapshots {
-                    let newer_local_read = self
-                        .imp()
-                        .local_read_ts_by_channel
-                        .borrow()
-                        .get(&snapshot.channel_id)
-                        .is_some_and(|local| {
-                            snapshot.last_read.as_deref().is_none_or(|server| {
-                                slack_timestamp_is_after(local.as_str(), server)
-                            })
-                        });
-                    if !newer_local_read {
-                        if snapshot.last_read.is_some()
-                            && self
-                                .imp()
-                                .local_read_ts_by_channel
-                                .borrow()
-                                .contains_key(&snapshot.channel_id)
-                        {
-                            acknowledged_local_reads.push(snapshot.channel_id.clone());
-                        }
-                        catalog.apply_unread_snapshot(&snapshot);
-                    }
-                }
-                drop(catalog);
-                let mut local_reads = self.imp().local_read_ts_by_channel.borrow_mut();
-                for channel_id in acknowledged_local_reads {
-                    local_reads.remove(&channel_id);
-                }
-                drop(local_reads);
-                self.sync_conversations_from_catalog();
-            }
-            RuntimeEventKind::ConversationUnreadUpdated {
-                channel_id,
-                unread_state,
-            } => self.apply_conversation_unread_state(&channel_id, unread_state),
-            RuntimeEventKind::ConversationMarkedRead { channel_id, ts } => {
-                self.imp()
-                    .local_read_ts_by_channel
-                    .borrow_mut()
-                    .insert(channel_id.clone(), ts.clone());
-                self.advance_conversation_read_cursor(&channel_id, &ts);
-                self.render_conversations();
-                if self.current_main_view() == MainMessageView::Unreads {
-                    self.populate_unreads(self.unread_items());
-                }
-            }
-            RuntimeEventKind::ConversationAttentionAcknowledged {
-                channel_id,
-                message_ts,
-            } => {
-                self.imp()
-                    .workspace
-                    .conversations
-                    .borrow_mut()
-                    .acknowledge_attention_messages(&channel_id, &message_ts);
-                self.render_conversations();
-                if self.current_main_view() == MainMessageView::Unreads {
-                    self.populate_unreads(self.unread_items());
-                }
+            RuntimeEventKind::ConversationLeft { channel_id: _ } => {
+                self.set_status(&gettext("Left channel"));
             }
             RuntimeEventKind::AttentionNotificationCandidate {
                 channel_id,
                 message,
                 decision,
             } => self.handle_attention_notification_candidate(&channel_id, &message, &decision),
-            RuntimeEventKind::AttentionMessagesObserved(observations) => {
-                self.apply_attention_observations(observations);
-            }
-            RuntimeEventKind::ThreadCatalogLoaded(records) => {
-                *self.imp().workspace.threads.borrow_mut() = ThreadCatalog::from_records(records);
-                if self.current_main_view() == MainMessageView::Threads {
-                    self.populate_threads();
-                } else if self.current_main_view() == MainMessageView::Unreads {
-                    self.populate_unreads(self.unread_items());
-                }
-            }
             RuntimeEventKind::HistoryLoaded {
                 channel_id,
                 messages,
@@ -6798,9 +6672,7 @@ impl ConduitWindow {
         *imp.workspace_team_id.borrow_mut() = None;
         imp.workspace_ready.set(false);
         imp.initial_sync_complete.set(false);
-        imp.local_read_ts_by_channel.borrow_mut().clear();
         imp.pending_message_notifications.borrow_mut().clear();
-        imp.pending_opened_conversation_ids.borrow_mut().clear();
         imp.pending_sent_drafts.borrow_mut().clear();
         imp.pending_upload_drafts.borrow_mut().clear();
         imp.discovered_channels.borrow_mut().clear();
@@ -7207,17 +7079,9 @@ impl ConduitWindow {
         self.set_sidebar_error(error);
     }
 
-    fn apply_conversation_workspace_patch(
-        &self,
-        patch: &crate::workspace_pipeline::WorkspacePatch,
-    ) {
+    fn apply_workspace_patch(&self, patch: &crate::workspace_pipeline::WorkspacePatch) {
         let revision = patch.revision();
-        let application = {
-            let local_reads = self.imp().local_read_ts_by_channel.borrow();
-            self.imp()
-                .workspace
-                .apply_conversation_patch_with_local_reads(patch, &local_reads)
-        };
+        let application = self.imp().workspace.apply_workspace_patch(patch);
         let Some(application) = application else {
             crate::debug::log(
                 "ui",
@@ -7228,30 +7092,12 @@ impl ConduitWindow {
             );
             return;
         };
-        {
-            let mut local_reads = self.imp().local_read_ts_by_channel.borrow_mut();
-            for channel_id in application.acknowledged_local_reads() {
-                local_reads.remove(channel_id);
-            }
-        }
-        if !application.conversation_changed() {
-            return;
-        }
 
         remove_patch_departures_from_discovery(
             &mut self.imp().discovered_channels.borrow_mut(),
             application.removals(),
         );
         for removal in application.removals() {
-            let channel_id = removal.channel_id();
-            self.imp()
-                .pending_opened_conversation_ids
-                .borrow_mut()
-                .remove(channel_id);
-            self.imp()
-                .local_read_ts_by_channel
-                .borrow_mut()
-                .remove(channel_id);
             if removal.was_visible() {
                 let title = gettext("Select a conversation");
                 self.imp().message_title.set_title(&title);
@@ -7259,50 +7105,27 @@ impl ConduitWindow {
                 self.render_closed_thread();
             }
         }
-        self.sync_conversations_from_catalog();
+        if application.conversation_changed() {
+            self.sync_conversations_from_catalog();
+        }
+        if application.thread_catalog_changed() {
+            match self.current_main_view() {
+                MainMessageView::Threads => self.populate_threads(),
+                MainMessageView::Unreads if !application.conversation_changed() => {
+                    self.populate_unreads(self.unread_items());
+                }
+                _ => {}
+            }
+        }
     }
 
     fn set_sidebar_error(&self, error: &str) {
         let imp = self.imp();
-        let has_conversations = !imp.workspace.conversations.borrow().is_empty();
+        let has_conversations = !imp.workspace.conversations().is_empty();
         *imp.sidebar_error.borrow_mut() = Some(error.to_string());
         if sidebar_error_change_needs_render(has_conversations) {
             self.render_conversations();
         }
-    }
-
-    fn populate_conversations(&self, conversations: Vec<SlackConversation>) {
-        let incoming_ids = conversations
-            .iter()
-            .map(|conversation| conversation.id.as_str())
-            .collect::<HashSet<_>>();
-        let pending_ids = self.imp().pending_opened_conversation_ids.borrow().clone();
-        let preserve_opened = {
-            let catalog = self.imp().workspace.conversations.borrow();
-            pending_ids
-                .iter()
-                .filter(|id| !incoming_ids.contains(id.as_str()))
-                .filter_map(|id| catalog.get(id).cloned())
-                .collect::<Vec<_>>()
-        };
-        {
-            let mut catalog = self.imp().workspace.conversations.borrow_mut();
-            let mut snapshot = catalog.begin_membership_snapshot();
-            for conversation in conversations {
-                snapshot.upsert(conversation);
-            }
-            if !catalog.commit_membership_snapshot(snapshot) {
-                return;
-            }
-            for conversation in preserve_opened {
-                catalog.upsert_opened(conversation);
-            }
-        }
-        self.imp()
-            .pending_opened_conversation_ids
-            .borrow_mut()
-            .clear();
-        self.sync_conversations_from_catalog();
     }
 
     fn sync_conversations_from_catalog(&self) {
@@ -7355,7 +7178,7 @@ impl ConduitWindow {
         }
         let should_render_sidebar = {
             let imp = self.imp();
-            let conversations = imp.workspace.conversations.borrow().conversations();
+            let conversations = imp.workspace.conversations().conversations();
             changed_user_ids
                 .iter()
                 .any(|user_id| sidebar_user_name_update_needs_render(&conversations, user_id))
@@ -7581,68 +7404,6 @@ impl ConduitWindow {
         }
     }
 
-    fn advance_conversation_read_cursor(&self, channel_id: &str, ts: &str) {
-        let current_user_id = self.imp().current_user_id.borrow().clone();
-        let remaining_unread = self
-            .imp()
-            .workspace
-            .view
-            .borrow()
-            .channel_messages(channel_id)
-            .iter()
-            .filter(|message| message.ts.as_str() > ts)
-            .filter(|message| message.user.as_deref() != current_user_id.as_deref())
-            .count() as u64;
-        self.imp()
-            .workspace
-            .conversations
-            .borrow_mut()
-            .advance_read_cursor(channel_id, ts, remaining_unread);
-    }
-
-    fn apply_conversation_unread_state(&self, channel_id: &str, unread_state: SlackUnreadState) {
-        if !unread_state.known {
-            return;
-        }
-        let previous = self
-            .imp()
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    conversation.unread_activity_count(),
-                )
-            });
-        self.imp()
-            .workspace
-            .conversations
-            .borrow_mut()
-            .apply_realtime_unread(channel_id, unread_state);
-        let current = self
-            .imp()
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    conversation.unread_activity_count(),
-                )
-            });
-        let changed = previous != current;
-
-        if changed {
-            self.render_conversations();
-            if self.current_main_view() == MainMessageView::Unreads {
-                self.populate_unreads(self.unread_items());
-            }
-        }
-    }
-
     fn channel_load_more_url(&self, channel_id: &str) -> Option<String> {
         self.imp()
             .workspace
@@ -7665,7 +7426,7 @@ impl ConduitWindow {
         let started = Instant::now();
         self.sync_workspace_chrome();
         let imp = self.imp();
-        let conversations = imp.workspace.conversations.borrow().conversations();
+        let conversations = imp.workspace.conversations().conversations();
         let user_names = imp.user_names.borrow().clone();
         let user_search_aliases = imp.user_search_aliases.borrow();
         let selected_channel = self.visible_channel_id();
@@ -7804,8 +7565,7 @@ impl ConduitWindow {
         let conversation = self
             .imp()
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(channel_id)
             .cloned();
 
@@ -7933,49 +7693,6 @@ impl ConduitWindow {
         });
     }
 
-    fn apply_conversation_left(&self, channel_id: &str) {
-        let was_visible = self.visible_channel_id().as_deref() == Some(channel_id);
-        let removed = self
-            .imp()
-            .workspace
-            .conversations
-            .borrow_mut()
-            .remove(channel_id);
-        self.imp()
-            .workspace
-            .view
-            .borrow_mut()
-            .remove_conversation(channel_id);
-
-        if removed
-            .as_ref()
-            .is_some_and(sidebar_conversation_leave_requires_confirmation)
-        {
-            self.imp()
-                .discovered_channels
-                .borrow_mut()
-                .retain(|conversation| conversation.id != channel_id);
-        }
-        self.imp()
-            .pending_opened_conversation_ids
-            .borrow_mut()
-            .remove(channel_id);
-        self.imp()
-            .local_read_ts_by_channel
-            .borrow_mut()
-            .remove(channel_id);
-
-        if was_visible {
-            let title = gettext("Select a conversation");
-            self.imp().message_title.set_title(&title);
-            self.show_message_placeholder(&title);
-            self.render_closed_thread();
-        }
-        self.sync_conversations_from_catalog();
-        self.refresh_open_conversation_picker();
-        self.set_status(&gettext("Left channel"));
-    }
-
     fn mark_channel_read_through_latest(&self, channel_id: &str) {
         let latest = SlackMessage::latest_ts(
             self.imp()
@@ -7988,8 +7705,7 @@ impl ConduitWindow {
         .or_else(|| {
             self.imp()
                 .workspace
-                .conversations
-                .borrow()
+                .conversations()
                 .get(channel_id)
                 .and_then(SlackConversation::latest_message_ts)
                 .map(ToString::to_string)
@@ -8627,7 +8343,7 @@ impl ConduitWindow {
     ) where
         F: Fn(&Self, SidebarRowAction) + 'static,
     {
-        if !include_discovery && self.imp().workspace.conversations.borrow().is_empty() {
+        if !include_discovery && self.imp().workspace.conversations().is_empty() {
             self.set_status(&gettext("No conversations loaded"));
             return;
         }
@@ -8760,7 +8476,7 @@ impl ConduitWindow {
         let query = view.search.text();
         let sections = {
             let imp = self.imp();
-            let conversations = imp.workspace.conversations.borrow().conversations();
+            let conversations = imp.workspace.conversations().conversations();
             picker_sections(
                 view.include_discovery,
                 sidebar::ConversationPickerSource {
@@ -8965,8 +8681,7 @@ impl ConduitWindow {
         let imp = self.imp();
         let status = imp
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(channel_id)
             .filter(|conversation| conversation.is_im.unwrap_or(false))
             .and_then(|conversation| conversation.user.as_deref().map(str::to_string))
@@ -9050,17 +8765,12 @@ impl ConduitWindow {
         self.withdraw_conversation_notification(channel_id);
         let (has_unread, last_read, unread_count) = imp
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(channel_id)
             .map(|conversation| {
                 (
                     conversation.has_unread_activity(),
-                    imp.local_read_ts_by_channel
-                        .borrow()
-                        .get(channel_id)
-                        .cloned()
-                        .or_else(|| conversation.last_read_ts().map(ToString::to_string)),
+                    conversation.last_read_ts().map(ToString::to_string),
                     conversation.unread_activity_count(),
                 )
             })
@@ -9166,17 +8876,12 @@ impl ConduitWindow {
         }
         let (has_unread, last_read, unread_count) = imp
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(channel_id)
             .map(|conversation| {
                 (
                     conversation.has_unread_activity(),
-                    imp.local_read_ts_by_channel
-                        .borrow()
-                        .get(channel_id)
-                        .cloned()
-                        .or_else(|| conversation.last_read_ts().map(ToString::to_string)),
+                    conversation.last_read_ts().map(ToString::to_string),
                     conversation.unread_activity_count(),
                 )
             })
@@ -9344,12 +9049,7 @@ impl ConduitWindow {
 
     fn populate_threads(&self) {
         let observed = self.imp().workspace.view.borrow().observed_threads();
-        let observed = self
-            .imp()
-            .workspace
-            .threads
-            .borrow()
-            .inbox_projection(observed);
+        let observed = self.imp().workspace.threads().inbox_projection(observed);
         let roots = observed
             .iter()
             .map(|(_, message)| message.clone())
@@ -9455,22 +9155,19 @@ impl ConduitWindow {
         let was_unread = self
             .imp()
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(&channel_id)
             .is_some_and(SlackConversation::has_unread_activity);
+        let conversation_known = self
+            .imp()
+            .workspace
+            .conversations()
+            .get(&channel_id)
+            .is_some();
         let external_post = event.kind == SocketModeMessageKind::Posted
             && message.user.as_deref() != current_user_id.as_deref();
-        if let Some(decision) = attention.as_ref().filter(|_| external_post) {
-            let known = self
-                .imp()
-                .workspace
-                .conversations
-                .borrow_mut()
-                .observe_attention_message(&channel_id, &message.ts, decision.record_unread);
-            if !known {
-                self.refresh_conversations();
-            }
+        if attention.as_ref().is_some_and(|_| external_post) && !conversation_known {
+            self.refresh_conversations();
         }
         let became_unread = attention
             .as_ref()
@@ -9487,33 +9184,6 @@ impl ConduitWindow {
             self.populate_unreads(self.unread_items());
         } else {
             self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-        }
-    }
-
-    fn apply_attention_observations(
-        &self,
-        observations: Vec<crate::runtime::AttentionObservation>,
-    ) {
-        if observations.is_empty() {
-            return;
-        }
-        let mut refresh_metadata = false;
-        {
-            let mut conversations = self.imp().workspace.conversations.borrow_mut();
-            for observation in observations {
-                refresh_metadata |= !conversations.observe_attention_message(
-                    &observation.channel_id,
-                    &observation.message_ts,
-                    observation.record_unread,
-                );
-            }
-        }
-        self.sync_conversations_from_catalog();
-        if self.current_main_view() == MainMessageView::Unreads {
-            self.populate_unreads(self.unread_items());
-        }
-        if refresh_metadata {
-            self.refresh_conversations();
         }
     }
 
@@ -10087,8 +9757,7 @@ impl ConduitWindow {
         let muted = self
             .imp()
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(channel_id)
             .is_some_and(SlackConversation::is_muted_conversation);
         if attention_notification_should_deliver(
@@ -10110,8 +9779,7 @@ impl ConduitWindow {
         let conversation = self
             .imp()
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(channel_id)
             .cloned();
         let content = message_notification_conversation(
@@ -10201,8 +9869,7 @@ impl ConduitWindow {
             let conversation = self
                 .imp()
                 .workspace
-                .conversations
-                .borrow()
+                .conversations()
                 .get(&notification.channel_id)
                 .cloned();
             let muted = conversation
@@ -10390,7 +10057,7 @@ impl ConduitWindow {
             }
             NotificationTargetResolution::Open => {
                 self.imp().pending_notification_target.borrow_mut().take();
-                let conversations = self.imp().workspace.conversations.borrow().conversations();
+                let conversations = self.imp().workspace.conversations().conversations();
                 let opened = match conversation_target_action(&target.channel_id, &conversations) {
                     ConversationTargetAction::SelectConversation(channel_id) => {
                         let title = self.conversation_title(&channel_id);
@@ -10416,8 +10083,7 @@ impl ConduitWindow {
         let user_names = imp.user_names.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
         imp.workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(channel_id)
             .map(|conversation| {
                 conversation.display_name_with_users(&user_names, current_user_id.as_deref())
@@ -10429,8 +10095,7 @@ impl ConduitWindow {
         if self
             .imp()
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .get(channel_id)
             .is_some()
         {
@@ -10445,7 +10110,7 @@ impl ConduitWindow {
 
     fn unread_items(&self) -> Vec<ActivityItem> {
         let imp = self.imp();
-        let conversations = imp.workspace.conversations.borrow().conversations();
+        let conversations = imp.workspace.conversations().conversations();
         let user_names = imp.user_names.borrow();
         let current_user_id = imp.current_user_id.borrow();
         let mut items =
@@ -10460,7 +10125,7 @@ impl ConduitWindow {
             })
             .collect::<HashMap<_, _>>();
         items.extend(activity::build_thread_activity_items(
-            imp.workspace.threads.borrow().clone().into_records(),
+            imp.workspace.threads().clone().into_records(),
             &conversation_titles,
         ));
         activity::sort_activity_items(&mut items);
@@ -10563,8 +10228,7 @@ impl ConduitWindow {
         let mut ids = self
             .imp()
             .workspace
-            .conversations
-            .borrow()
+            .conversations()
             .conversations()
             .iter()
             .flat_map(SlackConversation::display_user_ids)
@@ -10741,8 +10405,7 @@ impl ConduitWindow {
             .collect::<HashMap<_, _>>();
         conversation_titles.extend(
             imp.workspace
-                .conversations
-                .borrow()
+                .conversations()
                 .conversations()
                 .into_iter()
                 .map(|conversation| {
@@ -11048,6 +10711,31 @@ fn update_huddle_device_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gtk_catalogs_accept_mutations_only_through_workspace_patches() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let compact = production.split_whitespace().collect::<String>();
+        for legacy_path in [
+            "legacy_conversation_catalog_mutation_allowed",
+            "populate_conversations(",
+            "apply_conversation_left(",
+            "apply_conversation_unread_state(",
+            "apply_attention_observations(",
+            "local_read_ts_by_channel",
+            "pending_opened_conversation_ids",
+            "workspace.conversations.borrow",
+            "workspace.threads.borrow",
+        ] {
+            assert!(
+                !compact.contains(legacy_path),
+                "legacy GTK catalog mutation path remains: {legacy_path}"
+            );
+        }
+    }
 
     #[test]
     fn composer_completion_description_announces_person_and_position() {
@@ -11531,8 +11219,8 @@ mod tests {
         let RuntimeEventKind::WorkspacePatch(patch) = recovered.kind else {
             unreachable!();
         };
-        state.apply_conversation_patch(&patch).unwrap();
-        assert!(state.conversations.borrow().get("C1").is_some());
+        state.apply_workspace_patch(&patch).unwrap();
+        assert!(state.conversations().get("C1").is_some());
     }
 
     #[test]
@@ -11560,13 +11248,12 @@ mod tests {
             };
 
             assert!(state
-                .apply_conversation_patch(&patch)
+                .apply_workspace_patch(&patch)
                 .unwrap()
                 .conversation_changed());
             assert_eq!(
                 state
-                    .conversations
-                    .borrow()
+                    .conversations()
                     .get("C1")
                     .and_then(|conversation| conversation.name.as_deref()),
                 Some("general")
@@ -11578,55 +11265,6 @@ mod tests {
     fn conversation_sync_completion_initializes_an_empty_workspace_once() {
         assert!(conversation_sync_completion_needs_catalog_sync(false));
         assert!(!conversation_sync_completion_needs_catalog_sync(true));
-    }
-
-    #[test]
-    fn legacy_conversation_catalog_mutations_stop_after_typed_patch_adoption() {
-        let state = WorkspaceSessionState::default();
-        assert!(legacy_conversation_catalog_mutation_allowed(&state));
-        state
-            .conversations
-            .borrow_mut()
-            .upsert_metadata(SlackConversation {
-                id: "C1".to_string(),
-                name: Some("legacy".to_string()),
-                ..Default::default()
-            });
-
-        let patch = crate::workspace_pipeline::WorkspacePatch::new(
-            crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor(),
-            vec![
-                crate::workspace_pipeline::WorkspaceChange::ConversationUpsert(SlackConversation {
-                    id: "C1".to_string(),
-                    name: Some("authoritative".to_string()),
-                    ..Default::default()
-                }),
-            ],
-        )
-        .unwrap();
-        state.apply_conversation_patch(&patch).unwrap();
-        assert!(!legacy_conversation_catalog_mutation_allowed(&state));
-
-        if legacy_conversation_catalog_mutation_allowed(&state) {
-            state
-                .conversations
-                .borrow_mut()
-                .upsert_metadata(SlackConversation {
-                    id: "C1".to_string(),
-                    name: Some("rollback".to_string()),
-                    ..Default::default()
-                });
-        }
-        state.view.borrow_mut().select_conversation("C1");
-        assert_eq!(
-            state
-                .conversations
-                .borrow()
-                .get("C1")
-                .and_then(|conversation| conversation.name.as_deref()),
-            Some("authoritative")
-        );
-        assert_eq!(state.view.borrow().visible_channel_id(), Some("C1"));
     }
 
     #[test]
@@ -11645,7 +11283,7 @@ mod tests {
         };
         let first_revision = crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor();
         state
-            .apply_conversation_patch(
+            .apply_workspace_patch(
                 &crate::workspace_pipeline::WorkspacePatch::new(
                     first_revision,
                     vec![
@@ -11659,7 +11297,7 @@ mod tests {
             )
             .unwrap();
         let removal = state
-            .apply_conversation_patch(
+            .apply_workspace_patch(
                 &crate::workspace_pipeline::WorkspacePatch::new(
                     first_revision.successor(),
                     vec![

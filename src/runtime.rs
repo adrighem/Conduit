@@ -44,7 +44,6 @@ use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketMode
 use crate::store::{
     StoreBatchExecution, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
 };
-use crate::thread_catalog::ThreadRecord;
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
     MessageAttentionEffect, MessageChange, MessageMutationKind, MutationOrigin, ReactionMutation,
@@ -811,13 +810,19 @@ pub enum RuntimeEventKind {
     Authenticated(AuthInfo),
     WorkspacePatch(WorkspacePatch),
     ConversationsSynchronized,
-    ConversationsLoaded(Vec<SlackConversation>),
     ConversationsLoadFailed(RuntimeFailure),
     ConversationChannelsDiscovered(Vec<SlackConversation>),
     ConversationPeopleDiscovered(Vec<SlackUser>),
-    ConversationOpened(SlackConversation),
-    ConversationUpdated(SlackConversation),
-    ConversationStarUpdated(SlackConversation),
+    ConversationOpened {
+        channel_id: String,
+    },
+    ConversationUpdated {
+        channel_id: String,
+    },
+    ConversationStarUpdated {
+        channel_id: String,
+        starred: bool,
+    },
     CurrentUserStatusUpdated {
         user_id: String,
         status: Option<SlackUserStatus>,
@@ -825,29 +830,11 @@ pub enum RuntimeEventKind {
     ConversationLeft {
         channel_id: String,
     },
-    ConversationsPatched {
-        conversations: Vec<SlackConversation>,
-        unread_snapshots: Vec<SlackConversationUnreadSnapshot>,
-    },
-    ConversationUnreadUpdated {
-        channel_id: String,
-        unread_state: SlackUnreadState,
-    },
-    ConversationMarkedRead {
-        channel_id: String,
-        ts: String,
-    },
-    ConversationAttentionAcknowledged {
-        channel_id: String,
-        message_ts: Vec<String>,
-    },
     AttentionNotificationCandidate {
         channel_id: String,
         message: Box<SlackMessage>,
         decision: AttentionDecision,
     },
-    AttentionMessagesObserved(Vec<AttentionObservation>),
-    ThreadCatalogLoaded(Vec<ThreadRecord>),
     HistoryLoaded {
         channel_id: String,
         messages: Vec<SlackMessage>,
@@ -951,13 +938,6 @@ pub enum RuntimeEventKind {
     FileUploaded(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttentionObservation {
-    pub channel_id: String,
-    pub message_ts: String,
-    pub record_unread: bool,
-}
-
 impl RuntimeEventKind {
     pub fn operation_context(&self, fallback: &OperationContext) -> OperationContext {
         match self {
@@ -969,36 +949,27 @@ impl RuntimeEventKind {
             }
             Self::WorkspacePatch(_)
             | Self::ConversationsSynchronized
-            | Self::ConversationsLoaded(_)
-            | Self::ConversationsPatched { .. }
-            | Self::ConversationsLoadFailed(_)
-            | Self::ConversationUnreadUpdated { .. }
-            | Self::ConversationAttentionAcknowledged { .. }
-            | Self::ThreadCatalogLoaded(_) => {
+            | Self::ConversationsLoadFailed(_) => {
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
             }
             Self::AttentionNotificationCandidate { .. } => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
-            Self::ConversationMarkedRead { channel_id, .. } => OperationContext::new(
-                RuntimeOperation::ReadMarker,
-                RuntimeTarget::Channel(channel_id.clone()),
-            ),
             Self::ConversationChannelsDiscovered(_) | Self::ConversationPeopleDiscovered(_) => {
                 OperationContext::new(
                     RuntimeOperation::ConversationDiscovery,
                     RuntimeTarget::Workspace,
                 )
             }
-            Self::ConversationOpened(conversation) | Self::ConversationUpdated(conversation) => {
+            Self::ConversationOpened { channel_id } | Self::ConversationUpdated { channel_id } => {
                 OperationContext::new(
                     RuntimeOperation::OpenConversation,
-                    RuntimeTarget::Channel(conversation.id.clone()),
+                    RuntimeTarget::Channel(channel_id.clone()),
                 )
             }
-            Self::ConversationStarUpdated(conversation) => OperationContext::new(
+            Self::ConversationStarUpdated { channel_id, .. } => OperationContext::new(
                 RuntimeOperation::ConversationStar,
-                RuntimeTarget::Channel(conversation.id.clone()),
+                RuntimeTarget::Channel(channel_id.clone()),
             ),
             Self::CurrentUserStatusUpdated { .. } => {
                 OperationContext::new(RuntimeOperation::UserStatus, RuntimeTarget::Workspace)
@@ -1104,7 +1075,6 @@ impl RuntimeEventKind {
             }
             Self::Status(_)
             | Self::Error(_)
-            | Self::AttentionMessagesObserved(_)
             | Self::MessagePosted { .. }
             | Self::ReactionUpdated { .. }
             | Self::SavedUpdated { .. }
@@ -1780,8 +1750,8 @@ impl WorkspaceReducerAdapter {
         }
     }
 
-    /// Drains only after the caller has completed any awaited compatibility
-    /// work that must precede publication.
+    /// Drains only after the caller has completed any awaited work that must
+    /// precede publication.
     fn drain_persisted_admitted(&self) -> Vec<PersistedWorkspaceWrite> {
         let mut pending = self
             .pending_writes
@@ -3468,22 +3438,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     match persisted {
         Ok(writes) => {
             for write in &writes {
-                let hydrated_catalog =
-                    write
-                        .reduction
-                        .patch()
-                        .changes()
-                        .iter()
-                        .find_map(|change| match change {
-                            WorkspaceChange::BootstrapReset(data) => Some(&data.threads),
-                            _ => None,
-                        });
-                if let Some(records) = hydrated_catalog {
-                    events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records.clone()));
-                    publish_persisted_workspace_write_after_catalog(events, write);
-                } else {
-                    publish_persisted_workspace_write(events, write);
-                }
+                publish_persisted_workspace_write(events, write);
             }
         }
         Err(error) => {
@@ -3974,8 +3929,8 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     context.workspace_store.as_ref(),
                     context.events,
                     MutationOrigin::WebApi,
-                    WorkspaceMutation::ConversationUpsert(conversation.clone()),
-                    RuntimeEventKind::ConversationOpened(conversation),
+                    WorkspaceMutation::ConversationUpsert(conversation),
+                    RuntimeEventKind::ConversationOpened { channel_id },
                 )
                 .await?;
         }
@@ -4009,7 +3964,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     context.events,
                     MutationOrigin::WebApi,
                     WorkspaceMutation::ConversationUpsert(conversation.clone()),
-                    RuntimeEventKind::ConversationOpened(conversation),
+                    RuntimeEventKind::ConversationOpened {
+                        channel_id: conversation.id.clone(),
+                    },
                 )
                 .await?;
         }
@@ -4029,7 +3986,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     context.events,
                     MutationOrigin::WebApi,
                     WorkspaceMutation::ConversationUpsert(conversation.clone()),
-                    RuntimeEventKind::ConversationOpened(conversation),
+                    RuntimeEventKind::ConversationOpened {
+                        channel_id: conversation.id.clone(),
+                    },
                 )
                 .await?;
         }
@@ -4044,7 +4003,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     context.events,
                     MutationOrigin::WebApi,
                     WorkspaceMutation::ConversationUpsert(conversation.clone()),
-                    RuntimeEventKind::ConversationOpened(conversation),
+                    RuntimeEventKind::ConversationOpened {
+                        channel_id: conversation.id.clone(),
+                    },
                 )
                 .await?;
         }
@@ -4062,7 +4023,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     context.events,
                     MutationOrigin::WebApi,
                     WorkspaceMutation::ConversationUpsert(conversation.clone()),
-                    RuntimeEventKind::ConversationUpdated(conversation),
+                    RuntimeEventKind::ConversationUpdated { channel_id },
                 )
                 .await?;
         }
@@ -5416,14 +5377,6 @@ fn publish_persisted_workspace_write(events: &RuntimeEventSender, write: &Persis
     publish_persisted_workspace_notification(events, write);
 }
 
-fn publish_persisted_workspace_write_after_catalog(
-    events: &RuntimeEventSender,
-    write: &PersistedWorkspaceWrite,
-) {
-    events.send_workspace_patch(write.reduction.patch().clone());
-    publish_persisted_workspace_notification(events, write);
-}
-
 fn publish_persisted_workspace_notification(
     events: &RuntimeEventSender,
     write: &PersistedWorkspaceWrite,
@@ -5717,7 +5670,7 @@ async fn publish_local_thread_read(
     }
 
     let _admission = workspace.publication_admission.lock().await;
-    let current = workspace.apply_and_enqueue(
+    workspace.apply_and_enqueue(
         store,
         MutationOrigin::Local,
         WorkspaceMutation::ThreadReadAdvanced {
@@ -5726,19 +5679,6 @@ async fn publish_local_thread_read(
             ts: ts.to_string(),
         },
     );
-    let acknowledged_message_ts = current.as_ref().and_then(|reduction| {
-        reduction.effects().iter().find_map(|effect| match effect {
-            WorkspaceEffect::ThreadRead(effect) => Some(effect.acknowledged_message_ts.clone()),
-            WorkspaceEffect::MessageAttention(_) => None,
-        })
-    });
-    if let Some(message_ts) = acknowledged_message_ts.filter(|message_ts| !message_ts.is_empty()) {
-        events.send_event(RuntimeEventKind::ConversationAttentionAcknowledged {
-            channel_id: channel_id.to_string(),
-            message_ts,
-        });
-    }
-
     persist_and_publish_local_reductions(events, store, workspace, "LocalThreadRead", channel_id)
         .await;
 }
@@ -5769,7 +5709,7 @@ async fn persist_and_publish_local_reductions(
 ///
 /// Without a cache store there is no durable claim ledger. Notifications from
 /// this path are therefore explicitly session-only and unclaimed, while the
-/// raw event still precedes every typed patch derived from the current message.
+/// raw timeline event still precedes every typed patch derived from the current message.
 async fn publish_socket_message_without_store(
     current_user_id: Option<&str>,
     events: &RuntimeEventSender,
@@ -5832,9 +5772,6 @@ async fn publish_socket_message_without_store(
         })
         .flatten();
     let writes = workspace.drain_persisted_admitted();
-    for write in &writes {
-        send_thread_catalog_compatibility_for_reduction(events, &write.reduction);
-    }
     events.send_event(RuntimeEventKind::SocketModeEvent {
         event: SocketModeEvent::Message(Box::new(message_event)),
         attention,
@@ -5843,7 +5780,7 @@ async fn publish_socket_message_without_store(
     // These reductions are immediately publishable in memory, but their
     // persistence-only claim intents were not durably claimed.
     for write in &writes {
-        publish_persisted_workspace_write_after_catalog(events, write);
+        publish_persisted_workspace_write(events, write);
     }
     if attention_status == AttentionPersistenceStatus::Accepted {
         if let Some(notification) =
@@ -5860,9 +5797,9 @@ async fn publish_socket_message_without_store(
 
 /// Serializes socket message authority with interactive history snapshots.
 ///
-/// Compatibility UI still consumes the raw socket event. Older recovered
-/// patches publish first, while the current raw event must precede its typed
-/// patch so the window can retain the first-unread transition.
+/// The timeline UI still consumes the raw socket event. Older recovered patches
+/// publish first, while the current raw event must precede its typed patch so
+/// the window can retain the first-unread transition.
 async fn persist_socket_message(
     store: &WorkspaceStore,
     current_user_id: Option<&str>,
@@ -5966,36 +5903,14 @@ async fn persist_socket_message(
                 .map(|effect| effect.decision.clone())
         })
         .flatten();
-    if let Some(writes) = persisted.as_ref() {
-        for write in writes {
-            send_thread_catalog_compatibility_for_reduction(events, &write.reduction);
-        }
-    }
     events.send_event(RuntimeEventKind::SocketModeEvent {
         event: SocketModeEvent::Message(Box::new(message_event)),
         attention,
     });
     if let Some(writes) = persisted {
         for write in &writes {
-            publish_persisted_workspace_write_after_catalog(events, write);
+            publish_persisted_workspace_write(events, write);
         }
-    }
-}
-
-fn send_thread_catalog_compatibility_for_reduction(
-    events: &RuntimeEventSender,
-    reduction: &WorkspaceReduction,
-) {
-    if let Some(records) = reduction
-        .patch()
-        .changes()
-        .iter()
-        .find_map(|change| match change {
-            WorkspaceChange::ThreadCatalogChanged(records) => Some(records),
-            _ => None,
-        })
-    {
-        events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records.clone()));
     }
 }
 
@@ -6118,11 +6033,6 @@ async fn persist_confirmed_conversation_star(
     channel_id: String,
     starred: bool,
 ) -> std::result::Result<(), StoreError> {
-    let conversation = SlackConversation {
-        id: channel_id.clone(),
-        is_starred: Some(starred),
-        ..Default::default()
-    };
     workspace
         .apply_persisted_and_publish_with_completion(
             store,
@@ -6132,14 +6042,17 @@ async fn persist_confirmed_conversation_star(
                 channel_id: channel_id.clone(),
                 starred,
             },
-            RuntimeEventKind::ConversationStarUpdated(conversation),
+            RuntimeEventKind::ConversationStarUpdated {
+                channel_id,
+                starred,
+            },
         )
         .await?;
     Ok(())
 }
 
-/// Slack has already accepted this action, so compatibility completion is
-/// independent of local cache availability. The typed patch remains in the
+/// Slack has already accepted this action, so action completion is independent
+/// of local cache availability. The typed patch remains in the
 /// ordered journal until its complete store batch is durable.
 async fn persist_confirmed_reaction(
     events: &RuntimeEventSender,
@@ -7246,10 +7159,6 @@ async fn publish_local_conversation_read(
             remaining_unread: 0,
         },
     );
-    events.send_event(RuntimeEventKind::ConversationMarkedRead {
-        channel_id: channel_id.to_string(),
-        ts: latest_ts.to_string(),
-    });
     persist_and_publish_local_reductions(
         events,
         store,
@@ -7524,11 +7433,6 @@ impl TestWorkspacePatchSendGate {
 }
 
 fn publish_workspace_reduction(events: &RuntimeEventSender, reduction: &WorkspaceReduction) {
-    for change in reduction.patch().changes() {
-        if let WorkspaceChange::ThreadCatalogChanged(records) = change {
-            events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records.clone()));
-        }
-    }
     events.send_workspace_patch(reduction.patch().clone());
 }
 
@@ -7622,6 +7526,131 @@ mod tests {
     use super::*;
     use crate::workspace_pipeline::{ReactionMutation, StoreChange, WorkspaceChange};
     use crate::workspace_state::RealtimeMessageKind;
+
+    #[test]
+    fn stateful_catalog_compatibility_events_are_removed() {
+        let production = include_str!("runtime.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        for legacy_event in [
+            "ConversationsLoaded(",
+            "ConversationsPatched {",
+            "ConversationUnreadUpdated {",
+            "ConversationMarkedRead {",
+            "ConversationAttentionAcknowledged {",
+            "AttentionMessagesObserved(",
+            "ThreadCatalogLoaded(",
+        ] {
+            assert!(
+                !production.contains(legacy_event),
+                "stateful compatibility event remains: {legacy_event}"
+            );
+        }
+        for legacy_adapter in [
+            "send_thread_catalog_compatibility_for_reduction",
+            "publish_persisted_workspace_write_after_catalog",
+        ] {
+            assert!(
+                !production.contains(legacy_adapter),
+                "thread catalog compatibility adapter remains: {legacy_adapter}"
+            );
+        }
+    }
+
+    async fn apply_test_store_changes(
+        store: &WorkspaceStore,
+        changes: Vec<StoreChange>,
+    ) -> Result<()> {
+        let batch = StoreBatch::new(WorkspaceRevision::INITIAL.successor(), changes)
+            .expect("test store batch must contain a change");
+        assert_eq!(
+            store.execute_store_batch(batch).await?,
+            StoreBatchExecution::Committed,
+            "test fixture batch must be the first durable workspace revision"
+        );
+        Ok(())
+    }
+
+    async fn seed_test_conversations(
+        store: &WorkspaceStore,
+        conversations: &[SlackConversation],
+    ) -> Result<()> {
+        apply_test_store_changes(
+            store,
+            vec![StoreChange::ConversationsReplaced(conversations.to_vec())],
+        )
+        .await
+    }
+
+    async fn seed_test_conversation(
+        store: &WorkspaceStore,
+        conversation: &SlackConversation,
+    ) -> Result<()> {
+        apply_test_store_changes(
+            store,
+            vec![StoreChange::ConversationUpsert(conversation.clone())],
+        )
+        .await
+    }
+
+    async fn load_test_conversations(
+        store: &WorkspaceStore,
+    ) -> Result<Option<Vec<SlackConversation>>> {
+        Ok(store
+            .load_bootstrap()
+            .await?
+            .map(|bootstrap| bootstrap.conversations)
+            .filter(|conversations| !conversations.is_empty()))
+    }
+
+    async fn seed_test_history(
+        store: &WorkspaceStore,
+        channel_id: &str,
+        messages: &[SlackMessage],
+    ) -> Result<()> {
+        apply_test_store_changes(
+            store,
+            vec![StoreChange::HistoryReplaced {
+                channel_id: channel_id.to_string(),
+                messages: messages.to_vec(),
+            }],
+        )
+        .await
+    }
+
+    async fn load_test_thread_catalog(
+        store: &WorkspaceStore,
+    ) -> Result<Vec<crate::thread_catalog::ThreadRecord>> {
+        Ok(store
+            .load_bootstrap()
+            .await?
+            .map(|bootstrap| bootstrap.thread_catalog)
+            .unwrap_or_default())
+    }
+
+    async fn claim_test_attention_delivery(
+        store: &WorkspaceStore,
+        revision: WorkspaceRevision,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> Result<bool> {
+        let identity =
+            crate::workspace_pipeline::AttentionDeliveryIdentity::new(channel_id, message_ts)
+                .expect("test attention identity must be valid");
+        let batch = StoreBatch::new(
+            revision,
+            vec![StoreChange::AttentionNotificationClaim {
+                identity: identity.clone(),
+            }],
+        )
+        .expect("test attention claim batch must contain a change");
+        let outcome = store.execute_store_batch_with_claims(batch).await?;
+        Ok(outcome
+            .notification_claims
+            .iter()
+            .any(|claim| claim.identity == identity && claim.notification_claimed))
+    }
 
     fn thread_test_message(ts: &str, text: &str, thread_ts: Option<&str>) -> SlackMessage {
         SlackMessage {
@@ -7939,17 +7968,14 @@ mod tests {
     async fn recv_workspace_patch_for_test(
         receiver: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
     ) -> WorkspacePatch {
-        loop {
-            match receiver
-                .recv()
-                .await
-                .expect("runtime event channel closed")
-                .kind
-            {
-                RuntimeEventKind::ThreadCatalogLoaded(_) => {}
-                RuntimeEventKind::WorkspacePatch(patch) => return patch,
-                other => panic!("expected a workspace patch, got {other:?}"),
-            }
+        match receiver
+            .recv()
+            .await
+            .expect("runtime event channel closed")
+            .kind
+        {
+            RuntimeEventKind::WorkspacePatch(patch) => patch,
+            other => panic!("expected a workspace patch, got {other:?}"),
         }
     }
 
@@ -8143,7 +8169,7 @@ mod tests {
                 .unwrap()
                 .is_empty());
 
-            let stored = store.load_conversations().await.unwrap().unwrap();
+            let stored = load_test_conversations(&store).await.unwrap().unwrap();
             assert_eq!(stored.len(), 1);
             assert_eq!(stored[0].id, "C1");
         });
@@ -8239,10 +8265,6 @@ mod tests {
                 is_channel: Some(true),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
-                .await
-                .unwrap();
             let user_names = HashMap::from([("U1".to_string(), "Ada".to_string())]);
             store.store_user_names(&user_names).await.unwrap();
             let custom_emojis = HashMap::from([(
@@ -8270,7 +8292,6 @@ mod tests {
             threads.observe_history("C1", &[root, reply]);
             let thread_records = threads.into_records();
             assert_eq!(thread_records.len(), 1);
-            store.store_thread_catalog(&thread_records).await.unwrap();
             let reaction_actor_state = ReactionMutation {
                 channel_id: "C1".to_string(),
                 message_ts: "1.0".to_string(),
@@ -8278,18 +8299,16 @@ mod tests {
                 user_id: "U1".to_string(),
                 added: true,
             };
-            store
-                .execute_store_batch(
-                    StoreBatch::new(
-                        WorkspaceRevision::INITIAL.successor(),
-                        vec![StoreChange::ReactionActorStatesReplaced(vec![
-                            reaction_actor_state.clone(),
-                        ])],
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::ThreadCatalogReplaced(thread_records.clone()),
+                    StoreChange::ReactionActorStatesReplaced(vec![reaction_actor_state.clone()]),
+                ],
+            )
+            .await
+            .unwrap();
             let mut canonical_thread_records = thread_records.clone();
             canonical_thread_records[0]
                 .root
@@ -8351,12 +8370,11 @@ mod tests {
                     .map(|event| match &event.kind {
                         RuntimeEventKind::UserNamesLoaded(_) => "users",
                         RuntimeEventKind::WorkspacePatch(_) => "patch",
-                        RuntimeEventKind::ThreadCatalogLoaded(_) => "threads",
                         RuntimeEventKind::EmojiCatalogLoaded(_) => "emoji",
                         other => panic!("unexpected cache projection event {other:?}"),
                     })
                     .collect::<Vec<_>>(),
-                vec!["users", "threads", "patch", "emoji"]
+                vec!["users", "patch", "emoji"]
             );
             let patches = delivered
                 .iter()
@@ -8374,23 +8392,12 @@ mod tests {
                         && data.threads == canonical_thread_records
                         && data.reaction_actor_states == vec![reaction_actor_state.clone()]
             ));
-            assert!(!delivered
-                .iter()
-                .any(|event| matches!(event.kind, RuntimeEventKind::ConversationsLoaded(_))));
             assert!(delivered.iter().any(|event| {
                 matches!(
                     &event.kind,
                     RuntimeEventKind::UserNamesLoaded(names) if names == &user_names
                 )
             }));
-            let published_catalogs = delivered
-                .iter()
-                .filter_map(|event| match &event.kind {
-                    RuntimeEventKind::ThreadCatalogLoaded(records) => Some(records.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(published_catalogs, vec![canonical_thread_records]);
             assert!(delivered.iter().any(|event| {
                 matches!(
                     &event.kind,
@@ -8435,8 +8442,7 @@ mod tests {
                     ..Default::default()
                 };
                 if cache_has_conversation {
-                    store
-                        .store_conversations(std::slice::from_ref(&cached))
+                    seed_test_conversations(&store, std::slice::from_ref(&cached))
                         .await
                         .unwrap();
                 }
@@ -8562,9 +8568,6 @@ mod tests {
                         vec![1]
                     }
                 );
-                assert!(!delivered
-                    .iter()
-                    .any(|event| matches!(event.kind, RuntimeEventKind::ConversationsLoaded(_))));
                 let _ = std::fs::remove_dir_all(directory);
             }
         });
@@ -8831,7 +8834,7 @@ mod tests {
             );
             assert!(receiver.try_recv().is_err());
 
-            let stored = store.load_conversations().await.unwrap().unwrap();
+            let stored = load_test_conversations(&store).await.unwrap().unwrap();
             let one = stored
                 .iter()
                 .find(|conversation| conversation.id == "C1")
@@ -8849,7 +8852,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_refresh_metadata_cannot_roll_back_a_compatibility_local_read() {
+    fn recovered_refresh_metadata_cannot_roll_back_a_local_read() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -8910,7 +8913,7 @@ mod tests {
             let RuntimeEventKind::WorkspacePatch(bootstrap) = bootstrap.kind else {
                 panic!("expected a typed bootstrap patch");
             };
-            view.apply_conversation_patch(&bootstrap).unwrap();
+            view.apply_workspace_patch(&bootstrap).unwrap();
 
             let refresh_base = workspace.revision();
             store
@@ -8969,12 +8972,6 @@ mod tests {
                 "20.0",
             )
             .await;
-            let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
-            assert!(matches!(
-                receiver.recv().await.unwrap().kind,
-                RuntimeEventKind::ConversationMarkedRead { channel_id, ts }
-                    if channel_id == "C1" && ts == "20.0"
-            ));
             let recovered_refresh = receiver.recv().await.unwrap();
             let local_read = receiver.recv().await.unwrap();
             let patches = [&recovered_refresh, &local_read]
@@ -9000,11 +8997,10 @@ mod tests {
                         && conversation.local_read_ts() == Some("20.0")
             ));
             for patch in patches {
-                view.apply_conversation_patch_with_local_reads(patch, &local_reads)
-                    .unwrap();
+                view.apply_workspace_patch(patch).unwrap();
             }
             assert!(receiver.try_recv().is_err());
-            let before_recovery = store.load_conversations().await.unwrap().unwrap();
+            let before_recovery = load_test_conversations(&store).await.unwrap().unwrap();
             let before_recovery = before_recovery
                 .iter()
                 .find(|conversation| conversation.id == "C1")
@@ -9030,19 +9026,18 @@ mod tests {
             let RuntimeEventKind::WorkspacePatch(following) = following.kind else {
                 panic!("expected a typed workspace patch");
             };
-            view.apply_conversation_patch_with_local_reads(&following, &local_reads)
-                .unwrap();
+            view.apply_workspace_patch(&following).unwrap();
             assert!(receiver.try_recv().is_err());
 
             {
-                let conversations = view.conversations.borrow();
+                let conversations = view.conversations();
                 let current = conversations.get("C1").unwrap();
                 assert_eq!(current.name.as_deref(), Some("one refreshed"));
                 assert_eq!(current.unread_activity_count(), 0);
                 assert_eq!(current.last_read_ts(), Some("20.0"));
                 assert_eq!(current.latest_message_ts(), Some("19.0"));
             }
-            let stored = store.load_conversations().await.unwrap().unwrap();
+            let stored = load_test_conversations(&store).await.unwrap().unwrap();
             let stored = stored
                 .iter()
                 .find(|conversation| conversation.id == "C1")
@@ -9376,38 +9371,44 @@ mod tests {
                     RuntimeTarget::Channel("C1".into()),
                 ),
             );
-            workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
-                        conversations: vec![SlackConversation {
-                            id: "C1".into(),
-                            is_channel: Some(true),
-                            extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
-            assert!(matches!(
-                receiver.recv().await.unwrap().kind,
-                RuntimeEventKind::WorkspacePatch(_)
-            ));
-
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                is_channel: Some(true),
+                extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
+                ..Default::default()
+            };
             let cached = SlackMessage {
                 ts: "1.0".into(),
                 user: Some("U_OTHER".into()),
                 text: Some("cached".into()),
                 ..Default::default()
             };
-            store
-                .store_history("C1", std::slice::from_ref(&cached))
-                .await
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: vec![cached.clone()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+            let bootstrap = workspace
+                .apply(
+                    MutationOrigin::Cache,
+                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                        conversations: vec![conversation],
+                        ..Default::default()
+                    }),
+                )
                 .unwrap();
+            publish_workspace_reduction(&events, &bootstrap);
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::WorkspacePatch(_)
+            ));
             store
                 .install_conversation_batch_failure_trigger_for("C1")
                 .await
@@ -9638,8 +9639,7 @@ mod tests {
                 vec!["3.0"],
                 "history and attention must roll back in the same transaction"
             );
-            let stored_conversation = store
-                .load_conversations()
+            let stored_conversation = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -9801,8 +9801,7 @@ mod tests {
                 store.load_thread("C1", "10.0").await.unwrap().is_none(),
                 "the failed StoreBatch must roll back the thread timeline"
             );
-            let stored_conversation = store
-                .load_conversations()
+            let stored_conversation = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -9881,8 +9880,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![("11.0", "reply".into()), ("10.0", "root".into())]
             );
-            let reopened_conversation = reopened
-                .load_conversations()
+            let reopened_conversation = load_test_conversations(&reopened)
                 .await
                 .unwrap()
                 .unwrap()
@@ -10114,34 +10112,41 @@ mod tests {
                     },
                 ),
             );
-            workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::WebApi,
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                is_channel: Some(true),
+                extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
+                ..Default::default()
+            };
+            let root = thread_test_message("10.0", "root", None);
+            let current = thread_test_message("30.0", "current reply", Some("10.0"));
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "10.0".into(),
+                        messages: vec![root.clone(), current.clone()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+            let bootstrap = workspace
+                .apply(
+                    MutationOrigin::Cache,
                     WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
-                        conversations: vec![SlackConversation {
-                            id: "C1".into(),
-                            is_channel: Some(true),
-                            extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
-                            ..Default::default()
-                        }],
+                        conversations: vec![conversation],
                         ..Default::default()
                     }),
                 )
-                .await
                 .unwrap();
+            publish_workspace_reduction(&events, &bootstrap);
             assert!(matches!(
                 receiver.recv().await.unwrap().kind,
                 RuntimeEventKind::WorkspacePatch(_)
             ));
-
-            let root = thread_test_message("10.0", "root", None);
-            let current = thread_test_message("30.0", "current reply", Some("10.0"));
-            store
-                .store_thread("C1", "10.0", &[root.clone(), current.clone()])
-                .await
-                .unwrap();
             let cached = publish_thread_snapshot_with_completion(
                 &events,
                 &Some(store.clone()),
@@ -10318,31 +10323,38 @@ mod tests {
                 text: Some("one".into()),
                 ..Default::default()
             };
-            workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::WebApi,
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                is_channel: Some(true),
+                extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
+                ..Default::default()
+            };
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: vec![message.clone()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+            let bootstrap = workspace
+                .apply(
+                    MutationOrigin::Cache,
                     WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
-                        conversations: vec![SlackConversation {
-                            id: "C1".into(),
-                            is_channel: Some(true),
-                            extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
-                            ..Default::default()
-                        }],
+                        conversations: vec![conversation],
                         ..Default::default()
                     }),
                 )
-                .await
                 .unwrap();
+            publish_workspace_reduction(&events, &bootstrap);
             assert!(matches!(
                 receiver.recv().await.unwrap().kind,
                 RuntimeEventKind::WorkspacePatch(_)
             ));
-            store
-                .store_history("C1", std::slice::from_ref(&message))
-                .await
-                .unwrap();
             let workspace_store = Some(store.clone());
 
             let first = publish_history_snapshot_with_completion(
@@ -10417,8 +10429,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["1.0"]
             );
-            let stored_conversation = store
-                .load_conversations()
+            let stored_conversation = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -10737,7 +10748,7 @@ mod tests {
             let RuntimeEventKind::WorkspacePatch(bootstrap) = bootstrap.kind else {
                 panic!("expected a typed bootstrap patch");
             };
-            view.apply_conversation_patch(&bootstrap).unwrap();
+            view.apply_workspace_patch(&bootstrap).unwrap();
 
             store
                 .install_conversation_batch_failure_trigger_for("C1")
@@ -10833,17 +10844,8 @@ mod tests {
                 "20.0",
             )
             .await;
-            let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
 
-            let delivered = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
-            assert!(matches!(
-                delivered.first().map(|event| &event.kind),
-                Some(RuntimeEventKind::ConversationMarkedRead { channel_id, ts })
-                    if channel_id == "C1" && ts == "20.0"
-            ));
-            let patches = delivered
-                .into_iter()
-                .skip(1)
+            let patches = std::iter::from_fn(|| receiver.try_recv().ok())
                 .map(|event| match event.kind {
                     RuntimeEventKind::WorkspacePatch(patch) => patch,
                     other => panic!("expected only typed workspace patches, got {other:?}"),
@@ -10896,13 +10898,11 @@ mod tests {
                         && conversation.local_read_ts() == Some("20.0")
             ));
             for patch in &patches {
-                view.apply_conversation_patch_with_local_reads(patch, &local_reads)
-                    .unwrap();
+                view.apply_workspace_patch(patch).unwrap();
             }
 
-            let view_current = view.conversations.borrow().get("C1").cloned().unwrap();
-            let stored_current = store
-                .load_conversations()
+            let view_current = view.conversations().get("C1").cloned().unwrap();
+            let stored_current = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -10929,8 +10929,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                store
-                    .load_conversations()
+                load_test_conversations(&store)
                     .await
                     .unwrap()
                     .unwrap()
@@ -10943,8 +10942,7 @@ mod tests {
             drop(workspace_store);
             drop(store);
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let reopened_current = reopened
-                .load_conversations()
+            let reopened_current = load_test_conversations(&reopened)
                 .await
                 .unwrap()
                 .unwrap()
@@ -10986,8 +10984,7 @@ mod tests {
                 ]),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&initial))
+            seed_test_conversations(&store, std::slice::from_ref(&initial))
                 .await
                 .unwrap();
             workspace
@@ -11033,7 +11030,7 @@ mod tests {
                     .local_read_ts(),
                 None
             );
-            let before_release = store.load_conversations().await.unwrap().unwrap();
+            let before_release = load_test_conversations(&store).await.unwrap().unwrap();
             assert_eq!(before_release[0].local_read_ts(), None);
             assert_eq!(before_release[0].unread_activity_count(), 4);
 
@@ -11049,14 +11046,9 @@ mod tests {
                     .local_read_ts(),
                 Some("20.0")
             );
-            let persisted = store.load_conversations().await.unwrap().unwrap();
+            let persisted = load_test_conversations(&store).await.unwrap().unwrap();
             assert_eq!(persisted[0].local_read_ts(), Some("20.0"));
             assert_eq!(persisted[0].unread_activity_count(), 0);
-            assert!(matches!(
-                receiver.recv().await.unwrap().kind,
-                RuntimeEventKind::ConversationMarkedRead { channel_id, ts }
-                    if channel_id == "C1" && ts == "20.0"
-            ));
             assert!(matches!(
                 receiver.recv().await.unwrap().kind,
                 RuntimeEventKind::WorkspacePatch(_)
@@ -11086,7 +11078,7 @@ mod tests {
             assert!(reductions.is_empty());
             assert_eq!(workspace.revision(), base_revision);
             assert!(receiver.try_recv().is_err());
-            let persisted = store.load_conversations().await.unwrap().unwrap();
+            let persisted = load_test_conversations(&store).await.unwrap().unwrap();
             assert_eq!(persisted[0].local_read_ts(), Some("20.0"));
             assert_eq!(persisted[0].unread_activity_count(), 0);
         });
@@ -11155,10 +11147,9 @@ mod tests {
                             id: "C1".to_string(),
                             ..Default::default()
                         }),
-                        RuntimeEventKind::ConversationOpened(SlackConversation {
-                            id: "C1".to_string(),
-                            ..Default::default()
-                        }),
+                        RuntimeEventKind::ConversationOpened {
+                            channel_id: "C1".to_string(),
+                        },
                     )
                     .await
             });
@@ -11180,10 +11171,9 @@ mod tests {
                             id: "C2".to_string(),
                             ..Default::default()
                         }),
-                        RuntimeEventKind::ConversationOpened(SlackConversation {
-                            id: "C2".to_string(),
-                            ..Default::default()
-                        }),
+                        RuntimeEventKind::ConversationOpened {
+                            channel_id: "C2".to_string(),
+                        },
                     )
                     .await
             });
@@ -11205,8 +11195,8 @@ mod tests {
                     RuntimeEventKind::WorkspacePatch(patch) => {
                         format!("patch:{}", patch.revision().value())
                     }
-                    RuntimeEventKind::ConversationOpened(conversation) => {
-                        format!("opened:{}", conversation.id)
+                    RuntimeEventKind::ConversationOpened { channel_id } => {
+                        format!("opened:{channel_id}")
                     }
                     other => panic!("unexpected ordered event {other:?}"),
                 });
@@ -11254,7 +11244,7 @@ mod tests {
                 )
                 .await
                 .is_err());
-            assert!(store.load_conversations().await.unwrap().is_none());
+            assert!(load_test_conversations(&store).await.unwrap().is_none());
             store
                 .clear_conversation_batch_failure_trigger()
                 .await
@@ -11289,7 +11279,7 @@ mod tests {
                 "the recovered patch must remain ahead of the next mutation patch"
             );
 
-            let stored = store.load_conversations().await.unwrap().unwrap();
+            let stored = load_test_conversations(&store).await.unwrap().unwrap();
             assert_eq!(
                 stored
                     .iter()
@@ -11373,7 +11363,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![1, 2]
             );
-            let stored = store.load_conversations().await.unwrap().unwrap();
+            let stored = load_test_conversations(&store).await.unwrap().unwrap();
             assert_eq!(
                 stored
                     .iter()
@@ -11509,8 +11499,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            store
-                .store_conversations(std::slice::from_ref(&initial))
+            seed_test_conversations(&store, std::slice::from_ref(&initial))
                 .await
                 .unwrap();
             store
@@ -11536,7 +11525,7 @@ mod tests {
                 .conversation("C1")
                 .unwrap()
                 .is_starred());
-            assert!(!store.load_conversations().await.unwrap().unwrap()[0].is_starred());
+            assert!(!load_test_conversations(&store).await.unwrap().unwrap()[0].is_starred());
 
             workspace
                 .apply_persisted(
@@ -11556,7 +11545,7 @@ mod tests {
                 .conversation("C1")
                 .unwrap()
                 .is_starred());
-            assert!(!store.load_conversations().await.unwrap().unwrap()[0].is_starred());
+            assert!(!load_test_conversations(&store).await.unwrap().unwrap()[0].is_starred());
             assert!(
                 receiver.try_recv().is_err(),
                 "failed star batches must not publish completion events"
@@ -11611,7 +11600,7 @@ mod tests {
                 vec![2, 3]
             );
             assert!(receiver.try_recv().is_err());
-            assert!(!store.load_conversations().await.unwrap().unwrap()[0].is_starred());
+            assert!(!load_test_conversations(&store).await.unwrap().unwrap()[0].is_starred());
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -11648,8 +11637,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             store.corrupt_conversation_payload("C1").await.unwrap();
@@ -11693,7 +11681,7 @@ mod tests {
             ));
             assert!(receiver.try_recv().is_err());
             assert_eq!(
-                store.load_conversations().await.unwrap().unwrap(),
+                load_test_conversations(&store).await.unwrap().unwrap(),
                 vec![conversation]
             );
         });
@@ -11796,10 +11784,24 @@ mod tests {
                 )
                 .unwrap();
 
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
-                .await
-                .unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: vec![root.clone()],
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "2.0".into(),
+                        messages: vec![root.clone(), cached_reply.clone()],
+                    },
+                    StoreChange::ThreadCatalogReplaced(thread_records.clone()),
+                ],
+            )
+            .await
+            .unwrap();
             store
                 .store_user_names(&HashMap::from([("U1".to_string(), "Ada".to_string())]))
                 .await
@@ -11811,16 +11813,6 @@ mod tests {
                 )]))
                 .await
                 .unwrap();
-            store
-                .store_history("C1", std::slice::from_ref(&root))
-                .await
-                .unwrap();
-            store
-                .store_thread("C1", "2.0", &[root.clone(), cached_reply.clone()])
-                .await
-                .unwrap();
-            store.store_thread_catalog(&thread_records).await.unwrap();
-
             store
                 .install_history_batch_failure_trigger_for("C1")
                 .await
@@ -11936,7 +11928,7 @@ mod tests {
                     .all(|entry| !entry.persisted));
             }
             assert!(
-                store.load_conversations().await.unwrap().is_none(),
+                load_test_conversations(&store).await.unwrap().is_none(),
                 "a failed repair transaction must not leave a partial projection"
             );
             store.clear_history_batch_failure_trigger().await.unwrap();
@@ -11979,7 +11971,7 @@ mod tests {
             drop(store);
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U1");
             assert_eq!(
-                reopened.load_conversations().await.unwrap().unwrap(),
+                load_test_conversations(&reopened).await.unwrap().unwrap(),
                 canonical_conversations,
                 "unread-bearing conversations must match coordinator authority"
             );
@@ -12054,8 +12046,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             store.corrupt_conversation_payload("C1").await.unwrap();
@@ -12090,7 +12081,7 @@ mod tests {
             assert!(recovery.await.unwrap().unwrap().is_empty());
             assert!(!store.workspace_cache_needs_repair());
             assert_eq!(
-                store.load_conversations().await.unwrap().unwrap()[0]
+                load_test_conversations(&store).await.unwrap().unwrap()[0]
                     .name
                     .as_deref(),
                 Some("advanced during repair")
@@ -12145,8 +12136,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             store.corrupt_conversation_payload("C1").await.unwrap();
@@ -12257,8 +12247,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            store
-                .store_conversations(std::slice::from_ref(&initial))
+            seed_test_conversations(&store, std::slice::from_ref(&initial))
                 .await
                 .unwrap();
 
@@ -12323,7 +12312,7 @@ mod tests {
             );
             assert!(!store.workspace_cache_needs_repair());
             assert_eq!(
-                store.load_conversations().await.unwrap().unwrap()[0]
+                load_test_conversations(&store).await.unwrap().unwrap()[0]
                     .name
                     .as_deref(),
                 Some("second pending")
@@ -12373,14 +12362,18 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
-                .await
-                .unwrap();
-            store
-                .store_history("C1", std::slice::from_ref(&reacted))
-                .await
-                .unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: vec![reacted.clone()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
             let removal = ReactionMutation {
                 channel_id: "C1".into(),
                 message_ts: "1.0".into(),
@@ -12397,7 +12390,7 @@ mod tests {
                 .await
                 .unwrap();
             store.corrupt_conversation_payload("C1").await.unwrap();
-            assert!(store.load_conversations().await.unwrap().is_none());
+            assert!(load_test_conversations(&store).await.unwrap().is_none());
             assert!(store.workspace_cache_needs_repair());
 
             let _admission = workspace.publication_admission.lock().await;
@@ -14099,8 +14092,7 @@ mod tests {
                 id: "C1".into(),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
 
@@ -14246,8 +14238,7 @@ mod tests {
                 extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
@@ -14373,8 +14364,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["10.0"]
             );
-            let persisted_conversation = store
-                .load_conversations()
+            let persisted_conversation = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -14410,8 +14400,7 @@ mod tests {
                 extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
@@ -14624,8 +14613,7 @@ mod tests {
             ));
             assert!(runtime_receiver.try_recv().is_err());
 
-            let persisted_conversation = store
-                .load_conversations()
+            let persisted_conversation = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -14680,7 +14668,9 @@ mod tests {
             .split_once("async fn persist_socket_message(")
             .unwrap()
             .1
-            .split_once("fn send_thread_catalog_compatibility_for_reduction(")
+            .split_once(
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nstruct SocketModeReconnectTiming",
+            )
             .unwrap()
             .0;
         assert!(socket_persistence.contains("publication_admission.lock().await"));
@@ -14689,16 +14679,16 @@ mod tests {
         assert!(!socket_persistence.contains("store_merged_history("));
         assert!(!socket_persistence.contains("store_merged_thread("));
         assert!(!socket_persistence.contains("workspace.apply("));
-        let catalog_position = socket_persistence
-            .rfind("send_thread_catalog_compatibility_for_reduction")
+        let recovered_patch_position = socket_persistence
+            .find("publish_persisted_workspace_write")
             .unwrap();
         let raw_position = socket_persistence
             .rfind("events.send_event(RuntimeEventKind::SocketModeEvent")
             .unwrap();
         let patch_position = socket_persistence
-            .rfind("publish_persisted_workspace_write_after_catalog")
+            .rfind("publish_persisted_workspace_write")
             .unwrap();
-        assert!(catalog_position < raw_position);
+        assert!(recovered_patch_position < raw_position);
         assert!(raw_position < patch_position);
 
         let worker_message_path = source
@@ -14775,7 +14765,7 @@ mod tests {
     }
 
     #[test]
-    fn local_action_completions_survive_store_failure_and_patches_recover_fifo() {
+    fn local_post_completion_survives_store_failure_and_patches_recover_fifo() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -14801,8 +14791,7 @@ mod tests {
                 id: "C2".into(),
                 ..Default::default()
             };
-            store
-                .store_conversations(&[first.clone(), second.clone()])
+            seed_test_conversations(&store, &[first.clone(), second.clone()])
                 .await
                 .unwrap();
 
@@ -14845,15 +14834,9 @@ mod tests {
             )
             .await;
 
-            let first_event = receiver.recv().await.unwrap();
-            let second_event = receiver.recv().await.unwrap();
+            let completion = receiver.recv().await.unwrap();
             assert!(matches!(
-                first_event.kind,
-                RuntimeEventKind::ConversationMarkedRead { channel_id, ts }
-                    if channel_id == "C1" && ts == "2.0"
-            ));
-            assert!(matches!(
-                second_event.kind,
+                completion.kind,
                 RuntimeEventKind::MessagePosted { channel_id, message: posted }
                     if channel_id == "C2" && *posted == message
             ));
@@ -14901,7 +14884,7 @@ mod tests {
 
             drop(store);
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let stored = reopened.load_conversations().await.unwrap().unwrap();
+            let stored = load_test_conversations(&reopened).await.unwrap().unwrap();
             let stored_first = stored
                 .iter()
                 .find(|conversation| conversation.id == "C1")
@@ -14945,8 +14928,7 @@ mod tests {
                 id: "C1".into(),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
@@ -15041,7 +15023,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_read_batch_rolls_back_together_and_recovers_without_duplicate_completion() {
+    fn thread_read_batch_rolls_back_together_and_recovers_without_duplicate_patch() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -15068,28 +15050,31 @@ mod tests {
             let root = SlackMessage {
                 ts: "1.0".into(),
                 subscribed: Some(true),
-                unread_count: Some(0),
+                unread_count: Some(2),
                 ..Default::default()
             };
-            catalog.observe_thread("C1", "1.0", &[root], false);
-            for ts in ["2.0", "3.0"] {
-                catalog.observe_realtime(
-                    "C1",
-                    &SlackMessage {
-                        ts: ts.into(),
-                        thread_ts: Some("1.0".into()),
-                        user: Some("U_OTHER".into()),
-                        ..Default::default()
-                    },
-                    Some("U_SELF"),
-                );
-            }
+            let replies = ["2.0", "3.0"]
+                .into_iter()
+                .map(|ts| SlackMessage {
+                    ts: ts.into(),
+                    thread_ts: Some("1.0".into()),
+                    user: Some("U_OTHER".into()),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let mut thread = vec![root];
+            thread.extend(replies);
+            catalog.reconcile_complete_thread("C1", "1.0", &thread);
             let records = catalog.into_records();
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
-                .await
-                .unwrap();
-            store.store_thread_catalog(&records).await.unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::ThreadCatalogReplaced(records.clone()),
+                ],
+            )
+            .await
+            .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
             workspace.apply(
                 MutationOrigin::Cache,
@@ -15114,24 +15099,18 @@ mod tests {
                 .await
                 .unwrap();
             publish_local_thread_read(&events, Some(&store), &workspace, "C1", "1.0", "3.0").await;
+            if let Ok(event) = receiver.try_recv() {
+                panic!("failed thread-read batch published {event:?}");
+            }
             assert!(matches!(
-                receiver.recv().await.unwrap().kind,
-                RuntimeEventKind::ConversationAttentionAcknowledged {
-                    channel_id,
-                    message_ts,
-                } if channel_id == "C1"
-                    && message_ts == ["2.0".to_string(), "3.0".to_string()]
-            ));
-            assert!(receiver.try_recv().is_err());
-            assert!(matches!(
-                store.load_thread_catalog().await.unwrap().as_slice(),
+                load_test_thread_catalog(&store).await.unwrap().as_slice(),
                 [record] if record.unread == crate::thread_catalog::ThreadUnreadState::Known {
                     count: 2,
                     last_read: None,
                 }
             ));
             assert_eq!(
-                store.load_conversations().await.unwrap().unwrap()[0].unread_activity_count(),
+                load_test_conversations(&store).await.unwrap().unwrap()[0].unread_activity_count(),
                 3
             );
 
@@ -15150,21 +15129,26 @@ mod tests {
                 )
                 .await;
             }
-            let catalog_event = receiver.recv().await.unwrap();
             let patch = receiver.recv().await.unwrap();
+            let RuntimeEventKind::WorkspacePatch(patch) = patch.kind else {
+                panic!("thread read recovery must publish one workspace patch");
+            };
+            let records = patch
+                .changes()
+                .iter()
+                .find_map(|change| match change {
+                    WorkspaceChange::ThreadCatalogChanged(records) => Some(records),
+                    _ => None,
+                })
+                .expect("thread read patch must contain its catalog projection");
             assert!(matches!(
-                catalog_event.kind,
-                RuntimeEventKind::ThreadCatalogLoaded(records)
-                    if matches!(
-                        records.as_slice(),
-                        [record] if record.unread
-                            == crate::thread_catalog::ThreadUnreadState::Known {
-                                count: 0,
-                                last_read: Some("3.0".to_string()),
-                            }
-                    )
+                records.as_slice(),
+                [record] if record.unread
+                    == crate::thread_catalog::ThreadUnreadState::Known {
+                        count: 0,
+                        last_read: Some("3.0".to_string()),
+                    }
             ));
-            assert!(matches!(patch.kind, RuntimeEventKind::WorkspacePatch(_)));
             assert!(receiver.try_recv().is_err());
 
             let revision = workspace.revision();
@@ -15175,13 +15159,13 @@ mod tests {
             drop(store);
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
             assert!(matches!(
-                reopened.load_thread_catalog().await.unwrap().as_slice(),
+                load_test_thread_catalog(&reopened).await.unwrap().as_slice(),
                 [record] if record.unread == crate::thread_catalog::ThreadUnreadState::Known {
                     count: 0,
                     last_read: Some("3.0".to_string()),
                 }
             ));
-            let stored = reopened.load_conversations().await.unwrap().unwrap();
+            let stored = load_test_conversations(&reopened).await.unwrap().unwrap();
             assert_eq!(stored[0].unread_activity_count(), 1);
             assert!(stored[0].has_observed_attention_message("10.0"));
             drop(reopened);
@@ -15210,8 +15194,7 @@ mod tests {
                 id: "C1".into(),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
@@ -15355,8 +15338,7 @@ mod tests {
                 is_im: Some(true),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
@@ -15425,8 +15407,7 @@ mod tests {
                 .unwrap()
                 .unwrap_or_default()
                 .is_empty());
-            let failed_conversation = store
-                .load_conversations()
+            let failed_conversation = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -15528,7 +15509,7 @@ mod tests {
 
             drop(store);
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let conversations = reopened.load_conversations().await.unwrap().unwrap();
+            let conversations = load_test_conversations(&reopened).await.unwrap().unwrap();
             let histories = HashMap::from([(
                 "D1".into(),
                 reopened
@@ -15612,8 +15593,7 @@ mod tests {
                 is_im: Some(true),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
@@ -15673,7 +15653,14 @@ mod tests {
                 ["1.0"],
                 "the returned last event must not require a later socket event to become durable"
             );
-            assert!(!store.claim_attention_delivery("D1", "1.0").await.unwrap());
+            assert!(!claim_test_attention_delivery(
+                &store,
+                workspace.revision().successor(),
+                "D1",
+                "1.0",
+            )
+            .await
+            .unwrap());
             let delivered = std::iter::from_fn(|| receiver.try_recv().ok())
                 .map(|event| event.kind)
                 .collect::<Vec<_>>();
@@ -15701,7 +15688,7 @@ mod tests {
     }
 
     #[test]
-    fn no_store_message_fallback_publishes_catalog_raw_patch_and_notification() {
+    fn no_store_message_fallback_publishes_raw_patch_and_notification() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -15765,18 +15752,6 @@ mod tests {
             let delivered = std::iter::from_fn(|| receiver.try_recv().ok())
                 .map(|event| event.kind)
                 .collect::<Vec<_>>();
-            let catalog = delivered
-                .iter()
-                .position(|event| {
-                    matches!(
-                        event,
-                        RuntimeEventKind::ThreadCatalogLoaded(records)
-                            if records.iter().any(|record| {
-                                record.key.channel_id == "D1" && record.key.root_ts == "1.0"
-                            })
-                    )
-                })
-                .expect("the no-store reply must publish catalog compatibility");
             let raw = delivered
                 .iter()
                 .position(|event| {
@@ -15807,9 +15782,19 @@ mod tests {
                 })
                 .expect("the no-store DM reply must publish its notification");
             assert!(!patches.is_empty());
-            assert!(catalog < raw);
             assert!(raw < patches[0]);
             assert!(patches.last().unwrap() < &notification);
+            assert!(matches!(
+                delivered.get(patches[0]),
+                Some(RuntimeEventKind::WorkspacePatch(patch))
+                    if patch.changes().iter().any(|change| matches!(
+                        change,
+                        WorkspaceChange::ThreadCatalogChanged(records)
+                            if records.iter().any(|record| {
+                                record.key.channel_id == "D1" && record.key.root_ts == "1.0"
+                            })
+                    ))
+            ));
         });
     }
 
@@ -15862,8 +15847,7 @@ mod tests {
             )
             .await;
 
-            let persisted = store
-                .load_conversations()
+            let persisted = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap_or_default()
@@ -15872,10 +15856,14 @@ mod tests {
                 .expect("accepted attention must persist its canonical placeholder");
             assert_eq!(persisted.unread_activity_count(), 1);
             assert!(persisted.has_observed_attention_message("1.0"));
-            assert!(!store
-                .claim_attention_delivery("D_UNKNOWN", "1.0")
-                .await
-                .unwrap());
+            assert!(!claim_test_attention_delivery(
+                &store,
+                workspace.revision().successor(),
+                "D_UNKNOWN",
+                "1.0",
+            )
+            .await
+            .unwrap());
             assert!(workspace
                 .coordinator
                 .lock()
@@ -15927,8 +15915,7 @@ mod tests {
                 MutationOrigin::Cache,
                 WorkspaceMutation::ConversationUpsert(conversation.clone()),
             );
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             store.corrupt_conversation_payload("D1").await.unwrap();
@@ -16011,10 +15998,14 @@ mod tests {
                 persisted[0].notification(),
                 Some(MessageAttentionEffect { message, .. }) if message.ts == "1.0"
             ));
-            assert!(!store
-                .claim_attention_delivery(&identity.channel_id, &identity.message_ts)
-                .await
-                .unwrap());
+            assert!(!claim_test_attention_delivery(
+                &store,
+                workspace.revision().successor(),
+                &identity.channel_id,
+                &identity.message_ts,
+            )
+            .await
+            .unwrap());
 
             let _ = std::fs::remove_dir_all(directory);
         });
@@ -16048,14 +16039,18 @@ mod tests {
                 text: Some("root".into()),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
-                .await
-                .unwrap();
-            store
-                .store_history("D1", std::slice::from_ref(&root))
-                .await
-                .unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::HistoryReplaced {
+                        channel_id: "D1".into(),
+                        messages: vec![root.clone()],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".into()),
@@ -16112,19 +16107,21 @@ mod tests {
             assert!(matches!(
                 delivered.as_slice(),
                 [
-                    RuntimeEventKind::ThreadCatalogLoaded(records),
                     RuntimeEventKind::SocketModeEvent {
                         event: SocketModeEvent::Message(message),
                         attention: Some(_),
                     },
                     RuntimeEventKind::WorkspacePatch(patch),
                     RuntimeEventKind::AttentionNotificationCandidate { message: notified, .. },
-                ] if !records.is_empty()
-                    && message.message.ts == "2.0"
+                ] if message.message.ts == "2.0"
                     && notified.ts == "2.0"
                     && patch.changes().iter().any(|change| matches!(
                         change,
                         WorkspaceChange::ConversationAttentionObserved { .. }
+                    ))
+                    && patch.changes().iter().any(|change| matches!(
+                        change,
+                        WorkspaceChange::ThreadCatalogChanged(records) if !records.is_empty()
                     ))
             ));
             let _ = std::fs::remove_dir_all(directory);
@@ -16329,13 +16326,24 @@ mod tests {
             let mut catalog = crate::thread_catalog::ThreadCatalog::default();
             catalog.observe_thread("C1", "1.0", &thread, true);
             let initial_records = catalog.into_records();
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
-                .await
-                .unwrap();
-            store.store_history("C1", &history).await.unwrap();
-            store.store_thread("C1", "1.0", &thread).await.unwrap();
-            store.store_thread_catalog(&initial_records).await.unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: history.clone(),
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "1.0".into(),
+                        messages: thread.clone(),
+                    },
+                    StoreChange::ThreadCatalogReplaced(initial_records.clone()),
+                ],
+            )
+            .await
+            .unwrap();
 
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
@@ -16460,31 +16468,6 @@ mod tests {
                 "the duplicate moved event must not create another typed patch"
             );
 
-            let catalog_positions = delivered
-                .iter()
-                .enumerate()
-                .filter_map(|(index, event)| {
-                    matches!(event, RuntimeEventKind::ThreadCatalogLoaded(_)).then_some(index)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                catalog_positions.len(),
-                3,
-                "delete, move into a thread, and move out must each publish one catalog projection"
-            );
-            for catalog_position in catalog_positions {
-                assert!(matches!(
-                    delivered.get(catalog_position + 1),
-                    Some(RuntimeEventKind::SocketModeEvent {
-                        event: SocketModeEvent::Message(_),
-                        ..
-                    })
-                ));
-                assert!(matches!(
-                    delivered.get(catalog_position + 2),
-                    Some(RuntimeEventKind::WorkspacePatch(_))
-                ));
-            }
             let raw_positions = delivered
                 .iter()
                 .enumerate()
@@ -16543,15 +16526,6 @@ mod tests {
                 })
                 .last()
                 .expect("coordinator did not publish its reconciled thread catalog");
-            let compatibility_records = delivered
-                .iter()
-                .filter_map(|event| match event {
-                    RuntimeEventKind::ThreadCatalogLoaded(records) => Some(records.clone()),
-                    _ => None,
-                })
-                .last()
-                .expect("compatibility thread catalog was not published");
-            assert_eq!(compatibility_records, coordinator_records);
             let record = coordinator_records
                 .iter()
                 .find(|record| {
@@ -16585,7 +16559,7 @@ mod tests {
 
             drop(store);
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let restarted_records = reopened.load_thread_catalog().await.unwrap();
+            let restarted_records = load_test_thread_catalog(&reopened).await.unwrap();
             assert_eq!(restarted_records, coordinator_records);
             let restarted_thread = reopened.load_thread("C1", "1.0").await.unwrap().unwrap();
             assert_eq!(
@@ -16648,15 +16622,23 @@ mod tests {
             let mut catalog = crate::thread_catalog::ThreadCatalog::default();
             catalog.observe_thread("C1", "1.0", &initial_thread, true);
             let initial_records = catalog.into_records();
-            store
-                .store_history("C1", std::slice::from_ref(&root))
-                .await
-                .unwrap();
-            store
-                .store_thread("C1", "1.0", &initial_thread)
-                .await
-                .unwrap();
-            store.store_thread_catalog(&initial_records).await.unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: vec![root.clone()],
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "1.0".into(),
+                        messages: initial_thread.clone(),
+                    },
+                    StoreChange::ThreadCatalogReplaced(initial_records.clone()),
+                ],
+            )
+            .await
+            .unwrap();
 
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
@@ -16709,7 +16691,7 @@ mod tests {
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
             let restarted_history = reopened.load_history("C1").await.unwrap().unwrap();
             let restarted_thread = reopened.load_thread("C1", "1.0").await.unwrap().unwrap();
-            let restarted_records = reopened.load_thread_catalog().await.unwrap();
+            let restarted_records = load_test_thread_catalog(&reopened).await.unwrap();
             root = restarted_history
                 .iter()
                 .find(|message| message.ts == "1.0")
@@ -16792,15 +16774,13 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(!duplicate_delivered.iter().any(|event| matches!(
-                event,
-                RuntimeEventKind::WorkspacePatch(_) | RuntimeEventKind::ThreadCatalogLoaded(_)
-            )));
+            assert!(!duplicate_delivered
+                .iter()
+                .any(|event| matches!(event, RuntimeEventKind::WorkspacePatch(_))));
 
             drop(reopened);
             let final_store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let final_record = final_store
-                .load_thread_catalog()
+            let final_record = load_test_thread_catalog(&final_store)
                 .await
                 .unwrap()
                 .into_iter()
@@ -16861,19 +16841,28 @@ mod tests {
             catalog.observe_thread("C1", "1.0", &[first_root.clone(), previous.clone()], true);
             catalog.observe_thread("C1", "10.0", std::slice::from_ref(&second_root), true);
             let records = catalog.into_records();
-            store
-                .store_history("C1", &[first_root.clone(), second_root.clone()])
-                .await
-                .unwrap();
-            store
-                .store_thread("C1", "1.0", std::slice::from_ref(&first_root))
-                .await
-                .unwrap();
-            store
-                .store_thread("C1", "10.0", std::slice::from_ref(&second_root))
-                .await
-                .unwrap();
-            store.store_thread_catalog(&records).await.unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: vec![first_root.clone(), second_root.clone()],
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "1.0".into(),
+                        messages: vec![first_root.clone()],
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "10.0".into(),
+                        messages: vec![second_root.clone()],
+                    },
+                    StoreChange::ThreadCatalogReplaced(records.clone()),
+                ],
+            )
+            .await
+            .unwrap();
 
             let workspace = WorkspaceReducerAdapter::default();
             workspace.apply(
@@ -16944,7 +16933,7 @@ mod tests {
                 assert_eq!(root.reply_count, Some(expected_count));
                 assert_eq!(root.latest_reply.as_deref(), expected_latest);
             }
-            let records = reopened.load_thread_catalog().await.unwrap();
+            let records = load_test_thread_catalog(&reopened).await.unwrap();
             let first_record = records
                 .iter()
                 .find(|record| record.key.root_ts == "1.0")
@@ -17010,23 +16999,32 @@ mod tests {
             );
             catalog.observe_thread("C1", "10.0", std::slice::from_ref(&second_root), true);
             let records = catalog.into_records();
-            store
-                .store_history("C1", &[first_root.clone(), second_root.clone()])
-                .await
-                .unwrap();
-            store
-                .store_thread(
-                    "C1",
-                    "1.0",
-                    &[first_root.clone(), stale_location.clone(), retained.clone()],
-                )
-                .await
-                .unwrap();
-            store
-                .store_thread("C1", "10.0", std::slice::from_ref(&second_root))
-                .await
-                .unwrap();
-            store.store_thread_catalog(&records).await.unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: vec![first_root.clone(), second_root.clone()],
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "1.0".into(),
+                        messages: vec![
+                            first_root.clone(),
+                            stale_location.clone(),
+                            retained.clone(),
+                        ],
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "10.0".into(),
+                        messages: vec![second_root.clone()],
+                    },
+                    StoreChange::ThreadCatalogReplaced(records.clone()),
+                ],
+            )
+            .await
+            .unwrap();
 
             let workspace = WorkspaceReducerAdapter::default();
             workspace.apply(
@@ -17072,7 +17070,7 @@ mod tests {
             drop(store);
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
             let restarted_history = reopened.load_history("C1").await.unwrap().unwrap();
-            let restarted_records = reopened.load_thread_catalog().await.unwrap();
+            let restarted_records = load_test_thread_catalog(&reopened).await.unwrap();
             let restarted_workspace = WorkspaceReducerAdapter::default();
             restarted_workspace.apply(
                 MutationOrigin::Cache,
@@ -17111,7 +17109,7 @@ mod tests {
             assert_eq!(first_root.latest_reply.as_deref(), Some("3.0"));
             assert_eq!(second_root.reply_count, Some(0));
             assert_eq!(second_root.latest_reply, None);
-            let records = final_store.load_thread_catalog().await.unwrap();
+            let records = load_test_thread_catalog(&final_store).await.unwrap();
             let first = records
                 .iter()
                 .find(|record| record.key.root_ts == "1.0")
@@ -17144,7 +17142,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_socket_thread_catalog_projection_precedes_its_patch_and_next_raw_event() {
+    fn recovered_socket_thread_catalog_patch_precedes_next_raw_event() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17176,19 +17174,24 @@ mod tests {
             let mut catalog = crate::thread_catalog::ThreadCatalog::default();
             catalog.observe_thread("C1", "1.0", std::slice::from_ref(&root), true);
             let initial_records = catalog.into_records();
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
-                .await
-                .unwrap();
-            store
-                .store_history("C1", std::slice::from_ref(&root))
-                .await
-                .unwrap();
-            store
-                .store_thread("C1", "1.0", std::slice::from_ref(&root))
-                .await
-                .unwrap();
-            store.store_thread_catalog(&initial_records).await.unwrap();
+            apply_test_store_changes(
+                &store,
+                vec![
+                    StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::HistoryReplaced {
+                        channel_id: "C1".into(),
+                        messages: vec![root.clone()],
+                    },
+                    StoreChange::ThreadReplaced {
+                        channel_id: "C1".into(),
+                        thread_ts: "1.0".into(),
+                        messages: vec![root.clone()],
+                    },
+                    StoreChange::ThreadCatalogReplaced(initial_records.clone()),
+                ],
+            )
+            .await
+            .unwrap();
 
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
@@ -17260,7 +17263,7 @@ mod tests {
 
             let failed_raw = tokio::time::timeout(Duration::from_secs(1), runtime_receiver.recv())
                 .await
-                .expect("failed message did not reach compatibility UI")
+                .expect("failed message did not reach the raw UI path")
                 .expect("runtime event channel closed");
             assert!(matches!(
                 failed_raw.kind,
@@ -17292,13 +17295,20 @@ mod tests {
             drop(sender);
             worker.await.unwrap();
 
-            let recovered_catalog = runtime_receiver.recv().await.unwrap();
             let recovered_patch = runtime_receiver.recv().await.unwrap();
             let next_raw = runtime_receiver.recv().await.unwrap();
             let next_patch = runtime_receiver.recv().await.unwrap();
-            let RuntimeEventKind::ThreadCatalogLoaded(records) = recovered_catalog.kind else {
-                panic!("recovered catalog compatibility projection must publish first");
+            let RuntimeEventKind::WorkspacePatch(ref patch) = recovered_patch.kind else {
+                panic!("recovered workspace patch must publish first");
             };
+            let records = patch
+                .changes()
+                .iter()
+                .find_map(|change| match change {
+                    WorkspaceChange::ThreadCatalogChanged(records) => Some(records),
+                    _ => None,
+                })
+                .expect("recovered patch did not include the thread catalog");
             let record = records
                 .iter()
                 .find(|record| record.key.channel_id == "C1" && record.key.root_ts == "1.0")
@@ -17312,17 +17322,6 @@ mod tests {
                     last_read: None,
                 }
             );
-            assert!(matches!(
-                recovered_patch.kind,
-                RuntimeEventKind::WorkspacePatch(ref patch) if patch
-                    .changes()
-                    .iter()
-                    .any(|change| matches!(
-                        change,
-                        WorkspaceChange::ThreadCatalogChanged(projected)
-                            if projected == &records
-                    ))
-            ));
             assert!(matches!(
                 next_raw.kind,
                 RuntimeEventKind::SocketModeEvent {
@@ -17338,7 +17337,10 @@ mod tests {
 
             drop(store);
             let reopened = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            assert_eq!(reopened.load_thread_catalog().await.unwrap(), records);
+            assert_eq!(
+                load_test_thread_catalog(&reopened).await.unwrap(),
+                records.clone()
+            );
             let _ = std::fs::remove_dir_all(directory);
         });
     }
@@ -17609,8 +17611,7 @@ mod tests {
                 id: "C1".into(),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let (runtime_events, _receiver) = mpsc::unbounded_channel();
@@ -17679,7 +17680,11 @@ mod tests {
             let thread = store.load_thread("C1", "1.0").await.unwrap().unwrap();
             assert_eq!(thread.len(), 1);
             assert_eq!(thread[0].ts, "3.0");
-            let conversation = store.load_conversations().await.unwrap().unwrap().remove(0);
+            let conversation = load_test_conversations(&store)
+                .await
+                .unwrap()
+                .unwrap()
+                .remove(0);
             assert_eq!(conversation.unread_activity_count(), 3);
             let _ = std::fs::remove_dir_all(directory);
         });
@@ -17702,13 +17707,15 @@ mod tests {
                 std::process::id()
             ));
             let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            store
-                .store_conversations(&[SlackConversation {
+            seed_test_conversations(
+                &store,
+                &[SlackConversation {
                     id: "C1".into(),
                     ..Default::default()
-                }])
-                .await
-                .unwrap();
+                }],
+            )
+            .await
+            .unwrap();
             let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
@@ -17865,8 +17872,7 @@ mod tests {
                 is_im: Some(true),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let (runtime_events, mut receiver) = mpsc::unbounded_channel();
@@ -17946,8 +17952,7 @@ mod tests {
             assert_eq!(metrics.queue_dequeued, 2);
             assert_eq!(metrics.queue_depth, 0);
             assert_eq!(metrics.queue_peak_depth, 2);
-            let conversation = store
-                .load_conversations()
+            let conversation = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -18118,7 +18123,9 @@ mod tests {
                     ..Default::default()
                 },
             ];
-            store.store_conversations(&conversations).await.unwrap();
+            seed_test_conversations(&store, &conversations)
+                .await
+                .unwrap();
 
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
@@ -18391,7 +18398,10 @@ mod tests {
             }
 
             let reopened_store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let persisted = reopened_store.load_conversations().await.unwrap().unwrap();
+            let persisted = load_test_conversations(&reopened_store)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 persisted
                     .iter()
@@ -18441,8 +18451,7 @@ mod tests {
                 extra: HashMap::from([("last_read".into(), serde_json::json!("20.0"))]),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let workspace = WorkspaceReducerAdapter::default();
@@ -18506,8 +18515,7 @@ mod tests {
                 store.committed_transaction_count().await.unwrap() - transaction_baseline,
                 1
             );
-            let persisted = store
-                .load_conversations()
+            let persisted = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .unwrap()
@@ -18517,7 +18525,14 @@ mod tests {
             assert_eq!(persisted.unread_activity_count(), 0);
             assert!(!persisted.has_observed_attention_message("10.0"));
             assert!(
-                store.claim_attention_delivery("D1", "10.0").await.unwrap(),
+                claim_test_attention_delivery(
+                    &store,
+                    workspace.revision().successor(),
+                    "D1",
+                    "10.0",
+                )
+                .await
+                .unwrap(),
                 "a stale message must not consume the notification claim identity"
             );
 
@@ -18542,27 +18557,19 @@ mod tests {
                 std::process::id()
             ));
             let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            store
-                .store_conversations(&[SlackConversation {
-                    id: "C1".into(),
-                    ..Default::default()
-                }])
-                .await
-                .unwrap();
-            assert!(store
-                .clear_conversation_unread_state("C1", "20.0")
-                .await
-                .unwrap());
-
             let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".into()),
             });
             let mut conversation = SlackConversation {
                 id: "C1".into(),
+                extra: HashMap::from([("last_read".into(), serde_json::json!("20.0"))]),
                 ..Default::default()
             };
             conversation.set_local_read_ts("20.0");
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
+                .await
+                .unwrap();
             workspace.apply(
                 MutationOrigin::Cache,
                 WorkspaceMutation::ConversationUpsert(conversation),
@@ -18689,8 +18696,7 @@ mod tests {
                 is_im: Some(true),
                 ..Default::default()
             };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
+            seed_test_conversations(&store, std::slice::from_ref(&conversation))
                 .await
                 .unwrap();
             let transaction_baseline = store.committed_transaction_count().await.unwrap();
@@ -18803,7 +18809,14 @@ mod tests {
                 "the retired supervisor must leave no detached store writer"
             );
             assert!(
-                !store.claim_attention_delivery("D1", "1.0").await.unwrap(),
+                !claim_test_attention_delivery(
+                    &store,
+                    workspace.revision().successor(),
+                    "D1",
+                    "1.0",
+                )
+                .await
+                .unwrap(),
                 "the accepted notification claim must be durable before replacement completes"
             );
             let delivered = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
@@ -19359,7 +19372,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            store.store_conversation(&initial).await.unwrap();
+            seed_test_conversation(&store, &initial).await.unwrap();
             store
                 .install_conversation_batch_failure_trigger_for("C1")
                 .await
@@ -19385,7 +19398,7 @@ mod tests {
                 .conversation("C1")
                 .unwrap()
                 .is_starred());
-            assert!(!store.load_conversations().await.unwrap().unwrap()[0].is_starred());
+            assert!(!load_test_conversations(&store).await.unwrap().unwrap()[0].is_starred());
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -19413,7 +19426,7 @@ mod tests {
                 is_starred: Some(false),
                 ..Default::default()
             };
-            store.store_conversation(&initial).await.unwrap();
+            seed_test_conversation(&store, &initial).await.unwrap();
             workspace.apply(
                 MutationOrigin::Cache,
                 WorkspaceMutation::ConversationUpsert(initial.clone()),
@@ -19451,17 +19464,14 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(!toggle.is_finished());
 
-            store.store_conversation(&initial).await.unwrap();
             workspace.apply(
                 MutationOrigin::WebApi,
                 WorkspaceMutation::ConversationUpsert(initial.clone()),
             );
-            events.send_event(RuntimeEventKind::ConversationsLoaded(vec![initial]));
             drop(refresh_guard);
             toggle.await.unwrap();
 
-            let persisted = store
-                .load_conversations()
+            let persisted = load_test_conversations(&store)
                 .await
                 .unwrap()
                 .expect("missing cached conversations");
@@ -19475,17 +19485,16 @@ mod tests {
                 .is_starred());
             assert!(matches!(
                 receiver.recv().await.unwrap().kind,
-                RuntimeEventKind::ConversationsLoaded(_)
-            ));
-            assert!(matches!(
-                receiver.recv().await.unwrap().kind,
                 RuntimeEventKind::WorkspacePatch(_)
             ));
             assert!(matches!(
                 receiver.recv().await.unwrap().kind,
-                RuntimeEventKind::ConversationStarUpdated(conversation)
-                    if conversation.id == "C1" && conversation.is_starred()
+                RuntimeEventKind::ConversationStarUpdated {
+                    channel_id,
+                    starred: true,
+                } if channel_id == "C1"
             ));
+            assert!(receiver.try_recv().is_err());
 
             let _ = std::fs::remove_dir_all(directory);
         });
@@ -20279,8 +20288,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            store
-                .store_conversations(&[cached.clone(), removed])
+            seed_test_conversations(&store, &[cached.clone(), removed])
                 .await
                 .unwrap();
             let base_revision = workspace.revision();
@@ -20380,7 +20388,7 @@ mod tests {
                 .find(|conversation| conversation.id == "C2")
                 .unwrap()
                 .is_starred());
-            let mut persisted = store.load_conversations().await.unwrap().unwrap();
+            let mut persisted = load_test_conversations(&store).await.unwrap().unwrap();
             persisted.sort_by(|left, right| left.id.cmp(&right.id));
             assert_eq!(persisted, conversations);
 
@@ -20610,8 +20618,7 @@ mod tests {
                 text: Some("hello".into()),
                 ..Default::default()
             };
-            store
-                .store_history("C1", std::slice::from_ref(&message))
+            seed_test_history(&store, "C1", std::slice::from_ref(&message))
                 .await
                 .unwrap();
             store
@@ -21070,7 +21077,7 @@ mod tests {
     }
 
     #[test]
-    fn local_reaction_publishes_thread_catalog_compatibility_before_its_patch() {
+    fn local_reaction_publishes_raw_completion_before_its_patch() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -21131,12 +21138,8 @@ mod tests {
                 delivered.as_slice(),
                 [
                     RuntimeEventKind::ReactionUpdated { .. },
-                    RuntimeEventKind::ThreadCatalogLoaded(records),
                     RuntimeEventKind::WorkspacePatch(patch),
-                ] if message_has_named_reaction(
-                    records[0].root.as_ref().unwrap(),
-                    "wave"
-                ) && patch.changes().iter().any(|change| {
+                ] if patch.changes().iter().any(|change| {
                     matches!(
                         change,
                         WorkspaceChange::ThreadCatalogChanged(records)
@@ -21171,8 +21174,7 @@ mod tests {
                 text: Some("hello".into()),
                 ..Default::default()
             };
-            store
-                .store_history("C1", std::slice::from_ref(&message))
+            seed_test_history(&store, "C1", std::slice::from_ref(&message))
                 .await
                 .unwrap();
             let workspace = WorkspaceReducerAdapter::default();

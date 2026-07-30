@@ -10,13 +10,13 @@
 //! This module deliberately has no dependency on GTK, WebKit, or the runtime. Callers apply
 //! the returned outcomes to their views and translate request decisions into runtime commands.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
-    slack_timestamp_is_after, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
-    SlackFile, SlackMessage, SlackReaction,
+    SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile, SlackMessage,
+    SlackReaction,
 };
 use crate::thread_catalog::ThreadCatalog;
 use crate::workspace_pipeline::{WorkspaceChange, WorkspacePatch, WorkspaceRevision};
@@ -80,32 +80,33 @@ impl WorkspaceLifecycle {
     }
 }
 
-/// Canonical workspace-domain state owned by the window controller.
+/// Revisioned presentation projection owned by the window controller.
 ///
-/// Keeping the catalogs and navigation state behind one owner makes session reset explicit and
-/// prevents the GTK layer from maintaining parallel conversation collections.
+/// The workspace coordinator remains canonical. Apart from session reset, the
+/// window updates these catalogs only by applying its ordered `WorkspacePatch`
+/// stream.
 #[derive(Debug, Default)]
 pub(crate) struct WorkspaceSessionState {
     lifecycle: Cell<WorkspaceLifecycle>,
-    pub(crate) conversations: RefCell<ConversationCatalog>,
+    conversations: RefCell<ConversationCatalog>,
     pub(crate) view: RefCell<WorkspaceViewState>,
-    pub(crate) threads: RefCell<ThreadCatalog>,
-    conversation_patches: RefCell<ConversationPatchConsumer>,
+    threads: RefCell<ThreadCatalog>,
+    workspace_patches: RefCell<WorkspacePatchConsumer>,
 }
 
 #[derive(Debug, Default)]
-struct ConversationPatchConsumer {
+struct WorkspacePatchConsumer {
     revision: WorkspaceRevision,
 }
 
 #[derive(Debug)]
-pub(crate) struct ConversationPatchRemoval {
+pub(crate) struct WorkspacePatchRemoval {
     channel_id: String,
     conversation: Option<SlackConversation>,
     was_visible: bool,
 }
 
-impl ConversationPatchRemoval {
+impl WorkspacePatchRemoval {
     pub(crate) fn channel_id(&self) -> &str {
         &self.channel_id
     }
@@ -120,27 +121,35 @@ impl ConversationPatchRemoval {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ConversationPatchApplication {
+pub(crate) struct WorkspacePatchApplication {
     conversation_changed: bool,
-    removals: Vec<ConversationPatchRemoval>,
-    acknowledged_local_reads: Vec<String>,
+    thread_catalog_changed: bool,
+    removals: Vec<WorkspacePatchRemoval>,
 }
 
-impl ConversationPatchApplication {
+impl WorkspacePatchApplication {
     pub(crate) fn conversation_changed(&self) -> bool {
         self.conversation_changed
     }
 
-    pub(crate) fn removals(&self) -> &[ConversationPatchRemoval] {
-        &self.removals
+    pub(crate) fn thread_catalog_changed(&self) -> bool {
+        self.thread_catalog_changed
     }
 
-    pub(crate) fn acknowledged_local_reads(&self) -> &[String] {
-        &self.acknowledged_local_reads
+    pub(crate) fn removals(&self) -> &[WorkspacePatchRemoval] {
+        &self.removals
     }
 }
 
 impl WorkspaceSessionState {
+    pub(crate) fn conversations(&self) -> Ref<'_, ConversationCatalog> {
+        self.conversations.borrow()
+    }
+
+    pub(crate) fn threads(&self) -> Ref<'_, ThreadCatalog> {
+        self.threads.borrow()
+    }
+
     pub(crate) fn lifecycle(&self) -> WorkspaceLifecycle {
         self.lifecycle.get()
     }
@@ -158,46 +167,39 @@ impl WorkspaceSessionState {
         *self.conversations.borrow_mut() = ConversationCatalog::default();
         self.view.borrow_mut().reset();
         *self.threads.borrow_mut() = ThreadCatalog::default();
-        *self.conversation_patches.borrow_mut() = ConversationPatchConsumer::default();
-    }
-
-    pub(crate) fn conversation_patch_revision(&self) -> WorkspaceRevision {
-        self.conversation_patches.borrow().revision
-    }
-
-    pub(crate) fn has_conversation_patch(&self) -> bool {
-        self.conversation_patch_revision() > WorkspaceRevision::INITIAL
+        *self.workspace_patches.borrow_mut() = WorkspacePatchConsumer::default();
     }
 
     #[cfg(test)]
-    pub(crate) fn apply_conversation_patch(
-        &self,
-        patch: &WorkspacePatch,
-    ) -> Option<ConversationPatchApplication> {
-        self.apply_conversation_patch_with_local_reads(patch, &HashMap::new())
+    pub(crate) fn workspace_patch_revision(&self) -> WorkspaceRevision {
+        self.workspace_patches.borrow().revision
     }
 
-    pub(crate) fn apply_conversation_patch_with_local_reads(
+    pub(crate) fn apply_workspace_patch(
         &self,
         patch: &WorkspacePatch,
-        local_read_ts_by_channel: &HashMap<String, String>,
-    ) -> Option<ConversationPatchApplication> {
-        let mut consumer = self.conversation_patches.borrow_mut();
+    ) -> Option<WorkspacePatchApplication> {
+        let mut consumer = self.workspace_patches.borrow_mut();
         if patch.revision() <= consumer.revision {
             return None;
         }
 
         let mut catalog = self.conversations.borrow_mut();
         let mut view = self.view.borrow_mut();
-        let mut application = ConversationPatchApplication::default();
+        let mut threads = self.threads.borrow_mut();
+        let mut application = WorkspacePatchApplication::default();
         for change in patch.changes() {
             match change {
-                WorkspaceChange::BootstrapReset(data) => replace_patch_conversations(
-                    &mut catalog,
-                    &mut view,
-                    &data.conversations,
-                    &mut application,
-                ),
+                WorkspaceChange::BootstrapReset(data) => {
+                    replace_patch_conversations(
+                        &mut catalog,
+                        &mut view,
+                        &data.conversations,
+                        &mut application,
+                    );
+                    *threads = ThreadCatalog::from_records(data.threads.clone());
+                    application.thread_catalog_changed = true;
+                }
                 WorkspaceChange::ConversationsReset(conversations) => {
                     replace_patch_conversations(
                         &mut catalog,
@@ -218,22 +220,7 @@ impl WorkspaceSessionState {
                     channel_id,
                     observations,
                 } => {
-                    let local_read =
-                        local_read_ts_by_channel
-                            .get(channel_id)
-                            .cloned()
-                            .or_else(|| {
-                                catalog
-                                    .get(channel_id)
-                                    .and_then(SlackConversation::local_read_ts)
-                                    .map(str::to_string)
-                            });
                     for observation in observations {
-                        if local_read.as_deref().is_some_and(|last_read| {
-                            !slack_timestamp_is_after(&observation.message_ts, last_read)
-                        }) {
-                            continue;
-                        }
                         application.conversation_changed |= catalog
                             .apply_attention_observation(
                                 channel_id,
@@ -244,7 +231,7 @@ impl WorkspaceSessionState {
                     }
                 }
                 WorkspaceChange::ConversationRemoved { channel_id } => {
-                    application.removals.push(ConversationPatchRemoval {
+                    application.removals.push(WorkspacePatchRemoval {
                         channel_id: channel_id.clone(),
                         conversation: catalog.remove(channel_id),
                         was_visible: view.visible_channel_id() == Some(channel_id),
@@ -256,27 +243,16 @@ impl WorkspaceSessionState {
                     if !snapshot.unread_state.known || snapshot.channel_id.trim().is_empty() {
                         continue;
                     }
-                    let local_read = local_read_ts_by_channel.get(&snapshot.channel_id);
-                    let newer_local_read = local_read.is_some_and(|local| {
-                        snapshot
-                            .last_read
-                            .as_deref()
-                            .is_none_or(|server| slack_timestamp_is_after(local.as_str(), server))
-                    });
-                    if newer_local_read {
-                        continue;
-                    }
-                    if local_read.is_some() && snapshot.last_read.is_some() {
-                        application
-                            .acknowledged_local_reads
-                            .push(snapshot.channel_id.clone());
-                    }
-                    application.conversation_changed |= catalog.apply_unread_snapshot(snapshot);
+                    application.conversation_changed |=
+                        apply_authoritative_unread_snapshot(&mut catalog, snapshot);
+                }
+                WorkspaceChange::ThreadCatalogChanged(records) => {
+                    *threads = ThreadCatalog::from_records(records.clone());
+                    application.thread_catalog_changed = true;
                 }
                 WorkspaceChange::UsersReset(_)
                 | WorkspaceChange::UserUpsert(_)
-                | WorkspaceChange::TimelineChanged { .. }
-                | WorkspaceChange::ThreadCatalogChanged(_) => {}
+                | WorkspaceChange::TimelineChanged { .. } => {}
             }
         }
         consumer.revision = patch.revision();
@@ -284,11 +260,28 @@ impl WorkspaceSessionState {
     }
 }
 
+fn apply_authoritative_unread_snapshot(
+    catalog: &mut ConversationCatalog,
+    snapshot: &crate::models::SlackConversationUnreadSnapshot,
+) -> bool {
+    let Some(mut conversation) = catalog.get(&snapshot.channel_id).cloned() else {
+        return catalog.apply_unread_snapshot(snapshot);
+    };
+    let previous = conversation.clone();
+    conversation.clear_local_read_ts();
+    conversation.apply_unread_snapshot(snapshot);
+    if conversation == previous {
+        return false;
+    }
+    catalog.upsert_authoritative(conversation);
+    true
+}
+
 fn replace_patch_conversations(
     catalog: &mut ConversationCatalog,
     view: &mut WorkspaceViewState,
     conversations: &[SlackConversation],
-    application: &mut ConversationPatchApplication,
+    application: &mut WorkspacePatchApplication,
 ) {
     let incoming_ids = conversations
         .iter()
@@ -300,7 +293,7 @@ fn replace_patch_conversations(
         .filter(|conversation| !incoming_ids.contains(conversation.id.as_str()))
     {
         let channel_id = conversation.id.clone();
-        application.removals.push(ConversationPatchRemoval {
+        application.removals.push(WorkspacePatchRemoval {
             was_visible: view.visible_channel_id() == Some(channel_id.as_str()),
             channel_id: channel_id.clone(),
             conversation: Some(conversation),
@@ -1658,6 +1651,44 @@ mod tests {
         WorkspaceRevision,
     };
 
+    #[test]
+    fn workspace_catalogs_expose_only_read_only_views() {
+        let production = include_str!("workspace_state.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let session_fields = production
+            .split_once("struct WorkspaceSessionState {")
+            .unwrap()
+            .1
+            .split_once('}')
+            .unwrap()
+            .0;
+        let conversations_field = session_fields
+            .lines()
+            .find(|line| line.contains("conversations: RefCell"))
+            .unwrap()
+            .trim();
+        let threads_field = session_fields
+            .lines()
+            .find(|line| line.contains("threads: RefCell"))
+            .unwrap()
+            .trim();
+
+        assert_eq!(
+            conversations_field,
+            "conversations: RefCell<ConversationCatalog>,"
+        );
+        assert_eq!(threads_field, "threads: RefCell<ThreadCatalog>,");
+        assert!(production
+            .contains("pub(crate) fn conversations(&self) -> Ref<'_, ConversationCatalog>"));
+        assert!(production.contains("pub(crate) fn threads(&self) -> Ref<'_, ThreadCatalog>"));
+        assert!(!production.contains("fn conversations_mut"));
+        assert!(!production.contains("fn threads_mut"));
+        assert!(!production.contains("RefMut<'_, ConversationCatalog>"));
+        assert!(!production.contains("RefMut<'_, ThreadCatalog>"));
+    }
+
     fn message(ts: &str, text: &str) -> SlackMessage {
         SlackMessage {
             ts: ts.to_string(),
@@ -1690,19 +1721,19 @@ mod tests {
         }
     }
 
-    fn conversation_patch(revision: WorkspaceRevision, change: WorkspaceChange) -> WorkspacePatch {
+    fn workspace_patch(revision: WorkspaceRevision, change: WorkspaceChange) -> WorkspacePatch {
         WorkspacePatch::new(revision, vec![change]).unwrap()
     }
 
     #[test]
-    fn conversation_patch_consumer_accepts_gaps_and_rejects_stale_or_duplicate_rollbacks() {
+    fn workspace_patch_consumer_accepts_gaps_and_rejects_stale_or_duplicate_rollbacks() {
         let state = WorkspaceSessionState::default();
         let revision_one = WorkspaceRevision::INITIAL.successor();
         let revision_two = revision_one.successor();
         let revision_three = revision_two.successor();
         let revision_four = revision_three.successor();
 
-        let bootstrap = conversation_patch(
+        let bootstrap = workspace_patch(
             revision_one,
             WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
                 conversations: vec![conversation("C1", "old")],
@@ -1710,37 +1741,36 @@ mod tests {
             }),
         );
         assert!(state
-            .apply_conversation_patch(&bootstrap)
+            .apply_workspace_patch(&bootstrap)
             .unwrap()
             .conversation_changed());
         state.view.borrow_mut().select_conversation("C1");
 
-        let newer = conversation_patch(
+        let newer = workspace_patch(
             revision_three,
             WorkspaceChange::ConversationUpsert(conversation("C1", "new")),
         );
         assert!(state
-            .apply_conversation_patch(&newer)
+            .apply_workspace_patch(&newer)
             .unwrap()
             .conversation_changed());
-        assert_eq!(state.conversation_patch_revision(), revision_three);
+        assert_eq!(state.workspace_patch_revision(), revision_three);
 
-        let duplicate = conversation_patch(
+        let duplicate = workspace_patch(
             revision_three,
             WorkspaceChange::ConversationRemoved {
                 channel_id: "C1".to_string(),
             },
         );
-        assert!(state.apply_conversation_patch(&duplicate).is_none());
-        let stale = conversation_patch(
+        assert!(state.apply_workspace_patch(&duplicate).is_none());
+        let stale = workspace_patch(
             revision_two,
             WorkspaceChange::ConversationUpsert(conversation("C1", "rollback")),
         );
-        assert!(state.apply_conversation_patch(&stale).is_none());
+        assert!(state.apply_workspace_patch(&stale).is_none());
         assert_eq!(
             state
-                .conversations
-                .borrow()
+                .conversations()
                 .get("C1")
                 .and_then(|conversation| conversation.name.as_deref()),
             Some("new")
@@ -1751,28 +1781,26 @@ mod tests {
             "rejected patches must not mutate navigation"
         );
 
-        let removal = conversation_patch(
+        let removal = workspace_patch(
             revision_four,
             WorkspaceChange::ConversationRemoved {
                 channel_id: "C1".to_string(),
             },
         );
-        let application = state.apply_conversation_patch(&removal).unwrap();
+        let application = state.apply_workspace_patch(&removal).unwrap();
         assert_eq!(application.removals().len(), 1);
         assert_eq!(application.removals()[0].channel_id(), "C1");
         assert!(application.removals()[0].was_visible());
-        assert!(state.conversations.borrow().get("C1").is_none());
+        assert!(state.conversations().get("C1").is_none());
         assert_eq!(state.view.borrow().visible_channel_id(), None);
     }
 
     #[test]
-    fn conversation_patch_consumer_applies_unread_gaps_without_rolling_back_a_local_read() {
+    fn workspace_patch_consumer_applies_canonical_read_and_server_acknowledgement() {
         let state = WorkspaceSessionState::default();
         let revision_one = WorkspaceRevision::INITIAL.successor();
         let revision_two = revision_one.successor();
         let revision_three = revision_two.successor();
-        let revision_four = revision_three.successor();
-        let revision_five = revision_four.successor();
         let mut initial = conversation("C1", "general");
         initial.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
             channel_id: "C1".to_string(),
@@ -1783,7 +1811,7 @@ mod tests {
             is_open: None,
         });
         state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&workspace_patch(
                 revision_one,
                 WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
                     conversations: vec![initial],
@@ -1792,121 +1820,48 @@ mod tests {
             ))
             .unwrap();
 
-        state
-            .conversations
-            .borrow_mut()
-            .advance_read_cursor("C1", "20.0", 0);
-        let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
-        let delayed_unread = conversation_patch(
-            revision_three,
-            WorkspaceChange::UnreadChanged {
-                snapshot: SlackConversationUnreadSnapshot {
-                    channel_id: "C1".to_string(),
-                    unread_state: SlackUnreadState::from_parts(true, true, 9),
-                    last_read: Some("11.0".to_string()),
-                    latest: Some("19.0".to_string()),
-                    mention_count: Some(3),
-                    is_open: None,
-                },
-            },
+        let mut local_read = state.conversations().get("C1").cloned().unwrap();
+        local_read.advance_read_cursor("20.0", 0);
+        local_read.set_local_read_ts("20.0");
+        assert!(state
+            .apply_workspace_patch(&workspace_patch(
+                revision_two,
+                WorkspaceChange::ConversationUpsert(local_read),
+            ))
+            .unwrap()
+            .conversation_changed());
+        assert_eq!(
+            state
+                .conversations()
+                .get("C1")
+                .and_then(SlackConversation::local_read_ts),
+            Some("20.0")
         );
-        let delayed = state
-            .apply_conversation_patch_with_local_reads(&delayed_unread, &local_reads)
-            .unwrap();
-        assert!(!delayed.conversation_changed());
-        assert!(delayed.acknowledged_local_reads().is_empty());
-        assert_eq!(state.conversation_patch_revision(), revision_three);
-        assert!(state
-            .apply_conversation_patch_with_local_reads(
-                &conversation_patch(
-                    revision_three,
-                    WorkspaceChange::ConversationRemoved {
-                        channel_id: "C1".to_string(),
-                    },
-                ),
-                &local_reads,
-            )
-            .is_none());
-        assert!(state
-            .apply_conversation_patch_with_local_reads(
-                &conversation_patch(
-                    revision_two,
-                    WorkspaceChange::UnreadChanged {
-                        snapshot: SlackConversationUnreadSnapshot {
-                            channel_id: "C1".to_string(),
-                            unread_state: SlackUnreadState::from_parts(true, true, 7),
-                            last_read: None,
-                            latest: Some("18.0".to_string()),
-                            mention_count: Some(2),
-                            is_open: None,
-                        },
-                    },
-                ),
-                &local_reads,
-            )
-            .is_none());
-
-        {
-            let catalog = state.conversations.borrow();
-            let current = catalog.get("C1").unwrap();
-            assert_eq!(current.unread_state().display_count, 0);
-            assert_eq!(current.raw_unread_state().display_count, 0);
-            assert_eq!(current.raw_unread_activity_count(), 0);
-            assert_eq!(current.last_read_ts(), Some("20.0"));
-        }
-
-        let cursorless = state
-            .apply_conversation_patch_with_local_reads(
-                &conversation_patch(
-                    revision_four,
-                    WorkspaceChange::UnreadChanged {
-                        snapshot: SlackConversationUnreadSnapshot {
-                            channel_id: "C1".to_string(),
-                            unread_state: SlackUnreadState::from_parts(true, true, 8),
-                            last_read: None,
-                            latest: Some("21.0".to_string()),
-                            mention_count: Some(4),
-                            is_open: None,
-                        },
-                    },
-                ),
-                &local_reads,
-            )
-            .unwrap();
-        assert!(!cursorless.conversation_changed());
-        assert!(cursorless.acknowledged_local_reads().is_empty());
-        {
-            let catalog = state.conversations.borrow();
-            let current = catalog.get("C1").unwrap();
-            assert_eq!(current.raw_unread_state().display_count, 0);
-            assert_eq!(current.last_read_ts(), Some("20.0"));
-        }
 
         let acknowledged = state
-            .apply_conversation_patch_with_local_reads(
-                &conversation_patch(
-                    revision_five,
-                    WorkspaceChange::UnreadChanged {
-                        snapshot: SlackConversationUnreadSnapshot {
-                            channel_id: "C1".to_string(),
-                            unread_state: SlackUnreadState::from_parts(true, false, 0),
-                            last_read: Some("20.0".to_string()),
-                            ..Default::default()
-                        },
+            .apply_workspace_patch(&workspace_patch(
+                revision_three,
+                WorkspaceChange::UnreadChanged {
+                    snapshot: SlackConversationUnreadSnapshot {
+                        channel_id: "C1".to_string(),
+                        unread_state: SlackUnreadState::from_parts(true, false, 0),
+                        last_read: Some("20.0".to_string()),
+                        ..Default::default()
                     },
-                ),
-                &local_reads,
-            )
+                },
+            ))
             .unwrap();
-        assert!(
-            !acknowledged.conversation_changed(),
-            "a marker-only acknowledgement must not rebuild the sidebar"
-        );
-        assert_eq!(acknowledged.acknowledged_local_reads(), &["C1".to_string()]);
+        assert!(acknowledged.conversation_changed());
+        let catalog = state.conversations();
+        let current = catalog.get("C1").unwrap();
+        assert_eq!(current.last_read_ts(), Some("20.0"));
+        assert_eq!(current.local_read_ts(), None);
+        assert_eq!(current.unread_activity_count(), 0);
+        assert_eq!(state.workspace_patch_revision(), revision_three);
     }
 
     #[test]
-    fn conversation_attention_patches_are_idempotent_and_local_read_safe() {
+    fn workspace_attention_patches_apply_canonical_observations_idempotently() {
         let state = WorkspaceSessionState::default();
         let revision_one = WorkspaceRevision::INITIAL.successor();
         let revision_two = revision_one.successor();
@@ -1922,7 +1877,7 @@ mod tests {
             ("topic".to_string(), serde_json::json!("Keep me")),
         ]));
         state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&workspace_patch(
                 revision_one,
                 WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
                     conversations: vec![initial],
@@ -1936,7 +1891,7 @@ mod tests {
             record_unread: true,
         };
         let first = state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&workspace_patch(
                 revision_two,
                 WorkspaceChange::ConversationAttentionObserved {
                     channel_id: "C1".to_string(),
@@ -1946,7 +1901,7 @@ mod tests {
             .unwrap();
         assert!(first.conversation_changed());
         let duplicate = state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&workspace_patch(
                 revision_three,
                 WorkspaceChange::ConversationAttentionObserved {
                     channel_id: "C1".to_string(),
@@ -1956,7 +1911,7 @@ mod tests {
             .unwrap();
         assert!(!duplicate.conversation_changed());
         {
-            let conversations = state.conversations.borrow();
+            let conversations = state.conversations();
             let current = conversations.get("C1").unwrap();
             assert_eq!(current.unread_activity_count(), 1);
             assert_eq!(current.raw_unread_activity_count(), 5);
@@ -1968,29 +1923,18 @@ mod tests {
             );
         }
 
-        state
-            .conversations
-            .borrow_mut()
-            .advance_read_cursor("C1", "20.0", 0);
-        let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
-        let stale = state
-            .apply_conversation_patch_with_local_reads(
-                &conversation_patch(
-                    revision_four,
-                    WorkspaceChange::ConversationAttentionObserved {
-                        channel_id: "C1".to_string(),
-                        observations: vec![ConversationAttentionObservation {
-                            message_ts: "19.0".to_string(),
-                            record_unread: true,
-                        }],
-                    },
-                ),
-                &local_reads,
-            )
-            .unwrap();
-        assert!(!stale.conversation_changed());
+        let mut local_read = state.conversations().get("C1").cloned().unwrap();
+        local_read.advance_read_cursor("20.0", 0);
+        local_read.set_local_read_ts("20.0");
+        assert!(state
+            .apply_workspace_patch(&workspace_patch(
+                revision_four,
+                WorkspaceChange::ConversationUpsert(local_read),
+            ))
+            .unwrap()
+            .conversation_changed());
         {
-            let conversations = state.conversations.borrow();
+            let conversations = state.conversations();
             let current = conversations.get("C1").unwrap();
             assert_eq!(current.unread_activity_count(), 0);
             assert_eq!(current.raw_unread_activity_count(), 0);
@@ -2004,60 +1948,25 @@ mod tests {
         }
 
         let newer = state
-            .apply_conversation_patch_with_local_reads(
-                &conversation_patch(
-                    revision_five,
-                    WorkspaceChange::ConversationAttentionObserved {
-                        channel_id: "C1".to_string(),
-                        observations: vec![ConversationAttentionObservation {
-                            message_ts: "21.0".to_string(),
-                            record_unread: true,
-                        }],
-                    },
-                ),
-                &local_reads,
-            )
+            .apply_workspace_patch(&workspace_patch(
+                revision_five,
+                WorkspaceChange::ConversationAttentionObserved {
+                    channel_id: "C1".to_string(),
+                    observations: vec![ConversationAttentionObservation {
+                        message_ts: "21.0".to_string(),
+                        record_unread: true,
+                    }],
+                },
+            ))
             .unwrap();
         assert!(newer.conversation_changed());
-        let conversations = state.conversations.borrow();
+        let conversations = state.conversations();
         let current = conversations.get("C1").unwrap();
         assert_eq!(current.unread_activity_count(), 1);
         assert_eq!(current.raw_unread_activity_count(), 0);
         assert_eq!(current.last_read_ts(), Some("20.0"));
         assert!(current.is_starred());
         assert_eq!(current.name.as_deref(), Some("general"));
-
-        let embedded_marker_state = WorkspaceSessionState::default();
-        let mut embedded_marker = conversation("C2", "embedded marker");
-        embedded_marker.advance_read_cursor("30.0", 0);
-        embedded_marker.set_local_read_ts("30.0");
-        embedded_marker_state
-            .apply_conversation_patch(&conversation_patch(
-                revision_one,
-                WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
-                    conversations: vec![embedded_marker],
-                    ..Default::default()
-                }),
-            ))
-            .unwrap();
-        let embedded_stale = embedded_marker_state
-            .apply_conversation_patch(&conversation_patch(
-                revision_two,
-                WorkspaceChange::ConversationAttentionObserved {
-                    channel_id: "C2".to_string(),
-                    observations: vec![ConversationAttentionObservation {
-                        message_ts: "29.0".to_string(),
-                        record_unread: true,
-                    }],
-                },
-            ))
-            .unwrap();
-        assert!(!embedded_stale.conversation_changed());
-        let conversations = embedded_marker_state.conversations.borrow();
-        let embedded_current = conversations.get("C2").unwrap();
-        assert_eq!(embedded_current.unread_activity_count(), 0);
-        assert_eq!(embedded_current.last_read_ts(), Some("30.0"));
-        assert_eq!(embedded_current.local_read_ts(), Some("30.0"));
     }
 
     #[test]
@@ -2225,30 +2134,80 @@ mod tests {
     }
 
     #[test]
-    fn workspace_session_reset_clears_its_canonical_domain_state() {
+    fn workspace_session_reset_clears_its_presentation_projection() {
         let session = WorkspaceSessionState::default();
-        *session.conversations.borrow_mut() =
-            ConversationCatalog::from_cached([crate::models::SlackConversation {
-                id: "C1".to_string(),
-                ..Default::default()
-            }]);
-        session.view.borrow_mut().show_unreads();
         let mut thread_root = message("1", "thread root");
         thread_root.reply_count = Some(1);
+        let mut threads = ThreadCatalog::default();
+        threads.observe_history("C1", &[thread_root]);
         session
-            .threads
-            .borrow_mut()
-            .observe_history("C1", &[thread_root]);
-        assert!(session.threads.borrow().get("C1", "1").is_some());
+            .apply_workspace_patch(
+                &WorkspacePatch::new(
+                    WorkspaceRevision::INITIAL.successor(),
+                    vec![WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                        conversations: vec![crate::models::SlackConversation {
+                            id: "C1".to_string(),
+                            ..Default::default()
+                        }],
+                        threads: threads.into_records(),
+                        ..Default::default()
+                    })],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        session.view.borrow_mut().show_unreads();
+        assert_eq!(session.threads().clone().into_records().len(), 1);
 
         session.reset();
 
-        assert!(session.conversations.borrow().is_empty());
+        assert!(session.conversations().is_empty());
         assert_eq!(
             session.view.borrow().main_view(),
             MainMessageView::Placeholder
         );
-        assert!(session.threads.borrow().get("C1", "1").is_none());
+        assert!(session.threads().clone().into_records().is_empty());
+        assert_eq!(
+            session.workspace_patch_revision(),
+            WorkspaceRevision::INITIAL
+        );
+    }
+
+    #[test]
+    fn workspace_patch_alone_hydrates_and_replaces_the_thread_catalog() {
+        let session = WorkspaceSessionState::default();
+        let mut catalog = ThreadCatalog::default();
+        let mut root = message("1", "thread root");
+        root.reply_count = Some(1);
+        catalog.observe_history("C1", &[root]);
+        let records = catalog.into_records();
+
+        let hydrated = session
+            .apply_workspace_patch(
+                &WorkspacePatch::new(
+                    WorkspaceRevision::INITIAL.successor(),
+                    vec![WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                        threads: records.clone(),
+                        ..Default::default()
+                    })],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(hydrated.thread_catalog_changed());
+        assert_eq!(session.threads().clone().into_records(), records);
+
+        let replaced = session
+            .apply_workspace_patch(
+                &WorkspacePatch::new(
+                    WorkspaceRevision::INITIAL.successor().successor(),
+                    vec![WorkspaceChange::ThreadCatalogChanged(Vec::new())],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(replaced.thread_catalog_changed());
+        assert!(session.threads().clone().into_records().is_empty());
     }
 
     #[test]

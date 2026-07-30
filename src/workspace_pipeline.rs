@@ -5177,7 +5177,13 @@ mod tests {
             let mut reply = message(ts, "reply");
             reply.thread_ts = Some("1.0".to_string());
             reply.user = Some("U_OTHER".to_string());
-            catalog.observe_realtime("C1", &reply, Some("U_SELF"));
+            catalog.reconcile_message(
+                "C1",
+                &reply,
+                &[],
+                ThreadCatalogMessageKind::Posted,
+                Some("U_SELF"),
+            );
         }
         let mut coordinator = WorkspaceCoordinator::default();
         coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {

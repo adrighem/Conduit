@@ -401,6 +401,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::workspace_pipeline::{
+        MutationOrigin, WorkspaceBootstrapData, WorkspaceCoordinator, WorkspaceMutation,
+    };
 
     fn temp_dir() -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -450,7 +453,21 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    store.store_conversations(&conversations).await.unwrap();
+                    let mut coordinator = WorkspaceCoordinator::default();
+                    let reduction = coordinator
+                        .apply_from(
+                            MutationOrigin::WebApi,
+                            WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                                conversations,
+                                ..Default::default()
+                            }),
+                        )
+                        .expect("search fixture hydration should change the workspace");
+                    let batch = reduction
+                        .store_batch()
+                        .cloned()
+                        .expect("search fixture hydration should produce a store batch");
+                    store.execute_store_batch(batch).await.unwrap();
                     store.store_user_names(&user_names).await.unwrap();
                     store.store_user_full_names(&user_full_names).await.unwrap();
                     store
