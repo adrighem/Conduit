@@ -630,8 +630,9 @@ pub struct WorkspaceStore {
     hub: Arc<tokio::sync::OnceCell<StoreHub>>,
     store_batch_revision: Arc<std::sync::Mutex<WorkspaceRevision>>,
     recovery_generation: Arc<AtomicU64>,
+    workspace_reset_generation: Arc<AtomicU64>,
     workspace_repair_generation: Arc<AtomicU64>,
-    recovery_linearization: Arc<tokio::sync::Mutex<()>>,
+    recovery_linearization: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -656,6 +657,22 @@ pub(crate) struct SyncFreshness {
     pub(crate) retry_after_ms: Option<i64>,
 }
 
+fn advance_recovery_generation_if_observed(
+    recovery_generation: &AtomicU64,
+    observed_generation: u64,
+) -> Option<u64> {
+    let next_generation = observed_generation.checked_add(1)?;
+    recovery_generation
+        .compare_exchange(
+            observed_generation,
+            next_generation,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .ok()
+        .map(|_| next_generation)
+}
+
 impl WorkspaceStore {
     pub fn new(directory: PathBuf, workspace_id: &str) -> Self {
         Self {
@@ -666,8 +683,9 @@ impl WorkspaceStore {
             hub: Arc::new(tokio::sync::OnceCell::new()),
             store_batch_revision: Arc::new(std::sync::Mutex::new(WorkspaceRevision::INITIAL)),
             recovery_generation: Arc::new(AtomicU64::new(0)),
+            workspace_reset_generation: Arc::new(AtomicU64::new(0)),
             workspace_repair_generation: Arc::new(AtomicU64::new(0)),
-            recovery_linearization: Arc::new(tokio::sync::Mutex::new(())),
+            recovery_linearization: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -827,33 +845,90 @@ impl WorkspaceStore {
     async fn query_or_reset<T, F>(&self, empty: T, query: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        F: Fn(&mut Connection) -> Result<T> + Send + Sync + 'static,
     {
-        let hub = self.hub().await?;
+        let hub = self.hub().await?.clone();
+        // Readers share this gate, while publication and repair take it
+        // exclusively. A patch therefore cannot drain between observing
+        // corrupt cache data and completing its atomic recheck/reset.
+        let recovery_read = Arc::clone(&self.recovery_linearization).read_owned().await;
         let observed_generation = self.recovery_generation();
-        match hub.query(query).await {
-            Err(error) if error.category() == StoreErrorCategory::CorruptData => {
-                let _recovery = Arc::clone(&self.recovery_linearization).lock_owned().await;
-                if self.recovery_generation() != observed_generation {
-                    return Ok(empty);
+        let workspace_key = self.workspace_key.clone();
+        let store_batch_revision = Arc::clone(&self.store_batch_revision);
+        let recovery_generation = Arc::clone(&self.recovery_generation);
+        let workspace_reset_generation = Arc::clone(&self.workspace_reset_generation);
+        let query = Arc::new(query);
+        // Transfer the complete query and recovery sequence to the runtime
+        // before its first cancellation point. A cancelled caller therefore
+        // cannot abandon known corruption during either worker admission.
+        let operation = tokio::spawn(async move {
+            let initial_query = Arc::clone(&query);
+            let result = match hub.query(move |connection| initial_query(connection)).await {
+                Err(error) if error.category() == StoreErrorCategory::CorruptData => {
+                    let retry_query = Arc::clone(&query);
+                    let writer_recovery_generation = Arc::clone(&recovery_generation);
+                    let writer_reset_generation = Arc::clone(&workspace_reset_generation);
+                    let recovered = hub
+                        .write(move |connection| {
+                            if writer_recovery_generation.load(Ordering::Acquire)
+                                != observed_generation
+                            {
+                                return Ok(None);
+                            }
+                            match retry_query(connection) {
+                                Ok(value) => Ok(Some(value)),
+                                Err(error)
+                                    if error.category() == StoreErrorCategory::CorruptData =>
+                                {
+                                    let mut persisted_revision =
+                                        store_batch_revision.lock().map_err(|_| {
+                                            StoreError::Other(anyhow::anyhow!(
+                                                "store batch revision lock poisoned"
+                                            ))
+                                        })?;
+                                    reset_sqlite_workspace(connection, &workspace_key)?;
+                                    *persisted_revision = WorkspaceRevision::INITIAL;
+                                    if let Some(reset_generation) =
+                                        advance_recovery_generation_if_observed(
+                                            &writer_recovery_generation,
+                                            observed_generation,
+                                        )
+                                    {
+                                        writer_reset_generation
+                                            .fetch_max(reset_generation, Ordering::Release);
+                                    }
+                                    Ok(None)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        })
+                        .await;
+                    match recovered {
+                        Ok(Some(value)) => Ok(value),
+                        Ok(None) => Ok(empty),
+                        Err(error) => {
+                            // The reader established corruption, but writer
+                            // dispatch, revalidation, or reset could not prove
+                            // the current cache valid. Preserve repair intent
+                            // while the shared recovery guard is still held.
+                            advance_recovery_generation_if_observed(
+                                &recovery_generation,
+                                observed_generation,
+                            );
+                            Err(error)
+                        }
+                    }
                 }
-                let workspace_key = self.workspace_key.clone();
-                let store_batch_revision = Arc::clone(&self.store_batch_revision);
-                let recovery_generation = Arc::clone(&self.recovery_generation);
-                hub.write(move |connection| {
-                    let mut persisted_revision = store_batch_revision.lock().map_err(|_| {
-                        StoreError::Other(anyhow::anyhow!("store batch revision lock poisoned"))
-                    })?;
-                    reset_sqlite_workspace(connection, &workspace_key)?;
-                    *persisted_revision = WorkspaceRevision::INITIAL;
-                    recovery_generation.fetch_add(1, Ordering::Release);
-                    Ok(())
-                })
-                .await?;
-                Ok(empty)
-            }
-            result => result,
-        }
+                result => result,
+            };
+            drop(recovery_read);
+            result
+        });
+        operation.await.map_err(|error| {
+            StoreError::Other(anyhow::anyhow!(
+                "workspace cache query task failed: {error}"
+            ))
+        })?
     }
 
     pub(crate) fn recovery_generation(&self) -> u64 {
@@ -864,13 +939,59 @@ impl WorkspaceStore {
         self.workspace_repair_generation.load(Ordering::Acquire) < self.recovery_generation()
     }
 
-    pub(crate) fn mark_workspace_cache_repaired(&self, recovery_generation: u64) {
-        self.workspace_repair_generation
-            .fetch_max(recovery_generation, Ordering::AcqRel);
+    pub(crate) fn workspace_cache_needs_reset(&self) -> bool {
+        self.workspace_reset_generation.load(Ordering::Acquire) < self.recovery_generation()
     }
 
-    pub(crate) async fn lock_recovery_linearization(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        Arc::clone(&self.recovery_linearization).lock_owned().await
+    pub(crate) fn mark_workspace_cache_repaired(&self, recovery_generation: u64) {
+        if self.workspace_reset_generation.load(Ordering::Acquire) >= recovery_generation {
+            self.workspace_repair_generation
+                .fetch_max(recovery_generation, Ordering::AcqRel);
+        }
+    }
+
+    pub(crate) async fn lock_recovery_linearization(
+        &self,
+    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.recovery_linearization).write_owned().await
+    }
+
+    pub(crate) async fn ensure_workspace_cache_reset_for_repair(
+        &self,
+        expected_recovery_generation: u64,
+    ) -> Result<bool> {
+        if self.recovery_generation() != expected_recovery_generation {
+            return Ok(false);
+        }
+        if self.workspace_reset_generation.load(Ordering::Acquire) >= expected_recovery_generation {
+            return Ok(true);
+        }
+
+        let _recovery = self.lock_recovery_linearization().await;
+        if self.recovery_generation() != expected_recovery_generation {
+            return Ok(false);
+        }
+        if self.workspace_reset_generation.load(Ordering::Acquire) >= expected_recovery_generation {
+            return Ok(true);
+        }
+
+        let workspace_key = self.workspace_key.clone();
+        let store_batch_revision = Arc::clone(&self.store_batch_revision);
+        let workspace_reset_generation = Arc::clone(&self.workspace_reset_generation);
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let mut persisted_revision = store_batch_revision.lock().map_err(|_| {
+                    StoreError::Other(anyhow::anyhow!("store batch revision lock poisoned"))
+                })?;
+                reset_sqlite_workspace(connection, &workspace_key)?;
+                *persisted_revision = WorkspaceRevision::INITIAL;
+                workspace_reset_generation
+                    .fetch_max(expected_recovery_generation, Ordering::Release);
+                Ok(())
+            })
+            .await?;
+        Ok(true)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1045,7 +1166,7 @@ impl WorkspaceStore {
                  WHERE workspace_key = ?1 AND kind = 'pending_unread'",
             )?;
             let rows = statement
-                .query_map([workspace_key], |row| {
+                .query_map([workspace_key.as_str()], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()
@@ -1054,9 +1175,7 @@ impl WorkspaceStore {
             let mut legacy = Vec::new();
             for (item_key, payload) in rows {
                 if item_key == PENDING_UNREAD_QUEUE_KEY {
-                    if let Ok(stored) = serde_json::from_str::<Vec<String>>(&payload) {
-                        queue.extend(stored);
-                    }
+                    queue.extend(serde_json::from_str::<Vec<String>>(&payload)?);
                 } else {
                     legacy.push(item_key);
                 }
@@ -1458,6 +1577,62 @@ impl WorkspaceStore {
                         "test conversation payload was not found",
                     ));
                 }
+                Ok(())
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn corrupt_cached_item_payload(
+        &self,
+        kind: &str,
+        item_key: &str,
+    ) -> Result<()> {
+        let workspace_key = self.workspace_key.clone();
+        let kind = kind.to_string();
+        let item_key = item_key.to_string();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE workspace_items SET payload_json = '{'
+                     WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+                    params![workspace_key, kind, item_key],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::rejected_update(
+                        "test cache item payload was not found",
+                    ));
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_workspace_reset_failure_trigger(&self) -> Result<()> {
+        self.hub()
+            .await?
+            .write(|connection| {
+                connection.execute_batch(
+                    "CREATE TEMP TRIGGER conduit_test_fail_workspace_reset
+                     BEFORE DELETE ON workspaces
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected workspace reset failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clear_workspace_reset_failure_trigger(&self) -> Result<()> {
+        self.hub()
+            .await?
+            .write(|connection| {
+                connection
+                    .execute_batch("DROP TRIGGER IF EXISTS conduit_test_fail_workspace_reset;")?;
                 Ok(())
             })
             .await
@@ -6507,40 +6682,678 @@ mod tests {
         let directory = temp_cache_dir("workspace-concurrent-corrupt-read-reset");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");
         runtime().block_on(async {
-            let readers_observed_corruption = Arc::new(std::sync::Barrier::new(2));
-            let first_store = store.clone();
-            let first_barrier = Arc::clone(&readers_observed_corruption);
-            let first = async move {
-                first_store
-                    .query_or_reset((), move |_| {
-                        first_barrier.wait();
-                        Err(StoreError::from(
-                            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
-                        ))
-                    })
-                    .await
-            };
-            let second_store = store.clone();
-            let second_barrier = Arc::clone(&readers_observed_corruption);
-            let second = async move {
-                second_store
-                    .query_or_reset((), move |_| {
-                        second_barrier.wait();
-                        Err(StoreError::from(
-                            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
-                        ))
-                    })
-                    .await
-            };
+            store
+                .seed_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
 
-            let (first, second) = futures_util::future::join(first, second).await;
-            first.unwrap();
-            second.unwrap();
+            let first_store = store.clone();
+            let second_store = store.clone();
+            let (first, second) = futures_util::future::join(
+                async move { first_store.stored_conversations().await },
+                async move { second_store.stored_conversations().await },
+            )
+            .await;
+            assert!(first.unwrap().is_none());
+            assert!(second.unwrap().is_none());
             assert_eq!(
                 store.recovery_generation(),
                 1,
                 "readers that observed the same generation must coalesce their reset"
             );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn delayed_corrupt_read_does_not_reset_a_successor_store_batch() {
+        let directory = temp_cache_dir("workspace-delayed-corrupt-read-reset");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            first_revision,
+                            vec![StoreChange::ConversationUpsert(SlackConversation {
+                                id: "C1".into(),
+                                name: Some("before delayed read".into()),
+                                ..Default::default()
+                            })],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            let (corruption_observed, observed) = tokio::sync::oneshot::channel();
+            let corruption_observed = Arc::new(std::sync::Mutex::new(Some(corruption_observed)));
+            let release_read = Arc::new(std::sync::Barrier::new(2));
+            let query_attempt = Arc::new(AtomicUsize::new(0));
+            let reader_store = store.clone();
+            let reader_workspace_key = store.workspace_key.clone();
+            let reader_observed = Arc::clone(&corruption_observed);
+            let reader_release = Arc::clone(&release_read);
+            let reader_attempt = Arc::clone(&query_attempt);
+            let delayed_read = tokio::spawn(async move {
+                reader_store
+                    .query_or_reset((), move |connection| {
+                        if reader_attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                            if let Some(observed) = reader_observed
+                                .lock()
+                                .expect("corruption observation lock poisoned")
+                                .take()
+                            {
+                                let _ = observed.send(());
+                            }
+                            reader_release.wait();
+                            return Err(StoreError::invalid_derived_cache(
+                                "delayed corrupt read test",
+                            ));
+                        }
+                        let _ = load_sqlite_kind_values::<SlackConversation>(
+                            connection,
+                            &reader_workspace_key,
+                            "conversation",
+                        )?;
+                        Ok(())
+                    })
+                    .await
+            });
+            observed
+                .await
+                .expect("corrupt reader did not reach reset admission");
+
+            let successor_revision = first_revision.successor();
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            successor_revision,
+                            vec![StoreChange::ConversationUpsert(SlackConversation {
+                                id: "C2".into(),
+                                name: Some("committed after corrupt read".into()),
+                                ..Default::default()
+                            })],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            let publication_store = store.clone();
+            let publication = publication_store.lock_recovery_linearization();
+            tokio::pin!(publication);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), publication.as_mut())
+                    .await
+                    .is_err(),
+                "publication must wait until an in-flight recoverable read is settled"
+            );
+            release_read.wait();
+            delayed_read.await.unwrap().unwrap();
+            let publication_guard = publication.await;
+            drop(publication_guard);
+
+            let persisted_ids = store
+                .stored_conversations()
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|conversation| conversation.id)
+                .collect::<Vec<_>>();
+            let persisted_revision = *store
+                .store_batch_revision
+                .lock()
+                .expect("store revision lock poisoned");
+            assert_eq!(
+                (
+                    persisted_ids,
+                    persisted_revision,
+                    store.recovery_generation(),
+                    store.workspace_cache_needs_repair(),
+                ),
+                (
+                    vec!["C1".to_string(), "C2".to_string()],
+                    successor_revision,
+                    0,
+                    false,
+                ),
+                "a corrupt read observed before the successor batch must not reset that batch"
+            );
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let reopened_ids = reopened
+                .stored_conversations()
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|conversation| conversation.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reopened_ids,
+                vec!["C1".to_string(), "C2".to_string()],
+                "the successor batch must remain durable across reopen"
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn persistent_corruption_resets_before_successor_publication_continues() {
+        let directory = temp_cache_dir("workspace-corrupt-read-before-publication");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![StoreChange::ConversationUpsert(SlackConversation {
+                            id: "C1".into(),
+                            name: Some("corrupt conversation".into()),
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+
+            let (corruption_observed, observed) = tokio::sync::oneshot::channel();
+            let corruption_observed = Arc::new(std::sync::Mutex::new(Some(corruption_observed)));
+            let release_read = Arc::new(std::sync::Barrier::new(2));
+            let query_attempt = Arc::new(AtomicUsize::new(0));
+            let reader_store = store.clone();
+            let reader_workspace_key = store.workspace_key.clone();
+            let reader_observed = Arc::clone(&corruption_observed);
+            let reader_release = Arc::clone(&release_read);
+            let reader_attempt = Arc::clone(&query_attempt);
+            let corrupt_read = tokio::spawn(async move {
+                reader_store
+                    .query_or_reset((), move |connection| {
+                        let result = load_sqlite_kind_values::<SlackConversation>(
+                            connection,
+                            &reader_workspace_key,
+                            "conversation",
+                        )
+                        .map(|_| ());
+                        if reader_attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                            if let Some(observed) = reader_observed
+                                .lock()
+                                .expect("corruption observation lock poisoned")
+                                .take()
+                            {
+                                let _ = observed.send(());
+                            }
+                            reader_release.wait();
+                        }
+                        result
+                    })
+                    .await
+            });
+            observed
+                .await
+                .expect("corrupt reader did not finish its first read");
+
+            let successor_revision = first_revision.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        successor_revision,
+                        vec![StoreChange::ConversationUpsert(SlackConversation {
+                            id: "C2".into(),
+                            name: Some("successor conversation".into()),
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let publication_store = store.clone();
+            let publication = publication_store.lock_recovery_linearization();
+            tokio::pin!(publication);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), publication.as_mut())
+                    .await
+                    .is_err(),
+                "publication must not pass a still-unresolved corrupt read"
+            );
+            release_read.wait();
+            corrupt_read.await.unwrap().unwrap();
+
+            let publication_guard = publication.await;
+            assert_eq!(store.recovery_generation(), 1);
+            assert!(
+                store.workspace_cache_needs_repair(),
+                "publication must observe the reset and repair before draining"
+            );
+            assert_eq!(
+                *store
+                    .store_batch_revision
+                    .lock()
+                    .expect("store revision lock poisoned"),
+                WorkspaceRevision::INITIAL
+            );
+            drop(publication_guard);
+            assert!(store.stored_conversations().await.unwrap().is_none());
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_corrupt_cache_reset_marks_workspace_for_repair() {
+        let directory = temp_cache_dir("workspace-failed-corrupt-cache-reset");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let conversation = SlackConversation {
+                id: "C1".into(),
+                name: Some("general".into()),
+                ..Default::default()
+            };
+            let revision = WorkspaceRevision::INITIAL.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![StoreChange::ConversationUpsert(conversation.clone())],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+            store
+                .install_workspace_reset_failure_trigger()
+                .await
+                .unwrap();
+
+            assert!(store.validate_conversation_cache().await.is_err());
+            assert_eq!(
+                store.recovery_generation(),
+                1,
+                "confirmed corruption must advance recovery even when reset fails"
+            );
+            assert!(
+                store.workspace_cache_needs_repair(),
+                "publication must remain behind repair after a failed reset"
+            );
+            assert!(store.workspace_cache_needs_reset());
+
+            store.clear_workspace_reset_failure_trigger().await.unwrap();
+            let recovery_generation = store.recovery_generation();
+            assert!(store
+                .ensure_workspace_cache_reset_for_repair(recovery_generation)
+                .await
+                .unwrap());
+            assert!(!store.workspace_cache_needs_reset());
+            assert_eq!(
+                store
+                    .execute_store_repair_batch(
+                        StoreBatch::new(
+                            revision,
+                            vec![StoreChange::WorkspaceRepaired(WorkspaceStoreProjection {
+                                conversations: vec![conversation],
+                                ..Default::default()
+                            },)],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+            store.mark_workspace_cache_repaired(recovery_generation);
+            store.validate_conversation_cache().await.unwrap();
+            assert!(!store.workspace_cache_needs_repair());
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_corrupt_cache_recheck_marks_workspace_for_repair() {
+        let directory = temp_cache_dir("workspace-failed-corrupt-cache-recheck");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let query_attempts = Arc::clone(&attempts);
+            assert!(store
+                .query_or_reset((), move |_| {
+                    if query_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(StoreError::invalid_derived_cache(
+                            "injected initial corruption",
+                        ))
+                    } else {
+                        Err(StoreError::HubClosed)
+                    }
+                })
+                .await
+                .is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(store.recovery_generation(), 1);
+            assert!(store.workspace_cache_needs_repair());
+            assert!(store.workspace_cache_needs_reset());
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_corrupt_cache_writer_dispatch_marks_workspace_for_repair() {
+        let directory = temp_cache_dir("workspace-failed-corrupt-cache-dispatch");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .seed_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+
+            let hub = store.hub().await.unwrap().clone();
+            let (corruption_observed, observed) = tokio::sync::oneshot::channel();
+            let corruption_observed = Arc::new(std::sync::Mutex::new(Some(corruption_observed)));
+            let release_read = Arc::new(std::sync::Barrier::new(2));
+            let reader_store = store.clone();
+            let reader_workspace_key = store.workspace_key.clone();
+            let reader_observed = Arc::clone(&corruption_observed);
+            let reader_release = Arc::clone(&release_read);
+            let corrupt_read = tokio::spawn(async move {
+                reader_store
+                    .query_or_reset((), move |connection| {
+                        let result = load_sqlite_kind_values::<SlackConversation>(
+                            connection,
+                            &reader_workspace_key,
+                            "conversation",
+                        )
+                        .map(|_| ());
+                        if let Some(observed) = reader_observed
+                            .lock()
+                            .expect("corruption observation lock poisoned")
+                            .take()
+                        {
+                            let _ = observed.send(());
+                            reader_release.wait();
+                        }
+                        result
+                    })
+                    .await
+            });
+            observed
+                .await
+                .expect("corrupt reader did not finish its first read");
+
+            let admission = hub.inner.admission.lock().await;
+            hub.inner.closed.store(true, Ordering::Release);
+            release_read.wait();
+            drop(admission);
+            assert!(corrupt_read.await.unwrap().is_err());
+            assert_eq!(
+                store.recovery_generation(),
+                1,
+                "writer dispatch failure must preserve repair intent"
+            );
+            assert!(store.workspace_cache_needs_repair());
+            assert!(store.workspace_cache_needs_reset());
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cancelled_corrupt_read_keeps_publication_blocked_until_queued_reset_finishes() {
+        let directory = temp_cache_dir("workspace-cancelled-corrupt-read-reset");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .seed_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+
+            let hub = store.hub().await.unwrap().clone();
+            let release_writer = Arc::new(std::sync::Barrier::new(2));
+            let writer_release = Arc::clone(&release_writer);
+            let (writer_started, started) = tokio::sync::oneshot::channel();
+            let blocking_hub = hub.clone();
+            let blocking_write = tokio::spawn(async move {
+                blocking_hub
+                    .write(move |_| {
+                        let _ = writer_started.send(());
+                        writer_release.wait();
+                        Ok(())
+                    })
+                    .await
+            });
+            started.await.expect("blocking writer did not start");
+            let idle_writer_capacity = hub.inner.writer.capacity();
+
+            let (corruption_observed, observed) = tokio::sync::oneshot::channel();
+            let corruption_observed = Arc::new(std::sync::Mutex::new(Some(corruption_observed)));
+            let reader_store = store.clone();
+            let reader_workspace_key = store.workspace_key.clone();
+            let reader_observed = Arc::clone(&corruption_observed);
+            let corrupt_read = tokio::spawn(async move {
+                reader_store
+                    .query_or_reset((), move |connection| {
+                        let result = load_sqlite_kind_values::<SlackConversation>(
+                            connection,
+                            &reader_workspace_key,
+                            "conversation",
+                        )
+                        .map(|_| ());
+                        if let Some(observed) = reader_observed
+                            .lock()
+                            .expect("corruption observation lock poisoned")
+                            .take()
+                        {
+                            let _ = observed.send(());
+                        }
+                        result
+                    })
+                    .await
+            });
+            observed
+                .await
+                .expect("corrupt reader did not finish its first read");
+
+            let mut retry_was_queued = false;
+            for _ in 0..1_000 {
+                if hub.inner.writer.capacity() < idle_writer_capacity {
+                    retry_was_queued = true;
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                retry_was_queued,
+                "corrupt retry did not enter the writer queue"
+            );
+            corrupt_read.abort();
+            assert!(corrupt_read.await.unwrap_err().is_cancelled());
+
+            let publication_store = store.clone();
+            let publication = publication_store.lock_recovery_linearization();
+            tokio::pin!(publication);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), publication.as_mut())
+                    .await
+                    .is_err(),
+                "cancelling the reader must not release its queued reset guard"
+            );
+
+            release_writer.wait();
+            blocking_write.await.unwrap().unwrap();
+            let publication_guard = publication.await;
+            assert_eq!(store.recovery_generation(), 1);
+            assert!(store.workspace_cache_needs_repair());
+            drop(publication_guard);
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cancelled_corrupt_read_keeps_recovery_alive_during_initial_query() {
+        let directory = temp_cache_dir("workspace-cancelled-corrupt-initial-query");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .seed_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+
+            let (corruption_observed, observed) = tokio::sync::oneshot::channel();
+            let corruption_observed = Arc::new(std::sync::Mutex::new(Some(corruption_observed)));
+            let release_read = Arc::new(std::sync::Barrier::new(2));
+            let reader_store = store.clone();
+            let reader_workspace_key = store.workspace_key.clone();
+            let reader_observed = Arc::clone(&corruption_observed);
+            let reader_release = Arc::clone(&release_read);
+            let corrupt_read = tokio::spawn(async move {
+                reader_store
+                    .query_or_reset((), move |connection| {
+                        let result = load_sqlite_kind_values::<SlackConversation>(
+                            connection,
+                            &reader_workspace_key,
+                            "conversation",
+                        )
+                        .map(|_| ());
+                        if let Some(observed) = reader_observed
+                            .lock()
+                            .expect("corruption observation lock poisoned")
+                            .take()
+                        {
+                            let _ = observed.send(());
+                            reader_release.wait();
+                        }
+                        result
+                    })
+                    .await
+            });
+            observed
+                .await
+                .expect("corrupt reader did not observe its first result");
+            corrupt_read.abort();
+            assert!(corrupt_read.await.unwrap_err().is_cancelled());
+
+            let publication_store = store.clone();
+            let publication = publication_store.lock_recovery_linearization();
+            tokio::pin!(publication);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), publication.as_mut())
+                    .await
+                    .is_err(),
+                "cancelling the initial query must not release the recovery guard"
+            );
+
+            release_read.wait();
+            let publication_guard = publication.await;
+            assert_eq!(store.recovery_generation(), 1);
+            assert!(store.workspace_cache_needs_repair());
+            drop(publication_guard);
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cancelled_corrupt_read_keeps_recovery_alive_before_writer_enqueue() {
+        let directory = temp_cache_dir("workspace-cancelled-corrupt-read-before-enqueue");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .seed_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store.corrupt_conversation_payload("C1").await.unwrap();
+
+            let hub = store.hub().await.unwrap().clone();
+            let (corruption_observed, observed) = tokio::sync::oneshot::channel();
+            let corruption_observed = Arc::new(std::sync::Mutex::new(Some(corruption_observed)));
+            let release_read = Arc::new(std::sync::Barrier::new(2));
+            let reader_store = store.clone();
+            let reader_workspace_key = store.workspace_key.clone();
+            let reader_observed = Arc::clone(&corruption_observed);
+            let reader_release = Arc::clone(&release_read);
+            let mut corrupt_read = tokio::spawn(async move {
+                reader_store
+                    .query_or_reset((), move |connection| {
+                        let result = load_sqlite_kind_values::<SlackConversation>(
+                            connection,
+                            &reader_workspace_key,
+                            "conversation",
+                        )
+                        .map(|_| ());
+                        if let Some(observed) = reader_observed
+                            .lock()
+                            .expect("corruption observation lock poisoned")
+                            .take()
+                        {
+                            let _ = observed.send(());
+                            reader_release.wait();
+                        }
+                        result
+                    })
+                    .await
+            });
+            observed
+                .await
+                .expect("corrupt reader did not finish its first read");
+
+            let admission = hub.inner.admission.lock().await;
+            release_read.wait();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut corrupt_read)
+                    .await
+                    .is_err(),
+                "corrupt recovery must wait for writer admission"
+            );
+            corrupt_read.abort();
+            assert!(corrupt_read.await.unwrap_err().is_cancelled());
+
+            let publication_store = store.clone();
+            let publication = publication_store.lock_recovery_linearization();
+            tokio::pin!(publication);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), publication.as_mut())
+                    .await
+                    .is_err(),
+                "cancelling before enqueue must not release the recovery guard"
+            );
+
+            drop(admission);
+            let publication_guard = publication.await;
+            assert_eq!(store.recovery_generation(), 1);
+            assert!(store.workspace_cache_needs_repair());
+            drop(publication_guard);
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -7388,6 +8201,32 @@ mod tests {
             );
         });
 
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn malformed_pending_unread_queue_resets_workspace_cache() {
+        let directory = temp_cache_dir("workspace-malformed-pending-unread");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_pending_unread_refresh(&["C1".to_string()])
+                .await
+                .unwrap();
+            store
+                .corrupt_cached_item_payload("pending_unread", PENDING_UNREAD_QUEUE_KEY)
+                .await
+                .unwrap();
+
+            assert!(store
+                .load_pending_unread_refresh()
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(store.recovery_generation(), 1);
+            assert!(store.workspace_cache_needs_repair());
+            assert!(!store.workspace_cache_needs_reset());
+        });
         let _ = std::fs::remove_dir_all(directory);
     }
 

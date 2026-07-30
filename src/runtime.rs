@@ -1479,6 +1479,35 @@ struct PersistedWorkspaceWrite {
     notification_claimed: bool,
 }
 
+/// Keeps the cache reset gate exclusive until every recovered event is sent.
+struct PersistedWorkspacePublication {
+    writes: Vec<PersistedWorkspaceWrite>,
+    _recovery_publication: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+impl PersistedWorkspacePublication {
+    fn writes(&self) -> &[PersistedWorkspaceWrite] {
+        &self.writes
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.writes.is_empty()
+    }
+
+    fn into_reductions(self) -> Vec<WorkspaceReduction> {
+        self.writes
+            .into_iter()
+            .map(|write| write.reduction)
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn into_writes(self) -> Vec<PersistedWorkspaceWrite> {
+        self.writes
+    }
+}
+
 impl PersistedWorkspaceWrite {
     fn notification(&self) -> Option<MessageAttentionEffect> {
         let applied_attention = self
@@ -1681,9 +1710,7 @@ impl WorkspaceReducerAdapter {
         Ok(self
             .apply_persisted_admitted(store, origin, mutation)
             .await?
-            .into_iter()
-            .map(|write| write.reduction)
-            .collect())
+            .into_reductions())
     }
 
     /// Returns persisted reductions in revision order while the caller holds
@@ -1694,7 +1721,7 @@ impl WorkspaceReducerAdapter {
         store: Option<&WorkspaceStore>,
         origin: MutationOrigin,
         mutation: WorkspaceMutation,
-    ) -> std::result::Result<Vec<PersistedWorkspaceWrite>, StoreError> {
+    ) -> std::result::Result<PersistedWorkspacePublication, StoreError> {
         let pending_error = self.persist_pending_writes(store).await.err();
 
         self.apply_and_enqueue(store, origin, mutation);
@@ -1736,17 +1763,23 @@ impl WorkspaceReducerAdapter {
     async fn recover_persisted_admitted(
         &self,
         store: Option<&WorkspaceStore>,
-    ) -> std::result::Result<Vec<PersistedWorkspaceWrite>, StoreError> {
+    ) -> std::result::Result<PersistedWorkspacePublication, StoreError> {
         loop {
             self.persist_pending_writes(store).await?;
             let Some(store) = store else {
-                return Ok(self.drain_persisted_admitted());
+                return Ok(PersistedWorkspacePublication {
+                    writes: self.drain_persisted_admitted(),
+                    _recovery_publication: None,
+                });
             };
-            let _recovery = store.lock_recovery_linearization().await;
+            let recovery_publication = store.lock_recovery_linearization().await;
             if store.workspace_cache_needs_repair() {
                 continue;
             }
-            return Ok(self.drain_persisted_admitted());
+            return Ok(PersistedWorkspacePublication {
+                writes: self.drain_persisted_admitted(),
+                _recovery_publication: Some(recovery_publication),
+            });
         }
     }
 
@@ -1817,19 +1850,32 @@ impl WorkspaceReducerAdapter {
         mutation: WorkspaceMutation,
         completion: Option<RuntimeEventKind>,
     ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
-        let reductions = self
+        let publication = self
+            .apply_persisted_and_publish_retained_admitted(
+                store, events, origin, mutation, completion,
+            )
+            .await?;
+        Ok(publication.into_reductions())
+    }
+
+    async fn apply_persisted_and_publish_retained_admitted(
+        &self,
+        store: Option<&WorkspaceStore>,
+        events: &RuntimeEventSender,
+        origin: MutationOrigin,
+        mutation: WorkspaceMutation,
+        completion: Option<RuntimeEventKind>,
+    ) -> std::result::Result<PersistedWorkspacePublication, StoreError> {
+        let publication = self
             .apply_persisted_admitted(store, origin, mutation)
             .await?;
-        for write in &reductions {
+        for write in publication.writes() {
             publish_persisted_workspace_write(events, write);
         }
         if let Some(completion) = completion {
             events.send_event(completion);
         }
-        Ok(reductions
-            .into_iter()
-            .map(|write| write.reduction)
-            .collect())
+        Ok(publication)
     }
 
     async fn repair_workspace_cache_admitted(
@@ -1838,6 +1884,12 @@ impl WorkspaceReducerAdapter {
     ) -> std::result::Result<(), StoreError> {
         loop {
             let recovery_generation = store.recovery_generation();
+            if !store
+                .ensure_workspace_cache_reset_for_repair(recovery_generation)
+                .await?
+            {
+                continue;
+            }
             let (revision, projection) = {
                 let coordinator = self
                     .coordinator
@@ -1910,6 +1962,7 @@ impl WorkspaceReducerAdapter {
                 .lock()
                 .expect("workspace coordinator lock poisoned");
             if store.recovery_generation() != recovery_generation
+                || store.workspace_cache_needs_reset()
                 || coordinator.revision() != revision
             {
                 continue;
@@ -3436,8 +3489,8 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
         )
         .await;
     match persisted {
-        Ok(writes) => {
-            for write in &writes {
+        Ok(publication) => {
+            for write in publication.writes() {
                 publish_persisted_workspace_write(events, write);
             }
         }
@@ -5555,17 +5608,18 @@ async fn persist_realtime_reaction_admitted(
             return;
         }
     };
-    for write in &recovered {
+    for write in recovered.writes() {
         publish_persisted_workspace_write(events, write);
     }
+    drop(recovered);
 
     workspace.apply_and_enqueue(
         store,
         MutationOrigin::Realtime,
         realtime_reaction_mutation(&event),
     );
-    let persisted = match workspace.persist_pending_writes(store).await {
-        Ok(()) => Some(workspace.drain_persisted_admitted()),
+    let persisted = match workspace.recover_persisted_admitted(store).await {
+        Ok(publication) => Some(publication),
         Err(error) => {
             crate::debug::log(
                 "store",
@@ -5582,8 +5636,8 @@ async fn persist_realtime_reaction_admitted(
         event: SocketModeEvent::Reaction(event),
         attention: None,
     });
-    if let Some(writes) = persisted {
-        for write in &writes {
+    if let Some(publication) = persisted {
+        for write in publication.writes() {
             publish_persisted_workspace_write(events, write);
         }
     }
@@ -5690,18 +5744,21 @@ async fn persist_and_publish_local_reductions(
     action: &'static str,
     channel_id: &str,
 ) {
-    if let Err(error) = workspace.persist_pending_writes(store).await {
-        crate::debug::log(
-            "store",
-            &format!(
-                "{action}WorkspaceBatchDeferred channel_id={channel_id} category={:?}",
-                error.category()
-            ),
-        );
-        return;
-    }
-    for write in workspace.drain_persisted_admitted() {
-        publish_persisted_workspace_write(events, &write);
+    match workspace.recover_persisted_admitted(store).await {
+        Ok(publication) => {
+            for write in publication.writes() {
+                publish_persisted_workspace_write(events, write);
+            }
+        }
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "{action}WorkspaceBatchDeferred channel_id={channel_id} category={:?}",
+                    error.category()
+                ),
+            );
+        }
     }
 }
 
@@ -5735,9 +5792,10 @@ async fn publish_socket_message_without_store(
             return;
         }
     };
-    for write in &recovered {
+    for write in recovered.writes() {
         publish_persisted_workspace_write(events, write);
     }
+    drop(recovered);
 
     let classified = classify_socket_attention(workspace, current_user_id, &message_event);
     let delivery = match classified {
@@ -5845,9 +5903,10 @@ async fn persist_socket_message(
             return;
         }
     };
-    for write in &recovered {
+    for write in recovered.writes() {
         publish_persisted_workspace_write(events, write);
     }
+    drop(recovered);
 
     let classified = classify_socket_attention(workspace, current_user_id, &message_event);
     let delivery = match classified {
@@ -5873,8 +5932,8 @@ async fn persist_socket_message(
         } else {
             classified
         };
-    let persisted = match workspace.persist_pending_writes(Some(store)).await {
-        Ok(()) => Some(workspace.drain_persisted_admitted()),
+    let persisted = match workspace.recover_persisted_admitted(Some(store)).await {
+        Ok(publication) => Some(publication),
         Err(error) => {
             crate::debug::log(
                 "store",
@@ -5890,9 +5949,12 @@ async fn persist_socket_message(
             None
         }
     };
-    let notification_claimed = persisted
-        .as_ref()
-        .is_some_and(|writes| writes.iter().any(|write| write.notification_claimed));
+    let notification_claimed = persisted.as_ref().is_some_and(|publication| {
+        publication
+            .writes()
+            .iter()
+            .any(|write| write.notification_claimed)
+    });
     workspace
         .record_attention_persistence(attention_status.metrics_outcome(), notification_claimed);
 
@@ -5907,8 +5969,8 @@ async fn persist_socket_message(
         event: SocketModeEvent::Message(Box::new(message_event)),
         attention,
     });
-    if let Some(writes) = persisted {
-        for write in &writes {
+    if let Some(publication) = persisted {
+        for write in publication.writes() {
             publish_persisted_workspace_write(events, write);
         }
     }
@@ -6063,13 +6125,14 @@ async fn persist_confirmed_reaction(
 ) {
     if store.is_none() {
         let _publication = workspace.publication_admission.lock().await;
-        for write in workspace
+        let recovered = workspace
             .recover_persisted_admitted(None)
             .await
-            .expect("no-store workspace recovery cannot fail")
-        {
-            publish_persisted_workspace_write(events, &write);
+            .expect("no-store workspace recovery cannot fail");
+        for write in recovered.writes() {
+            publish_persisted_workspace_write(events, write);
         }
+        drop(recovered);
         workspace.apply_and_enqueue(
             None,
             MutationOrigin::Local,
@@ -6102,19 +6165,22 @@ async fn persist_confirmed_reaction(
         thread_ts,
     });
 
-    if let Err(error) = workspace.persist_pending_writes(store).await {
-        crate::debug::log(
-            "store",
-            &format!(
-                "ConfirmedReactionDeltaDeferred channel_id={} category={:?}",
-                change.channel_id,
-                error.category()
-            ),
-        );
-        return;
-    }
-    for write in workspace.drain_persisted_admitted() {
-        publish_persisted_workspace_write(events, &write);
+    match workspace.recover_persisted_admitted(store).await {
+        Ok(publication) => {
+            for write in publication.writes() {
+                publish_persisted_workspace_write(events, write);
+            }
+        }
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "ConfirmedReactionDeltaDeferred channel_id={} category={:?}",
+                    change.channel_id,
+                    error.category()
+                ),
+            );
+        }
     }
 }
 
@@ -6828,8 +6894,8 @@ async fn publish_history_snapshot_with_completion(
 ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
     let requested_messages = messages.clone();
     let _admission = workspace.publication_admission.lock().await;
-    let reductions = workspace
-        .apply_persisted_and_publish_admitted(
+    let publication = workspace
+        .apply_persisted_and_publish_retained_admitted(
             workspace_store.as_ref(),
             events,
             origin,
@@ -6879,7 +6945,7 @@ async fn publish_history_snapshot_with_completion(
         cached,
     });
     drop(coordinator);
-    Ok(reductions)
+    Ok(publication.into_reductions())
 }
 
 fn canonical_history_page_projection(
@@ -6982,8 +7048,8 @@ async fn publish_thread_snapshot_page_with_completion(
     let requested_messages = page.messages.clone();
     let complete = snapshot_page.complete;
     let _admission = workspace.publication_admission.lock().await;
-    let reductions = workspace
-        .apply_persisted_and_publish_admitted(
+    let publication = workspace
+        .apply_persisted_and_publish_retained_admitted(
             workspace_store.as_ref(),
             events,
             origin,
@@ -7024,7 +7090,7 @@ async fn publish_thread_snapshot_page_with_completion(
         append_older,
     });
     drop(coordinator);
-    Ok(reductions)
+    Ok(publication.into_reductions())
 }
 
 fn canonical_thread_page_projection(
@@ -7556,6 +7622,401 @@ mod tests {
                 "thread catalog compatibility adapter remains: {legacy_adapter}"
             );
         }
+    }
+
+    #[test]
+    fn store_backed_publication_drains_only_after_exclusive_recovery() {
+        let production = include_str!("runtime.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let recovery = production
+            .split_once("async fn recover_persisted_admitted(")
+            .unwrap()
+            .1
+            .split_once("fn drain_persisted_admitted(")
+            .unwrap()
+            .0;
+        assert!(recovery.contains("PersistedWorkspacePublication"));
+        assert!(recovery.contains("lock_recovery_linearization().await"));
+        assert!(recovery.contains("Some(recovery_publication)"));
+
+        let realtime_reaction = production
+            .split_once("async fn persist_realtime_reaction_admitted(")
+            .unwrap()
+            .1
+            .split_once("/// Publish Slack's authoritative response")
+            .unwrap()
+            .0;
+        assert_eq!(
+            realtime_reaction
+                .matches("recover_persisted_admitted(store)")
+                .count(),
+            2
+        );
+        assert!(!realtime_reaction.contains("persist_pending_writes("));
+        assert!(!realtime_reaction.contains("drain_persisted_admitted("));
+        assert!(realtime_reaction.contains("drop(recovered);"));
+        let reaction_recovery = realtime_reaction
+            .rfind("recover_persisted_admitted(store)")
+            .unwrap();
+        let reaction_raw = realtime_reaction
+            .rfind("events.send_event(RuntimeEventKind::SocketModeEvent")
+            .unwrap();
+        let reaction_patch = realtime_reaction
+            .rfind("publish_persisted_workspace_write")
+            .unwrap();
+        assert!(reaction_recovery < reaction_raw);
+        assert!(reaction_raw < reaction_patch);
+
+        let local_reductions = production
+            .split_once("async fn persist_and_publish_local_reductions(")
+            .unwrap()
+            .1
+            .split_once("/// Keeps storeless Socket Mode sessions")
+            .unwrap()
+            .0;
+        assert!(local_reductions.contains("recover_persisted_admitted(store)"));
+        assert!(!local_reductions.contains("persist_pending_writes("));
+        assert!(!local_reductions.contains("drain_persisted_admitted("));
+
+        let socket_message = production
+            .split_once("async fn persist_socket_message(")
+            .unwrap()
+            .1
+            .split_once(
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nstruct SocketModeReconnectTiming",
+            )
+            .unwrap()
+            .0;
+        assert_eq!(
+            socket_message
+                .matches("recover_persisted_admitted(Some(store))")
+                .count(),
+            2
+        );
+        assert!(!socket_message.contains("persist_pending_writes("));
+        assert!(!socket_message.contains("drain_persisted_admitted("));
+        assert!(socket_message.contains("drop(recovered);"));
+
+        let confirmed_reaction = production
+            .split_once("async fn persist_confirmed_reaction(")
+            .unwrap()
+            .1
+            .split_once("async fn load_conversations_with_api(")
+            .unwrap()
+            .0;
+        let store_backed = confirmed_reaction
+            .split_once("let _admission = workspace.publication_admission.lock().await;")
+            .unwrap()
+            .1;
+        assert!(store_backed.contains("recover_persisted_admitted(store)"));
+        assert!(!store_backed.contains("persist_pending_writes("));
+        assert!(!store_backed.contains("drain_persisted_admitted("));
+        let reaction_raw = store_backed
+            .find("events.send_event(RuntimeEventKind::ReactionUpdated")
+            .unwrap();
+        let reaction_recovery = store_backed
+            .find("recover_persisted_admitted(store)")
+            .unwrap();
+        let reaction_patch = store_backed
+            .find("publish_persisted_workspace_write")
+            .unwrap();
+        assert!(reaction_raw < reaction_recovery);
+        assert!(reaction_recovery < reaction_patch);
+
+        let history_publication = production
+            .split_once("async fn publish_history_snapshot_with_completion(")
+            .unwrap()
+            .1
+            .split_once("fn canonical_history_page_projection(")
+            .unwrap()
+            .0;
+        assert!(history_publication.contains("apply_persisted_and_publish_retained_admitted("));
+        assert!(
+            history_publication
+                .find("events.send_event(RuntimeEventKind::HistoryLoaded")
+                .unwrap()
+                < history_publication
+                    .find("publication.into_reductions()")
+                    .unwrap()
+        );
+
+        let thread_publication = production
+            .split_once("async fn publish_thread_snapshot_page_with_completion(")
+            .unwrap()
+            .1
+            .split_once("fn canonical_thread_page_projection(")
+            .unwrap()
+            .0;
+        assert!(thread_publication.contains("apply_persisted_and_publish_retained_admitted("));
+        assert!(
+            thread_publication
+                .find("events.send_event(RuntimeEventKind::ThreadLoaded")
+                .unwrap()
+                < thread_publication
+                    .find("publication.into_reductions()")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn recovered_publication_holds_exclusive_cache_guard_through_patch_delivery() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-recovery-publication-guard-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply_and_enqueue(
+                Some(&store),
+                MutationOrigin::Local,
+                WorkspaceMutation::ConversationUpsert(SlackConversation {
+                    id: "C1".into(),
+                    ..Default::default()
+                }),
+            );
+            let _admission = workspace.publication_admission.lock().await;
+            let publication = workspace
+                .recover_persisted_admitted(Some(&store))
+                .await
+                .unwrap();
+            assert_eq!(publication.writes().len(), 1);
+
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
+            );
+            for write in publication.writes() {
+                publish_persisted_workspace_write(&events, write);
+            }
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::WorkspacePatch(_)
+            ));
+
+            let reader_store = store.clone();
+            let mut blocked_read =
+                tokio::spawn(async move { reader_store.load_bootstrap().await.unwrap() });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut blocked_read)
+                    .await
+                    .is_err(),
+                "cache reads must wait until the recovered patch publication finishes"
+            );
+            drop(publication);
+            assert!(tokio::time::timeout(Duration::from_secs(1), blocked_read)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_some());
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn history_completion_retains_exclusive_cache_guard_until_delivery() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-history-completion-recovery-guard-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+            let workspace = WorkspaceReducerAdapter::default();
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(
+                    RuntimeOperation::History,
+                    RuntimeTarget::Channel("C1".into()),
+                ),
+            );
+            let (completion_started, completion_reached) = std::sync::mpsc::channel();
+            let (release_completion, release) = std::sync::mpsc::channel();
+            workspace.set_history_completion_send_gate(Arc::new(TestWorkspacePatchSendGate {
+                started: completion_started,
+                release: Mutex::new(release),
+            }));
+
+            let history_store = Some(store.clone());
+            let history_workspace = workspace.clone();
+            let history_events = events.clone();
+            let history = tokio::spawn(async move {
+                publish_history_snapshot_with_completion(
+                    &history_events,
+                    &history_store,
+                    &history_workspace,
+                    "C1",
+                    MutationOrigin::WebApi,
+                    WorkspaceRevision::INITIAL,
+                    vec![SlackMessage {
+                        ts: "1.0".into(),
+                        text: Some("history".into()),
+                        ..Default::default()
+                    }],
+                    false,
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .await
+            });
+            completion_reached
+                .recv_timeout(Duration::from_secs(1))
+                .expect("history completion did not reach its delivery gate");
+
+            let reader_store = store.clone();
+            let mut blocked_read =
+                tokio::spawn(async move { reader_store.load_bootstrap().await.unwrap() });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut blocked_read)
+                    .await
+                    .is_err(),
+                "cache reads must wait until HistoryLoaded has been delivered"
+            );
+
+            release_completion.send(()).unwrap();
+            history.await.unwrap().unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(1), blocked_read)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_some());
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn failed_unprojected_cache_reset_blocks_publication_until_full_repair() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-unprojected-cache-reset-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+            store
+                .store_custom_emojis(&HashMap::from([(
+                    "party".to_string(),
+                    "https://example.invalid/party.png".to_string(),
+                )]))
+                .await
+                .unwrap();
+            store
+                .corrupt_cached_item_payload("custom_emoji", "party")
+                .await
+                .unwrap();
+            store
+                .install_workspace_reset_failure_trigger()
+                .await
+                .unwrap();
+            assert!(store.load_custom_emojis().await.is_err());
+            assert!(store.workspace_cache_needs_repair());
+
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply_and_enqueue(
+                Some(&store),
+                MutationOrigin::Local,
+                WorkspaceMutation::ConversationUpsert(SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }),
+            );
+            let _admission = workspace.publication_admission.lock().await;
+            assert!(
+                workspace
+                    .recover_persisted_admitted(Some(&store))
+                    .await
+                    .is_err(),
+                "publication must wait for a successful full reset"
+            );
+            assert_eq!(
+                workspace
+                    .pending_writes
+                    .lock()
+                    .expect("pending workspace writes lock poisoned")
+                    .len(),
+                1
+            );
+
+            store.clear_workspace_reset_failure_trigger().await.unwrap();
+            let publication = workspace
+                .recover_persisted_admitted(Some(&store))
+                .await
+                .unwrap();
+            assert_eq!(publication.writes().len(), 1);
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
+            );
+            for write in publication.writes() {
+                publish_persisted_workspace_write(&events, write);
+            }
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::WorkspacePatch(_)
+            ));
+            drop(publication);
+            assert!(!store.workspace_cache_needs_repair());
+            assert!(store.load_custom_emojis().await.unwrap().is_empty());
+
+            let reopened = WorkspaceStore::new(directory.clone(), "T1:U1");
+            let bootstrap = reopened.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(
+                bootstrap
+                    .conversations
+                    .into_iter()
+                    .map(|conversation| conversation.id)
+                    .collect::<Vec<_>>(),
+                vec!["C1".to_string()]
+            );
+            assert!(reopened.load_custom_emojis().await.unwrap().is_empty());
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
     }
 
     async fn apply_test_store_changes(
@@ -11960,6 +12421,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
+                    .into_writes()
                     .into_iter()
                     .map(|write| write.reduction.patch().revision())
                     .collect::<Vec<_>>(),
@@ -12304,6 +12766,7 @@ mod tests {
             };
             assert_eq!(
                 drained
+                    .into_writes()
                     .into_iter()
                     .map(|write| write.reduction.patch().revision())
                     .collect::<Vec<_>>(),
