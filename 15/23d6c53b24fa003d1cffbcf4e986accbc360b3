@@ -1,0 +1,5 @@
+CI root-cause follow-up for Issue #11
+
+GitHub strict Clippy 1.97 rejected a test MutexGuard that remained in lexical scope across receiver.recv().await despite explicit drop. The guard is now confined to a nested block before the await.
+
+Validation: focused attention-persistence regression passed; cargo fmt --check passed; cargo check passed; git diff --check passed.
