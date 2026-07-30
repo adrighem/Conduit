@@ -1,0 +1,25 @@
+Phase: Authoritative conversation adoption
+
+Track: workspace_pipeline_rearchitecture_20260720
+
+Automated verification:
+- cargo fmt -- --check: passed
+- cargo check --all-targets: passed
+- cargo test --no-fail-fast --quiet: 964 passed, 3 ignored
+- meson compile -C _build-task4: passed
+- meson test -C _build-task4 --print-errorlogs: 17 passed
+- git diff --check: passed
+- Independent WebKit API and implementation review: no blockers
+
+Manual verification:
+- User confirmed the available Phase 3 live checks.
+- User confirmed the corrected task4 artifact removes WebKit's native back, forward, stop, and refresh actions while preserving the usable message view.
+- The first WebView retest was traced to an installed main-branch binary that did not contain the fix; the exact task4 artifact then passed.
+- Channel rename and unavailable multi-client scenarios were accepted through deterministic conversation metadata, reconciliation, unread, thread, and cache-recovery coverage.
+
+Limitations:
+- Coverage tooling is not configured.
+- Strict Clippy is unavailable locally because cargo-clippy 1.87 does not match rustc/cargo 1.95.
+
+Rationale:
+The phase now has green automated coverage and explicit user confirmation for every locally available live behavior. Unavailable Slack-account and permission scenarios are covered by deterministic reducer, runtime, store, and presentation regressions.
