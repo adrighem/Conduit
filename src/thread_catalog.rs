@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::SlackMessage;
+use crate::models::{slack_timestamp_is_after, SlackMessage};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ThreadKey {
@@ -269,31 +269,30 @@ impl ThreadCatalog {
             return Vec::new();
         };
         if let Some(record) = self.records.get_mut(&key) {
-            if record
-                .latest_reply
+            let (previous_count, previous_last_read) = match &record.unread {
+                ThreadUnreadState::Known { count, last_read } => (*count, last_read.clone()),
+                ThreadUnreadState::Unknown => (0, None),
+            };
+            if previous_last_read
                 .as_deref()
-                .is_some_and(|latest| last_read < latest)
+                .is_some_and(|previous| !slack_timestamp_is_after(last_read, previous))
             {
                 return Vec::new();
             }
             let mut cleared_reply_ts = record
                 .unread_reply_ts
                 .iter()
-                .filter(|reply_ts| reply_ts.as_str() <= last_read)
+                .filter(|reply_ts| !slack_timestamp_is_after(reply_ts, last_read))
                 .cloned()
                 .collect::<Vec<_>>();
-            if let ThreadUnreadState::Known {
-                last_read: Some(previous_last_read),
-                ..
-            } = &record.unread
-            {
+            if let Some(previous_last_read) = previous_last_read.as_deref() {
                 cleared_reply_ts.extend(
                     record
                         .seen_reply_ts
                         .iter()
                         .filter(|reply_ts| {
-                            reply_ts.as_str() > previous_last_read.as_str()
-                                && reply_ts.as_str() <= last_read
+                            slack_timestamp_is_after(reply_ts, previous_last_read)
+                                && !slack_timestamp_is_after(reply_ts, last_read)
                         })
                         .cloned(),
                 );
@@ -302,9 +301,19 @@ impl ThreadCatalog {
             cleared_reply_ts.dedup();
             record
                 .unread_reply_ts
-                .retain(|reply_ts| reply_ts.as_str() > last_read);
+                .retain(|reply_ts| slack_timestamp_is_after(reply_ts, last_read));
+            let marker_reaches_latest = record
+                .latest_reply
+                .as_deref()
+                .is_none_or(|latest| !slack_timestamp_is_after(latest, last_read));
+            let remaining_count = if marker_reaches_latest {
+                0
+            } else {
+                previous_count
+                    .saturating_sub(u64::try_from(cleared_reply_ts.len()).unwrap_or(u64::MAX))
+            };
             record.unread = ThreadUnreadState::Known {
-                count: 0,
+                count: remaining_count,
                 last_read: (!last_read.trim().is_empty()).then(|| last_read.to_string()),
             };
             return cleared_reply_ts;
@@ -601,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_read_does_not_clear_a_reply_newer_than_the_marker() {
+    fn mark_read_preserves_a_reply_newer_than_the_marker() {
         let mut catalog = ThreadCatalog::default();
         let mut root = root("1.0", 1);
         root.subscribed = Some(true);
@@ -613,7 +622,7 @@ mod tests {
             catalog.get("C1", "1.0").unwrap().unread,
             ThreadUnreadState::Known {
                 count: 1,
-                last_read: None
+                last_read: Some("2.0".into())
             }
         );
     }

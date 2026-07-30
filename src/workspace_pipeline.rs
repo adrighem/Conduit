@@ -26,7 +26,7 @@ use crate::models::{
     conversation_metadata_key_is_unread_owned, slack_timestamp_is_after, SlackConversation,
     SlackConversationUnreadSnapshot, SlackMessage, SlackUser,
 };
-use crate::thread_catalog::{ThreadRecord, ThreadUnreadState};
+use crate::thread_catalog::{ThreadCatalog, ThreadRecord, ThreadUnreadState};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct WorkspaceRevision(u64);
@@ -179,6 +179,11 @@ pub(crate) enum WorkspaceMutation {
         channel_id: String,
         ts: String,
         remaining_unread: u64,
+    },
+    ThreadReadAdvanced {
+        channel_id: String,
+        thread_ts: String,
+        ts: String,
     },
     AttentionAcknowledged {
         channel_id: String,
@@ -362,8 +367,17 @@ pub(crate) struct MessageAttentionEffect {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ThreadReadEffect {
+    pub(crate) channel_id: String,
+    pub(crate) thread_ts: String,
+    pub(crate) ts: String,
+    pub(crate) acknowledged_message_ts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WorkspaceEffect {
     MessageAttention(MessageAttentionEffect),
+    ThreadRead(ThreadReadEffect),
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +576,11 @@ impl WorkspaceCoordinator {
                 ts,
                 remaining_unread,
             } => self.apply_read_advanced(&channel_id, &ts, remaining_unread),
+            WorkspaceMutation::ThreadReadAdvanced {
+                channel_id,
+                thread_ts,
+                ts,
+            } => self.apply_thread_read_advanced(&channel_id, &thread_ts, &ts),
             WorkspaceMutation::AttentionAcknowledged {
                 channel_id,
                 message_ts,
@@ -1051,7 +1070,16 @@ impl WorkspaceCoordinator {
         ts: &str,
         remaining_unread: u64,
     ) -> Option<WorkspaceReduction> {
-        self.conversations.get(channel_id)?;
+        let conversation = &self.conversations.get(channel_id)?.value;
+        if conversation
+            .local_read_ts()
+            .is_some_and(|current| !slack_timestamp_is_after(ts, current))
+            || conversation
+                .last_read_ts()
+                .is_some_and(|current| !slack_timestamp_is_after(ts, current))
+        {
+            return None;
+        }
         let revision = self.next_revision();
         let entry = self.conversations.get_mut(channel_id).unwrap();
         let before = entry.value.clone();
@@ -1061,17 +1089,10 @@ impl WorkspaceCoordinator {
             return None;
         }
         entry.unread_revision = revision;
-        let state = entry.value.unread_state();
         let conversation = entry.value.clone();
-        let snapshot = SlackConversationUnreadSnapshot {
-            channel_id: channel_id.to_string(),
-            unread_state: state,
-            last_read: Some(ts.to_string()),
-            ..Default::default()
-        };
         self.commit(
             revision,
-            vec![WorkspaceChange::UnreadChanged { snapshot }],
+            vec![WorkspaceChange::ConversationUpsert(conversation.clone())],
             vec![StoreChange::ConversationUpsert(conversation)],
         )
     }
@@ -1096,6 +1117,64 @@ impl WorkspaceCoordinator {
             revision,
             vec![WorkspaceChange::ConversationUpsert(conversation.clone())],
             vec![StoreChange::ConversationUpsert(conversation)],
+        )
+    }
+
+    fn apply_thread_read_advanced(
+        &mut self,
+        channel_id: &str,
+        thread_ts: &str,
+        ts: &str,
+    ) -> Option<WorkspaceReduction> {
+        if channel_id.trim().is_empty() || thread_ts.trim().is_empty() || ts.trim().is_empty() {
+            return None;
+        }
+
+        let mut catalog = ThreadCatalog::from_records(self.thread_catalog.clone());
+        let acknowledged_message_ts = catalog.mark_read(channel_id, thread_ts, ts);
+        let records = catalog.into_records();
+        let catalog_changed = records != self.thread_catalog;
+
+        let conversation_changed = if acknowledged_message_ts.is_empty() {
+            false
+        } else {
+            self.conversations.get_mut(channel_id).is_some_and(|entry| {
+                entry
+                    .value
+                    .acknowledge_attention_messages(&acknowledged_message_ts)
+                    > 0
+            })
+        };
+        if !catalog_changed && !conversation_changed {
+            return None;
+        }
+
+        let revision = self.next_revision();
+        let mut patch_changes = Vec::new();
+        let mut store_changes = Vec::new();
+        if conversation_changed {
+            let entry = self.conversations.get_mut(channel_id).unwrap();
+            entry.unread_revision = revision;
+            let conversation = entry.value.clone();
+            patch_changes.push(WorkspaceChange::ConversationUpsert(conversation.clone()));
+            store_changes.push(StoreChange::ConversationUpsert(conversation));
+        }
+        if catalog_changed {
+            self.thread_catalog = records.clone();
+            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(records.clone()));
+            store_changes.insert(0, StoreChange::ThreadCatalogReplaced(records));
+        }
+
+        self.commit_with_effects(
+            revision,
+            patch_changes,
+            store_changes,
+            vec![WorkspaceEffect::ThreadRead(ThreadReadEffect {
+                channel_id: channel_id.to_string(),
+                thread_ts: thread_ts.to_string(),
+                ts: ts.to_string(),
+                acknowledged_message_ts,
+            })],
         )
     }
 
@@ -2366,7 +2445,10 @@ mod tests {
     }
 
     fn attention_effect(reduction: &WorkspaceReduction) -> &MessageAttentionEffect {
-        let Some(WorkspaceEffect::MessageAttention(effect)) = reduction.effects().last() else {
+        let Some(effect) = reduction.effects().iter().find_map(|effect| match effect {
+            WorkspaceEffect::MessageAttention(effect) => Some(effect),
+            WorkspaceEffect::ThreadRead(_) => None,
+        }) else {
             panic!("expected a message attention effect");
         };
         effect
@@ -3280,6 +3362,188 @@ mod tests {
     }
 
     #[test]
+    fn local_conversation_read_has_one_canonical_patch_and_durable_conversation() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut channel = conversation("C1", "general");
+        channel.observe_attention_message_at("2.0", true);
+        channel.observe_attention_message_at("3.0", true);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(channel));
+
+        let reduction = coordinator
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::ReadAdvanced {
+                    channel_id: "C1".to_string(),
+                    ts: "3.0".to_string(),
+                    remaining_unread: 0,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::ConversationUpsert(conversation)]
+                if conversation.id == "C1"
+                    && conversation.local_read_ts() == Some("3.0")
+                    && conversation.raw_unread_activity_count() == 0
+                    && conversation.unread_activity_count() == 0
+        ));
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::ConversationUpsert(conversation)]
+                if conversation.id == "C1"
+                    && conversation.local_read_ts() == Some("3.0")
+                    && conversation.unread_activity_count() == 0
+        ));
+        let revision = coordinator.revision();
+        assert!(coordinator
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::ReadAdvanced {
+                    channel_id: "C1".to_string(),
+                    ts: "3.0".to_string(),
+                    remaining_unread: 0,
+                },
+            )
+            .is_none());
+        assert_eq!(coordinator.revision(), revision);
+        assert!(coordinator
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::ReadAdvanced {
+                    channel_id: "C1".to_string(),
+                    ts: "2.0".to_string(),
+                    remaining_unread: 0,
+                },
+            )
+            .is_none());
+        assert_eq!(coordinator.revision(), revision);
+        assert_eq!(
+            coordinator.conversation("C1").unwrap().local_read_ts(),
+            Some("3.0")
+        );
+    }
+
+    #[test]
+    fn local_thread_read_reconciles_catalog_and_attention_in_one_reduction() {
+        let mut channel = conversation("C1", "general");
+        channel.observe_attention_message_at("2.0", true);
+        channel.observe_attention_message_at("4.0", true);
+        channel.observe_attention_message_at("10.0", true);
+        let mut catalog = crate::thread_catalog::ThreadCatalog::default();
+        let mut root = message("1.0", "root");
+        root.subscribed = Some(true);
+        root.unread_count = Some(0);
+        catalog.observe_thread("C1", "1.0", &[root], false);
+        for ts in ["2.0", "4.0"] {
+            let mut reply = message(ts, "reply");
+            reply.thread_ts = Some("1.0".to_string());
+            reply.user = Some("U_OTHER".to_string());
+            catalog.observe_realtime("C1", &reply, Some("U_SELF"));
+        }
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![channel],
+            threads: catalog.into_records(),
+            ..Default::default()
+        }));
+
+        let reduction = coordinator
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::ThreadReadAdvanced {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "1.0".to_string(),
+                    ts: "3.0".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            reduction.patch().changes(),
+            [
+                WorkspaceChange::ConversationUpsert(conversation),
+                WorkspaceChange::ThreadCatalogChanged(records),
+            ] if conversation.id == "C1"
+                && conversation.unread_activity_count() == 2
+                && conversation.has_observed_attention_message("4.0")
+                && conversation.has_observed_attention_message("10.0")
+                && matches!(
+                    records.as_slice(),
+                    [record] if record.unread == ThreadUnreadState::Known {
+                        count: 1,
+                        last_read: Some("3.0".to_string()),
+                    }
+                )
+        ));
+        assert!(matches!(
+            reduction.effects(),
+            [WorkspaceEffect::ThreadRead(effect)]
+                if effect.channel_id == "C1"
+                    && effect.thread_ts == "1.0"
+                    && effect.ts == "3.0"
+                    && effect.acknowledged_message_ts == ["2.0".to_string()]
+        ));
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [
+                StoreChange::ThreadCatalogReplaced(records),
+                StoreChange::ConversationUpsert(conversation),
+            ] if matches!(
+                    records.as_slice(),
+                    [record] if record.unread == ThreadUnreadState::Known {
+                        count: 1,
+                        last_read: Some("3.0".to_string()),
+                    }
+                )
+                && conversation.id == "C1"
+                && conversation.unread_activity_count() == 2
+                && conversation.has_observed_attention_message("4.0")
+                && conversation.has_observed_attention_message("10.0")
+        ));
+        let revision = coordinator.revision();
+        assert!(coordinator
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::ThreadReadAdvanced {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "1.0".to_string(),
+                    ts: "3.0".to_string(),
+                },
+            )
+            .is_none());
+        assert_eq!(coordinator.revision(), revision);
+
+        let advanced = coordinator
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::ThreadReadAdvanced {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "1.0".to_string(),
+                    ts: "5.0".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            advanced.effects(),
+            [WorkspaceEffect::ThreadRead(effect)]
+                if effect.acknowledged_message_ts == ["4.0".to_string()]
+        ));
+        let revision = coordinator.revision();
+        assert!(coordinator
+            .apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::ThreadReadAdvanced {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "1.0".to_string(),
+                    ts: "4.0".to_string(),
+                },
+            )
+            .is_none());
+        assert_eq!(coordinator.revision(), revision);
+    }
+
+    #[test]
     fn stale_history_snapshots_preserve_newer_posts_edits_and_deletes() {
         let mut coordinator = WorkspaceCoordinator::default();
         let empty_base = coordinator.revision();
@@ -3771,8 +4035,10 @@ mod tests {
             2
         );
         assert!(reduction.effects().iter().all(|effect| {
-            let WorkspaceEffect::MessageAttention(effect) = effect;
-            !effect.decision.send_notification
+            match effect {
+                WorkspaceEffect::MessageAttention(effect) => !effect.decision.send_notification,
+                WorkspaceEffect::ThreadRead(_) => false,
+            }
         }));
         coordinator.apply(WorkspaceMutation::UnreadChanged {
             snapshot: SlackConversationUnreadSnapshot {
@@ -3862,9 +4128,9 @@ mod tests {
             history
                 .effects()
                 .iter()
-                .map(|effect| {
-                    let WorkspaceEffect::MessageAttention(effect) = effect;
-                    effect.message.ts.as_str()
+                .filter_map(|effect| match effect {
+                    WorkspaceEffect::MessageAttention(effect) => Some(effect.message.ts.as_str()),
+                    WorkspaceEffect::ThreadRead(_) => None,
                 })
                 .collect::<Vec<_>>(),
             vec!["11.0", "12.0", "13.0"]
