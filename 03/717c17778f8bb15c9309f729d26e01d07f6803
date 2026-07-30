@@ -1,0 +1,26 @@
+Conductor task: Prevent native reload of internal message WebViews from navigating away
+
+Summary:
+- Removed WebKit's stock back, forward, stop, and reload actions from generated message views.
+- Preserved copy, selection, link, image, and media context-menu actions.
+- Applied the filter in the shared factory used by main conversations and threads.
+
+Files:
+- src/window.rs
+
+Red/green verification:
+- The new action-classifier test initially failed because the filter did not exist.
+- The factory-hook regression initially had no context-menu handler to find.
+- Both focused regressions pass after adding the shared filter.
+
+Final verification:
+- cargo fmt -- --check: passed
+- cargo check --all-targets: passed
+- cargo test --no-fail-fast --quiet: 964 passed, 3 ignored
+- meson compile -C _build-task4: passed
+- meson test -C _build-task4 --print-errorlogs: 17 passed
+- git diff --check: passed
+- Independent WebKit API and implementation review: no blockers
+
+Rationale:
+WebKit cannot reconstruct a document loaded with load_html by fetching its synthetic app base URI. Filtering only the unsupported stock navigation actions prevents the error document while retaining the useful native context menu.
