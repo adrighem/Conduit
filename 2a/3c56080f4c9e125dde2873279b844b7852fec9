@@ -1,0 +1,32 @@
+Conductor task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations
+
+Summary:
+- Linearized corrupt-cache reads, writer revalidation, reset, repair, and persisted event publication.
+- Detached recovery from caller cancellation and retained shared/exclusive recovery guards through actual patch and completion delivery.
+- Tracked full reset completion separately from projection repair so failed or indeterminate resets cannot publish partial repairs.
+- Removed remaining store-backed runtime drain bypasses and made malformed pending-unread cache data enter recovery.
+
+Files:
+- src/store.rs
+- src/runtime.rs
+
+Red/green verification:
+- Successor StoreBatch was erased by a delayed corrupt reader before writer-local revalidation.
+- Initial-query, pre-enqueue, and post-enqueue cancellation tests exposed abandoned recovery windows.
+- Writer dispatch and reset failure tests exposed missing repair intent.
+- Unprojected custom-emoji corruption proved partial repair could publish before a later destructive reset.
+- History completion proved the exclusive guard was dropped before stateful completion delivery.
+- Malformed pending-unread JSON was silently ignored before the fallible parse.
+
+Final verification:
+- cargo fmt --all -- --check: passed
+- cargo check --all-targets: passed
+- cargo test --all-targets --quiet: 962 passed, 3 ignored
+- meson compile -C _build-task4: passed
+- meson test -C _build-task4 --print-errorlogs: 17 passed
+- git diff --check: passed
+- Independent race, reset-state, and Task 5 scope reviews: no blockers
+- Strict Clippy unavailable locally because cargo-clippy 1.87 does not match rustc/cargo 1.95; coverage tooling is not configured.
+
+Rationale:
+A derived cache reset is safe only when every known-corrupt generation either completes a full reset or blocks publication until that reset and the canonical projection repair succeed. Keeping the recovery guard alive through event delivery prevents an intervening reset from invalidating already-published state.
