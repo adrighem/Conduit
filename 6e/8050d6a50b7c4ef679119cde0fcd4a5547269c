@@ -1,0 +1,28 @@
+Conductor task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations
+
+Summary:
+- Removed direct conversation, attention, history, thread, and thread-catalog persistence APIs.
+- Removed duplicate stateful runtime compatibility events and catalog publishers.
+- Routed GTK conversation and thread projections only through ordered WorkspacePatch application.
+- Made the presentation catalogs private with read-only accessors.
+
+Modified files:
+- src/conversation_catalog.rs
+- src/gnome_search_provider.rs
+- src/runtime.rs
+- src/store.rs
+- src/thread_catalog.rs
+- src/window.rs
+- src/workspace_pipeline.rs
+- src/workspace_state.rs
+
+Verification:
+- Red phase: four Task 5 boundary tests failed before implementation.
+- cargo fmt --check passed.
+- cargo check --all-targets passed.
+- Full cargo test passed: 949 passed, 3 ignored.
+- Meson test suite passed: 17 passed, 0 failed.
+- Independent Task 5 acceptance audit passed.
+
+Rationale:
+The revisioned workspace coordinator and atomic StoreBatch now provide the only live state mutation path for the adopted conversation and thread projections, while later-phase timeline and whole-state migration seams remain intact.
