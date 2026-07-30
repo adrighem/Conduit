@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 
+MAIN_WINDOW_TITLE = "Conduit"
 SWITCHER_TITLE = "Switch conversation"
 WEBKIT_SETTINGS = {
     "allow_file_access": False,
@@ -35,6 +36,35 @@ def wait_until(predicate, timeout: float = 40.0, interval: float = 0.1):
     raise AssertionError(f"condition was not met within {timeout:.1f}s")
 
 
+def active_window_id(name: str, process_id: int) -> str | None:
+    active = subprocess.run(
+        ["xdotool", "getactivewindow"],
+        capture_output=True,
+        text=True,
+    )
+    if active.returncode != 0:
+        return None
+    window_id = active.stdout.strip()
+    title = subprocess.run(
+        ["xdotool", "getwindowname", window_id],
+        capture_output=True,
+        text=True,
+    )
+    owner = subprocess.run(
+        ["xdotool", "getwindowpid", window_id],
+        capture_output=True,
+        text=True,
+    )
+    if (
+        title.returncode != 0
+        or title.stdout.strip() != name
+        or owner.returncode != 0
+        or owner.stdout.strip() != str(process_id)
+    ):
+        return None
+    return window_id
+
+
 def wait_for_window(process: subprocess.Popen[str], timeout: float = 40.0) -> str:
     def find_window() -> str | None:
         return_code = process.poll()
@@ -43,18 +73,7 @@ def wait_for_window(process: subprocess.Popen[str], timeout: float = 40.0) -> st
             raise AssertionError(
                 f"Conduit exited with {return_code} before showing a window:\n{stderr}"
             )
-        result = subprocess.run(
-            [
-                "xdotool",
-                "search",
-                "--onlyvisible",
-                "--pid",
-                str(process.pid),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        return next(iter(result.stdout.splitlines()), None)
+        return active_window_id(MAIN_WINDOW_TITLE, process.pid)
 
     return wait_until(find_window, timeout=timeout)
 
@@ -81,29 +100,22 @@ def visible_window_ids(name: str) -> list[str]:
 
 def focus_window(window_id: str) -> None:
     # Ask the window manager first so GTK receives normal activation state.
-    # A newly mapped window or dialog transition can briefly leave the target
-    # unmapped. Retry instead of issuing a direct X focus request that races it.
-    deadline = time.monotonic() + 15.0
+    # A newly mapped window, or the main window after a dialog closes, can
+    # briefly race the WM's activation bookkeeping. Retry through the WM.
+    deadline = time.monotonic() + 5.0
+    last_result: subprocess.CompletedProcess[bytes] | None = None
     while time.monotonic() < deadline:
-        active = subprocess.run(
-            ["xdotool", "getactivewindow"],
-            capture_output=True,
-            text=True,
-        )
-        if active.returncode == 0 and active.stdout.strip() == window_id:
-            break
         try:
-            activation = subprocess.run(
+            last_result = subprocess.run(
                 ["xdotool", "windowactivate", "--sync", window_id],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=2,
+                timeout=1,
             )
         except subprocess.TimeoutExpired:
-            activation = None
-        if activation is not None and activation.returncode != 0:
-            time.sleep(0.1)
-            continue
+            last_result = None
+        if last_result is not None and last_result.returncode == 0:
+            break
         time.sleep(0.1)
     else:
         raise AssertionError(f"window {window_id} did not become activatable")
@@ -389,9 +401,7 @@ def main() -> None:
                     for _ in range(2):
                         press(window_id, "ctrl+k")
                         switcher_id = wait_until(
-                            lambda: next(
-                                iter(visible_window_ids(SWITCHER_TITLE)), None
-                            )
+                            lambda: active_window_id(SWITCHER_TITLE, process.pid)
                         )
                         press(switcher_id, "Escape")
                         wait_until(
