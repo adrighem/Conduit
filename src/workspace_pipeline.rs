@@ -412,6 +412,16 @@ impl TimelineState {
         messages
     }
 
+    fn messages_with_revisions(&self) -> Vec<(SlackMessage, WorkspaceRevision)> {
+        let mut messages = self
+            .messages
+            .values()
+            .map(|entry| (entry.value.clone(), entry.revision))
+            .collect::<Vec<_>>();
+        messages.sort_by(|(left, _), (right, _)| left.ts.cmp(&right.ts));
+        messages
+    }
+
     fn contains_identity(&self, message: &SlackMessage) -> bool {
         self.messages
             .values()
@@ -481,6 +491,16 @@ impl WorkspaceCoordinator {
         self.histories
             .get(channel_id)
             .map(TimelineState::messages)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn history_with_revisions(
+        &self,
+        channel_id: &str,
+    ) -> Vec<(SlackMessage, WorkspaceRevision)> {
+        self.histories
+            .get(channel_id)
+            .map(TimelineState::messages_with_revisions)
             .unwrap_or_default()
     }
 
@@ -1280,7 +1300,8 @@ impl WorkspaceCoordinator {
         }
         accepted_messages.sort_by(|left, right| left.ts.cmp(&right.ts));
         let messages = timeline.messages();
-        let store_change = store_timeline_replacement(&target, messages);
+        let store_change = (origin != MutationOrigin::Cache)
+            .then(|| store_timeline_replacement(&target, messages));
         let reconciled_message_ts =
             self.reconciled_unread_message_ts(&target, &accepted_messages, origin);
         let attention_effects = accepted_messages
@@ -1336,7 +1357,7 @@ impl WorkspaceCoordinator {
             }
         }
         let mut patch_changes = vec![WorkspaceChange::TimelineChanged { target, changes }];
-        let mut store_changes = vec![store_change];
+        let mut store_changes = store_change.into_iter().collect::<Vec<_>>();
         if !attention_observations.is_empty() {
             patch_changes.push(WorkspaceChange::ConversationAttentionObserved {
                 channel_id: attention_channel_id.clone(),
@@ -3786,17 +3807,20 @@ mod tests {
             message.user = Some("U_OTHER".to_string());
         }
         let history = coordinator
-            .apply(WorkspaceMutation::HistorySnapshot {
-                channel_id: "C1".to_string(),
-                snapshot: SnapshotEnvelope::new(
-                    coordinator.revision(),
-                    MessagePage {
-                        messages: history_messages,
-                        complete: true,
-                        ..Default::default()
-                    },
-                ),
-            })
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".to_string(),
+                    snapshot: SnapshotEnvelope::new(
+                        coordinator.revision(),
+                        MessagePage {
+                            messages: history_messages,
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
             .unwrap();
         let [WorkspaceChange::TimelineChanged { .. }, WorkspaceChange::ConversationAttentionObserved {
             channel_id,
@@ -3917,6 +3941,99 @@ mod tests {
         );
         assert_eq!(current.raw_unread_activity_count(), 3);
         assert_eq!(current.unread_activity_count(), 4);
+    }
+
+    #[test]
+    fn cache_history_reuses_durable_timeline_but_persists_semantic_attention() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        let mut channel = conversation("C1", "general");
+        channel
+            .extra
+            .insert("last_read".to_string(), serde_json::json!("10.0"));
+        coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+            conversations: vec![channel],
+            ..Default::default()
+        }));
+        let mut cached = message("11.0", "cached");
+        cached.user = Some("U_OTHER".to_string());
+
+        let reduction = coordinator
+            .apply_from(
+                MutationOrigin::Cache,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".to_string(),
+                    snapshot: SnapshotEnvelope::new(
+                        WorkspaceRevision::INITIAL,
+                        MessagePage {
+                            messages: vec![cached],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            reduction.patch().changes(),
+            [
+                WorkspaceChange::TimelineChanged { .. },
+                WorkspaceChange::ConversationAttentionObserved {
+                    channel_id,
+                    observations,
+                },
+            ] if channel_id == "C1"
+                && observations == &[ConversationAttentionObservation {
+                    message_ts: "11.0".to_string(),
+                    record_unread: true,
+                }]
+        ));
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::ConversationAttentionObserved {
+                channel_id,
+                observations,
+            }] if channel_id == "C1"
+                && observations == &[ConversationAttentionObservation {
+                    message_ts: "11.0".to_string(),
+                    record_unread: true,
+                }]
+        ));
+    }
+
+    #[test]
+    fn cache_thread_snapshot_does_not_rewrite_the_durable_thread() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut reply = message("11.0", "cached reply");
+        reply.thread_ts = Some("10.0".to_string());
+
+        let reduction = coordinator
+            .apply_from(
+                MutationOrigin::Cache,
+                WorkspaceMutation::ThreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "10.0".to_string(),
+                    snapshot: SnapshotEnvelope::new(
+                        WorkspaceRevision::INITIAL,
+                        MessagePage {
+                            messages: vec![reply],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::TimelineChanged { .. }]
+        ));
+        assert!(
+            reduction.store_batch().is_none(),
+            "cache-origin threads are already durable and must not emit ThreadReplaced"
+        );
     }
 
     #[test]
@@ -4193,17 +4310,20 @@ mod tests {
     fn timeline_snapshots_and_pages_keep_full_store_replacements() {
         let mut coordinator = WorkspaceCoordinator::default();
         let history = coordinator
-            .apply(WorkspaceMutation::HistorySnapshot {
-                channel_id: "C1".to_string(),
-                snapshot: SnapshotEnvelope::new(
-                    WorkspaceRevision::INITIAL,
-                    MessagePage {
-                        messages: vec![message("10.0", "history")],
-                        complete: true,
-                        ..Default::default()
-                    },
-                ),
-            })
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::HistorySnapshot {
+                    channel_id: "C1".to_string(),
+                    snapshot: SnapshotEnvelope::new(
+                        WorkspaceRevision::INITIAL,
+                        MessagePage {
+                            messages: vec![message("10.0", "history")],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
             .unwrap();
         assert!(matches!(
             history.store_batch().unwrap().changes(),
@@ -4217,15 +4337,18 @@ mod tests {
         let mut reply = message("11.0", "reply");
         reply.thread_ts = Some("10.0".to_string());
         let thread = coordinator
-            .apply(WorkspaceMutation::ThreadPage {
-                channel_id: "C1".to_string(),
-                thread_ts: "10.0".to_string(),
-                page: MessagePage {
-                    messages: vec![reply],
-                    complete: false,
-                    ..Default::default()
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ThreadPage {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "10.0".to_string(),
+                    page: MessagePage {
+                        messages: vec![reply],
+                        complete: false,
+                        ..Default::default()
+                    },
                 },
-            })
+            )
             .unwrap();
         assert!(matches!(
             thread.store_batch().unwrap().changes(),
@@ -4837,18 +4960,21 @@ mod tests {
         let mut stale_reply = message("11.0", "stale page reply");
         stale_reply.thread_ts = Some("10.0".to_string());
         let reduction = coordinator
-            .apply(WorkspaceMutation::ThreadSnapshot {
-                channel_id: "C1".to_string(),
-                thread_ts: "10.0".to_string(),
-                snapshot: SnapshotEnvelope::new(
-                    snapshot_base,
-                    MessagePage {
-                        messages: vec![old_root, stale_reply],
-                        complete: true,
-                        ..Default::default()
-                    },
-                ),
-            })
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ThreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "10.0".to_string(),
+                    snapshot: SnapshotEnvelope::new(
+                        snapshot_base,
+                        MessagePage {
+                            messages: vec![old_root, stale_reply],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
             .unwrap();
         assert!(matches!(
             reduction.store_batch().unwrap().changes(),
@@ -4885,18 +5011,21 @@ mod tests {
             })
             .unwrap();
         let reduction = coordinator
-            .apply(WorkspaceMutation::ThreadSnapshot {
-                channel_id: "C1".to_string(),
-                thread_ts: "10.0".to_string(),
-                snapshot: SnapshotEnvelope::new(
-                    snapshot_base,
-                    MessagePage {
-                        messages: vec![old_root, stale_reply],
-                        complete: true,
-                        ..Default::default()
-                    },
-                ),
-            })
+            .apply_from(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::ThreadSnapshot {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "10.0".to_string(),
+                    snapshot: SnapshotEnvelope::new(
+                        snapshot_base,
+                        MessagePage {
+                            messages: vec![old_root, stale_reply],
+                            complete: true,
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
             .unwrap();
 
         assert!(matches!(

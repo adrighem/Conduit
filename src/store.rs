@@ -1618,6 +1618,7 @@ impl WorkspaceStore {
             .filter(|messages| !messages.is_empty()))
     }
 
+    #[cfg(test)]
     pub async fn store_history(&self, channel_id: &str, messages: &[SlackMessage]) -> Result<()> {
         self.store_merged_history(channel_id, messages).await
     }
@@ -2038,6 +2039,49 @@ impl WorkspaceStore {
                 connection.execute_batch(
                     "DROP TRIGGER IF EXISTS conduit_test_fail_conversation_batch;",
                 )?;
+                Ok(())
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_history_batch_failure_trigger_for(
+        &self,
+        channel_id: &str,
+    ) -> Result<()> {
+        if channel_id.is_empty()
+            || !channel_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        {
+            return Err(StoreError::rejected_update(
+                "test failure channel id must be ASCII alphanumeric",
+            ));
+        }
+        let channel_id = channel_id.to_string();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                connection.execute_batch(&format!(
+                    "CREATE TEMP TRIGGER conduit_test_fail_history_batch
+                     BEFORE INSERT ON workspace_items
+                     WHEN NEW.kind = 'channel_history' AND NEW.item_key = '{channel_id}'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected history batch failure');
+                     END;"
+                ))?;
+                Ok(())
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clear_history_batch_failure_trigger(&self) -> Result<()> {
+        self.hub()
+            .await?
+            .write(|connection| {
+                connection
+                    .execute_batch("DROP TRIGGER IF EXISTS conduit_test_fail_history_batch;")?;
                 Ok(())
             })
             .await

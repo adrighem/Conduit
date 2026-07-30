@@ -1,6 +1,6 @@
 use crate::models::SlackMessage;
 use crate::slack::{SlackApi, SlackError, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
-use crate::store::{StoreError, StoreErrorCategory, WorkspaceStore};
+use crate::store::{StoreError, WorkspaceStore};
 
 pub(crate) trait ConversationHistorySlack {
     async fn load_history(&self, channel_id: &str) -> Result<SlackMessagePage, SlackError>;
@@ -9,12 +9,6 @@ pub(crate) trait ConversationHistorySlack {
 pub(crate) trait ConversationHistoryStore {
     async fn load_history(&self, channel_id: &str)
         -> Result<Option<Vec<SlackMessage>>, StoreError>;
-
-    async fn store_history(
-        &self,
-        channel_id: &str,
-        messages: &[SlackMessage],
-    ) -> Result<(), StoreError>;
 }
 
 impl ConversationHistorySlack for SlackApi {
@@ -30,22 +24,6 @@ impl ConversationHistoryStore for WorkspaceStore {
     ) -> Result<Option<Vec<SlackMessage>>, StoreError> {
         self.load_history(channel_id).await
     }
-
-    async fn store_history(
-        &self,
-        channel_id: &str,
-        messages: &[SlackMessage],
-    ) -> Result<(), StoreError> {
-        self.store_history(channel_id, messages).await
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ConversationHistoryProgress {
-    Cached(Vec<SlackMessage>),
-    Loading,
-    CacheReadFailed(StoreErrorCategory),
-    CacheWriteFailed(StoreErrorCategory),
 }
 
 pub(crate) struct ConversationHistoryService<'a, Slack, Store> {
@@ -62,39 +40,22 @@ where
         Self { slack, store }
     }
 
-    pub(crate) async fn load(
+    pub(crate) async fn load_cached(
         &self,
         channel_id: &str,
-        mut progress: impl FnMut(ConversationHistoryProgress),
-    ) -> Result<SlackMessagePage, SlackError> {
-        if let Some(store) = self.store {
-            match store.load_history(channel_id).await {
-                Ok(Some(messages)) if !messages.is_empty() => progress(
-                    ConversationHistoryProgress::Cached(recent_history_preview(messages)),
-                ),
-                Ok(_) => {}
-                Err(error) => progress(ConversationHistoryProgress::CacheReadFailed(
-                    error.category(),
-                )),
-            }
-        }
+    ) -> Result<Option<Vec<SlackMessage>>, StoreError> {
+        let Some(store) = self.store else {
+            return Ok(None);
+        };
+        store.load_history(channel_id).await
+    }
 
-        progress(ConversationHistoryProgress::Loading);
-        let page = self.slack.load_history(channel_id).await?;
-
-        if let Some(store) = self.store {
-            if let Err(error) = store.store_history(channel_id, &page.messages).await {
-                progress(ConversationHistoryProgress::CacheWriteFailed(
-                    error.category(),
-                ));
-            }
-        }
-
-        Ok(page)
+    pub(crate) async fn fetch(&self, channel_id: &str) -> Result<SlackMessagePage, SlackError> {
+        self.slack.load_history(channel_id).await
     }
 }
 
-fn recent_history_preview(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+pub(crate) fn recent_history_preview(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
     messages.sort_by(|left, right| right.ts.cmp(&left.ts));
     messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
     messages.truncate(CHANNEL_HISTORY_PAGE_LIMIT);
@@ -132,7 +93,6 @@ mod tests {
 
     struct FakeStore {
         cached: Vec<SlackMessage>,
-        stored: Mutex<Vec<(String, Vec<SlackMessage>)>>,
     }
 
     impl ConversationHistoryStore for FakeStore {
@@ -141,18 +101,6 @@ mod tests {
             _channel_id: &str,
         ) -> Result<Option<Vec<SlackMessage>>, StoreError> {
             Ok(Some(self.cached.clone()))
-        }
-
-        async fn store_history(
-            &self,
-            channel_id: &str,
-            messages: &[SlackMessage],
-        ) -> Result<(), StoreError> {
-            self.stored
-                .lock()
-                .unwrap()
-                .push((channel_id.to_string(), messages.to_vec()));
-            Ok(())
         }
     }
 
@@ -163,14 +111,6 @@ mod tests {
             &self,
             _channel_id: &str,
         ) -> Result<Option<Vec<SlackMessage>>, StoreError> {
-            Err(StoreError::Io(std::io::Error::other("cache unavailable")))
-        }
-
-        async fn store_history(
-            &self,
-            _channel_id: &str,
-            _messages: &[SlackMessage],
-        ) -> Result<(), StoreError> {
             Err(StoreError::Io(std::io::Error::other("cache unavailable")))
         }
     }
@@ -184,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn service_emits_cached_preview_before_loading_fresh_history() {
+    fn service_splits_full_cache_read_from_network_fetch_without_store_write() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -193,38 +133,43 @@ mod tests {
             let slack = FakeSlack::default();
             let cached = (0..CHANNEL_HISTORY_PAGE_LIMIT + 2)
                 .map(|index| message(&format!("{index:02}"), "cached"))
-                .collect();
+                .collect::<Vec<_>>();
             let store = FakeStore {
-                cached,
-                stored: Mutex::new(Vec::new()),
+                cached: cached.clone(),
             };
             let service = ConversationHistoryService::new(&slack, Some(&store));
-            let mut progress = Vec::new();
 
-            let page = service
-                .load("C1", |update| progress.push(update))
-                .await
-                .unwrap();
+            assert_eq!(
+                service.load_cached("C1").await.unwrap(),
+                Some(cached),
+                "cache hydration must retain the full stored history"
+            );
+            let page = service.fetch("C1").await.unwrap();
 
             assert_eq!(page.messages, vec![message("3", "fresh")]);
-            assert!(matches!(
-                progress[0],
-                ConversationHistoryProgress::Cached(_)
-            ));
-            let ConversationHistoryProgress::Cached(preview) = &progress[0] else {
-                unreachable!();
-            };
-            assert_eq!(preview.len(), CHANNEL_HISTORY_PAGE_LIMIT);
-            assert_eq!(preview.first().unwrap().ts, "31");
-            assert_eq!(progress[1], ConversationHistoryProgress::Loading);
             assert_eq!(slack.requested_channels.lock().unwrap().as_slice(), &["C1"]);
-            assert_eq!(store.stored.lock().unwrap()[0].0, "C1");
-            assert_eq!(store.stored.lock().unwrap()[0].1, page.messages);
         });
     }
 
     #[test]
-    fn cache_failures_are_reported_without_hiding_fresh_history() {
+    fn recent_history_preview_sorts_deduplicates_and_caps_full_cache() {
+        let mut cached = (0..CHANNEL_HISTORY_PAGE_LIMIT + 2)
+            .map(|index| message(&format!("{index:02}"), "cached"))
+            .collect::<Vec<_>>();
+        cached.push(message("10", "duplicate"));
+
+        let preview = recent_history_preview(cached);
+
+        assert_eq!(preview.len(), CHANNEL_HISTORY_PAGE_LIMIT);
+        assert_eq!(preview.first().unwrap().ts, "31");
+        assert_eq!(
+            preview.iter().filter(|message| message.ts == "10").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cache_failure_does_not_prevent_fresh_history_fetch() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -233,22 +178,16 @@ mod tests {
             let slack = FakeSlack::default();
             let store = FailingStore;
             let service = ConversationHistoryService::new(&slack, Some(&store));
-            let mut progress = Vec::new();
 
-            let page = service
-                .load("C1", |update| progress.push(update))
-                .await
-                .unwrap();
+            let cache_error = service.load_cached("C1").await.unwrap_err();
+            let page = service.fetch("C1").await.unwrap();
 
             assert_eq!(page.messages, vec![message("3", "fresh")]);
             assert_eq!(
-                progress,
-                vec![
-                    ConversationHistoryProgress::CacheReadFailed(StoreErrorCategory::LocalIo,),
-                    ConversationHistoryProgress::Loading,
-                    ConversationHistoryProgress::CacheWriteFailed(StoreErrorCategory::LocalIo,),
-                ]
+                cache_error.category(),
+                crate::store::StoreErrorCategory::LocalIo
             );
+            assert_eq!(slack.requested_channels.lock().unwrap().as_slice(), &["C1"]);
         });
     }
 }

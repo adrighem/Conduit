@@ -1532,14 +1532,14 @@ fn merge_channel_message_pages(
     existing: &[SlackMessage],
     page: &[SlackMessage],
 ) -> Vec<SlackMessage> {
-    normalize_channel_messages(existing.iter().chain(page).cloned().collect::<Vec<_>>())
+    normalize_channel_messages(page.iter().chain(existing).cloned().collect::<Vec<_>>())
 }
 
 fn merge_channel_message_refresh(
-    existing: &[SlackMessage],
+    _existing: &[SlackMessage],
     snapshot: &[SlackMessage],
 ) -> Vec<SlackMessage> {
-    normalize_channel_messages(snapshot.iter().chain(existing).cloned().collect::<Vec<_>>())
+    normalize_channel_messages(snapshot.to_vec())
 }
 
 fn clean_channel_messages_in_place(messages: &mut Vec<SlackMessage>) -> bool {
@@ -2824,12 +2824,62 @@ mod tests {
             vec!["4", "3", "2"]
         );
         assert_eq!(state.channel_cursor("C1"), None);
+        assert_eq!(
+            state
+                .channel_messages("C1")
+                .iter()
+                .find(|message| message.ts == "2")
+                .unwrap()
+                .body_text(),
+            "duplicate",
+            "canonical append entries must replace duplicate compatibility state"
+        );
         assert!(state.begin_history_request("C1"));
         assert_eq!(
             outcome.scroll,
             Some(WorkspaceScrollBehavior::PreservePrepend)
         );
         assert!(!outcome.notify_new_messages);
+    }
+
+    #[test]
+    fn canonical_history_refresh_removes_absent_stale_entries() {
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        apply_fresh(
+            &mut state,
+            "C1",
+            vec![
+                message("3", "stale edit"),
+                message("2", "deleted"),
+                message("1", "old"),
+            ],
+        );
+
+        state.apply_history(
+            "C1",
+            vec![
+                message("4", "concurrent post"),
+                message("3", "canonical edit"),
+            ],
+            true,
+            Some("older".into()),
+            false,
+            false,
+        );
+
+        assert_eq!(
+            state
+                .channel_messages("C1")
+                .iter()
+                .map(|message| (message.ts.as_str(), message.body_text()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("4", "concurrent post".into()),
+                ("3", "canonical edit".into())
+            ]
+        );
+        assert_eq!(state.channel_cursor("C1"), Some("older"));
     }
 
     #[test]
@@ -3183,7 +3233,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_messages_survive_stale_channel_and_thread_snapshots() {
+    fn canonical_channel_completion_and_thread_snapshot_preserve_confirmed_messages() {
         let mut state = WorkspaceViewState::default();
         state.select_conversation("C1");
         apply_fresh(&mut state, "C1", vec![message("3", "parent")]);
@@ -3201,7 +3251,14 @@ mod tests {
             RealtimeMessageKind::Posted,
         );
 
-        apply_fresh(&mut state, "C1", vec![message("3", "stale parent")]);
+        apply_fresh(
+            &mut state,
+            "C1",
+            vec![
+                message("5", "confirmed channel post"),
+                message("3", "stale parent"),
+            ],
+        );
         state.apply_thread(
             "C1",
             "3",
