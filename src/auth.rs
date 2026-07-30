@@ -192,7 +192,7 @@ impl SlackOAuthClient {
         auth_debug(debug, &format!("client_id={client_id}"));
         auth_debug(debug, &format!("redirect_uri={redirect_uri}"));
         auth_debug(debug, &format!("scopes={}", config.user_scopes.join(",")));
-        auth_debug(debug, &format!("authorize_url={authorize_url}"));
+        auth_debug(debug, authorization_url_diagnostic(&authorize_url));
         let callback =
             wait_for_oauth_callback(config.redirect_port, authorize_url, state.clone(), debug)
                 .await?;
@@ -639,6 +639,12 @@ fn auth_debug(enabled: bool, message: &str) {
     }
 }
 
+fn authorization_url_diagnostic(_authorize_url: &str) -> &'static str {
+    // The URL query contains the OAuth state and PKCE challenge. Keep the
+    // diagnostic useful without exposing any part of that transaction.
+    "authorization URL prepared; transaction details omitted"
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -714,6 +720,27 @@ mod tests {
             Some("S256")
         );
         assert_eq!(params.get("state").map(String::as_str), Some("state"));
+    }
+
+    #[test]
+    fn authorization_url_diagnostic_omits_transaction_data() {
+        let authorize_url = build_authorize_url(
+            &OAuthConfig::new("public-client-id"),
+            "pkce-challenge",
+            "oauth-state",
+        )
+        .unwrap();
+        let diagnostic = authorization_url_diagnostic(&authorize_url);
+
+        for sensitive in [
+            authorize_url.as_str(),
+            "public-client-id",
+            "pkce-challenge",
+            "oauth-state",
+            "code_challenge",
+        ] {
+            assert!(!diagnostic.contains(sensitive));
+        }
     }
 
     #[test]

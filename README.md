@@ -1,130 +1,413 @@
 # Conduit
 
 <p align="center">
-  <img src="data/branding/conduit.png" alt="Conduit logo" width="280">
+  <img src="https://raw.githubusercontent.com/adrighem/Conduit/main/data/branding/conduit.png" alt="" width="280">
 </p>
 
 <p align="center">
   A focused, native Slack client for the GNOME desktop.
 </p>
 
-Conduit is a Rust, GTK4, libadwaita, and WebKitGTK desktop client that aims to make the everyday parts of Slack feel fast and at home on Linux. It combines native workspace navigation and composers with an app-generated message timeline that escapes Slack-provided content.
+Conduit is an independent Slack client built with Rust, GTK4, libadwaita, and
+WebKitGTK. It focuses on channels, direct messages, threads, search, files,
+notifications, and keyboard-driven navigation while storing workspace credentials
+in the system keyring.
 
-The app is becoming usable as a daily driver for focused messaging, but it is still a young project. Expect gaps outside the core conversation workflow and occasional changes to setup or behavior before a stable release.
+Conduit is pre-1.0. It is becoming useful for daily messaging, but it does not cover
+every Slack feature and its setup or behavior may still change. It is not affiliated
+with or endorsed by Slack Technologies, LLC.
 
-Conduit is an independent project and is not affiliated with or endorsed by Slack Technologies, LLC.
+## Before you start
 
-## What works today
+- Conduit is intentionally designed for one connected Slack workspace.
+- Current release packages target x86_64 Debian 13, Fedora 44, and Flatpak. Other
+  systems and architectures require a source build.
+- Current GitHub packages do not embed a shared Slack client ID. To use the
+  recommended OAuth flow, you need permission to create and install a Slack app in
+  your workspace. An administrator may need to approve it.
+- Signing out does not erase cached messages, downloaded media, preferences, or
+  drafts. See [Local data and security](#local-data-and-security).
 
-### Conversations and navigation
+## Install
 
-- Adaptive GNOME interface for channels, direct messages, and group messages.
-- Complete paginated catalog of subscribed channels, DMs, and group DMs, with persisted metadata and unread state. The default sidebar keeps relevant DMs compact; **Show All Conversations** and the conversation switcher expose the full catalog.
-- A Priority section mirrors Slack conversation stars, listing starred DMs as VIP conversations before starred channels. Sidebar context menus can star or unstar channels and DMs, and one-to-one DMs expose a **Profile** action.
-- Sections for Messages, Unreads, observed threads, Files, and Later.
-- Fast conversation switcher with discovery of channels and people.
-- Create public or private channels, start direct or group messages, and add people to existing conversations when Slack permissions allow it.
-- GNOME Shell search-provider integration for opening cached channels, existing direct messages, and new direct messages with cached workspace members straight from the desktop overview. It reads only conversation and name metadata for the active workspace and never indexes message history.
-- Transactional SQLite caching for conversations, names, histories, threads, unread state, statuses, and custom emoji, with automatic migration from the earlier JSON cache.
-- Unread badges, muted and external-conversation indicators, read markers, and relevant-only desktop notifications for direct messages, mentions, configured terms, and interested-thread replies.
-- Slack status emoji and hover text for people in direct messages, shown consistently in navigation, switchers, titles, and message authors.
-- The workspace header shows your display name and active custom status. Its menu opens a native status editor with searchable emoji, expiration choices, and explicit clearing.
-- Multi-word, case-insensitive substring filtering with globally ranked, category-free results across conversation, forwarding, message, and emoji searches. Conversation ranking treats direct messages and people as one-person groups, while group DMs use the share of other participants whose names match; group titles omit your own name.
-
-### Messaging
-
-- Paged channel history and threaded replies.
-- Multiline message and thread composers with persistent per-conversation drafts and person completion after typing `@`.
-- File uploads with progress reporting, including pasting clipboard screenshots directly into either composer.
-- Emoji and person completion with type-ahead filtering and keyboard navigation in main messages and threads. Completed people remain readable by name while being sent to Slack as real mentions.
-- Edited and deleted messages, Slack links and mentions, user-group mentions, common Block Kit and legacy bot attachments, bot identities, code blocks, and image and video previews.
-- Safe bot links open directly; callback buttons and menus open the exact originating message in Slack so the publishing app remains responsible for the interaction.
-- Workspace custom emoji in messages, reactions, composer completion, and the reusable searchable emoji picker.
-- Add and remove reactions, save messages for Later, copy message text or links, and forward messages.
-- Message authors use cached avatars with initial fallbacks. Author names and `@mentions` expose **Message** and **Profile** actions; hovering shows the person's full name when available, falling back to the display name.
-- Message timelines follow the GTK system text size and GNOME text scaling without applying other system theme settings to their content.
-
-### Search, files, and media
-
-- Workspace message search with Slack modifiers such as `from:`, `in:`, and `has:` preserved.
-- A persistent Threads inbox assembled from fetched history, opened threads, realtime replies, and Slack subscription/unread metadata.
-- Relevance-ranked multi-term results while retaining Slack's own result order for close matches.
-- Files and saved-item views with navigation back to their source messages.
-- Slack message permalinks for the connected workspace open directly inside Conduit.
-- Official `slack://` links can activate Conduit from the desktop or a browser and open channels, direct messages, and files in the connected workspace.
-- Internal image and video viewer with galleries, zoom, fullscreen, context actions, and Save As.
-- Unsupported Slack attachments download through authenticated, size-bounded local caching and open in the system's default application; old cache entries are evicted automatically.
-
-### Huddles
-
-- Active huddles are discovered from supported Slack conversation and presence data and shown only in the matching workspace and conversation.
-- A camera-off preflight shows the available media choices without starting capture, and privacy-safe desktop notifications open the matching conversation.
-- Until a verified Slack/Amazon Chime join bridge is available, Conduit opens the exact huddle in Slack over HTTPS. The optional native media stack is a generic WebRTC engine and synthetic harness, not a production Slack join implementation.
-
-### Sync and resilience
-
-- Network and cache work runs away from the GTK UI thread, with short connection, request, and Socket Mode liveness deadlines.
-- Optional Slack Socket Mode ingestion for message, reaction, and conversation updates.
-- Realtime messages, user changes, and reactions use a session-owned ordered actor with an unbounded callback queue and opt-in live high-water diagnostics; messages are cached for unopened conversations, and unread DMs are prioritized for background history refresh.
-- Automatic Socket Mode reconnect with capped backoff.
-- Scoped loading and error recovery so failures in one surface do not replace unrelated content.
-- Workspace inputs are normalized through a revisioned coordinator behind compatibility adapters, while the WAL-backed SQLite cache applies incremental entity updates and supports concurrent desktop search reads.
-- Tokens are validated with `auth.test` and stored through the system Secret Service/keyring.
-
-## Current limitations
-
-- Conduit intentionally manages one connected Slack workspace session at a time.
-- OAuth requires your own Slack app unless a packaged build supplies a client ID.
-- Slack does not expose its separate paid-plan VIP preference through the public API, so Conduit's VIP projection consists of starred DMs.
-- Socket Mode is optional and requires separate Slack app configuration and an `xapp-` token.
-- Workspace search is bounded by Slack's search API and cannot guarantee arbitrary middle-of-word discovery outside the candidates Slack returns.
-- Slack's public API cannot enumerate every historical subscribed thread. Conduit retains and reconciles every thread it discovers, but a fresh installation builds its thread catalog progressively as history and replies are fetched.
-- Threads and Unreads reflect the conversations and activity Conduit has observed; they are not complete Slack-wide activity aggregators.
-- File and workspace-search views currently load a bounded result set rather than every page.
-- Rich composer formatting, autocomplete beyond emoji and people, message editing/deletion controls, typing indicators, general live presence, sidebar avatars (message and profile avatars are supported), native production huddle joining, canvases, workflows, custom sidebar sections, and full Slack administration are not implemented.
-- Release bundles currently target x86_64 Debian 13, Fedora 44, and Flatpak. Other distributions and architectures still require a source build.
-- Signing out removes the stored credential and clears the active-workspace selection, but it does not currently purge cached workspace data or saved drafts from local storage.
-
-## Install a release
-
-Each [GitHub Release](https://github.com/adrighem/Conduit/releases) includes packages for Debian 13 (Trixie), Fedora 44, and a GNOME 50 Flatpak bundle, plus `SHA256SUMS`. Download one package and install it with the matching system tool:
+Download a package and `SHA256SUMS` from the
+[latest GitHub release](https://github.com/adrighem/Conduit/releases). From the
+download directory, verify the package that is present:
 
 ```sh
-# Debian 13
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Install it with the matching system tool:
+
+```sh
+# Debian 13 (Trixie)
 sudo apt install ./conduit_VERSION-1_amd64.deb
 
 # Fedora 44
 sudo dnf install ./conduit-VERSION-1.fc44.x86_64.rpm
 
-# Any Flatpak host with the Flathub runtime remote
+# x86_64 Flatpak host with the Flathub runtime remote
 flatpak install --user ./conduit-VERSION-x86_64.flatpak
 ```
 
-The single-file Flatpak bundle is installable but does not provide automatic updates. Conduit is not currently published on Flathub. See [the release guide](docs/releases.md) for release maintenance, verification, and the current Flathub boundary.
+These are standalone packages, not an update repository. Install newer releases
+manually. Conduit is not currently published on Flathub, and the single-file Flatpak
+bundle does not receive automatic updates. See the
+[release guide](https://github.com/adrighem/Conduit/blob/main/docs/releases.md) for
+package verification and release-maintenance details.
 
-General release packages keep the optional native huddle media and screen-sharing stack disabled until production Slack joining is available. Huddle discovery and the exact **Open in Slack** fallback remain supported.
+Release packages keep the experimental native huddle media stack disabled. Huddle
+discovery and the exact **Open in Slack** fallback remain available.
 
-## Build and run
+## Connect a Slack workspace
 
-Install Rust, Meson, Ninja, PyGObject with GdkPixbuf introspection, and the development packages for GTK4, libadwaita, WebKitGTK 6.0, GLib/GIO, D-Bus, gettext, and Secret Service. Package names vary by distribution.
+### Recommended: OAuth with PKCE
 
-Build and test with Meson:
+Use a dedicated Slack app for Conduit. Enabling
+[PKCE](https://docs.slack.dev/authentication/using-pkce/) makes a Slack app a public
+client and is not normally reversible, so do not reuse an unrelated production app.
+
+The quickest reproducible setup is an app manifest:
+
+1. Open the [Slack app dashboard](https://api.slack.com/apps).
+2. Choose **Create New App**, then **From an app manifest**, and select the workspace
+   you want Conduit to use.
+3. Paste the manifest below, review the requested access, and create the app.
+
+```json
+{
+  "display_information": {
+    "name": "Conduit Desktop"
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "http://127.0.0.1:8934/callback"
+    ],
+    "scopes": {
+      "user": [
+        "channels:read",
+        "channels:history",
+        "channels:join",
+        "channels:write",
+        "groups:read",
+        "groups:history",
+        "groups:write",
+        "im:read",
+        "im:history",
+        "im:write",
+        "mpim:read",
+        "mpim:history",
+        "mpim:write",
+        "users:read",
+        "users:read.email",
+        "users.profile:read",
+        "users.profile:write",
+        "usergroups:read",
+        "emoji:read",
+        "chat:write",
+        "search:read",
+        "stars:read",
+        "stars:write",
+        "reactions:read",
+        "reactions:write",
+        "files:read",
+        "files:write"
+      ]
+    },
+    "pkce_enabled": true
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
+```
+
+4. In the Slack app's **Basic Information** page, copy its **Client ID**. Conduit
+   does not need the client secret or a bot token.
+5. Start Conduit, enter the Client ID, choose **Connect Workspace**, approve the
+   user-token grant in your browser, and return to Conduit.
+
+The manifest requests user scopes for conversation discovery and history, sending
+messages and read markers, people and status data, search, stars, reactions, emoji,
+and files. It requests no bot scopes. To configure an existing app manually, add the
+same redirect URL, enable PKCE, and add the manifest's entries under
+**OAuth & Permissions > User Token Scopes**.
+
+If Conduit adds scopes in a later release, update the Slack app, sign out, and
+reconnect so Slack can extend the grant.
+
+### Advanced: import a browser session
+
+Browser-session import is an unofficial compatibility path. XOXC and XOXD values
+grant access to your signed-in Slack session and may stop working without notice.
+Prefer OAuth. Never put these values in shell history, files, logs, screenshots,
+commits, or issue reports.
+
+Enable **Use XOXC/XOXD tokens** on Conduit's connection screen and paste values
+directly into its password fields.
+
+<a id="lookup-slack_mcp_xoxc_token"></a>
+<details>
+<summary>Show browser-session import steps</summary>
+
+1. Open the target workspace in a signed-in browser tab.
+2. Open that tab's developer console. Use the console's `copy()` helper so the XOXC
+   value goes to the clipboard without being rendered as console output:
+
+   ```js
+   copy(
+     JSON.parse(localStorage.localConfig_v2)
+       .teams[document.location.pathname.match(/^\/client\/([A-Z0-9]+)/)[1]]
+       .token
+   );
+   ```
+
+   If the browser blocks console pasting, do not disable its self-XSS protection.
+   Type the command or use the browser's storage inspector instead.
+3. Paste the clipboard directly into Conduit's **XOXC token** field.
+4. In the browser's Storage or Application tools, open Cookies, select the `d`
+   cookie, copy its value, and paste it directly into Conduit's **XOXD cookie**
+   field.
+5. Enterprise Slack may also require the exact User-Agent from the same browser.
+   Copy it without rendering the value:
+
+   ```js
+   copy(navigator.userAgent);
+   ```
+
+   Paste it into **Browser User-Agent (Enterprise)**.
+6. Choose **Import Browser Session**, then overwrite or clear the clipboard values.
+
+</details>
+
+Conduit stores an imported session in the system keyring. It also uses Slack Web's
+browser WebSocket and private unread bootstrap flow for that session. Slack does not
+document either interface for third-party clients, so Conduit validates responses
+defensively and falls back to normal Web API refreshes when needed.
+
+## Highlights
+
+- Native, adaptive GNOME navigation for channels, direct messages, group messages,
+  threads, Priority, Unreads, Files, and a legacy-starred-message Later view.
+- A complete cached catalog of subscribed conversations, a fast conversation
+  switcher, and GNOME Shell search that indexes conversation metadata but not message
+  history.
+- Paged history and threads, persistent drafts, people and emoji completion, file
+  uploads, clipboard-image uploads, reactions, legacy message stars, forwarding,
+  and read markers.
+- Sanitized rendering for Slack links and mentions, edited and deleted message
+  states, common Block Kit and bot attachments, code blocks, media previews, and
+  custom emoji.
+- Workspace message search, source-message navigation, Slack permalink handling,
+  and an internal image and video viewer.
+- Status viewing and editing, person profile actions, relevant desktop
+  notifications, and optional realtime updates.
+- Transactional SQLite caching for responsive startup and offline context, with
+  workspace credentials kept separately in the system keyring.
+
+See the
+[changelog](https://github.com/adrighem/Conduit/blob/main/CHANGELOG.md) for detailed
+release changes.
+
+## Known limitations
+
+- One connected Slack workspace is an intentional product boundary.
+- Threads and Unreads grow from history and activity Conduit has observed. A fresh
+  installation cannot reconstruct every historical Slack thread or activity item.
+- File and workspace-search views currently use bounded result sets.
+- The view labeled **Later** uses Slack's frozen legacy stars APIs. It does not
+  synchronize with items added to or removed from Slack's current Later feature.
+- Priority projects Slack conversation stars. Slack's separate paid-plan VIP
+  preference is not available through the public API.
+- Conduit renders edited and deleted message states but does not yet provide message
+  editing or deletion controls.
+- Rich composer formatting, typing indicators, general live presence, sidebar
+  avatars, canvases, workflows, custom sidebar sections, and full Slack
+  administration are not implemented.
+- Native production huddle joining is not implemented. Conduit discovers supported
+  huddles and opens the exact huddle in Slack. See
+  [Slack huddles](https://github.com/adrighem/Conduit/blob/main/docs/huddles.md).
+
+## Optional realtime updates
+
+OAuth workspaces work without Socket Mode through cached state, manual refresh, and
+direct Web API calls. To add live message, reaction, profile, huddle, and conversation
+updates:
+
+1. In the same Slack app, open **Socket Mode** and enable it.
+2. Under **Basic Information > App-Level Tokens**, generate a token with the
+   `connections:write` scope.
+3. Under **Event Subscriptions > Subscribe to events on behalf of users**, add the
+   events Conduit currently consumes:
+
+   ```text
+   message.channels, message.groups, message.im, message.mpim
+   reaction_added, reaction_removed
+   user_change, user_huddle_changed
+   channel_archive, channel_created, channel_deleted, channel_left
+   channel_rename, channel_unarchive
+   group_archive, group_joined, group_left, group_rename, group_unarchive
+   im_created, member_joined_channel, member_left_channel, mpim_open
+   ```
+
+4. Paste the app-level token into **Preferences > Realtime updates** and restart
+   Conduit. Tokens entered there are stored in the system keyring.
+
+Browser-session workspaces use their browser WebSocket automatically and do not need
+an app-level token.
+
+When realtime is online, **Preferences > Notifications** controls direct-message,
+mention/name, thread-reply, and keyword triggers. Configured name and keyword lists
+start empty. See
+[Attention and notifications](https://github.com/adrighem/Conduit/blob/main/docs/attention-and-notifications.md)
+for the full policy.
+
+## Local data and security
+
+- OAuth and imported browser-session credentials, plus Socket Mode tokens entered in
+  Preferences, are stored through the system Secret Service/keyring.
+- Workspace metadata, names, statuses, emoji, and message and thread history are
+  stored in `state/state.sqlite3` below Conduit's XDG cache directory. WebKit,
+  downloaded image, media, and attachment data use sibling cache directories.
+- Clipboard images are temporarily encoded as PNG files in the cache's
+  `upload-staging` directory. They are normally removed when the upload task ends;
+  leftovers from a crash are cleared at the next startup.
+- Drafts and preferences are stored through GSettings. Cache and settings data have
+  no additional application-level encryption.
+- **Sign Out** attempts to remove the saved user-session credential and active
+  workspace selection. It reports keyring deletion failures but still completes. It
+  does not remove the separately saved Socket Mode app token, cached workspace data,
+  or drafts.
+- Huddle media, portal sessions, SDP, ICE candidates, and TURN credentials are
+  ephemeral and are not written to Conduit's cache or settings.
+
+General `--debug` output can contain private workspace metadata such as channel names,
+user IDs, timestamps, and unread counts. `--debug-auth` omits tokens, authorization
+codes, OAuth state, and PKCE values, but can include client, scope, workspace, and
+user identifiers. Review and redact every diagnostic before sharing it.
+
+Never share tokens, cookies, private messages, or unredacted diagnostics. Use
+[private vulnerability reporting](https://github.com/adrighem/Conduit/security/policy)
+for security issues.
+
+## Reference
+
+### Open Slack links with Conduit
+
+An installed Conduit desktop entry advertises Slack's `slack://` scheme but does not
+change your current default handler. Inspect the current handler before selecting
+Conduit:
+
+```sh
+xdg-mime query default x-scheme-handler/slack
+xdg-mime default eu.vanadrighem.conduit.desktop x-scheme-handler/slack
+```
+
+Save the first command's output. To restore it later, substitute that value here:
+
+```sh
+xdg-mime default PREVIOUS_DESKTOP_ID x-scheme-handler/slack
+```
+
+Conduit accepts `open`, `channel`, `user`, `file`, `share-file`, and `app` actions.
+Channels, direct messages, and files use native surfaces. App actions use Slack's
+official HTTPS fallback and do not preserve a requested app tab. `share-file` opens
+the file but does not share it. Unknown actions present Conduit without target
+navigation.
+
+Workspace-scoped links must match the connected workspace. Ordinary Slack HTTPS
+links remain in the browser unless Slack or the browser hands off a `slack://` URI.
+
+### Keyboard shortcuts
+
+| Action | Shortcut |
+| --- | --- |
+| Switch conversation | `Ctrl+K` |
+| Search workspace messages | `Ctrl+F` |
+| Messages / Unreads / Files / Later (legacy stars) | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` |
+| Focus composer | `Ctrl+M` |
+| Upload file | `Ctrl+O` |
+| Close thread | `Ctrl+Shift+W` |
+| Show the complete shortcut list | `Ctrl+?` |
+
+In a composer, `Enter` sends when no completion menu is open. `Shift+Enter` inserts
+a newline; `Ctrl+Enter` is also accepted as a newline alias. When completion is open,
+`Enter` or `Tab` accepts the selected person or emoji.
+
+### Command-line options
+
+```text
+Usage: conduit [OPTIONS] [slack://URI ...]
+
+-c, --connect       Disconnect the active runtime session and open the connection flow
+-d, --debug         Enable general diagnostics, including OAuth stages
+    --debug-auth    Enable OAuth diagnostics only
+```
+
+At most 16 positional Slack URIs are handled per invocation.
+
+## Troubleshooting and support
+
+- For an OAuth workspace with a newly required user scope, update the Slack app,
+  sign out, and reconnect. Conversation-specific failures can instead be caused by
+  membership or workspace policy.
+- If a development build cannot find `conduit.gresource`, run
+  the Meson-produced `_build/src/conduit` or set `CONDUIT_RESOURCE_PATH` to
+  `_build/src/conduit.gresource`. If GSettings reports a missing schema, compile and
+  select it with the two schema commands shown under **Build from source**.
+- If credentials cannot be stored, confirm that a Secret Service-compatible keyring
+  is installed and unlocked.
+- If OAuth realtime is absent, verify Socket Mode, the user-event subscriptions, and
+  the app-level token under **Preferences > Realtime updates**.
+- For a browser session, re-import XOXC and XOXD from the same signed-in browser.
+  Enterprise Slack may also require that browser's exact User-Agent. Use OAuth if
+  browser TLS fingerprint requirements still block the session.
+- If a `slack://` link opens another client, check the current handler with
+  `xdg-mime query default x-scheme-handler/slack` and select Conduit as shown above.
+- If native huddle joining is unavailable, use **Open in Slack**. This is the
+  expected fallback.
+
+For other problems, search or open a
+[GitHub issue](https://github.com/adrighem/Conduit/issues) with the Conduit version,
+operating system, and desktop environment. Do not attach private workspace content
+or unredacted diagnostics. Report sensitive problems through
+[SECURITY.md](https://github.com/adrighem/Conduit/blob/main/SECURITY.md).
+
+## Build from source
+
+The default build requires:
+
+- Rust 1.88 or newer. The repository pins the reviewed Rust, rustfmt, and Clippy
+  version in `rust-toolchain.toml`, currently 1.97.1.
+- Meson 1.0 or newer, Ninja, CMake, a C compiler, pkg-config, and gettext.
+- Development packages for GTK4, libadwaita, WebKitGTK 6.0, GdkPixbuf, GLib/GIO,
+  and D-Bus.
+- Python 3 with PyGObject and GdkPixbuf introspection for the headless UI tests.
+- A running Secret Service-compatible keyring when connecting a workspace.
+
+Exact package names are recorded in the
+[Debian control file](https://github.com/adrighem/Conduit/blob/main/packaging/debian/control)
+and
+[Fedora RPM spec](https://github.com/adrighem/Conduit/blob/main/packaging/rpm/conduit.spec).
+
+Build, test, and run:
 
 ```sh
 meson setup _build
 meson compile -C _build
-meson test -C _build
+meson test -C _build --print-errorlogs
+glib-compile-schemas --strict --targetdir=_build/data data
+GSETTINGS_SCHEMA_DIR="$PWD/_build/data" _build/src/conduit
 ```
 
-Run the development build directly:
+Use the Meson-produced executable. It expects `conduit.gresource` beside the binary
+or in the configured package-data directory, plus the compiled GSettings schema
+selected above, so `cargo run` alone is not enough.
 
-```sh
-_build/src/conduit
-```
-
-The binary expects `conduit.gresource` beside it or in the configured package-data directory, so a Meson build or installation is recommended over invoking `cargo run` directly.
-
-To install under a local prefix:
+To install under your user prefix:
 
 ```sh
 meson setup _build --prefix="$HOME/.local" --reconfigure
@@ -132,204 +415,31 @@ meson compile -C _build
 meson install -C _build
 ```
 
-Rerunning the install upgrades an existing source installation. Conduit's
-install hook removes known obsolete branding files from earlier versions before
-Meson refreshes the GNOME icon and desktop caches, so manual cache deletion is
-not required. Fully quit and reopen Conduit after an upgrade. If GNOME Shell
-keeps an already-rendered application icon, sign out and back in once.
+Reinstalling from the same build directory upgrades the source installation and
+removes known obsolete branding files. Fully quit and reopen Conduit afterward. If
+GNOME Shell retains an old icon, sign out and back in once.
 
-To remove the files recorded by the most recent install from that build
-directory:
+To remove the files recorded by that build directory:
 
 ```sh
 ninja -C _build uninstall
 ```
 
-Use the same build directory and permissions that were used for installation.
+Use the same build directory and permissions used for installation. Native huddle
+media and screen sharing are optional development features; their dependencies and
+test matrix are documented in
+[Slack huddles](https://github.com/adrighem/Conduit/blob/main/docs/huddles.md).
+See
+[CONTRIBUTING.md](https://github.com/adrighem/Conduit/blob/main/CONTRIBUTING.md) for
+the complete contributor checks.
 
-Useful Rust-only checks while developing:
+## Contributing and license
 
-```sh
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-```
+The near-term goal is a dependable, keyboard-friendly client for everyday
+conversation, thread, unread, reaction, search, legacy-starred-message, and file
+workflows. Contributions are welcome. Read
+[CONTRIBUTING.md](https://github.com/adrighem/Conduit/blob/main/CONTRIBUTING.md)
+before starting larger work.
 
-Native huddle media is optional. It requires GStreamer 1.24 or newer; portal-based screen sharing additionally uses PipeWire and `xdg-desktop-portal`. See [Slack huddles](docs/huddles.md) for Debian packages, Meson feature flags, the synthetic test command, privacy guarantees, and the current Slack/Amazon Chime interoperability boundary.
-
-## Open Slack links with Conduit
-
-An installed Conduit desktop entry advertises support for Slack's official `slack://` scheme. Conduit does not change the current default handler during installation. To inspect the current choice and select Conduit explicitly:
-
-```sh
-xdg-mime query default x-scheme-handler/slack
-xdg-mime default eu.vanadrighem.conduit.desktop x-scheme-handler/slack
-```
-
-Save the first command's output if you may want to restore the previous handler later. Run the second command again with that desktop ID to restore it.
-
-Conduit accepts Slack's `open`, `channel`, `user`, `file`, `share-file`, and `app` URI forms. Channels, direct messages, and files use native Conduit surfaces. App links use Slack's official HTTPS `app_redirect` fallback, which opens the app or bot conversation and cannot preserve a requested App Home tab. The `share-file` form opens the file but reports that sharing an existing file is not yet supported. Workspace-scoped links must match the currently connected Slack team; Conduit will not open a same-shaped target from another workspace.
-
-Firefox, Chromium, and other browsers normally show an external-protocol confirmation before handing a `slack://` URI to the selected desktop application. Conduit does not install a browser extension and does not claim `http` or `https`, so an ordinary Slack web link remains in the browser unless Slack itself turns it into a `slack://` request.
-
-## Connect a Slack workspace
-
-### Recommended: OAuth with PKCE
-
-Create a Slack app, configure user-token OAuth, and add this redirect URL. Conduit performs the authorization using PKCE:
-
-```text
-http://127.0.0.1:8934/callback
-```
-
-Configure these user scopes:
-
-```text
-channels:read,channels:history,channels:join,channels:write,
-groups:read,groups:history,groups:write,
-im:read,im:history,im:write,
-mpim:read,mpim:history,mpim:write,
-users:read,users:read.email,users.profile:read,users.profile:write,usergroups:read,emoji:read,
-chat:write,search:read,
-stars:read,stars:write,
-reactions:read,reactions:write,
-files:read,files:write
-```
-
-Provide the client ID in one of three ways:
-
-- Enter it on Conduit's connection screen.
-- Set `CONDUIT_SLACK_CLIENT_ID` before starting Conduit.
-- Embed it in a packaged build:
-
-  ```sh
-  meson setup _build -Dslack_client_id=1234567890.1234567890123
-  ```
-
-Choose **Connect Workspace**, approve access in the browser, and return to Conduit. If scopes change later, sign out, update the Slack app, and reconnect so Slack issues a new grant.
-
-Desktop PKCE uses `oauth.v2.user.access` and user scopes. Conduit does not require a client secret or bot token for its core workspace connection.
-
-### Advanced: import a browser session
-
-Conduit can import `xoxc-*` and `xoxd-*` browser-session credentials. Enable **Use XOXC/XOXD tokens** on the connection screen, or set:
-
-```sh
-export CONDUIT_SLACK_XOXC_TOKEN=xoxc-...
-export CONDUIT_SLACK_XOXD_TOKEN=xoxd-...
-export CONDUIT_SLACK_USER_AGENT="Mozilla/5.0 ..." # exact source-browser value for Enterprise Slack
-```
-
-The aliases `SLACK_MCP_XOXC_TOKEN`, `SLACK_MCP_XOXD_TOKEN`, and `SLACK_MCP_USER_AGENT` are also accepted.
-
-Slack documents status changes through [`users.profile.set`](https://docs.slack.dev/reference/methods/users.profile.set/) for OAuth user tokens. Imported browser-session credentials reuse Conduit's existing request transport, but Slack does not document that credential mode for Web API status changes. Use OAuth if Slack rejects the request.
-
-#### Lookup `SLACK_MCP_XOXC_TOKEN`
-
-- Open your browser's Developer Console.
-- In Firefox, under `Tools -> Browser Tools -> Web Developer tools` in the menu bar
-- In Chrome, click the "three dots" button to the right of the URL Bar, then select
-  `More Tools -> Developer Tools`
-- Switch to the console tab.
-- Type "allow pasting" and press ENTER.
-- Paste the following snippet and press ENTER to execute:
-  `JSON.parse(localStorage.localConfig_v2).teams[document.location.pathname.match(/^\/client\/([A-Z0-9]+)/)[1]].token`
-
-Token value is printed right after the executed command (it starts with
-`xoxc-`), save it somewhere for now.
-
-#### Lookup `SLACK_MCP_XOXD_TOKEN`
-
-- Switch to "Application" tab and select "Cookies" in the left navigation pane (or use a cookie manager extension).
-- Find the cookie with the name `d`.  That's right, just the letter `d`.
-- Double-click the Value of this cookie.
-- Press Ctrl+C or Cmd+C to copy it's value to clipboard.
-- Save it for later.
-
-#### User agent
-
-For Enterprise Slack, copy `navigator.userAgent` from the same signed-in browser where you obtained the `xoxc` token and `xoxd` cookie. The [upstream Slack MCP guidance](https://github.com/korotovsky/slack-mcp-server/blob/master/docs/03-configuration-and-usage.md) notes that some higher-security environments additionally require a browser-compatible TLS handshake. Conduit does not impersonate a browser TLS fingerprint; if the exact User-Agent is still rejected, use the supported OAuth flow instead.
-
-Browser-session credentials are highly sensitive and rely on an unofficial authentication path. Keep them out of shell history, logs, commits, screenshots, and issue reports. Unset the variables after import if you do not want Conduit to import them again after sign-out.
-
-An imported browser session also supplies realtime updates through Slack's browser WebSocket. No `xapp-` token is needed for that workspace; **Preferences → Realtime updates** shows whether the XOXC/XOXD connection is online or retrying.
-
-At startup, browser sessions also use Slack Web's private bootstrap/counts flow to establish unread conversation state. Slack does not document this flow as a supported API, so Conduit validates it defensively and falls back to its bounded per-conversation refresh if it is unavailable or changes shape.
-
-## Optional realtime updates
-
-Enable Socket Mode in your Slack app, create an app-level token with `connections:write`, and subscribe to the message, reaction, and conversation events you want Conduit to receive. Save the `xapp-` token under **Preferences → Realtime updates**, then restart Conduit. The token is stored in the system keyring.
-
-For development, the token can instead be supplied through the environment:
-
-```sh
-export CONDUIT_SLACK_APP_TOKEN=xapp-...
-```
-
-`SLACK_APP_TOKEN` is accepted as an alias. Environment values take precedence over the keyring. Socket Mode starts after OAuth authentication, stops on sign-out, and reconnects automatically after transient failures. Browser-session workspaces use their XOXC/XOXD WebSocket instead.
-
-By default, incoming direct and group-direct messages, direct mentions, configured names/aliases or keywords/phrases, and replies in threads you started, replied to, or subscribed to can produce ten-second desktop notifications. Ordinary channel posts still become unread without notifying. Membership noise, other non-message noise, and self-authored messages become neither unread nor notifications. Muted or actively viewed messages do not notify but may remain unread; historical, already-observed, or at-or-before-read-cursor deliveries do not create new attention. Preferences → Notifications changes enabled triggers and configured terms immediately without a restart or reconnect.
-
-Names, aliases, keywords, and phrases are entered one per line. Matching is case- and diacritic-insensitive, collapses whitespace, respects alphanumeric word boundaries, and keeps punctuation significant. Channel notifications include the resolved sender, and selecting a thread-reply notification opens the matching thread. See [Attention And Notifications](docs/attention-and-notifications.md) for the complete policy and raw-unread distinction. Without a realtime connection, Conduit continues to work through cached state, explicit refreshes, and Slack Web API requests.
-
-## Keyboard shortcuts
-
-| Action | Shortcut |
-| --- | --- |
-| Switch conversation | `Ctrl+K` |
-| Search workspace messages | `Ctrl+F` |
-| Messages / Unreads / Files / Later | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` |
-| Focus composer | `Ctrl+M` |
-| Send message | `Enter` |
-| Insert newline | `Shift+Enter` or `Ctrl+Enter` |
-| Complete emoji | Type `:` and at least two characters, then `Enter` or `Tab` |
-| Complete person | Type `@`, filter by name, then `Enter` or `Tab` |
-| Upload file | `Ctrl+O` |
-| Close thread | `Ctrl+Shift+W` |
-| Refresh conversations | `F5` |
-| Show shortcuts | `Ctrl+?` |
-| Preferences | `Ctrl+,` |
-| Quit | `Ctrl+Q` |
-
-## Command-line options
-
-```text
--c, --connect       Open the workspace connection flow
--d, --debug         Enable UI, rendering, cache, and Slack diagnostics
-    --debug-auth    Enable OAuth diagnostics only
-```
-
-Debug output can contain private workspace metadata such as channel names, user IDs, timestamps, and unread counts. To opt into only the attention diagnostics target, run:
-
-```sh
-RUST_LOG=conduit::attention=trace conduit
-```
-
-That target is limited to counters, booleans, and stable category codes; it excludes message text, configured terms, and workspace, user, conversation, and message identifiers. This target-specific privacy property does not apply to general `--debug` output. Diagnostics should not contain tokens or authorization codes, but always review and redact logs before sharing them.
-
-## Local data and security
-
-- OAuth tokens, imported browser-session credentials, and Socket Mode app tokens are stored through the system Secret Service/keyring.
-- Workspace metadata, resolved names and statuses, emoji information, and message and thread history are stored in `state/state.sqlite3` below Conduit's XDG cache directory. Downloaded attachments, image/media data, and WebKit data are cached in sibling directories. None has additional application-level encryption.
-- Drafts and preferences are stored through GSettings.
-- Huddle media, portal sessions, SDP, ICE candidates, and TURN credentials are ephemeral and are not stored in Conduit's cache or settings.
-- **Sign Out** removes the keyring credential and deactivates the workspace for desktop search. It does not currently erase cached workspace content or drafts, and credential environment variables remain available for re-import.
-- Authenticated preview, media, and attachment downloads accept only trusted Slack HTTPS URLs and enforce size bounds. Conduit also restricts message navigation to supported internal actions and HTTP(S) links and disables file-URL access and several unused WebKit capabilities. This is not a claim of a formal security audit.
-
-Never share tokens, cookies, private messages, or unredacted debug logs. See [SECURITY.md](SECURITY.md) for vulnerability-reporting guidance.
-
-## Troubleshooting
-
-- If a feature reports missing permissions, sign out, update the Slack app's user scopes, and reconnect to obtain a fresh grant.
-- If a development build cannot find `conduit.gresource`, run it from the Meson build tree or set `CONDUIT_RESOURCE_PATH` to the generated resource bundle.
-- If credentials cannot be stored, confirm that a Secret Service-compatible keyring is installed and unlocked.
-- If realtime updates are absent, check **Preferences → Realtime updates**. For OAuth workspaces, verify Socket Mode, event subscriptions, and the `xapp-` token. For browser-session workspaces, re-import valid XOXC/XOXD credentials. Core Web API workflows remain available without realtime updates.
-- If a `slack://` link opens another client, check `xdg-mime query default x-scheme-handler/slack`, install Conduit's desktop entry, and select it as described above. Browser external-protocol prompts may need separate approval.
-- If huddle discovery is available but native joining is not, use **Open in Slack**. This is the expected safe fallback until Conduit has both a verified Slack bootstrap adapter and a compatible Amazon Chime bridge.
-- Use `--debug-auth` for OAuth problems and `--debug` for wider diagnostics, then redact output before sharing it.
-
-## Project direction
-
-The near-term goal is a dependable, keyboard-friendly client for daily channel, DM, thread, unread, reaction, search, saved-item, and file workflows. Broader Slack surface parity will follow where public APIs and a native desktop experience make it practical.
-
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before starting larger work, and use the guidance in [SECURITY.md](SECURITY.md) for sensitive reports. The project is licensed under [GPL-3.0-or-later](LICENSE).
+Conduit is licensed under the
+[GNU General Public License v3.0 or later](https://github.com/adrighem/Conduit/blob/main/LICENSE).
