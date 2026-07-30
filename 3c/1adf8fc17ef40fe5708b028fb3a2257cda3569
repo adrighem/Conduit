@@ -1,0 +1,9 @@
+Issue #11 Phase 3 Task 4 authority slice validation
+
+Source validation before the non-overlapping emoji rebase: cargo test 874 passed, 3 ignored, 0 failed; cargo check passed without warnings; cargo fmt --check passed; Meson compile passed; Meson tests 8/8 passed; git diff --check passed.
+
+Focused coverage: fresh history 5/5; socket 24/24; history 47/47; realtime 34 passed and 2 ignored; deterministic history publication, delayed timestamp, FIFO recovery, direct attention failure, closed-worker fallback, both authority orders, and SQLite reopen regressions passed.
+
+Two independent frozen-diff reviews found no blockers. Exact rebased head cargo check and diff check passed.
+
+Task 4 remains in progress. Scoped follow-ups: full timeline reconstruction after cache-corruption reset, and thread-catalog edit/delete/move reconciliation.
