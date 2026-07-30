@@ -25,8 +25,8 @@ use crate::models::{SlackUnreadState, LOCAL_READ_TS_KEY};
 use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 use crate::workspace_pipeline::{
-    same_message_identity, ConversationAttentionObservation, MessageMutationKind, StoreBatch,
-    StoreChange, WorkspaceRevision,
+    same_message_identity, AttentionDeliveryIdentity, ConversationAttentionObservation,
+    MessageMutationKind, StoreBatch, StoreChange, WorkspaceRevision,
 };
 
 pub(crate) const CACHE_VERSION: u32 = 1;
@@ -76,7 +76,7 @@ pub(crate) enum StoreError {
 }
 
 impl StoreError {
-    fn rejected_update(message: impl Into<String>) -> Self {
+    pub(crate) fn rejected_update(message: impl Into<String>) -> Self {
         Self::RejectedUpdate {
             message: message.into(),
         }
@@ -162,6 +162,18 @@ pub(crate) enum StoreBatchExecution {
     Committed,
     Unchanged,
     SkippedStale,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NotificationClaimOutcome {
+    pub(crate) identity: AttentionDeliveryIdentity,
+    pub(crate) notification_claimed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoreBatchOutcome {
+    pub(crate) execution: StoreBatchExecution,
+    pub(crate) notification_claims: Vec<NotificationClaimOutcome>,
 }
 
 /// Owns the bounded, persistent SQLite connections for one derived cache.
@@ -628,6 +640,7 @@ pub(crate) struct WorkspaceBootstrap {
     pub(crate) custom_emojis: HashMap<String, String>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AttentionObservationStatus {
     InvalidIdentity,
@@ -636,6 +649,7 @@ pub(crate) enum AttentionObservationStatus {
     Accepted,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AttentionDeliveryOutcome {
     pub(crate) observation: AttentionObservationStatus,
@@ -686,25 +700,49 @@ impl WorkspaceStore {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn committed_transaction_count(&self) -> Result<u64> {
+        Ok(self.hub().await?.metrics().transactions)
+    }
+
     /// Executes one coordinator batch on the existing writer queue.
     ///
     /// The gate is strictly increasing rather than contiguous while compatibility
     /// surfaces still produce unsubmitted revisions. Migrated runtime paths must
     /// serialize reducer assignment and this submission.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn execute_store_batch(
         &self,
         batch: StoreBatch,
     ) -> Result<StoreBatchExecution> {
+        Ok(self
+            .execute_store_batch_inner(batch, false)
+            .await?
+            .execution)
+    }
+
+    pub(crate) async fn execute_store_batch_with_claims(
+        &self,
+        batch: StoreBatch,
+    ) -> Result<StoreBatchOutcome> {
         self.execute_store_batch_inner(batch, false).await
     }
 
     /// Rebuilds a reset cache from the coordinator's complete current
     /// projection. An equal revision is accepted because an intervening delta
     /// may already have reached the newly empty cache.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn execute_store_repair_batch(
         &self,
         batch: StoreBatch,
     ) -> Result<StoreBatchExecution> {
+        Ok(self.execute_store_batch_inner(batch, true).await?.execution)
+    }
+
+    pub(crate) async fn execute_store_repair_batch_with_claims(
+        &self,
+        batch: StoreBatch,
+    ) -> Result<StoreBatchOutcome> {
         self.execute_store_batch_inner(batch, true).await
     }
 
@@ -712,8 +750,9 @@ impl WorkspaceStore {
         &self,
         batch: StoreBatch,
         accept_equal_revision: bool,
-    ) -> Result<StoreBatchExecution> {
+    ) -> Result<StoreBatchOutcome> {
         let revision = batch.revision();
+        let notification_claims = batch.notification_claims();
         let changes = batch.changes().to_vec();
         let workspace_key = self.workspace_key.clone();
         let workspace_id = self.workspace_id.clone();
@@ -727,19 +766,56 @@ impl WorkspaceStore {
                 if revision < *persisted_revision
                     || (!accept_equal_revision && revision == *persisted_revision)
                 {
-                    return Ok(StoreBatchExecution::SkippedStale);
+                    let notification_claims = known_notification_claim_outcomes(
+                        connection,
+                        &workspace_key,
+                        notification_claims,
+                    )?;
+                    return Ok(StoreBatchOutcome {
+                        execution: StoreBatchExecution::SkippedStale,
+                        notification_claims,
+                    });
                 }
 
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let mut changed =
                     ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                let mut notification_claims = Vec::new();
                 for change in changes {
-                    match apply_store_change(&transaction, &workspace_key, &workspace_id, change) {
-                        Ok(change_applied) => changed |= change_applied,
-                        Err(error) => {
-                            let _ = transaction.rollback();
-                            return Err(error);
+                    match change {
+                        StoreChange::AttentionNotificationClaim { identity } => {
+                            match apply_attention_notification_claim(
+                                &transaction,
+                                &workspace_key,
+                                &identity,
+                            ) {
+                                Ok((change_applied, notification_claimed)) => {
+                                    changed |= change_applied;
+                                    notification_claims.push(NotificationClaimOutcome {
+                                        identity,
+                                        notification_claimed,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = transaction.rollback();
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        change => {
+                            match apply_store_change(
+                                &transaction,
+                                &workspace_key,
+                                &workspace_id,
+                                change,
+                            ) {
+                                Ok(change_applied) => changed |= change_applied,
+                                Err(error) => {
+                                    let _ = transaction.rollback();
+                                    return Err(error);
+                                }
+                            }
                         }
                     }
                 }
@@ -749,7 +825,10 @@ impl WorkspaceStore {
                     StoreBatchExecution::Unchanged
                 };
                 *persisted_revision = revision;
-                Ok(outcome)
+                Ok(StoreBatchOutcome {
+                    execution: outcome,
+                    notification_claims,
+                })
             })
             .await
     }
@@ -1309,6 +1388,7 @@ impl WorkspaceStore {
     /// Atomically records a classified message and, when requested, claims its
     /// native-notification identity. This keeps a restart between the two
     /// writes from turning one realtime delivery into divergent state.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn accept_attention_delivery(
         &self,
         channel_id: &str,
@@ -2768,6 +2848,9 @@ fn apply_store_change(
             &observations,
         )
         .map(|(changed, _)| changed),
+        StoreChange::AttentionNotificationClaim { .. } => {
+            unreachable!("notification claims are applied with keyed batch outcomes")
+        }
         StoreChange::ConversationRemoved { channel_id } => {
             require_store_key("conversation", &channel_id)?;
             Ok(transaction.execute(
@@ -3878,6 +3961,65 @@ fn attention_delivery_identity(channel_id: &str, message_ts: &str) -> Option<Str
                 output
             }),
     )
+}
+
+fn apply_attention_notification_claim(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    identity: &AttentionDeliveryIdentity,
+) -> Result<(bool, bool)> {
+    let identity_key = attention_delivery_identity(&identity.channel_id, &identity.message_ts)
+        .ok_or_else(|| StoreError::rejected_update("invalid attention delivery identity"))?;
+    let mut ledger = load_sqlite_item::<Vec<String>>(
+        transaction,
+        workspace_key,
+        ATTENTION_DELIVERY_KIND,
+        ATTENTION_DELIVERY_LEDGER_KEY,
+    )?
+    .unwrap_or_default();
+    if ledger.iter().any(|known| known == &identity_key) {
+        return Ok((false, false));
+    }
+    ledger.push(identity_key);
+    if ledger.len() > MAX_ATTENTION_DELIVERIES {
+        ledger.drain(..ledger.len() - MAX_ATTENTION_DELIVERIES);
+    }
+    let changed = upsert_sqlite_item(
+        transaction,
+        workspace_key,
+        ATTENTION_DELIVERY_KIND,
+        ATTENTION_DELIVERY_LEDGER_KEY,
+        &ledger,
+    )?;
+    Ok((changed, true))
+}
+
+fn known_notification_claim_outcomes(
+    connection: &Connection,
+    workspace_key: &str,
+    identities: Vec<AttentionDeliveryIdentity>,
+) -> Result<Vec<NotificationClaimOutcome>> {
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ledger = load_sqlite_item::<Vec<String>>(
+        connection,
+        workspace_key,
+        ATTENTION_DELIVERY_KIND,
+        ATTENTION_DELIVERY_LEDGER_KEY,
+    )?
+    .unwrap_or_default();
+    Ok(identities
+        .into_iter()
+        .filter(|identity| {
+            attention_delivery_identity(&identity.channel_id, &identity.message_ts)
+                .is_some_and(|identity| ledger.iter().any(|known| known == &identity))
+        })
+        .map(|identity| NotificationClaimOutcome {
+            identity,
+            notification_claimed: false,
+        })
+        .collect())
 }
 
 fn conversation_for_cache(conversation: &SlackConversation) -> SlackConversation {
@@ -7674,6 +7816,100 @@ mod tests {
                 .claim_attention_delivery("D1", "1710000001.000001")
                 .await
                 .unwrap());
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn notification_claim_outcome_is_keyed_independently_of_batch_commit() {
+        let directory = temp_cache_dir("workspace-store-keyed-attention-claim");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            assert!(store.claim_attention_delivery("D1", "1.0").await.unwrap());
+            let transaction_baseline = store.committed_transaction_count().await.unwrap();
+            let duplicate_identity = AttentionDeliveryIdentity::new("D1", "1.0").unwrap();
+            let duplicate_batch = StoreBatch::new(
+                WorkspaceRevision::INITIAL.successor(),
+                vec![
+                    StoreChange::MessageDelta {
+                        channel_id: "D1".into(),
+                        message: SlackMessage {
+                            ts: "2.0".into(),
+                            text: Some("the delta still changes".into()),
+                            ..Default::default()
+                        },
+                        kind: MessageMutationKind::Posted,
+                    },
+                    StoreChange::AttentionNotificationClaim {
+                        identity: duplicate_identity.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+            assert!(!duplicate_batch.is_repair_subsumable());
+            let duplicate = store
+                .execute_store_batch_with_claims(duplicate_batch)
+                .await
+                .unwrap();
+            assert_eq!(duplicate.execution, StoreBatchExecution::Committed);
+            assert_eq!(
+                duplicate.notification_claims,
+                [NotificationClaimOutcome {
+                    identity: duplicate_identity,
+                    notification_claimed: false,
+                }]
+            );
+            assert_eq!(
+                store.committed_transaction_count().await.unwrap() - transaction_baseline,
+                1
+            );
+            assert_eq!(
+                store
+                    .load_history("D1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                ["2.0"]
+            );
+
+            let fresh_identity = AttentionDeliveryIdentity::new("D1", "3.0").unwrap();
+            let fresh = store
+                .execute_store_batch_with_claims(
+                    StoreBatch::new(
+                        WorkspaceRevision::INITIAL.successor().successor(),
+                        vec![
+                            StoreChange::MessageDelta {
+                                channel_id: "D1".into(),
+                                message: SlackMessage {
+                                    ts: "3.0".into(),
+                                    text: Some("fresh claim".into()),
+                                    ..Default::default()
+                                },
+                                kind: MessageMutationKind::Posted,
+                            },
+                            StoreChange::AttentionNotificationClaim {
+                                identity: fresh_identity.clone(),
+                            },
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(fresh.execution, StoreBatchExecution::Committed);
+            assert_eq!(
+                fresh.notification_claims,
+                [NotificationClaimOutcome {
+                    identity: fresh_identity,
+                    notification_claimed: true,
+                }]
+            );
         });
 
         let _ = std::fs::remove_dir_all(directory);
