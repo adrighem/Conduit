@@ -7937,24 +7937,23 @@ mod tests {
                     .unwrap();
             }
 
-            for current in [
-                view.conversations.borrow().get("C1").cloned().unwrap(),
-                store
-                    .load_conversations()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .into_iter()
-                    .find(|conversation| conversation.id == "C1")
-                    .unwrap(),
-                workspace
-                    .coordinator
-                    .lock()
-                    .unwrap()
-                    .conversation("C1")
-                    .cloned()
-                    .unwrap(),
-            ] {
+            let view_current = view.conversations.borrow().get("C1").cloned().unwrap();
+            let stored_current = store
+                .load_conversations()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .find(|conversation| conversation.id == "C1")
+                .unwrap();
+            let coordinator_current = workspace
+                .coordinator
+                .lock()
+                .unwrap()
+                .conversation("C1")
+                .cloned()
+                .unwrap();
+            for current in [view_current, stored_current, coordinator_current] {
                 assert_eq!(current.name.as_deref(), Some("general"));
                 assert!(current.is_starred());
                 assert_eq!(current.raw_unread_activity_count(), 0);
