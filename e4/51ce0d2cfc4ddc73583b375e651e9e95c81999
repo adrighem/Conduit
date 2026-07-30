@@ -1,0 +1,3 @@
+Issue #11 Phase 3 task 4 conversation-refresh authority: base-aware composite metadata and unread refresh batches for browser unread, detail enrichment including MPIM members, and prefetched unread publication, with sparse typed metadata patches, shared unread-owned field and local-read marker semantics, strict component IDs, and compatibility local-read admission serialization.
+
+Validated on exact e451ce0 with a sanitized full suite: 848 passed, 3 ignored; cargo check and formatting; Meson compile and 8/8 tests; independent review found no remaining findings. Local strict Clippy was unavailable because the installed driver does not match the repository Rust 1.97.1 toolchain, so remote CI remains the final Clippy gate.
