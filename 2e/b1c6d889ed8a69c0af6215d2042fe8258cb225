@@ -1,0 +1,3 @@
+Issue #11 Phase 3 task 4 prefetched-history authority: durable canonical HistorySnapshot publication replaces the raw prefetch history write, with ordered semantic attention patches and atomic store changes that preserve metadata, local reads, and revision-ordered recovery.
+
+Validated on exact 2eb1c6d with a sanitized full suite: 854 passed, 3 ignored; cargo check and formatting; Meson compile and 8/8 tests; focused canonical persistence, atomic rollback, strict identity, idempotence, and before/after-cursor recovery regressions; independent final review found no remaining findings. Local strict Clippy remains unavailable because the installed driver does not match the repository Rust 1.97.1 toolchain, so remote CI is the final Clippy gate.
