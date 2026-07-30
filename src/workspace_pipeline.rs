@@ -2747,7 +2747,6 @@ mod tests {
             latest: Some("4.0".to_string()),
             mention_count: Some(2),
             is_open: Some(false),
-            ..Default::default()
         };
         let reduction = coordinator
             .apply(WorkspaceMutation::ConversationRefreshBatch(vec![
