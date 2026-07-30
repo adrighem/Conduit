@@ -5288,6 +5288,22 @@ mod tests {
     }
 
     #[test]
+    fn reaction_chips_resolve_slack_unicode_canonical_names() {
+        let mut message = message("skeptical");
+        message.reactions = Some(vec![SlackReaction {
+            name: Some("face_with_raised_eyebrow".to_string()),
+            count: Some(1),
+            users: None,
+        }]);
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains(">🤨 1</a>"));
+        assert!(!html.contains(":face_with_raised_eyebrow: 1"));
+        assert!(html.contains("name=face_with_raised_eyebrow&amp;add=true"));
+    }
+
+    #[test]
     fn reaction_chip_toggle_preserves_thread_context() {
         let mut reply = message("reply");
         reply.thread_ts = Some("1710000000.000000".to_string());

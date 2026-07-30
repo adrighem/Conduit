@@ -1,8 +1,22 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
 use crate::search::{SearchField, SearchQuery, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT};
+
+static UNICODE_BY_CANONICAL_NAME: LazyLock<HashMap<String, Option<&'static emojis::Emoji>>> =
+    LazyLock::new(|| {
+        let mut by_name = HashMap::new();
+        for emoji in emojis::iter() {
+            let name = canonical_emoji_name(emoji.name());
+            by_name
+                .entry(name)
+                .and_modify(|resolved| *resolved = None)
+                .or_insert(Some(emoji));
+        }
+        by_name
+    });
 
 pub const EMOJI_PICKER_PROTOCOL_VERSION: u8 = 1;
 pub const EMOJI_PICKER_RESULT_LIMIT: usize = 64;
@@ -59,7 +73,14 @@ impl<'a> EmojiCatalog<'a> {
                 return Some(EmojiValue::CustomImage(value.clone()));
             }
         }
-        emojis::get_by_shortcode(name).map(|emoji| EmojiValue::Unicode(emoji.as_str()))
+        emojis::get_by_shortcode(name)
+            .or_else(|| {
+                UNICODE_BY_CANONICAL_NAME
+                    .get(&canonical_emoji_name(name))
+                    .copied()
+                    .flatten()
+            })
+            .map(|emoji| EmojiValue::Unicode(emoji.as_str()))
     }
 
     pub fn entries(&self) -> Vec<EmojiEntry> {
@@ -86,6 +107,23 @@ impl<'a> EmojiCatalog<'a> {
         }));
         entries
     }
+}
+
+fn canonical_emoji_name(name: &str) -> String {
+    let mut canonical = String::with_capacity(name.len());
+    let mut pending_separator = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            if pending_separator && !canonical.is_empty() {
+                canonical.push('_');
+            }
+            canonical.push(character.to_ascii_lowercase());
+            pending_separator = false;
+        } else {
+            pending_separator = true;
+        }
+    }
+    canonical
 }
 
 /// Widget-independent emoji picker data. Both the native composer popover and
@@ -311,6 +349,46 @@ mod tests {
             ))
         );
         assert_eq!(catalog.resolve("ship_it"), Some(EmojiValue::Unicode("🚀")));
+    }
+
+    #[test]
+    fn catalog_resolves_slack_names_from_unicode_canonical_names() {
+        let custom = HashMap::from([(
+            "skeptical".to_string(),
+            "alias:face_with_raised_eyebrow".to_string(),
+        )]);
+        let catalog = EmojiCatalog::new(&custom);
+
+        assert_eq!(
+            catalog.resolve("face_with_raised_eyebrow"),
+            Some(EmojiValue::Unicode("🤨"))
+        );
+        assert_eq!(
+            catalog.resolve("skeptical"),
+            Some(EmojiValue::Unicode("🤨"))
+        );
+    }
+
+    #[test]
+    fn exact_custom_emoji_shadows_unicode_canonical_name_fallback() {
+        let custom = HashMap::from([(
+            "face_with_raised_eyebrow".to_string(),
+            "https://emoji.example/skeptical.png".to_string(),
+        )]);
+
+        assert_eq!(
+            EmojiCatalog::new(&custom).resolve("face_with_raised_eyebrow"),
+            Some(EmojiValue::CustomImage(
+                "https://emoji.example/skeptical.png".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn canonical_name_fallback_rejects_ambiguous_names() {
+        let custom = HashMap::new();
+
+        assert_eq!(EmojiCatalog::new(&custom).resolve("keycap"), None);
     }
 
     #[test]
