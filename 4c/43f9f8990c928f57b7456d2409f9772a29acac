@@ -1,0 +1,9 @@
+Task: Integrate the validated bounded SyncJob scheduler after authoritative conversation adoption
+
+Summary: Added a Tokio runtime adapter with admission-before-spawn, bounded payload ownership, tracked retry wakeups, terminal receipts, panic containment, cancellation feedback, and durable shutdown draining. RuntimeState now owns a fresh scheduler per session and drains the old scheduler during replacement.
+
+Modified files: src/main.rs, src/runtime.rs, src/runtime_sync.rs
+
+Rationale: Establish the validated bounded scheduler as a session-owned runtime boundary before concrete startup, refresh, navigation, and membership work moves onto it in Task 2.
+
+Validation: cargo check --all-targets; cargo test --all-targets --no-fail-fast (981 passed, 3 ignored); 16 focused runtime_sync tests; git diff --check. Coverage tooling is not configured.
