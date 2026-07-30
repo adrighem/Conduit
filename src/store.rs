@@ -1256,6 +1256,7 @@ impl WorkspaceStore {
         .await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn observe_conversation_attention_batch(
         &self,
         channel_id: &str,
@@ -1686,6 +1687,7 @@ impl WorkspaceStore {
             .filter(|messages| !messages.is_empty()))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn store_thread(
         &self,
         channel_id: &str,

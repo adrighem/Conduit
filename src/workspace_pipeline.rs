@@ -504,6 +504,17 @@ impl WorkspaceCoordinator {
             .unwrap_or_default()
     }
 
+    pub(crate) fn thread_with_revisions(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+    ) -> Vec<(SlackMessage, WorkspaceRevision)> {
+        self.threads
+            .get(&(channel_id.to_string(), thread_ts.to_string()))
+            .map(TimelineState::messages_with_revisions)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn apply(&mut self, mutation: WorkspaceMutation) -> Option<WorkspaceReduction> {
         self.apply_from(MutationOrigin::Cache, mutation)
     }
