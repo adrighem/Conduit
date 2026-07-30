@@ -1,0 +1,3 @@
+Issue #11 Phase 3 task 4 CI follow-up: remove a redundant Default struct update reported by the pinned Rust 1.97 all-targets Clippy gate.
+
+Validated with the sanitized conversation-refresh suite (7 passed), cargo check, formatting, and diff checks. Remote CI remains the exact Rust 1.97 strict Clippy verification.
