@@ -2883,6 +2883,24 @@ fn configure_message_web_view_settings(settings: &webkit6::Settings) {
     settings.set_zoom_text_only(true);
 }
 
+fn message_web_view_context_menu_action_is_unsupported(action: webkit6::ContextMenuAction) -> bool {
+    matches!(
+        action,
+        webkit6::ContextMenuAction::GoBack
+            | webkit6::ContextMenuAction::GoForward
+            | webkit6::ContextMenuAction::Stop
+            | webkit6::ContextMenuAction::Reload
+    )
+}
+
+fn prune_message_web_view_context_menu(context_menu: &webkit6::ContextMenu) {
+    for item in context_menu.items() {
+        if message_web_view_context_menu_action_is_unsupported(item.stock_action()) {
+            context_menu.remove(&item);
+        }
+    }
+}
+
 fn message_text_zoom(font_name: Option<&str>) -> f64 {
     let Some(font_name) = font_name else {
         return 1.0;
@@ -3709,6 +3727,11 @@ impl ConduitWindow {
                 },
             );
         }
+
+        web_view.connect_context_menu(|_, context_menu, _| {
+            prune_message_web_view_context_menu(context_menu);
+            false
+        });
 
         let weak_window = self.downgrade();
         web_view.connect_decide_policy(move |_, decision, decision_type| {
@@ -10711,6 +10734,45 @@ fn update_huddle_device_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_web_view_context_menu_classifies_unsupported_navigation_actions() {
+        for action in [
+            webkit6::ContextMenuAction::GoBack,
+            webkit6::ContextMenuAction::GoForward,
+            webkit6::ContextMenuAction::Stop,
+            webkit6::ContextMenuAction::Reload,
+        ] {
+            assert!(message_web_view_context_menu_action_is_unsupported(action));
+        }
+
+        for action in [
+            webkit6::ContextMenuAction::Copy,
+            webkit6::ContextMenuAction::SelectAll,
+            webkit6::ContextMenuAction::OpenLink,
+            webkit6::ContextMenuAction::CopyLinkToClipboard,
+        ] {
+            assert!(!message_web_view_context_menu_action_is_unsupported(action));
+        }
+    }
+
+    #[test]
+    fn message_web_view_factory_filters_native_navigation_actions() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let factory = production
+            .split_once("    fn create_message_web_view(")
+            .unwrap()
+            .1
+            .split_once("    fn reaction_emoji_picker_model(")
+            .unwrap()
+            .0;
+
+        assert!(factory.contains("connect_context_menu"));
+        assert!(factory.contains("prune_message_web_view_context_menu(context_menu)"));
+    }
 
     #[test]
     fn gtk_catalogs_accept_mutations_only_through_workspace_patches() {
