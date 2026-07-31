@@ -39,7 +39,7 @@
 
 - [x] Task: Define SidebarProjection keyed splice/update/reset behavior with 1,430-row regression tests cd2ab3c
 - [x] Task: Migrate the sidebar to GtkListView, gio::ListStore, and stable single selection ec6dfe2
-- [ ] Task: Define TimelinePresenter document/revision/loading/delta behavior with scroll regression tests
+- [x] Task: Define TimelinePresenter document/revision/loading/delta behavior with scroll regression tests 029b8d1
 - [ ] Task: Route one batched TimelineDelta per frame and restrict full document loads
 - [ ] Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers
 - [ ] Task: Conductor - User Manual Verification 'Incremental GTK and WebKit presentation' (Protocol in workflow.md)
