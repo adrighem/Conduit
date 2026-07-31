@@ -55,6 +55,8 @@ mod store;
 mod sync_scheduler;
 mod thread_catalog;
 mod thread_pane;
+#[allow(dead_code)]
+mod timeline_presenter;
 mod window;
 mod workspace_pipeline;
 mod workspace_state;

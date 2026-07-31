@@ -152,9 +152,15 @@ START_PROBE = r"""
     const snapshotAnchorTop = replacement.getBoundingClientRect().top;
     const snapshotHtml = Array.from({ length: 24 }, (_, offset) => {
       const index = offset;
+      const delayedMedia = index === 2
+        ? '<div data-image-key="anchor-image" data-image-alt="Image" ' +
+          'data-image-unavailable="Unavailable" style="height:20px"></div>' +
+          '<div data-image-key="anchor-video" data-image-alt="Video" ' +
+          'data-image-unavailable="Unavailable" style="height:20px"></div>'
+        : '';
       return '<li><article class="message" data-message-ts="' + index +
         '" style="min-height:' + (80 + index % 3 * 20) + 'px">Snapshot ' + index +
-        ' with changed wrapping and dimensions.</article></li>';
+        ' with changed wrapping and dimensions.' + delayedMedia + '</article></li>';
     }).join("");
     const snapshotApplied = window.conduitApplyTimelinePatch({
       type: "replace-snapshot",
@@ -164,6 +170,239 @@ START_PROBE = r"""
     await wait(100);
     const snapshotAnchor = document.querySelector('[data-message-ts="10"]');
     const snapshotAnchorDelta = snapshotAnchor.getBoundingClientRect().top - snapshotAnchorTop;
+
+    snapshotAnchor.scrollIntoView({ block: "start" });
+    window.dispatchEvent(new Event("scroll"));
+    await nextFrame();
+    await nextFrame();
+    const deltaAnchorTop = snapshotAnchor.getBoundingClientRect().top;
+    const stateBeforeDelta = window.conduitTimelineState();
+    const batchResult = window.conduitApplyTimelineDelta({
+      id: 1,
+      document_generation: 7,
+      base_timeline_revision: 40,
+      timeline_revision: 41,
+      operations: [
+        {
+          type: "insert-message",
+          position: "append",
+          message_ts: "batch-1",
+          html: '<li class="message-list-item"><article class="message" data-message-ts="batch-1" ' +
+            'data-author-user-id="U-BATCH"><header class="message-header">' +
+            '<span class="author-actions"><span class="author-label">Old name</span></span>' +
+            '</header><span data-mention-user-id="U-BATCH">@old</span>' +
+            '<span data-message-region="responses">old response</span>' +
+            'Batch message</article></li>'
+        },
+        {
+          type: "replace-message",
+          message_ts: "batch-1",
+          html: '<article class="message" data-message-ts="batch-1" ' +
+            'data-author-user-id="U-BATCH"><header class="message-header">' +
+            '<span class="author-actions"><span class="author-label">Old name</span></span>' +
+            '</header><span data-mention-user-id="U-BATCH">@old</span>' +
+            '<span data-message-region="responses">old response</span>' +
+            'Batch edited message</article>',
+          part_html: ""
+        },
+        {
+          type: "insert-message",
+          position: "append",
+          message_ts: "batch-1",
+          html: '<li><article class="message" data-message-ts="batch-1">duplicate</article></li>'
+        },
+        {
+          type: "insert-message",
+          position: "append",
+          message_ts: "batch-delete",
+          html: '<li class="message-list-item"><article class="message" ' +
+            'data-message-ts="batch-delete">remove me</article></li>'
+        },
+        {
+          type: "remove-message",
+          message_ts: "batch-delete"
+        },
+        {
+          type: "update-user",
+          user_id: "U-BATCH",
+          name: "Batch User",
+          status_html: '<span class="user-status">Busy</span>'
+        },
+        {
+          type: "replace-region",
+          message_ts: "batch-1",
+          region: "responses",
+          html: "new response"
+        },
+        {
+          type: "update-image",
+          asset_key: "anchor-image",
+          source: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+        },
+        {
+          type: "update-image",
+          asset_key: "anchor-video",
+          source: "data:video/mp4;base64,AAAA"
+        },
+        {
+          type: "update-image",
+          asset_key: "missing-image",
+          source: null
+        },
+        {
+          type: "update-user",
+          user_id: "U-MISSING",
+          name: "Missing User",
+          status_html: ""
+        }
+      ]
+    });
+    const stateAfterDelta = window.conduitTimelineState();
+    await nextFrame();
+    await nextFrame();
+    const batchAnchorDelta = snapshotAnchor.getBoundingClientRect().top - deltaAnchorTop;
+    const batchMessages = document.querySelectorAll('[data-message-ts="batch-1"]');
+    const batchMessage = batchMessages[0];
+
+    const mismatchHtml = document.querySelector(".message-list").innerHTML;
+    const baseMismatchResult = window.conduitApplyTimelineDelta({
+      id: 2,
+      document_generation: 7,
+      base_timeline_revision: 40,
+      timeline_revision: 42,
+      operations: [{
+        type: "insert-message",
+        position: "append",
+        message_ts: "must-not-insert-base",
+        html: '<li><article class="message" data-message-ts="must-not-insert-base">bad</article></li>'
+      }]
+    });
+    const generationMismatchResult = window.conduitApplyTimelineDelta({
+      id: 3,
+      document_generation: 8,
+      base_timeline_revision: 41,
+      timeline_revision: 42,
+      operations: [{
+        type: "insert-message",
+        position: "append",
+        message_ts: "must-not-insert-generation",
+        html: '<li><article class="message" data-message-ts="must-not-insert-generation">bad</article></li>'
+      }]
+    });
+    const skippedRevisionResult = window.conduitApplyTimelineDelta({
+      id: 4,
+      document_generation: 7,
+      base_timeline_revision: 41,
+      timeline_revision: 43,
+      operations: []
+    });
+    const mismatchDidNotMutate =
+      document.querySelector(".message-list").innerHTML === mismatchHtml;
+
+    const missingEnrichmentResult = window.conduitApplyTimelineDelta({
+      id: 5,
+      document_generation: 7,
+      base_timeline_revision: 41,
+      timeline_revision: 42,
+      operations: [
+        {
+          type: "update-image",
+          asset_key: "still-missing",
+          source: null
+        },
+        {
+          type: "update-user",
+          user_id: "STILL-MISSING",
+          name: "Nobody",
+          status_html: ""
+        }
+      ]
+    });
+    const corruptResult = window.conduitApplyTimelineDelta({
+      id: 6,
+      document_generation: 7,
+      base_timeline_revision: 42,
+      timeline_revision: 43,
+      operations: [{
+        type: "replace-message",
+        message_ts: "missing-structural-target",
+        html: '<article class="message" data-message-ts="missing-structural-target">bad</article>',
+        part_html: ""
+      }]
+    });
+    const revisionAfterCorrupt = window.conduitTimelineState().timeline_revision;
+    const idempotentResult = window.conduitApplyTimelineDelta({
+      id: 7,
+      document_generation: 7,
+      base_timeline_revision: 42,
+      timeline_revision: 43,
+      operations: [{
+        type: "insert-message",
+        position: "append",
+        message_ts: "batch-1",
+        html: '<li><article class="message" data-message-ts="batch-1">replacement duplicate</article></li>'
+      }]
+    });
+
+    const delayedImage = document.querySelector('[data-image-key="anchor-image"]');
+    const delayedVideo = document.querySelector('[data-image-key="anchor-video"]');
+    const mediaAnchorTop = snapshotAnchor.getBoundingClientRect().top;
+    delayedImage.style.height = "180px";
+    delayedImage.dispatchEvent(new Event("load"));
+    await nextFrame();
+    await nextFrame();
+    await wait(80);
+    const delayedImageAnchorDelta =
+      snapshotAnchor.getBoundingClientRect().top - mediaAnchorTop;
+    const videoAnchorTop = snapshotAnchor.getBoundingClientRect().top;
+    delayedVideo.style.height = "160px";
+    delayedVideo.dispatchEvent(new Event("loadedmetadata"));
+    await nextFrame();
+    await nextFrame();
+    await wait(80);
+    const delayedVideoAnchorDelta =
+      snapshotAnchor.getBoundingClientRect().top - videoAnchorTop;
+
+    await waitForBottom(true);
+    delayedImage.style.height = "240px";
+    delayedImage.dispatchEvent(new Event("load"));
+    delayedVideo.style.height = "220px";
+    delayedVideo.dispatchEvent(new Event("loadedmetadata"));
+    await nextFrame();
+    await nextFrame();
+    await wait(80);
+    const delayedMediaBottomGap = bottomGap();
+
+    snapshotAnchor.scrollIntoView({ block: "start" });
+    window.dispatchEvent(new Event("scroll"));
+    await nextFrame();
+    await nextFrame();
+    const cancellationResult = window.conduitApplyTimelineDelta({
+      id: 8,
+      document_generation: 7,
+      base_timeline_revision: 43,
+      timeline_revision: 44,
+      operations: [{
+        type: "replace-message",
+        message_ts: "2",
+        html: '<article class="message" data-message-ts="2" style="height:520px">resized above viewport</article>',
+        part_html: ""
+      }]
+    });
+    root.scrollTop -= 137;
+    const immediateUserScrollTop = root.scrollTop;
+    window.dispatchEvent(new WheelEvent("wheel", { deltaY: -137 }));
+    window.dispatchEvent(new Event("scroll"));
+    await nextFrame();
+    await nextFrame();
+    await wait(100);
+    const cancelledRestoreDelta = root.scrollTop - immediateUserScrollTop;
+    const compatibilityNoopApplied = window.conduitApplyTimelinePatch({
+      type: "update-user",
+      user_id: "COMPAT-MISSING",
+      name: "Nobody",
+      status_html: ""
+    });
 
     window.timelineScrollResult = {
       initialFocusDelta,
@@ -191,7 +430,37 @@ START_PROBE = r"""
       snapshotApplied,
       snapshotText: snapshotAnchor.textContent,
       snapshotAnchorDelta,
-      snapshotLoadMore: document.querySelector(".timeline-action").textContent
+      snapshotLoadMore: document.querySelector(".timeline-action").textContent,
+      stateBeforeDelta,
+      batchResult,
+      stateAfterDelta,
+      batchAnchorDelta,
+      batchMessageCount: batchMessages.length,
+      batchDeleted: !document.querySelector('[data-message-ts="batch-delete"]'),
+      batchMessageText: batchMessage.textContent,
+      batchAuthor: batchMessage.querySelector(".author-label").textContent,
+      batchMention: batchMessage.querySelector('[data-mention-user-id="U-BATCH"]').textContent,
+      batchStatus: batchMessage.querySelector(".user-status").textContent,
+      batchResponse: batchMessage.querySelector('[data-message-region="responses"]').textContent,
+      baseMismatchResult,
+      generationMismatchResult,
+      skippedRevisionResult,
+      mismatchDidNotMutate,
+      missingEnrichmentResult,
+      corruptResult,
+      revisionAfterCorrupt,
+      idempotentResult,
+      idempotentMessageCount: document.querySelectorAll('[data-message-ts="batch-1"]').length,
+      idempotentMessageText: document.querySelector('[data-message-ts="batch-1"]').textContent,
+      delayedImageTag: delayedImage.tagName,
+      delayedVideoTag: delayedVideo.tagName,
+      delayedImageAnchorDelta,
+      delayedVideoAnchorDelta,
+      delayedMediaBottomGap,
+      cancellationResult,
+      cancelledRestoreDelta,
+      compatibilityNoopApplied,
+      finalState: window.conduitTimelineState()
     };
   })().catch((error) => {
     window.timelineScrollError = String(error && error.stack ? error.stack : error);
@@ -227,6 +496,7 @@ html, body {{ margin: 0; padding: 0; }}
 </style></head><body>
 <main class="timeline" data-timeline-positioning="pending"
  data-timeline-mode="preserve" data-focus-message-ts="10"
+ data-timeline-document-generation="7" data-timeline-revision="40"
  data-timeline-sticky-key="test:sticky" data-timeline-anchor-key="test:anchor"><ol class="message-list">{messages}</ol>
 <div id="delayed"></div></main>
 <script>{timeline_script}</script>
@@ -319,6 +589,69 @@ html, body {{ margin: 0; padding: 0; }}
     assert payload["snapshotText"] == "Snapshot 10 with changed wrapping and dimensions.", payload
     assert abs(payload["snapshotAnchorDelta"]) <= 2, payload
     assert payload["snapshotLoadMore"] == "Older", payload
+    assert payload["stateBeforeDelta"]["document_generation"] == 7, payload
+    assert payload["stateBeforeDelta"]["timeline_revision"] == 40, payload
+    assert payload["batchResult"] == {
+        "status": "applied",
+        "timeline_revision": 41,
+    }, payload
+    assert payload["stateAfterDelta"]["document_generation"] == 7, payload
+    assert payload["stateAfterDelta"]["timeline_revision"] == 41, payload
+    assert (
+        payload["stateAfterDelta"]["preserved_scroll_transactions"]
+        - payload["stateBeforeDelta"]["preserved_scroll_transactions"]
+        == 1
+    ), payload
+    assert abs(payload["batchAnchorDelta"]) <= 2, payload
+    assert payload["batchMessageCount"] == 1, payload
+    assert payload["batchDeleted"] is True, payload
+    assert "Batch edited message" in payload["batchMessageText"], payload
+    assert "duplicate" not in payload["batchMessageText"], payload
+    assert payload["batchAuthor"] == "Batch User", payload
+    assert payload["batchMention"] == "@Batch User", payload
+    assert payload["batchStatus"] == "Busy", payload
+    assert payload["batchResponse"] == "new response", payload
+    assert payload["baseMismatchResult"] == {
+        "status": "revision-mismatch",
+        "timeline_revision": 41,
+    }, payload
+    assert payload["generationMismatchResult"] == {
+        "status": "revision-mismatch",
+        "timeline_revision": 41,
+    }, payload
+    assert payload["skippedRevisionResult"] == {
+        "status": "revision-mismatch",
+        "timeline_revision": 41,
+    }, payload
+    assert payload["mismatchDidNotMutate"] is True, payload
+    assert payload["missingEnrichmentResult"] == {
+        "status": "applied",
+        "timeline_revision": 42,
+    }, payload
+    assert payload["corruptResult"] == {
+        "status": "corrupt",
+        "timeline_revision": 42,
+    }, payload
+    assert payload["revisionAfterCorrupt"] == 42, payload
+    assert payload["idempotentResult"] == {
+        "status": "applied",
+        "timeline_revision": 43,
+    }, payload
+    assert payload["idempotentMessageCount"] == 1, payload
+    assert "replacement duplicate" not in payload["idempotentMessageText"], payload
+    assert payload["delayedImageTag"] == "IMG", payload
+    assert payload["delayedVideoTag"] == "VIDEO", payload
+    assert abs(payload["delayedImageAnchorDelta"]) <= 2, payload
+    assert abs(payload["delayedVideoAnchorDelta"]) <= 2, payload
+    assert abs(payload["delayedMediaBottomGap"]) <= 2, payload
+    assert payload["cancellationResult"] == {
+        "status": "applied",
+        "timeline_revision": 44,
+    }, payload
+    assert abs(payload["cancelledRestoreDelta"]) <= 2, payload
+    assert payload["compatibilityNoopApplied"] is True, payload
+    assert payload["finalState"]["document_generation"] == 7, payload
+    assert payload["finalState"]["timeline_revision"] == 44, payload
 
 
 if __name__ == "__main__":

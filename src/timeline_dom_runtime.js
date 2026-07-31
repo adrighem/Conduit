@@ -91,13 +91,22 @@
   let viewportPinnedToBottom = isNearBottom();
   let rememberViewportAnchorFrame = 0;
   let resizeCorrectionFrame = 0;
+  let userScrollIntentFrame = 0;
+  let userScrollIntentPending = false;
   let scrollMutationGeneration = 0;
+  let preservedScrollTransactions = 0;
   const timeline = document.querySelector(".timeline");
   const initialMode = timeline ? timeline.dataset.timelineMode || "preserve" : "preserve";
   const stickyKey = timeline ? timeline.dataset.timelineStickyKey : "";
   const anchorKey = timeline ? timeline.dataset.timelineAnchorKey : "";
   const generation = timeline && timeline.dataset.timelineGeneration
     ? Number(timeline.dataset.timelineGeneration)
+    : null;
+  const documentGeneration = timeline && timeline.dataset.timelineDocumentGeneration
+    ? Number(timeline.dataset.timelineDocumentGeneration)
+    : null;
+  let timelineRevision = timeline && timeline.dataset.timelineRevision
+    ? Number(timeline.dataset.timelineRevision)
     : null;
   let initialPositionPending = Boolean(timeline);
   let automaticPositioning = false;
@@ -285,12 +294,39 @@
     notifyHost("interacted");
   }
 
+  function cancelPendingViewportRestore() {
+    scrollMutationGeneration += 1;
+    restoringViewportAnchor = false;
+    userScrollIntentPending = true;
+    if (userScrollIntentFrame) cancelAnimationFrame(userScrollIntentFrame);
+    userScrollIntentFrame = requestAnimationFrame(function () {
+      userScrollIntentFrame = requestAnimationFrame(rememberUserViewport);
+    });
+  }
+
+  function rememberUserViewport() {
+    if (userScrollIntentFrame) cancelAnimationFrame(userScrollIntentFrame);
+    userScrollIntentFrame = 0;
+    userScrollIntentPending = false;
+    restoringViewportAnchor = false;
+    viewportPinnedToBottom = isNearBottom();
+    const anchor = visibleAnchor();
+    if (!anchor) return;
+    viewportAnchor = anchor;
+    viewportAnchorTop = anchor.getBoundingClientRect().top;
+  }
+
+  function noteUserScrollIntent() {
+    noteUserInteraction();
+    cancelPendingViewportRestore();
+  }
+
   ["wheel", "touchstart", "pointerdown"].forEach(function (eventName) {
-    window.addEventListener(eventName, noteUserInteraction, { passive: true, capture: true });
+    window.addEventListener(eventName, noteUserScrollIntent, { passive: true, capture: true });
   });
   window.addEventListener("keydown", function (event) {
     if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
-      noteUserInteraction();
+      noteUserScrollIntent();
     }
   }, true);
 
@@ -335,7 +371,7 @@
   }, true);
 
   function preserveViewportAnchorDuringResize() {
-    if (initialPositionPending) return;
+    if (initialPositionPending || userScrollIntentPending) return;
     if (viewportPinnedToBottom) {
       scrollToPinnedBottom();
       return;
@@ -368,6 +404,7 @@
       noteUserInteraction();
       return;
     }
+    if (userScrollIntentPending) rememberUserViewport();
     scheduleRememberViewportAnchor();
     if (!initialPositionPending) rememberStoredViewport();
   }, { passive: true });
@@ -390,6 +427,7 @@
   });
 
   function withPreservedScroll(mutate) {
+    preservedScrollTransactions += 1;
     const root = timelineRoot();
     const nearBottom = isNearBottom();
     const arrivalVisible = nearBottom;
@@ -398,11 +436,11 @@
     const anchorTs = anchor ? anchor.dataset.messageTs : null;
     const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
     const oldScrollTop = root.scrollTop;
-    const changed = mutate(arrivalVisible);
-    if (!changed) return false;
-    const generation = ++scrollMutationGeneration;
+    const outcome = mutate(arrivalVisible);
+    if (!outcome.changed) return outcome;
+    const mutationGeneration = ++scrollMutationGeneration;
     function restore() {
-      if (generation !== scrollMutationGeneration) return;
+      if (mutationGeneration !== scrollMutationGeneration) return;
       if (wasAtBottom) {
         scrollToPinnedBottom();
       } else {
@@ -421,140 +459,240 @@
     restore();
     requestAnimationFrame(restore);
     requestAnimationFrame(function () { requestAnimationFrame(restore); });
-    return true;
+    return outcome;
   }
+
+  const operationNoop = 0;
+  const operationChanged = 1;
+  const operationCorrupt = 2;
+
+  function validNonemptyString(value) {
+    return typeof value === "string" && value.length > 0;
+  }
+
+  function applyTimelineOperation(patch, arrivalVisible) {
+    if (!patch || typeof patch.type !== "string") return operationCorrupt;
+
+    if (patch.type === "replace-snapshot") {
+      const list = document.querySelector(".message-list");
+      if (
+        !list ||
+        typeof patch.list_html !== "string" ||
+        typeof patch.load_more_html !== "string"
+      ) return operationCorrupt;
+      const previous = list.previousElementSibling;
+      if (previous && previous.matches(".timeline-action")) previous.remove();
+      if (patch.load_more_html) list.before(fragment(patch.load_more_html));
+      list.replaceChildren(fragment(patch.list_html));
+      return operationChanged;
+    }
+
+    if (patch.type === "insert-message") {
+      const list = document.querySelector(".message-list");
+      if (
+        !list ||
+        typeof patch.html !== "string" ||
+        !validNonemptyString(patch.message_ts) ||
+        (patch.position !== "append" && patch.position !== "prepend")
+      ) return operationCorrupt;
+      if (messageElement(patch.message_ts)) return operationNoop;
+      const content = fragment(patch.html);
+      if (!messageElementIn(content, patch.message_ts)) return operationCorrupt;
+      if (patch.arrival === "sent") {
+        animateSentMessage(content, patch.message_ts, arrivalVisible);
+      }
+      if (patch.position === "prepend") list.prepend(content);
+      else list.append(content);
+      return operationChanged;
+    }
+
+    if (patch.type === "replace-message") {
+      if (!validNonemptyString(patch.message_ts) || typeof patch.html !== "string") {
+        return operationCorrupt;
+      }
+      const target = messageElement(patch.message_ts);
+      if (!target) return operationCorrupt;
+      const html = target.classList.contains("message-part") ? patch.part_html : patch.html;
+      if (typeof html !== "string") return operationCorrupt;
+      const content = fragment(html);
+      if (!messageElementIn(content, patch.message_ts)) return operationCorrupt;
+      if (patch.arrival === "sent") {
+        animateSentMessage(content, patch.message_ts, arrivalVisible);
+      }
+      target.replaceWith(content);
+      return operationChanged;
+    }
+
+    if (patch.type === "remove-message") {
+      if (!validNonemptyString(patch.message_ts)) return operationCorrupt;
+      const target = messageElement(patch.message_ts);
+      if (!target) return operationCorrupt;
+      const item = target.closest(".message-list-item");
+      const stack = target.closest(".message-stack");
+      target.remove();
+      if (item && (!stack || stack.querySelectorAll("[data-message-ts]").length === 0)) {
+        item.remove();
+      }
+      return operationChanged;
+    }
+
+    if (patch.type === "replace-region") {
+      if (
+        !validNonemptyString(patch.message_ts) ||
+        !validNonemptyString(patch.region) ||
+        typeof patch.html !== "string"
+      ) return operationCorrupt;
+      const target = messageElement(patch.message_ts);
+      if (!target) return operationCorrupt;
+      const region = Array.from(target.querySelectorAll("[data-message-region]")).find(
+        function (element) { return element.dataset.messageRegion === patch.region; }
+      );
+      if (!region) return operationCorrupt;
+      region.replaceChildren(fragment(patch.html));
+      return operationChanged;
+    }
+
+    if (patch.type === "update-image") {
+      if (
+        !validNonemptyString(patch.asset_key) ||
+        (patch.source !== null && typeof patch.source !== "string")
+      ) return operationCorrupt;
+      const targets = imageElements(patch.asset_key);
+      if (targets.length === 0) return operationNoop;
+      targets.forEach(function (target) {
+        if (typeof patch.source === "string") {
+          const isVideo = patch.source.startsWith("data:video/");
+          if ((isVideo && target.matches("video")) || (!isVideo && target.matches("img"))) {
+            target.src = patch.source;
+          } else if (isVideo) {
+            const video = document.createElement("video");
+            video.preload = "metadata";
+            video.muted = true;
+            video.playsInline = true;
+            video.src = patch.source;
+            video.setAttribute("aria-label", target.dataset.imageAlt || "");
+            video.dataset.imageKey = patch.asset_key;
+            video.dataset.imageAlt = target.dataset.imageAlt || "";
+            video.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
+            target.replaceWith(video);
+          } else {
+            const image = document.createElement("img");
+            image.loading = "lazy";
+            image.decoding = "async";
+            image.src = patch.source;
+            image.alt = target.dataset.imageAlt || "";
+            image.dataset.imageKey = patch.asset_key;
+            image.dataset.imageAlt = image.alt;
+            image.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
+            target.replaceWith(image);
+          }
+        } else {
+          const placeholder = document.createElement("div");
+          placeholder.className = "image-placeholder";
+          placeholder.dataset.imageKey = patch.asset_key;
+          placeholder.dataset.imageAlt = target.dataset.imageAlt || "";
+          placeholder.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
+          placeholder.textContent = placeholder.dataset.imageUnavailable;
+          target.replaceWith(placeholder);
+        }
+      });
+      return operationChanged;
+    }
+
+    if (patch.type === "update-user") {
+      if (
+        !validNonemptyString(patch.user_id) ||
+        typeof patch.name !== "string" ||
+        typeof patch.status_html !== "string"
+      ) return operationCorrupt;
+      const targets = authorElements(patch.user_id);
+      const mentions = mentionElements(patch.user_id);
+      if (targets.length === 0 && mentions.length === 0) return operationNoop;
+      mentions.forEach(function (mention) {
+        mention.textContent = "@" + patch.name;
+      });
+      targets.forEach(function (target) {
+        const author = target.querySelector(".author-label");
+        if (author) author.textContent = patch.name;
+        const header = target.querySelector(".message-header");
+        if (!header) return;
+        const oldStatus = header.querySelector(".user-status");
+        if (oldStatus) oldStatus.remove();
+        if (patch.status_html) {
+          const status = fragment(patch.status_html);
+          const identity = author && (author.closest(".author-actions") || author);
+          if (identity) identity.after(status);
+        }
+      });
+      return operationChanged;
+    }
+    return operationCorrupt;
+  }
+
+  function applyTimelineOperations(operations, arrivalVisible) {
+    let changed = false;
+    for (const operation of operations) {
+      const result = applyTimelineOperation(operation, arrivalVisible);
+      if (result === operationCorrupt) return { changed, corrupt: true };
+      if (result === operationChanged) changed = true;
+    }
+    return { changed, corrupt: false };
+  }
+
+  function currentTimelineRevision() {
+    return Number.isSafeInteger(timelineRevision) && timelineRevision > 0
+      ? timelineRevision
+      : null;
+  }
+
+  function timelineApplyResult(status) {
+    return { status, timeline_revision: currentTimelineRevision() };
+  }
+
+  window.conduitTimelineState = function () {
+    return {
+      document_generation: Number.isSafeInteger(documentGeneration) && documentGeneration > 0
+        ? documentGeneration
+        : null,
+      timeline_revision: currentTimelineRevision(),
+      preserved_scroll_transactions: preservedScrollTransactions
+    };
+  };
+
+  window.conduitApplyTimelineDelta = function (delta) {
+    if (!delta || typeof delta !== "object") return timelineApplyResult("corrupt");
+    const currentRevision = currentTimelineRevision();
+    const validGeneration = Number.isSafeInteger(documentGeneration) && documentGeneration > 0;
+    const validEnvelope =
+      Number.isSafeInteger(delta.document_generation) && delta.document_generation > 0 &&
+      Number.isSafeInteger(delta.base_timeline_revision) && delta.base_timeline_revision > 0 &&
+      Number.isSafeInteger(delta.timeline_revision) && delta.timeline_revision > 0;
+    if (
+      !validGeneration ||
+      currentRevision === null ||
+      !validEnvelope ||
+      delta.document_generation !== documentGeneration ||
+      delta.base_timeline_revision !== currentRevision ||
+      delta.timeline_revision !== delta.base_timeline_revision + 1
+    ) return timelineApplyResult("revision-mismatch");
+    if (!Number.isSafeInteger(delta.id) || delta.id <= 0 || !Array.isArray(delta.operations)) {
+      return timelineApplyResult("corrupt");
+    }
+
+    const outcome = withPreservedScroll(function (arrivalVisible) {
+      return applyTimelineOperations(delta.operations, arrivalVisible);
+    });
+    if (outcome.corrupt) return timelineApplyResult("corrupt");
+    timelineRevision = delta.timeline_revision;
+    if (timeline) timeline.dataset.timelineRevision = String(timelineRevision);
+    return timelineApplyResult("applied");
+  };
 
   window.conduitApplyTimelinePatch = function (patch) {
     if (!patch || typeof patch.type !== "string") return false;
-    return withPreservedScroll(function (arrivalVisible) {
-      if (patch.type === "replace-snapshot") {
-        const list = document.querySelector(".message-list");
-        if (
-          !list ||
-          typeof patch.list_html !== "string" ||
-          typeof patch.load_more_html !== "string"
-        ) return false;
-        const previous = list.previousElementSibling;
-        if (previous && previous.matches(".timeline-action")) previous.remove();
-        if (patch.load_more_html) list.before(fragment(patch.load_more_html));
-        list.replaceChildren(fragment(patch.list_html));
-        return true;
-      }
-
-      if (patch.type === "insert-message") {
-        const list = document.querySelector(".message-list");
-        if (
-          !list ||
-          typeof patch.html !== "string" ||
-          typeof patch.message_ts !== "string"
-        ) return false;
-        const content = fragment(patch.html);
-        if (patch.arrival === "sent") {
-          animateSentMessage(content, patch.message_ts, arrivalVisible);
-        }
-        if (patch.position === "prepend") list.prepend(content);
-        else list.append(content);
-        return true;
-      }
-
-      if (patch.type === "replace-message") {
-        const target = messageElement(patch.message_ts);
-        if (!target || typeof patch.html !== "string") return false;
-        const html = target.classList.contains("message-part") ? patch.part_html : patch.html;
-        if (typeof html !== "string") return false;
-        const content = fragment(html);
-        if (patch.arrival === "sent") {
-          animateSentMessage(content, patch.message_ts, arrivalVisible);
-        }
-        target.replaceWith(content);
-        return true;
-      }
-
-      if (patch.type === "remove-message") {
-        const target = messageElement(patch.message_ts);
-        if (!target) return false;
-        const item = target.closest(".message-list-item");
-        const stack = target.closest(".message-stack");
-        target.remove();
-        if (item && (!stack || stack.querySelectorAll("[data-message-ts]").length === 0)) item.remove();
-        return true;
-      }
-
-      if (patch.type === "replace-region") {
-        const target = messageElement(patch.message_ts);
-        if (!target || typeof patch.html !== "string") return false;
-        const region = target.querySelector('[data-message-region="' + patch.region + '"]');
-        if (!region) return false;
-        region.replaceChildren(fragment(patch.html));
-        return true;
-      }
-
-      if (patch.type === "update-image") {
-        const targets = imageElements(patch.asset_key);
-        if (targets.length === 0) return false;
-        targets.forEach(function (target) {
-          if (typeof patch.source === "string") {
-            const isVideo = patch.source.startsWith("data:video/");
-            if ((isVideo && target.matches("video")) || (!isVideo && target.matches("img"))) {
-              target.src = patch.source;
-            } else if (isVideo) {
-              const video = document.createElement("video");
-              video.preload = "metadata";
-              video.muted = true;
-              video.playsInline = true;
-              video.src = patch.source;
-              video.setAttribute("aria-label", target.dataset.imageAlt || "");
-              video.dataset.imageKey = patch.asset_key;
-              video.dataset.imageAlt = target.dataset.imageAlt || "";
-              video.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
-              target.replaceWith(video);
-            } else {
-              const image = document.createElement("img");
-              image.loading = "lazy";
-              image.decoding = "async";
-              image.src = patch.source;
-              image.alt = target.dataset.imageAlt || "";
-              image.dataset.imageKey = patch.asset_key;
-              image.dataset.imageAlt = image.alt;
-              image.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
-              target.replaceWith(image);
-            }
-          } else {
-            const placeholder = document.createElement("div");
-            placeholder.className = "image-placeholder";
-            placeholder.dataset.imageKey = patch.asset_key;
-            placeholder.dataset.imageAlt = target.dataset.imageAlt || "";
-            placeholder.dataset.imageUnavailable = target.dataset.imageUnavailable || "";
-            placeholder.textContent = placeholder.dataset.imageUnavailable;
-            target.replaceWith(placeholder);
-          }
-        });
-        return true;
-      }
-
-      if (patch.type === "update-user") {
-        const targets = authorElements(patch.user_id);
-        const mentions = mentionElements(patch.user_id);
-        if (targets.length === 0 && mentions.length === 0) return false;
-        mentions.forEach(function (mention) {
-          mention.textContent = "@" + patch.name;
-        });
-        targets.forEach(function (target) {
-          const author = target.querySelector(".author-label");
-          if (author) author.textContent = patch.name;
-          const header = target.querySelector(".message-header");
-          if (!header) return;
-          const oldStatus = header.querySelector(".user-status");
-          if (oldStatus) oldStatus.remove();
-          if (patch.status_html) {
-            const status = fragment(patch.status_html);
-            const identity = author && (author.closest(".author-actions") || author);
-            if (identity) identity.after(status);
-          }
-        });
-        return true;
-      }
-      return false;
+    const outcome = withPreservedScroll(function (arrivalVisible) {
+      return applyTimelineOperations([patch], arrivalVisible);
     });
+    return !outcome.corrupt;
   };
 })();
