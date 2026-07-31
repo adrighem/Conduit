@@ -9,7 +9,8 @@ This document records an earlier implementation of the Conduit workspace sidebar
 ## Source Files
 
 - `src/window.ui`: Defines the workspace sidebar shell and static controls.
-- `src/window.rs`: Renders the pure sidebar model into GTK rows, owns row activation, and keeps the row-action map.
+- `src/window.rs`: Binds the pure sidebar projection to a virtualized GTK list and owns activation.
+- `src/sidebar_widgets.rs`: Adapts keyed projection changes to stable GObjects in a `gio::ListStore` and renders recycled list items.
 - `src/sidebar.rs`: Builds the pure sidebar list model, including filtering, placeholder state, grouping, sorting, row state, accessibility labels, unread badges, switcher items, and conversation type classification.
 - `src/models.rs`: Defines `SlackConversation`, including the Slack fields used by the sidebar.
 - `src/runtime.rs`: Prioritizes and rotates bounded unread-state enrichment work.
@@ -61,10 +62,10 @@ The sidebar is the start child of the workspace `GtkPaned`. It is a vertical `Gt
 - Conversation filter entry with placeholder text `Filter conversations`.
 - Unread-only toggle button using `mail-unread-symbolic`.
 - All-conversations toggle button using `view-list-symbolic`.
-- Scrollable `GtkListBox` named `conversation_list`, styled with `navigation-sidebar`.
+- Scrollable `GtkListView` named `conversation_list`, styled with `navigation-sidebar`.
 - Status footer label named `workspace_status_label`, used for transient progress and errors.
 
-The conversation list is a native GTK `ListBox`; every section header and conversation row is created in Rust.
+The conversation list is a native GTK `ListView`. A `gio::ListStore` retains one stable GObject per visible sidebar key, while a `GtkSingleSelection` provides native selection. The list item factory creates only enough recycled widgets for the visible viewport.
 
 ## Sidebar States
 
@@ -194,7 +195,7 @@ If no conversations exist, the list shows `No conversations`. If the filter remo
 
 ## Row Rendering
 
-Each conversation row is a selectable and activatable `GtkListBoxRow`. The row contains a horizontal `GtkBox` with:
+Each conversation item is selectable and activatable. Its recycled list item contains a horizontal `GtkBox` with:
 
 - A conversation type icon.
 - An ellipsized title label.
@@ -208,7 +209,7 @@ Icons:
 - Group direct message: `system-users-symbolic`
 - Unknown conversation: `dialog-question-symbolic`
 
-Rows with unread messages apply explicit bold Pango weight and the native `heading` CSS class to the title, including badge-less unread channels. Read rows apply explicit normal title weight. Unread counts remain visually emphasized with the `heading` CSS class when Slack provides a display count. Selected conversations use the native `GtkListBox` selected row state, not `suggested-action`.
+Rows with unread messages apply explicit bold Pango weight and the native `heading` CSS class to the title, including badge-less unread channels. Read rows apply explicit normal title weight. Unread counts remain visually emphasized with the `heading` CSS class when Slack provides a display count. Selected conversations use the native `GtkSingleSelection` state, not `suggested-action`.
 
 Unread badge labels are capped at `99+` for counts above 99. Row titles ellipsize and the sidebar width remains stable at the shell level.
 
@@ -216,11 +217,11 @@ If the same selected conversation appears in both `Unreads` and its normal secti
 
 ## Row Activation
 
-Rows are activated through the `GtkListBox::row-activated` signal on `conversation_list`; the row is the interactive object. There is no nested button inside a conversation row.
+Items are activated through the `GtkListView::activate` signal on `conversation_list`; there is no nested button inside a conversation item.
 
-The list sets `activate-on-single-click` to `True`, so a normal mouse click activates the channel or DM. Keyboard activation still uses native list behavior.
+The list sets `single-click-activate` to `True`, so a normal mouse click activates the channel or DM. Keyboard activation still uses native list behavior.
 
-`src/window.rs` registers a `SidebarRowAction` for each conversation row and a section toggle action for each header, keyed by the rendered `GtkListBoxRow` index. Placeholder rows are not registered. Activating a header toggles its collapsed state and rerenders the keyed list without navigating away from the current conversation.
+Activation resolves the current `SidebarListItemObject` at the signalled position. Conversation IDs and section kinds therefore remain correct after recycling, moves, inserts, and removals without a parallel row-index action map. Activating a header toggles its collapsed state and reconciles the keyed list without navigating away from the current conversation.
 
 Activating a conversation row calls `select_conversation(channel_id, title)`.
 

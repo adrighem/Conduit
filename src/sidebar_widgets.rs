@@ -18,10 +18,188 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
 use gtk::prelude::*;
+use gtk::{gio, glib};
 
 use crate::emoji::{EmojiCatalog, EmojiValue};
-use crate::sidebar::SidebarRowModel;
+use crate::sidebar::{
+    KeyedSidebarItem, SidebarItemKey, SidebarItemModel, SidebarProjectionChange,
+    SidebarProjectionOperation, SidebarRowModel,
+};
+
+mod imp {
+    use super::*;
+    use glib::subclass::prelude::*;
+
+    #[derive(Debug, Default)]
+    pub struct SidebarListItemObject {
+        pub item: RefCell<Option<KeyedSidebarItem>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for SidebarListItemObject {
+        const NAME: &'static str = "ConduitSidebarListItemObject";
+        type Type = super::SidebarListItemObject;
+    }
+
+    impl ObjectImpl for SidebarListItemObject {}
+}
+
+glib::wrapper! {
+    pub struct SidebarListItemObject(ObjectSubclass<imp::SidebarListItemObject>);
+}
+
+impl SidebarListItemObject {
+    pub fn new(item: KeyedSidebarItem) -> Self {
+        use glib::subclass::prelude::ObjectSubclassIsExt;
+
+        let object: Self = glib::Object::new();
+        object.imp().item.replace(Some(item));
+        object
+    }
+
+    pub fn item(&self) -> KeyedSidebarItem {
+        use glib::subclass::prelude::ObjectSubclassIsExt;
+
+        self.imp()
+            .item
+            .borrow()
+            .as_ref()
+            .expect("sidebar list item objects are initialized at construction")
+            .clone()
+    }
+
+    pub fn replace_model(&self, key: &SidebarItemKey, model: SidebarItemModel) -> bool {
+        use glib::subclass::prelude::ObjectSubclassIsExt;
+
+        let mut item = self.imp().item.borrow_mut();
+        let item = item
+            .as_mut()
+            .expect("sidebar list item objects are initialized at construction");
+        if &item.key != key || item.model == model {
+            return false;
+        }
+        item.model = model;
+        true
+    }
+}
+
+#[derive(Debug)]
+pub struct SidebarListStore {
+    model: gio::ListStore,
+    objects: HashMap<SidebarItemKey, SidebarListItemObject>,
+}
+
+impl Default for SidebarListStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SidebarListStore {
+    pub fn new() -> Self {
+        Self {
+            model: gio::ListStore::new::<SidebarListItemObject>(),
+            objects: HashMap::new(),
+        }
+    }
+
+    pub fn model(&self) -> gio::ListStore {
+        self.model.clone()
+    }
+
+    pub fn n_items(&self) -> u32 {
+        self.model.n_items()
+    }
+
+    pub fn object_at(&self, position: u32) -> Option<SidebarListItemObject> {
+        self.model
+            .item(position)
+            .and_then(|item| item.downcast::<SidebarListItemObject>().ok())
+    }
+
+    pub fn item_at(&self, position: u32) -> Option<KeyedSidebarItem> {
+        self.object_at(position).map(|object| object.item())
+    }
+
+    pub fn apply(&mut self, change: &SidebarProjectionChange, final_items: &[KeyedSidebarItem]) {
+        for operation in &change.operations {
+            match operation {
+                SidebarProjectionOperation::Reset { items } => {
+                    self.objects.clear();
+                    let objects = items
+                        .iter()
+                        .cloned()
+                        .map(|item| {
+                            let key = item.key.clone();
+                            let object = SidebarListItemObject::new(item);
+                            self.objects.insert(key, object.clone());
+                            object
+                        })
+                        .collect::<Vec<_>>();
+                    self.model.splice(0, self.model.n_items(), &objects);
+                }
+                SidebarProjectionOperation::Splice {
+                    position,
+                    removed,
+                    inserted,
+                } => {
+                    self.model.splice(
+                        *position,
+                        removed.len() as u32,
+                        &[] as &[SidebarListItemObject],
+                    );
+                    let objects = inserted
+                        .iter()
+                        .cloned()
+                        .map(|item| {
+                            let key = item.key.clone();
+                            let object = self
+                                .objects
+                                .entry(key)
+                                .or_insert_with(|| SidebarListItemObject::new(item.clone()))
+                                .clone();
+                            object.replace_model(&item.key, item.model);
+                            object
+                        })
+                        .collect::<Vec<_>>();
+                    if !objects.is_empty() {
+                        self.model.splice(*position, 0, &objects);
+                    }
+                }
+                SidebarProjectionOperation::Update {
+                    position,
+                    key,
+                    model,
+                } => {
+                    let object = self
+                        .objects
+                        .get(key)
+                        .expect("projection updates refer to an existing sidebar key")
+                        .clone();
+                    object.replace_model(key, model.clone());
+                    self.model
+                        .splice(*position, 1, std::slice::from_ref(&object));
+                }
+            }
+        }
+
+        let retained = final_items
+            .iter()
+            .map(|item| &item.key)
+            .collect::<HashSet<_>>();
+        self.objects.retain(|key, _| retained.contains(key));
+
+        debug_assert_eq!(self.n_items() as usize, final_items.len());
+        debug_assert!(final_items
+            .iter()
+            .enumerate()
+            .all(|(position, item)| self.item_at(position as u32).as_ref() == Some(item)));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SidebarRowLayout {
@@ -161,10 +339,127 @@ fn sidebar_title_weight(unread: bool) -> gtk::pango::Weight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::{
+        ConversationKind, KeyedSidebarItem, SidebarItemKey, SidebarItemModel, SidebarPlaceholder,
+        SidebarProjection, SidebarRowModel, SidebarSectionKind,
+    };
+
+    fn conversation_item(id: &str) -> KeyedSidebarItem {
+        KeyedSidebarItem {
+            key: SidebarItemKey::Conversation {
+                section: None,
+                id: id.to_string(),
+            },
+            model: SidebarItemModel::Conversation(SidebarRowModel {
+                id: id.to_string(),
+                title: id.to_string(),
+                kind: ConversationKind::PublicChannel,
+                unread: false,
+                unread_count: 0,
+                selected: false,
+                starred: false,
+                private: false,
+                muted: false,
+                external: false,
+                huddle_active: false,
+                search_aliases: Vec::new(),
+                status: None,
+            }),
+        }
+    }
 
     #[test]
     fn title_weight_uses_bold_only_for_unread_rows() {
         assert_eq!(sidebar_title_weight(false), gtk::pango::Weight::Normal);
         assert_eq!(sidebar_title_weight(true), gtk::pango::Weight::Bold);
+    }
+
+    #[test]
+    fn sidebar_list_item_object_updates_content_without_changing_identity() {
+        let object = SidebarListItemObject::new(KeyedSidebarItem {
+            key: SidebarItemKey::Placeholder,
+            model: SidebarItemModel::Placeholder(SidebarPlaceholder::Loading),
+        });
+        let same_object = object.clone();
+
+        assert!(object.replace_model(
+            &SidebarItemKey::Placeholder,
+            SidebarItemModel::Placeholder(SidebarPlaceholder::LoadFailed),
+        ));
+        assert_eq!(object, same_object);
+        assert_eq!(object.item().key, SidebarItemKey::Placeholder);
+        assert_eq!(
+            object.item().model,
+            SidebarItemModel::Placeholder(SidebarPlaceholder::LoadFailed)
+        );
+        assert!(!object.replace_model(
+            &SidebarItemKey::SectionHeader(SidebarSectionKind::Channels),
+            SidebarItemModel::SectionHeader {
+                kind: SidebarSectionKind::Channels,
+                title: "Channels".to_string(),
+                collapsed: false,
+            },
+        ));
+        assert_eq!(object.item().key, SidebarItemKey::Placeholder);
+    }
+
+    #[test]
+    fn sidebar_list_store_updates_one_of_1430_items_without_replacing_objects() {
+        let initial = (0..1_430)
+            .map(|index| conversation_item(&format!("C{index:04}")))
+            .collect::<Vec<_>>();
+        let mut projection = SidebarProjection::default();
+        let reset = projection.reset(initial.clone()).unwrap();
+        let mut store = SidebarListStore::new();
+        store.apply(&reset, &initial);
+        let target_position = 715;
+        let target_before = store.object_at(target_position).unwrap();
+        let neighbor_before = store.object_at(target_position + 1).unwrap();
+        let mut next = initial;
+        let SidebarItemModel::Conversation(row) = &mut next[target_position as usize].model else {
+            panic!("expected conversation row");
+        };
+        row.unread = true;
+        row.unread_count = 1;
+
+        let change = projection.reconcile(next.clone()).unwrap();
+        store.apply(&change, &next);
+
+        assert_eq!(store.n_items(), 1_430);
+        assert_eq!(store.object_at(target_position).unwrap(), target_before);
+        assert_eq!(
+            store.object_at(target_position + 1).unwrap(),
+            neighbor_before
+        );
+        assert_eq!(
+            store.item_at(target_position).unwrap(),
+            next[target_position as usize]
+        );
+    }
+
+    #[test]
+    fn sidebar_list_store_reuses_keyed_objects_across_moves() {
+        let initial = vec![
+            conversation_item("C1"),
+            conversation_item("C2"),
+            conversation_item("C3"),
+        ];
+        let mut projection = SidebarProjection::default();
+        let reset = projection.reset(initial.clone()).unwrap();
+        let mut store = SidebarListStore::new();
+        store.apply(&reset, &initial);
+        let moved = store.object_at(2).unwrap();
+        let next = vec![initial[2].clone(), initial[0].clone(), initial[1].clone()];
+
+        let change = projection.reconcile(next.clone()).unwrap();
+        store.apply(&change, &next);
+
+        assert_eq!(store.object_at(0).unwrap(), moved);
+        assert_eq!(
+            (0..store.n_items())
+                .map(|position| store.item_at(position).unwrap().key)
+                .collect::<Vec<_>>(),
+            next.into_iter().map(|item| item.key).collect::<Vec<_>>()
+        );
     }
 }
