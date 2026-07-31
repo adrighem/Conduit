@@ -35,14 +35,14 @@
 - [x] Task: Add scheduler/API tracing counters and no-realtime stale-check behavior 6e9b437
 - [x] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md) 34ebd6c
 
-## Phase 5: Incremental GTK and WebKit presentation
+## Phase 5: Incremental GTK and WebKit presentation [checkpoint: 4ba00d2]
 
 - [x] Task: Define SidebarProjection keyed splice/update/reset behavior with 1,430-row regression tests cd2ab3c
 - [x] Task: Migrate the sidebar to GtkListView, gio::ListStore, and stable single selection ec6dfe2
 - [x] Task: Define TimelinePresenter document/revision/loading/delta behavior with scroll regression tests 029b8d1
 - [x] Task: Route one batched TimelineDelta per frame and restrict full document loads 3d28d14
 - [x] Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers c5b9d8d
-- [ ] Task: Conductor - User Manual Verification 'Incremental GTK and WebKit presentation' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Incremental GTK and WebKit presentation' (Protocol in workflow.md) 4ba00d2
 
 ## Phase 6: Expansion and cleanup
 
