@@ -1,0 +1,9 @@
+Task: Define SidebarProjection keyed splice/update/reset behavior with 1,430-row regression tests
+
+Summary: Added a pure keyed SidebarProjection with explicit reset, sequential splice, content update, duplicate-key rejection, stable duplicate-placement selection, and privacy-safe cumulative counters. Replaced the ambiguous final-index diff and applied projection operations incrementally to the transitional GtkListBox without clearing and re-appending retained rows.
+
+Modified files: src/sidebar.rs, src/window.rs
+
+Rationale: Give the upcoming gio::ListStore and GtkListView migration an executable O(n log n) projection contract while ensuring a local row change does not rebuild a 1,430-conversation sidebar.
+
+Validation: cargo test --quiet (1093 passed, 3 ignored); cargo check --all-targets; cargo fmt --all -- --check; git diff --check; meson compile -C _build; meson test -C _build --print-errorlogs (17 passed). Focused projection regressions cover 1,430 conversations, local updates, middle insertion/removal, reorder, placeholder changes, disjoint replacement, duplicate rejection, no-op accounting, and stable duplicate-placement selection. Strict Clippy was unavailable because installed Clippy 0.1.87 does not match rustc 1.95.0. Coverage was unavailable because cargo-llvm-cov is not installed.
