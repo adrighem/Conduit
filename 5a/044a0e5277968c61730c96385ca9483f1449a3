@@ -1,0 +1,9 @@
+Task: Enforce startup enrichment/history limits and lazy 24-hour user-directory loading
+
+Summary: Limited deterministic startup work to 30 conversation enrichments and 12 history prefetches. Added persisted 24-hour Slack user-directory freshness, lazy consumer loading, full profile hydration, exact authoritative cache replacement, deferred per-user fallback lookups, and race-safe coordination across startup, realtime, bulk, and users.info results.
+
+Modified files: README.md, src/huddles/model.rs, src/models.rs, src/runtime.rs, src/slack.rs, src/store.rs, src/sync_scheduler.rs, src/window.rs, src/workspace_pipeline.rs
+
+Rationale: Bound network work at startup, avoid redundant user fan-out, preserve newer realtime authority, and keep the coordinator, durable cache, compatibility events, and GTK identity maps consistent.
+
+Validation: cargo test --all-targets --no-fail-fast (1062 passed, 3 ignored); cargo check --all-targets; cargo fmt --all -- --check; git diff --check; meson compile -C _build-task4; meson test -C _build-task4 --print-errorlogs (17 passed). Strict Clippy was unavailable because installed Clippy 0.1.87 does not match rustc 1.95.0.
