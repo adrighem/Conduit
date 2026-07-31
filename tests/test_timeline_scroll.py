@@ -53,11 +53,14 @@ START_PROBE = r"""
     const initialGap = bottomGap();
 
     document.querySelector(".timeline").style.width = "260px";
+    window.dispatchEvent(new Event("resize"));
     await waitForBottom(false);
     const reflowGap = bottomGap();
 
     await waitForBottom(true);
-    document.getElementById("delayed").style.height = "700px";
+    const initialDelayedImage = document.getElementById("delayed");
+    initialDelayedImage.style.height = "700px";
+    initialDelayedImage.dispatchEvent(new Event("load"));
     await waitForBottom(false);
     const delayedExpansionGap = bottomGap();
 
@@ -116,6 +119,7 @@ START_PROBE = r"""
     await nextFrame();
     await nextFrame();
     const anchor = document.querySelector('[data-message-ts="10"]');
+    window.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }));
     anchor.scrollIntoView({ block: "start" });
     window.dispatchEvent(new Event("scroll"));
     await nextFrame();
@@ -237,12 +241,18 @@ START_PROBE = r"""
         {
           type: "update-image",
           asset_key: "anchor-image",
-          source: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+          source: {
+            uri: "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            kind: "image"
+          }
         },
         {
           type: "update-image",
           asset_key: "anchor-video",
-          source: "data:video/mp4;base64,AAAA"
+          source: {
+            uri: "conduit-asset://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            kind: "video"
+          }
         },
         {
           type: "update-image",
@@ -363,6 +373,15 @@ START_PROBE = r"""
     const delayedVideoAnchorDelta =
       snapshotAnchor.getBoundingClientRect().top - videoAnchorTop;
 
+    const failedMediaAnchorTop = snapshotAnchor.getBoundingClientRect().top;
+    delayedImage.style.height = "210px";
+    delayedImage.dispatchEvent(new Event("error"));
+    await nextFrame();
+    await nextFrame();
+    await wait(80);
+    const failedMediaAnchorDelta =
+      snapshotAnchor.getBoundingClientRect().top - failedMediaAnchorTop;
+
     await waitForBottom(true);
     delayedImage.style.height = "240px";
     delayedImage.dispatchEvent(new Event("load"));
@@ -372,6 +391,15 @@ START_PROBE = r"""
     await nextFrame();
     await wait(80);
     const delayedMediaBottomGap = bottomGap();
+
+    delayedImage.style.height = "280px";
+    delayedImage.dispatchEvent(new Event("error"));
+    delayedVideo.style.height = "260px";
+    delayedVideo.dispatchEvent(new Event("error"));
+    await nextFrame();
+    await nextFrame();
+    await wait(80);
+    const failedMediaBottomGap = bottomGap();
 
     snapshotAnchor.scrollIntoView({ block: "start" });
     window.dispatchEvent(new Event("scroll"));
@@ -456,7 +484,9 @@ START_PROBE = r"""
       delayedVideoTag: delayedVideo.tagName,
       delayedImageAnchorDelta,
       delayedVideoAnchorDelta,
+      failedMediaAnchorDelta,
       delayedMediaBottomGap,
+      failedMediaBottomGap,
       cancellationResult,
       cancelledRestoreDelta,
       compatibilityNoopApplied,
@@ -480,6 +510,10 @@ JSON.stringify({
 def main() -> None:
     timeline_script = Path(sys.argv[1]).read_text(encoding="utf-8")
     assert "</script" not in timeline_script.lower()
+    assert "ResizeObserver" not in timeline_script
+    assert 'document.addEventListener("load"' in timeline_script
+    assert 'document.addEventListener("loadedmetadata"' in timeline_script
+    assert 'document.addEventListener("error"' in timeline_script
     messages = "".join(
         f'<li><article class="message" data-message-ts="{index}">'
         f'Message {index} with enough wrapping text to exercise a narrower timeline. '
@@ -492,13 +526,13 @@ html, body {{ margin: 0; padding: 0; }}
 .timeline {{ box-sizing: border-box; width: 580px; }}
 .message-list {{ list-style: none; margin: 0; padding: 0; }}
 .message {{ box-sizing: border-box; display: block; min-height: 90px; padding: 12px; }}
-#delayed {{ height: 20px; }}
+#delayed {{ display: block; height: 20px; }}
 </style></head><body>
 <main class="timeline" data-timeline-positioning="pending"
  data-timeline-mode="preserve" data-focus-message-ts="10"
  data-timeline-document-generation="7" data-timeline-revision="40"
  data-timeline-sticky-key="test:sticky" data-timeline-anchor-key="test:anchor"><ol class="message-list">{messages}</ol>
-<div id="delayed"></div></main>
+<img id="delayed" alt=""></main>
 <script>{timeline_script}</script>
 </body></html>"""
 
@@ -643,7 +677,9 @@ html, body {{ margin: 0; padding: 0; }}
     assert payload["delayedVideoTag"] == "VIDEO", payload
     assert abs(payload["delayedImageAnchorDelta"]) <= 2, payload
     assert abs(payload["delayedVideoAnchorDelta"]) <= 2, payload
+    assert abs(payload["failedMediaAnchorDelta"]) <= 2, payload
     assert abs(payload["delayedMediaBottomGap"]) <= 2, payload
+    assert abs(payload["failedMediaBottomGap"]) <= 2, payload
     assert payload["cancellationResult"] == {
         "status": "applied",
         "timeline_revision": 44,

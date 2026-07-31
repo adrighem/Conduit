@@ -1097,27 +1097,14 @@ impl SlackApi {
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .map(str::trim)
-            .filter(|value| {
-                value.starts_with("image/")
-                    || matches!(
-                        *value,
-                        "video/mp4" | "video/webm" | "video/quicktime" | "video/ogg"
-                    )
-            })
+            .and_then(PreviewAssetMime::parse)
             .ok_or_else(|| {
                 SlackError::validation(
                     "Slack attachment preview returned an unsupported content type",
                 )
-            })?
-            .to_string();
+            })?;
 
-        let max_bytes = if mime_type.starts_with("video/") {
-            MAX_PREVIEW_VIDEO_BYTES
-        } else {
-            MAX_PREVIEW_IMAGE_BYTES
-        };
+        let max_bytes = mime_type.max_bytes();
 
         if response
             .content_length()
@@ -2156,9 +2143,137 @@ fn conversation_latest_ts(conversation: &SlackConversation) -> Option<&str> {
     .filter(|value| !value.is_empty())
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum PreviewAssetMime {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    Avif,
+    Mp4,
+    Webm,
+    Quicktime,
+    Ogg,
+}
+
+impl PreviewAssetMime {
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Png,
+        Self::Jpeg,
+        Self::Gif,
+        Self::Webp,
+        Self::Avif,
+        Self::Mp4,
+        Self::Webm,
+        Self::Quicktime,
+        Self::Ogg,
+    ];
+
+    pub(crate) fn parse(content_type: &str) -> Option<Self> {
+        let normalized = content_type.split(';').next()?.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "image/png" => Some(Self::Png),
+            "image/jpeg" => Some(Self::Jpeg),
+            "image/gif" => Some(Self::Gif),
+            "image/webp" => Some(Self::Webp),
+            "image/avif" => Some(Self::Avif),
+            "video/mp4" => Some(Self::Mp4),
+            "video/webm" => Some(Self::Webm),
+            "video/quicktime" => Some(Self::Quicktime),
+            "video/ogg" => Some(Self::Ogg),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+            Self::Avif => "image/avif",
+            Self::Mp4 => "video/mp4",
+            Self::Webm => "video/webm",
+            Self::Quicktime => "video/quicktime",
+            Self::Ogg => "video/ogg",
+        }
+    }
+
+    pub(crate) const fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Gif => "gif",
+            Self::Webp => "webp",
+            Self::Avif => "avif",
+            Self::Mp4 => "mp4",
+            Self::Webm => "webm",
+            Self::Quicktime => "mov",
+            Self::Ogg => "ogv",
+        }
+    }
+
+    pub(crate) const fn is_video(self) -> bool {
+        matches!(self, Self::Mp4 | Self::Webm | Self::Quicktime | Self::Ogg)
+    }
+
+    pub(crate) const fn max_bytes(self) -> usize {
+        if self.is_video() {
+            MAX_PREVIEW_VIDEO_BYTES
+        } else {
+            MAX_PREVIEW_IMAGE_BYTES
+        }
+    }
+
+    pub(crate) const fn validate_size(self, size: usize) -> bool {
+        size > 0 && size <= self.max_bytes()
+    }
+
+    pub(crate) fn validate_bytes(self, bytes: &[u8]) -> bool {
+        if !self.validate_size(bytes.len()) {
+            return false;
+        }
+        self.validate_signature(bytes)
+    }
+
+    pub(crate) fn validate_cached_content(self, size: u64, prefix: &[u8]) -> bool {
+        usize::try_from(size)
+            .ok()
+            .is_some_and(|size| self.validate_size(size))
+            && self.validate_signature(prefix)
+    }
+
+    fn validate_signature(self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            Self::Jpeg => bytes.starts_with(b"\xff\xd8\xff"),
+            Self::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            Self::Webp => {
+                bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
+            }
+            Self::Avif => {
+                bytes.len() >= 12
+                    && &bytes[4..8] == b"ftyp"
+                    && bytes[8..bytes.len().min(64)]
+                        .chunks_exact(4)
+                        .any(|brand| brand == b"avif" || brand == b"avis")
+            }
+            Self::Mp4 | Self::Quicktime => bytes.len() >= 12 && &bytes[4..8] == b"ftyp",
+            Self::Webm => bytes.starts_with(b"\x1a\x45\xdf\xa3"),
+            Self::Ogg => bytes.starts_with(b"OggS"),
+        }
+    }
+}
+
+impl std::fmt::Display for PreviewAssetMime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadedPreviewAsset {
-    pub mime_type: String,
+    pub(crate) mime_type: PreviewAssetMime,
     pub bytes: Vec<u8>,
 }
 
@@ -3544,6 +3659,48 @@ mod tests {
         assert_eq!(supported_media_mime_type("audio/mpeg"), None);
         assert_eq!(supported_media_mime_type("text/html"), None);
         assert_eq!(supported_media_mime_type("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn preview_asset_mime_types_are_normalized_and_strictly_allowlisted() {
+        assert_eq!(
+            PreviewAssetMime::parse(" Image/PNG; charset=binary "),
+            Some(PreviewAssetMime::Png)
+        );
+        assert_eq!(
+            PreviewAssetMime::parse("video/webm; codecs=vp9"),
+            Some(PreviewAssetMime::Webm)
+        );
+        assert_eq!(PreviewAssetMime::parse("image/svg+xml"), None);
+        assert_eq!(PreviewAssetMime::parse("image/unknown"), None);
+        assert_eq!(PreviewAssetMime::parse("text/html"), None);
+        assert_eq!(PreviewAssetMime::parse("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn preview_asset_mime_types_validate_content_signatures_and_bounds() {
+        assert!(PreviewAssetMime::Png.validate_bytes(b"\x89PNG\r\n\x1a\nbody"));
+        assert!(PreviewAssetMime::Gif.validate_bytes(b"GIF89abody"));
+        assert!(PreviewAssetMime::Webp.validate_bytes(b"RIFF\x04\x00\x00\x00WEBPbody"));
+        assert!(
+            PreviewAssetMime::Avif.validate_bytes(b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avif")
+        );
+        assert!(PreviewAssetMime::Mp4.validate_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"));
+        assert!(PreviewAssetMime::Webm.validate_bytes(b"\x1a\x45\xdf\xa3body"));
+        assert!(!PreviewAssetMime::Png.validate_bytes(b"<html>not an image</html>"));
+        assert!(!PreviewAssetMime::Mp4.validate_bytes(b"OggSnot-mp4"));
+        assert!(!PreviewAssetMime::Jpeg.validate_bytes(&[]));
+        assert!(!PreviewAssetMime::Png
+            .validate_size(PreviewAssetMime::Png.max_bytes().saturating_add(1)));
+        assert!(PreviewAssetMime::Webm.validate_size(PreviewAssetMime::Webm.max_bytes()));
+        assert!(!PreviewAssetMime::Gif.validate_size(0));
+        for mime_type in PreviewAssetMime::ALL {
+            assert_eq!(PreviewAssetMime::parse(mime_type.as_str()), Some(mime_type));
+            assert!(mime_type
+                .extension()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()));
+        }
     }
 
     #[test]

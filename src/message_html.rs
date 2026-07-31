@@ -30,6 +30,44 @@ const TIMESTAMP_LOCALIZATION_SCRIPT: &str = include_str!("timestamp_localization
 const RICH_MESSAGE_CSS: &str = include_str!("message_html/message.css");
 static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CachedAssetKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CachedAssetSource {
+    uri: String,
+    kind: CachedAssetKind,
+}
+
+impl CachedAssetSource {
+    pub(crate) fn new(uri: impl Into<String>, kind: CachedAssetKind) -> Option<Self> {
+        let uri = uri.into();
+        valid_cached_asset_uri(&uri).then_some(Self { uri, kind })
+    }
+
+    pub(crate) fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub(crate) fn kind(&self) -> CachedAssetKind {
+        self.kind
+    }
+}
+
+fn valid_cached_asset_uri(uri: &str) -> bool {
+    let Some(cache_key) = uri.strip_prefix("conduit-asset://") else {
+        return false;
+    };
+    cache_key.len() == 64
+        && cache_key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
     pub user_names: Arc<HashMap<String, String>>,
@@ -43,7 +81,7 @@ pub struct MessageHtmlContext {
     pub thread_ts: Option<String>,
     pub load_more_url: Option<String>,
     pub timeline_scroll: TimelineScrollBehavior,
-    pub image_assets: HashMap<String, String>,
+    pub image_assets: HashMap<String, CachedAssetSource>,
     pub failed_image_urls: HashSet<String>,
     pub recent_reactions: Vec<String>,
     pub custom_emojis: Arc<HashMap<String, String>>,
@@ -111,7 +149,7 @@ pub enum TimelineDomPatch {
     },
     UpdateImage {
         asset_key: String,
-        source: Option<String>,
+        source: Option<CachedAssetSource>,
     },
     UpdateUser {
         user_id: String,
@@ -232,7 +270,7 @@ pub fn message_region_patch(
 #[allow(dead_code)]
 pub fn update_image_patch(
     asset_key: impl Into<String>,
-    source: Option<String>,
+    source: Option<CachedAssetSource>,
 ) -> TimelineDomPatch {
     TimelineDomPatch::UpdateImage {
         asset_key: asset_key.into(),
@@ -2082,11 +2120,11 @@ fn message_avatar_html(
     let source = user_avatar_url
         .or_else(|| message.avatar_url())
         .and_then(|url| context.image_assets.get(url))
-        .filter(|source| source.starts_with("data:image/"));
+        .filter(|source| source.kind() == CachedAssetKind::Image);
     if let Some(source) = source {
         return format!(
             "<img class=\"message-avatar\" src=\"{}\" alt=\"\" aria-hidden=\"true\">",
-            escape_html(source)
+            escape_html(source.uri())
         );
     }
 
@@ -3263,28 +3301,13 @@ fn video_figure_html(
     context: &MessageHtmlContext,
 ) -> String {
     let alt = gettext("Video preview: {name}").replace("{name}", label);
-    let poster = if context
-        .image_assets
-        .get(poster_key)
-        .is_some_and(|asset| asset.starts_with("data:video/"))
-    {
-        let src = context.image_assets.get(poster_key).unwrap();
-        format!(
-            "<video preload=\"metadata\" muted playsinline src=\"{}\" aria-label=\"{}\" data-image-key=\"{}\" data-image-alt=\"{}\"></video>",
-            escape_html(src),
-            escape_html(&alt),
-            escape_html(poster_key),
-            escape_html(&alt),
-        )
-    } else {
-        preview_image_html(
-            poster_key,
-            &alt,
-            &gettext("Loading video preview"),
-            &gettext("Video preview unavailable"),
-            context,
-        )
-    };
+    let poster = preview_image_html(
+        poster_key,
+        &alt,
+        &gettext("Loading video preview"),
+        &gettext("Video preview unavailable"),
+        context,
+    );
     let play = "<span class=\"video-play\" aria-hidden=\"true\">▶</span>";
     let caption = attachment_caption_html(Some(label));
     let aria_label = gettext("Play video: {name}").replace("{name}", label);
@@ -3309,19 +3332,27 @@ fn preview_image_html(
         escape_html(alt),
         escape_html(unavailable_label),
     );
-    if let Some(src) = context.image_assets.get(asset_key) {
+    if let Some(source) = context.image_assets.get(asset_key) {
         if debug::enabled() {
             debug::log(
                 "render",
                 &format!("image state=loaded key={}", debug::url_for_log(asset_key)),
             );
         }
-        format!(
-            "<img loading=\"lazy\" decoding=\"async\" src=\"{}\" alt=\"{}\"{}>",
-            escape_html(src),
-            escape_html(alt),
-            patch_attributes,
-        )
+        match source.kind() {
+            CachedAssetKind::Image => format!(
+                "<img loading=\"lazy\" decoding=\"async\" src=\"{}\" alt=\"{}\"{}>",
+                escape_html(source.uri()),
+                escape_html(alt),
+                patch_attributes,
+            ),
+            CachedAssetKind::Video => format!(
+                "<video preload=\"metadata\" muted playsinline src=\"{}\" aria-label=\"{}\"{}></video>",
+                escape_html(source.uri()),
+                escape_html(alt),
+                patch_attributes,
+            ),
+        }
     } else if context.failed_image_urls.contains(asset_key) {
         if debug::enabled() {
             debug::log(
@@ -4166,6 +4197,14 @@ mod tests {
         }
     }
 
+    fn cached_asset_uri(hex_digit: char) -> String {
+        format!("conduit-asset://{}", hex_digit.to_string().repeat(64))
+    }
+
+    fn cached_asset(hex_digit: char, kind: CachedAssetKind) -> CachedAssetSource {
+        CachedAssetSource::new(cached_asset_uri(hex_digit), kind).unwrap()
+    }
+
     fn with_message_control(
         mut context: MessageHtmlContext,
         channel_id: &str,
@@ -4515,7 +4554,7 @@ mod tests {
             )])),
             image_assets: HashMap::from([(
                 avatar_url.to_string(),
-                "data:image/png;base64,YXZhdGFy".to_string(),
+                cached_asset('a', CachedAssetKind::Image),
             )]),
             ..Default::default()
         };
@@ -4526,7 +4565,7 @@ mod tests {
 
         let html = conversation_document("C123", &messages, &context);
         assert_eq!(html.matches("class=\"message-avatar\"").count(), 1);
-        assert!(html.contains("src=\"data:image/png;base64,YXZhdGFy\""));
+        assert!(html.contains(&format!("src=\"{}\"", cached_asset_uri('a'))));
         assert!(html.contains("alt=\"\" aria-hidden=\"true\""));
 
         let fallback = conversation_document(
@@ -4882,7 +4921,7 @@ mod tests {
         let context = MessageHtmlContext {
             image_assets: HashMap::from([(
                 image_url.to_string(),
-                "data:image/png;base64,image".to_string(),
+                cached_asset('b', CachedAssetKind::Image),
             )]),
             ..Default::default()
         };
@@ -4890,7 +4929,7 @@ mod tests {
         let html = conversation_document("C123", &[message], &context);
 
         assert!(!html.contains("No message text"));
-        assert!(html.contains("src=\"data:image/png;base64,image\""));
+        assert!(html.contains(&format!("src=\"{}\"", cached_asset_uri('b'))));
         assert!(html.contains("Screenshot"));
     }
 
@@ -5043,11 +5082,11 @@ mod tests {
             image_assets: HashMap::from([
                 (
                     avatar_url.to_string(),
-                    "data:image/png;base64,avatar".to_string(),
+                    cached_asset('c', CachedAssetKind::Image),
                 ),
                 (
                     image_url.to_string(),
-                    "data:image/png;base64,request".to_string(),
+                    cached_asset('d', CachedAssetKind::Image),
                 ),
             ]),
             ..Default::default()
@@ -5057,11 +5096,11 @@ mod tests {
         let html = conversation_document("C123", &[message], &context);
 
         assert!(html.contains("People assistant"));
-        assert!(html.contains("data:image/png;base64,avatar"));
+        assert!(html.contains(&cached_asset_uri('c')));
         assert!(html.contains("A request needs review"));
         assert!(html.contains("Review request"));
         assert!(html.contains("Example Person"));
-        assert!(html.contains("data:image/png;base64,request"));
+        assert!(html.contains(&cached_asset_uri('d')));
         assert!(html.contains("Approve"));
         assert!(html.contains(&control_url));
         assert!(!html.contains("private-callback"));
@@ -5634,7 +5673,7 @@ mod tests {
             thread_ts: Some("1710000000.000100".to_string()),
             image_assets: HashMap::from([(
                 image_url.to_string(),
-                "data:image/png;base64,thread".to_string(),
+                cached_asset('e', CachedAssetKind::Image),
             )]),
             ..Default::default()
         };
@@ -5644,7 +5683,7 @@ mod tests {
         assert!(html.contains("thread_ts=1710000000.000100"));
         assert!(!html.contains("conduit://thread?"));
         assert!(html.contains("title=\":stuck_out_tongue:\" role=\"img\""));
-        assert!(html.contains("src=\"data:image/png;base64,thread\""));
+        assert!(html.contains(&format!("src=\"{}\"", cached_asset_uri('e'))));
         assert!(html.contains("Thread image"));
     }
 
@@ -5661,7 +5700,7 @@ mod tests {
         let context = MessageHtmlContext {
             image_assets: HashMap::from([(
                 image_url.to_string(),
-                "data:image/png;base64,abc".to_string(),
+                cached_asset('f', CachedAssetKind::Image),
             )]),
             ..Default::default()
         };
@@ -5669,8 +5708,79 @@ mod tests {
         let html = conversation_document("C123", &[message], &context);
 
         assert!(html.contains("loading=\"lazy\""));
-        assert!(html.contains("src=\"data:image/png;base64,abc\""));
+        assert!(html.contains(&format!("src=\"{}\"", cached_asset_uri('f'))));
         assert!(html.contains("Diagram"));
+    }
+
+    #[test]
+    fn cached_asset_source_requires_an_exact_cache_uri() {
+        assert!(CachedAssetSource::new(cached_asset_uri('a'), CachedAssetKind::Image).is_some());
+        for invalid in [
+            "https://files.slack.com/private.png".to_string(),
+            "data:image/png,invalid".to_string(),
+            "conduit-asset://short".to_string(),
+            format!("{}?query=private", cached_asset_uri('b')),
+            format!("{}/private", cached_asset_uri('c')),
+            format!("conduit-asset://{}", "A".repeat(64)),
+        ] {
+            assert!(
+                CachedAssetSource::new(invalid, CachedAssetKind::Image).is_none(),
+                "invalid cached asset URI was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_asset_html_and_patch_use_typed_uris_without_base64_data() {
+        let image_url = "https://files.slack.com/files-pri/T123-F123/image.png";
+        let mut message = message("image");
+        message.files = Some(vec![SlackFile {
+            title: Some("Diagram".to_string()),
+            mimetype: Some("image/png".to_string()),
+            thumb_480: Some(image_url.to_string()),
+            ..Default::default()
+        }]);
+        let image = cached_asset('d', CachedAssetKind::Image);
+        let context = MessageHtmlContext {
+            image_assets: HashMap::from([(image_url.to_string(), image.clone())]),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message], &context);
+        let image_script =
+            timeline_dom_patch_call(&update_image_patch(image_url, Some(image.clone())));
+        let video = cached_asset('e', CachedAssetKind::Video);
+        let video_script =
+            timeline_dom_patch_call(&update_image_patch(image_url, Some(video.clone())));
+
+        assert!(html.contains(&format!("src=\"{}\"", image.uri())));
+        assert!(image_script.contains(&format!(
+            "\"source\":{{\"uri\":\"{}\",\"kind\":\"image\"}}",
+            image.uri()
+        )));
+        assert!(video_script.contains(&format!(
+            "\"source\":{{\"uri\":\"{}\",\"kind\":\"video\"}}",
+            video.uri()
+        )));
+        for output in [&html, &image_script, &video_script] {
+            assert!(output.contains("conduit-asset://"));
+            assert!(!output.contains("base64"));
+            assert!(!output.contains("data:image/"));
+            assert!(!output.contains("data:video/"));
+        }
+    }
+
+    #[test]
+    fn timeline_runtime_requires_the_explicit_cached_asset_kind() {
+        let script = timeline_dom_runtime_script();
+
+        assert!(script.contains("source.kind === \"image\""));
+        assert!(script.contains("source.kind === \"video\""));
+        assert!(script.contains("validCachedAssetSource"));
+        assert!(!script.contains("startsWith(\"data:video/\")"));
+        assert!(!script.contains("ResizeObserver"));
+        assert!(script.contains("loadedmetadata"));
+        assert!(script.contains("document.addEventListener(\"error\""));
     }
 
     #[test]
@@ -5689,7 +5799,7 @@ mod tests {
         let context = MessageHtmlContext {
             image_assets: HashMap::from([(
                 preview.to_string(),
-                "data:image/png;base64,x".to_string(),
+                cached_asset('0', CachedAssetKind::Image),
             )]),
             ..Default::default()
         };
@@ -5697,7 +5807,7 @@ mod tests {
 
         assert!(html.contains("conduit://media?"));
         assert!(html.contains("url=https%3A%2F%2Ffiles.slack.com%2Foriginal.png"));
-        assert!(html.contains("src=\"data:image/png;base64,x\""));
+        assert!(html.contains(&format!("src=\"{}\"", cached_asset_uri('0'))));
     }
 
     #[test]
@@ -5756,7 +5866,7 @@ mod tests {
         let context = MessageHtmlContext {
             image_assets: HashMap::from([(
                 preview.to_string(),
-                "data:image/png;base64,video-poster".to_string(),
+                cached_asset('1', CachedAssetKind::Image),
             )]),
             ..Default::default()
         };
@@ -5764,7 +5874,7 @@ mod tests {
         let html = conversation_document("C123", &[message], &context);
 
         assert!(html.contains("class=\"video-attachment\""));
-        assert!(html.contains("src=\"data:image/png;base64,video-poster\""));
+        assert!(html.contains(&format!("src=\"{}\"", cached_asset_uri('1'))));
         assert!(html.contains("alt=\"Video preview: Demo clip\""));
         assert!(html.contains("aria-label=\"Play video: Demo clip\""));
         assert!(html.contains("kind=video"));
@@ -5820,7 +5930,7 @@ mod tests {
         let context = MessageHtmlContext {
             image_assets: HashMap::from([(
                 preview.to_string(),
-                "data:video/mp4;base64,motion-preview".to_string(),
+                cached_asset('2', CachedAssetKind::Video),
             )]),
             ..Default::default()
         };
@@ -5828,7 +5938,7 @@ mod tests {
         let html = conversation_document("C123", &[message], &context);
 
         assert!(html.contains("<video preload=\"metadata\" muted playsinline"));
-        assert!(html.contains("src=\"data:video/mp4;base64,motion-preview\""));
+        assert!(html.contains(&format!("src=\"{}\"", cached_asset_uri('2'))));
         assert!(html.contains("aria-label=\"Video preview: Demo clip\""));
     }
 

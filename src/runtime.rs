@@ -2,14 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
@@ -41,8 +42,8 @@ use crate::runtime_sync::{
 };
 use crate::services::conversation_history::{recent_history_preview, ConversationHistoryService};
 use crate::slack::{
-    DownloadedPreviewAsset, SlackApi, SlackError, SlackErrorCategory, SlackMessagePage,
-    SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
+    DownloadedPreviewAsset, PreviewAssetMime, SlackApi, SlackError, SlackErrorCategory,
+    SlackMessagePage, SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
@@ -918,7 +919,7 @@ pub enum RuntimeEventKind {
     EmojiCatalogLoaded(HashMap<String, String>),
     ImageAssetLoaded {
         key: String,
-        data_uri: String,
+        asset: CachedAssetDescriptor,
     },
     ImageAssetFailed {
         key: String,
@@ -3428,27 +3429,183 @@ struct ImageAssetCache {
     directory: PathBuf,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct CachedAssetDescriptor {
+    cache_key: String,
+    path: PathBuf,
+    mime_type: PreviewAssetMime,
+    size: u64,
+}
+
+impl CachedAssetDescriptor {
+    fn new(
+        cache_key: String,
+        path: PathBuf,
+        mime_type: PreviewAssetMime,
+        size: u64,
+    ) -> Result<Self> {
+        if !valid_image_asset_cache_key(&cache_key) {
+            return Err(anyhow!("cached preview asset has an invalid cache key"));
+        }
+        let expected_filename = format!("{cache_key}.{}", mime_type.extension());
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_filename.as_str()) {
+            return Err(anyhow!("cached preview asset has an invalid path"));
+        }
+        let size_for_validation = usize::try_from(size)
+            .map_err(|_| anyhow!("cached preview asset exceeds the supported size"))?;
+        if !mime_type.validate_size(size_for_validation) {
+            return Err(anyhow!("cached preview asset has an invalid size"));
+        }
+        Ok(Self {
+            cache_key,
+            path,
+            mime_type,
+            size,
+        })
+    }
+
+    pub(crate) fn cache_key(&self) -> &str {
+        &self.cache_key
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mime_type(&self) -> PreviewAssetMime {
+        self.mime_type
+    }
+
+    pub(crate) fn content_type(&self) -> &'static str {
+        self.mime_type.as_str()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn is_video(&self) -> bool {
+        self.mime_type.is_video()
+    }
+
+    pub(crate) fn uri(&self) -> String {
+        format!("conduit-asset://{}", self.cache_key)
+    }
+
+    pub(crate) fn validates_opened_content(&self, size: u64, prefix: &[u8]) -> bool {
+        self.mime_type.validate_cached_content(size, prefix) && size == self.size
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        cache_key: String,
+        path: PathBuf,
+        mime_type: PreviewAssetMime,
+        size: u64,
+    ) -> Result<Self> {
+        Self::new(cache_key, path, mime_type, size)
+    }
+}
+
+impl std::fmt::Debug for CachedAssetDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CachedAssetDescriptor")
+            .field("cache_key", &self.cache_key)
+            .field("mime_type", &self.mime_type.as_str())
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
 impl ImageAssetCache {
     fn new(directory: PathBuf) -> Self {
         Self { directory }
     }
 
-    async fn load(&self, key: &str) -> Result<Option<String>> {
-        let path = self.path_for_key(key);
-        match tokio::fs::read_to_string(&path).await {
-            Ok(data_uri)
-                if data_uri.starts_with("data:image/") || data_uri.starts_with("data:video/") =>
-            {
-                Ok(Some(data_uri))
-            }
-            Ok(_) => Ok(None),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to read cached image {}", path.display())),
-        }
+    async fn load(&self, key: &str) -> Result<Option<CachedAssetDescriptor>> {
+        self.load_with_pre_open(key, |_| {}).await
     }
 
-    async fn store(&self, key: &str, data_uri: &str) -> Result<()> {
+    async fn load_with_pre_open(
+        &self,
+        key: &str,
+        mut before_open: impl FnMut(&Path),
+    ) -> Result<Option<CachedAssetDescriptor>> {
+        let cache_key = image_asset_cache_key(key);
+        let mut loaded = None;
+        for mime_type in PreviewAssetMime::ALL {
+            let path = self.path_for_cache_key(&cache_key, mime_type);
+            let metadata = match tokio::fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect cached preview asset {}", path.display())
+                    });
+                }
+            };
+            if !metadata.file_type().is_file() {
+                return Err(anyhow!("cached preview asset is not a regular file"));
+            }
+
+            before_open(&path);
+            let mut file = tokio::fs::File::open(&path).await.with_context(|| {
+                format!("failed to open cached preview asset {}", path.display())
+            })?;
+            let opened_metadata = file.metadata().await.with_context(|| {
+                format!("failed to inspect cached preview asset {}", path.display())
+            })?;
+            if !opened_metadata.is_file() || !same_cache_file_identity(&metadata, &opened_metadata)
+            {
+                return Err(anyhow!("cached preview asset is not a regular file"));
+            }
+            let mut prefix = [0_u8; 64];
+            let prefix_length = file.read(&mut prefix).await.with_context(|| {
+                format!("failed to validate cached preview asset {}", path.display())
+            })?;
+            let current_metadata = tokio::fs::symlink_metadata(&path).await.with_context(|| {
+                format!(
+                    "failed to revalidate cached preview asset {}",
+                    path.display()
+                )
+            })?;
+            if !current_metadata.file_type().is_file()
+                || !same_cache_file_identity(&opened_metadata, &current_metadata)
+                || !mime_type
+                    .validate_cached_content(opened_metadata.len(), &prefix[..prefix_length])
+            {
+                return Err(anyhow!(
+                    "cached preview asset has invalid MIME content or size"
+                ));
+            }
+            let descriptor = CachedAssetDescriptor::new(
+                cache_key.clone(),
+                path,
+                mime_type,
+                opened_metadata.len(),
+            )?;
+            if loaded.replace(descriptor).is_some() {
+                return Err(anyhow!(
+                    "cached preview asset has multiple MIME representations"
+                ));
+            }
+        }
+        Ok(loaded)
+    }
+
+    async fn store(
+        &self,
+        key: &str,
+        asset: DownloadedPreviewAsset,
+    ) -> Result<CachedAssetDescriptor> {
+        if !asset.mime_type.validate_bytes(&asset.bytes) {
+            return Err(anyhow!(
+                "downloaded preview asset has invalid MIME content or size"
+            ));
+        }
         tokio::fs::create_dir_all(&self.directory)
             .await
             .with_context(|| {
@@ -3458,16 +3615,98 @@ impl ImageAssetCache {
                 )
             })?;
 
-        let path = self.path_for_key(key);
-        tokio::fs::write(&path, data_uri)
-            .await
-            .with_context(|| format!("failed to write cached image {}", path.display()))
+        let cache_key = image_asset_cache_key(key);
+        for other_mime_type in PreviewAssetMime::ALL {
+            if other_mime_type == asset.mime_type {
+                continue;
+            }
+            let other_path = self.path_for_cache_key(&cache_key, other_mime_type);
+            match tokio::fs::remove_file(&other_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to remove stale cached preview asset {}",
+                            other_path.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        let path = self.path_for_cache_key(&cache_key, asset.mime_type);
+        let temporary_path = self
+            .directory
+            .join(format!(".{cache_key}-{:016x}.part", rand::random::<u64>()));
+        write_preview_asset_atomically(&path, &temporary_path, &asset.bytes).await?;
+
+        CachedAssetDescriptor::new(cache_key, path, asset.mime_type, asset.bytes.len() as u64)
     }
 
-    fn path_for_key(&self, key: &str) -> PathBuf {
-        self.directory
-            .join(format!("{}.data-uri", image_asset_cache_key(key)))
+    #[cfg(test)]
+    fn path_for_key(&self, key: &str, mime_type: PreviewAssetMime) -> PathBuf {
+        self.path_for_cache_key(&image_asset_cache_key(key), mime_type)
     }
+
+    fn path_for_cache_key(&self, cache_key: &str, mime_type: PreviewAssetMime) -> PathBuf {
+        self.directory
+            .join(format!("{cache_key}.{}", mime_type.extension()))
+    }
+}
+
+fn same_cache_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+async fn write_preview_asset_atomically(
+    destination: &Path,
+    temporary_path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut owns_temporary_path = false;
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(temporary_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create temporary preview asset {}",
+                    temporary_path.display()
+                )
+            })?;
+        owns_temporary_path = true;
+        file.write_all(bytes).await.with_context(|| {
+            format!(
+                "failed to write temporary preview asset {}",
+                temporary_path.display()
+            )
+        })?;
+        file.flush().await.with_context(|| {
+            format!(
+                "failed to flush temporary preview asset {}",
+                temporary_path.display()
+            )
+        })?;
+        drop(file);
+        tokio::fs::rename(temporary_path, destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to finalize cached preview asset {}",
+                    destination.display()
+                )
+            })?;
+        owns_temporary_path = false;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if owns_temporary_path {
+        let _ = tokio::fs::remove_file(temporary_path).await;
+    }
+    write_result
 }
 
 fn image_asset_cache_key(key: &str) -> String {
@@ -3477,6 +3716,13 @@ fn image_asset_cache_key(key: &str) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+fn valid_image_asset_cache_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn media_cache_path(url: &str, name: &str) -> PathBuf {
@@ -3675,14 +3921,6 @@ impl Drop for RemoveFileOnDrop {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-fn preview_asset_data_uri(asset: DownloadedPreviewAsset) -> String {
-    format!(
-        "data:{};base64,{}",
-        asset.mime_type,
-        BASE64.encode(asset.bytes)
-    )
 }
 
 impl AppRuntime {
@@ -6011,14 +6249,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 &format!("LoadImageAsset key={}", crate::debug::url_for_log(&key)),
             );
             match context.image_cache.load(&key).await {
-                Ok(Some(data_uri)) => {
+                Ok(Some(asset)) => {
                     crate::debug::log(
                         "runtime",
                         &format!("ImageAssetCacheHit key={}", crate::debug::url_for_log(&key)),
                     );
                     context
                         .events
-                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, data_uri });
+                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, asset });
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -6042,19 +6280,23 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                             asset.bytes.len()
                         ),
                     );
-                    let data_uri = preview_asset_data_uri(asset);
-                    if let Err(error) = context.image_cache.store(&key, &data_uri).await {
-                        crate::debug::log(
-                            "runtime",
-                            &format!(
-                                "ImageAssetCacheWriteFailed key={} error={error:#}",
-                                crate::debug::url_for_log(&key)
-                            ),
-                        );
+                    match context.image_cache.store(&key, asset).await {
+                        Ok(asset) => context
+                            .events
+                            .send_event(RuntimeEventKind::ImageAssetLoaded { key, asset }),
+                        Err(error) => {
+                            crate::debug::log(
+                                "runtime",
+                                &format!(
+                                    "ImageAssetCacheWriteFailed key={} error={error:#}",
+                                    crate::debug::url_for_log(&key)
+                                ),
+                            );
+                            context
+                                .events
+                                .send_event(RuntimeEventKind::ImageAssetFailed { key });
+                        }
                     }
-                    context
-                        .events
-                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, data_uri });
                 }
                 Err(error) => {
                     crate::debug::log(
@@ -25140,7 +25382,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_asset_cache_round_trips_image_and_video_data_uris() {
+    fn preview_asset_cache_round_trips_bounded_raw_image_and_video_files() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time before Unix epoch")
@@ -25164,41 +25406,297 @@ mod tests {
                 None
             );
 
-            cache
+            let image_bytes = b"\x89PNG\r\n\x1a\nraw-image".to_vec();
+            let image = cache
                 .store(
                     "https://files.example/image.png",
-                    "data:image/png;base64,abc",
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Png,
+                        bytes: image_bytes.clone(),
+                    },
                 )
                 .await
                 .expect("cache store failed");
-
+            assert_eq!(image.mime_type(), PreviewAssetMime::Png);
+            assert_eq!(image.content_type(), "image/png");
+            assert_eq!(image.size(), image_bytes.len() as u64);
+            assert!(!image.is_video());
+            assert!(image.validates_opened_content(image.size(), &image_bytes));
+            assert!(!image.validates_opened_content(image.size() + 1, &image_bytes));
+            assert!(!image.validates_opened_content(image.size(), b"not a PNG"));
+            assert!(image
+                .cache_key()
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()));
+            assert_eq!(image.cache_key().len(), 64);
             assert_eq!(
-                cache
-                    .load("https://files.example/image.png")
-                    .await
-                    .expect("cache load failed")
-                    .as_deref(),
-                Some("data:image/png;base64,abc")
+                image.uri(),
+                format!("conduit-asset://{}", image.cache_key())
+            );
+            assert_eq!(tokio::fs::read(image.path()).await.unwrap(), image_bytes);
+            assert_eq!(
+                cache.load("https://files.example/image.png").await.unwrap(),
+                Some(image.clone())
             );
 
-            cache
+            let video_bytes = b"\x1a\x45\xdf\xa3raw-video".to_vec();
+            let video = cache
                 .store(
-                    "https://files.example/video.mp4",
-                    "data:video/mp4;base64,def",
+                    "https://files.example/video.webm",
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Webm,
+                        bytes: video_bytes.clone(),
+                    },
                 )
                 .await
                 .expect("cache store failed");
+            assert!(video.is_video());
+            assert_eq!(video.mime_type(), PreviewAssetMime::Webm);
+            assert_eq!(tokio::fs::read(video.path()).await.unwrap(), video_bytes);
             assert_eq!(
                 cache
-                    .load("https://files.example/video.mp4")
+                    .load("https://files.example/video.webm")
                     .await
-                    .expect("cache load failed")
-                    .as_deref(),
-                Some("data:video/mp4;base64,def")
+                    .unwrap(),
+                Some(video)
             );
         });
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preview_asset_cache_rejects_invalid_or_oversized_content() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-invalid-image-cache-test-{}-{unique}",
+            std::process::id()
+        ));
+        let cache = ImageAssetCache::new(directory.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let invalid_url = "https://files.example/not-really.png";
+            assert!(cache
+                .store(
+                    invalid_url,
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Png,
+                        bytes: b"<html>not an image</html>".to_vec(),
+                    },
+                )
+                .await
+                .is_err());
+
+            tokio::fs::create_dir_all(&directory).await.unwrap();
+            let malformed_path = cache.path_for_key(invalid_url, PreviewAssetMime::Png);
+            tokio::fs::write(&malformed_path, b"not a PNG")
+                .await
+                .unwrap();
+            assert!(cache.load(invalid_url).await.is_err());
+
+            tokio::fs::remove_file(&malformed_path).await.unwrap();
+            let mut oversized = std::fs::File::create(&malformed_path).unwrap();
+            std::io::Write::write_all(&mut oversized, b"\x89PNG\r\n\x1a\n").unwrap();
+            oversized
+                .set_len(PreviewAssetMime::Png.max_bytes() as u64 + 1)
+                .unwrap();
+            drop(oversized);
+            assert!(cache.load(invalid_url).await.is_err());
+
+            tokio::fs::remove_file(&malformed_path).await.unwrap();
+            tokio::fs::create_dir(&malformed_path).await.unwrap();
+            assert!(cache
+                .store(
+                    invalid_url,
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Png,
+                        bytes: b"\x89PNG\r\n\x1a\nvalid".to_vec(),
+                    },
+                )
+                .await
+                .is_err());
+            assert!(cache.load(invalid_url).await.is_err());
+            let mut entries = tokio::fs::read_dir(&directory).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                assert!(!entry.file_name().to_string_lossy().ends_with(".part"));
+            }
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preview_asset_cache_rejects_path_replacement_between_lstat_and_open() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-image-cache-race-test-{}-{unique}",
+            std::process::id()
+        ));
+        let cache = ImageAssetCache::new(directory.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let url = "https://files.example/race.png";
+            let bytes = b"\x89PNG\r\n\x1a\npreview".to_vec();
+            let descriptor = cache
+                .store(
+                    url,
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Png,
+                        bytes: bytes.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            let original_path = directory.join("original.png");
+            let mut replaced = false;
+
+            let result = cache
+                .load_with_pre_open(url, |path| {
+                    assert!(!replaced);
+                    replaced = true;
+                    std::fs::rename(path, &original_path).unwrap();
+                    std::fs::write(path, &bytes).unwrap();
+                })
+                .await;
+
+            assert!(result.is_err());
+            assert!(replaced);
+            assert_ne!(
+                std::fs::symlink_metadata(descriptor.path()).unwrap().ino(),
+                std::fs::symlink_metadata(&original_path).unwrap().ino()
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preview_asset_atomic_write_preserves_a_colliding_temporary_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-image-cache-collision-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("destination.png");
+        let temporary_path = directory.join("existing-writer.part");
+        let existing_bytes = b"owned by another writer";
+        std::fs::write(&temporary_path, existing_bytes).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        assert!(runtime
+            .block_on(write_preview_asset_atomically(
+                &destination,
+                &temporary_path,
+                b"new bytes",
+            ))
+            .is_err());
+        assert_eq!(std::fs::read(&temporary_path).unwrap(), existing_bytes);
+        assert!(!destination.exists());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preview_asset_cache_ignores_legacy_data_uris_and_partial_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-legacy-image-cache-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let url = "https://files.example/legacy.png";
+        let cache_key = image_asset_cache_key(url);
+        std::fs::write(
+            directory.join(format!("{cache_key}.data-uri")),
+            "data:image/png;base64,cHJpdmF0ZQ==",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(format!(".{cache_key}-abandoned.part")),
+            b"partial",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(format!("{cache_key}.svg")),
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+        )
+        .unwrap();
+
+        let cache = ImageAssetCache::new(directory.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(cache.load(url)).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cached_asset_debug_output_never_exposes_paths_or_original_urls() {
+        let descriptor = CachedAssetDescriptor::new(
+            "0".repeat(64),
+            PathBuf::from(format!("/private/cache/location/{}.png", "0".repeat(64))),
+            PreviewAssetMime::Png,
+            12,
+        )
+        .unwrap();
+        let debug = format!("{descriptor:?}");
+
+        assert!(debug.contains(&"0".repeat(64)));
+        assert!(debug.contains("image/png"));
+        assert!(!debug.contains("/private"));
+        assert!(!debug.contains("location"));
+        assert!(!debug.contains("https://"));
+    }
+
+    #[test]
+    fn cached_asset_descriptors_require_canonical_keys_and_filenames() {
+        assert!(CachedAssetDescriptor::new(
+            "../private".into(),
+            PathBuf::from("../private.png"),
+            PreviewAssetMime::Png,
+            12,
+        )
+        .is_err());
+        assert!(CachedAssetDescriptor::new(
+            "a".repeat(64),
+            PathBuf::from(format!("{}.webm", "a".repeat(64))),
+            PreviewAssetMime::Png,
+            12,
+        )
+        .is_err());
+        assert!(CachedAssetDescriptor::new(
+            "A".repeat(64),
+            PathBuf::from(format!("{}.png", "A".repeat(64))),
+            PreviewAssetMime::Png,
+            12,
+        )
+        .is_err());
     }
 
     #[test]

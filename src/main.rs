@@ -20,6 +20,7 @@
 
 mod activity;
 mod application;
+mod asset_scheme;
 mod attention;
 mod attention_metrics;
 mod attention_settings;

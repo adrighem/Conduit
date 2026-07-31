@@ -587,7 +587,9 @@ fn latest_workspace_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message_html::{TimelineInsertPosition, TimelineMessageArrival};
+    use crate::message_html::{
+        CachedAssetKind, CachedAssetSource, TimelineInsertPosition, TimelineMessageArrival,
+    };
 
     fn workspace_revision(value: u64) -> WorkspaceRevision {
         let mut revision = WorkspaceRevision::INITIAL;
@@ -628,7 +630,10 @@ mod tests {
     fn enrichment(asset_key: &str) -> TimelineDomPatch {
         TimelineDomPatch::UpdateImage {
             asset_key: asset_key.to_string(),
-            source: Some("data:image/png;base64,c2FmZQ==".to_string()),
+            source: CachedAssetSource::new(
+                format!("conduit-asset://{}", "a".repeat(64)),
+                CachedAssetKind::Image,
+            ),
         }
     }
 

@@ -409,10 +409,24 @@
     if (!initialPositionPending) rememberStoredViewport();
   }, { passive: true });
   window.addEventListener("resize", preserveViewportAnchorAfterResize, { passive: true });
-  if ("ResizeObserver" in window) {
-    const timelineResizeObserver = new ResizeObserver(preserveViewportAnchorAfterResize);
-    if (timeline) timelineResizeObserver.observe(timeline);
-  }
+  document.addEventListener("load", function (event) {
+    const target = event.target;
+    if (target && target.matches && target.matches(".timeline img")) {
+      preserveViewportAnchorAfterResize();
+    }
+  }, true);
+  document.addEventListener("loadedmetadata", function (event) {
+    const target = event.target;
+    if (target && target.matches && target.matches(".timeline video")) {
+      preserveViewportAnchorAfterResize();
+    }
+  }, true);
+  document.addEventListener("error", function (event) {
+    const target = event.target;
+    if (target && target.matches && target.matches(".timeline img, .timeline video")) {
+      preserveViewportAnchorAfterResize();
+    }
+  }, true);
   document.addEventListener("click", function (event) {
     const target = event.target && event.target.closest
       ? event.target.closest("a[href^='conduit://load-older']")
@@ -468,6 +482,14 @@
 
   function validNonemptyString(value) {
     return typeof value === "string" && value.length > 0;
+  }
+
+  function validCachedAssetSource(source) {
+    return source !== null &&
+      typeof source === "object" &&
+      typeof source.uri === "string" &&
+      /^conduit-asset:\/\/[0-9a-f]{64}$/.test(source.uri) &&
+      (source.kind === "image" || source.kind === "video");
   }
 
   function applyTimelineOperation(patch, arrivalVisible) {
@@ -558,21 +580,21 @@
     if (patch.type === "update-image") {
       if (
         !validNonemptyString(patch.asset_key) ||
-        (patch.source !== null && typeof patch.source !== "string")
+        (patch.source !== null && !validCachedAssetSource(patch.source))
       ) return operationCorrupt;
       const targets = imageElements(patch.asset_key);
       if (targets.length === 0) return operationNoop;
       targets.forEach(function (target) {
-        if (typeof patch.source === "string") {
-          const isVideo = patch.source.startsWith("data:video/");
+        if (patch.source !== null) {
+          const isVideo = patch.source.kind === "video";
           if ((isVideo && target.matches("video")) || (!isVideo && target.matches("img"))) {
-            target.src = patch.source;
+            target.src = patch.source.uri;
           } else if (isVideo) {
             const video = document.createElement("video");
             video.preload = "metadata";
             video.muted = true;
             video.playsInline = true;
-            video.src = patch.source;
+            video.src = patch.source.uri;
             video.setAttribute("aria-label", target.dataset.imageAlt || "");
             video.dataset.imageKey = patch.asset_key;
             video.dataset.imageAlt = target.dataset.imageAlt || "";
@@ -582,7 +604,7 @@
             const image = document.createElement("img");
             image.loading = "lazy";
             image.decoding = "async";
-            image.src = patch.source;
+            image.src = patch.source.uri;
             image.alt = target.dataset.imageAlt || "";
             image.dataset.imageKey = patch.asset_key;
             image.dataset.imageAlt = image.alt;

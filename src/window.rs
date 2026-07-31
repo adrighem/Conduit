@@ -32,6 +32,7 @@ use gtk::{gio, glib};
 use webkit6::prelude::*;
 
 use crate::activity::{self, ActivityItem};
+use crate::asset_scheme::AssetSchemeRegistry;
 use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
@@ -58,8 +59,8 @@ use crate::message_handoff::{
     MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
 use crate::message_html::{
-    self, MessageHtmlContext, TimelineDomPatch, TimelineInsertPosition, TimelineMessageArrival,
-    TimelineMessageRegion, TimelineScrollBehavior,
+    self, CachedAssetKind, CachedAssetSource, MessageHtmlContext, TimelineDomPatch,
+    TimelineInsertPosition, TimelineMessageArrival, TimelineMessageRegion, TimelineScrollBehavior,
 };
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
@@ -68,9 +69,9 @@ use crate::models::{
 use crate::realtime::{RealtimePhase, RealtimeStatus};
 use crate::rendering;
 use crate::runtime::{
-    AppRuntime, OperationContext, RequestId, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
-    RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity, RuntimeOperation,
-    RuntimeTarget, SessionId,
+    AppRuntime, CachedAssetDescriptor, OperationContext, RequestId, RuntimeCommand, RuntimeEvent,
+    RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity,
+    RuntimeOperation, RuntimeTarget, SessionId,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
@@ -372,7 +373,8 @@ mod imp {
         pub message_font_settings_handler: RefCell<Option<(gtk::Settings, glib::SignalHandlerId)>>,
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub(super) thread_pane_controller: RefCell<Option<ThreadPane>>,
-        pub image_assets: RefCell<HashMap<String, String>>,
+        pub(super) asset_scheme_registry: AssetSchemeRegistry,
+        pub image_assets: RefCell<HashMap<String, CachedAssetSource>>,
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
         pub custom_emojis: RefCell<Arc<HashMap<String, String>>>,
@@ -3567,6 +3569,15 @@ impl ConduitWindow {
     }
 
     fn setup_message_view(&self) {
+        let web_context = webkit6::WebContext::new();
+        if self
+            .imp()
+            .asset_scheme_registry
+            .install_on(&web_context)
+            .is_err()
+        {
+            crate::debug::log("ui", "Cached asset URI scheme unavailable");
+        }
         let network_session = self.create_message_network_session();
         let font_settings = gtk::Settings::default();
         let text_zoom = message_text_zoom(
@@ -3576,16 +3587,24 @@ impl ConduitWindow {
                 .as_deref(),
         );
 
-        let message_view =
-            self.create_message_web_view(&network_session, text_zoom, TimelineSurface::Main);
+        let message_view = self.create_message_web_view(
+            &web_context,
+            &network_session,
+            text_zoom,
+            TimelineSurface::Main,
+        );
         let viewer = self.create_media_viewer(&message_view);
         self.imp().message_view_box.append(&viewer.surface_stack);
         *self.imp().message_view.borrow_mut() = Some(message_view.clone());
         *self.imp().media_viewer.borrow_mut() = Some(viewer);
         self.setup_media_viewer_callbacks();
 
-        let thread_view =
-            self.create_message_web_view(&network_session, text_zoom, TimelineSurface::Thread);
+        let thread_view = self.create_message_web_view(
+            &web_context,
+            &network_session,
+            text_zoom,
+            TimelineSurface::Thread,
+        );
         let weak_message_view = message_view.downgrade();
         let weak_thread_view = thread_view.downgrade();
         let thread_pane = ThreadPane::new(
@@ -4101,6 +4120,7 @@ impl ConduitWindow {
 
     fn create_message_web_view(
         &self,
+        web_context: &webkit6::WebContext,
         network_session: &webkit6::NetworkSession,
         text_zoom: f64,
         timeline_surface: TimelineSurface,
@@ -4112,6 +4132,7 @@ impl ConduitWindow {
             .register_script_message_handler(EMOJI_PICKER_MESSAGE_HANDLER, None);
 
         let web_view = webkit6::WebView::builder()
+            .web_context(web_context)
             .network_session(network_session)
             .settings(&settings)
             .user_content_manager(&user_content_manager)
@@ -5882,18 +5903,20 @@ impl ConduitWindow {
                 self.populate_user_groups(names, members);
             }
             RuntimeEventKind::EmojiCatalogLoaded(emojis) => self.replace_custom_emojis(emojis),
-            RuntimeEventKind::ImageAssetLoaded { key, data_uri } => {
+            RuntimeEventKind::ImageAssetLoaded { key, asset } => {
                 crate::debug::log(
                     "ui",
                     &format!("ImageAssetLoaded key={}", crate::debug::url_for_log(&key)),
                 );
                 let imp = self.imp();
+                let source = cached_asset_source(&asset);
+                imp.asset_scheme_registry.insert(asset);
                 imp.pending_image_assets.borrow_mut().remove(&key);
                 imp.failed_image_assets.borrow_mut().remove(&key);
                 imp.image_assets
                     .borrow_mut()
-                    .insert(key.clone(), data_uri.clone());
-                self.patch_image_asset(&key, Some(data_uri));
+                    .insert(key.clone(), source.clone());
+                self.patch_image_asset(&key, Some(source));
             }
             RuntimeEventKind::ImageAssetFailed { key } => {
                 crate::debug::log(
@@ -7638,6 +7661,7 @@ impl ConduitWindow {
         *imp.workspace_name.borrow_mut() = None;
         *imp.workspace_url.borrow_mut() = None;
         *imp.sidebar_error.borrow_mut() = None;
+        imp.asset_scheme_registry.clear();
         imp.image_assets.borrow_mut().clear();
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
@@ -7989,7 +8013,7 @@ impl ConduitWindow {
         self.patch_image_asset(key, None);
     }
 
-    fn patch_image_asset(&self, key: &str, source: Option<String>) {
+    fn patch_image_asset(&self, key: &str, source: Option<CachedAssetSource>) {
         if self
             .imp()
             .user_avatar_urls
@@ -11823,6 +11847,16 @@ impl ConduitWindow {
     }
 }
 
+fn cached_asset_source(asset: &CachedAssetDescriptor) -> CachedAssetSource {
+    let kind = if asset.is_video() {
+        CachedAssetKind::Video
+    } else {
+        CachedAssetKind::Image
+    };
+    CachedAssetSource::new(asset.uri(), kind)
+        .expect("cached asset descriptors always produce valid conduit-asset URIs")
+}
+
 fn set_huddle_button_state(button: &gtk::Button, icon_name: &str, label: &str) {
     button.set_icon_name(icon_name);
     button.set_tooltip_text(Some(label));
@@ -12032,6 +12066,7 @@ fn update_huddle_device_picker(
 mod tests {
     use super::*;
     use crate::sidebar::SidebarRowModel;
+    use crate::slack::PreviewAssetMime;
 
     #[test]
     fn webview_load_binding_keeps_superseded_events_with_their_own_generation() {
@@ -12688,6 +12723,67 @@ mod tests {
 
         assert!(factory.contains("connect_context_menu"));
         assert!(factory.contains("prune_message_web_view_context_menu(context_menu)"));
+    }
+
+    #[test]
+    fn message_web_views_share_the_registered_asset_scheme_context() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let setup = production
+            .split_once("    fn setup_message_view(&self) {")
+            .unwrap()
+            .1
+            .split_once("    fn create_media_viewer(")
+            .unwrap()
+            .0;
+        let factory = production
+            .split_once("    fn create_message_web_view(")
+            .unwrap()
+            .1
+            .split_once("    fn connect_timeline_web_view_lifecycle(")
+            .unwrap()
+            .0;
+        let reset = production
+            .split_once("    fn reset_workspace_state(&self) {")
+            .unwrap()
+            .1
+            .split_once("    fn render_workspace_lifecycle(&self)")
+            .unwrap()
+            .0;
+
+        assert!(setup.contains("let web_context = webkit6::WebContext::new()"));
+        assert!(setup.contains("asset_scheme_registry\n            .install_on(&web_context)"));
+        assert!(setup.contains("Cached asset URI scheme unavailable"));
+        assert!(!setup.contains(".expect("));
+        assert_eq!(setup.matches("&web_context,").count(), 2);
+        assert!(factory.contains("web_context: &webkit6::WebContext"));
+        assert!(factory.contains(".web_context(web_context)"));
+        assert!(factory.contains(".network_session(network_session)"));
+        assert!(reset.contains("asset_scheme_registry.clear()"));
+        assert!(!production.contains("data_uri"));
+    }
+
+    #[test]
+    fn cached_asset_sources_preserve_explicit_image_and_video_kinds() {
+        for (character, extension, mime, expected_kind) in [
+            ('a', "png", PreviewAssetMime::Png, CachedAssetKind::Image),
+            ('b', "mp4", PreviewAssetMime::Mp4, CachedAssetKind::Video),
+        ] {
+            let cache_key = std::iter::repeat_n(character, 64).collect::<String>();
+            let descriptor = CachedAssetDescriptor::for_test(
+                cache_key.clone(),
+                PathBuf::from(format!("{cache_key}.{extension}")),
+                mime,
+                1,
+            )
+            .expect("construct cached asset descriptor");
+
+            let source = cached_asset_source(&descriptor);
+            assert_eq!(source.uri(), format!("conduit-asset://{cache_key}"));
+            assert_eq!(source.kind(), expected_kind);
+        }
     }
 
     #[test]
