@@ -1,0 +1,5 @@
+Phase 5 Task 4: route one batched TimelineDelta per GTK frame and restrict full document loads.
+
+Validation: cargo check --locked; cargo test --locked (1120 passed, 3 ignored); Meson 17/17; node syntax; rustfmt and diff checks. Independent final review clean after fixing empty timelines, stale WebKit load attribution, and wrong-target deltas.
+
+Coverage: cargo-llvm-cov is unavailable in this environment; focused lifecycle, 100-operation batching, empty-state, source-boundary, and real WebKit scroll regressions passed.
