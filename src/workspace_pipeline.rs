@@ -695,6 +695,7 @@ struct ReconciledRootProjection {
 pub(crate) struct WorkspaceCoordinator {
     revision: WorkspaceRevision,
     conversations: HashMap<String, RevisionedConversation>,
+    conversation_membership_tombstones: HashMap<String, WorkspaceRevision>,
     users: HashMap<String, RevisionedValue<SlackUser>>,
     histories: HashMap<String, TimelineState>,
     threads: HashMap<(String, String), TimelineState>,
@@ -1038,6 +1039,7 @@ impl WorkspaceCoordinator {
                 )
             })
             .collect();
+        self.conversation_membership_tombstones.clear();
         self.users = data
             .users
             .iter()
@@ -1124,6 +1126,8 @@ impl WorkspaceCoordinator {
         if !changed {
             return None;
         }
+        self.conversation_membership_tombstones
+            .remove(&conversation.id);
         let current = self.conversation(&conversation.id).unwrap().clone();
         self.commit(
             revision,
@@ -1135,6 +1139,8 @@ impl WorkspaceCoordinator {
     fn apply_conversation_remove(&mut self, channel_id: &str) -> Option<WorkspaceReduction> {
         self.conversations.remove(channel_id)?;
         let revision = self.next_revision();
+        self.conversation_membership_tombstones
+            .insert(channel_id.to_string(), revision);
         self.commit(
             revision,
             vec![WorkspaceChange::ConversationRemoved {
@@ -1210,23 +1216,36 @@ impl WorkspaceCoordinator {
             }
         }
         let revision = self.next_revision();
+        let membership_authority = base_revision.min(self.revision);
         let mut patch_changes = Vec::new();
         let mut store_changes = Vec::new();
 
         for (channel_id, conversation) in &incoming {
             match self.conversations.get_mut(channel_id) {
-                Some(entry) if entry.metadata_revision <= base_revision => {
-                    let mut merged = entry.value.clone();
-                    merge_conversation_metadata(&mut merged, conversation);
-                    if merged != entry.value {
-                        entry.value = merged.clone();
-                        entry.metadata_revision = revision;
-                        patch_changes.push(WorkspaceChange::ConversationUpsert(merged.clone()));
-                        store_changes.push(StoreChange::ConversationMembershipUpsert(merged));
+                Some(entry) => {
+                    // Presence can be authoritative even when the projected data is identical.
+                    // Keep that authority internal and bounded by the global revision.
+                    entry.membership_revision = entry.membership_revision.max(membership_authority);
+                    if entry.metadata_revision <= base_revision {
+                        let mut merged = entry.value.clone();
+                        merge_conversation_metadata(&mut merged, conversation);
+                        if merged != entry.value {
+                            entry.value = merged.clone();
+                            entry.metadata_revision = revision;
+                            patch_changes.push(WorkspaceChange::ConversationUpsert(merged.clone()));
+                            store_changes.push(StoreChange::ConversationMembershipUpsert(merged));
+                        }
                     }
                 }
-                Some(_) => {}
                 None => {
+                    if self
+                        .conversation_membership_tombstones
+                        .get(channel_id)
+                        .is_some_and(|removed_at| *removed_at > base_revision)
+                    {
+                        continue;
+                    }
+                    self.conversation_membership_tombstones.remove(channel_id);
                     self.conversations.insert(
                         channel_id.clone(),
                         RevisionedConversation {
@@ -1255,6 +1274,8 @@ impl WorkspaceCoordinator {
             .collect::<Vec<_>>();
         for channel_id in removed {
             self.conversations.remove(&channel_id);
+            self.conversation_membership_tombstones
+                .insert(channel_id.clone(), revision);
             patch_changes.push(WorkspaceChange::ConversationRemoved {
                 channel_id: channel_id.clone(),
             });
@@ -4028,6 +4049,7 @@ impl Default for WorkspaceCoordinator {
         Self {
             revision: WorkspaceRevision::INITIAL,
             conversations: HashMap::new(),
+            conversation_membership_tombstones: HashMap::new(),
             users: HashMap::new(),
             histories: HashMap::new(),
             threads: HashMap::new(),
@@ -4377,6 +4399,118 @@ mod tests {
         assert!(
             !coordinator.conversation("C1").unwrap().is_starred(),
             "a star projection older than a local toggle must not roll it back"
+        );
+    }
+
+    #[test]
+    fn newer_membership_removal_blocks_stale_resurrection_until_a_newer_snapshot_readds() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::MembershipSnapshot(
+            SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                ConversationMembershipSnapshot {
+                    conversations: vec![conversation("C1", "general")],
+                    starred_ids: None,
+                },
+            ),
+        ));
+        let stale_base = coordinator.revision();
+
+        coordinator.apply(WorkspaceMutation::ConversationRemove {
+            channel_id: "C1".to_string(),
+        });
+        let removal_revision = coordinator.revision();
+
+        assert!(coordinator
+            .apply(WorkspaceMutation::MembershipSnapshot(
+                SnapshotEnvelope::new(
+                    stale_base,
+                    ConversationMembershipSnapshot {
+                        conversations: vec![conversation("C1", "stale")],
+                        starred_ids: None,
+                    },
+                ),
+            ))
+            .is_none());
+        assert_eq!(coordinator.revision(), removal_revision);
+        assert!(coordinator.conversation("C1").is_none());
+
+        let rejoined = coordinator
+            .apply(WorkspaceMutation::MembershipSnapshot(
+                SnapshotEnvelope::new(
+                    removal_revision,
+                    ConversationMembershipSnapshot {
+                        conversations: vec![conversation("C1", "rejoined")],
+                        starred_ids: None,
+                    },
+                ),
+            ))
+            .expect("a snapshot based after the removal may re-add the conversation");
+        assert!(matches!(
+            rejoined.patch().changes(),
+            [WorkspaceChange::ConversationUpsert(conversation)]
+                if conversation.id == "C1"
+                    && conversation.name.as_deref() == Some("rejoined")
+        ));
+        assert_eq!(
+            coordinator.conversation("C1").unwrap().name.as_deref(),
+            Some("rejoined")
+        );
+    }
+
+    #[test]
+    fn unchanged_newer_membership_presence_blocks_an_older_absent_snapshot() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator.apply(WorkspaceMutation::MembershipSnapshot(
+            SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                ConversationMembershipSnapshot {
+                    conversations: vec![conversation("C1", "general")],
+                    starred_ids: None,
+                },
+            ),
+        ));
+        let older_absent_base = coordinator.revision();
+
+        coordinator.apply(WorkspaceMutation::ConversationStarChanged {
+            channel_id: "C1".to_string(),
+            starred: true,
+        });
+        let newer_presence_base = coordinator.revision();
+
+        assert!(coordinator
+            .apply(WorkspaceMutation::MembershipSnapshot(
+                SnapshotEnvelope::new(
+                    newer_presence_base,
+                    ConversationMembershipSnapshot {
+                        conversations: vec![conversation("C1", "general")],
+                        starred_ids: None,
+                    },
+                ),
+            ))
+            .is_none());
+        assert_eq!(coordinator.revision(), newer_presence_base);
+
+        assert!(coordinator
+            .apply(WorkspaceMutation::MembershipSnapshot(
+                SnapshotEnvelope::new(
+                    older_absent_base,
+                    ConversationMembershipSnapshot {
+                        conversations: Vec::new(),
+                        starred_ids: None,
+                    },
+                ),
+            ))
+            .is_none());
+        assert_eq!(coordinator.revision(), newer_presence_base);
+        assert!(coordinator.conversation("C1").is_some());
+        assert_eq!(
+            coordinator
+                .conversations
+                .get("C1")
+                .unwrap()
+                .membership_revision,
+            newer_presence_base
         );
     }
 

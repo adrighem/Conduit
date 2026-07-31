@@ -9163,7 +9163,7 @@ impl ConduitWindow {
                     }
                 }
             }
-            SocketModeEvent::RefreshConversations => self.refresh_conversations(),
+            SocketModeEvent::RefreshConversations(_) => {}
         }
     }
 

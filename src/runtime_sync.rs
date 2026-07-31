@@ -232,6 +232,7 @@ struct RuntimeSyncState {
     running: HashMap<JobRun, AbortHandle>,
     cancellation_requested: HashSet<JobRun>,
     retry_wakeups: HashMap<SyncJobId, RetryWakeup>,
+    next_job_identity: u64,
     next_retry_wakeup_generation: u64,
 }
 
@@ -282,6 +283,25 @@ pub(crate) struct RuntimeSyncScheduler {
     inner: Arc<RuntimeSyncInner>,
 }
 
+/// Session-local identity pair for one scheduler admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeSyncJobIdentity {
+    job_id: SyncJobId,
+    cancellation_id: CancellationId,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeSyncJobIdentity {
+    pub(crate) fn job_id(self) -> SyncJobId {
+        self.job_id
+    }
+
+    pub(crate) fn cancellation_id(self) -> CancellationId {
+        self.cancellation_id
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl RuntimeSyncScheduler {
     pub(crate) fn new(config: SchedulerConfig) -> Self {
@@ -304,11 +324,33 @@ impl RuntimeSyncScheduler {
                     running: HashMap::new(),
                     cancellation_requested: HashSet::new(),
                     retry_wakeups: HashMap::new(),
+                    next_job_identity: 0,
                     next_retry_wakeup_generation: 0,
                 }),
                 shutdown_complete,
             }),
         }
+    }
+
+    /// Allocates one unique job and cancellation identity pair for this
+    /// session-owned scheduler.
+    pub(crate) fn allocate_job_identity(&self) -> RuntimeSyncJobIdentity {
+        let mut state = self.inner.state();
+        let value = state
+            .next_job_identity
+            .checked_add(1)
+            .expect("runtime sync job identity space exhausted");
+        state.next_job_identity = value;
+        RuntimeSyncJobIdentity {
+            job_id: SyncJobId::new(value),
+            cancellation_id: CancellationId::new(value),
+        }
+    }
+
+    /// Returns epoch-compatible milliseconds that remain monotonic for this
+    /// scheduler session.
+    pub(crate) fn now_epoch_ms(&self) -> u64 {
+        self.inner.now_ms()
     }
 
     pub(crate) fn admit(
@@ -962,6 +1004,63 @@ mod tests {
             wait_for_count(&starts, 1).await;
             scheduler.shutdown().await;
         });
+    }
+
+    #[test]
+    fn job_identities_are_session_local_monotonic_and_shared_by_clones() {
+        let runtime_scheduler = scheduler(1, 1);
+        let scheduler_clone = runtime_scheduler.clone();
+
+        let first = runtime_scheduler.allocate_job_identity();
+        let second = scheduler_clone.allocate_job_identity();
+
+        assert_eq!(first.job_id(), SyncJobId::new(1));
+        assert_eq!(
+            first.cancellation_id(),
+            crate::sync_scheduler::CancellationId::new(1)
+        );
+        assert_eq!(second.job_id(), SyncJobId::new(2));
+        assert_eq!(
+            second.cancellation_id(),
+            crate::sync_scheduler::CancellationId::new(2)
+        );
+        assert_ne!(first, second);
+
+        let next_session_scheduler = scheduler(1, 1);
+        let next_session_first = next_session_scheduler.allocate_job_identity();
+        assert_eq!(next_session_first.job_id(), SyncJobId::new(1));
+        assert_eq!(
+            next_session_first.cancellation_id(),
+            crate::sync_scheduler::CancellationId::new(1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "runtime sync job identity space exhausted")]
+    fn job_identity_allocation_panics_instead_of_wrapping() {
+        let scheduler = scheduler(1, 1);
+        scheduler.inner.state().next_job_identity = u64::MAX;
+
+        let _ = scheduler.allocate_job_identity();
+    }
+
+    #[test]
+    fn exposed_scheduler_clock_is_epoch_compatible_and_monotonic() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        let scheduler = scheduler(1, 1);
+        let first = scheduler.now_epoch_ms();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        let second = scheduler.now_epoch_ms();
+
+        assert!(first >= before);
+        assert!(first <= after);
+        assert!(second >= first);
     }
 
     #[test]

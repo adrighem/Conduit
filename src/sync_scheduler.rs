@@ -716,9 +716,9 @@ impl SyncScheduler {
             return None;
         }
 
-        let interactive = Self::eligible_position(&self.interactive, now_ms);
-        let foreground = Self::eligible_position(&self.foreground, now_ms);
-        let maintenance = Self::eligible_position(&self.maintenance, now_ms);
+        let interactive = self.dispatchable_position(SyncPriority::Interactive, now_ms);
+        let foreground = self.dispatchable_position(SyncPriority::Foreground, now_ms);
+        let maintenance = self.dispatchable_position(SyncPriority::Maintenance, now_ms);
         let priority = if maintenance.is_some()
             && self.maintenance_wait_dispatches >= self.config.max_higher_priority_dispatches
         {
@@ -1114,7 +1114,7 @@ impl SyncScheduler {
     }
 
     fn reset_wait_if_ineligible(&mut self, priority: SyncPriority, now_ms: u64) {
-        if Self::eligible_position(self.queue(priority), now_ms).is_some() {
+        if self.dispatchable_position(priority, now_ms).is_some() {
             return;
         }
         match priority {
@@ -1124,8 +1124,15 @@ impl SyncScheduler {
         }
     }
 
-    fn eligible_position(queue: &VecDeque<QueuedJob>, now_ms: u64) -> Option<usize> {
-        queue.iter().position(|queued| queued.ready_at_ms <= now_ms)
+    fn dispatchable_position(&self, priority: SyncPriority, now_ms: u64) -> Option<usize> {
+        self.queue(priority).iter().position(|queued| {
+            queued.ready_at_ms <= now_ms
+                && (!matches!(queued.job.replacement, ReplacementClass::Refresh(_))
+                    || !self
+                        .running
+                        .values()
+                        .any(|running| running.job.target == queued.job.target))
+        })
     }
 
     fn queue_mut(&mut self, priority: SyncPriority) -> &mut VecDeque<QueuedJob> {
@@ -1778,6 +1785,96 @@ mod tests {
     }
 
     #[test]
+    fn queued_refresh_waits_for_running_work_on_the_same_target() {
+        let mut scheduler = scheduler(2, 2, 3);
+        admit(
+            &mut scheduler,
+            replaceable_job(1, 10, RefreshClass::ConversationHistory),
+        );
+        let running = scheduler.dispatch_next(10_000).unwrap();
+        admit(
+            &mut scheduler,
+            replaceable_job(2, 10, RefreshClass::ConversationHistory),
+        );
+
+        assert!(scheduler.dispatch_next(10_000).is_none());
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Succeeded, 10_000),
+            Ok(CompletionOutcome::Completed)
+        );
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            SyncJobId::new(2)
+        );
+    }
+
+    #[test]
+    fn newest_queued_refresh_coalesces_while_the_current_generation_runs() {
+        let mut scheduler = scheduler(3, 2, 3);
+        let older_queued = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+        let newest = replaceable_job(3, 10, RefreshClass::ConversationHistory);
+        admit(
+            &mut scheduler,
+            replaceable_job(1, 10, RefreshClass::ConversationHistory),
+        );
+        let running = scheduler.dispatch_next(10_000).unwrap();
+        admit(&mut scheduler, older_queued.clone());
+
+        assert_eq!(
+            scheduler.admit(newest.clone(), 10_001, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(newest.id(), 3),
+                coalesced: Some(ReleasedJob::new(older_queued, 1)),
+            }
+        );
+        assert!(scheduler.dispatch_next(10_001).is_none());
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Succeeded, 10_001),
+            Ok(CompletionOutcome::Completed)
+        );
+        assert_eq!(dispatch_and_complete(&mut scheduler, 10_001), newest.id());
+    }
+
+    #[test]
+    fn blocked_interactive_refresh_does_not_hide_dispatchable_maintenance_work() {
+        let mut scheduler = scheduler(3, 2, 3);
+        admit(
+            &mut scheduler,
+            replaceable_job(1, 10, RefreshClass::ConversationHistory),
+        );
+        let running = scheduler.dispatch_next(10_000).unwrap();
+        admit(
+            &mut scheduler,
+            with_priority(
+                replaceable_job(2, 10, RefreshClass::ConversationHistory),
+                SyncPriority::Interactive,
+            ),
+        );
+        admit(
+            &mut scheduler,
+            with_priority(ephemeral_job(3), SyncPriority::Maintenance),
+        );
+
+        let unrelated = scheduler.dispatch_next(10_000).unwrap();
+        assert_eq!(unrelated.job().id(), SyncJobId::new(3));
+        assert_eq!(
+            scheduler.complete(unrelated.run(), JobOutcome::Succeeded, 10_000),
+            Ok(CompletionOutcome::Completed)
+        );
+        assert!(scheduler.dispatch_next(10_000).is_none());
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Succeeded, 10_000),
+            Ok(CompletionOutcome::Completed)
+        );
+        assert_eq!(
+            dispatch_and_complete(&mut scheduler, 10_000),
+            SyncJobId::new(2)
+        );
+    }
+
+    #[test]
     fn queued_cancellation_releases_capacity_but_durable_work_is_protected() {
         let mut scheduler = scheduler(2, 1, 3);
         let ephemeral = ephemeral_job(1);
@@ -2110,56 +2207,42 @@ mod tests {
     }
 
     #[test]
-    fn newer_running_refresh_supersedes_an_older_concurrent_retry() {
+    fn different_refresh_classes_for_the_same_target_are_serialized() {
         let mut scheduler = scheduler(2, 2, 3);
-        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
-        older.retry = RetryPolicy::fixed(2, 250).unwrap();
+        let older = replaceable_job(1, 10, RefreshClass::Presence);
         let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
         scheduler.admit(older.clone(), 1_000, None).unwrap();
         let older_run = scheduler.dispatch_next(1_000).unwrap();
         scheduler.admit(newer.clone(), 1_001, None).unwrap();
-        let newer_run = scheduler.dispatch_next(1_001).unwrap();
 
+        assert!(scheduler.dispatch_next(1_001).is_none());
         assert_eq!(
-            scheduler.complete(older_run.run(), JobOutcome::RetryableFailure, 1_010),
-            Ok(CompletionOutcome::Superseded {
-                released: ReleasedJob::new(older, 1),
-                superseding: AdmissionToken::new(newer.id(), 2),
-            })
-        );
-        assert_eq!(
-            scheduler.complete(newer_run.run(), JobOutcome::Succeeded, 1_010),
+            scheduler.complete(older_run.run(), JobOutcome::Succeeded, 1_010),
             Ok(CompletionOutcome::Completed)
         );
+        assert_eq!(dispatch_and_complete(&mut scheduler, 1_010), newer.id());
     }
 
     #[test]
-    fn completed_newer_refresh_still_supersedes_an_older_concurrent_retry() {
+    fn queued_refresh_waits_for_non_refresh_work_on_the_same_target() {
         let mut scheduler = scheduler(2, 2, 3);
-        let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
-        older.retry = RetryPolicy::fixed(2, 250).unwrap();
-        let newer = replaceable_job(2, 10, RefreshClass::ConversationHistory);
-        scheduler.admit(older.clone(), 1_000, None).unwrap();
-        let older_run = scheduler.dispatch_next(1_000).unwrap();
-        scheduler.admit(newer.clone(), 1_001, None).unwrap();
-        let newer_run = scheduler.dispatch_next(1_001).unwrap();
+        let mut non_refresh = ephemeral_job(1);
+        non_refresh.target = conversation_target(10);
+        let refresh = replaceable_job(2, 10, RefreshClass::ConversationHistory);
+        scheduler.admit(non_refresh.clone(), 1_000, None).unwrap();
+        let non_refresh_run = scheduler.dispatch_next(1_000).unwrap();
+        scheduler.admit(refresh.clone(), 1_001, None).unwrap();
+
+        assert!(scheduler.dispatch_next(1_001).is_none());
         assert_eq!(
-            scheduler.complete(newer_run.run(), JobOutcome::Succeeded, 1_005),
+            scheduler.complete(non_refresh_run.run(), JobOutcome::Succeeded, 1_010),
             Ok(CompletionOutcome::Completed)
         );
-
-        assert_eq!(
-            scheduler.complete(older_run.run(), JobOutcome::RetryableFailure, 1_010),
-            Ok(CompletionOutcome::Superseded {
-                released: ReleasedJob::new(older, 1),
-                superseding: AdmissionToken::new(newer.id(), 2),
-            })
-        );
-        assert!(scheduler.dispatch_next(1_500).is_none());
+        assert_eq!(dispatch_and_complete(&mut scheduler, 1_010), refresh.id());
     }
 
     #[test]
-    fn reused_job_id_does_not_change_the_admission_that_superseded_a_retry() {
+    fn reused_job_id_gets_a_new_admission_after_serialized_refresh_runs() {
         let mut scheduler = scheduler(2, 2, 3);
         let mut older = replaceable_job(1, 10, RefreshClass::ConversationHistory);
         older.retry = RetryPolicy::fixed(2, 250).unwrap();
@@ -2173,21 +2256,7 @@ mod tests {
         else {
             unreachable!("newer refresh must be admitted");
         };
-        let newer_run = scheduler.dispatch_next(1_001).unwrap();
-        assert_eq!(
-            scheduler.complete(newer_run.run(), JobOutcome::Succeeded, 1_005),
-            Ok(CompletionOutcome::Completed)
-        );
-
-        let unrelated_reuse = replaceable_job(2, 20, RefreshClass::ConversationHistory);
-        let AdmissionOutcome::Accepted {
-            token: reused_admission,
-            ..
-        } = scheduler.admit(unrelated_reuse, 1_006, None).unwrap()
-        else {
-            unreachable!("unrelated reuse must be admitted");
-        };
-        assert_ne!(newer_admission, reused_admission);
+        assert!(scheduler.dispatch_next(1_001).is_none());
         assert_eq!(
             scheduler.complete(older_run.run(), JobOutcome::RetryableFailure, 1_010),
             Ok(CompletionOutcome::Superseded {
@@ -2195,6 +2264,22 @@ mod tests {
                 superseding: newer_admission,
             })
         );
+
+        let newer_run = scheduler.dispatch_next(1_010).unwrap();
+        assert_eq!(
+            scheduler.complete(newer_run.run(), JobOutcome::Succeeded, 1_010),
+            Ok(CompletionOutcome::Completed)
+        );
+
+        let unrelated_reuse = replaceable_job(2, 20, RefreshClass::ConversationHistory);
+        let AdmissionOutcome::Accepted {
+            token: reused_admission,
+            ..
+        } = scheduler.admit(unrelated_reuse, 1_011, None).unwrap()
+        else {
+            unreachable!("unrelated reuse must be admitted");
+        };
+        assert_ne!(newer_admission, reused_admission);
     }
 
     #[test]

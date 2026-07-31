@@ -190,6 +190,63 @@ pub(crate) struct StoreHub {
     inner: Arc<StoreHubInner>,
 }
 
+struct StoreHubOpening {
+    writer: Option<tokio::sync::mpsc::Sender<StoreWorkerRequest>>,
+    readers: Vec<tokio::sync::mpsc::Sender<StoreWorkerRequest>>,
+    workers: Vec<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl StoreHubOpening {
+    fn new(
+        writer: tokio::sync::mpsc::Sender<StoreWorkerRequest>,
+        worker: std::thread::JoinHandle<Result<()>>,
+    ) -> Self {
+        Self {
+            writer: Some(writer),
+            readers: Vec::with_capacity(STORE_READER_COUNT),
+            workers: vec![worker],
+        }
+    }
+
+    fn add_reader(
+        &mut self,
+        reader: tokio::sync::mpsc::Sender<StoreWorkerRequest>,
+        worker: std::thread::JoinHandle<Result<()>>,
+    ) {
+        self.readers.push(reader);
+        self.workers.push(worker);
+    }
+
+    fn finish(mut self, metrics: Arc<StoreMetrics>) -> StoreHub {
+        StoreHub {
+            inner: Arc::new(StoreHubInner {
+                writer: self
+                    .writer
+                    .take()
+                    .expect("store opening guard must own its writer"),
+                readers: std::mem::take(&mut self.readers),
+                next_reader: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
+                admission: tokio::sync::Mutex::new(()),
+                workers: std::sync::Mutex::new(std::mem::take(&mut self.workers)),
+                metrics,
+            }),
+        }
+    }
+}
+
+impl Drop for StoreHubOpening {
+    fn drop(&mut self) {
+        // Closing every request channel lets workers that outlive a cancelled
+        // startup finish cleanly before another hub retries schema creation.
+        drop(self.writer.take());
+        self.readers.clear();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl StoreHub {
     pub(crate) async fn open(directory: PathBuf) -> Result<Self> {
@@ -200,10 +257,9 @@ impl StoreHub {
             STORE_WRITER_QUEUE_CAPACITY,
             Arc::clone(&metrics),
         );
+        let mut opening = StoreHubOpening::new(writer, writer_worker);
         writer_startup.await.map_err(|_| StoreError::HubClosed)??;
 
-        let mut readers = Vec::with_capacity(STORE_READER_COUNT);
-        let mut workers = vec![writer_worker];
         for _ in 0..STORE_READER_COUNT {
             let (reader, startup, worker) = spawn_store_worker(
                 directory.clone(),
@@ -211,22 +267,11 @@ impl StoreHub {
                 STORE_READER_QUEUE_CAPACITY,
                 Arc::clone(&metrics),
             );
+            opening.add_reader(reader, worker);
             startup.await.map_err(|_| StoreError::HubClosed)??;
-            readers.push(reader);
-            workers.push(worker);
         }
 
-        Ok(Self {
-            inner: Arc::new(StoreHubInner {
-                writer,
-                readers,
-                next_reader: AtomicUsize::new(0),
-                closed: AtomicBool::new(false),
-                admission: tokio::sync::Mutex::new(()),
-                workers: std::sync::Mutex::new(workers),
-                metrics,
-            }),
-        })
+        Ok(opening.finish(metrics))
     }
 
     pub(crate) async fn write<T, F>(&self, task: F) -> Result<T>
@@ -628,6 +673,8 @@ pub struct WorkspaceStore {
     #[allow(dead_code)]
     update_lock: Arc<Mutex<()>>,
     hub: Arc<tokio::sync::OnceCell<StoreHub>>,
+    hub_migration: Arc<tokio::sync::OnceCell<()>>,
+    hub_initialization_started: Arc<AtomicBool>,
     store_batch_revision: Arc<std::sync::Mutex<WorkspaceRevision>>,
     recovery_generation: Arc<AtomicU64>,
     workspace_reset_generation: Arc<AtomicU64>,
@@ -681,6 +728,8 @@ impl WorkspaceStore {
             workspace_key: cache_key(workspace_id),
             update_lock: Arc::new(Mutex::new(())),
             hub: Arc::new(tokio::sync::OnceCell::new()),
+            hub_migration: Arc::new(tokio::sync::OnceCell::new()),
+            hub_initialization_started: Arc::new(AtomicBool::new(false)),
             store_batch_revision: Arc::new(std::sync::Mutex::new(WorkspaceRevision::INITIAL)),
             recovery_generation: Arc::new(AtomicU64::new(0)),
             workspace_reset_generation: Arc::new(AtomicU64::new(0)),
@@ -690,19 +739,39 @@ impl WorkspaceStore {
     }
 
     async fn hub(&self) -> Result<&StoreHub> {
+        // This remains true after cancellation so a later handoff barrier can
+        // finish or retry a partially started first initialization.
+        self.hub_initialization_started
+            .store(true, Ordering::Release);
+        let directory = self.directory.clone();
+        let hub = self
+            .hub
+            .get_or_try_init(|| StoreHub::open(directory))
+            .await?;
+
+        // Publish the hub before migration work is queued. If this future is
+        // cancelled, the owned worker pool remains available and the separate
+        // cell retries the idempotent migration on the next access.
         let directory = self.directory.clone();
         let workspace_key = self.workspace_key.clone();
         let workspace_id = self.workspace_id.clone();
-        self.hub
-            .get_or_try_init(|| async move {
-                let hub = StoreHub::open(directory.clone()).await?;
+        self.hub_migration
+            .get_or_try_init(|| async {
                 hub.write(move |connection| {
                     migrate_legacy_workspace(connection, &directory, &workspace_key, &workspace_id)
                 })
                 .await?;
-                Ok(hub)
+                Ok::<(), StoreError>(())
             })
-            .await
+            .await?;
+        Ok(hub)
+    }
+
+    pub(crate) async fn barrier(&self) -> Result<()> {
+        if !self.hub_initialization_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.hub().await?.barrier().await
     }
 
     #[cfg(test)]
@@ -7426,6 +7495,53 @@ mod tests {
             }
             hub.shutdown().await.unwrap();
         });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_barrier_is_a_noop_before_the_hub_is_initialized() {
+        let directory = temp_cache_dir("workspace-store-unopened-barrier");
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+
+        runtime().block_on(async {
+            assert!(store.hub.get().is_none());
+            store.barrier().await.unwrap();
+            assert!(store.hub.get().is_none());
+        });
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn workspace_store_barrier_retries_an_incomplete_first_initialization() {
+        let directory = temp_cache_dir("workspace-store-incomplete-barrier");
+        std::fs::create_dir_all(&directory).unwrap();
+        Connection::open(database_path(&directory)).unwrap();
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        store
+            .hub_initialization_started
+            .store(true, Ordering::Release);
+
+        runtime().block_on(async {
+            assert!(store.hub.get().is_none());
+            store.barrier().await.unwrap();
+            let hub = store
+                .hub
+                .get()
+                .expect("barrier must finish an attempted initialization");
+            assert!(
+                store.hub_migration.get().is_some(),
+                "barrier must finish or retry the workspace migration"
+            );
+            let workspace_rows: i64 = hub
+                .query(|connection| {
+                    Ok(connection
+                        .query_row("SELECT count(*) FROM workspaces", [], |row| row.get(0))?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(workspace_rows, 0);
+        });
+
         let _ = std::fs::remove_dir_all(directory);
     }
 

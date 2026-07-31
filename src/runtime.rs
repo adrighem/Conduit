@@ -35,7 +35,10 @@ use crate::models::{
     SlackUserGroup, SlackUserStatus, StoredToken,
 };
 use crate::realtime::RealtimeStatus;
-use crate::runtime_sync::RuntimeSyncScheduler;
+use crate::runtime_sync::{
+    RuntimeSyncAdmissionOutcome, RuntimeSyncFailureKind, RuntimeSyncReceipt, RuntimeSyncScheduler,
+    RuntimeSyncTerminalResult, RuntimeSyncWork,
+};
 use crate::services::conversation_history::{recent_history_preview, ConversationHistoryService};
 use crate::slack::{
     DownloadedPreviewAsset, SlackApi, SlackError, SlackErrorCategory, SlackMessagePage,
@@ -45,7 +48,11 @@ use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketMode
 use crate::store::{
     StoreBatchExecution, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
 };
-use crate::sync_scheduler::SchedulerConfig;
+use crate::sync_scheduler::{
+    AdmissionRejectionReason, AdmissionToken, CancellationId, FreshnessPolicy, JobOutcome,
+    RefreshClass, ReplacementClass, RetryPolicy, SchedulerConfig, SyncDurability, SyncJob,
+    SyncPriority, SyncTargetKey, SyncTargetKind,
+};
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
     MessageAttentionEffect, MessageChange, MessageMutationKind, MutationOrigin, ReactionMutation,
@@ -74,7 +81,7 @@ const ATTACHMENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60
 const ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const ATTACHMENT_BASENAME_MAX_BYTES: usize = 180;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RuntimeCommand {
     LoadStoredToken,
     StartOAuth {
@@ -2188,8 +2195,247 @@ impl TrackedRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ActiveRequest {
-    task_id: u64,
+enum ActiveWork {
+    Task {
+        task_id: u64,
+    },
+    Sync {
+        admission: AdmissionToken,
+        cancellation_id: CancellationId,
+    },
+}
+
+struct RuntimeTaskHandle {
+    abort: tokio::task::AbortHandle,
+    completion: watch::Receiver<bool>,
+}
+
+impl RuntimeTaskHandle {
+    fn request_abort(&self) {
+        self.abort.abort();
+    }
+
+    fn abort(self) -> watch::Receiver<bool> {
+        self.request_abort();
+        self.completion
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeSyncPlan {
+    target: SyncTargetKey,
+    priority: SyncPriority,
+    durability: SyncDurability,
+    freshness: FreshnessPolicy,
+    replacement: ReplacementClass,
+    retry: RetryPolicy,
+}
+
+impl RuntimeSyncPlan {
+    const fn ephemeral(
+        target: SyncTargetKey,
+        priority: SyncPriority,
+        replacement: ReplacementClass,
+    ) -> Self {
+        Self {
+            target,
+            priority,
+            durability: SyncDurability::Ephemeral,
+            freshness: FreshnessPolicy::Always,
+            replacement,
+            retry: RetryPolicy::Never,
+        }
+    }
+
+    fn job(self, identity: crate::runtime_sync::RuntimeSyncJobIdentity) -> SyncJob {
+        SyncJob::new(
+            identity.job_id(),
+            identity.cancellation_id(),
+            self.target,
+            self.priority,
+            self.durability,
+            self.freshness,
+            self.replacement,
+            self.retry,
+        )
+        .expect("runtime sync plan must satisfy scheduler job contracts")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeStartupSyncKind {
+    EmojiCatalog,
+    Membership,
+    UserGroups,
+}
+
+struct PendingMembershipSync {
+    session: SessionId,
+    plan: RuntimeSyncPlan,
+    work: RuntimeSyncWork,
+}
+
+fn runtime_sync_target(kind: SyncTargetKind, domain: &str, stable_parts: &[&str]) -> SyncTargetKey {
+    fn update_part(hasher: &mut Sha256, value: &str) {
+        let bytes = value.as_bytes();
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    update_part(&mut hasher, "conduit-runtime-sync-target-v1");
+    update_part(&mut hasher, domain);
+    for part in stable_parts {
+        update_part(&mut hasher, part);
+    }
+    let digest = hasher.finalize();
+    let opaque_id = u64::from_be_bytes(
+        digest[..std::mem::size_of::<u64>()]
+            .try_into()
+            .expect("SHA-256 digest contains a u64 prefix"),
+    );
+    SyncTargetKey::new(kind, opaque_id)
+}
+
+fn connected_command_sync_plan(command: &RuntimeCommand) -> Option<RuntimeSyncPlan> {
+    let plan = match command {
+        RuntimeCommand::RefreshConversations => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::Workspace,
+                "workspace-operation",
+                &["conversation-membership"],
+            ),
+            SyncPriority::Foreground,
+            ReplacementClass::Refresh(RefreshClass::Membership),
+        ),
+        RuntimeCommand::DiscoverConversations => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::Workspace,
+                "workspace-operation",
+                &["conversation-discovery"],
+            ),
+            SyncPriority::Maintenance,
+            ReplacementClass::Refresh(RefreshClass::Workspace),
+        ),
+        RuntimeCommand::DiscoverChannels => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::Workspace,
+                "workspace-operation",
+                &["conversation-discovery"],
+            ),
+            SyncPriority::Interactive,
+            ReplacementClass::Refresh(RefreshClass::Workspace),
+        ),
+        RuntimeCommand::LoadHistory { channel_id } => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::Conversation,
+                "conversation-history",
+                &[channel_id],
+            ),
+            SyncPriority::Interactive,
+            ReplacementClass::Refresh(RefreshClass::ConversationHistory),
+        ),
+        RuntimeCommand::LoadOlderHistory { channel_id, .. } => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::Conversation,
+                "conversation-history",
+                &[channel_id],
+            ),
+            SyncPriority::Interactive,
+            ReplacementClass::Never,
+        ),
+        RuntimeCommand::LoadThread { channel_id, ts } => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(SyncTargetKind::Thread, "thread-replies", &[channel_id, ts]),
+            SyncPriority::Interactive,
+            ReplacementClass::Refresh(RefreshClass::ThreadReplies),
+        ),
+        RuntimeCommand::LoadOlderThread { channel_id, ts, .. } => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(SyncTargetKind::Thread, "thread-replies", &[channel_id, ts]),
+            SyncPriority::Interactive,
+            ReplacementClass::Never,
+        ),
+        RuntimeCommand::LoadMessageContext(location) => {
+            let (kind, parts, replacement) = match location.thread_ts() {
+                Some(thread_ts) => (
+                    SyncTargetKind::Thread,
+                    vec![location.channel_id(), thread_ts, location.message_ts()],
+                    ReplacementClass::Refresh(RefreshClass::ThreadReplies),
+                ),
+                None => (
+                    SyncTargetKind::Conversation,
+                    vec![location.channel_id(), location.message_ts()],
+                    ReplacementClass::Refresh(RefreshClass::ConversationHistory),
+                ),
+            };
+            RuntimeSyncPlan::ephemeral(
+                runtime_sync_target(kind, "message-context", &parts),
+                SyncPriority::Interactive,
+                replacement,
+            )
+        }
+        RuntimeCommand::SearchMessages { .. } => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::SearchIndex,
+                "workspace-operation",
+                &["message-search"],
+            ),
+            SyncPriority::Interactive,
+            ReplacementClass::Never,
+        ),
+        RuntimeCommand::LoadFiles => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(SyncTargetKind::Workspace, "workspace-operation", &["files"]),
+            SyncPriority::Interactive,
+            ReplacementClass::Never,
+        ),
+        RuntimeCommand::LoadFile { file_id, .. } => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(SyncTargetKind::Asset, "file", &[file_id]),
+            SyncPriority::Interactive,
+            ReplacementClass::Never,
+        ),
+        RuntimeCommand::LoadSavedItems => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::Workspace,
+                "workspace-operation",
+                &["saved-items"],
+            ),
+            SyncPriority::Interactive,
+            ReplacementClass::Never,
+        ),
+        _ => return None,
+    };
+    Some(plan)
+}
+
+fn startup_sync_plan(kind: RuntimeStartupSyncKind) -> RuntimeSyncPlan {
+    match kind {
+        RuntimeStartupSyncKind::EmojiCatalog => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::Asset,
+                "workspace-operation",
+                &["emoji-catalog"],
+            ),
+            SyncPriority::Maintenance,
+            ReplacementClass::Refresh(RefreshClass::Workspace),
+        ),
+        RuntimeStartupSyncKind::Membership => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::Workspace,
+                "workspace-operation",
+                &["conversation-membership"],
+            ),
+            SyncPriority::Foreground,
+            ReplacementClass::Refresh(RefreshClass::Membership),
+        ),
+        RuntimeStartupSyncKind::UserGroups => RuntimeSyncPlan::ephemeral(
+            runtime_sync_target(
+                SyncTargetKind::UserDirectory,
+                "workspace-operation",
+                &["user-groups"],
+            ),
+            SyncPriority::Maintenance,
+            ReplacementClass::Refresh(RefreshClass::UserDirectory),
+        ),
+    }
 }
 
 fn runtime_sync_scheduler() -> RuntimeSyncScheduler {
@@ -2233,12 +2479,13 @@ struct RuntimeState {
     attention_preferences: AttentionPreferences,
     sync_scheduler: RuntimeSyncScheduler,
     socket_mode_supervisor: Option<SocketModeSupervisorHandle>,
-    tasks: HashMap<u64, tokio::task::AbortHandle>,
+    tasks: HashMap<u64, RuntimeTaskHandle>,
     task_requests: HashMap<u64, TrackedRequest>,
-    active_requests: HashMap<OperationContext, ActiveRequest>,
+    active_requests: HashMap<OperationContext, ActiveWork>,
     latest_requests: HashMap<OperationContext, RequestId>,
-    active_navigation: HashMap<NavigationSlot, ActiveRequest>,
+    active_navigation: HashMap<NavigationSlot, ActiveWork>,
     latest_navigation: HashMap<NavigationSlot, RequestId>,
+    pending_membership: Option<PendingMembershipSync>,
     next_task_id: u64,
 }
 
@@ -2256,20 +2503,24 @@ impl RuntimeState {
             latest_requests: HashMap::new(),
             active_navigation: HashMap::new(),
             latest_navigation: HashMap::new(),
+            pending_membership: None,
             next_task_id: 0,
         }
     }
 
     fn begin_session_replacement(&mut self) -> Option<watch::Receiver<bool>> {
         let sync_completion = self.sync_scheduler.begin_shutdown();
-        for (_, task) in self.tasks.drain() {
-            task.abort();
-        }
+        let task_completions = self
+            .tasks
+            .drain()
+            .map(|(_, task)| task.abort())
+            .collect::<Vec<_>>();
         self.active_requests.clear();
         self.latest_requests.clear();
         self.task_requests.clear();
         self.active_navigation.clear();
         self.latest_navigation.clear();
+        self.pending_membership = None;
         self.connection = None;
         let socket_completion = self
             .socket_mode_supervisor
@@ -2278,6 +2529,7 @@ impl RuntimeState {
         combine_runtime_shutdown_completions(
             socket_completion
                 .into_iter()
+                .chain(task_completions)
                 .chain([sync_completion])
                 .collect(),
         )
@@ -2343,12 +2595,13 @@ impl RuntimeState {
         self.next_task_id
     }
 
-    fn register_task(
+    fn register_task_with_completion(
         &mut self,
         session: SessionId,
         task_id: u64,
         request: Option<TrackedRequest>,
         task: tokio::task::AbortHandle,
+        completion: watch::Receiver<bool>,
     ) -> bool {
         if self.active_session != session || task.is_finished() {
             task.abort();
@@ -2383,18 +2636,16 @@ impl RuntimeState {
             let context_task = request
                 .supersedes_previous
                 .then(|| self.active_requests.get(&request.context).copied())
-                .flatten()
-                .map(|active| active.task_id);
-            let navigation_task = request
+                .flatten();
+            let navigation_work = request
                 .navigation_slot
-                .and_then(|slot| self.active_navigation.get(&slot).copied())
-                .map(|active| active.task_id);
-            if let Some(previous_task_id) = context_task {
-                self.abort_task(previous_task_id);
+                .and_then(|slot| self.active_navigation.get(&slot).copied());
+            if let Some(previous) = context_task {
+                self.cancel_active_work(previous);
             }
-            if let Some(previous_task_id) = navigation_task {
-                if Some(previous_task_id) != context_task {
-                    self.abort_task(previous_task_id);
+            if let Some(previous) = navigation_work {
+                if Some(previous) != context_task {
+                    self.cancel_active_work(previous);
                 }
             }
 
@@ -2402,19 +2653,37 @@ impl RuntimeState {
                 self.latest_requests
                     .insert(request.context.clone(), request.identity.request);
                 self.active_requests
-                    .insert(request.context.clone(), ActiveRequest { task_id });
+                    .insert(request.context.clone(), ActiveWork::Task { task_id });
             }
             if let Some(slot) = request.navigation_slot {
                 self.latest_navigation
                     .insert(slot, request.identity.request);
                 self.active_navigation
-                    .insert(slot, ActiveRequest { task_id });
+                    .insert(slot, ActiveWork::Task { task_id });
             }
             self.task_requests.insert(task_id, request.clone());
         }
 
-        self.tasks.insert(task_id, task);
+        self.tasks.insert(
+            task_id,
+            RuntimeTaskHandle {
+                abort: task,
+                completion,
+            },
+        );
         true
+    }
+
+    #[cfg(test)]
+    fn register_task(
+        &mut self,
+        session: SessionId,
+        task_id: u64,
+        request: Option<TrackedRequest>,
+        task: tokio::task::AbortHandle,
+    ) -> bool {
+        let (_, completion) = watch::channel(true);
+        self.register_task_with_completion(session, task_id, request, task, completion)
     }
 
     fn finish_task(&mut self, task_id: u64, request: Option<&TrackedRequest>) {
@@ -2425,7 +2694,7 @@ impl RuntimeState {
                 let is_current = self
                     .active_requests
                     .get(&request.context)
-                    .is_some_and(|active| active.task_id == task_id);
+                    .is_some_and(|active| *active == ActiveWork::Task { task_id });
                 if is_current {
                     self.active_requests.remove(&request.context);
                 }
@@ -2434,7 +2703,7 @@ impl RuntimeState {
                 let is_current = self
                     .active_navigation
                     .get(&slot)
-                    .is_some_and(|active| active.task_id == task_id);
+                    .is_some_and(|active| *active == ActiveWork::Task { task_id });
                 if is_current {
                     self.active_navigation.remove(&slot);
                 }
@@ -2443,15 +2712,15 @@ impl RuntimeState {
     }
 
     fn abort_task(&mut self, task_id: u64) {
-        if let Some(task) = self.tasks.remove(&task_id) {
-            task.abort();
+        if let Some(task) = self.tasks.get(&task_id) {
+            task.request_abort();
         }
         if let Some(request) = self.task_requests.remove(&task_id) {
             if request.supersedes_previous
                 && self
                     .active_requests
                     .get(&request.context)
-                    .is_some_and(|active| active.task_id == task_id)
+                    .is_some_and(|active| *active == ActiveWork::Task { task_id })
             {
                 self.active_requests.remove(&request.context);
             }
@@ -2459,13 +2728,192 @@ impl RuntimeState {
                 if self
                     .active_navigation
                     .get(&slot)
-                    .is_some_and(|active| active.task_id == task_id)
+                    .is_some_and(|active| *active == ActiveWork::Task { task_id })
                 {
                     self.active_navigation.remove(&slot);
                 }
             }
         }
     }
+
+    fn cancel_active_work(&mut self, active: ActiveWork) {
+        match active {
+            ActiveWork::Task { task_id } => self.abort_task(task_id),
+            ActiveWork::Sync {
+                admission,
+                cancellation_id,
+            } => {
+                let _ = self.sync_scheduler.cancel(cancellation_id);
+                self.active_requests.retain(|_, current| {
+                    *current
+                        != ActiveWork::Sync {
+                            admission,
+                            cancellation_id,
+                        }
+                });
+                self.active_navigation.retain(|_, current| {
+                    *current
+                        != ActiveWork::Sync {
+                            admission,
+                            cancellation_id,
+                        }
+                });
+            }
+        }
+    }
+
+    fn admit_sync_request(
+        &mut self,
+        request: &TrackedRequest,
+        plan: RuntimeSyncPlan,
+        work: RuntimeSyncWork,
+    ) -> RuntimeSyncRequestAdmission {
+        if self.active_session != request.identity.session {
+            return RuntimeSyncRequestAdmission::Stale;
+        }
+        if request.supersedes_previous
+            && self
+                .latest_requests
+                .get(&request.context)
+                .is_some_and(|latest| *latest >= request.identity.request)
+        {
+            return RuntimeSyncRequestAdmission::Stale;
+        }
+        if let Some(slot) = request.navigation_slot {
+            if self
+                .latest_navigation
+                .get(&slot)
+                .is_some_and(|latest| *latest >= request.identity.request)
+            {
+                return RuntimeSyncRequestAdmission::Stale;
+            }
+        }
+
+        let cancel_context_work = request.supersedes_previous
+            && (request.navigation_slot.is_some() || plan.replacement == ReplacementClass::Never);
+        let context_work = cancel_context_work
+            .then(|| self.active_requests.get(&request.context).copied())
+            .flatten();
+        let navigation_work = request
+            .navigation_slot
+            .and_then(|slot| self.active_navigation.get(&slot).copied());
+        if let Some(previous) = context_work {
+            self.cancel_active_work(previous);
+        }
+        if let Some(previous) = navigation_work {
+            if Some(previous) != context_work {
+                self.cancel_active_work(previous);
+            }
+        }
+
+        if request.supersedes_previous {
+            self.latest_requests
+                .insert(request.context.clone(), request.identity.request);
+        }
+        if let Some(slot) = request.navigation_slot {
+            self.latest_navigation
+                .insert(slot, request.identity.request);
+        }
+
+        let identity = self.sync_scheduler.allocate_job_identity();
+        let cancellation_id = identity.cancellation_id();
+        match self.sync_scheduler.admit(plan.job(identity), None, work) {
+            Ok(RuntimeSyncAdmissionOutcome::Accepted(receipt)) => {
+                if plan.replacement == ReplacementClass::Refresh(RefreshClass::Membership) {
+                    self.pending_membership = None;
+                }
+                let active = ActiveWork::Sync {
+                    admission: receipt.admission(),
+                    cancellation_id,
+                };
+                if request.supersedes_previous {
+                    self.active_requests.insert(request.context.clone(), active);
+                }
+                if let Some(slot) = request.navigation_slot {
+                    self.active_navigation.insert(slot, active);
+                }
+                RuntimeSyncRequestAdmission::Accepted(receipt)
+            }
+            Ok(RuntimeSyncAdmissionOutcome::SkippedFresh(_)) => {
+                RuntimeSyncRequestAdmission::SkippedFresh
+            }
+            Err(error) => RuntimeSyncRequestAdmission::Rejected(error.reason()),
+        }
+    }
+
+    fn admit_session_sync(
+        &mut self,
+        session: SessionId,
+        plan: RuntimeSyncPlan,
+        work: RuntimeSyncWork,
+    ) -> RuntimeSyncRequestAdmission {
+        if self.active_session != session {
+            return RuntimeSyncRequestAdmission::Stale;
+        }
+        let identity = self.sync_scheduler.allocate_job_identity();
+        match self.sync_scheduler.admit(plan.job(identity), None, work) {
+            Ok(RuntimeSyncAdmissionOutcome::Accepted(receipt)) => {
+                if plan.replacement == ReplacementClass::Refresh(RefreshClass::Membership) {
+                    self.pending_membership = None;
+                }
+                RuntimeSyncRequestAdmission::Accepted(receipt)
+            }
+            Ok(RuntimeSyncAdmissionOutcome::SkippedFresh(_)) => {
+                RuntimeSyncRequestAdmission::SkippedFresh
+            }
+            Err(error) => RuntimeSyncRequestAdmission::Rejected(error.reason()),
+        }
+    }
+
+    fn finish_sync_request(
+        &mut self,
+        session: SessionId,
+        admission: AdmissionToken,
+        request: Option<&TrackedRequest>,
+    ) {
+        if self.active_session != session {
+            return;
+        }
+        let Some(request) = request else {
+            return;
+        };
+        if request.supersedes_previous
+            && self
+                .active_requests
+                .get(&request.context)
+                .is_some_and(|active| {
+                    matches!(
+                        active,
+                        ActiveWork::Sync {
+                            admission: current,
+                            ..
+                        } if *current == admission
+                    )
+                })
+        {
+            self.active_requests.remove(&request.context);
+        }
+        if let Some(slot) = request.navigation_slot {
+            if self.active_navigation.get(&slot).is_some_and(|active| {
+                matches!(
+                    active,
+                    ActiveWork::Sync {
+                        admission: current,
+                        ..
+                    } if *current == admission
+                )
+            }) {
+                self.active_navigation.remove(&slot);
+            }
+        }
+    }
+}
+
+enum RuntimeSyncRequestAdmission {
+    Accepted(RuntimeSyncReceipt),
+    SkippedFresh,
+    Stale,
+    Rejected(AdmissionRejectionReason),
 }
 
 struct SocketModeSupervisorHandle {
@@ -2492,16 +2940,50 @@ impl Drop for SocketModeSupervisorCompletion {
     }
 }
 
+struct RuntimeTaskCompletion {
+    completion: Option<watch::Sender<bool>>,
+    state: Arc<Mutex<RuntimeState>>,
+    task_id: u64,
+    request: Option<TrackedRequest>,
+}
+
+impl Drop for RuntimeTaskCompletion {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .finish_task(self.task_id, self.request.as_ref());
+        if let Some(completion) = self.completion.take() {
+            completion.send_replace(true);
+        }
+    }
+}
+
 async fn replace_runtime_session(state: &Arc<Mutex<RuntimeState>>, session: SessionId) {
-    let completion = state
-        .lock()
-        .expect("runtime state lock poisoned")
-        .begin_session_replacement();
+    let (completion, workspace_store) = {
+        let mut runtime_state = state.lock().expect("runtime state lock poisoned");
+        let workspace_store = runtime_state
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.workspace_store.clone());
+        (runtime_state.begin_session_replacement(), workspace_store)
+    };
     if let Some(mut completion) = completion {
         while !*completion.borrow() {
             if completion.changed().await.is_err() {
                 break;
             }
+        }
+    }
+    if let Some(store) = workspace_store {
+        if let Err(error) = store.barrier().await {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "WorkspaceSessionReplacementBarrierFailed category={:?}",
+                    error.category()
+                ),
+            );
         }
     }
     state
@@ -2539,24 +3021,37 @@ fn spawn_runtime_task<F>(
     let state_after_task = Arc::clone(state);
     let request_after_task = request.clone();
     let (start_task, task_started) = tokio::sync::oneshot::channel();
+    let (completion, completion_receiver) = watch::channel(false);
     let parent_span = tracing::Span::current();
     let task = tokio::spawn(
         async move {
+            let _completion = RuntimeTaskCompletion {
+                completion: Some(completion),
+                state: state_after_task,
+                task_id,
+                request: request_after_task,
+            };
+            // Locals drop in reverse declaration order. Keep the user future
+            // after the completion guard so its store handles are retired
+            // before session replacement observes task completion.
+            let future = future;
             if task_started.await.is_err() {
                 return;
             }
             future.await;
-            state_after_task
-                .lock()
-                .expect("runtime state lock poisoned")
-                .finish_task(task_id, request_after_task.as_ref());
         }
         .instrument(parent_span),
     );
     let registered = state
         .lock()
         .expect("runtime state lock poisoned")
-        .register_task(session, task_id, request, task.abort_handle());
+        .register_task_with_completion(
+            session,
+            task_id,
+            request,
+            task.abort_handle(),
+            completion_receiver,
+        );
     if registered {
         let _ = start_task.send(());
     }
@@ -3022,21 +3517,14 @@ fn dispatch_command(
                 AuthenticationFailureContext::Default
             };
             let oauth = oauth.clone();
-            spawn_authentication_task(
-                state,
-                identity,
-                events,
-                limits.clone(),
-                failure_context,
-                async move {
-                    let token = if token.should_refresh() {
-                        oauth.refresh(&token).await?
-                    } else {
-                        token
-                    };
-                    authenticate_token(token).await
-                },
-            );
+            spawn_authentication_task(state, identity, events, failure_context, async move {
+                let token = if token.should_refresh() {
+                    oauth.refresh(&token).await?
+                } else {
+                    token
+                };
+                authenticate_token(token).await
+            });
         }
         RuntimeCommand::StartOAuth {
             client_id,
@@ -3051,7 +3539,6 @@ fn dispatch_command(
                 state,
                 identity,
                 events,
-                limits.clone(),
                 AuthenticationFailureContext::Default,
                 async move {
                     let token = oauth
@@ -3094,7 +3581,6 @@ fn dispatch_command(
                 state,
                 identity,
                 events,
-                limits.clone(),
                 AuthenticationFailureContext::BrowserSession,
                 authenticate_token(token),
             );
@@ -3125,6 +3611,18 @@ fn dispatch_command(
                 )));
                 return;
             };
+            if let Some(plan) = connected_command_sync_plan(&command) {
+                schedule_connected_sync_command(
+                    state,
+                    identity,
+                    command,
+                    connection,
+                    events,
+                    image_cache.clone(),
+                    plan,
+                );
+                return;
+            }
             let lane = command.task_lane();
             let tracked_request = TrackedRequest::for_command(identity, &command);
             let image_cache = image_cache.clone();
@@ -3138,6 +3636,183 @@ fn dispatch_command(
                 }
             });
         }
+    }
+}
+
+fn schedule_connected_sync_command(
+    state: &Arc<Mutex<RuntimeState>>,
+    identity: RuntimeIdentity,
+    command: RuntimeCommand,
+    connection: RuntimeConnection,
+    events: RuntimeEventSender,
+    image_cache: ImageAssetCache,
+    plan: RuntimeSyncPlan,
+) {
+    let request = TrackedRequest::for_command(identity, &command);
+    let command_reports_failure = matches!(command, RuntimeCommand::RefreshConversations);
+    let work_events = events.clone();
+    let work = RuntimeSyncWork::new(move |_attempt| {
+        let command = command.clone();
+        let connection = connection.clone();
+        let events = work_events.clone();
+        let image_cache = image_cache.clone();
+        async move {
+            match handle_connected_command(command, connection, &events, &image_cache).await {
+                Ok(()) => JobOutcome::Succeeded,
+                Err(error) => {
+                    if !command_reports_failure {
+                        events.send_failure(&error);
+                    }
+                    JobOutcome::PermanentFailure
+                }
+            }
+        }
+    });
+    let admission = state
+        .lock()
+        .expect("runtime state lock poisoned")
+        .admit_sync_request(&request, plan, work);
+    match admission {
+        RuntimeSyncRequestAdmission::Accepted(receipt) => {
+            spawn_runtime_sync_receipt_monitor(
+                state,
+                identity.session,
+                Some(request),
+                Some(events),
+                receipt,
+            );
+        }
+        RuntimeSyncRequestAdmission::SkippedFresh | RuntimeSyncRequestAdmission::Stale => {}
+        RuntimeSyncRequestAdmission::Rejected(AdmissionRejectionReason::ShuttingDown) => {}
+        RuntimeSyncRequestAdmission::Rejected(reason) => {
+            crate::debug::log(
+                "runtime",
+                &format!("RuntimeSyncAdmissionRejected reason={reason:?}"),
+            );
+            events.send_event(RuntimeEventKind::Error(RuntimeFailure::internal()));
+        }
+    }
+}
+
+fn schedule_session_sync_work(
+    state: &Arc<Mutex<RuntimeState>>,
+    session: SessionId,
+    plan: RuntimeSyncPlan,
+    work: RuntimeSyncWork,
+) {
+    let retained_work = work.clone();
+    let admission = state
+        .lock()
+        .expect("runtime state lock poisoned")
+        .admit_session_sync(session, plan, work);
+    match admission {
+        RuntimeSyncRequestAdmission::Accepted(receipt) => {
+            spawn_runtime_sync_receipt_monitor(state, session, None, None, receipt);
+        }
+        RuntimeSyncRequestAdmission::SkippedFresh | RuntimeSyncRequestAdmission::Stale => {}
+        RuntimeSyncRequestAdmission::Rejected(AdmissionRejectionReason::AtCapacity)
+            if plan.replacement == ReplacementClass::Refresh(RefreshClass::Membership) =>
+        {
+            retain_pending_membership_sync(state, session, plan, retained_work);
+        }
+        RuntimeSyncRequestAdmission::Rejected(reason) => {
+            crate::debug::log(
+                "runtime",
+                &format!("RuntimeBackgroundSyncAdmissionRejected reason={reason:?}"),
+            );
+        }
+    }
+}
+
+fn spawn_runtime_sync_receipt_monitor(
+    state: &Arc<Mutex<RuntimeState>>,
+    session: SessionId,
+    request: Option<TrackedRequest>,
+    failure_events: Option<RuntimeEventSender>,
+    receipt: RuntimeSyncReceipt,
+) {
+    let admission = receipt.admission();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let terminal = receipt.wait().await;
+        state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .finish_sync_request(session, admission, request.as_ref());
+        let internal_failure = match terminal {
+            Ok(terminal) => matches!(
+                terminal.result(),
+                RuntimeSyncTerminalResult::Failed(RuntimeSyncFailureKind::Panicked)
+            ),
+            Err(_) => true,
+        };
+        if internal_failure {
+            crate::debug::log("runtime", "RuntimeSyncWorkFailed reason=internal");
+            if let Some(events) = failure_events {
+                events.send_event(RuntimeEventKind::Error(RuntimeFailure::internal()));
+            }
+        }
+        try_admit_pending_membership_sync(&state);
+    });
+}
+
+fn retain_pending_membership_sync(
+    state: &Arc<Mutex<RuntimeState>>,
+    session: SessionId,
+    plan: RuntimeSyncPlan,
+    work: RuntimeSyncWork,
+) {
+    let mut state = state.lock().expect("runtime state lock poisoned");
+    if state.active_session != session {
+        return;
+    }
+    let replace = state.pending_membership.as_ref().is_none_or(|pending| {
+        pending.session != session
+            || sync_priority_strength(plan.priority)
+                >= sync_priority_strength(pending.plan.priority)
+    });
+    if replace {
+        state.pending_membership = Some(PendingMembershipSync {
+            session,
+            plan,
+            work,
+        });
+    }
+}
+
+fn try_admit_pending_membership_sync(state: &Arc<Mutex<RuntimeState>>) {
+    let (session, plan, retained_work, admission) = {
+        let mut runtime_state = state.lock().expect("runtime state lock poisoned");
+        let Some(pending) = runtime_state.pending_membership.take() else {
+            return;
+        };
+        let PendingMembershipSync {
+            session,
+            plan,
+            work,
+        } = pending;
+        let retained_work = work.clone();
+        let admission = runtime_state.admit_session_sync(session, plan, work);
+        (session, plan, retained_work, admission)
+    };
+    match admission {
+        RuntimeSyncRequestAdmission::Accepted(receipt) => {
+            spawn_runtime_sync_receipt_monitor(state, session, None, None, receipt);
+        }
+        RuntimeSyncRequestAdmission::Rejected(AdmissionRejectionReason::AtCapacity) => {
+            retain_pending_membership_sync(state, session, plan, retained_work);
+        }
+        RuntimeSyncRequestAdmission::SkippedFresh
+        | RuntimeSyncRequestAdmission::Stale
+        | RuntimeSyncRequestAdmission::Rejected(_) => {}
+    }
+}
+
+const fn sync_priority_strength(priority: SyncPriority) -> u8 {
+    match priority {
+        SyncPriority::Maintenance => 1,
+        SyncPriority::Foreground => 2,
+        SyncPriority::Interactive => 3,
     }
 }
 
@@ -3181,7 +3856,6 @@ fn spawn_authentication_task<F>(
     state: &Arc<Mutex<RuntimeState>>,
     identity: RuntimeIdentity,
     events: RuntimeEventSender,
-    limits: RuntimeTaskLimits,
     failure_context: AuthenticationFailureContext,
     future: F,
 ) where
@@ -3250,7 +3924,6 @@ fn spawn_authentication_task<F>(
                         identity,
                         events,
                         connection,
-                        limits,
                         huddle_receiver,
                     );
                 }
@@ -3268,7 +3941,6 @@ fn spawn_workspace_tasks(
     identity: RuntimeIdentity,
     events: RuntimeEventSender,
     connection: RuntimeConnection,
-    limits: RuntimeTaskLimits,
     huddle_receiver: mpsc::UnboundedReceiver<HuddleActorMessage>,
 ) {
     let huddle_events = events.unsolicited(OperationContext::new(
@@ -3289,7 +3961,6 @@ fn spawn_workspace_tasks(
     let state_after_hydration = Arc::clone(state);
     let hydration_events = events.clone();
     let hydration_connection = connection.clone();
-    let hydration_limits = limits.clone();
     spawn_session_task(state, identity.session, async move {
         if let Some(store) = hydration_connection.workspace_store.as_ref() {
             if let Err(error) = store.ensure_workspace_identity().await {
@@ -3302,54 +3973,63 @@ fn spawn_workspace_tasks(
         load_cached_bootstrap(&hydration_events, &hydration_connection).await;
         let _ = hydration_ready_sender.send(());
 
-        let emoji_events = hydration_events.clone();
+        let emoji_events = hydration_events.with_context(OperationContext::new(
+            RuntimeOperation::Emoji,
+            RuntimeTarget::Workspace,
+        ));
         let emoji_connection = hydration_connection.clone();
-        let emoji_limits = hydration_limits.clone();
-        spawn_request_task(
-            &state_after_hydration,
-            TrackedRequest::new(
-                identity,
-                OperationContext::new(RuntimeOperation::Emoji, RuntimeTarget::Workspace),
-            ),
+        let emoji_work = RuntimeSyncWork::new(move |_attempt| {
+            let emoji_events = emoji_events.clone();
+            let emoji_connection = emoji_connection.clone();
             async move {
-                let _permit = emoji_limits.acquire(RuntimeTaskLane::Background).await;
                 match emoji_connection.slack.custom_emojis().await {
                     Ok(emojis) => {
                         if let Some(store) = emoji_connection.workspace_store.as_ref() {
                             if let Err(error) = store.store_custom_emojis(&emojis).await {
                                 crate::debug::log(
                                     "store",
-                                    &format!("CustomEmojiStoreFailed error={error:#}"),
+                                    &format!(
+                                        "CustomEmojiStoreFailed category={:?}",
+                                        error.category()
+                                    ),
                                 );
                             }
                         }
                         emoji_events.send_event(RuntimeEventKind::EmojiCatalogLoaded(emojis));
+                        JobOutcome::Succeeded
                     }
-                    Err(error) => crate::debug::log(
-                        "runtime",
-                        &format!("CustomEmojiRefreshFailed error={error:#}"),
-                    ),
+                    Err(error) => {
+                        crate::debug::log(
+                            "runtime",
+                            &format!("CustomEmojiRefreshFailed category={:?}", error.category()),
+                        );
+                        JobOutcome::PermanentFailure
+                    }
                 }
-            },
+            }
+        });
+        schedule_session_sync_work(
+            &state_after_hydration,
+            identity.session,
+            startup_sync_plan(RuntimeStartupSyncKind::EmojiCatalog),
+            emoji_work,
         );
 
-        let refresh_events = hydration_events.clone();
+        let refresh_events = hydration_events.with_context(OperationContext::new(
+            RuntimeOperation::Conversations,
+            RuntimeTarget::Workspace,
+        ));
         let refresh_connection = hydration_connection.clone();
-        let refresh_limits = hydration_limits.clone();
-        spawn_request_task(
-            &state_after_hydration,
-            TrackedRequest::new(
-                identity,
-                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
-            ),
+        let refresh_work = RuntimeSyncWork::new(move |_attempt| {
+            let refresh_events = refresh_events.clone();
+            let refresh_connection = refresh_connection.clone();
             async move {
-                let _permit = refresh_limits.acquire(RuntimeTaskLane::Background).await;
                 let cached_user_names = refresh_connection
                     .user_cache
                     .lock()
                     .expect("runtime user cache lock poisoned")
                     .clone();
-                if let Err(error) = load_conversations_best_effort_with_api(
+                match load_conversations_best_effort_with_api(
                     &refresh_events,
                     &refresh_connection.slack,
                     refresh_connection.workspace_url.as_deref(),
@@ -3364,38 +4044,68 @@ fn spawn_workspace_tasks(
                 )
                 .await
                 {
-                    crate::debug::log(
-                        "runtime",
-                        &format!("ConversationsBackgroundRefreshFailed error={error:#}"),
-                    );
+                    Ok(()) => JobOutcome::Succeeded,
+                    Err(error) => {
+                        crate::debug::log(
+                            "runtime",
+                            &format!(
+                                "ConversationsBackgroundRefreshFailed category={:?}",
+                                RuntimeFailure::from_error(&error).category
+                            ),
+                        );
+                        JobOutcome::PermanentFailure
+                    }
                 }
-            },
+            }
+        });
+        schedule_session_sync_work(
+            &state_after_hydration,
+            identity.session,
+            startup_sync_plan(RuntimeStartupSyncKind::Membership),
+            refresh_work,
         );
 
-        let group_events = hydration_events;
+        let group_events = hydration_events.with_context(OperationContext::new(
+            RuntimeOperation::User,
+            RuntimeTarget::Workspace,
+        ));
         let group_connection = hydration_connection;
-        let group_limits = hydration_limits;
-        spawn_request_task(
-            &state_after_hydration,
-            TrackedRequest::new(
-                identity,
-                OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
-            ),
+        let group_work = RuntimeSyncWork::new(move |_attempt| {
+            let group_events = group_events.clone();
+            let group_connection = group_connection.clone();
             async move {
-                let _permit = group_limits.acquire(RuntimeTaskLane::Background).await;
                 let cached_user_names = group_connection
                     .user_cache
                     .lock()
                     .expect("runtime user cache lock poisoned")
                     .clone();
-                load_user_groups_best_effort_with_api(
+                match load_user_groups_best_effort_with_api(
                     &group_events,
                     &group_connection.slack,
                     &group_connection.workspace_store,
                     cached_user_names,
                 )
-                .await;
-            },
+                .await
+                {
+                    Ok(()) => JobOutcome::Succeeded,
+                    Err(error) => {
+                        crate::debug::log(
+                            "runtime",
+                            &format!(
+                                "UserGroupsLoadFailed category={:?}",
+                                RuntimeFailure::from_error(&error).category
+                            ),
+                        );
+                        JobOutcome::PermanentFailure
+                    }
+                }
+            }
+        });
+        schedule_session_sync_work(
+            &state_after_hydration,
+            identity.session,
+            startup_sync_plan(RuntimeStartupSyncKind::UserGroups),
+            group_work,
         );
     });
 
@@ -3416,6 +4126,8 @@ fn spawn_workspace_tasks(
             socket_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
                 RealtimeStatus::connecting(credentials.transport()),
             ));
+            let socket_state = Arc::clone(state);
+            let socket_session = identity.session;
             spawn_socket_mode_supervisor(
                 state,
                 identity.session,
@@ -3436,7 +4148,15 @@ fn spawn_workspace_tasks(
                         }
                     };
                     if hydrated {
-                        run_socket_mode(credentials, socket_events, connection, cancellation).await;
+                        run_socket_mode(
+                            credentials,
+                            socket_events,
+                            connection,
+                            socket_state,
+                            socket_session,
+                            cancellation,
+                        )
+                        .await;
                     }
                 },
             );
@@ -4767,12 +5487,83 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
     Ok(())
 }
 
+fn socket_membership_refresh_required(
+    scope: &socket_mode::SocketModeConversationRefreshScope,
+    current_user_id: Option<&str>,
+) -> bool {
+    match scope {
+        socket_mode::SocketModeConversationRefreshScope::Workspace => true,
+        socket_mode::SocketModeConversationRefreshScope::Membership { user_id, .. } => {
+            current_user_id.is_some_and(|current| current == user_id)
+        }
+    }
+}
+
+fn schedule_realtime_membership_refresh(
+    state: &Arc<Mutex<RuntimeState>>,
+    session: SessionId,
+    connection: RuntimeConnection,
+    events: RuntimeEventSender,
+) {
+    let work = RuntimeSyncWork::new(move |_attempt| {
+        let connection = connection.clone();
+        let events = events.clone();
+        async move {
+            let cached_user_names = connection
+                .user_cache
+                .lock()
+                .expect("runtime user cache lock poisoned")
+                .clone();
+            match load_conversations_best_effort_with_api(
+                &events,
+                &connection.slack,
+                connection.workspace_url.as_deref(),
+                WorkspacePipelineContext {
+                    store: &connection.workspace_store,
+                    reducer: &connection.workspace,
+                    conversation_star_sync: &connection.conversation_star_sync,
+                },
+                cached_user_names,
+                connection.team_id.as_deref(),
+                &connection.huddles,
+            )
+            .await
+            {
+                Ok(()) => JobOutcome::Succeeded,
+                Err(error) => {
+                    crate::debug::log(
+                        "runtime",
+                        &format!(
+                            "RealtimeMembershipRefreshFailed category={:?}",
+                            RuntimeFailure::from_error(&error).category
+                        ),
+                    );
+                    JobOutcome::PermanentFailure
+                }
+            }
+        }
+    });
+    schedule_session_sync_work(
+        state,
+        session,
+        startup_sync_plan(RuntimeStartupSyncKind::Membership),
+        work,
+    );
+}
+
 async fn run_socket_mode(
     credentials: socket_mode::SocketModeCredentials,
     events: RuntimeEventSender,
     connection: RuntimeConnection,
+    state: Arc<Mutex<RuntimeState>>,
+    session: SessionId,
     mut cancellation: watch::Receiver<bool>,
 ) {
+    let membership_connection = connection.clone();
+    let membership_events = events.with_context(OperationContext::new(
+        RuntimeOperation::Conversations,
+        RuntimeTarget::Workspace,
+    ));
     let RuntimeConnection {
         workspace_store,
         workspace,
@@ -4819,6 +5610,10 @@ async fn run_socket_mode(
         let huddles_for_run = huddles.clone();
         let team_id_for_run = team_id.clone();
         let user_status_sync_for_run = user_status_sync.clone();
+        let current_user_id_for_run = current_user_id.clone();
+        let membership_connection_for_run = membership_connection.clone();
+        let membership_events_for_run = membership_events.clone();
+        let membership_state_for_run = Arc::clone(&state);
         let run_once = socket_mode::run_once(
             &credentials,
             move || {
@@ -4828,11 +5623,29 @@ async fn run_socket_mode(
             },
             move |event| {
                 observe_huddle_socket_event(&huddles_for_run, team_id_for_run.as_deref(), &event);
+                let membership_refresh = match &event {
+                    SocketModeEvent::RefreshConversations(scope) => {
+                        socket_membership_refresh_required(
+                            scope,
+                            current_user_id_for_run.as_deref(),
+                        )
+                    }
+                    _ => false,
+                };
+                if membership_refresh {
+                    schedule_realtime_membership_refresh(
+                        &membership_state_for_run,
+                        session,
+                        membership_connection_for_run.clone(),
+                        membership_events_for_run.clone(),
+                    );
+                }
+                let forward_to_ui = !matches!(&event, SocketModeEvent::RefreshConversations(_));
                 let defer_ordered_ui = matches!(
                     &event,
                     SocketModeEvent::Message(_) | SocketModeEvent::Reaction(_)
                 );
-                let attention = (!defer_ordered_ui)
+                let attention = (forward_to_ui && !defer_ordered_ui)
                     .then(|| apply_realtime_workspace_event(&workspace_for_run, &event))
                     .flatten();
                 let status_change_user_id = match &event {
@@ -4847,7 +5660,7 @@ async fn run_socket_mode(
                     }
                     _ => None,
                 };
-                let status_revision = if !defer_ordered_ui {
+                let status_revision = if forward_to_ui && !defer_ordered_ui {
                     if let Some(user_id) = status_change_user_id.as_deref() {
                         Some(user_status_sync_for_run.publish_change(user_id, || {
                             events_for_run.send_event(RuntimeEventKind::SocketModeEvent {
@@ -4883,7 +5696,7 @@ async fn run_socket_mode(
                     }),
                     SocketModeEvent::UserChanged(_)
                     | SocketModeEvent::UserHuddleChanged(_)
-                    | SocketModeEvent::RefreshConversations => None,
+                    | SocketModeEvent::RefreshConversations(_) => None,
                 };
                 if let Some(persistence_event) = persistence_event {
                     if let Err(returned) = persistence_for_run.send(persistence_event) {
@@ -5005,7 +5818,7 @@ fn apply_realtime_workspace_event(
         SocketModeEvent::Message(event) => Some(realtime_message_mutation(event, None)),
         SocketModeEvent::Reaction(event) => Some(realtime_reaction_mutation(event)),
         SocketModeEvent::UserChanged(user) => Some(WorkspaceMutation::UserUpsert((**user).clone())),
-        SocketModeEvent::UserHuddleChanged(_) | SocketModeEvent::RefreshConversations => None,
+        SocketModeEvent::UserHuddleChanged(_) | SocketModeEvent::RefreshConversations(_) => None,
     };
     let reduction = workspace.apply(MutationOrigin::Realtime, mutation?)?;
     reduction.effects().iter().find_map(|effect| match effect {
@@ -5138,7 +5951,7 @@ fn observe_huddle_socket_event(
         }
         SocketModeEvent::UserChanged(_)
         | SocketModeEvent::Reaction(_)
-        | SocketModeEvent::RefreshConversations => Ok(()),
+        | SocketModeEvent::RefreshConversations(_) => Ok(()),
     };
 
     if result.is_err() {
@@ -6057,14 +6870,8 @@ async fn load_user_groups_best_effort_with_api(
     api: &SlackApi,
     workspace_store: &Option<WorkspaceStore>,
     cached_user_names: HashMap<String, String>,
-) {
-    let groups = match api.user_groups().await {
-        Ok(groups) => groups,
-        Err(error) => {
-            crate::debug::log("runtime", &format!("UserGroupsLoadFailed error={error:#}"));
-            return;
-        }
-    };
+) -> Result<()> {
+    let groups = api.user_groups().await?;
 
     let (names, members, loaded_user_names) =
         resolve_user_group_display_data(api, groups, cached_user_names).await;
@@ -6081,6 +6888,7 @@ async fn load_user_groups_best_effort_with_api(
         );
         events.send_event(RuntimeEventKind::UserGroupsLoaded { names, members });
     }
+    Ok(())
 }
 
 async fn resolve_user_group_display_data(
@@ -6384,7 +7192,10 @@ async fn load_conversations_best_effort_with_api(
             )
             .await;
         }
-        Err(error) => handle_conversations_load_error(events, error),
+        Err(error) => {
+            handle_conversations_load_error(events, &error);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -6892,12 +7703,12 @@ async fn refresh_cached_conversation_user_names(
     }
 }
 
-fn handle_conversations_load_error(events: &RuntimeEventSender, error: anyhow::Error) {
+fn handle_conversations_load_error(events: &RuntimeEventSender, error: &anyhow::Error) {
     crate::debug::log(
         "runtime",
         &format!("ConversationsLoadFailed error={error:#}"),
     );
-    let failure = RuntimeFailure::from_error(&error);
+    let failure = RuntimeFailure::from_error(error);
     events.send_event(RuntimeEventKind::WorkspaceLifecycle(
         lifecycle_failure_event(&failure),
     ));
@@ -7580,6 +8391,17 @@ impl RuntimeEventSender {
         }
     }
 
+    fn with_context(&self, context: OperationContext) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            session: self.session,
+            request: self.request,
+            fallback: context,
+            #[cfg(test)]
+            workspace_patch_send_gate: self.workspace_patch_send_gate.clone(),
+        }
+    }
+
     fn send_workspace_patch(&self, patch: WorkspacePatch) {
         #[cfg(test)]
         if let Some(gate) = self.workspace_patch_send_gate.as_ref() {
@@ -7641,6 +8463,10 @@ mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::sync_scheduler::{
+        FreshnessPolicy, RefreshClass, ReplacementClass, RetryPolicy, SyncDurability, SyncPriority,
+        SyncTargetKind,
+    };
     use crate::workspace_pipeline::{ReactionMutation, StoreChange, WorkspaceChange};
     use crate::workspace_state::RealtimeMessageKind;
 
@@ -13615,7 +14441,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_main_navigation_aborts_old_target_and_starts_new_target() {
+    fn switching_main_navigation_cancels_scheduled_old_target_and_starts_new_target() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -13624,7 +14450,6 @@ mod tests {
         runtime.block_on(async {
             let session = SessionId::default().next();
             let state = Arc::new(Mutex::new(RuntimeState::new(session)));
-            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
             let first_command = RuntimeCommand::LoadHistory {
                 channel_id: "C1".to_string(),
             };
@@ -13639,43 +14464,360 @@ mod tests {
                 session,
                 request: RequestId::new(2),
             };
-            let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
-            let (first_cancelled_tx, first_cancelled_rx) = tokio::sync::oneshot::channel();
-            let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
-
-            let first_limits = limits.clone();
-            spawn_request_task(
-                &state,
-                TrackedRequest::for_command(first_identity, &first_command),
+            let first_request = TrackedRequest::for_command(first_identity, &first_command);
+            let second_request = TrackedRequest::for_command(second_identity, &second_command);
+            let first_started = Arc::new(tokio::sync::Notify::new());
+            let first_started_for_work = Arc::clone(&first_started);
+            let first_work = RuntimeSyncWork::new(move |_attempt| {
+                let first_started = Arc::clone(&first_started_for_work);
                 async move {
-                    let _permit = first_limits.acquire(RuntimeTaskLane::Navigation).await;
-                    let _cancelled = CancellationSignal(Some(first_cancelled_tx));
-                    let _ = first_started_tx.send(());
-                    future::pending::<()>().await;
-                },
-            );
-            first_started_rx
-                .await
-                .expect("first navigation did not start");
+                    first_started.notify_one();
+                    future::pending::<JobOutcome>().await
+                }
+            });
+            let first_receipt = match state.lock().unwrap().admit_sync_request(
+                &first_request,
+                connected_command_sync_plan(&first_command).unwrap(),
+                first_work,
+            ) {
+                RuntimeSyncRequestAdmission::Accepted(receipt) => receipt,
+                _ => panic!("first scheduled navigation was not admitted"),
+            };
+            first_started.notified().await;
 
-            let second_limits = limits;
-            spawn_request_task(
-                &state,
-                TrackedRequest::for_command(second_identity, &second_command),
+            let second_started = Arc::new(tokio::sync::Notify::new());
+            let second_started_for_work = Arc::clone(&second_started);
+            let second_work = RuntimeSyncWork::new(move |_attempt| {
+                let second_started = Arc::clone(&second_started_for_work);
                 async move {
-                    let _permit = second_limits.acquire(RuntimeTaskLane::Navigation).await;
-                    let _ = second_started_tx.send(());
-                },
+                    second_started.notify_one();
+                    JobOutcome::Succeeded
+                }
+            });
+            let second_receipt = match state.lock().unwrap().admit_sync_request(
+                &second_request,
+                connected_command_sync_plan(&second_command).unwrap(),
+                second_work,
+            ) {
+                RuntimeSyncRequestAdmission::Accepted(receipt) => receipt,
+                _ => panic!("second scheduled navigation was not admitted"),
+            };
+            let second_admission = second_receipt.admission();
+
+            let first_terminal =
+                tokio::time::timeout(Duration::from_millis(100), first_receipt.wait())
+                    .await
+                    .expect("abandoned navigation was not cancelled")
+                    .expect("first navigation receipt was lost");
+            assert_eq!(
+                first_terminal.result(),
+                RuntimeSyncTerminalResult::Cancelled
+            );
+            tokio::time::timeout(Duration::from_millis(100), second_started.notified())
+                .await
+                .expect("new navigation did not get capacity");
+            let second_terminal =
+                tokio::time::timeout(Duration::from_millis(100), second_receipt.wait())
+                    .await
+                    .expect("new navigation did not complete")
+                    .expect("second navigation receipt was lost");
+            assert_eq!(
+                second_terminal.result(),
+                RuntimeSyncTerminalResult::Succeeded
             );
 
-            tokio::time::timeout(Duration::from_millis(100), first_cancelled_rx)
+            let mut runtime_state = state.lock().unwrap();
+            runtime_state.finish_sync_request(
+                session,
+                first_terminal.admission(),
+                Some(&first_request),
+            );
+            assert!(runtime_state
+                .active_navigation
+                .get(&NavigationSlot::Main)
+                .is_some_and(|active| {
+                    matches!(
+                        active,
+                        ActiveWork::Sync { admission, .. }
+                            if *admission == second_admission
+                    )
+                }));
+            runtime_state.finish_sync_request(
+                session,
+                second_terminal.admission(),
+                Some(&second_request),
+            );
+            assert!(!runtime_state
+                .active_navigation
+                .contains_key(&NavigationSlot::Main));
+        });
+    }
+
+    #[test]
+    fn scheduled_thread_navigation_remains_independent_from_main_navigation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(session)));
+            let main_command = RuntimeCommand::LoadHistory {
+                channel_id: "C1".to_string(),
+            };
+            let thread_command = RuntimeCommand::LoadThread {
+                channel_id: "C1".to_string(),
+                ts: "1710000000.000100".to_string(),
+            };
+            let main_request = TrackedRequest::for_command(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(1),
+                },
+                &main_command,
+            );
+            let thread_request = TrackedRequest::for_command(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(2),
+                },
+                &thread_command,
+            );
+            let main_started = Arc::new(tokio::sync::Notify::new());
+            let main_release = Arc::new(tokio::sync::Notify::new());
+            let main_started_for_work = Arc::clone(&main_started);
+            let main_release_for_work = Arc::clone(&main_release);
+            let (cancelled_tx, mut cancelled_rx) = oneshot::channel();
+            let cancellation_sender = Arc::new(Mutex::new(Some(cancelled_tx)));
+            let cancellation_sender_for_work = Arc::clone(&cancellation_sender);
+            let main_receipt = match state.lock().unwrap().admit_sync_request(
+                &main_request,
+                connected_command_sync_plan(&main_command).unwrap(),
+                RuntimeSyncWork::new(move |_attempt| {
+                    let main_started = Arc::clone(&main_started_for_work);
+                    let main_release = Arc::clone(&main_release_for_work);
+                    let cancellation_sender = Arc::clone(&cancellation_sender_for_work);
+                    async move {
+                        let _cancellation = CancellationSignal(
+                            cancellation_sender
+                                .lock()
+                                .expect("cancellation sender lock poisoned")
+                                .take(),
+                        );
+                        main_started.notify_one();
+                        main_release.notified().await;
+                        JobOutcome::Succeeded
+                    }
+                }),
+            ) {
+                RuntimeSyncRequestAdmission::Accepted(receipt) => receipt,
+                _ => panic!("main navigation was not admitted"),
+            };
+            main_started.notified().await;
+
+            let thread_started = Arc::new(tokio::sync::Notify::new());
+            let thread_started_for_work = Arc::clone(&thread_started);
+            let thread_receipt = match state.lock().unwrap().admit_sync_request(
+                &thread_request,
+                connected_command_sync_plan(&thread_command).unwrap(),
+                RuntimeSyncWork::new(move |_attempt| {
+                    let thread_started = Arc::clone(&thread_started_for_work);
+                    async move {
+                        thread_started.notify_one();
+                        JobOutcome::Succeeded
+                    }
+                }),
+            ) {
+                RuntimeSyncRequestAdmission::Accepted(receipt) => receipt,
+                _ => panic!("thread navigation was not admitted"),
+            };
+
+            tokio::time::timeout(Duration::from_millis(100), thread_started.notified())
                 .await
-                .expect("abandoned navigation was not aborted")
-                .expect("navigation cancellation signal dropped");
-            tokio::time::timeout(Duration::from_millis(100), second_started_rx)
+                .expect("thread navigation did not start independently");
+            assert_eq!(
+                thread_receipt.wait().await.unwrap().result(),
+                RuntimeSyncTerminalResult::Succeeded
+            );
+            assert!(matches!(
+                cancelled_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+
+            main_release.notify_one();
+            assert_eq!(
+                main_receipt.wait().await.unwrap().result(),
+                RuntimeSyncTerminalResult::Succeeded
+            );
+        });
+    }
+
+    #[test]
+    fn membership_invalidation_at_capacity_is_retained_and_readmitted() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(session)));
+            state.lock().unwrap().sync_scheduler = RuntimeSyncScheduler::new(
+                SchedulerConfig::new(1, 1, 1).expect("valid test scheduler configuration"),
+            );
+
+            let blocker_started = Arc::new(tokio::sync::Notify::new());
+            let blocker_release = Arc::new(tokio::sync::Notify::new());
+            let blocker_started_for_work = Arc::clone(&blocker_started);
+            let blocker_release_for_work = Arc::clone(&blocker_release);
+            schedule_session_sync_work(
+                &state,
+                session,
+                startup_sync_plan(RuntimeStartupSyncKind::EmojiCatalog),
+                RuntimeSyncWork::new(move |_attempt| {
+                    let blocker_started = Arc::clone(&blocker_started_for_work);
+                    let blocker_release = Arc::clone(&blocker_release_for_work);
+                    async move {
+                        blocker_started.notify_one();
+                        blocker_release.notified().await;
+                        JobOutcome::Succeeded
+                    }
+                }),
+            );
+            blocker_started.notified().await;
+
+            let membership_started = Arc::new(tokio::sync::Notify::new());
+            let membership_started_for_work = Arc::clone(&membership_started);
+            schedule_session_sync_work(
+                &state,
+                session,
+                startup_sync_plan(RuntimeStartupSyncKind::Membership),
+                RuntimeSyncWork::new(move |_attempt| {
+                    let membership_started = Arc::clone(&membership_started_for_work);
+                    async move {
+                        membership_started.notify_one();
+                        JobOutcome::Succeeded
+                    }
+                }),
+            );
+
+            assert!(state.lock().unwrap().pending_membership.is_some());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), membership_started.notified())
+                    .await
+                    .is_err(),
+                "membership work started before scheduler capacity was released"
+            );
+
+            blocker_release.notify_one();
+            tokio::time::timeout(Duration::from_millis(100), membership_started.notified())
                 .await
-                .expect("new navigation did not get capacity")
-                .expect("new navigation start signal dropped");
+                .expect("retained membership invalidation was not readmitted");
+            tokio::task::yield_now().await;
+            assert!(state.lock().unwrap().pending_membership.is_none());
+        });
+    }
+
+    #[test]
+    fn repeated_manual_membership_refresh_queues_without_cancelling_running_work() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(session)));
+            let command = RuntimeCommand::RefreshConversations;
+            let plan = connected_command_sync_plan(&command).unwrap();
+            let first_request = TrackedRequest::for_command(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(1),
+                },
+                &command,
+            );
+            let second_request = TrackedRequest::for_command(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(2),
+                },
+                &command,
+            );
+            let first_started = Arc::new(tokio::sync::Notify::new());
+            let first_release = Arc::new(tokio::sync::Notify::new());
+            let first_started_for_work = Arc::clone(&first_started);
+            let first_release_for_work = Arc::clone(&first_release);
+            let (cancelled_tx, mut cancelled_rx) = oneshot::channel();
+            let cancellation_sender = Arc::new(Mutex::new(Some(cancelled_tx)));
+            let cancellation_sender_for_work = Arc::clone(&cancellation_sender);
+            let first_receipt = match state.lock().unwrap().admit_sync_request(
+                &first_request,
+                plan,
+                RuntimeSyncWork::new(move |_attempt| {
+                    let first_started = Arc::clone(&first_started_for_work);
+                    let first_release = Arc::clone(&first_release_for_work);
+                    let cancellation_sender = Arc::clone(&cancellation_sender_for_work);
+                    async move {
+                        let _cancellation = CancellationSignal(
+                            cancellation_sender
+                                .lock()
+                                .expect("cancellation sender lock poisoned")
+                                .take(),
+                        );
+                        first_started.notify_one();
+                        first_release.notified().await;
+                        JobOutcome::Succeeded
+                    }
+                }),
+            ) {
+                RuntimeSyncRequestAdmission::Accepted(receipt) => receipt,
+                _ => panic!("first membership refresh was not admitted"),
+            };
+            first_started.notified().await;
+
+            let second_started = Arc::new(tokio::sync::Notify::new());
+            let second_started_for_work = Arc::clone(&second_started);
+            let second_receipt = match state.lock().unwrap().admit_sync_request(
+                &second_request,
+                plan,
+                RuntimeSyncWork::new(move |_attempt| {
+                    let second_started = Arc::clone(&second_started_for_work);
+                    async move {
+                        second_started.notify_one();
+                        JobOutcome::Succeeded
+                    }
+                }),
+            ) {
+                RuntimeSyncRequestAdmission::Accepted(receipt) => receipt,
+                _ => panic!("second membership refresh was not admitted"),
+            };
+
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                cancelled_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), second_started.notified())
+                    .await
+                    .is_err(),
+                "same-target membership refresh ran concurrently"
+            );
+
+            first_release.notify_one();
+            assert_eq!(
+                first_receipt.wait().await.unwrap().result(),
+                RuntimeSyncTerminalResult::Succeeded
+            );
+            tokio::time::timeout(Duration::from_millis(100), second_started.notified())
+                .await
+                .expect("queued membership refresh did not start");
+            assert_eq!(
+                second_receipt.wait().await.unwrap().result(),
+                RuntimeSyncTerminalResult::Succeeded
+            );
         });
     }
 
@@ -13795,11 +14937,8 @@ mod tests {
 
             state.finish_task(1, Some(&first));
             assert_eq!(
-                state
-                    .active_requests
-                    .get(&context)
-                    .map(|request| request.task_id),
-                Some(2)
+                state.active_requests.get(&context),
+                Some(&ActiveWork::Task { task_id: 2 })
             );
 
             state.finish_task(2, Some(&second));
@@ -14258,7 +15397,14 @@ mod tests {
             .split_once("#[cfg(test)]\nmod tests")
             .unwrap()
             .0;
-        let history_commands = production
+        let command_handler = production
+            .split_once("async fn handle_command(")
+            .unwrap()
+            .1
+            .split_once("\nfn socket_membership_refresh_required(")
+            .unwrap()
+            .0;
+        let history_commands = command_handler
             .split_once("RuntimeCommand::LoadHistory")
             .unwrap()
             .1
@@ -14310,7 +15456,14 @@ mod tests {
             .split_once("#[cfg(test)]\nmod tests")
             .unwrap()
             .0;
-        let thread_commands = production
+        let command_handler = production
+            .split_once("async fn handle_command(")
+            .unwrap()
+            .1
+            .split_once("\nfn socket_membership_refresh_required(")
+            .unwrap()
+            .0;
+        let thread_commands = command_handler
             .split_once("RuntimeCommand::LoadThread")
             .unwrap()
             .1
@@ -19189,6 +20342,128 @@ mod tests {
     }
 
     #[test]
+    fn replacing_session_fences_a_superseded_task_before_the_old_store_barrier() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-session-replacement-task-fence-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+            let first_session = SessionId::default().next();
+            let second_session = first_session.next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(first_session)));
+            let (huddles, _huddle_receiver) = huddle_actor_channel();
+            state.lock().unwrap().connection = Some(RuntimeConnection {
+                slack: SlackApi::new(StoredToken {
+                    access_token: "handoff-test-token".into(),
+                    token_type: None,
+                    scope: None,
+                    refresh_token: None,
+                    expires_in: None,
+                    expires_at: None,
+                    team_id: None,
+                    team_name: None,
+                    user_id: Some("U1".into()),
+                    client_id: None,
+                    browser_cookie_d: None,
+                    user_agent: None,
+                }),
+                workspace_url: None,
+                workspace_store: Some(store.clone()),
+                workspace: WorkspaceReducerAdapter::default(),
+                current_user_id: Some("U1".into()),
+                user_cache: Arc::new(Mutex::new(HashMap::new())),
+                read_marks: Arc::new(Mutex::new(HashMap::new())),
+                message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
+                conversation_star_sync: ConversationStarSyncGate::default(),
+                user_status_sync: UserStatusSync::default(),
+                team_id: Some("T1".into()),
+                huddles,
+                cached_bootstrap_load_gate: None,
+            });
+
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (completed_tx, completed_rx) = oneshot::channel();
+            let task_store = store.clone();
+            spawn_request_task(
+                &state,
+                TrackedRequest::new(
+                    RuntimeIdentity {
+                        session: first_session,
+                        request: RequestId::new(1),
+                    },
+                    OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+                ),
+                async move {
+                    let _completion = CancellationSignal(Some(completed_tx));
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    drop(release_rx);
+                    let _ = task_store
+                        .store_custom_emojis(&HashMap::from([(
+                            "late".to_string(),
+                            "https://example.invalid/late.png".to_string(),
+                        )]))
+                        .await;
+                },
+            );
+            tokio::task::spawn_blocking(move || {
+                started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("ordinary runtime task did not reach its pre-store gate");
+            })
+            .await
+            .unwrap();
+            state
+                .lock()
+                .unwrap()
+                .cancel_active_work(ActiveWork::Task { task_id: 1 });
+
+            let replacement = replace_runtime_session(&state, second_session);
+            tokio::pin!(replacement);
+            let replacement_while_task_is_running =
+                tokio::time::timeout(Duration::from_millis(25), &mut replacement).await;
+            assert_eq!(state.lock().unwrap().active_session, first_session);
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), completed_rx)
+                .await
+                .expect("aborted runtime task did not complete")
+                .expect("runtime task completion signal was dropped");
+            if replacement_while_task_is_running.is_err() {
+                tokio::time::timeout(Duration::from_secs(1), replacement)
+                    .await
+                    .expect("session replacement did not finish after task completion");
+            }
+
+            assert!(
+                replacement_while_task_is_running.is_err(),
+                "session replacement passed the old store barrier before the aborted task completed"
+            );
+            assert_eq!(state.lock().unwrap().active_session, second_session);
+            let transactions_after_replacement = store.committed_transaction_count().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(
+                store.committed_transaction_count().await.unwrap(),
+                transactions_after_replacement,
+                "an old-session task wrote after the store handoff barrier"
+            );
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
     fn replacing_session_drains_scheduled_durable_work_before_reopening() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -19889,6 +21164,259 @@ mod tests {
     }
 
     #[test]
+    fn bounded_sync_command_plans_cover_reads_without_carrying_payload_content() {
+        let main_location = SearchMessageLocation::new("C1", "1710000001.000100", None).unwrap();
+        let thread_location =
+            SearchMessageLocation::new("C1", "1710000002.000100", Some("1710000000.000100"))
+                .unwrap();
+        let scheduled = [
+            RuntimeCommand::RefreshConversations,
+            RuntimeCommand::DiscoverChannels,
+            RuntimeCommand::DiscoverConversations,
+            RuntimeCommand::LoadHistory {
+                channel_id: "C1".to_string(),
+            },
+            RuntimeCommand::LoadOlderHistory {
+                channel_id: "C1".to_string(),
+                cursor: "cursor-a".to_string(),
+            },
+            RuntimeCommand::LoadThread {
+                channel_id: "C1".to_string(),
+                ts: "1710000000.000100".to_string(),
+            },
+            RuntimeCommand::LoadOlderThread {
+                channel_id: "C1".to_string(),
+                ts: "1710000000.000100".to_string(),
+                cursor: "cursor-b".to_string(),
+            },
+            RuntimeCommand::LoadMessageContext(main_location),
+            RuntimeCommand::LoadMessageContext(thread_location),
+            RuntimeCommand::SearchMessages {
+                query: "first query".to_string(),
+            },
+            RuntimeCommand::LoadFiles,
+            RuntimeCommand::LoadFile {
+                file_id: "F1".to_string(),
+                share_requested: false,
+            },
+            RuntimeCommand::LoadSavedItems,
+        ];
+        assert!(scheduled
+            .iter()
+            .all(|command| connected_command_sync_plan(command).is_some()));
+
+        let excluded = [
+            RuntimeCommand::JoinConversation {
+                channel_id: "C1".to_string(),
+            },
+            RuntimeCommand::LoadUserProfile {
+                user_id: "U1".to_string(),
+            },
+            RuntimeCommand::PostMessage {
+                channel_id: "C1".to_string(),
+                text: "message text".to_string(),
+                thread_ts: None,
+            },
+            RuntimeCommand::LoadImageAsset {
+                key: "preview-key".to_string(),
+                url: "https://files.example.invalid/private".to_string(),
+            },
+        ];
+        assert!(excluded
+            .iter()
+            .all(|command| connected_command_sync_plan(command).is_none()));
+
+        let first_search = connected_command_sync_plan(&RuntimeCommand::SearchMessages {
+            query: "first query".to_string(),
+        })
+        .unwrap();
+        let second_search = connected_command_sync_plan(&RuntimeCommand::SearchMessages {
+            query: "different query".to_string(),
+        })
+        .unwrap();
+        assert_eq!(first_search.target, second_search.target);
+
+        let first_page = connected_command_sync_plan(&RuntimeCommand::LoadOlderHistory {
+            channel_id: "C1".to_string(),
+            cursor: "cursor-a".to_string(),
+        })
+        .unwrap();
+        let second_page = connected_command_sync_plan(&RuntimeCommand::LoadOlderHistory {
+            channel_id: "C1".to_string(),
+            cursor: "cursor-b".to_string(),
+        })
+        .unwrap();
+        assert_eq!(first_page.target, second_page.target);
+    }
+
+    #[test]
+    fn bounded_sync_navigation_plans_have_exact_contracts() {
+        let history = connected_command_sync_plan(&RuntimeCommand::LoadHistory {
+            channel_id: "C1".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            history,
+            RuntimeSyncPlan {
+                target: runtime_sync_target(
+                    SyncTargetKind::Conversation,
+                    "conversation-history",
+                    &["C1"],
+                ),
+                priority: SyncPriority::Interactive,
+                durability: SyncDurability::Ephemeral,
+                freshness: FreshnessPolicy::Always,
+                replacement: ReplacementClass::Refresh(RefreshClass::ConversationHistory),
+                retry: RetryPolicy::Never,
+            }
+        );
+
+        let older = connected_command_sync_plan(&RuntimeCommand::LoadOlderHistory {
+            channel_id: "C1".to_string(),
+            cursor: "cursor-a".to_string(),
+        })
+        .unwrap();
+        assert_eq!(older.target, history.target);
+        assert_eq!(older.replacement, ReplacementClass::Never);
+
+        let thread = connected_command_sync_plan(&RuntimeCommand::LoadThread {
+            channel_id: "C1".to_string(),
+            ts: "1710000000.000100".to_string(),
+        })
+        .unwrap();
+        assert_eq!(thread.priority, SyncPriority::Interactive);
+        assert_eq!(
+            thread.replacement,
+            ReplacementClass::Refresh(RefreshClass::ThreadReplies)
+        );
+        assert_eq!(
+            thread.target,
+            runtime_sync_target(
+                SyncTargetKind::Thread,
+                "thread-replies",
+                &["C1", "1710000000.000100"],
+            )
+        );
+
+        let main_context = connected_command_sync_plan(&RuntimeCommand::LoadMessageContext(
+            SearchMessageLocation::new("C1", "1710000001.000100", None).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            main_context.replacement,
+            ReplacementClass::Refresh(RefreshClass::ConversationHistory)
+        );
+        assert_eq!(
+            main_context.target,
+            runtime_sync_target(
+                SyncTargetKind::Conversation,
+                "message-context",
+                &["C1", "1710000001.000100"],
+            )
+        );
+
+        let thread_context = connected_command_sync_plan(&RuntimeCommand::LoadMessageContext(
+            SearchMessageLocation::new("C1", "1710000002.000100", Some("1710000000.000100"))
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            thread_context.replacement,
+            ReplacementClass::Refresh(RefreshClass::ThreadReplies)
+        );
+        assert_eq!(
+            thread_context.target,
+            runtime_sync_target(
+                SyncTargetKind::Thread,
+                "message-context",
+                &["C1", "1710000000.000100", "1710000002.000100"],
+            )
+        );
+
+        for command in [
+            RuntimeCommand::SearchMessages {
+                query: "query".to_string(),
+            },
+            RuntimeCommand::LoadFiles,
+            RuntimeCommand::LoadFile {
+                file_id: "F1".to_string(),
+                share_requested: false,
+            },
+            RuntimeCommand::LoadSavedItems,
+        ] {
+            let plan = connected_command_sync_plan(&command).unwrap();
+            assert_eq!(plan.priority, SyncPriority::Interactive);
+            assert_eq!(plan.durability, SyncDurability::Ephemeral);
+            assert_eq!(plan.freshness, FreshnessPolicy::Always);
+            assert_eq!(plan.replacement, ReplacementClass::Never);
+            assert_eq!(plan.retry, RetryPolicy::Never);
+        }
+    }
+
+    #[test]
+    fn startup_sync_contracts_share_membership_replacement_with_manual_refresh() {
+        let manual = connected_command_sync_plan(&RuntimeCommand::RefreshConversations).unwrap();
+        let startup = startup_sync_plan(RuntimeStartupSyncKind::Membership);
+        assert_eq!(manual.target, startup.target);
+        assert_eq!(manual.replacement, startup.replacement);
+        assert_eq!(
+            startup,
+            RuntimeSyncPlan {
+                target: runtime_sync_target(
+                    SyncTargetKind::Workspace,
+                    "workspace-operation",
+                    &["conversation-membership"],
+                ),
+                priority: SyncPriority::Foreground,
+                durability: SyncDurability::Ephemeral,
+                freshness: FreshnessPolicy::Always,
+                replacement: ReplacementClass::Refresh(RefreshClass::Membership),
+                retry: RetryPolicy::Never,
+            }
+        );
+
+        let emoji = startup_sync_plan(RuntimeStartupSyncKind::EmojiCatalog);
+        assert_eq!(emoji.priority, SyncPriority::Maintenance);
+        assert_eq!(emoji.durability, SyncDurability::Ephemeral);
+        assert_eq!(emoji.freshness, FreshnessPolicy::Always);
+        assert_eq!(
+            emoji.replacement,
+            ReplacementClass::Refresh(RefreshClass::Workspace)
+        );
+        assert_eq!(emoji.retry, RetryPolicy::Never);
+
+        let groups = startup_sync_plan(RuntimeStartupSyncKind::UserGroups);
+        assert_eq!(groups.priority, SyncPriority::Maintenance);
+        assert_eq!(
+            groups.replacement,
+            ReplacementClass::Refresh(RefreshClass::UserDirectory)
+        );
+
+        let automatic =
+            connected_command_sync_plan(&RuntimeCommand::DiscoverConversations).unwrap();
+        let manual_discovery =
+            connected_command_sync_plan(&RuntimeCommand::DiscoverChannels).unwrap();
+        assert_eq!(automatic.target, manual_discovery.target);
+        assert_eq!(automatic.replacement, manual_discovery.replacement);
+        assert_eq!(automatic.priority, SyncPriority::Maintenance);
+        assert_eq!(manual_discovery.priority, SyncPriority::Interactive);
+    }
+
+    #[test]
+    fn workspace_startup_network_work_has_no_legacy_spawn_or_lane_wait() {
+        let source = include_str!("runtime.rs");
+        let startup = source
+            .split_once("fn spawn_workspace_tasks(")
+            .and_then(|(_, tail)| tail.split_once("async fn load_cached_bootstrap("))
+            .map(|(body, _)| body)
+            .expect("spawn_workspace_tasks source slice should exist");
+
+        assert!(!startup.contains("spawn_request_task("));
+        assert!(!startup.contains(".acquire(RuntimeTaskLane::"));
+        assert!(startup.contains("schedule_session_sync_work("));
+    }
+
+    #[test]
     fn conversation_star_command_is_an_interactive_channel_mutation() {
         let descriptor = RuntimeCommand::SetConversationStarred {
             channel_id: "C123".to_string(),
@@ -20350,6 +21878,38 @@ mod tests {
                 next_backoff: SOCKET_MODE_INITIAL_RECONNECT_DELAY,
             }
         );
+    }
+
+    #[test]
+    fn realtime_membership_refresh_filters_other_users_but_keeps_workspace_signals() {
+        assert!(socket_membership_refresh_required(
+            &socket_mode::SocketModeConversationRefreshScope::Workspace,
+            Some("U-current"),
+        ));
+        assert!(socket_membership_refresh_required(
+            &socket_mode::SocketModeConversationRefreshScope::Membership {
+                kind: socket_mode::SocketModeMembershipKind::Joined,
+                user_id: "U-current".to_string(),
+                channel_id: "C1".to_string(),
+            },
+            Some("U-current"),
+        ));
+        assert!(!socket_membership_refresh_required(
+            &socket_mode::SocketModeConversationRefreshScope::Membership {
+                kind: socket_mode::SocketModeMembershipKind::Left,
+                user_id: "U-coworker".to_string(),
+                channel_id: "C1".to_string(),
+            },
+            Some("U-current"),
+        ));
+        assert!(!socket_membership_refresh_required(
+            &socket_mode::SocketModeConversationRefreshScope::Membership {
+                kind: socket_mode::SocketModeMembershipKind::Joined,
+                user_id: "U-current".to_string(),
+                channel_id: "C1".to_string(),
+            },
+            None,
+        ));
     }
 
     #[test]

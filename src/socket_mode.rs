@@ -49,7 +49,23 @@ pub enum SocketModeEvent {
     Reaction(SocketModeReactionEvent),
     UserChanged(Box<SlackUser>),
     UserHuddleChanged(Box<SlackUser>),
-    RefreshConversations,
+    RefreshConversations(SocketModeConversationRefreshScope),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketModeConversationRefreshScope {
+    Workspace,
+    Membership {
+        kind: SocketModeMembershipKind,
+        user_id: String,
+        channel_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketModeMembershipKind {
+    Joined,
+    Left,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,11 +330,37 @@ fn socket_event_from_event(event: &Value) -> Option<SocketModeEvent> {
             .and_then(|user| serde_json::from_value(user).ok())
             .map(Box::new)
             .map(SocketModeEvent::UserHuddleChanged),
-        event_type if conversation_refresh_event(event_type) => {
-            Some(SocketModeEvent::RefreshConversations)
+        "member_joined_channel" => {
+            conversation_membership_refresh(event, SocketModeMembershipKind::Joined)
         }
+        "member_left_channel" => {
+            conversation_membership_refresh(event, SocketModeMembershipKind::Left)
+        }
+        event_type if workspace_conversation_refresh_event(event_type) => Some(
+            SocketModeEvent::RefreshConversations(SocketModeConversationRefreshScope::Workspace),
+        ),
         _ => None,
     }
+}
+
+fn conversation_membership_refresh(
+    event: &Value,
+    kind: SocketModeMembershipKind,
+) -> Option<SocketModeEvent> {
+    let user_id = non_empty_event_id(event.get("user")?)?;
+    let channel_id = non_empty_event_id(event.get("channel")?)?;
+    Some(SocketModeEvent::RefreshConversations(
+        SocketModeConversationRefreshScope::Membership {
+            kind,
+            user_id,
+            channel_id,
+        },
+    ))
+}
+
+fn non_empty_event_id(value: &Value) -> Option<String> {
+    let value = value.as_str()?.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn message_event(event: &Value) -> Option<SocketModeMessageEvent> {
@@ -391,7 +433,7 @@ fn reaction_event(event: &Value, added: bool) -> Option<SocketModeReactionEvent>
     })
 }
 
-fn conversation_refresh_event(event_type: &str) -> bool {
+fn workspace_conversation_refresh_event(event_type: &str) -> bool {
     matches!(
         event_type,
         "channel_archive"
@@ -406,8 +448,6 @@ fn conversation_refresh_event(event_type: &str) -> bool {
             | "group_rename"
             | "group_unarchive"
             | "im_created"
-            | "member_joined_channel"
-            | "member_left_channel"
             | "mpim_open"
     )
 }
@@ -706,6 +746,106 @@ mod tests {
     }
 
     #[test]
+    fn parses_workspace_conversation_refresh_events() {
+        for event_type in [
+            "channel_archive",
+            "channel_created",
+            "channel_deleted",
+            "channel_left",
+            "channel_rename",
+            "channel_unarchive",
+            "group_archive",
+            "group_joined",
+            "group_left",
+            "group_rename",
+            "group_unarchive",
+            "im_created",
+            "mpim_open",
+        ] {
+            assert_eq!(
+                socket_event_from_payload(&payload(serde_json::json!({
+                    "type": event_type
+                }))),
+                Some(SocketModeEvent::RefreshConversations(
+                    SocketModeConversationRefreshScope::Workspace
+                )),
+                "unexpected refresh scope for {event_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_scoped_channel_membership_events() {
+        for (event_type, kind) in [
+            ("member_joined_channel", SocketModeMembershipKind::Joined),
+            ("member_left_channel", SocketModeMembershipKind::Left),
+        ] {
+            assert_eq!(
+                socket_event_from_payload(&payload(serde_json::json!({
+                    "type": event_type,
+                    "user": "U123",
+                    "channel": "C123"
+                }))),
+                Some(SocketModeEvent::RefreshConversations(
+                    SocketModeConversationRefreshScope::Membership {
+                        kind,
+                        user_id: "U123".to_string(),
+                        channel_id: "C123".to_string(),
+                    }
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_channel_membership_events() {
+        for event_type in ["member_joined_channel", "member_left_channel"] {
+            for malformed in [
+                serde_json::json!({
+                    "type": event_type,
+                    "channel": "C123"
+                }),
+                serde_json::json!({
+                    "type": event_type,
+                    "user": "U123"
+                }),
+                serde_json::json!({
+                    "type": event_type,
+                    "user": "",
+                    "channel": "C123"
+                }),
+                serde_json::json!({
+                    "type": event_type,
+                    "user": "   ",
+                    "channel": "C123"
+                }),
+                serde_json::json!({
+                    "type": event_type,
+                    "user": "U123",
+                    "channel": ""
+                }),
+                serde_json::json!({
+                    "type": event_type,
+                    "user": "U123",
+                    "channel": "   "
+                }),
+                serde_json::json!({
+                    "type": event_type,
+                    "user": 123,
+                    "channel": "C123"
+                }),
+                serde_json::json!({
+                    "type": event_type,
+                    "user": "U123",
+                    "channel": 123
+                }),
+            ] {
+                assert_eq!(socket_event_from_payload(&payload(malformed)), None);
+            }
+        }
+    }
+
+    #[test]
     fn browser_rtm_decodes_raw_events_without_socket_mode_envelope() {
         let event = socket_event_from_rtm(&serde_json::json!({
             "type": "user_huddle_changed",
@@ -723,6 +863,24 @@ mod tests {
             Some(SocketModeEvent::UserHuddleChanged(user))
                 if user.id.as_deref() == Some("U123")
         ));
+    }
+
+    #[test]
+    fn browser_rtm_preserves_scoped_channel_membership_events() {
+        assert_eq!(
+            socket_event_from_rtm(&serde_json::json!({
+                "type": "member_left_channel",
+                "user": " U123 ",
+                "channel": " C123 "
+            })),
+            Some(SocketModeEvent::RefreshConversations(
+                SocketModeConversationRefreshScope::Membership {
+                    kind: SocketModeMembershipKind::Left,
+                    user_id: "U123".to_string(),
+                    channel_id: "C123".to_string(),
+                }
+            ))
+        );
     }
 
     #[test]
