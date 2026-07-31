@@ -1,0 +1,9 @@
+Task: Move startup, manual refresh, navigation, and membership-event scheduling onto the bounded scheduler
+
+Summary: Routed startup emoji, membership, and user-group refreshes plus manual refresh/discovery and all main/thread navigation reads through session-owned bounded admission. Realtime membership changes now use typed scopes, ignore other-user churn, and coalesce same-target refresh generations without GTK round trips. Session replacement drains scheduler, Socket Mode, and ordinary tasks before a cancellation-safe StoreHub migration/barrier fence.
+
+Modified files: src/runtime.rs, src/runtime_sync.rs, src/socket_mode.rs, src/store.rs, src/sync_scheduler.rs, src/window.rs, src/workspace_pipeline.rs
+
+Rationale: Bound network work before spawn, prioritize interactive navigation, prevent concurrent same-target snapshots, preserve newer membership authority, and ensure old-session writes cannot cross workspace handoff.
+
+Validation: cargo test --all-targets --no-fail-fast (1004 passed, 3 ignored); cargo check --all-targets; 100 repeated session-handoff race regressions; cargo fmt --all -- --check; git diff --check. Coverage tooling is not configured. Strict Clippy was unavailable because the installed Clippy driver is 1.87 while the crate requires Rust 1.88 or newer.
