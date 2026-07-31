@@ -1,0 +1,9 @@
+Task: Migrate the sidebar to GtkListView, gio::ListStore, and stable single selection
+
+Summary: Replaced the widget-heavy GtkListBox adapter with a virtualized GtkListView backed by a keyed gio::ListStore and GtkSingleSelection. Stable GObjects survive content updates and moves, recycled factory rows preserve accessibility and native interaction semantics, and activation and context menus now resolve current model objects rather than stale index maps.
+
+Modified files: docs/sidebar-design.md, src/sidebar_widgets.rs, src/window.rs, src/window.ui
+
+Rationale: Bound widget creation to the visible viewport and make local sidebar changes incremental without sacrificing exact duplicate-placement selection, section activation, or conversation actions.
+
+Validation: cargo test --all -- --nocapture (1097 passed, 3 ignored); cargo check; cargo fmt --all -- --check; git diff --check; meson test -C _build --print-errorlogs (17 passed). Focused regressions cover a one-row update in 1,430 items, stable object identity through moves, interaction semantics, and the GtkListView template contract. Strict Clippy was unavailable because installed Clippy 0.1.87 does not match rustc 1.95.0. Coverage was unavailable because cargo-llvm-cov is not installed.
