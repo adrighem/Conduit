@@ -305,7 +305,13 @@ Debug output can contain private workspace metadata such as channel names, user 
 RUST_LOG=conduit::attention=trace conduit
 ```
 
-That target is limited to counters, booleans, and stable category codes; it excludes message text, configured terms, and workspace, user, conversation, and message identifiers. This target-specific privacy property does not apply to general `--debug` output. Diagnostics should not contain tokens or authorization codes, but always review and redact logs before sharing them.
+Scheduler and Slack API request counters are available as another privacy-safe diagnostic stream:
+
+```sh
+RUST_LOG=conduit::sync=trace,conduit::slack=trace conduit
+```
+
+These targets are limited to counters, booleans, and stable category or method codes; they exclude message text, configured terms, and workspace, user, conversation, and message identifiers. This target-specific privacy property does not apply to general `--debug` output. Diagnostics should not contain tokens or authorization codes, but always review and redact logs before sharing them.
 
 ## Local data and security
 

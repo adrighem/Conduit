@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -50,6 +51,216 @@ const USER_BOOT_OMIT_EXTRAS: &str = "feature_usage_data,plan_info,salesforce_fea
 const MAX_SLACK_ROUTE_BYTES: usize = 2048;
 const READ_MARKER_SCOPES: [&str; 4] = ["channels:write", "groups:write", "im:write", "mpim:write"];
 static NEXT_CLIENT_MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
+
+const SLACK_WEB_API_SURFACE: &str = "web_api";
+const SLACK_BROWSER_API_SURFACE: &str = "browser_api";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SlackApiCountersSnapshot {
+    pub(crate) attempts_started: u64,
+    pub(crate) succeeded: u64,
+    pub(crate) failed: u64,
+    pub(crate) rate_limited: u64,
+    pub(crate) abandoned: u64,
+    pub(crate) retries_scheduled: u64,
+    pub(crate) in_flight: u64,
+    pub(crate) in_flight_high_water: u64,
+}
+
+impl SlackApiCountersSnapshot {
+    pub(crate) fn is_conserved(self) -> bool {
+        self.attempts_started
+            == self
+                .succeeded
+                .saturating_add(self.failed)
+                .saturating_add(self.rate_limited)
+                .saturating_add(self.abandoned)
+                .saturating_add(self.in_flight)
+    }
+}
+
+#[derive(Debug, Default)]
+struct SlackApiCounters {
+    state: Mutex<SlackApiCountersSnapshot>,
+}
+
+impl SlackApiCounters {
+    fn snapshot(&self) -> SlackApiCountersSnapshot {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin(&self, surface: &'static str, method: &str, attempt: usize) -> SlackApiAttempt<'_> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.attempts_started = state.attempts_started.saturating_add(1);
+            state.in_flight = state.in_flight.saturating_add(1);
+            state.in_flight_high_water = state.in_flight_high_water.max(state.in_flight);
+        }
+        SlackApiAttempt {
+            counters: self,
+            surface,
+            method: stable_slack_api_method(method),
+            attempt,
+            completed: false,
+        }
+    }
+
+    fn complete(
+        &self,
+        surface: &'static str,
+        method: &'static str,
+        attempt: usize,
+        outcome: SlackApiRequestOutcome,
+        retry_scheduled: bool,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.in_flight > 0);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        match outcome {
+            SlackApiRequestOutcome::Succeeded => {
+                state.succeeded = state.succeeded.saturating_add(1);
+            }
+            SlackApiRequestOutcome::Failed => {
+                state.failed = state.failed.saturating_add(1);
+            }
+            SlackApiRequestOutcome::RateLimited => {
+                state.rate_limited = state.rate_limited.saturating_add(1);
+            }
+            SlackApiRequestOutcome::Abandoned => {
+                state.abandoned = state.abandoned.saturating_add(1);
+            }
+        }
+        if retry_scheduled {
+            state.retries_scheduled = state.retries_scheduled.saturating_add(1);
+        }
+        let snapshot = *state;
+
+        // Keep mutation and emission serialized so cumulative snapshots cannot
+        // appear to regress when requests finish concurrently.
+        debug_assert!(snapshot.is_conserved());
+        tracing::trace!(
+            target: "conduit::slack",
+            parent: None,
+            event = "slack_api_request",
+            surface,
+            method,
+            attempt,
+            outcome = outcome.code(),
+            attempts_started = snapshot.attempts_started,
+            succeeded = snapshot.succeeded,
+            failed = snapshot.failed,
+            rate_limited = snapshot.rate_limited,
+            abandoned = snapshot.abandoned,
+            retries_scheduled = snapshot.retries_scheduled,
+            in_flight = snapshot.in_flight,
+            in_flight_high_water = snapshot.in_flight_high_water,
+        );
+        drop(state);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SlackApiRequestOutcome {
+    Succeeded,
+    Failed,
+    RateLimited,
+    Abandoned,
+}
+
+impl SlackApiRequestOutcome {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::RateLimited => "rate_limited",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+struct SlackApiAttempt<'a> {
+    counters: &'a SlackApiCounters,
+    surface: &'static str,
+    method: &'static str,
+    attempt: usize,
+    completed: bool,
+}
+
+impl SlackApiAttempt<'_> {
+    fn complete(mut self, outcome: SlackApiRequestOutcome, retry_scheduled: bool) {
+        self.completed = true;
+        self.counters.complete(
+            self.surface,
+            self.method,
+            self.attempt,
+            outcome,
+            retry_scheduled,
+        );
+    }
+}
+
+impl Drop for SlackApiAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.completed = true;
+            self.counters.complete(
+                self.surface,
+                self.method,
+                self.attempt,
+                SlackApiRequestOutcome::Abandoned,
+                false,
+            );
+        }
+    }
+}
+
+fn stable_slack_api_method(method: &str) -> &'static str {
+    match method {
+        "auth.test" => "auth.test",
+        "users.conversations" => "users.conversations",
+        "conversations.list" => "conversations.list",
+        "users.list" => "users.list",
+        "emoji.list" => "emoji.list",
+        "conversations.join" => "conversations.join",
+        "conversations.leave" => "conversations.leave",
+        "conversations.open" => "conversations.open",
+        "conversations.create" => "conversations.create",
+        "conversations.invite" => "conversations.invite",
+        "conversations.history" => "conversations.history",
+        "conversations.info" => "conversations.info",
+        "conversations.members" => "conversations.members",
+        "conversations.replies" => "conversations.replies",
+        "search.messages" => "search.messages",
+        "stars.list" => "stars.list",
+        "files.list" => "files.list",
+        "files.info" => "files.info",
+        "users.info" => "users.info",
+        "users.profile.get" => "users.profile.get",
+        "users.profile.set" => "users.profile.set",
+        "usergroups.list" => "usergroups.list",
+        "chat.postMessage" => "chat.postMessage",
+        "chat.getPermalink" => "chat.getPermalink",
+        "reactions.add" => "reactions.add",
+        "reactions.remove" => "reactions.remove",
+        "stars.add" => "stars.add",
+        "stars.remove" => "stars.remove",
+        "conversations.mark" => "conversations.mark",
+        "files.getUploadURLExternal" => "files.getUploadURLExternal",
+        "files.completeUploadExternal" => "files.completeUploadExternal",
+        "client.userBoot" => "client.userBoot",
+        "client.counts" => "client.counts",
+        _ => "unknown",
+    }
+}
 
 fn next_client_message_id() -> String {
     let counter = NEXT_CLIENT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
@@ -327,6 +538,7 @@ pub struct SlackApi {
     scopes: HashSet<String>,
     browser_cookie_d: Option<String>,
     user_agent: Option<String>,
+    api_counters: Arc<SlackApiCounters>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,7 +584,13 @@ impl SlackApi {
             scopes,
             browser_cookie_d: token.browser_cookie_d,
             user_agent: token.user_agent,
+            api_counters: Arc::new(SlackApiCounters::default()),
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn api_counters(&self) -> SlackApiCountersSnapshot {
+        self.api_counters.snapshot()
     }
 
     pub async fn auth_test(&self) -> Result<AuthInfo> {
@@ -1278,20 +1496,33 @@ impl SlackApi {
         if self.browser_cookie_d.is_some() && !form.iter().any(|(key, _)| *key == "token") {
             form.push(("token", self.access_token.clone()));
         }
-        let mut retries = 0;
+        let mut retries: usize = 0;
 
         loop {
-            let response = self
+            let attempt_number = retries.saturating_add(1);
+            let attempt = self
+                .api_counters
+                .begin(SLACK_WEB_API_SURFACE, method, attempt_number);
+            let response = match self
                 .authenticated_request(Method::POST, &url)
                 .timeout(API_REQUEST_TIMEOUT)
                 .form(&form)
                 .send()
                 .await
-                .with_context(|| format!("failed to call Slack method {method}"))?;
+                .with_context(|| format!("failed to call Slack method {method}"))
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    attempt.complete(SlackApiRequestOutcome::Failed, false);
+                    return Err(error.into());
+                }
+            };
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = retry_after_delay(&response);
-                if retries >= MAX_RATE_LIMIT_RETRIES {
+                let retry_scheduled = retries < MAX_RATE_LIMIT_RETRIES;
+                attempt.complete(SlackApiRequestOutcome::RateLimited, retry_scheduled);
+                if !retry_scheduled {
                     crate::debug::log(
                         "slack",
                         &format!("Slack method {method} rate limited; not retrying automatically"),
@@ -1312,14 +1543,38 @@ impl SlackApi {
                 continue;
             }
 
-            let response = response
+            let response = match response
                 .error_for_status()
-                .with_context(|| format!("Slack method {method} returned an HTTP error"))?
+                .with_context(|| format!("Slack method {method} returned an HTTP error"))
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    attempt.complete(SlackApiRequestOutcome::Failed, false);
+                    return Err(error.into());
+                }
+            };
+            let response = match response
                 .json::<T>()
                 .await
-                .with_context(|| format!("failed to parse Slack method {method} response"))?;
+                .with_context(|| format!("failed to parse Slack method {method} response"))
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    attempt.complete(SlackApiRequestOutcome::Failed, false);
+                    return Err(error.into());
+                }
+            };
 
-            return response.into_result(method);
+            let result = response.into_result(method);
+            let outcome = match &result {
+                Ok(_) => SlackApiRequestOutcome::Succeeded,
+                Err(error) if error.category() == SlackErrorCategory::RateLimited => {
+                    SlackApiRequestOutcome::RateLimited
+                }
+                Err(_) => SlackApiRequestOutcome::Failed,
+            };
+            attempt.complete(outcome, false);
+            return result;
         }
     }
 
@@ -1374,23 +1629,58 @@ impl SlackApi {
         if let Some(user_agent) = user_agent {
             request = request.header(USER_AGENT, user_agent);
         }
-        let response = request
+        let attempt = self
+            .api_counters
+            .begin(SLACK_BROWSER_API_SURFACE, method, 1);
+        let response = match request
             .send()
             .await
-            .with_context(|| format!("failed to call Slack method {method}"))?;
+            .with_context(|| format!("failed to call Slack method {method}"))
+        {
+            Ok(response) => response,
+            Err(error) => {
+                attempt.complete(SlackApiRequestOutcome::Failed, false);
+                return Err(error.into());
+            }
+        };
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            attempt.complete(SlackApiRequestOutcome::RateLimited, false);
             return Err(SlackError::RateLimited {
                 method: method.to_string(),
             });
         }
-        let response = response
+        let response = match response
             .error_for_status()
-            .with_context(|| format!("Slack method {method} returned an HTTP error"))?
+            .with_context(|| format!("Slack method {method} returned an HTTP error"))
+        {
+            Ok(response) => response,
+            Err(error) => {
+                attempt.complete(SlackApiRequestOutcome::Failed, false);
+                return Err(error.into());
+            }
+        };
+        let response = match response
             .json::<T>()
             .await
-            .with_context(|| format!("failed to parse Slack method {method} response"))?;
+            .with_context(|| format!("failed to parse Slack method {method} response"))
+        {
+            Ok(response) => response,
+            Err(error) => {
+                attempt.complete(SlackApiRequestOutcome::Failed, false);
+                return Err(error.into());
+            }
+        };
 
-        response.into_result(method)
+        let result = response.into_result(method);
+        let outcome = match &result {
+            Ok(_) => SlackApiRequestOutcome::Succeeded,
+            Err(error) if error.category() == SlackErrorCategory::RateLimited => {
+                SlackApiRequestOutcome::RateLimited
+            }
+            Err(_) => SlackApiRequestOutcome::Failed,
+        };
+        attempt.complete(outcome, false);
+        result
     }
 
     fn ensure_browser_session_credentials(&self) -> Result<()> {
@@ -2357,10 +2647,59 @@ fn thread_replies_in_history_order(mut messages: Vec<SlackMessage>) -> Vec<Slack
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
 
     use super::*;
     use tiny_http::{Header, Response, Server};
+
+    #[derive(Clone)]
+    struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct BlockingTraceLayer {
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for BlockingTraceLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let entered = self
+                .entered
+                .lock()
+                .expect("trace entry lock poisoned")
+                .take();
+            if let Some(entered) = entered {
+                entered.send(()).expect("trace entry should be observed");
+                self.release
+                    .lock()
+                    .expect("trace release lock poisoned")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("trace emission should be released");
+            }
+        }
+    }
+
+    impl Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace output lock poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn browser_test_token(browser_cookie_d: Option<&str>) -> StoredToken {
         StoredToken {
@@ -2424,6 +2763,22 @@ mod tests {
         }
     }
 
+    fn assert_api_counter_conservation(counters: SlackApiCountersSnapshot) {
+        assert!(
+            counters.is_conserved(),
+            "counters did not reconcile: {counters:?}"
+        );
+        assert_eq!(
+            counters.attempts_started,
+            counters
+                .succeeded
+                .saturating_add(counters.failed)
+                .saturating_add(counters.rate_limited)
+                .saturating_add(counters.abandoned)
+                .saturating_add(counters.in_flight)
+        );
+    }
+
     #[test]
     fn generated_client_message_ids_are_unique_uuid_values() {
         let first = next_client_message_id();
@@ -2437,6 +2792,269 @@ mod tests {
             first.chars().filter(|character| *character == '-').count(),
             4
         );
+    }
+
+    #[test]
+    fn api_counters_count_rate_limit_retries_as_physical_attempts() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            for (status, body) in [
+                (429, r#"{"ok":false,"error":"ratelimited"}"#),
+                (200, r#"{"ok":true}"#),
+            ] {
+                let request = server.recv().expect("mock Slack request should arrive");
+                let mut response = Response::from_string(body)
+                    .with_status_code(status)
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    );
+                if status == 429 {
+                    response.add_header(
+                        Header::from_bytes("Retry-After", "1")
+                            .expect("retry header should be valid"),
+                    );
+                }
+                request
+                    .respond(response)
+                    .expect("mock Slack response should be sent");
+            }
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.auth_test())
+            .expect("authentication should succeed after one retry");
+        received.join().expect("mock Slack server should finish");
+
+        let counters = api.api_counters();
+        assert_eq!(counters.attempts_started, 2);
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.failed, 0);
+        assert_eq!(counters.rate_limited, 1);
+        assert_eq!(counters.abandoned, 0);
+        assert_eq!(counters.retries_scheduled, 1);
+        assert_eq!(counters.in_flight, 0);
+        assert_eq!(counters.in_flight_high_water, 1);
+        assert_api_counter_conservation(counters);
+    }
+
+    #[test]
+    fn api_counters_record_failed_attempts() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let request = server.recv().expect("mock Slack request should arrive");
+            request
+                .respond(Response::empty(500))
+                .expect("mock Slack response should be sent");
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let error = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.auth_test())
+            .expect_err("HTTP failure should be reported");
+        assert_eq!(error.category(), SlackErrorCategory::Unexpected);
+        received.join().expect("mock Slack server should finish");
+
+        let counters = api.api_counters();
+        assert_eq!(counters.attempts_started, 1);
+        assert_eq!(counters.succeeded, 0);
+        assert_eq!(counters.failed, 1);
+        assert_eq!(counters.rate_limited, 0);
+        assert_eq!(counters.abandoned, 0);
+        assert_eq!(counters.retries_scheduled, 0);
+        assert_eq!(counters.in_flight, 0);
+        assert_eq!(counters.in_flight_high_water, 1);
+        assert_api_counter_conservation(counters);
+    }
+
+    #[test]
+    fn api_counters_share_clone_state_and_record_abandoned_attempts() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let (request_started, request_started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let received = thread::spawn(move || {
+            let request = server.recv().expect("mock Slack request should arrive");
+            request_started
+                .send(())
+                .expect("request observation should be delivered");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("mock response should be released");
+            let _ = request.respond(
+                Response::from_string(r#"{"ok":true}"#).with_header(
+                    Header::from_bytes("Content-Type", "application/json")
+                        .expect("content type header should be valid"),
+                ),
+            );
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let clone = api.clone();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let request = runtime.spawn(async move { clone.auth_test().await });
+        request_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock Slack request should start");
+        request.abort();
+        runtime.block_on(async {
+            assert!(request
+                .await
+                .expect_err("aborted request should not complete")
+                .is_cancelled());
+        });
+        release.send(()).expect("mock response should be released");
+        received.join().expect("mock Slack server should finish");
+
+        let counters = api.api_counters();
+        assert_eq!(counters.attempts_started, 1);
+        assert_eq!(counters.succeeded, 0);
+        assert_eq!(counters.failed, 0);
+        assert_eq!(counters.rate_limited, 0);
+        assert_eq!(counters.abandoned, 1);
+        assert_eq!(counters.retries_scheduled, 0);
+        assert_eq!(counters.in_flight, 0);
+        assert_eq!(counters.in_flight_high_water, 1);
+        assert_api_counter_conservation(counters);
+    }
+
+    #[test]
+    fn api_counter_snapshot_emission_is_serialized_with_mutation() {
+        use tracing_subscriber::prelude::*;
+
+        let counters = SlackApiCounters::default();
+        let attempt = counters.begin(SLACK_WEB_API_SURFACE, "auth.test", 1);
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let subscriber = tracing_subscriber::registry().with(BlockingTraceLayer {
+            entered: Mutex::new(Some(entered)),
+            release: Mutex::new(release_rx),
+        });
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        thread::scope(|scope| {
+            let completion = scope.spawn(|| {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    attempt.complete(SlackApiRequestOutcome::Succeeded, false);
+                });
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("counter trace emission should start");
+            let mutation_lock_was_released = counters.state.try_lock().is_ok();
+            release.send(()).expect("counter trace should be released");
+            completion
+                .join()
+                .expect("counter completion thread should finish");
+            assert!(
+                !mutation_lock_was_released,
+                "counter state was unlocked before its trace snapshot was emitted"
+            );
+        });
+
+        assert_eq!(
+            counters.snapshot(),
+            SlackApiCountersSnapshot {
+                attempts_started: 1,
+                succeeded: 1,
+                in_flight_high_water: 1,
+                ..SlackApiCountersSnapshot::default()
+            }
+        );
+    }
+
+    #[test]
+    fn api_trace_contains_only_stable_codes_and_scalar_counters() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let request = server.recv().expect("mock Slack request should arrive");
+            request
+                .respond(
+                    Response::from_string(r#"{"ok":true}"#).with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+        });
+        let private_token = "xoxp-PrivateTokenTraceCanary";
+        let private_channel = "C_PRIVATE_TRACE_CANARY";
+        let private_timestamp = "1710000000.000100-private";
+        let private_reaction = "private_reaction_trace_canary";
+        let mut token = user_test_token();
+        token.access_token = private_token.to_string();
+        let mut api = SlackApi::new(token);
+        api.api_base_url = format!("http://{address}/api");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_env_filter("conduit::slack=trace")
+            .with_writer(move || writer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let parent = tracing::trace_span!(
+                target: "conduit::slack",
+                "private_api_parent",
+                private_channel,
+                private_timestamp,
+                private_reaction,
+            );
+            let _entered = parent.enter();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should start")
+                .block_on(api.set_reaction(
+                    private_channel,
+                    private_timestamp,
+                    private_reaction,
+                    true,
+                ))
+                .expect("reaction should be accepted");
+        });
+        received.join().expect("mock Slack server should finish");
+
+        let output = String::from_utf8(output.lock().expect("trace output lock poisoned").clone())
+            .expect("trace output should be UTF-8");
+        for expected in [
+            "slack_api_request",
+            "surface=\"web_api\"",
+            "method=\"reactions.add\"",
+            "attempt=1",
+            "outcome=\"succeeded\"",
+            "attempts_started=1",
+            "succeeded=1",
+            "in_flight=0",
+        ] {
+            assert!(
+                output.contains(expected),
+                "trace omitted {expected}: {output}"
+            );
+        }
+        for private in [
+            private_token,
+            private_channel,
+            private_timestamp,
+            private_reaction,
+            &address.to_string(),
+        ] {
+            assert!(
+                !output.contains(private),
+                "trace leaked private input: {output}"
+            );
+        }
     }
 
     #[test]
@@ -3101,6 +3719,15 @@ mod tests {
         );
         let observations = received.join().expect("mock Slack server should finish");
         assert_eq!(observations.len(), 2);
+        let counters = api.api_counters();
+        assert_eq!(counters.attempts_started, 2);
+        assert_eq!(counters.succeeded, 2);
+        assert_eq!(counters.failed, 0);
+        assert_eq!(counters.rate_limited, 0);
+        assert_eq!(counters.abandoned, 0);
+        assert_eq!(counters.retries_scheduled, 0);
+        assert_eq!(counters.in_flight, 0);
+        assert_api_counter_conservation(counters);
         for (index, (path, body)) in observations.iter().enumerate() {
             assert_eq!(path, "/api/stars.list");
             let form = url::form_urlencoded::parse(body.as_bytes())
@@ -3737,10 +4364,22 @@ mod tests {
 
         let mut api = SlackApi::new(browser_test_token(Some("browser-cookie-value")));
         api.api_base_url = format!("http://{address}/api");
-        let snapshot = tokio::runtime::Runtime::new()
-            .expect("test runtime should start")
-            .block_on(api.browser_unread_snapshot("https://example.slack.com/"))
-            .expect("browser unread snapshot should succeed");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_env_filter("conduit::slack=trace")
+            .with_writer(move || writer.clone())
+            .finish();
+        let snapshot = tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should start")
+                .block_on(api.browser_unread_snapshot("https://example.slack.com/"))
+                .expect("browser unread snapshot should succeed")
+        });
 
         assert_eq!(snapshot.channels.len(), 1);
         assert_eq!(snapshot.ims.len(), 2);
@@ -3754,6 +4393,27 @@ mod tests {
 
         let observations = received.join().expect("mock Slack server should finish");
         assert_eq!(observations.len(), 2);
+        let counters = api.api_counters();
+        assert_eq!(counters.attempts_started, 2);
+        assert_eq!(counters.succeeded, 2);
+        assert_eq!(counters.failed, 0);
+        assert_eq!(counters.rate_limited, 0);
+        assert_eq!(counters.abandoned, 0);
+        assert_eq!(counters.in_flight, 0);
+        assert_api_counter_conservation(counters);
+        let trace = String::from_utf8(output.lock().expect("trace output lock poisoned").clone())
+            .expect("trace output should be UTF-8");
+        for expected in [
+            "surface=\"browser_api\"",
+            "method=\"client.userBoot\"",
+            "method=\"client.counts\"",
+            "outcome=\"succeeded\"",
+        ] {
+            assert!(
+                trace.contains(expected),
+                "browser trace omitted {expected}: {trace}"
+            );
+        }
         assert_eq!(observations[0].0, "/api/client.userBoot");
         assert_eq!(
             observations[1].0,

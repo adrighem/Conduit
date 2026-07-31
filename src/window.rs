@@ -340,6 +340,7 @@ mod imp {
         pub workspace_ready: Cell<bool>,
         // Cached data can make the workspace ready for routing before the initial live sync ends.
         pub initial_sync_complete: Cell<bool>,
+        pub(super) membership_reactivation: RefCell<MembershipReactivationState>,
         pub(super) pending_notification_target: RefCell<Option<NotificationTarget>>,
         pub(super) pending_message_notifications:
             RefCell<HashMap<(String, String), PendingMessageNotification>>,
@@ -2759,6 +2760,31 @@ fn initial_sync_completion(completed_before: bool, lifecycle: WorkspaceLifecycle
     }
 }
 
+#[derive(Debug, Default)]
+pub(super) struct MembershipReactivationState {
+    has_activated: bool,
+    was_active: bool,
+}
+
+impl MembershipReactivationState {
+    fn observe(&mut self, is_active: bool) -> bool {
+        let reactivated = self.has_activated && !self.was_active && is_active;
+        if is_active {
+            self.has_activated = true;
+        }
+        self.was_active = is_active;
+        reactivated
+    }
+}
+
+fn membership_reactivation_should_refresh(
+    reactivated: bool,
+    workspace_connected: bool,
+    realtime_status: RealtimeStatus,
+) -> bool {
+    reactivated && workspace_connected && realtime_status.transport.is_none()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaceholderSurface {
     Messages,
@@ -4087,6 +4113,23 @@ impl ConduitWindow {
 
         clear_stale_upload_staging();
         self.setup_window_actions();
+        imp.membership_reactivation
+            .borrow_mut()
+            .observe(self.is_active());
+        self.connect_is_active_notify(move |window| {
+            let reactivated = window
+                .imp()
+                .membership_reactivation
+                .borrow_mut()
+                .observe(window.is_active());
+            if membership_reactivation_should_refresh(
+                reactivated,
+                window.imp().workspace_id.borrow().is_some(),
+                window.realtime_status(),
+            ) {
+                window.send_command(RuntimeCommand::RefreshConversationsIfStale);
+            }
+        });
         self.connect_close_request(|window| {
             window.flush_persistent_state();
             glib::Propagation::Proceed
@@ -12009,6 +12052,45 @@ mod tests {
             true,
             WorkspaceLifecycle::Disconnected
         ));
+    }
+
+    #[test]
+    fn membership_reactivation_ignores_first_activation_and_repeated_notifications() {
+        let mut state = MembershipReactivationState::default();
+
+        assert!(!state.observe(false));
+        assert!(!state.observe(true));
+        assert!(!state.observe(true));
+        assert!(!state.observe(false));
+        assert!(state.observe(true));
+        assert!(!state.observe(true));
+    }
+
+    #[test]
+    fn membership_reactivation_requires_a_workspace_and_absent_realtime_transport() {
+        assert!(!membership_reactivation_should_refresh(
+            true,
+            false,
+            RealtimeStatus::default(),
+        ));
+        assert!(membership_reactivation_should_refresh(
+            true,
+            true,
+            RealtimeStatus::default(),
+        ));
+        assert!(membership_reactivation_should_refresh(
+            true,
+            true,
+            RealtimeStatus::configuration_error(),
+        ));
+
+        for status in [
+            RealtimeStatus::connecting(crate::realtime::RealtimeTransport::SocketMode),
+            RealtimeStatus::online(crate::realtime::RealtimeTransport::SocketMode),
+            RealtimeStatus::reconnecting(crate::realtime::RealtimeTransport::SocketMode),
+        ] {
+            assert!(!membership_reactivation_should_refresh(true, true, status));
+        }
     }
 
     #[test]

@@ -65,6 +65,9 @@ use crate::workspace_state::WorkspaceLifecycleEvent;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
 const CONVERSATION_ENRICHMENT_LIMIT: usize = 30;
+const MEMBERSHIP_MAX_AGE_MS: u64 = 5 * 60 * 1_000;
+const MEMBERSHIP_FRESHNESS_OPERATION: &str = "membership";
+const MEMBERSHIP_FRESHNESS_TARGET: &str = "workspace";
 const USER_DIRECTORY_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
 const USER_DIRECTORY_FRESHNESS_OPERATION: &str = "user-directory";
 const USER_DIRECTORY_FRESHNESS_TARGET: &str = "workspace";
@@ -98,6 +101,7 @@ pub enum RuntimeCommand {
     SignOut,
     Disconnect,
     RefreshConversations,
+    RefreshConversationsIfStale,
     UpdateAttentionPreferences(AttentionPreferences),
     DiscoverChannels,
     LoadUserDirectory,
@@ -244,6 +248,7 @@ pub enum RuntimeOperation {
     SignOut,
     Disconnect,
     Conversations,
+    MembershipRefresh,
     ConversationDiscovery,
     OpenConversation,
     LeaveConversation,
@@ -413,6 +418,15 @@ impl RuntimeCommandDescriptor {
             lane,
         }
     }
+
+    fn independent(context: OperationContext, lane: RuntimeTaskLane) -> Self {
+        Self {
+            context,
+            supersedes_previous: false,
+            navigation_slot: None,
+            lane,
+        }
+    }
 }
 
 impl RuntimeCommand {
@@ -452,6 +466,10 @@ impl RuntimeCommand {
             ),
             Self::RefreshConversations => RuntimeCommandDescriptor::request(
                 workspace(RuntimeOperation::Conversations),
+                RuntimeTaskLane::Background,
+            ),
+            Self::RefreshConversationsIfStale => RuntimeCommandDescriptor::independent(
+                workspace(RuntimeOperation::MembershipRefresh),
                 RuntimeTaskLane::Background,
             ),
             Self::UpdateAttentionPreferences(_) => RuntimeCommandDescriptor::mutation(
@@ -1196,6 +1214,7 @@ struct RuntimeConnection {
     read_marks: Arc<Mutex<HashMap<String, String>>>,
     message_handoffs: Arc<Mutex<MessageHandoffResolver>>,
     conversation_star_sync: ConversationStarSyncGate,
+    membership_sync: MembershipSync,
     user_directory_sync: UserDirectorySync,
     user_status_sync: UserStatusSync,
     team_id: Option<String>,
@@ -1205,6 +1224,85 @@ struct RuntimeConnection {
 }
 
 type ConversationStarSyncGate = Arc<tokio::sync::Mutex<()>>;
+
+#[derive(Clone, Debug, Default)]
+struct MembershipSync {
+    state: Arc<Mutex<MembershipSyncState>>,
+    refresh: Arc<tokio::sync::Mutex<()>>,
+    hydration_completed: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, Default)]
+struct MembershipSyncState {
+    hydration_completed: bool,
+    loaded: bool,
+    last_success_at_ms: Option<u64>,
+}
+
+impl MembershipSync {
+    fn hydrate(&self, has_cached_membership: bool, last_success_at_ms: Option<u64>) {
+        let mut state = self.state.lock().expect("membership sync lock poisoned");
+        let notify = !state.hydration_completed;
+        state.hydration_completed = true;
+        state.loaded = has_cached_membership;
+        state.last_success_at_ms = has_cached_membership
+            .then_some(last_success_at_ms)
+            .flatten();
+        drop(state);
+        if notify {
+            self.hydration_completed.notify_waiters();
+        }
+    }
+
+    async fn wait_for_hydration(&self) {
+        loop {
+            let notified = self.hydration_completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .expect("membership sync lock poisoned")
+                .hydration_completed
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn acquire_refresh_if_required(
+        &self,
+        stale_only: bool,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.wait_for_hydration().await;
+        let refresh = Arc::clone(&self.refresh).lock_owned().await;
+        if stale_only && !self.refresh_required(current_unix_millis()) {
+            return None;
+        }
+        Some(refresh)
+    }
+
+    fn last_success_for_stale_check(&self) -> Option<u64> {
+        let state = self.state.lock().expect("membership sync lock poisoned");
+        state.loaded.then_some(state.last_success_at_ms).flatten()
+    }
+
+    fn refresh_required(&self, now_ms: u64) -> bool {
+        let state = self.state.lock().expect("membership sync lock poisoned");
+        membership_refresh_required(state.loaded, now_ms, state.last_success_at_ms)
+    }
+
+    fn record_success(&self, refreshed_at_ms: u64) {
+        let mut state = self.state.lock().expect("membership sync lock poisoned");
+        state.loaded = true;
+        state.last_success_at_ms = Some(
+            state
+                .last_success_at_ms
+                .map_or(refreshed_at_ms, |current| current.max(refreshed_at_ms)),
+        );
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct UserDirectorySync {
@@ -1305,6 +1403,21 @@ impl UserDirectorySync {
 
 fn user_directory_last_success_at_ms(refreshed_at_ms: Option<i64>) -> Option<u64> {
     refreshed_at_ms.and_then(|value| u64::try_from(value).ok())
+}
+
+fn membership_last_success_at_ms(refreshed_at_ms: Option<i64>) -> Option<u64> {
+    refreshed_at_ms.and_then(|value| u64::try_from(value).ok())
+}
+
+fn membership_refresh_required(
+    has_cached_membership: bool,
+    now_ms: u64,
+    last_success_at_ms: Option<u64>,
+) -> bool {
+    !has_cached_membership
+        || last_success_at_ms.is_none_or(|last_success_at_ms| {
+            now_ms.saturating_sub(last_success_at_ms) >= MEMBERSHIP_MAX_AGE_MS
+        })
 }
 
 fn user_directory_refresh_required(
@@ -2440,6 +2553,16 @@ fn connected_command_sync_plan(command: &RuntimeCommand) -> Option<RuntimeSyncPl
             SyncPriority::Foreground,
             ReplacementClass::Refresh(RefreshClass::Membership),
         ),
+        RuntimeCommand::RefreshConversationsIfStale => RuntimeSyncPlan::refresh_if_older_than(
+            runtime_sync_target(
+                SyncTargetKind::Workspace,
+                "workspace-operation",
+                &["conversation-membership"],
+            ),
+            SyncPriority::Maintenance,
+            ReplacementClass::Refresh(RefreshClass::Membership),
+            MEMBERSHIP_MAX_AGE_MS,
+        ),
         RuntimeCommand::LoadUserDirectory => RuntimeSyncPlan::refresh_if_older_than(
             runtime_sync_target(
                 SyncTargetKind::UserDirectory,
@@ -2550,7 +2673,7 @@ fn startup_sync_plan(kind: RuntimeStartupSyncKind) -> RuntimeSyncPlan {
             SyncPriority::Maintenance,
             ReplacementClass::Refresh(RefreshClass::Workspace),
         ),
-        RuntimeStartupSyncKind::Membership => RuntimeSyncPlan::ephemeral(
+        RuntimeStartupSyncKind::Membership => RuntimeSyncPlan::refresh_if_older_than(
             runtime_sync_target(
                 SyncTargetKind::Workspace,
                 "workspace-operation",
@@ -2558,6 +2681,7 @@ fn startup_sync_plan(kind: RuntimeStartupSyncKind) -> RuntimeSyncPlan {
             ),
             SyncPriority::Foreground,
             ReplacementClass::Refresh(RefreshClass::Membership),
+            MEMBERSHIP_MAX_AGE_MS,
         ),
         RuntimeStartupSyncKind::UserDirectory => RuntimeSyncPlan::refresh_if_older_than(
             runtime_sync_target(
@@ -2579,6 +2703,18 @@ fn startup_sync_plan(kind: RuntimeStartupSyncKind) -> RuntimeSyncPlan {
             ReplacementClass::Refresh(RefreshClass::UserDirectory),
         ),
     }
+}
+
+fn realtime_membership_sync_plan() -> RuntimeSyncPlan {
+    RuntimeSyncPlan::ephemeral(
+        runtime_sync_target(
+            SyncTargetKind::Workspace,
+            "workspace-operation",
+            &["conversation-membership"],
+        ),
+        SyncPriority::Foreground,
+        ReplacementClass::Refresh(RefreshClass::Membership),
+    )
 }
 
 fn runtime_sync_scheduler() -> RuntimeSyncScheduler {
@@ -2976,9 +3112,7 @@ impl RuntimeState {
             .admit(plan.job(identity), last_success_at_ms, work)
         {
             Ok(RuntimeSyncAdmissionOutcome::Accepted(receipt)) => {
-                if plan.replacement == ReplacementClass::Refresh(RefreshClass::Membership) {
-                    self.pending_membership = None;
-                }
+                self.clear_pending_membership_superseded_by(plan);
                 let active = ActiveWork::Sync {
                     admission: receipt.admission(),
                     cancellation_id,
@@ -3023,15 +3157,26 @@ impl RuntimeState {
             .admit(plan.job(identity), last_success_at_ms, work)
         {
             Ok(RuntimeSyncAdmissionOutcome::Accepted(receipt)) => {
-                if plan.replacement == ReplacementClass::Refresh(RefreshClass::Membership) {
-                    self.pending_membership = None;
-                }
+                self.clear_pending_membership_superseded_by(plan);
                 RuntimeSyncRequestAdmission::Accepted(receipt)
             }
             Ok(RuntimeSyncAdmissionOutcome::SkippedFresh(_)) => {
                 RuntimeSyncRequestAdmission::SkippedFresh
             }
             Err(error) => RuntimeSyncRequestAdmission::Rejected(error.reason()),
+        }
+    }
+
+    fn clear_pending_membership_superseded_by(&mut self, accepted_plan: RuntimeSyncPlan) {
+        if accepted_plan.replacement != ReplacementClass::Refresh(RefreshClass::Membership) {
+            return;
+        }
+        let supersedes_pending = self
+            .pending_membership
+            .as_ref()
+            .is_some_and(|pending| sync_plan_can_replace_pending(accepted_plan, pending.plan));
+        if supersedes_pending {
+            self.pending_membership = None;
         }
     }
 
@@ -3820,20 +3965,26 @@ fn schedule_connected_sync_command(
 ) {
     let request = TrackedRequest::for_command(identity, &command);
     let is_user_directory = matches!(command, RuntimeCommand::LoadUserDirectory);
+    let is_stale_membership = matches!(command, RuntimeCommand::RefreshConversationsIfStale);
     let fresh_directory_state = is_user_directory.then(|| {
         (
             connection.workspace.clone(),
             Arc::clone(&connection.user_cache),
         )
     });
-    let last_success_at_ms = is_user_directory
-        .then(|| {
-            connection
-                .user_directory_sync
-                .last_success_for_manual_open()
-        })
-        .flatten();
-    let command_reports_failure = matches!(command, RuntimeCommand::RefreshConversations);
+    let last_success_at_ms = if is_user_directory {
+        connection
+            .user_directory_sync
+            .last_success_for_manual_open()
+    } else if is_stale_membership {
+        connection.membership_sync.last_success_for_stale_check()
+    } else {
+        None
+    };
+    let command_reports_failure = matches!(
+        command,
+        RuntimeCommand::RefreshConversations | RuntimeCommand::RefreshConversationsIfStale
+    );
     let work_events = events.clone();
     let work = RuntimeSyncWork::new(move |_attempt| {
         let command = command.clone();
@@ -3852,6 +4003,7 @@ fn schedule_connected_sync_command(
             }
         }
     });
+    let retained_work = work.clone();
     let admission = state
         .lock()
         .expect("runtime state lock poisoned")
@@ -3862,7 +4014,7 @@ fn schedule_connected_sync_command(
                 state,
                 identity.session,
                 Some(request),
-                Some(events),
+                (!is_stale_membership).then_some(events),
                 receipt,
             );
         }
@@ -3872,7 +4024,18 @@ fn schedule_connected_sync_command(
             }
         }
         RuntimeSyncRequestAdmission::Stale => {}
-        RuntimeSyncRequestAdmission::Rejected(AdmissionRejectionReason::ShuttingDown) => {}
+        RuntimeSyncRequestAdmission::Rejected(AdmissionRejectionReason::AtCapacity)
+            if is_stale_membership =>
+        {
+            retain_background_stale_membership_sync_after_capacity(
+                state,
+                identity.session,
+                plan,
+                retained_work,
+            );
+        }
+        RuntimeSyncRequestAdmission::Rejected(reason)
+            if connected_sync_rejection_is_silent(is_stale_membership, reason) => {}
         RuntimeSyncRequestAdmission::Rejected(reason) => {
             crate::debug::log(
                 "runtime",
@@ -3881,6 +4044,14 @@ fn schedule_connected_sync_command(
             events.send_event(RuntimeEventKind::Error(RuntimeFailure::internal()));
         }
     }
+}
+
+const fn connected_sync_rejection_is_silent(
+    is_stale_membership: bool,
+    reason: AdmissionRejectionReason,
+) -> bool {
+    matches!(reason, AdmissionRejectionReason::ShuttingDown)
+        || (is_stale_membership && matches!(reason, AdmissionRejectionReason::AtCapacity))
 }
 
 fn publish_fresh_user_directory_completion(
@@ -3912,7 +4083,7 @@ fn schedule_session_sync_work(
     plan: RuntimeSyncPlan,
     work: RuntimeSyncWork,
 ) {
-    schedule_session_sync_work_with_last_success(state, session, plan, None, work);
+    let _ = schedule_session_sync_work_with_last_success(state, session, plan, None, work);
 }
 
 fn schedule_session_sync_work_with_last_success(
@@ -3921,7 +4092,7 @@ fn schedule_session_sync_work_with_last_success(
     plan: RuntimeSyncPlan,
     last_success_at_ms: Option<u64>,
     work: RuntimeSyncWork,
-) {
+) -> bool {
     let retained_work = work.clone();
     let admission = state
         .lock()
@@ -3930,19 +4101,44 @@ fn schedule_session_sync_work_with_last_success(
     match admission {
         RuntimeSyncRequestAdmission::Accepted(receipt) => {
             spawn_runtime_sync_receipt_monitor(state, session, None, None, receipt);
+            false
         }
-        RuntimeSyncRequestAdmission::SkippedFresh | RuntimeSyncRequestAdmission::Stale => {}
+        RuntimeSyncRequestAdmission::SkippedFresh => true,
+        RuntimeSyncRequestAdmission::Stale => false,
         RuntimeSyncRequestAdmission::Rejected(AdmissionRejectionReason::AtCapacity)
             if plan.replacement == ReplacementClass::Refresh(RefreshClass::Membership) =>
         {
             retain_pending_membership_sync(state, session, plan, retained_work);
+            false
         }
         RuntimeSyncRequestAdmission::Rejected(reason) => {
             crate::debug::log(
                 "runtime",
                 &format!("RuntimeBackgroundSyncAdmissionRejected reason={reason:?}"),
             );
+            false
         }
+    }
+}
+
+fn schedule_startup_membership_sync_work(
+    state: &Arc<Mutex<RuntimeState>>,
+    session: SessionId,
+    events: &RuntimeEventSender,
+    last_success_at_ms: Option<u64>,
+    work: RuntimeSyncWork,
+) {
+    let skipped_fresh = schedule_session_sync_work_with_last_success(
+        state,
+        session,
+        startup_sync_plan(RuntimeStartupSyncKind::Membership),
+        last_success_at_ms,
+        work,
+    );
+    if skipped_fresh {
+        events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+            WorkspaceLifecycleEvent::SyncCompleted,
+        ));
     }
 }
 
@@ -3989,9 +4185,7 @@ fn retain_pending_membership_sync(
         return;
     }
     let replace = state.pending_membership.as_ref().is_none_or(|pending| {
-        pending.session != session
-            || sync_priority_strength(plan.priority)
-                >= sync_priority_strength(pending.plan.priority)
+        pending.session != session || sync_plan_can_replace_pending(plan, pending.plan)
     });
     if replace {
         state.pending_membership = Some(PendingMembershipSync {
@@ -4000,6 +4194,16 @@ fn retain_pending_membership_sync(
             work,
         });
     }
+}
+
+fn retain_background_stale_membership_sync_after_capacity(
+    state: &Arc<Mutex<RuntimeState>>,
+    session: SessionId,
+    plan: RuntimeSyncPlan,
+    work: RuntimeSyncWork,
+) {
+    crate::debug::log("runtime", "StaleMembershipCheckDeferred reason=at-capacity");
+    retain_pending_membership_sync(state, session, plan, work);
 }
 
 fn try_admit_pending_membership_sync(state: &Arc<Mutex<RuntimeState>>) {
@@ -4030,12 +4234,9 @@ fn try_admit_pending_membership_sync(state: &Arc<Mutex<RuntimeState>>) {
     }
 }
 
-const fn sync_priority_strength(priority: SyncPriority) -> u8 {
-    match priority {
-        SyncPriority::Maintenance => 1,
-        SyncPriority::Foreground => 2,
-        SyncPriority::Interactive => 3,
-    }
+fn sync_plan_can_replace_pending(candidate: RuntimeSyncPlan, pending: RuntimeSyncPlan) -> bool {
+    candidate.priority.can_supersede(pending.priority)
+        && candidate.freshness.can_supersede(pending.freshness)
 }
 
 fn finish_sign_out(events: &RuntimeEventSender, clear_result: Result<()>) {
@@ -4127,6 +4328,7 @@ fn spawn_authentication_task<F>(
                                 256,
                             ))),
                             conversation_star_sync: ConversationStarSyncGate::default(),
+                            membership_sync: MembershipSync::default(),
                             user_directory_sync: UserDirectorySync::default(),
                             user_status_sync: UserStatusSync::default(),
                             team_id: auth.team_id.clone(),
@@ -4308,6 +4510,10 @@ fn spawn_workspace_tasks(
             RuntimeTarget::Workspace,
         ));
         let refresh_connection = hydration_connection.clone();
+        let refresh_last_success = refresh_connection
+            .membership_sync
+            .last_success_for_stale_check();
+        let refresh_completion_events = refresh_events.clone();
         let refresh_work = RuntimeSyncWork::new(move |_attempt| {
             let refresh_events = refresh_events.clone();
             let refresh_connection = refresh_connection.clone();
@@ -4320,7 +4526,9 @@ fn spawn_workspace_tasks(
                         store: &refresh_connection.workspace_store,
                         reducer: &refresh_connection.workspace,
                         conversation_star_sync: &refresh_connection.conversation_star_sync,
+                        membership_sync: &refresh_connection.membership_sync,
                     },
+                    MembershipRefreshMode::StartupStaleOnly,
                     refresh_connection.team_id.as_deref(),
                     &refresh_connection.huddles,
                 )
@@ -4340,10 +4548,11 @@ fn spawn_workspace_tasks(
                 }
             }
         });
-        schedule_session_sync_work(
+        schedule_startup_membership_sync_work(
             &state_after_hydration,
             identity.session,
-            startup_sync_plan(RuntimeStartupSyncKind::Membership),
+            &refresh_completion_events,
+            refresh_last_success,
             refresh_work,
         );
 
@@ -4456,11 +4665,27 @@ fn spawn_workspace_tasks(
 
 async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &RuntimeConnection) {
     let Some(store) = connection.workspace_store.as_ref() else {
+        connection.membership_sync.hydrate(false, None);
         connection.user_directory_sync.hydrate(false, None);
         return;
     };
     let _admission = connection.workspace.publication_admission.lock().await;
-    let last_success_at_ms = match store
+    let membership_last_success_at_ms = match store
+        .load_sync_freshness(MEMBERSHIP_FRESHNESS_OPERATION, MEMBERSHIP_FRESHNESS_TARGET)
+        .await
+    {
+        Ok(freshness) => {
+            freshness.and_then(|freshness| membership_last_success_at_ms(freshness.refreshed_at_ms))
+        }
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!("MembershipFreshnessLoadFailed error={error:#}"),
+            );
+            None
+        }
+    };
+    let directory_last_success_at_ms = match store
         .load_sync_freshness(
             USER_DIRECTORY_FRESHNESS_OPERATION,
             USER_DIRECTORY_FRESHNESS_TARGET,
@@ -4480,9 +4705,10 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     let bootstrap = match store.load_bootstrap().await {
         Ok(Some(bootstrap)) => bootstrap,
         Ok(None) => {
+            connection.membership_sync.hydrate(false, None);
             connection
                 .user_directory_sync
-                .hydrate(false, last_success_at_ms);
+                .hydrate(false, directory_last_success_at_ms);
             return;
         }
         Err(error) => {
@@ -4490,6 +4716,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
                 "store",
                 &format!("WorkspaceBootstrapLoadFailed error={error:#}"),
             );
+            connection.membership_sync.hydrate(false, None);
             connection.user_directory_sync.hydrate(false, None);
             return;
         }
@@ -4586,12 +4813,22 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
         events.send_event(RuntimeEventKind::EmojiCatalogLoaded(custom_emojis));
     }
     let has_cached_users = hydration_succeeded && !users.is_empty();
+    let has_cached_membership =
+        hydration_succeeded && !connection.workspace.conversations().is_empty();
+    connection.membership_sync.hydrate(
+        has_cached_membership,
+        hydration_succeeded
+            .then_some(membership_last_success_at_ms)
+            .flatten(),
+    );
     if has_cached_users {
         user_events.send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
     }
     connection.user_directory_sync.hydrate(
         has_cached_users,
-        hydration_succeeded.then_some(last_success_at_ms).flatten(),
+        hydration_succeeded
+            .then_some(directory_last_success_at_ms)
+            .flatten(),
     );
 }
 
@@ -4919,6 +5156,7 @@ async fn handle_connected_command(
         read_marks: &mut read_marks,
         message_handoffs: &connection.message_handoffs,
         conversation_star_sync: &connection.conversation_star_sync,
+        membership_sync: &connection.membership_sync,
         user_directory_sync: &connection.user_directory_sync,
         user_status_sync: &connection.user_status_sync,
         team_id: connection.team_id.as_deref(),
@@ -4974,6 +5212,7 @@ struct RuntimeContext<'a> {
     read_marks: &'a mut HashMap<String, String>,
     message_handoffs: &'a Arc<Mutex<MessageHandoffResolver>>,
     conversation_star_sync: &'a ConversationStarSyncGate,
+    membership_sync: &'a MembershipSync,
     user_directory_sync: &'a UserDirectorySync,
     user_status_sync: &'a UserStatusSync,
     team_id: Option<&'a str>,
@@ -4986,6 +5225,24 @@ struct WorkspacePipelineContext<'a> {
     store: &'a Option<WorkspaceStore>,
     reducer: &'a WorkspaceReducerAdapter,
     conversation_star_sync: &'a ConversationStarSyncGate,
+    membership_sync: &'a MembershipSync,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MembershipRefreshMode {
+    Forced,
+    StartupStaleOnly,
+    BackgroundStaleOnly,
+}
+
+impl MembershipRefreshMode {
+    const fn is_stale_only(self) -> bool {
+        !matches!(self, Self::Forced)
+    }
+
+    const fn reports_user_feedback(self) -> bool {
+        !matches!(self, Self::BackgroundStaleOnly)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5266,13 +5523,19 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         RuntimeCommand::Huddle(_) => {
             return Err(anyhow!("huddle command reached generic task handler"));
         }
-        RuntimeCommand::RefreshConversations => {
-            crate::debug::log("runtime", "RefreshConversations");
-            context
-                .events
-                .send_event(RuntimeEventKind::WorkspaceLifecycle(
-                    WorkspaceLifecycleEvent::RecoveryStarted,
-                ));
+        command @ (RuntimeCommand::RefreshConversations
+        | RuntimeCommand::RefreshConversationsIfStale) => {
+            let mode = if matches!(command, RuntimeCommand::RefreshConversations) {
+                crate::debug::log("runtime", "RefreshConversations");
+                context
+                    .events
+                    .send_event(RuntimeEventKind::WorkspaceLifecycle(
+                        WorkspaceLifecycleEvent::RecoveryStarted,
+                    ));
+                MembershipRefreshMode::Forced
+            } else {
+                MembershipRefreshMode::BackgroundStaleOnly
+            };
             let api = require_slack(context.slack)?.clone();
             let workspace_store = (*context.workspace_store).clone();
             load_conversations_best_effort_with_api(
@@ -5283,7 +5546,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     store: &workspace_store,
                     reducer: context.workspace,
                     conversation_star_sync: context.conversation_star_sync,
+                    membership_sync: context.membership_sync,
                 },
+                mode,
                 context.team_id,
                 context.huddles,
             )
@@ -6087,7 +6352,9 @@ fn schedule_realtime_membership_refresh(
                     store: &connection.workspace_store,
                     reducer: &connection.workspace,
                     conversation_star_sync: &connection.conversation_star_sync,
+                    membership_sync: &connection.membership_sync,
                 },
+                MembershipRefreshMode::Forced,
                 connection.team_id.as_deref(),
                 &connection.huddles,
             )
@@ -6107,12 +6374,7 @@ fn schedule_realtime_membership_refresh(
             }
         }
     });
-    schedule_session_sync_work(
-        state,
-        session,
-        startup_sync_plan(RuntimeStartupSyncKind::Membership),
-        work,
-    );
+    schedule_session_sync_work(state, session, realtime_membership_sync_plan(), work);
 }
 
 async fn run_socket_mode(
@@ -7679,7 +7941,6 @@ async fn load_conversations_with_api(
     conversation_star_sync: &ConversationStarSyncGate,
 ) -> Result<Vec<SlackConversation>> {
     let _star_sync_guard = conversation_star_sync.lock().await;
-    events.send_status("Loading conversations");
     let base_revision = workspace.revision();
     let fresh = api.conversations().await?;
     let starred_ids = match api.starred_conversation_ids().await {
@@ -7754,14 +8015,56 @@ async fn apply_conversation_membership_snapshot(
     Ok(workspace.conversations())
 }
 
+async fn record_membership_refresh_success(
+    workspace_store: Option<&WorkspaceStore>,
+    membership_sync: &MembershipSync,
+    refreshed_at_ms: u64,
+) {
+    membership_sync.record_success(refreshed_at_ms);
+    let Some(store) = workspace_store else {
+        return;
+    };
+    if let Err(error) = store
+        .store_sync_freshness(
+            MEMBERSHIP_FRESHNESS_OPERATION,
+            MEMBERSHIP_FRESHNESS_TARGET,
+            SyncFreshness {
+                refreshed_at_ms: Some(i64::try_from(refreshed_at_ms).unwrap_or(i64::MAX)),
+                retry_count: 0,
+                retry_after_ms: None,
+            },
+        )
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!(
+                "MembershipFreshnessStoreFailed category={:?}",
+                error.category()
+            ),
+        );
+    }
+}
+
 async fn load_conversations_best_effort_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
     workspace_url: Option<&str>,
     workspace: WorkspacePipelineContext<'_>,
+    mode: MembershipRefreshMode,
     team_id: Option<&str>,
     huddles: &HuddleActorHandle,
 ) -> Result<()> {
+    let Some(_refresh) = workspace
+        .membership_sync
+        .acquire_refresh_if_required(mode.is_stale_only())
+        .await
+    else {
+        return Ok(());
+    };
+    if mode.reports_user_feedback() {
+        events.send_status("Loading conversations");
+    }
     match load_conversations_with_api(
         events,
         api,
@@ -7772,6 +8075,12 @@ async fn load_conversations_best_effort_with_api(
     .await
     {
         Ok(conversations) => {
+            record_membership_refresh_success(
+                workspace.store.as_ref(),
+                workspace.membership_sync,
+                current_unix_millis(),
+            )
+            .await;
             let browser_covered = apply_browser_unread_snapshot_best_effort(
                 events,
                 api,
@@ -7815,7 +8124,7 @@ async fn load_conversations_best_effort_with_api(
             .await;
         }
         Err(error) => {
-            handle_conversations_load_error(events, &error);
+            handle_membership_refresh_error(events, &error, mode);
             return Err(error);
         }
     }
@@ -8256,6 +8565,24 @@ fn handle_conversations_load_error(events: &RuntimeEventSender, error: &anyhow::
         lifecycle_failure_event(&failure),
     ));
     events.send_event(RuntimeEventKind::ConversationsLoadFailed(failure));
+}
+
+fn handle_membership_refresh_error(
+    events: &RuntimeEventSender,
+    error: &anyhow::Error,
+    mode: MembershipRefreshMode,
+) {
+    if mode.reports_user_feedback() {
+        handle_conversations_load_error(events, error);
+    } else {
+        crate::debug::log(
+            "runtime",
+            &format!(
+                "BackgroundMembershipRefreshFailed category={:?}",
+                RuntimeFailure::from_error(error).category
+            ),
+        );
+    }
 }
 
 fn lifecycle_failure_event(failure: &RuntimeFailure) -> WorkspaceLifecycleEvent {
@@ -8904,6 +9231,7 @@ mod tests {
     use std::cell::Cell;
     use std::future;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -10102,6 +10430,19 @@ mod tests {
             )
             .await
             .unwrap();
+            let membership_refreshed_at_ms = current_unix_millis();
+            store
+                .store_sync_freshness(
+                    MEMBERSHIP_FRESHNESS_OPERATION,
+                    MEMBERSHIP_FRESHNESS_TARGET,
+                    SyncFreshness {
+                        refreshed_at_ms: Some(i64::try_from(membership_refreshed_at_ms).unwrap()),
+                        retry_count: 0,
+                        retry_after_ms: None,
+                    },
+                )
+                .await
+                .unwrap();
             let mut canonical_thread_records = thread_records.clone();
             canonical_thread_records[0]
                 .root
@@ -10148,6 +10489,7 @@ mod tests {
                 read_marks: Arc::new(Mutex::new(HashMap::new())),
                 message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
                 conversation_star_sync: ConversationStarSyncGate::default(),
+                membership_sync: MembershipSync::default(),
                 user_directory_sync: UserDirectorySync::default(),
                 user_status_sync: UserStatusSync::default(),
                 team_id: None,
@@ -10156,6 +10498,14 @@ mod tests {
             };
 
             load_cached_bootstrap(&events, &connection).await;
+
+            assert_eq!(
+                connection.membership_sync.last_success_for_stale_check(),
+                Some(membership_refreshed_at_ms)
+            );
+            assert!(!connection
+                .membership_sync
+                .refresh_required(membership_refreshed_at_ms));
 
             let delivered = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
             assert_eq!(
@@ -10306,6 +10656,7 @@ mod tests {
                     read_marks: Arc::new(Mutex::new(HashMap::new())),
                     message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
                     conversation_star_sync: ConversationStarSyncGate::default(),
+                    membership_sync: MembershipSync::default(),
                     user_directory_sync: UserDirectorySync::default(),
                     user_status_sync: UserStatusSync::default(),
                     team_id: None,
@@ -15204,11 +15555,129 @@ mod tests {
             );
 
             blocker_release.notify_one();
-            tokio::time::timeout(Duration::from_millis(100), membership_started.notified())
+            tokio::time::timeout(Duration::from_secs(1), membership_started.notified())
                 .await
                 .expect("retained membership invalidation was not readmitted");
             tokio::task::yield_now().await;
             assert!(state.lock().unwrap().pending_membership.is_none());
+        });
+    }
+
+    #[test]
+    fn background_membership_check_at_capacity_is_retained_and_readmitted() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(session)));
+            state.lock().unwrap().sync_scheduler = RuntimeSyncScheduler::new(
+                SchedulerConfig::new(1, 1, 1).expect("valid test scheduler configuration"),
+            );
+
+            let blocker_started = Arc::new(tokio::sync::Notify::new());
+            let blocker_release = Arc::new(tokio::sync::Notify::new());
+            let blocker_started_for_work = Arc::clone(&blocker_started);
+            let blocker_release_for_work = Arc::clone(&blocker_release);
+            schedule_session_sync_work(
+                &state,
+                session,
+                startup_sync_plan(RuntimeStartupSyncKind::EmojiCatalog),
+                RuntimeSyncWork::new(move |_attempt| {
+                    let blocker_started = Arc::clone(&blocker_started_for_work);
+                    let blocker_release = Arc::clone(&blocker_release_for_work);
+                    async move {
+                        blocker_started.notify_one();
+                        blocker_release.notified().await;
+                        JobOutcome::Succeeded
+                    }
+                }),
+            );
+            blocker_started.notified().await;
+
+            let membership_started = Arc::new(tokio::sync::Notify::new());
+            let membership_started_for_work = Arc::clone(&membership_started);
+            retain_background_stale_membership_sync_after_capacity(
+                &state,
+                session,
+                connected_command_sync_plan(&RuntimeCommand::RefreshConversationsIfStale).unwrap(),
+                RuntimeSyncWork::new(move |_attempt| {
+                    let membership_started = Arc::clone(&membership_started_for_work);
+                    async move {
+                        membership_started.notify_one();
+                        JobOutcome::Succeeded
+                    }
+                }),
+            );
+
+            assert!(state.lock().unwrap().pending_membership.is_some());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), membership_started.notified())
+                    .await
+                    .is_err(),
+                "background membership work started before capacity was released"
+            );
+
+            blocker_release.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), membership_started.notified())
+                .await
+                .expect("retained background membership check was not readmitted");
+            tokio::task::yield_now().await;
+            assert!(state.lock().unwrap().pending_membership.is_none());
+        });
+    }
+
+    #[test]
+    fn accepted_background_membership_check_preserves_pending_forced_refresh() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(session)));
+            let forced_plan =
+                connected_command_sync_plan(&RuntimeCommand::RefreshConversations).unwrap();
+            retain_pending_membership_sync(
+                &state,
+                session,
+                forced_plan,
+                RuntimeSyncWork::new(|_attempt| async { JobOutcome::Succeeded }),
+            );
+
+            let command = RuntimeCommand::RefreshConversationsIfStale;
+            let request = TrackedRequest::for_command(
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(1),
+                },
+                &command,
+            );
+            let receipt = match state.lock().unwrap().admit_sync_request(
+                &request,
+                connected_command_sync_plan(&command).unwrap(),
+                RuntimeSyncWork::new(|_attempt| async { JobOutcome::Succeeded }),
+            ) {
+                RuntimeSyncRequestAdmission::Accepted(receipt) => receipt,
+                _ => panic!("background membership check was not admitted"),
+            };
+
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .pending_membership
+                    .as_ref()
+                    .map(|pending| pending.plan),
+                Some(forced_plan)
+            );
+            assert_eq!(
+                receipt.wait().await.unwrap().result(),
+                RuntimeSyncTerminalResult::Succeeded
+            );
         });
     }
 
@@ -21171,6 +21640,7 @@ mod tests {
                 read_marks: Arc::new(Mutex::new(HashMap::new())),
                 message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
                 conversation_star_sync: ConversationStarSyncGate::default(),
+                membership_sync: MembershipSync::default(),
                 user_directory_sync: UserDirectorySync::default(),
                 user_status_sync: UserStatusSync::default(),
                 team_id: Some("T1".into()),
@@ -21577,6 +22047,7 @@ mod tests {
             read_marks: Arc::new(Mutex::new(HashMap::new())),
             message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(256))),
             conversation_star_sync: ConversationStarSyncGate::default(),
+            membership_sync: MembershipSync::default(),
             user_directory_sync: UserDirectorySync::default(),
             user_status_sync: UserStatusSync::default(),
             team_id: None,
@@ -21935,6 +22406,17 @@ mod tests {
             )
         );
 
+        let stale_membership = RuntimeCommand::RefreshConversationsIfStale.descriptor();
+        assert_eq!(stale_membership.lane, RuntimeTaskLane::Background);
+        assert!(!stale_membership.supersedes_previous);
+        assert_eq!(
+            stale_membership.context,
+            OperationContext::new(
+                RuntimeOperation::MembershipRefresh,
+                RuntimeTarget::Workspace,
+            )
+        );
+
         let huddle = RuntimeCommand::Huddle(crate::huddles::state::HuddleCommand::SetMuted(true))
             .descriptor();
         assert_eq!(huddle.lane, RuntimeTaskLane::Interactive);
@@ -21956,6 +22438,7 @@ mod tests {
                 .unwrap();
         let scheduled = [
             RuntimeCommand::RefreshConversations,
+            RuntimeCommand::RefreshConversationsIfStale,
             RuntimeCommand::DiscoverChannels,
             RuntimeCommand::LoadUserDirectory,
             RuntimeCommand::LoadHistory {
@@ -22139,11 +22622,25 @@ mod tests {
     }
 
     #[test]
-    fn startup_sync_contracts_share_membership_replacement_with_manual_refresh() {
+    fn startup_membership_sync_is_stale_only_while_manual_refresh_is_forced() {
         let manual = connected_command_sync_plan(&RuntimeCommand::RefreshConversations).unwrap();
+        let stale =
+            connected_command_sync_plan(&RuntimeCommand::RefreshConversationsIfStale).unwrap();
         let startup = startup_sync_plan(RuntimeStartupSyncKind::Membership);
+        let realtime = realtime_membership_sync_plan();
         assert_eq!(manual.target, startup.target);
         assert_eq!(manual.replacement, startup.replacement);
+        assert_eq!(stale.target, startup.target);
+        assert_eq!(stale.replacement, startup.replacement);
+        assert_eq!(realtime.target, startup.target);
+        assert_eq!(realtime.replacement, startup.replacement);
+        assert_eq!(manual.freshness, FreshnessPolicy::Always);
+        assert_eq!(realtime.freshness, FreshnessPolicy::Always);
+        assert_eq!(stale.freshness, startup.freshness);
+        assert_eq!(manual.priority, SyncPriority::Foreground);
+        assert_eq!(realtime.priority, SyncPriority::Foreground);
+        assert_eq!(startup.priority, SyncPriority::Foreground);
+        assert_eq!(stale.priority, SyncPriority::Maintenance);
         assert_eq!(
             startup,
             RuntimeSyncPlan {
@@ -22154,7 +22651,9 @@ mod tests {
                 ),
                 priority: SyncPriority::Foreground,
                 durability: SyncDurability::Ephemeral,
-                freshness: FreshnessPolicy::Always,
+                freshness: FreshnessPolicy::IfOlderThan {
+                    max_age_ms: 5 * 60 * 1_000,
+                },
                 replacement: ReplacementClass::Refresh(RefreshClass::Membership),
                 retry: RetryPolicy::Never,
             }
@@ -22191,6 +22690,229 @@ mod tests {
             }
         );
         assert_eq!(automatic.freshness, manual_directory.freshness);
+    }
+
+    #[test]
+    fn pending_membership_replacement_preserves_forced_refresh_intent() {
+        let forced = connected_command_sync_plan(&RuntimeCommand::RefreshConversations).unwrap();
+        let realtime = realtime_membership_sync_plan();
+        let startup_stale = startup_sync_plan(RuntimeStartupSyncKind::Membership);
+        let background_stale =
+            connected_command_sync_plan(&RuntimeCommand::RefreshConversationsIfStale).unwrap();
+
+        assert!(sync_plan_can_replace_pending(forced, startup_stale));
+        assert!(sync_plan_can_replace_pending(forced, background_stale));
+        assert!(sync_plan_can_replace_pending(realtime, background_stale));
+        assert!(sync_plan_can_replace_pending(
+            startup_stale,
+            background_stale
+        ));
+        assert!(!sync_plan_can_replace_pending(startup_stale, forced));
+        assert!(!sync_plan_can_replace_pending(background_stale, forced));
+        assert!(!sync_plan_can_replace_pending(background_stale, realtime));
+        assert!(!sync_plan_can_replace_pending(
+            background_stale,
+            startup_stale
+        ));
+    }
+
+    #[test]
+    fn background_stale_capacity_rejection_is_silent() {
+        assert!(connected_sync_rejection_is_silent(
+            true,
+            AdmissionRejectionReason::AtCapacity
+        ));
+        assert!(connected_sync_rejection_is_silent(
+            false,
+            AdmissionRejectionReason::ShuttingDown
+        ));
+        assert!(!connected_sync_rejection_is_silent(
+            false,
+            AdmissionRejectionReason::AtCapacity
+        ));
+        assert!(!connected_sync_rejection_is_silent(
+            true,
+            AdmissionRejectionReason::DuplicateIdentity
+        ));
+    }
+
+    #[test]
+    fn membership_refresh_policy_handles_cache_and_the_five_minute_boundary() {
+        let now_ms: u64 = 200_000_000;
+        assert!(membership_refresh_required(false, now_ms, Some(now_ms)));
+        assert!(membership_refresh_required(true, now_ms, None));
+        assert!(!membership_refresh_required(
+            true,
+            now_ms,
+            Some(now_ms - 5 * 60 * 1_000 + 1),
+        ));
+        assert!(membership_refresh_required(
+            true,
+            now_ms,
+            Some(now_ms - 5 * 60 * 1_000),
+        ));
+        assert!(!membership_refresh_required(true, now_ms, Some(now_ms + 1),));
+    }
+
+    #[test]
+    fn membership_sync_rechecks_shared_freshness_after_a_success() {
+        let sync = MembershipSync::default();
+        let now_ms: u64 = 200_000_000;
+        sync.hydrate(false, Some(now_ms));
+        assert!(sync.refresh_required(now_ms));
+        assert_eq!(sync.last_success_for_stale_check(), None);
+
+        sync.hydrate(true, Some(now_ms.saturating_sub(5 * 60 * 1_000)));
+        assert!(sync.refresh_required(now_ms));
+
+        sync.record_success(now_ms);
+
+        assert!(!sync.refresh_required(now_ms));
+        assert_eq!(sync.last_success_for_stale_check(), Some(now_ms));
+    }
+
+    #[test]
+    fn concurrent_stale_membership_workers_recheck_freshness_after_serialization() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let sync = MembershipSync::default();
+            sync.hydrate(false, None);
+
+            let first_sync = sync.clone();
+            let first_started = Arc::new(tokio::sync::Notify::new());
+            let first_started_for_work = Arc::clone(&first_started);
+            let first_release = Arc::new(tokio::sync::Notify::new());
+            let first_release_for_work = Arc::clone(&first_release);
+            let first = tokio::spawn(async move {
+                let Some(refresh) = first_sync.acquire_refresh_if_required(true).await else {
+                    return false;
+                };
+                first_started_for_work.notify_one();
+                first_release_for_work.notified().await;
+                first_sync.record_success(current_unix_millis());
+                drop(refresh);
+                true
+            });
+            first_started.notified().await;
+
+            let second_sync = sync.clone();
+            let mut second = tokio::spawn(async move {
+                second_sync
+                    .acquire_refresh_if_required(true)
+                    .await
+                    .is_some()
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut second)
+                    .await
+                    .is_err(),
+                "the second stale worker bypassed refresh serialization"
+            );
+
+            first_release.notify_one();
+            assert!(first.await.unwrap());
+            assert!(
+                !second.await.unwrap(),
+                "the second stale worker did not observe the first worker's success"
+            );
+            assert!(
+                sync.acquire_refresh_if_required(false).await.is_some(),
+                "forced refreshes must proceed even when membership is fresh"
+            );
+        });
+    }
+
+    #[test]
+    fn successful_membership_refresh_persists_shared_freshness() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-membership-freshness-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let sync = MembershipSync::default();
+        sync.hydrate(false, None);
+        let refreshed_at_ms = 200_000_000;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(record_membership_refresh_success(
+            Some(&store),
+            &sync,
+            refreshed_at_ms,
+        ));
+
+        assert_eq!(sync.last_success_for_stale_check(), Some(refreshed_at_ms));
+        let persisted =
+            runtime
+                .block_on(store.load_sync_freshness(
+                    MEMBERSHIP_FRESHNESS_OPERATION,
+                    MEMBERSHIP_FRESHNESS_TARGET,
+                ))
+                .unwrap()
+                .unwrap();
+        assert_eq!(persisted.refreshed_at_ms, Some(refreshed_at_ms as i64));
+        assert_eq!(persisted.retry_count, 0);
+        assert_eq!(persisted.retry_after_ms, None);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn fresh_startup_membership_completes_without_running_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let session = SessionId::default().next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(session)));
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session,
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(
+                    RuntimeOperation::MembershipRefresh,
+                    RuntimeTarget::Workspace,
+                ),
+            );
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_for_work = Arc::clone(&ran);
+            schedule_startup_membership_sync_work(
+                &state,
+                session,
+                &events,
+                Some(current_unix_millis()),
+                RuntimeSyncWork::new(move |_attempt| {
+                    let ran = Arc::clone(&ran_for_work);
+                    async move {
+                        ran.store(true, Ordering::SeqCst);
+                        JobOutcome::Succeeded
+                    }
+                }),
+            );
+
+            let event = tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .expect("startup completion timed out")
+                .expect("startup completion event");
+            assert!(matches!(
+                event.kind,
+                RuntimeEventKind::WorkspaceLifecycle(WorkspaceLifecycleEvent::SyncCompleted)
+            ));
+            tokio::task::yield_now().await;
+            assert!(!ran.load(Ordering::SeqCst));
+        });
     }
 
     #[test]
@@ -22314,6 +23036,50 @@ mod tests {
                 RuntimeTarget::Channel("C123".to_string()),
             )
         );
+    }
+
+    #[test]
+    fn background_membership_failure_is_non_disruptive() {
+        let session = SessionId::default().next();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let events = RuntimeEventSender::new(
+            sender,
+            RuntimeIdentity {
+                session,
+                request: RequestId::new(1),
+            },
+            OperationContext::new(
+                RuntimeOperation::MembershipRefresh,
+                RuntimeTarget::Workspace,
+            ),
+        );
+        let error = anyhow!("membership refresh unavailable");
+
+        handle_membership_refresh_error(
+            &events,
+            &error,
+            MembershipRefreshMode::BackgroundStaleOnly,
+        );
+
+        assert!(receiver.try_recv().is_err());
+
+        handle_membership_refresh_error(&events, &error, MembershipRefreshMode::StartupStaleOnly);
+        assert!(matches!(
+            receiver.try_recv().unwrap().kind,
+            RuntimeEventKind::WorkspaceLifecycle(WorkspaceLifecycleEvent::RetryableFailure)
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().kind,
+            RuntimeEventKind::ConversationsLoadFailed(_)
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn background_membership_feedback_is_quiet() {
+        assert!(MembershipRefreshMode::Forced.reports_user_feedback());
+        assert!(MembershipRefreshMode::StartupStaleOnly.reports_user_feedback());
+        assert!(!MembershipRefreshMode::BackgroundStaleOnly.reports_user_feedback());
     }
 
     #[test]

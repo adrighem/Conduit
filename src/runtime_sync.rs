@@ -19,9 +19,9 @@ use futures_util::FutureExt;
 use tokio::sync::{oneshot, watch};
 
 use crate::sync_scheduler::{
-    AdmissionOutcome, AdmissionRejection, AdmissionToken, CancellationId, CancellationOutcome,
-    CompletionOutcome, DispatchedJob, JobOutcome, JobRun, SchedulerConfig, SchedulerCounters,
-    ShutdownPhase, SyncJob, SyncJobId, SyncScheduler,
+    AdmissionOutcome, AdmissionRejection, AdmissionRejectionReason, AdmissionToken, CancellationId,
+    CancellationOutcome, CompletionOutcome, DispatchedJob, JobOutcome, JobRun, SchedulerConfig,
+    SchedulerCounters, ShutdownPhase, SyncJob, SyncJobId, SyncScheduler,
 };
 
 type RuntimeSyncFuture = Pin<Box<dyn Future<Output = JobOutcome> + Send + 'static>>;
@@ -277,6 +277,59 @@ struct RuntimeRetryWakeup {
     abort_registration: AbortRegistration,
 }
 
+fn shutdown_phase_code(phase: ShutdownPhase) -> &'static str {
+    match phase {
+        ShutdownPhase::Open => "open",
+        ShutdownPhase::Draining => "draining",
+        ShutdownPhase::Drained => "drained",
+    }
+}
+
+fn cancellation_transition(outcome: &CancellationOutcome) -> &'static str {
+    match outcome {
+        CancellationOutcome::Cancelled(_) => "cancellation_cancelled",
+        CancellationOutcome::Requested(_) => "cancellation_requested",
+        CancellationOutcome::AlreadyRequested(_) => "cancellation_already_requested",
+        CancellationOutcome::Protected { .. } => "cancellation_protected",
+        CancellationOutcome::NotFound => "cancellation_not_found",
+    }
+}
+
+fn completion_transition(outcome: &CompletionOutcome) -> &'static str {
+    match outcome {
+        CompletionOutcome::Completed => "completion_completed",
+        CompletionOutcome::Retried { .. } => "completion_retried",
+        CompletionOutcome::Failed(_) => "completion_failed",
+        CompletionOutcome::Cancelled(_) => "completion_cancelled",
+        CompletionOutcome::Superseded { .. } => "completion_superseded",
+    }
+}
+
+fn trace_scheduler_snapshot(transition: &'static str, counters: SchedulerCounters) {
+    tracing::trace!(
+        target: "conduit::sync",
+        parent: None,
+        event = "sync_scheduler_snapshot",
+        transition,
+        admitted = counters.admitted(),
+        queued_depth = counters.queued_depth(),
+        running_depth = counters.running_depth(),
+        coalesced = counters.coalesced(),
+        cancellation_requested = counters.cancellation_requested(),
+        cancellation_completed = counters.cancellation_completed(),
+        completed = counters.completed(),
+        failed = counters.failed(),
+        retried = counters.retried(),
+        skipped_fresh = counters.skipped_fresh(),
+        rejected_at_capacity = counters.rejected(AdmissionRejectionReason::AtCapacity),
+        rejected_duplicate_identity = counters.rejected(AdmissionRejectionReason::DuplicateIdentity),
+        rejected_shutting_down = counters.rejected(AdmissionRejectionReason::ShuttingDown),
+        queue_high_water = counters.queue_high_water(),
+        running_high_water = counters.running_high_water(),
+        shutdown_phase = shutdown_phase_code(counters.shutdown_phase()),
+    );
+}
+
 /// Cloneable Tokio adapter around the deterministic synchronization scheduler.
 #[derive(Clone)]
 pub(crate) struct RuntimeSyncScheduler {
@@ -362,18 +415,21 @@ impl RuntimeSyncScheduler {
         let dispatches;
         let runtime_outcome;
         let notification;
+        let trace_transition;
         {
             let mut state = self.inner.state();
             let now_ms = self.inner.now_ms();
             let outcome = match state.scheduler.admit(job, now_ms, last_success_at_ms) {
                 Ok(outcome) => outcome,
                 Err(rejection) => {
+                    trace_scheduler_snapshot("admission_rejected", state.scheduler.counters());
                     return Err(RuntimeSyncAdmissionError { rejection, work });
                 }
             };
 
             match outcome {
                 AdmissionOutcome::Accepted { token, coalesced } => {
+                    trace_transition = "admission_accepted";
                     notification = coalesced.and_then(|released| {
                         Self::release_terminal_locked(
                             &mut state,
@@ -397,6 +453,7 @@ impl RuntimeSyncScheduler {
                     });
                 }
                 AdmissionOutcome::SkippedFresh(job) => {
+                    trace_transition = "admission_skipped_fresh";
                     notification = None;
                     runtime_outcome = RuntimeSyncAdmissionOutcome::SkippedFresh(job);
                 }
@@ -404,6 +461,7 @@ impl RuntimeSyncScheduler {
 
             dispatches = Self::pump_locked(&mut state, now_ms);
             self.inner.publish_drained(&state);
+            trace_scheduler_snapshot(trace_transition, state.scheduler.counters());
         }
         if let Some(notification) = notification {
             notification.send();
@@ -445,6 +503,10 @@ impl RuntimeSyncScheduler {
             };
             dispatches = Self::pump_locked(&mut state, now_ms);
             self.inner.publish_drained(&state);
+            trace_scheduler_snapshot(
+                cancellation_transition(&outcome),
+                state.scheduler.counters(),
+            );
         }
 
         if let Some(abort) = abort {
@@ -497,6 +559,7 @@ impl RuntimeSyncScheduler {
 
             dispatches = Self::pump_locked(&mut state, now_ms);
             self.inner.publish_drained(&state);
+            trace_scheduler_snapshot("shutdown_started", state.scheduler.counters());
             completion = self.inner.shutdown_complete.subscribe();
         }
 
@@ -567,6 +630,7 @@ impl RuntimeSyncScheduler {
     fn pump_locked(state: &mut RuntimeSyncState, now_ms: u64) -> Vec<RuntimeDispatch> {
         let mut dispatches = Vec::new();
         while let Some(dispatched) = state.scheduler.dispatch_next(now_ms) {
+            let is_retry = dispatched.attempt() > 1;
             let job_id = dispatched.job().id();
             let run = dispatched.run();
             let work = state
@@ -578,6 +642,11 @@ impl RuntimeSyncScheduler {
             let (abort, abort_registration) = AbortHandle::new_pair();
             state.running.insert(run, abort);
             dispatches.push(Self::runtime_dispatch(dispatched, work, abort_registration));
+            if is_retry {
+                // Running capacity is reserved at this point, so this event
+                // always represents an actual retry dispatch.
+                trace_scheduler_snapshot("retry_dispatched", state.scheduler.counters());
+            }
         }
         dispatches
     }
@@ -655,6 +724,7 @@ impl RuntimeSyncScheduler {
                 .scheduler
                 .complete(run, outcome, now_ms)
                 .expect("runtime completion must match its dispatched scheduler run");
+            let trace_transition = completion_transition(&completion);
             retry_wakeup = match completion {
                 CompletionOutcome::Retried {
                     job_id,
@@ -733,6 +803,7 @@ impl RuntimeSyncScheduler {
                 notification.send();
             }
             self.inner.publish_drained(&state);
+            trace_scheduler_snapshot(trace_transition, state.scheduler.counters());
         }
 
         self.spawn_dispatches(dispatches);
@@ -776,6 +847,7 @@ impl RuntimeSyncScheduler {
             }
             state.retry_wakeups.remove(&job_id);
             let now_ms = self.inner.now_ms();
+            trace_scheduler_snapshot("retry_wakeup_ready", state.scheduler.counters());
             dispatches = Self::pump_locked(&mut state, now_ms);
             self.inner.publish_drained(&state);
         }
@@ -785,8 +857,9 @@ impl RuntimeSyncScheduler {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tokio::sync::Notify;
@@ -916,6 +989,281 @@ mod tests {
             .enable_all()
             .build()
             .expect("failed to build sync scheduler test runtime")
+    }
+
+    #[derive(Clone)]
+    struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    static TRACE_SUBSCRIBER_TEST_LOCK: Mutex<()> = Mutex::new(());
+    const TRACE_TEST_CHILD_ENV: &str = "CONDUIT_SYNC_TRACE_TEST_CHILD";
+
+    fn run_trace_test_in_isolated_process(test_name: &str) -> bool {
+        if std::env::var_os(TRACE_TEST_CHILD_ENV).is_some() {
+            return false;
+        }
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("test executable should be available"),
+        )
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--test-threads=1")
+        .env_clear()
+        .env("LANG", "C.UTF-8")
+        .env(TRACE_TEST_CHILD_ENV, "1")
+        .output()
+        .expect("isolated trace test should start");
+        assert!(
+            output.status.success(),
+            "isolated trace test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    impl Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace output lock poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scheduler_trace_snapshots_are_structured_and_redacted() {
+        if run_trace_test_in_isolated_process(
+            "runtime_sync::tests::scheduler_trace_snapshots_are_structured_and_redacted",
+        ) {
+            return;
+        }
+        let _trace_guard = TRACE_SUBSCRIBER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("isolated scheduler trace subscriber should install");
+
+        const PRIVATE_ID_CANARY: u64 = 9_876_543_210;
+        const PRIVATE_PAYLOAD_CANARY: &str = "private-runtime-payload-canary";
+        test_runtime().block_on(async {
+            let cancellation_scheduler = scheduler(1, 1);
+            let starts = Arc::new(AtomicUsize::new(0));
+            let gate = Arc::new(Notify::new());
+            let receipt = accepted_receipt(
+                cancellation_scheduler
+                    .admit(
+                        job(PRIVATE_ID_CANARY, SyncDurability::Ephemeral),
+                        None,
+                        counted_work(Arc::clone(&starts), Some(Arc::clone(&gate))),
+                    )
+                    .unwrap(),
+            );
+            wait_for_count(&starts, 1).await;
+
+            let rejection = cancellation_scheduler
+                .admit(
+                    job(PRIVATE_ID_CANARY + 1, SyncDurability::Ephemeral),
+                    None,
+                    counted_work(Arc::new(AtomicUsize::new(0)), None),
+                )
+                .unwrap_err();
+            assert_eq!(rejection.reason(), AdmissionRejectionReason::AtCapacity);
+            assert!(matches!(
+                cancellation_scheduler.cancel(crate::sync_scheduler::CancellationId::new(
+                    PRIVATE_ID_CANARY
+                )),
+                CancellationOutcome::Requested(_)
+            ));
+            assert_eq!(
+                receipt.wait().await.unwrap().result(),
+                RuntimeSyncTerminalResult::Cancelled
+            );
+
+            let fresh_scheduler = scheduler(1, 1);
+            let fresh_outcome = fresh_scheduler
+                .admit(
+                    freshness_job(PRIVATE_ID_CANARY + 2, 60_000),
+                    Some(fresh_scheduler.now_epoch_ms()),
+                    counted_work(Arc::new(AtomicUsize::new(0)), None),
+                )
+                .unwrap();
+            assert!(matches!(
+                fresh_outcome,
+                RuntimeSyncAdmissionOutcome::SkippedFresh(_)
+            ));
+
+            let retry_scheduler = scheduler(2, 1);
+            let retry_attempts = Arc::new(AtomicUsize::new(0));
+            let retry_first_attempt_gate = Arc::new(Notify::new());
+            let payload_canary = Arc::new(String::from(PRIVATE_PAYLOAD_CANARY));
+            let retry_attempts_for_work = Arc::clone(&retry_attempts);
+            let retry_first_attempt_gate_for_work = Arc::clone(&retry_first_attempt_gate);
+            let retry_receipt = accepted_receipt(
+                retry_scheduler
+                    .admit(
+                        retrying_job_with_delay(PRIVATE_ID_CANARY + 3, 50),
+                        None,
+                        RuntimeSyncWork::new(move |attempt| {
+                            let payload_canary = Arc::clone(&payload_canary);
+                            let retry_attempts = Arc::clone(&retry_attempts_for_work);
+                            let retry_first_attempt_gate =
+                                Arc::clone(&retry_first_attempt_gate_for_work);
+                            async move {
+                                assert_eq!(payload_canary.as_str(), PRIVATE_PAYLOAD_CANARY);
+                                retry_attempts.fetch_add(1, Ordering::SeqCst);
+                                if attempt == 1 {
+                                    retry_first_attempt_gate.notified().await;
+                                    JobOutcome::RetryableFailure
+                                } else {
+                                    JobOutcome::Succeeded
+                                }
+                            }
+                        }),
+                    )
+                    .unwrap(),
+            );
+            wait_for_count(&retry_attempts, 1).await;
+
+            let blocker_starts = Arc::new(AtomicUsize::new(0));
+            let blocker_gate = Arc::new(Notify::new());
+            let blocker_receipt = accepted_receipt(
+                retry_scheduler
+                    .admit(
+                        job(PRIVATE_ID_CANARY + 4, SyncDurability::Ephemeral),
+                        None,
+                        counted_work(Arc::clone(&blocker_starts), Some(Arc::clone(&blocker_gate))),
+                    )
+                    .unwrap(),
+            );
+            retry_first_attempt_gate.notify_one();
+            wait_for_count(&blocker_starts, 1).await;
+            wait_for_scheduler(&retry_scheduler, |counters| counters.retried() == 1).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while retry_scheduler.retry_wakeup_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("retry wakeup did not fire while capacity was occupied");
+            assert_eq!(retry_attempts.load(Ordering::SeqCst), 1);
+
+            blocker_gate.notify_one();
+            assert_eq!(
+                blocker_receipt.wait().await.unwrap().result(),
+                RuntimeSyncTerminalResult::Succeeded
+            );
+            assert_eq!(
+                retry_receipt.wait().await.unwrap().result(),
+                RuntimeSyncTerminalResult::Succeeded
+            );
+            retry_scheduler.shutdown().await;
+        });
+
+        let output = String::from_utf8(output.lock().expect("trace output lock poisoned").clone())
+            .expect("trace output should be UTF-8");
+        let snapshots = output
+            .lines()
+            .filter(|line| line.contains("sync_scheduler_snapshot"))
+            .collect::<Vec<_>>();
+        assert!(!snapshots.is_empty(), "scheduler snapshots were not traced");
+        for transition in [
+            "admission_accepted",
+            "admission_rejected",
+            "admission_skipped_fresh",
+            "cancellation_requested",
+            "completion_cancelled",
+            "completion_retried",
+            "retry_wakeup_ready",
+            "retry_dispatched",
+            "completion_completed",
+            "shutdown_started",
+        ] {
+            assert!(
+                snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.contains(&format!("transition=\"{transition}\""))),
+                "scheduler trace omitted {transition}: {output}"
+            );
+        }
+        for snapshot in &snapshots {
+            assert!(
+                snapshot.contains("conduit::sync"),
+                "scheduler trace used the wrong target: {snapshot}"
+            );
+            for field in [
+                "admitted=",
+                "queued_depth=",
+                "running_depth=",
+                "coalesced=",
+                "cancellation_requested=",
+                "cancellation_completed=",
+                "completed=",
+                "failed=",
+                "retried=",
+                "skipped_fresh=",
+                "rejected_at_capacity=",
+                "rejected_duplicate_identity=",
+                "rejected_shutting_down=",
+                "queue_high_water=",
+                "running_high_water=",
+                "shutdown_phase=",
+            ] {
+                assert!(
+                    snapshot.contains(field),
+                    "scheduler snapshot omitted {field}: {snapshot}"
+                );
+            }
+            for private in [
+                PRIVATE_ID_CANARY.to_string(),
+                (PRIVATE_ID_CANARY + 1).to_string(),
+                (PRIVATE_ID_CANARY + 2).to_string(),
+                (PRIVATE_ID_CANARY + 3).to_string(),
+                (PRIVATE_ID_CANARY + 4).to_string(),
+                PRIVATE_PAYLOAD_CANARY.to_string(),
+            ] {
+                assert!(
+                    !snapshot.contains(&private),
+                    "scheduler snapshot leaked private data: {snapshot}"
+                );
+            }
+        }
+        let retry_wakeup = snapshots
+            .iter()
+            .position(|snapshot| snapshot.contains("transition=\"retry_wakeup_ready\""))
+            .expect("retry wakeup transition should be traced");
+        let retry_dispatch = snapshots
+            .iter()
+            .position(|snapshot| snapshot.contains("transition=\"retry_dispatched\""))
+            .expect("retry dispatch transition should be traced");
+        assert!(
+            retry_wakeup < retry_dispatch,
+            "retry was reported as dispatched before capacity became available: {output}"
+        );
+        assert!(
+            snapshots[retry_wakeup].contains("queued_depth=1")
+                && snapshots[retry_wakeup].contains("running_depth=1"),
+            "retry wakeup did not preserve the queued retry under contention: {}",
+            snapshots[retry_wakeup]
+        );
+        assert!(
+            snapshots[retry_dispatch].contains("queued_depth=0")
+                && snapshots[retry_dispatch].contains("running_depth=1"),
+            "retry dispatch snapshot did not describe the actual dispatch: {}",
+            snapshots[retry_dispatch]
+        );
     }
 
     #[test]

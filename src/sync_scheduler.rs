@@ -64,7 +64,7 @@ pub(crate) enum SyncPriority {
 }
 
 impl SyncPriority {
-    fn can_supersede(self, existing: Self) -> bool {
+    pub(crate) const fn can_supersede(self, existing: Self) -> bool {
         matches!(
             (self, existing),
             (Self::Interactive, _)
@@ -108,6 +108,22 @@ impl FreshnessPolicy {
                 FreshnessDecision::SkipFresh
             }
             (Self::IfOlderThan { .. }, Some(_)) => FreshnessDecision::Run,
+        }
+    }
+
+    /// Returns whether replacing `existing` preserves or strengthens its run contract.
+    pub(crate) const fn can_supersede(self, existing: Self) -> bool {
+        match (self, existing) {
+            (Self::Always, _) => true,
+            (Self::IfOlderThan { .. }, Self::Always) => false,
+            (
+                Self::IfOlderThan {
+                    max_age_ms: new_max_age_ms,
+                },
+                Self::IfOlderThan {
+                    max_age_ms: existing_max_age_ms,
+                },
+            ) => new_max_age_ms <= existing_max_age_ms,
         }
     }
 }
@@ -697,6 +713,7 @@ impl SyncScheduler {
                 if running.job.target == job.target
                     && running.job.replacement == job.replacement
                     && job.priority.can_supersede(running.job.priority)
+                    && job.freshness.can_supersede(running.job.freshness)
                 {
                     running.retry_superseded_by = Some(token);
                 }
@@ -1105,6 +1122,7 @@ impl SyncScheduler {
                         && queued.job.replacement == job.replacement
                         && !queued.job.durability.is_durable()
                         && job.priority.can_supersede(queued.job.priority)
+                        && job.freshness.can_supersede(queued.job.freshness)
                 })
                 .map(|position| (priority, position))
         })
@@ -1128,6 +1146,7 @@ impl SyncScheduler {
                         && queued.job.replacement == job.replacement
                         && !queued.job.durability.is_durable()
                         && queued.job.priority.can_supersede(job.priority)
+                        && queued.job.freshness.can_supersede(job.freshness)
                 })
                 .map(|queued| queued.admission)
         })
@@ -1323,6 +1342,11 @@ mod tests {
 
     fn with_priority(mut job: SyncJob, priority: SyncPriority) -> SyncJob {
         job.priority = priority;
+        job
+    }
+
+    fn with_freshness(mut job: SyncJob, freshness: FreshnessPolicy) -> SyncJob {
+        job.freshness = freshness;
         job
     }
 
@@ -1926,6 +1950,105 @@ mod tests {
     }
 
     #[test]
+    fn stale_refresh_cannot_replace_queued_always_refresh() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let forced = replaceable_job(1, 10, RefreshClass::Membership);
+        let stale = with_freshness(
+            replaceable_job(2, 10, RefreshClass::Membership),
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: 300_000,
+            },
+        );
+        scheduler.admit(forced.clone(), 10_000, None).unwrap();
+
+        assert_eq!(
+            scheduler.admit(stale, 10_001, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(SyncJobId::new(2), 2),
+                coalesced: None,
+            }
+        );
+        assert_eq!(scheduler.dispatch_next(10_001).unwrap().job(), &forced);
+    }
+
+    #[test]
+    fn always_refresh_replaces_queued_stale_refresh() {
+        let mut scheduler = scheduler(1, 1, 3);
+        let stale = with_freshness(
+            replaceable_job(1, 10, RefreshClass::Membership),
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: 300_000,
+            },
+        );
+        let forced = replaceable_job(2, 10, RefreshClass::Membership);
+        scheduler.admit(stale.clone(), 10_000, None).unwrap();
+
+        assert_eq!(
+            scheduler.admit(forced.clone(), 10_001, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(forced.id(), 2),
+                coalesced: Some(ReleasedJob::new(stale, 1)),
+            }
+        );
+        assert_eq!(scheduler.dispatch_next(10_001).unwrap().job(), &forced);
+    }
+
+    #[test]
+    fn stale_refresh_replacement_requires_an_equal_or_stricter_max_age() {
+        let existing = with_freshness(
+            replaceable_job(1, 10, RefreshClass::Membership),
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: 300_000,
+            },
+        );
+        let weaker = with_freshness(
+            replaceable_job(2, 10, RefreshClass::Membership),
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: 600_000,
+            },
+        );
+        let mut weaker_scheduler = scheduler(2, 1, 3);
+        weaker_scheduler
+            .admit(existing.clone(), 10_000, None)
+            .unwrap();
+        assert!(matches!(
+            weaker_scheduler.admit(weaker, 10_001, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                coalesced: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            weaker_scheduler.dispatch_next(10_001).unwrap().job(),
+            &existing
+        );
+
+        let existing = with_freshness(
+            replaceable_job(3, 10, RefreshClass::Membership),
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: 600_000,
+            },
+        );
+        let stricter = with_freshness(
+            replaceable_job(4, 10, RefreshClass::Membership),
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: 300_000,
+            },
+        );
+        let mut stricter_scheduler = scheduler(1, 1, 3);
+        stricter_scheduler
+            .admit(existing.clone(), 10_000, None)
+            .unwrap();
+        assert_eq!(
+            stricter_scheduler.admit(stricter, 10_001, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(SyncJobId::new(4), 2),
+                coalesced: Some(ReleasedJob::new(existing, 1)),
+            }
+        );
+    }
+
+    #[test]
     fn blocked_interactive_refresh_does_not_hide_dispatchable_maintenance_work() {
         let mut scheduler = scheduler(3, 2, 3);
         admit(
@@ -2293,6 +2416,57 @@ mod tests {
         );
         assert_eq!(dispatch_and_complete(&mut scheduler, 1_010), newer.id());
         assert!(scheduler.dispatch_next(1_010).is_none());
+    }
+
+    #[test]
+    fn stale_refresh_cannot_supersede_an_always_retry_after_it_starts() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let mut forced = replaceable_job(1, 10, RefreshClass::Membership);
+        forced.retry = RetryPolicy::fixed(2, 250).unwrap();
+        let stale = with_freshness(
+            replaceable_job(2, 10, RefreshClass::Membership),
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: 300_000,
+            },
+        );
+        scheduler.admit(forced.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+        scheduler.admit(stale, 1_001, None).unwrap();
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::RetryableFailure, 1_010),
+            Ok(CompletionOutcome::Retried {
+                job_id: forced.id(),
+                attempt: 2,
+                ready_at_ms: 1_260,
+            })
+        );
+    }
+
+    #[test]
+    fn queued_stale_refresh_cannot_supersede_an_always_retry() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let mut forced = replaceable_job(1, 10, RefreshClass::Membership);
+        forced.retry = RetryPolicy::fixed(2, 250).unwrap();
+        let stale = with_freshness(
+            replaceable_job(2, 10, RefreshClass::Membership),
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: 300_000,
+            },
+        );
+        scheduler.admit(forced.clone(), 1_000, None).unwrap();
+        scheduler.admit(stale, 1_001, None).unwrap();
+        let running = scheduler.dispatch_next(1_001).unwrap();
+        assert_eq!(running.job(), &forced);
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::RetryableFailure, 1_010),
+            Ok(CompletionOutcome::Retried {
+                job_id: forced.id(),
+                attempt: 2,
+                ready_at_ms: 1_260,
+            })
+        );
     }
 
     #[test]
