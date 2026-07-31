@@ -578,7 +578,7 @@ pub(crate) struct WorkspaceAttentionContext {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MessageAttentionEffect {
     pub(crate) channel_id: String,
-    pub(crate) message: SlackMessage,
+    pub(crate) message: Box<SlackMessage>,
     pub(crate) decision: AttentionDecision,
     pub(crate) delivery: DeliveryState,
 }
@@ -684,6 +684,16 @@ struct ReconciledRootProjection {
     canonical: SlackMessage,
     channel: Option<SlackMessage>,
     thread: Option<SlackMessage>,
+}
+
+struct ChannelRootReconciliation<'a> {
+    channel_id: &'a str,
+    message: &'a SlackMessage,
+    kind: MessageMutationKind,
+    previous_channel_known: bool,
+    previous_reply_locations: &'a [(String, String)],
+    identity_was_tombstoned: bool,
+    revision: WorkspaceRevision,
 }
 
 /// Pure owner of one workspace's canonical domain model and global revision.
@@ -2678,15 +2688,16 @@ impl WorkspaceCoordinator {
             });
         }
 
-        let mut changed_roots = self.reconcile_channel_roots_for_message(
-            channel_id,
-            &message,
-            kind,
-            previous_channel_known,
-            &previous_reply_locations,
-            identity_was_tombstoned,
-            revision,
-        );
+        let mut changed_roots =
+            self.reconcile_channel_roots_for_message(ChannelRootReconciliation {
+                channel_id,
+                message: &message,
+                kind,
+                previous_channel_known,
+                previous_reply_locations: &previous_reply_locations,
+                identity_was_tombstoned,
+                revision,
+            });
 
         let previous_thread_catalog = self.thread_catalog.clone();
         let mut thread_catalog = ThreadCatalog::from_records(previous_thread_catalog.clone());
@@ -2964,14 +2975,16 @@ impl WorkspaceCoordinator {
         let mut thread_targets = self
             .threads
             .iter()
-            .filter_map(|((channel_id, thread_ts), timeline)| {
-                (channel_id == &change.channel_id
-                    && timeline.messages.contains_key(&change.message_ts))
-                .then(|| TimelineTarget::Thread {
+            .filter(|((channel_id, _thread_ts), timeline)| {
+                channel_id.as_str() == change.channel_id.as_str()
+                    && timeline.messages.contains_key(&change.message_ts)
+            })
+            .map(
+                |((channel_id, thread_ts), _timeline)| TimelineTarget::Thread {
                     channel_id: channel_id.clone(),
                     thread_ts: thread_ts.clone(),
-                })
-            })
+                },
+            )
             .collect::<Vec<_>>();
         thread_targets.sort();
         targets.extend(thread_targets);
@@ -3307,7 +3320,7 @@ impl WorkspaceCoordinator {
         };
         Some(MessageAttentionEffect {
             channel_id: channel_id.to_string(),
-            message: message.clone(),
+            message: Box::new(message.clone()),
             decision: self.attention_policy.decide(candidate),
             delivery,
         })
@@ -3421,14 +3434,17 @@ impl WorkspaceCoordinator {
 
     fn reconcile_channel_roots_for_message(
         &mut self,
-        channel_id: &str,
-        message: &SlackMessage,
-        kind: MessageMutationKind,
-        previous_channel_known: bool,
-        previous_reply_locations: &[(String, String)],
-        identity_was_tombstoned: bool,
-        revision: WorkspaceRevision,
+        reconciliation: ChannelRootReconciliation<'_>,
     ) -> Vec<ReconciledRootProjection> {
+        let ChannelRootReconciliation {
+            channel_id,
+            message,
+            kind,
+            previous_channel_known,
+            previous_reply_locations,
+            identity_was_tombstoned,
+            revision,
+        } = reconciliation;
         let incoming_root = message.thread_root_ts().map(str::to_string);
         let mut root_timestamps = if kind == MessageMutationKind::Posted {
             Vec::new()
@@ -4003,7 +4019,7 @@ fn upsert_message_change(changes: &mut Vec<MessageChange>, message: SlackMessage
         MessageChange::Upsert(existing) if existing.ts == message.ts => Some(existing),
         MessageChange::Upsert(_) | MessageChange::Remove { .. } => None,
     }) {
-        *existing = Box::new(message);
+        **existing = message;
     } else {
         changes.push(MessageChange::Upsert(Box::new(message)));
     }

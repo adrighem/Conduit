@@ -4862,12 +4862,8 @@ fn spawn_workspace_tasks(
                             std::pin::pin!(wait_for_socket_mode_cancellation(&mut cancellation));
                         let hydration = std::pin::pin!(hydration_ready_receiver);
                         match futures_util::future::select(cancellation_wait, hydration).await {
-                            futures_util::future::Either::Left(((), pending_hydration)) => {
-                                drop(pending_hydration);
-                                false
-                            }
-                            futures_util::future::Either::Right((ready, pending_cancellation)) => {
-                                drop(pending_cancellation);
+                            futures_util::future::Either::Left(((), _pending_hydration)) => false,
+                            futures_util::future::Either::Right((ready, _pending_cancellation)) => {
                                 ready.is_ok()
                             }
                         }
@@ -6776,12 +6772,8 @@ async fn run_socket_mode(
                 std::pin::pin!(wait_for_socket_mode_cancellation(&mut cancellation));
             let run_once = std::pin::pin!(run_once);
             match futures_util::future::select(cancellation_wait, run_once).await {
-                futures_util::future::Either::Left(((), pending_run)) => {
-                    drop(pending_run);
-                    None
-                }
-                futures_util::future::Either::Right((result, pending_cancellation)) => {
-                    drop(pending_cancellation);
+                futures_util::future::Either::Left(((), _pending_run)) => None,
+                futures_util::future::Either::Right((result, _pending_cancellation)) => {
                     Some(result)
                 }
             }
@@ -6836,14 +6828,8 @@ async fn run_socket_mode(
                 std::pin::pin!(wait_for_socket_mode_cancellation(&mut cancellation));
             let reconnect_sleep = std::pin::pin!(tokio::time::sleep(timing.sleep));
             match futures_util::future::select(cancellation_wait, reconnect_sleep).await {
-                futures_util::future::Either::Left(((), pending_sleep)) => {
-                    drop(pending_sleep);
-                    true
-                }
-                futures_util::future::Either::Right(((), pending_cancellation)) => {
-                    drop(pending_cancellation);
-                    false
-                }
+                futures_util::future::Either::Left(((), _pending_sleep)) => true,
+                futures_util::future::Either::Right(((), _pending_cancellation)) => false,
             }
         };
         if cancelled {
@@ -7373,7 +7359,7 @@ fn publish_persisted_workspace_notification(
         // the window may reject its candidate after explicitly moving on.
         events.send_event(RuntimeEventKind::AttentionNotificationCandidate {
             channel_id: notification.channel_id,
-            message: Box::new(notification.message),
+            message: notification.message,
             decision: notification.decision,
         });
     }
@@ -7845,7 +7831,7 @@ async fn publish_socket_message_without_store(
         {
             events.send_event(RuntimeEventKind::AttentionNotificationCandidate {
                 channel_id: notification.channel_id,
-                message: Box::new(notification.message),
+                message: notification.message,
                 decision: notification.decision,
             });
         }
@@ -8713,9 +8699,11 @@ async fn prefetch_channel_histories_best_effort(
                     workspace.reducer,
                     &channel_id,
                     base_revision,
-                    page.messages.clone(),
-                    page.has_more,
-                    page.next_cursor.clone(),
+                    PrefetchedHistoryPage {
+                        messages: page.messages.clone(),
+                        has_more: page.has_more,
+                        next_cursor: page.next_cursor.clone(),
+                    },
                 )
                 .await
                 {
@@ -8763,18 +8751,23 @@ async fn prefetch_channel_histories_best_effort(
     }
 }
 
+struct PrefetchedHistoryPage {
+    messages: Vec<SlackMessage>,
+    has_more: bool,
+    next_cursor: Option<String>,
+}
+
 async fn publish_prefetched_history_snapshot(
     events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
     workspace: &WorkspaceReducerAdapter,
     channel_id: &str,
     base_revision: WorkspaceRevision,
-    messages: Vec<SlackMessage>,
-    has_more: bool,
-    next_cursor: Option<String>,
+    page: PrefetchedHistoryPage,
 ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
-    let complete = !has_more
-        && next_cursor
+    let complete = !page.has_more
+        && page
+            .next_cursor
             .as_deref()
             .is_none_or(|cursor| cursor.trim().is_empty());
     workspace
@@ -8787,8 +8780,8 @@ async fn publish_prefetched_history_snapshot(
                 snapshot: SnapshotEnvelope::new(
                     base_revision,
                     crate::workspace_pipeline::MessagePage {
-                        messages,
-                        next_cursor,
+                        messages: page.messages,
+                        next_cursor: page.next_cursor,
                         complete,
                     },
                 ),
@@ -11535,9 +11528,11 @@ mod tests {
                 &workspace,
                 "C1",
                 partial_base,
-                vec![newest.clone()],
-                true,
-                Some("next".into()),
+                PrefetchedHistoryPage {
+                    messages: vec![newest.clone()],
+                    has_more: true,
+                    next_cursor: Some("next".into()),
+                },
             )
             .await
             .unwrap();
@@ -11558,9 +11553,11 @@ mod tests {
                 &workspace,
                 "C1",
                 complete_base,
-                vec![newest],
-                false,
-                None,
+                PrefetchedHistoryPage {
+                    messages: vec![newest],
+                    has_more: false,
+                    next_cursor: None,
+                },
             )
             .await
             .unwrap();
@@ -11708,14 +11705,16 @@ mod tests {
                 &workspace,
                 "C1",
                 network_base,
-                vec![
-                    original_edited,
-                    original_deleted,
-                    original_moved,
-                    new_message.clone(),
-                ],
-                false,
-                None,
+                PrefetchedHistoryPage {
+                    messages: vec![
+                        original_edited,
+                        original_deleted,
+                        original_moved,
+                        new_message.clone(),
+                    ],
+                    has_more: false,
+                    next_cursor: None,
+                },
             )
             .await
             .unwrap();
@@ -13191,9 +13190,11 @@ mod tests {
                 &workspace,
                 "C1",
                 history_base,
-                vec![initial_message, history_message],
-                false,
-                None,
+                PrefetchedHistoryPage {
+                    messages: vec![initial_message, history_message],
+                    has_more: false,
+                    next_cursor: None,
+                },
             )
             .await
             .is_err());
@@ -19108,7 +19109,7 @@ mod tests {
                 .expect("fresh DM must produce a pending reduction");
             assert_eq!(
                 reduction.store_batch().unwrap().notification_claims(),
-                [identity.clone()]
+                std::slice::from_ref(&identity)
             );
 
             let (repair_started, repair_started_receiver) = oneshot::channel();
@@ -19688,7 +19689,7 @@ mod tests {
                     }
                     _ => None,
                 })
-                .last()
+                .next_back()
                 .expect("coordinator did not publish its reconciled thread catalog");
             let record = coordinator_records
                 .iter()

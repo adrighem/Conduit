@@ -2559,12 +2559,13 @@ fn apply_reaction_delta(
     let mut changed = false;
     if let Some(existing_history) = existing_history {
         let mut history = channel_timeline_messages(normalize_cached_messages(existing_history));
-        let history_changed = history
+        let mut history_changed = false;
+        for message in history
             .iter_mut()
             .filter(|message| message.ts == projection.change.message_ts)
-            .fold(false, |changed, message| {
-                apply_reaction_projection_mutation(message, &projection) || changed
-            });
+        {
+            history_changed |= apply_reaction_projection_mutation(message, &projection);
+        }
         if history_changed {
             changed |= replace_timeline_item(
                 transaction,
@@ -2579,13 +2580,14 @@ fn apply_reaction_delta(
     for mut thread in
         load_sqlite_channel_threads(transaction, workspace_key, &projection.change.channel_id)?
     {
-        let thread_changed = thread
+        let mut thread_changed = false;
+        for message in thread
             .messages
             .iter_mut()
             .filter(|message| message.ts == projection.change.message_ts)
-            .fold(false, |changed, message| {
-                apply_reaction_projection_mutation(message, &projection) || changed
-            });
+        {
+            thread_changed |= apply_reaction_projection_mutation(message, &projection);
+        }
         if thread_changed {
             changed |= replace_timeline_item(
                 transaction,
