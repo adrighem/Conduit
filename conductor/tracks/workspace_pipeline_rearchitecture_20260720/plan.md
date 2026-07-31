@@ -27,13 +27,13 @@
 - [x] Task: Prevent native reload of internal message WebViews from navigating away 03717c1
 - [x] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md) da64ac5
 
-## Phase 4: Bounded synchronization and backpressure
+## Phase 4: Bounded synchronization and backpressure [checkpoint: 34ebd6c]
 
 - [x] Task: Integrate the validated bounded SyncJob scheduler after authoritative conversation adoption 4c43f9f
 - [x] Task: Move startup, manual refresh, navigation, and membership-event scheduling onto the bounded scheduler 0e0804a
 - [x] Task: Enforce startup enrichment/history limits and lazy 24-hour user-directory loading 5a044a0
 - [x] Task: Add scheduler/API tracing counters and no-realtime stale-check behavior 6e9b437
-- [ ] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md) 34ebd6c
 
 ## Phase 5: Incremental GTK and WebKit presentation
 
