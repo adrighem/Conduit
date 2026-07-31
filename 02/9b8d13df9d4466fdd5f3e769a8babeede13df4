@@ -1,0 +1,9 @@
+Task: Define TimelinePresenter document/revision/loading/delta behavior with scroll regression tests
+
+Summary: Added a pure per-WebView TimelinePresenter with presenter-local document generations and DOM revisions, loading queues, one scheduled frame, one in-flight delta, exact acknowledgements, canonical mismatch/corruption recovery, stale callback rejection, and privacy-safe counters. Added a revisioned JavaScript batch contract that applies ordered operations in one preserved-scroll transaction while retaining the single-patch compatibility wrapper.
+
+Modified files: src/main.rs, src/timeline_presenter.rs, src/timeline_dom_runtime.js, tests/test_timeline_scroll.py
+
+Rationale: Workspace revisions can skip or be shared by enrichment, so DOM correctness requires its own handshake. Batched operations preserve pinned-bottom and stable-anchor behavior while immediate user input cancels pending automatic correction.
+
+Validation: red confirmed for 12 presenter contracts and the missing WebKit delta API; cargo test --all -- --nocapture (1111 passed, 3 ignored); cargo check; focused presenter tests (14 passed); real WebKit Timeline scroll anchoring test passed locally and three consecutive subagent runs; node --check; cargo fmt; git diff --check. Strict Clippy was unavailable because installed Clippy 0.1.87 does not match rustc 1.95.0. Coverage was unavailable because cargo-llvm-cov is not installed.
