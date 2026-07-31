@@ -1,0 +1,9 @@
+Task: Add scheduler/API tracing counters and no-realtime stale-check behavior
+
+Summary: Added privacy-safe cumulative scheduler and Slack Web/browser API attempt counters, accurate retry transition tracing, persisted five-minute conversation-membership freshness, and window-reactivation checks when no realtime transport exists. Background failures stay non-disruptive, capacity-deferred work is retained, and forced refresh intent wins priority and freshness coalescing races.
+
+Modified files: README.md, src/runtime.rs, src/runtime_sync.rs, src/slack.rs, src/sync_scheduler.rs, src/window.rs
+
+Rationale: Make bounded synchronization observable without leaking workspace data, avoid unnecessary membership polling, and guarantee stale fallback work cannot displace or lose explicit and realtime refreshes.
+
+Validation: cargo test --all-targets --no-fail-fast (1086 passed, 3 ignored); cargo check --all-targets; cargo fmt --all -- --check; git diff --check; meson compile -C _build-task4; meson test -C _build-task4 --print-errorlogs (17 passed). Privacy, concurrent counter ordering, retry contention, freshness boundaries, forced-versus-stale coalescing, deferred admission, and concurrent execution-time recheck regressions passed. Strict Clippy was unavailable because installed Clippy 0.1.87 does not match rustc 1.95.0. Coverage was unavailable because cargo-llvm-cov is not installed.
