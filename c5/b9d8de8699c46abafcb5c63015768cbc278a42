@@ -1,0 +1,35 @@
+Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers
+
+Summary:
+- Store bounded raw preview assets with strict MIME allowlisting and signature validation.
+- Serve only registered cache keys through a secure WebKit custom scheme with file-identity checks and generic failures.
+- Share one WebContext across main and thread timelines and use typed image/video asset patches.
+- Replace the root ResizeObserver with targeted media load, metadata, and error anchoring.
+- Harden atomic cache writes against path swaps and temporary-name collisions.
+
+Modified files:
+- src/asset_scheme.rs
+- src/main.rs
+- src/message_html.rs
+- src/runtime.rs
+- src/slack.rs
+- src/timeline_dom_runtime.js
+- src/timeline_presenter.rs
+- src/window.rs
+- tests/test_timeline_scroll.py
+
+Rationale:
+Avoid base64 document inflation and root-wide resize observation while retaining secure, incremental media rendering and stable scroll position.
+
+Validation:
+- cargo check --locked: passed without warnings
+- cargo test --locked: 1144 passed, 3 ignored
+- cargo fmt --all -- --check: passed
+- node --check src/timeline_dom_runtime.js: passed
+- xvfb-run timeline scroll/media integration: passed
+- ninja -C _build: passed
+- meson test -C _build --print-errorlogs: 17 passed
+- git diff --check: passed
+- Independent security and WebKit review: clean after three regression-backed hardening fixes
+- Strict Clippy unavailable: installed clippy 0.1.87 uses rustc 1.87, below the project rust-version 1.88
+- Coverage unavailable: cargo-llvm-cov is not installed
