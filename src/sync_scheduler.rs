@@ -63,6 +63,17 @@ pub(crate) enum SyncPriority {
     Maintenance,
 }
 
+impl SyncPriority {
+    fn can_supersede(self, existing: Self) -> bool {
+        matches!(
+            (self, existing),
+            (Self::Interactive, _)
+                | (Self::Foreground, Self::Foreground | Self::Maintenance)
+                | (Self::Maintenance, Self::Maintenance)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SyncDurability {
     Ephemeral,
@@ -683,7 +694,10 @@ impl SyncScheduler {
             .expect("scheduler admission generation space exhausted");
         if matches!(job.replacement, ReplacementClass::Refresh(_)) {
             for running in self.running.values_mut() {
-                if running.job.target == job.target && running.job.replacement == job.replacement {
+                if running.job.target == job.target
+                    && running.job.replacement == job.replacement
+                    && job.priority.can_supersede(running.job.priority)
+                {
                     running.retry_superseded_by = Some(token);
                 }
             }
@@ -842,10 +856,10 @@ impl SyncScheduler {
             }
             JobOutcome::RetryableFailure => match running.job.retry.decision(run.attempt, now_ms) {
                 RetryDecision::RetryAt { ready_at_ms } => {
-                    if let Some(superseding) = running.retry_superseded_by.or_else(|| {
-                        self.queued_replacement_for(&running.job)
-                            .map(|(priority, position)| self.queue(priority)[position].admission)
-                    }) {
+                    if let Some(superseding) = running
+                        .retry_superseded_by
+                        .or_else(|| self.queued_superseding_refresh_for(&running.job))
+                    {
                         CompletionOutcome::Superseded {
                             released: ReleasedJob::new(running.job, running.attempt),
                             superseding,
@@ -1090,8 +1104,32 @@ impl SyncScheduler {
                     queued.job.target == job.target
                         && queued.job.replacement == job.replacement
                         && !queued.job.durability.is_durable()
+                        && job.priority.can_supersede(queued.job.priority)
                 })
                 .map(|position| (priority, position))
+        })
+    }
+
+    fn queued_superseding_refresh_for(&self, job: &SyncJob) -> Option<AdmissionToken> {
+        if !matches!(job.replacement, ReplacementClass::Refresh(_)) {
+            return None;
+        }
+        [
+            SyncPriority::Interactive,
+            SyncPriority::Foreground,
+            SyncPriority::Maintenance,
+        ]
+        .into_iter()
+        .find_map(|priority| {
+            self.queue(priority)
+                .iter()
+                .find(|queued| {
+                    queued.job.target == job.target
+                        && queued.job.replacement == job.replacement
+                        && !queued.job.durability.is_durable()
+                        && queued.job.priority.can_supersede(job.priority)
+                })
+                .map(|queued| queued.admission)
         })
     }
 
@@ -1785,6 +1823,57 @@ mod tests {
     }
 
     #[test]
+    fn lower_priority_refresh_cannot_replace_queued_interactive_work() {
+        let mut scheduler = scheduler(3, 1, 3);
+        let mut interactive = replaceable_job(1, 10, RefreshClass::UserDirectory);
+        interactive.priority = SyncPriority::Interactive;
+        assert_eq!(
+            scheduler.admit(interactive.clone(), 10_000, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(SyncJobId::new(1), 1),
+                coalesced: None,
+            }
+        );
+
+        let mut maintenance = replaceable_job(2, 10, RefreshClass::UserDirectory);
+        maintenance.priority = SyncPriority::Maintenance;
+        assert_eq!(
+            scheduler.admit(maintenance.clone(), 10_000, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(SyncJobId::new(2), 2),
+                coalesced: None,
+            }
+        );
+
+        let first = scheduler.dispatch_next(10_000).unwrap();
+        assert_eq!(first.job().id(), interactive.id());
+        assert_eq!(
+            scheduler.complete(first.run(), JobOutcome::Succeeded, 10_000),
+            Ok(CompletionOutcome::Completed)
+        );
+        assert_eq!(scheduler.dispatch_next(10_000).unwrap().job(), &maintenance);
+    }
+
+    #[test]
+    fn interactive_refresh_replaces_queued_maintenance_work() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let mut maintenance = replaceable_job(1, 10, RefreshClass::UserDirectory);
+        maintenance.priority = SyncPriority::Maintenance;
+        scheduler.admit(maintenance.clone(), 10_000, None).unwrap();
+
+        let mut interactive = replaceable_job(2, 10, RefreshClass::UserDirectory);
+        interactive.priority = SyncPriority::Interactive;
+        assert_eq!(
+            scheduler.admit(interactive.clone(), 10_000, None).unwrap(),
+            AdmissionOutcome::Accepted {
+                token: AdmissionToken::new(SyncJobId::new(2), 2),
+                coalesced: Some(ReleasedJob::new(maintenance, 1)),
+            }
+        );
+        assert_eq!(scheduler.dispatch_next(10_000).unwrap().job(), &interactive);
+    }
+
+    #[test]
     fn queued_refresh_waits_for_running_work_on_the_same_target() {
         let mut scheduler = scheduler(2, 2, 3);
         admit(
@@ -2204,6 +2293,33 @@ mod tests {
         );
         assert_eq!(dispatch_and_complete(&mut scheduler, 1_010), newer.id());
         assert!(scheduler.dispatch_next(1_010).is_none());
+    }
+
+    #[test]
+    fn lower_priority_refresh_does_not_supersede_an_interactive_retry() {
+        let mut scheduler = scheduler(2, 1, 3);
+        let mut interactive = with_priority(
+            replaceable_job(1, 10, RefreshClass::UserDirectory),
+            SyncPriority::Interactive,
+        );
+        interactive.retry = RetryPolicy::fixed(2, 250).unwrap();
+        let maintenance = with_priority(
+            replaceable_job(2, 10, RefreshClass::UserDirectory),
+            SyncPriority::Maintenance,
+        );
+        scheduler.admit(interactive.clone(), 1_000, None).unwrap();
+        let running = scheduler.dispatch_next(1_000).unwrap();
+        scheduler.admit(maintenance.clone(), 1_001, None).unwrap();
+
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::RetryableFailure, 1_010),
+            Ok(CompletionOutcome::Retried {
+                job_id: interactive.id(),
+                attempt: 2,
+                ready_at_ms: 1_260,
+            })
+        );
+        assert_eq!(scheduler.dispatch_next(1_260).unwrap().job(), &interactive);
     }
 
     #[test]

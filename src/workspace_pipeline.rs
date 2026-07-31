@@ -688,15 +688,18 @@ struct ReconciledRootProjection {
 
 /// Pure owner of one workspace's canonical domain model and global revision.
 ///
-/// Runtime and GTK adapters are deliberately absent here. A mutation either changes the model
-/// once and produces one revision-stamped reduction, or is a no-op that leaves the revision
-/// untouched.
+/// Runtime and GTK adapters are deliberately absent here. Data changes produce one
+/// revision-stamped reduction. Accepted causal-only user events can advance the revision without
+/// emitting an identical UI patch or store write.
 #[derive(Debug)]
 pub(crate) struct WorkspaceCoordinator {
     revision: WorkspaceRevision,
     conversations: HashMap<String, RevisionedConversation>,
     conversation_membership_tombstones: HashMap<String, WorkspaceRevision>,
     users: HashMap<String, RevisionedValue<SlackUser>>,
+    user_snapshot_revisions: HashMap<String, WorkspaceRevision>,
+    user_snapshot_tombstones: HashMap<String, WorkspaceRevision>,
+    user_realtime_overlays: HashMap<String, RevisionedValue<SlackUser>>,
     histories: HashMap<String, TimelineState>,
     threads: HashMap<(String, String), TimelineState>,
     message_authority_by_ts: HashMap<(String, String), MessageProjectionAuthority>,
@@ -729,16 +732,20 @@ impl WorkspaceCoordinator {
         conversations
     }
 
-    pub(crate) fn store_projection(&self) -> WorkspaceStoreProjection {
+    pub(crate) fn users(&self) -> Vec<SlackUser> {
         let mut users = self
             .users
             .values()
             .map(|entry| entry.value.clone())
             .collect::<Vec<_>>();
         users.sort_by(|left, right| left.id.cmp(&right.id));
+        users
+    }
+
+    pub(crate) fn store_projection(&self) -> WorkspaceStoreProjection {
         WorkspaceStoreProjection {
             conversations: self.conversations(),
-            users,
+            users: self.users(),
             histories: self
                 .histories
                 .iter()
@@ -929,6 +936,12 @@ impl WorkspaceCoordinator {
         self.revision.successor()
     }
 
+    fn advance_causal_revision(&mut self) -> WorkspaceRevision {
+        let revision = self.next_revision();
+        self.revision = revision;
+        revision
+    }
+
     fn commit(
         &mut self,
         revision: WorkspaceRevision,
@@ -1055,6 +1068,14 @@ impl WorkspaceCoordinator {
                 ))
             })
             .collect();
+        self.user_snapshot_revisions = self
+            .users
+            .keys()
+            .cloned()
+            .map(|user_id| (user_id, revision))
+            .collect();
+        self.user_snapshot_tombstones.clear();
+        self.user_realtime_overlays.clear();
         self.histories = data
             .histories
             .iter()
@@ -1583,7 +1604,7 @@ impl WorkspaceCoordinator {
     ) -> Option<WorkspaceReduction> {
         let base_revision = snapshot.base_revision();
         let revision = self.next_revision();
-        let mut changed = Vec::new();
+        let mut incoming = HashMap::new();
         for user in snapshot.into_data() {
             let Some(user_id) = user
                 .id
@@ -1594,32 +1615,128 @@ impl WorkspaceCoordinator {
             else {
                 continue;
             };
-            let should_apply = self
+            incoming.insert(user_id, user);
+        }
+
+        let mut data_changed = false;
+        let mut first_authoritative_adoption = false;
+        let mut accepted_present = Vec::new();
+        for (user_id, user) in &incoming {
+            if self
+                .user_snapshot_revisions
+                .get(user_id)
+                .is_some_and(|authority| *authority > base_revision)
+                || self
+                    .user_snapshot_tombstones
+                    .get(user_id)
+                    .is_some_and(|removed_at| *removed_at > base_revision)
+            {
+                continue;
+            }
+            first_authoritative_adoption |= !self.user_snapshot_revisions.contains_key(user_id);
+            accepted_present.push(user_id.clone());
+            let next_user = self
+                .user_realtime_overlays
+                .get(user_id)
+                .filter(|overlay| overlay.revision > base_revision)
+                .map(|overlay| user.clone().merge_sparse_update(overlay.value.clone()))
+                .unwrap_or_else(|| user.clone());
+            if self
                 .users
-                .get(&user_id)
-                .is_none_or(|entry| entry.revision <= base_revision && entry.value != user);
-            if should_apply {
+                .get(user_id)
+                .is_none_or(|entry| entry.value != next_user)
+            {
                 self.users.insert(
-                    user_id,
+                    user_id.clone(),
                     RevisionedValue {
-                        value: user.clone(),
+                        value: next_user,
                         revision,
                     },
                 );
-                changed.push(user);
+                data_changed = true;
             }
         }
-        if changed.is_empty() {
+        let removed = self
+            .users
+            .iter()
+            .filter(|(user_id, _entry)| {
+                !incoming.contains_key(*user_id)
+                    && self
+                        .user_snapshot_revisions
+                        .get(*user_id)
+                        .is_none_or(|authority| *authority <= base_revision)
+                    && self
+                        .user_snapshot_tombstones
+                        .get(*user_id)
+                        .is_none_or(|removed_at| *removed_at <= base_revision)
+                    && self
+                        .user_realtime_overlays
+                        .get(*user_id)
+                        .is_none_or(|overlay| overlay.revision <= base_revision)
+            })
+            .map(|(user_id, _)| user_id.clone())
+            .collect::<Vec<_>>();
+        for user_id in &removed {
+            self.users.remove(user_id);
+            self.user_snapshot_revisions.remove(user_id);
+            data_changed = true;
+        }
+        self.user_realtime_overlays
+            .retain(|_, overlay| overlay.revision > base_revision);
+
+        let confirmed_tombstones = self
+            .user_snapshot_tombstones
+            .keys()
+            .filter(|user_id| {
+                !incoming.contains_key(*user_id)
+                    && !self.users.contains_key(*user_id)
+                    && self
+                        .user_snapshot_tombstones
+                        .get(*user_id)
+                        .is_some_and(|removed_at| *removed_at <= base_revision)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // A realtime user can make the projection identical before the first bulk directory
+        // arrives, but that first authoritative adoption still has to replace the durable list.
+        let changed = data_changed || first_authoritative_adoption;
+        let accepted_any =
+            !accepted_present.is_empty() || !confirmed_tombstones.is_empty() || !removed.is_empty();
+        let accepted_revision = if changed {
+            revision
+        } else if accepted_any {
+            self.advance_causal_revision()
+        } else {
+            self.revision
+        };
+        for user_id in accepted_present {
+            self.user_snapshot_revisions
+                .insert(user_id.clone(), accepted_revision);
+            self.user_snapshot_tombstones.remove(&user_id);
+        }
+        for user_id in confirmed_tombstones {
+            self.user_snapshot_tombstones
+                .insert(user_id, accepted_revision);
+        }
+        for user_id in removed {
+            self.user_snapshot_tombstones
+                .insert(user_id, accepted_revision);
+        }
+
+        if !changed {
             return None;
         }
+        let mut users = self
+            .users
+            .values()
+            .map(|entry| entry.value.clone())
+            .collect::<Vec<_>>();
+        users.sort_by(|left, right| left.id.cmp(&right.id));
         self.commit(
             revision,
-            changed
-                .iter()
-                .cloned()
-                .map(WorkspaceChange::UserUpsert)
-                .collect(),
-            changed.into_iter().map(StoreChange::UserUpsert).collect(),
+            vec![WorkspaceChange::UsersReset(users.clone())],
+            vec![StoreChange::UsersReplaced(users)],
         )
     }
 
@@ -1630,14 +1747,41 @@ impl WorkspaceCoordinator {
             .map(str::trim)
             .filter(|user_id| !user_id.is_empty())?
             .to_string();
-        if self
+        let mut user = user;
+        user.id = Some(user_id.clone());
+        let overlay = self
+            .user_realtime_overlays
+            .get(&user_id)
+            .map(|entry| entry.value.clone().merge_sparse_update(user.clone()))
+            .unwrap_or_else(|| user.clone());
+        let user = self
             .users
             .get(&user_id)
-            .is_some_and(|entry| entry.value == user)
-        {
+            .map(|entry| entry.value.clone().merge_sparse_update(user.clone()))
+            .unwrap_or(user);
+        let user_changed = self
+            .users
+            .get(&user_id)
+            .is_none_or(|entry| entry.value != user);
+        if !user_changed {
+            let revision = self.advance_causal_revision();
+            self.user_realtime_overlays.insert(
+                user_id,
+                RevisionedValue {
+                    value: overlay,
+                    revision,
+                },
+            );
             return None;
         }
         let revision = self.next_revision();
+        self.user_realtime_overlays.insert(
+            user_id.clone(),
+            RevisionedValue {
+                value: overlay,
+                revision,
+            },
+        );
         self.users.insert(
             user_id,
             RevisionedValue {
@@ -4051,6 +4195,9 @@ impl Default for WorkspaceCoordinator {
             conversations: HashMap::new(),
             conversation_membership_tombstones: HashMap::new(),
             users: HashMap::new(),
+            user_snapshot_revisions: HashMap::new(),
+            user_snapshot_tombstones: HashMap::new(),
+            user_realtime_overlays: HashMap::new(),
             histories: HashMap::new(),
             threads: HashMap::new(),
             message_authority_by_ts: HashMap::new(),
@@ -4242,6 +4389,37 @@ mod tests {
             reduction.store_batch().is_none(),
             "the startup projection omits histories and must not replace persistent cache domains"
         );
+    }
+
+    #[test]
+    fn cached_user_hydration_establishes_snapshot_authority_without_a_rewrite() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let user = SlackUser {
+            id: Some("U1".to_string()),
+            name: Some("ada".to_string()),
+            ..Default::default()
+        };
+        coordinator
+            .apply_from(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    users: vec![user.clone()],
+                    ..Default::default()
+                }),
+            )
+            .expect("cache hydration should project the stored directory");
+        let refresh_base = coordinator.revision();
+
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    refresh_base,
+                    vec![user],
+                )))
+                .is_none(),
+            "an identical refresh must not rewrite an authoritative cached directory"
+        );
+        assert!(coordinator.revision() > refresh_base);
     }
 
     #[test]
@@ -4666,6 +4844,530 @@ mod tests {
         assert_eq!(
             coordinator.conversation("C1").unwrap().latest_message_ts(),
             Some("30.0")
+        );
+    }
+
+    #[test]
+    fn authoritative_user_snapshot_removes_absent_cached_directory_entries() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                vec![
+                    SlackUser {
+                        id: Some("U1".to_string()),
+                        name: Some("ada".to_string()),
+                        ..Default::default()
+                    },
+                    SlackUser {
+                        id: Some("U2".to_string()),
+                        name: Some("grace".to_string()),
+                        ..Default::default()
+                    },
+                ],
+            )))
+            .unwrap();
+        let base_revision = coordinator.revision();
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                base_revision,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada".to_string()),
+                    ..Default::default()
+                }],
+            )))
+            .expect("the removed user must produce one reduction");
+
+        assert_eq!(
+            coordinator
+                .store_projection()
+                .users
+                .iter()
+                .filter_map(|user| user.id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["U1"]
+        );
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::UsersReset(users)] if users.len() == 1
+        ));
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::UsersReplaced(users)] if users.len() == 1
+        ));
+    }
+
+    #[test]
+    fn sparse_user_upsert_keeps_the_coordinator_directory_record_complete() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada".to_string()),
+                    real_name: Some("Ada Lovelace".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        display_name: Some("Ada".to_string()),
+                        image_72: Some("https://example.test/ada.png".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            )))
+            .unwrap();
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U1".to_string()),
+                profile: Some(crate::models::SlackUserProfile {
+                    status_text: Some("Focusing".to_string()),
+                    status_emoji: Some(":headphones:".to_string()),
+                    status_expiration: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        let user = &coordinator.store_projection().users[0];
+        assert_eq!(user.name.as_deref(), Some("ada"));
+        assert_eq!(user.real_name.as_deref(), Some("Ada Lovelace"));
+        let profile = user.profile.as_ref().unwrap();
+        assert_eq!(profile.display_name.as_deref(), Some("Ada"));
+        assert_eq!(
+            profile.image_72.as_deref(),
+            Some("https://example.test/ada.png")
+        );
+        assert_eq!(profile.status_text.as_deref(), Some("Focusing"));
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::UserUpsert(user)]
+                if user.name.as_deref() == Some("ada")
+                    && user.profile.as_ref().and_then(|profile| profile.image_72.as_deref())
+                        == Some("https://example.test/ada.png")
+        ));
+    }
+
+    #[test]
+    fn full_user_snapshot_fills_a_newer_pre_bulk_sparse_realtime_user() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let snapshot_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U1".to_string()),
+                profile: Some(crate::models::SlackUserProfile {
+                    status_text: Some("Focusing".to_string()),
+                    status_emoji: Some(":headphones:".to_string()),
+                    status_expiration: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                snapshot_base,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada".to_string()),
+                    real_name: Some("Ada Lovelace".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        display_name: Some("Ada".to_string()),
+                        image_72: Some("https://example.test/ada.png".to_string()),
+                        status_text: Some("Old status".to_string()),
+                        status_emoji: Some(":hourglass:".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            )))
+            .expect("the full snapshot must fill the sparse user");
+
+        let user = &coordinator.store_projection().users[0];
+        assert_eq!(user.name.as_deref(), Some("ada"));
+        assert_eq!(user.real_name.as_deref(), Some("Ada Lovelace"));
+        let profile = user.profile.as_ref().unwrap();
+        assert_eq!(profile.display_name.as_deref(), Some("Ada"));
+        assert_eq!(
+            profile.image_72.as_deref(),
+            Some("https://example.test/ada.png")
+        );
+        assert_eq!(profile.status_text.as_deref(), Some("Focusing"));
+        assert_eq!(profile.status_emoji.as_deref(), Some(":headphones:"));
+    }
+
+    #[test]
+    fn first_authoritative_user_snapshot_persists_an_identical_pre_bulk_user() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let user = SlackUser {
+            id: Some("U1".to_string()),
+            name: Some("ada".to_string()),
+            profile: Some(crate::models::SlackUserProfile {
+                status_text: Some("Focusing".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        coordinator
+            .apply(WorkspaceMutation::UserUpsert(user.clone()))
+            .unwrap();
+        let snapshot_base = coordinator.revision();
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                snapshot_base,
+                vec![user],
+            )))
+            .expect("the first authoritative adoption must persist the full directory");
+
+        assert!(matches!(
+            reduction.patch().changes(),
+            [WorkspaceChange::UsersReset(users)] if users.len() == 1
+        ));
+        assert!(matches!(
+            reduction.store_batch().unwrap().changes(),
+            [StoreChange::UsersReplaced(users)] if users.len() == 1
+        ));
+    }
+
+    #[test]
+    fn identical_sparse_user_upsert_records_overlay_without_a_data_reduction() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        status_text: Some("Focusing".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            )))
+            .unwrap();
+        let stale_snapshot_base = coordinator.revision();
+
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::UserUpsert(SlackUser {
+                    id: Some("U1".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        status_text: Some("Focusing".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .is_none(),
+            "identical realtime data must not emit a patch or store batch"
+        );
+        assert!(
+            coordinator.revision() > stale_snapshot_base,
+            "the no-op realtime update must still advance causal authority"
+        );
+
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                stale_snapshot_base,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada-renamed".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        status_text: Some("Available".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            )))
+            .expect("the stale snapshot may still contribute unrelated fields");
+        let user = &coordinator.store_projection().users[0];
+        assert_eq!(user.name.as_deref(), Some("ada-renamed"));
+        assert_eq!(
+            user.profile
+                .as_ref()
+                .and_then(|profile| profile.status_text.as_deref()),
+            Some("Focusing")
+        );
+    }
+
+    #[test]
+    fn stale_user_snapshot_overlays_only_newer_sparse_realtime_fields() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        email: Some("old@example.test".to_string()),
+                        status_text: Some("Available".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            )))
+            .unwrap();
+        let snapshot_base = coordinator.revision();
+
+        coordinator
+            .apply(WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U1".to_string()),
+                profile: Some(crate::models::SlackUserProfile {
+                    status_text: Some("Focusing".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                snapshot_base,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada-renamed".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        email: Some("new@example.test".to_string()),
+                        status_text: Some("Available".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            )))
+            .unwrap();
+
+        let user = &coordinator.store_projection().users[0];
+        assert_eq!(user.name.as_deref(), Some("ada-renamed"));
+        let profile = user.profile.as_ref().unwrap();
+        assert_eq!(profile.email.as_deref(), Some("new@example.test"));
+        assert_eq!(profile.status_text.as_deref(), Some("Focusing"));
+    }
+
+    #[test]
+    fn stale_user_snapshot_cannot_resurrect_a_newer_snapshot_tombstone() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada".to_string()),
+                    ..Default::default()
+                }],
+            )))
+            .unwrap();
+        let stale_snapshot_base = coordinator.revision();
+
+        coordinator
+            .apply(WorkspaceMutation::ConversationUpsert(conversation(
+                "C1", "general",
+            )))
+            .unwrap();
+        let removal_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                removal_base,
+                Vec::new(),
+            )))
+            .expect("the newer snapshot must remove the absent user");
+        let removal_revision = coordinator.revision();
+
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    stale_snapshot_base,
+                    vec![SlackUser {
+                        id: Some("U1".to_string()),
+                        name: Some("stale".to_string()),
+                        ..Default::default()
+                    }],
+                )))
+                .is_none(),
+            "a stale snapshot must not resurrect an authoritative removal"
+        );
+        assert_eq!(coordinator.revision(), removal_revision);
+        assert!(coordinator.store_projection().users.is_empty());
+    }
+
+    #[test]
+    fn stale_user_snapshot_cannot_roll_back_fields_after_overlay_retirement() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        status_text: Some("Available".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            )))
+            .unwrap();
+        let stale_snapshot_base = coordinator.revision();
+
+        coordinator
+            .apply(WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U1".to_string()),
+                profile: Some(crate::models::SlackUserProfile {
+                    status_text: Some("Focusing".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+        let fresh_snapshot_base = coordinator.revision();
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                fresh_snapshot_base,
+                vec![SlackUser {
+                    id: Some("U1".to_string()),
+                    name: Some("ada-renamed".to_string()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        status_text: Some("Focusing".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            )))
+            .expect("the fresh snapshot must update the authoritative name");
+        let fresh_revision = coordinator.revision();
+
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    stale_snapshot_base,
+                    vec![SlackUser {
+                        id: Some("U1".to_string()),
+                        name: Some("stale-name".to_string()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            status_text: Some("Available".to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                )))
+                .is_none(),
+            "a stale snapshot must not roll back accepted authoritative fields"
+        );
+        assert_eq!(coordinator.revision(), fresh_revision);
+        let user = &coordinator.store_projection().users[0];
+        assert_eq!(user.name.as_deref(), Some("ada-renamed"));
+        assert_eq!(
+            user.profile
+                .as_ref()
+                .and_then(|profile| profile.status_text.as_deref()),
+            Some("Focusing")
+        );
+    }
+
+    #[test]
+    fn identical_fresh_user_snapshot_blocks_an_older_field_rollback() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let user = SlackUser {
+            id: Some("U1".to_string()),
+            name: Some("ada".to_string()),
+            ..Default::default()
+        };
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                vec![user.clone()],
+            )))
+            .unwrap();
+        let stale_snapshot_base = coordinator.revision();
+
+        coordinator
+            .apply(WorkspaceMutation::ConversationUpsert(conversation(
+                "C1", "general",
+            )))
+            .unwrap();
+        let fresh_snapshot_base = coordinator.revision();
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    fresh_snapshot_base,
+                    vec![user],
+                )))
+                .is_none(),
+            "identical authoritative data must not emit a reduction"
+        );
+        let fresh_authority_revision = coordinator.revision();
+        assert!(fresh_authority_revision > fresh_snapshot_base);
+
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    stale_snapshot_base,
+                    vec![SlackUser {
+                        id: Some("U1".to_string()),
+                        name: Some("stale-name".to_string()),
+                        ..Default::default()
+                    }],
+                )))
+                .is_none(),
+            "the accepted fresh snapshot must establish internal authority"
+        );
+        assert_eq!(coordinator.revision(), fresh_authority_revision);
+        assert_eq!(
+            coordinator.store_projection().users[0].name.as_deref(),
+            Some("ada")
+        );
+    }
+
+    #[test]
+    fn accepted_identical_user_snapshot_blocks_a_conflicting_same_base_response() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let user = SlackUser {
+            id: Some("U1".to_string()),
+            name: Some("ada".to_string()),
+            ..Default::default()
+        };
+        coordinator
+            .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                WorkspaceRevision::INITIAL,
+                vec![user.clone()],
+            )))
+            .unwrap();
+        let response_base = coordinator.revision();
+
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    response_base,
+                    vec![user],
+                )))
+                .is_none(),
+            "identical authoritative data must not emit a reduction"
+        );
+        let accepted_revision = coordinator.revision();
+        assert!(accepted_revision > response_base);
+
+        assert!(
+            coordinator
+                .apply(WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    response_base,
+                    vec![SlackUser {
+                        id: Some("U1".to_string()),
+                        name: Some("stale-name".to_string()),
+                        ..Default::default()
+                    }],
+                )))
+                .is_none(),
+            "a conflicting response at the accepted base must be stale"
+        );
+        assert_eq!(coordinator.revision(), accepted_revision);
+        assert_eq!(
+            coordinator.store_projection().users[0].name.as_deref(),
+            Some("ada")
         );
     }
 

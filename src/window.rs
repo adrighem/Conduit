@@ -314,7 +314,10 @@ mod imp {
         pub(super) workspace: WorkspaceSessionState,
         pub discovered_channels: RefCell<Vec<SlackConversation>>,
         pub discovered_users: RefCell<Vec<SlackUser>>,
+        pub user_directory_loaded: Cell<bool>,
+        pub user_directory_failed: Cell<bool>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
+        pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
         pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
         pub(super) sidebar_section_actions: RefCell<HashMap<i32, SidebarSectionKind>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
@@ -327,6 +330,8 @@ mod imp {
         pub user_group_names: RefCell<Arc<HashMap<String, String>>>,
         pub user_group_members: RefCell<Arc<HashMap<String, Vec<String>>>>,
         pub pending_user_ids: RefCell<HashSet<String>>,
+        pub deferred_user_ids: RefCell<HashSet<String>>,
+        pub user_directory_request_in_flight: Cell<bool>,
         pub pending_profile_user_id: RefCell<Option<String>>,
         pub workspace_id: RefCell<Option<String>>,
         pub workspace_team_id: RefCell<Option<String>>,
@@ -738,6 +743,7 @@ struct ComposerCompletion {
     list: gtk::ListBox,
     entries: Vec<ComposerCompletionEntry>,
     token: Option<ComposerCompletionToken>,
+    directory_checked_mention_start: Option<usize>,
 }
 
 fn composer_emoji_preview(entry: &EmojiEntry) -> gtk::Widget {
@@ -878,6 +884,46 @@ struct ConversationPickerView {
     search: gtk::SearchEntry,
     actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
     include_discovery: bool,
+}
+
+type PeoplePickerSubmit = Rc<dyn Fn(&ConduitWindow, Vec<String>)>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeoplePickerCandidate {
+    user_id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+struct PeoplePickerRow {
+    user_id: String,
+    search_name: String,
+    check: gtk::CheckButton,
+    row: gtk::ListBoxRow,
+}
+
+#[derive(Clone)]
+struct PeoplePickerView {
+    dialog: gtk::Window,
+    search: gtk::SearchEntry,
+    list: gtk::ListBox,
+    confirm: gtk::Button,
+    rows: Rc<RefCell<Vec<PeoplePickerRow>>>,
+    excluded_user_ids: HashSet<String>,
+}
+
+impl std::fmt::Debug for PeoplePickerView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PeoplePickerView")
+            .field("dialog", &self.dialog)
+            .field("search", &self.search)
+            .field("list", &self.list)
+            .field("confirm", &self.confirm)
+            .field("rows", &self.rows)
+            .field("excluded_user_ids", &self.excluded_user_ids)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1035,6 +1081,210 @@ fn picker_sections(
         },
         query,
     )
+}
+
+fn people_picker_candidates(
+    users: &[SlackUser],
+    current_user_id: Option<&str>,
+    excluded_user_ids: &HashSet<String>,
+) -> Vec<PeoplePickerCandidate> {
+    let mut people = users
+        .iter()
+        .filter(|user| !user.deleted.unwrap_or(false) && !user.is_bot.unwrap_or(false))
+        .filter_map(|user| {
+            let user_id = user.id.as_deref()?.trim();
+            let name = user.direct_message_name()?;
+            (!user_id.is_empty()
+                && Some(user_id) != current_user_id
+                && !excluded_user_ids.contains(user_id))
+            .then(|| PeoplePickerCandidate {
+                user_id: user_id.to_string(),
+                name,
+            })
+        })
+        .collect::<Vec<_>>();
+    people.sort_by_key(|person| person.name.to_lowercase());
+    people
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserLookupPlan {
+    deferred_ids: Vec<String>,
+    individual_ids: Vec<String>,
+    request_directory: bool,
+}
+
+fn plan_user_id_lookups(
+    ids: Vec<String>,
+    known_user_ids: &HashSet<String>,
+    directory_user_ids: &HashSet<String>,
+    pending_user_ids: &HashSet<String>,
+    directory_loaded: bool,
+    directory_failed: bool,
+    directory_request_in_flight: bool,
+) -> UserLookupPlan {
+    let mut missing_ids = ids
+        .into_iter()
+        .map(|user_id| user_id.trim().to_string())
+        .filter(|user_id| {
+            !user_id.is_empty()
+                && !known_user_ids.contains(user_id)
+                && !pending_user_ids.contains(user_id)
+        })
+        .collect::<Vec<_>>();
+    missing_ids.sort();
+    missing_ids.dedup();
+    if directory_loaded {
+        missing_ids.retain(|user_id| !directory_user_ids.contains(user_id));
+    }
+
+    if !directory_loaded || directory_failed || directory_request_in_flight {
+        return UserLookupPlan {
+            request_directory: !missing_ids.is_empty()
+                && !directory_loaded
+                && !directory_failed
+                && !directory_request_in_flight,
+            deferred_ids: missing_ids,
+            individual_ids: Vec::new(),
+        };
+    }
+
+    UserLookupPlan {
+        deferred_ids: Vec::new(),
+        individual_ids: missing_ids,
+        request_directory: false,
+    }
+}
+
+fn discovered_user_ids(users: &[SlackUser]) -> HashSet<String> {
+    users
+        .iter()
+        .filter_map(|user| user.id.as_deref())
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct UserDirectoryIdentityMaps {
+    names: HashMap<String, String>,
+    full_names: HashMap<String, String>,
+    avatar_urls: HashMap<String, String>,
+}
+
+fn user_directory_identity_maps(users: &[SlackUser]) -> UserDirectoryIdentityMaps {
+    let mut maps = UserDirectoryIdentityMaps::default();
+    for user in users {
+        let Some(user_id) = user
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|user_id| !user_id.is_empty())
+        else {
+            continue;
+        };
+        if let Some(name) = user.display_name().filter(|name| !name.trim().is_empty()) {
+            maps.names.insert(user_id.to_string(), name);
+        }
+        if let Some(full_name) = user.full_name().filter(|name| !name.trim().is_empty()) {
+            maps.full_names.insert(user_id.to_string(), full_name);
+        }
+        if let Some(avatar_url) = user.avatar_url().filter(|url| !url.trim().is_empty()) {
+            maps.avatar_urls.insert(user_id.to_string(), avatar_url);
+        }
+    }
+    maps
+}
+
+fn changed_map_keys<T: PartialEq>(
+    current: &HashMap<String, T>,
+    replacement: &HashMap<String, T>,
+) -> Vec<String> {
+    let mut keys = current
+        .keys()
+        .chain(replacement.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter(|key| current.get(key) != replacement.get(key))
+        .collect()
+}
+
+fn is_user_directory_request(context: &OperationContext) -> bool {
+    context.operation == RuntimeOperation::User && context.target == RuntimeTarget::Workspace
+}
+
+fn merge_discovered_user_update(users: &mut Vec<SlackUser>, mut update: SlackUser) -> bool {
+    let Some(user_id) = update
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
+        .map(ToString::to_string)
+    else {
+        return false;
+    };
+    update.id = Some(user_id.clone());
+
+    let Some(existing) = users.iter_mut().find(|user| {
+        user.id
+            .as_deref()
+            .is_some_and(|existing_id| existing_id.trim() == user_id)
+    }) else {
+        users.push(update);
+        return true;
+    };
+    let merged = existing.clone().merge_sparse_update(update);
+    if *existing == merged {
+        return false;
+    }
+    *existing = merged;
+    true
+}
+
+fn composer_directory_check_transition(
+    mention_start: Option<usize>,
+    checked_mention_start: Option<usize>,
+) -> (Option<usize>, bool) {
+    (
+        mention_start,
+        mention_start.is_some() && mention_start != checked_mention_start,
+    )
+}
+
+fn failed_user_directory_request(context: &OperationContext, directory_empty: bool) -> bool {
+    directory_empty && is_user_directory_request(context)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeoplePickerDirectoryState {
+    Loading,
+    LoadedEmpty,
+    Failed,
+}
+
+fn people_picker_directory_state(
+    directory_loaded: bool,
+    directory_failed: bool,
+) -> PeoplePickerDirectoryState {
+    if directory_failed {
+        PeoplePickerDirectoryState::Failed
+    } else if directory_loaded {
+        PeoplePickerDirectoryState::LoadedEmpty
+    } else {
+        PeoplePickerDirectoryState::Loading
+    }
+}
+
+fn people_picker_empty_message(state: PeoplePickerDirectoryState) -> &'static str {
+    match state {
+        PeoplePickerDirectoryState::Loading => "Loading people...",
+        PeoplePickerDirectoryState::LoadedEmpty => "No people available",
+        PeoplePickerDirectoryState::Failed => "Could not load people",
+    }
 }
 
 fn conversation_picker_population_entries(
@@ -4603,6 +4853,7 @@ impl ConduitWindow {
             list: list.clone(),
             entries: Vec::new(),
             token: None,
+            directory_checked_mention_start: None,
         };
         *self.composer_completion(target).borrow_mut() = Some(completion);
 
@@ -4657,6 +4908,31 @@ impl ConduitWindow {
         text_view.add_controller(controller);
     }
 
+    fn should_check_user_directory_for_mention(
+        &self,
+        target: ComposerTarget,
+        mention_start: Option<usize>,
+    ) -> bool {
+        let mut completion_ref = self.composer_completion(target).borrow_mut();
+        let Some(completion) = completion_ref.as_mut() else {
+            return false;
+        };
+        let (next_checked_start, should_check) = composer_directory_check_transition(
+            mention_start,
+            completion.directory_checked_mention_start,
+        );
+        completion.directory_checked_mention_start = next_checked_start;
+        should_check
+    }
+
+    fn reset_composer_user_directory_checks(&self) {
+        for target in COMPOSER_TARGETS {
+            if let Some(completion) = self.composer_completion(target).borrow_mut().as_mut() {
+                completion.directory_checked_mention_start = None;
+            }
+        }
+    }
+
     fn refresh_composer_completion(&self, target: ComposerTarget) {
         let text_view = self.composer_text_view(target);
         let buffer = text_view.buffer();
@@ -4665,6 +4941,14 @@ impl ConduitWindow {
         let mention_token = mention_token_at_caret(&text, caret).filter(|token| {
             !self.composer_range_intersects_mention(target, token.start, token.end)
         });
+        if self.should_check_user_directory_for_mention(
+            target,
+            mention_token.as_ref().map(|token| token.start),
+        ) {
+            // Cached candidates remain immediately available. The runtime decides
+            // whether the directory is old enough to require network activity.
+            self.request_user_directory();
+        }
         let (token, entries) = if let Some(token) = mention_token {
             let candidates = mention_candidates(&self.imp().discovered_users.borrow());
             let entries = search_mention_candidates(&candidates, &token.query, 10)
@@ -4906,6 +5190,18 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::Error(error) => {
+                if is_user_directory_request(&meta.context) {
+                    self.imp().user_directory_request_in_flight.set(false);
+                    self.imp().user_directory_failed.set(true);
+                    self.reset_composer_user_directory_checks();
+                    self.refresh_open_people_picker();
+                }
+                if failed_user_directory_request(
+                    &meta.context,
+                    self.imp().discovered_users.borrow().is_empty(),
+                ) {
+                    self.imp().user_directory_loaded.set(false);
+                }
                 self.handle_runtime_error(&meta.context, &error);
             }
             RuntimeEventKind::RuntimeStartFailed(error) => self.show_session_error(&error.message),
@@ -4916,7 +5212,6 @@ impl ConduitWindow {
             RuntimeEventKind::Authenticated(auth) => {
                 if !self.imp().connect_requested.get() {
                     self.show_workspace(auth);
-                    self.send_command(RuntimeCommand::DiscoverConversations);
                 }
             }
             RuntimeEventKind::WorkspacePatch(patch) => {
@@ -4942,18 +5237,14 @@ impl ConduitWindow {
                 self.refresh_open_conversation_picker();
             }
             RuntimeEventKind::ConversationPeopleDiscovered(users) => {
-                let names = users
-                    .iter()
-                    .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
-                    .collect::<HashMap<_, _>>();
-                let avatar_urls = users
-                    .iter()
-                    .filter_map(|user| Some((user.id.clone()?, user.avatar_url()?)))
-                    .collect::<HashMap<_, _>>();
-                self.populate_user_names(names);
-                self.populate_user_avatar_urls(avatar_urls);
+                self.imp().user_directory_request_in_flight.set(false);
+                self.imp().user_directory_loaded.set(true);
+                self.imp().user_directory_failed.set(false);
+                self.replace_user_directory_identity_maps(&users);
                 *self.imp().discovered_users.borrow_mut() = users;
+                self.resolve_deferred_user_ids();
                 self.refresh_open_conversation_picker();
+                self.refresh_open_people_picker();
                 for target in COMPOSER_TARGETS {
                     self.refresh_composer_completion(target);
                 }
@@ -6676,6 +6967,10 @@ impl ConduitWindow {
         if let Some(preflight) = imp.huddle_preflight_dialog.borrow_mut().take() {
             preflight.dialog.force_close();
         }
+        let people_picker = imp.people_picker_view.borrow_mut().take();
+        if let Some(view) = people_picker {
+            view.dialog.close();
+        }
         let status_dialog = imp.status_dialog.borrow_mut().take();
         if let Some(state) = status_dialog {
             state.dialog.force_close();
@@ -6700,6 +6995,8 @@ impl ConduitWindow {
         imp.pending_upload_drafts.borrow_mut().clear();
         imp.discovered_channels.borrow_mut().clear();
         imp.discovered_users.borrow_mut().clear();
+        imp.user_directory_loaded.set(false);
+        imp.user_directory_failed.set(false);
         imp.sidebar_row_actions.borrow_mut().clear();
         imp.sidebar_section_actions.borrow_mut().clear();
         *imp.user_names.borrow_mut() = Arc::default();
@@ -6712,6 +7009,8 @@ impl ConduitWindow {
         *imp.user_group_names.borrow_mut() = Arc::default();
         *imp.user_group_members.borrow_mut() = Arc::default();
         imp.pending_user_ids.borrow_mut().clear();
+        imp.deferred_user_ids.borrow_mut().clear();
+        imp.user_directory_request_in_flight.set(false);
         *imp.workspace_name.borrow_mut() = None;
         *imp.workspace_url.borrow_mut() = None;
         *imp.sidebar_error.borrow_mut() = None;
@@ -7153,7 +7452,6 @@ impl ConduitWindow {
 
     fn sync_conversations_from_catalog(&self) {
         *self.imp().sidebar_error.borrow_mut() = None;
-        self.request_conversation_user_names();
         self.render_conversations();
         if self.current_main_view() == MainMessageView::Unreads {
             self.populate_unreads(self.unread_items());
@@ -7192,6 +7490,32 @@ impl ConduitWindow {
             changed_user_ids
         };
 
+        self.user_names_changed(changed_user_ids);
+    }
+
+    fn replace_user_directory_identity_maps(&self, users: &[SlackUser]) {
+        let maps = user_directory_identity_maps(users);
+        let directory_user_ids = discovered_user_ids(users);
+        self.imp()
+            .pending_user_ids
+            .borrow_mut()
+            .retain(|user_id| !directory_user_ids.contains(user_id));
+        self.replace_user_names(maps.names);
+        self.replace_user_full_names(maps.full_names);
+        self.replace_user_avatar_urls(maps.avatar_urls);
+    }
+
+    fn replace_user_names(&self, replacement: HashMap<String, String>) {
+        let changed_user_ids = {
+            let mut current = self.imp().user_names.borrow_mut();
+            let changed_user_ids = changed_map_keys(current.as_ref(), &replacement);
+            *current = Arc::new(replacement);
+            changed_user_ids
+        };
+        self.user_names_changed(changed_user_ids);
+    }
+
+    fn user_names_changed(&self, changed_user_ids: Vec<String>) {
         if changed_user_ids.is_empty() {
             return;
         }
@@ -7233,7 +7557,28 @@ impl ConduitWindow {
         };
         if changed {
             self.queue_ui_invalidations(
-                UiInvalidations::MAIN | UiInvalidations::SIDEBAR | UiInvalidations::PICKER,
+                UiInvalidations::MAIN
+                    | UiInvalidations::THREAD
+                    | UiInvalidations::SIDEBAR
+                    | UiInvalidations::PICKER,
+            );
+            self.flush_pending_message_notifications();
+        }
+    }
+
+    fn replace_user_full_names(&self, replacement: HashMap<String, String>) {
+        let changed = {
+            let mut current = self.imp().user_full_names.borrow_mut();
+            let changed = !changed_map_keys(current.as_ref(), &replacement).is_empty();
+            *current = Arc::new(replacement);
+            changed
+        };
+        if changed {
+            self.queue_ui_invalidations(
+                UiInvalidations::MAIN
+                    | UiInvalidations::THREAD
+                    | UiInvalidations::SIDEBAR
+                    | UiInvalidations::PICKER,
             );
             self.flush_pending_message_notifications();
         }
@@ -7251,6 +7596,18 @@ impl ConduitWindow {
                 .fold(false, |changed, (user_id, url)| {
                     (known.insert(user_id, url.clone()).as_ref() != Some(&url)) || changed
                 })
+        };
+        if changed {
+            self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
+        }
+    }
+
+    fn replace_user_avatar_urls(&self, replacement: HashMap<String, String>) {
+        let changed = {
+            let mut current = self.imp().user_avatar_urls.borrow_mut();
+            let changed = !changed_map_keys(current.as_ref(), &replacement).is_empty();
+            *current = Arc::new(replacement);
+            changed
         };
         if changed {
             self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
@@ -7923,6 +8280,16 @@ impl ConduitWindow {
             },
         );
         self.send_command(RuntimeCommand::DiscoverChannels);
+        self.request_user_directory();
+    }
+
+    fn request_user_directory(&self) {
+        if self.imp().user_directory_request_in_flight.replace(true) {
+            return;
+        }
+        self.imp().user_directory_failed.set(false);
+        self.refresh_open_people_picker();
+        self.send_command(RuntimeCommand::LoadUserDirectory);
     }
 
     fn show_change_status_dialog(&self) {
@@ -8219,27 +8586,9 @@ impl ConduitWindow {
     ) where
         F: Fn(&Self, Vec<String>) + 'static,
     {
-        let excluded = excluded_user_ids.iter().collect::<HashSet<_>>();
-        let current_user_id = self.imp().current_user_id.borrow().clone();
-        let mut people = self
-            .imp()
-            .discovered_users
-            .borrow()
-            .iter()
-            .filter(|user| !user.deleted.unwrap_or(false) && !user.is_bot.unwrap_or(false))
-            .filter_map(|user| {
-                let id = user.id.as_ref()?.trim();
-                let name = user.direct_message_name()?;
-                (!id.is_empty()
-                    && Some(id) != current_user_id.as_deref()
-                    && !excluded.contains(&id.to_string()))
-                .then(|| (id.to_string(), name))
-            })
-            .collect::<Vec<_>>();
-        people.sort_by_key(|(_, name)| name.to_lowercase());
-        if people.is_empty() {
-            self.set_status(&gettext("No people available"));
-            return;
+        let people_picker = self.imp().people_picker_view.borrow_mut().take();
+        if let Some(view) = people_picker {
+            view.dialog.close();
         }
 
         let dialog = gtk::Window::builder()
@@ -8260,20 +8609,6 @@ impl ConduitWindow {
         container.append(&search);
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::None);
-        let rows = people
-            .into_iter()
-            .map(|(id, name)| {
-                let check = gtk::CheckButton::with_label(&name);
-                check.set_margin_top(6);
-                check.set_margin_bottom(6);
-                check.set_margin_start(9);
-                check.set_margin_end(9);
-                let row = gtk::ListBoxRow::new();
-                row.set_child(Some(&check));
-                list.append(&row);
-                (id, name.to_lowercase(), check, row)
-            })
-            .collect::<Vec<_>>();
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_vexpand(true);
         scroller.set_child(Some(&list));
@@ -8282,37 +8617,168 @@ impl ConduitWindow {
         confirm.add_css_class("suggested-action");
         confirm.set_sensitive(false);
         container.append(&confirm);
-        let rows = Rc::new(rows);
-        for (_, _, check, _) in rows.iter() {
-            let rows = rows.clone();
-            let confirm = confirm.clone();
-            check.connect_toggled(move |_| {
-                confirm.set_sensitive(rows.iter().any(|(_, _, check, _)| check.is_active()));
-            });
-        }
+        let rows = Rc::new(RefCell::new(Vec::<PeoplePickerRow>::new()));
         let rows_for_search = rows.clone();
         search.connect_search_changed(move |search| {
             let query = search.text().trim().to_lowercase();
-            for (_, name, _, row) in rows_for_search.iter() {
-                row.set_visible(query.is_empty() || name.contains(&query));
+            for row in rows_for_search.borrow().iter() {
+                row.row
+                    .set_visible(query.is_empty() || row.search_name.contains(&query));
             }
         });
         let weak_window = self.downgrade();
         let dialog_for_submit = dialog.clone();
-        let on_submit = Rc::new(on_submit);
+        let on_submit: PeoplePickerSubmit = Rc::new(on_submit);
+        let on_submit_for_click = on_submit.clone();
+        let rows_for_submit = rows.clone();
         confirm.connect_clicked(move |_| {
-            let user_ids = rows
+            let user_ids = rows_for_submit
+                .borrow()
                 .iter()
-                .filter(|(_, _, check, _)| check.is_active())
-                .map(|(id, _, _, _)| id.clone())
+                .filter(|row| row.check.is_active())
+                .map(|row| row.user_id.clone())
                 .collect::<Vec<_>>();
             if let Some(window) = weak_window.upgrade() {
-                on_submit(&window, user_ids);
+                on_submit_for_click(&window, user_ids);
                 dialog_for_submit.close();
             }
         });
+
+        *self.imp().people_picker_view.borrow_mut() = Some(PeoplePickerView {
+            dialog: dialog.clone(),
+            search: search.clone(),
+            list: list.clone(),
+            confirm,
+            rows,
+            excluded_user_ids: excluded_user_ids.iter().cloned().collect(),
+        });
+
+        let weak_window = self.downgrade();
+        let list_for_close = list;
+        dialog.connect_close_request(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                let mut active = window.imp().people_picker_view.borrow_mut();
+                if active
+                    .as_ref()
+                    .is_some_and(|view| view.list == list_for_close)
+                {
+                    active.take();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+
+        self.refresh_open_people_picker();
         dialog.present();
         search.grab_focus();
+        self.request_user_directory();
+    }
+
+    fn refresh_open_people_picker(&self) {
+        let Some(view) = self.imp().people_picker_view.borrow().clone() else {
+            return;
+        };
+        let selected_user_ids = view
+            .rows
+            .borrow()
+            .iter()
+            .filter(|row| row.check.is_active())
+            .map(|row| row.user_id.clone())
+            .collect::<HashSet<_>>();
+        let (people, directory_state) = {
+            let imp = self.imp();
+            let current_user_id = imp.current_user_id.borrow().clone();
+            let users = imp.discovered_users.borrow();
+            (
+                people_picker_candidates(
+                    &users,
+                    current_user_id.as_deref(),
+                    &view.excluded_user_ids,
+                ),
+                people_picker_directory_state(
+                    imp.user_directory_loaded.get(),
+                    imp.user_directory_failed.get(),
+                ),
+            )
+        };
+
+        self.clear_list(&view.list);
+        view.rows.borrow_mut().clear();
+        view.confirm.set_sensitive(false);
+        if people.is_empty() {
+            if directory_state == PeoplePickerDirectoryState::Failed {
+                self.append_people_picker_load_failure(&view.list);
+            } else {
+                self.append_placeholder(
+                    &view.list,
+                    &gettext(people_picker_empty_message(directory_state)),
+                );
+            }
+            return;
+        }
+
+        for person in people {
+            let check = gtk::CheckButton::with_label(&person.name);
+            check.set_margin_top(6);
+            check.set_margin_bottom(6);
+            check.set_margin_start(9);
+            check.set_margin_end(9);
+            check.set_active(selected_user_ids.contains(&person.user_id));
+            let row = gtk::ListBoxRow::new();
+            row.set_child(Some(&check));
+            view.list.append(&row);
+            view.rows.borrow_mut().push(PeoplePickerRow {
+                user_id: person.user_id,
+                search_name: person.name.to_lowercase(),
+                check: check.clone(),
+                row,
+            });
+
+            let rows = Rc::downgrade(&view.rows);
+            let confirm = view.confirm.clone();
+            check.connect_toggled(move |_| {
+                let selected = rows
+                    .upgrade()
+                    .is_some_and(|rows| rows.borrow().iter().any(|row| row.check.is_active()));
+                confirm.set_sensitive(selected);
+            });
+        }
+
+        let query = view.search.text().trim().to_lowercase();
+        for row in view.rows.borrow().iter() {
+            row.row
+                .set_visible(query.is_empty() || row.search_name.contains(&query));
+        }
+        view.confirm
+            .set_sensitive(view.rows.borrow().iter().any(|row| row.check.is_active()));
+    }
+
+    fn append_people_picker_load_failure(&self, list: &gtk::ListBox) {
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_bottom(12);
+        content.append(
+            &self.placeholder_label(&gettext(people_picker_empty_message(
+                PeoplePickerDirectoryState::Failed,
+            ))),
+        );
+
+        let retry = gtk::Button::with_label(&gettext("Retry"));
+        retry.set_halign(gtk::Align::Start);
+        retry.set_margin_start(12);
+        retry.add_css_class("suggested-action");
+        let weak_window = self.downgrade();
+        retry.connect_clicked(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.request_user_directory();
+            }
+        });
+        content.append(&retry);
+
+        let row = gtk::ListBoxRow::new();
+        row.set_selectable(false);
+        row.set_activatable(false);
+        row.set_child(Some(&content));
+        list.append(&row);
     }
 
     fn show_new_channel_dialog(&self) {
@@ -9141,16 +9607,27 @@ impl ConduitWindow {
                 let Some(user_id) = user.id.clone() else {
                     return;
                 };
-                if let Some(display_name) = user.display_name() {
+                let (directory_changed, directory_user) = {
+                    let mut users = self.imp().discovered_users.borrow_mut();
+                    let directory_changed =
+                        merge_discovered_user_update(&mut users, user.as_ref().clone());
+                    let directory_user = users
+                        .iter()
+                        .find(|candidate| candidate.id.as_deref() == Some(user_id.as_str()))
+                        .cloned()
+                        .unwrap_or_else(|| user.as_ref().clone());
+                    (directory_changed, directory_user)
+                };
+                if let Some(display_name) = directory_user.display_name() {
                     self.populate_user_names(HashMap::from([(user_id.clone(), display_name)]));
                 }
-                if let Some(full_name) = user.full_name() {
+                if let Some(full_name) = directory_user.full_name() {
                     self.populate_user_full_names(HashMap::from([(user_id.clone(), full_name)]));
                 }
-                if let Some(avatar_url) = user.avatar_url() {
+                if let Some(avatar_url) = directory_user.avatar_url() {
                     self.populate_user_avatar_urls(HashMap::from([(user_id.clone(), avatar_url)]));
                 }
-                if let Some(profile) = user.profile.as_ref() {
+                if let Some(profile) = directory_user.profile.as_ref() {
                     let mut statuses = self.imp().user_statuses.borrow_mut();
                     let changed = apply_user_status_profile_update(
                         Arc::make_mut(&mut statuses),
@@ -9159,7 +9636,18 @@ impl ConduitWindow {
                     );
                     drop(statuses);
                     if changed {
-                        self.user_statuses_changed(vec![user_id]);
+                        self.user_statuses_changed(vec![user_id.clone()]);
+                    }
+                }
+                if directory_changed {
+                    self.imp()
+                        .user_search_aliases
+                        .borrow_mut()
+                        .insert(user_id, directory_user.search_aliases());
+                    self.refresh_open_conversation_picker();
+                    self.refresh_open_people_picker();
+                    for target in COMPOSER_TARGETS {
+                        self.refresh_composer_completion(target);
                     }
                 }
             }
@@ -10247,35 +10735,56 @@ impl ConduitWindow {
         self.request_user_ids(ids);
     }
 
-    fn request_conversation_user_names(&self) {
-        let mut ids = self
-            .imp()
-            .workspace
-            .conversations()
-            .conversations()
-            .iter()
-            .flat_map(SlackConversation::display_user_ids)
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
-
-        self.request_user_ids(ids);
+    fn request_user_ids(&self, ids: Vec<String>) {
+        let imp = self.imp();
+        let known_user_ids = imp.user_names.borrow().keys().cloned().collect();
+        let directory_user_ids = discovered_user_ids(&imp.discovered_users.borrow());
+        let plan = plan_user_id_lookups(
+            ids,
+            &known_user_ids,
+            &directory_user_ids,
+            &imp.pending_user_ids.borrow(),
+            imp.user_directory_loaded.get(),
+            imp.user_directory_failed.get(),
+            imp.user_directory_request_in_flight.get(),
+        );
+        imp.deferred_user_ids.borrow_mut().extend(plan.deferred_ids);
+        if plan.request_directory {
+            self.request_user_directory();
+        }
+        self.send_individual_user_lookups(plan.individual_ids);
     }
 
-    fn request_user_ids(&self, ids: Vec<String>) {
-        let known_users = self.imp().user_names.borrow();
-        let mut pending_user_ids = self.imp().pending_user_ids.borrow_mut();
-        let missing_ids = ids
-            .into_iter()
-            .filter(|user_id| {
-                !known_users.contains_key(user_id) && pending_user_ids.insert(user_id.clone())
-            })
-            .collect::<Vec<_>>();
-        drop(pending_user_ids);
-        drop(known_users);
+    fn resolve_deferred_user_ids(&self) {
+        let imp = self.imp();
+        let deferred_ids = std::mem::take(&mut *imp.deferred_user_ids.borrow_mut());
+        if deferred_ids.is_empty() {
+            return;
+        }
+        let known_user_ids = imp.user_names.borrow().keys().cloned().collect();
+        let directory_user_ids = discovered_user_ids(&imp.discovered_users.borrow());
+        let plan = plan_user_id_lookups(
+            deferred_ids.into_iter().collect(),
+            &known_user_ids,
+            &directory_user_ids,
+            &imp.pending_user_ids.borrow(),
+            true,
+            false,
+            false,
+        );
+        self.send_individual_user_lookups(plan.individual_ids);
+    }
 
-        for user_id in missing_ids {
-            self.send_command(RuntimeCommand::LoadUser { user_id });
+    fn send_individual_user_lookups(&self, ids: Vec<String>) {
+        for user_id in ids {
+            if self
+                .imp()
+                .pending_user_ids
+                .borrow_mut()
+                .insert(user_id.clone())
+            {
+                self.send_command(RuntimeCommand::LoadUser { user_id });
+            }
         }
     }
 
@@ -10734,6 +11243,506 @@ fn update_huddle_device_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_user_directory_is_requested_only_by_consumers() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let authenticated = production
+            .split_once("            RuntimeEventKind::Authenticated(auth) => {")
+            .unwrap()
+            .1
+            .split_once("            RuntimeEventKind::WorkspacePatch(patch) => {")
+            .unwrap()
+            .0;
+        let switcher = production
+            .split_once("    fn show_conversation_switcher(&self) {")
+            .unwrap()
+            .1
+            .split_once("    fn request_user_directory(&self) {")
+            .unwrap()
+            .0;
+        let directory_request = production
+            .split_once("    fn request_user_directory(&self) {")
+            .unwrap()
+            .1
+            .split_once("    fn show_change_status_dialog(&self) {")
+            .unwrap()
+            .0;
+        let people_picker = production
+            .split_once("    fn show_people_picker<F>(")
+            .unwrap()
+            .1
+            .split_once("    fn show_new_channel_dialog(&self) {")
+            .unwrap()
+            .0;
+        let composer_completion = production
+            .split_once("    fn refresh_composer_completion(&self, target: ComposerTarget) {")
+            .unwrap()
+            .1
+            .split_once("    fn dismiss_composer_completion(&self, target: ComposerTarget) {")
+            .unwrap()
+            .0;
+
+        assert!(!authenticated.contains("DiscoverConversations"));
+        assert!(!authenticated.contains("LoadUserDirectory"));
+        assert!(switcher.contains("self.request_user_directory();"));
+        assert!(directory_request.contains("RuntimeCommand::LoadUserDirectory"));
+        assert!(people_picker.contains("request_user_directory"));
+        assert!(composer_completion.contains("request_user_directory"));
+    }
+
+    #[test]
+    fn catalog_sync_never_fans_out_per_user_requests() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let catalog_sync = production
+            .split_once("    fn sync_conversations_from_catalog(&self) {")
+            .unwrap()
+            .1
+            .split_once("    fn populate_user_names(&self")
+            .unwrap()
+            .0;
+
+        assert!(!catalog_sync.contains("request_user_names"));
+        assert!(!catalog_sync.contains("request_user_ids"));
+        assert!(!catalog_sync.contains("RuntimeCommand::LoadUser"));
+        assert!(!production.contains("fn request_conversation_user_names"));
+    }
+
+    #[test]
+    fn implicit_user_lookups_wait_for_the_authoritative_directory() {
+        let known_user_ids = HashSet::from(["U_KNOWN".to_string()]);
+        let directory_user_ids = HashSet::from(["U_NAMELESS".to_string()]);
+        let pending_user_ids = HashSet::new();
+        let requested = vec![
+            "U_KNOWN".to_string(),
+            "U_NAMELESS".to_string(),
+            "U_MISSING".to_string(),
+            "U_MISSING".to_string(),
+        ];
+
+        let initial = plan_user_id_lookups(
+            requested.clone(),
+            &known_user_ids,
+            &directory_user_ids,
+            &pending_user_ids,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            initial,
+            UserLookupPlan {
+                deferred_ids: vec!["U_MISSING".to_string(), "U_NAMELESS".to_string()],
+                individual_ids: Vec::new(),
+                request_directory: true,
+            }
+        );
+
+        let while_loading = plan_user_id_lookups(
+            requested.clone(),
+            &known_user_ids,
+            &directory_user_ids,
+            &pending_user_ids,
+            false,
+            false,
+            true,
+        );
+        assert!(!while_loading.request_directory);
+        assert!(while_loading.individual_ids.is_empty());
+
+        let after_directory = plan_user_id_lookups(
+            requested,
+            &known_user_ids,
+            &directory_user_ids,
+            &pending_user_ids,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(after_directory.deferred_ids, Vec::<String>::new());
+        assert_eq!(after_directory.individual_ids, vec!["U_MISSING"]);
+        assert!(!after_directory.request_directory);
+
+        let while_refreshing = plan_user_id_lookups(
+            vec!["U_NEW".to_string()],
+            &known_user_ids,
+            &directory_user_ids,
+            &pending_user_ids,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(while_refreshing.deferred_ids, vec!["U_NEW"]);
+        assert!(while_refreshing.individual_ids.is_empty());
+
+        let after_failed_refresh = plan_user_id_lookups(
+            vec!["U_NEW".to_string()],
+            &known_user_ids,
+            &directory_user_ids,
+            &pending_user_ids,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(after_failed_refresh.deferred_ids, vec!["U_NEW"]);
+        assert!(after_failed_refresh.individual_ids.is_empty());
+        assert!(!after_failed_refresh.request_directory);
+    }
+
+    #[test]
+    fn bulk_directory_members_never_trigger_users_info_without_a_display_name() {
+        let users = vec![SlackUser {
+            id: Some("U_NAMELESS".to_string()),
+            ..Default::default()
+        }];
+        let directory_user_ids = discovered_user_ids(&users);
+        let plan = plan_user_id_lookups(
+            vec!["U_NAMELESS".to_string()],
+            &HashSet::new(),
+            &directory_user_ids,
+            &HashSet::new(),
+            true,
+            false,
+            false,
+        );
+
+        assert!(plan.individual_ids.is_empty());
+    }
+
+    #[test]
+    fn authoritative_directory_identity_maps_remove_users_and_cleared_values() {
+        let users = vec![
+            SlackUser {
+                id: Some("U_KEEP".to_string()),
+                name: Some("keep".to_string()),
+                profile: Some(SlackUserProfile {
+                    display_name: Some("Kept Name".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            SlackUser {
+                id: Some("U_CLEARED".to_string()),
+                ..Default::default()
+            },
+        ];
+        let replacement = user_directory_identity_maps(&users);
+
+        assert_eq!(
+            replacement.names,
+            HashMap::from([("U_KEEP".to_string(), "Kept Name".to_string())])
+        );
+        assert!(replacement.full_names.is_empty());
+        assert!(replacement.avatar_urls.is_empty());
+
+        let current_names = HashMap::from([
+            ("U_KEEP".to_string(), "Old Name".to_string()),
+            ("U_CLEARED".to_string(), "Stale Name".to_string()),
+            ("U_REMOVED".to_string(), "Removed Name".to_string()),
+        ]);
+        assert_eq!(
+            changed_map_keys(&current_names, &replacement.names),
+            vec![
+                "U_CLEARED".to_string(),
+                "U_KEEP".to_string(),
+                "U_REMOVED".to_string(),
+            ]
+        );
+        assert_eq!(
+            changed_map_keys(
+                &HashMap::from([("U_CLEARED".to_string(), "stale-avatar".to_string())]),
+                &replacement.avatar_urls,
+            ),
+            vec!["U_CLEARED".to_string()]
+        );
+    }
+
+    #[test]
+    fn bulk_directory_event_replaces_identity_maps_while_incremental_events_upsert() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let directory_result = production
+            .split_once("            RuntimeEventKind::ConversationPeopleDiscovered(users) => {")
+            .unwrap()
+            .1
+            .split_once("            RuntimeEventKind::ConversationOpened")
+            .unwrap()
+            .0;
+        let user_loaded = production
+            .split_once("            RuntimeEventKind::UserLoaded {")
+            .unwrap()
+            .1
+            .split_once("            RuntimeEventKind::UserProfileLoaded")
+            .unwrap()
+            .0;
+
+        assert!(directory_result.contains("replace_user_directory_identity_maps(&users)"));
+        assert!(!directory_result.contains("populate_user_names"));
+        assert!(!directory_result.contains("populate_user_full_names"));
+        assert!(!directory_result.contains("populate_user_avatar_urls"));
+        assert!(user_loaded.contains("populate_user_names"));
+        assert!(user_loaded.contains("populate_user_full_names"));
+        assert!(user_loaded.contains("populate_user_avatar_urls"));
+    }
+
+    #[test]
+    fn implicit_lookup_deferral_is_completed_and_reset_on_every_terminal_path() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let directory_result = production
+            .split_once("            RuntimeEventKind::ConversationPeopleDiscovered(users) => {")
+            .unwrap()
+            .1
+            .split_once("            RuntimeEventKind::ConversationOpened")
+            .unwrap()
+            .0;
+        let error_handler = production
+            .split_once("            RuntimeEventKind::Error(error) => {")
+            .unwrap()
+            .1
+            .split_once("            RuntimeEventKind::RuntimeStartFailed")
+            .unwrap()
+            .0;
+        let reset = production
+            .split_once("    fn reset_workspace_state(&self) {")
+            .unwrap()
+            .1
+            .split_once("    fn show_workspace(&self, auth: AuthInfo) {")
+            .unwrap()
+            .0;
+        let profile = production
+            .split_once("    fn show_user_profile(&self, user_id: &str) {")
+            .unwrap()
+            .1
+            .split_once("    fn ")
+            .unwrap()
+            .0;
+
+        assert!(directory_result.contains("resolve_deferred_user_ids"));
+        assert!(!error_handler.contains("resolve_deferred_user_ids"));
+        assert!(error_handler.contains("user_directory_request_in_flight.set(false)"));
+        assert!(reset.contains("deferred_user_ids.borrow_mut().clear()"));
+        assert!(reset.contains("user_directory_request_in_flight.set(false)"));
+        assert!(profile.contains("RuntimeCommand::LoadUserProfile"));
+    }
+
+    #[test]
+    fn people_picker_candidates_filter_and_sort_directory_users() {
+        let users = vec![
+            SlackUser {
+                id: Some("U_CURRENT".to_string()),
+                name: Some("current".to_string()),
+                ..Default::default()
+            },
+            SlackUser {
+                id: Some("U_GRACE".to_string()),
+                real_name: Some("Grace Hopper".to_string()),
+                ..Default::default()
+            },
+            SlackUser {
+                id: Some("U_ADA".to_string()),
+                real_name: Some("Ada Lovelace".to_string()),
+                ..Default::default()
+            },
+            SlackUser {
+                id: Some("U_EXCLUDED".to_string()),
+                name: Some("excluded".to_string()),
+                ..Default::default()
+            },
+            SlackUser {
+                id: Some("U_DELETED".to_string()),
+                name: Some("deleted".to_string()),
+                deleted: Some(true),
+                ..Default::default()
+            },
+            SlackUser {
+                id: Some("U_BOT".to_string()),
+                name: Some("bot".to_string()),
+                is_bot: Some(true),
+                ..Default::default()
+            },
+        ];
+        let excluded = HashSet::from(["U_EXCLUDED".to_string()]);
+
+        assert_eq!(
+            people_picker_candidates(&users, Some("U_CURRENT"), &excluded),
+            vec![
+                PeoplePickerCandidate {
+                    user_id: "U_ADA".to_string(),
+                    name: "Ada Lovelace".to_string(),
+                },
+                PeoplePickerCandidate {
+                    user_id: "U_GRACE".to_string(),
+                    name: "Grace Hopper".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn realtime_user_updates_merge_into_the_discovered_directory() {
+        let mut users = vec![SlackUser {
+            id: Some("U_ADA".to_string()),
+            name: Some("ada".to_string()),
+            real_name: Some("Ada Lovelace".to_string()),
+            profile: Some(SlackUserProfile {
+                display_name: Some("Ada".to_string()),
+                email: Some("ada@example.test".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+
+        assert!(merge_discovered_user_update(
+            &mut users,
+            SlackUser {
+                id: Some("U_ADA".to_string()),
+                profile: Some(SlackUserProfile {
+                    display_name: Some("Ada Byron".to_string()),
+                    status_text: Some("Focusing".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ));
+
+        assert_eq!(users.len(), 1);
+        let user = &users[0];
+        assert_eq!(user.name.as_deref(), Some("ada"));
+        assert_eq!(user.real_name.as_deref(), Some("Ada Lovelace"));
+        let profile = user.profile.as_ref().unwrap();
+        assert_eq!(profile.display_name.as_deref(), Some("Ada Byron"));
+        assert_eq!(profile.email.as_deref(), Some("ada@example.test"));
+        assert_eq!(profile.status_text.as_deref(), Some("Focusing"));
+
+        assert!(merge_discovered_user_update(
+            &mut users,
+            SlackUser {
+                id: Some("U_GRACE".to_string()),
+                real_name: Some("Grace Hopper".to_string()),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(users.len(), 2);
+        assert!(!merge_discovered_user_update(
+            &mut users,
+            SlackUser {
+                id: Some("U_GRACE".to_string()),
+                real_name: Some("Grace Hopper".to_string()),
+                ..Default::default()
+            },
+        ));
+    }
+
+    #[test]
+    fn composer_directory_check_is_gated_per_active_mention_token() {
+        assert_eq!(
+            composer_directory_check_transition(Some(4), None),
+            (Some(4), true)
+        );
+        assert_eq!(
+            composer_directory_check_transition(Some(4), Some(4)),
+            (Some(4), false),
+            "typing more characters in the same mention must not enqueue another check"
+        );
+        assert_eq!(
+            composer_directory_check_transition(Some(18), Some(4)),
+            (Some(18), true),
+            "moving to a different mention token starts one freshness check"
+        );
+        assert_eq!(
+            composer_directory_check_transition(None, Some(18)),
+            (None, false),
+            "leaving mention completion resets the per-token gate"
+        );
+        assert_eq!(
+            composer_directory_check_transition(Some(18), None),
+            (Some(18), true),
+            "a later mention session checks freshness again"
+        );
+    }
+
+    #[test]
+    fn only_failed_empty_workspace_directory_requests_enter_failure_state() {
+        let workspace_user =
+            OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace);
+        let profile_user = OperationContext::new(
+            RuntimeOperation::User,
+            RuntimeTarget::User("U1".to_string()),
+        );
+        let workspace_history =
+            OperationContext::new(RuntimeOperation::History, RuntimeTarget::Workspace);
+
+        assert!(failed_user_directory_request(&workspace_user, true));
+        assert!(!failed_user_directory_request(&workspace_user, false));
+        assert!(!failed_user_directory_request(&profile_user, true));
+        assert!(!failed_user_directory_request(&workspace_history, true));
+    }
+
+    #[test]
+    fn empty_people_picker_distinguishes_loading_loaded_and_failed_states() {
+        let loading = people_picker_directory_state(false, false);
+        let loaded = people_picker_directory_state(true, false);
+        let failed = people_picker_directory_state(false, true);
+
+        assert_eq!(loading, PeoplePickerDirectoryState::Loading);
+        assert_eq!(people_picker_empty_message(loading), "Loading people...");
+        assert_eq!(loaded, PeoplePickerDirectoryState::LoadedEmpty);
+        assert_eq!(people_picker_empty_message(loaded), "No people available");
+        assert_eq!(failed, PeoplePickerDirectoryState::Failed);
+        assert_eq!(people_picker_empty_message(failed), "Could not load people");
+        assert_eq!(
+            people_picker_directory_state(true, true),
+            PeoplePickerDirectoryState::Failed,
+            "a failed refresh must not be hidden by an earlier empty result"
+        );
+    }
+
+    #[test]
+    fn failed_people_picker_load_exposes_retry_and_restores_loading_state() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let error_handler = production
+            .split_once("            RuntimeEventKind::Error(error) => {")
+            .unwrap()
+            .1
+            .split_once("            RuntimeEventKind::RuntimeStartFailed")
+            .unwrap()
+            .0;
+        let directory_request = production
+            .split_once("    fn request_user_directory(&self) {")
+            .unwrap()
+            .1
+            .split_once("    fn show_change_status_dialog(&self) {")
+            .unwrap()
+            .0;
+        let failure_view = production
+            .split_once("    fn append_people_picker_load_failure(&self")
+            .unwrap()
+            .1
+            .split_once("    fn show_new_channel_dialog(&self)")
+            .unwrap()
+            .0;
+
+        assert!(error_handler.contains("user_directory_failed.set(true)"));
+        assert!(error_handler.contains("refresh_open_people_picker"));
+        assert!(directory_request.contains("user_directory_failed.set(false)"));
+        assert!(directory_request.contains("refresh_open_people_picker"));
+        assert!(failure_view.contains("Button::with_label(&gettext(\"Retry\"))"));
+        assert!(failure_view.contains("request_user_directory"));
+    }
 
     #[test]
     fn message_web_view_context_menu_classifies_unsupported_navigation_actions() {

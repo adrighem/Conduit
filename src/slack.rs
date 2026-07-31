@@ -795,14 +795,6 @@ impl SlackApi {
         Ok(response.file)
     }
 
-    pub async fn user_display_name(&self, user_id: &str) -> Result<String> {
-        Ok(self
-            .user(user_id)
-            .await?
-            .display_name()
-            .unwrap_or_else(|| user_id.to_string()))
-    }
-
     pub async fn user(&self, user_id: &str) -> Result<SlackUser> {
         let response: UserInfoResponse = self
             .post_form("users.info", &[("user", user_id.to_string())])
@@ -3215,6 +3207,79 @@ mod tests {
             paginated_list_params(Some("  "), false),
             vec![("limit", "200".to_string())]
         );
+    }
+
+    #[test]
+    fn membership_paginates_all_1430_conversations() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut observations = Vec::new();
+            for page in 0..8 {
+                let start = page * 200;
+                let end = (start + 200).min(1_430);
+                let channels = (start..end)
+                    .map(|index| {
+                        serde_json::json!({
+                            "id": format!("C{index:04}"),
+                            "name": format!("channel-{index:04}"),
+                            "is_channel": true,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let next_cursor = (page < 7).then(|| format!("page-{}", page + 1));
+                let response_body = serde_json::json!({
+                    "ok": true,
+                    "channels": channels,
+                    "response_metadata": {
+                        "next_cursor": next_cursor.unwrap_or_default(),
+                    },
+                })
+                .to_string();
+                let mut request = server.recv().expect("mock Slack request should arrive");
+                let path = request.url().to_string();
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("mock Slack request body should be readable");
+                request
+                    .respond(
+                        Response::from_string(response_body).with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("content type header should be valid"),
+                        ),
+                    )
+                    .expect("mock Slack response should be sent");
+                observations.push((path, body));
+            }
+            observations
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let conversations = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.conversations())
+            .expect("all membership pages should load");
+
+        assert_eq!(conversations.len(), 1_430);
+        let observations = received.join().expect("mock Slack server should finish");
+        assert_eq!(observations.len(), 8);
+        for (page, (path, body)) in observations.iter().enumerate() {
+            assert_eq!(path, "/api/users.conversations");
+            let form = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>();
+            assert_eq!(form.get("limit").map(String::as_str), Some("200"));
+            assert_eq!(
+                form.get("cursor").map(String::as_str),
+                (page > 0).then(|| format!("page-{page}")).as_deref(),
+            );
+        }
     }
 
     #[test]

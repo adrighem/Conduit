@@ -25,7 +25,7 @@ Conduit is an independent project and is not affiliated with or endorsed by Slac
 - Fast conversation switcher with discovery of channels and people.
 - Create public or private channels, start direct or group messages, and add people to existing conversations when Slack permissions allow it.
 - GNOME Shell search-provider integration for opening cached channels, existing direct messages, and new direct messages with cached workspace members straight from the desktop overview. It reads only conversation and name metadata for the active workspace and never indexes message history.
-- Transactional SQLite caching for conversations, names, histories, threads, unread state, statuses, and custom emoji, with automatic migration from the earlier JSON cache.
+- Transactional SQLite caching for conversations, the Slack user directory and profile metadata, histories, threads, unread state, statuses, and custom emoji, with automatic migration from the earlier JSON cache.
 - Unread badges, muted and external-conversation indicators, read markers, and relevant-only desktop notifications for direct messages, mentions, configured terms, and interested-thread replies.
 - Slack status emoji and hover text for people in direct messages, shown consistently in navigation, switchers, titles, and message authors.
 - The workspace header shows your display name and active custom status. Its menu opens a native status editor with searchable emoji, expiration choices, and explicit clearing.
@@ -310,7 +310,7 @@ That target is limited to counters, booleans, and stable category codes; it excl
 ## Local data and security
 
 - OAuth tokens, imported browser-session credentials, and Socket Mode app tokens are stored through the system Secret Service/keyring.
-- Workspace metadata, resolved names and statuses, emoji information, and message and thread history are stored in `state/state.sqlite3` below Conduit's XDG cache directory. Downloaded attachments, image/media data, and WebKit data are cached in sibling directories. None has additional application-level encryption.
+- Workspace metadata, the Slack user directory and profile metadata, resolved names and statuses, emoji information, and message and thread history are stored in `state/state.sqlite3` below Conduit's XDG cache directory. Downloaded attachments, image/media data, and WebKit data are cached in sibling directories. None has additional application-level encryption.
 - Drafts and preferences are stored through GSettings.
 - Huddle media, portal sessions, SDP, ICE candidates, and TURN credentials are ephemeral and are not stored in Conduit's cache or settings.
 - **Sign Out** removes the keyring credential and deactivates the workspace for desktop search. It does not currently erase cached workspace content or drafts, and credential environment variables remain available for re-import.

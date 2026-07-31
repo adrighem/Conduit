@@ -39,6 +39,7 @@ const ATTENTION_DELIVERY_KIND: &str = "attention_delivery";
 const ATTENTION_DELIVERY_LEDGER_KEY: &str = "__ledger__";
 const WORKSPACE_REPAIR_KIND: &str = "workspace_repair";
 const WORKSPACE_REPAIR_USER_BASELINE_KEY: &str = "user_projection_baseline";
+const USER_DIRECTORY_KIND: &str = "user";
 const MAX_ATTENTION_DELIVERIES: usize = 512;
 const STORE_WRITER_QUEUE_CAPACITY: usize = 64;
 const STORE_READER_QUEUE_CAPACITY: usize = 32;
@@ -686,6 +687,7 @@ pub struct WorkspaceStore {
 pub(crate) struct WorkspaceBootstrap {
     pub(crate) workspace_id: String,
     pub(crate) conversations: Vec<SlackConversation>,
+    pub(crate) users: Vec<SlackUser>,
     pub(crate) user_names: HashMap<String, String>,
     pub(crate) user_full_names: HashMap<String, String>,
     pub(crate) user_avatar_urls: HashMap<String, String>,
@@ -1267,12 +1269,14 @@ impl WorkspaceStore {
         self.load_kind_map("user_name").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_name(&self, user_id: &str, display_name: &str) -> Result<()> {
         let mut names = HashMap::new();
         names.insert(user_id.to_string(), display_name.to_string());
         self.store_user_names(&names).await
     }
 
+    #[cfg(test)]
     pub async fn store_user_names(&self, user_names: &HashMap<String, String>) -> Result<()> {
         let values = user_names
             .iter()
@@ -1289,6 +1293,7 @@ impl WorkspaceStore {
         self.load_kind_map("user_full_name").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_full_names(
         &self,
         user_full_names: &HashMap<String, String>,
@@ -1308,6 +1313,7 @@ impl WorkspaceStore {
         self.load_kind_map("user_avatar_url").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_avatar_urls(
         &self,
         avatar_urls: &HashMap<String, String>,
@@ -1325,6 +1331,7 @@ impl WorkspaceStore {
         self.load_kind_map("user_aliases").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_search_aliases(
         &self,
         aliases: &HashMap<String, Vec<String>>,
@@ -1342,14 +1349,6 @@ impl WorkspaceStore {
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn load_user_statuses(&self) -> Result<HashMap<String, SlackUserStatus>> {
         self.load_kind_map("user_status").await
-    }
-
-    pub async fn store_user_statuses(
-        &self,
-        statuses: &HashMap<String, SlackUserStatus>,
-    ) -> Result<()> {
-        self.store_kind_map("user_status", statuses.clone(), true)
-            .await
     }
 
     pub async fn store_user_status(
@@ -1725,6 +1724,8 @@ struct CachedWorkspaceState {
     #[serde(default)]
     conversations: Vec<SlackConversation>,
     #[serde(default)]
+    users: Vec<SlackUser>,
+    #[serde(default)]
     user_names: HashMap<String, String>,
     #[serde(default)]
     user_full_names: HashMap<String, String>,
@@ -1756,6 +1757,7 @@ impl CachedWorkspaceState {
             version: CACHE_VERSION,
             workspace_id: String::new(),
             conversations: Vec::new(),
+            users: Vec::new(),
             user_names: HashMap::new(),
             user_full_names: HashMap::new(),
             user_avatar_urls: HashMap::new(),
@@ -1777,6 +1779,7 @@ impl From<CachedWorkspaceState> for WorkspaceBootstrap {
         Self {
             workspace_id: state.workspace_id,
             conversations: state.conversations,
+            users: state.users,
             user_names: state.user_names,
             user_full_names: state.user_full_names,
             user_avatar_urls: state.user_avatar_urls,
@@ -2002,6 +2005,19 @@ fn load_sqlite_state(
             "conversation" => state
                 .conversations
                 .push(serde_json::from_str(&payload).context("invalid cached conversation")?),
+            USER_DIRECTORY_KIND => {
+                let user: SlackUser =
+                    serde_json::from_str(&payload).context("invalid cached user")?;
+                let user_id = user_projection_id(&user).map_err(|_| {
+                    StoreError::invalid_derived_cache("cached user is missing its keyed id")
+                })?;
+                if user_id != item_key || user.id.as_deref() != Some(item_key.as_str()) {
+                    return Err(StoreError::invalid_derived_cache(
+                        "cached user id does not match its item key",
+                    ));
+                }
+                state.users.push(user);
+            }
             "user_name" => {
                 state.user_names.insert(
                     item_key,
@@ -2312,10 +2328,8 @@ fn apply_store_change(
                 )
             })?;
             let mut changed = sync_conversations(transaction, workspace_key, conversations)?;
-            let mut user_projections = CachedUserProjections::default();
-            for user in users {
-                user_projections.insert(user)?;
-            }
+            let (user_directory, user_projections) = cached_users(users)?;
+            let user_payloads = serialize_cached_users(&user_directory)?;
             let prior_user_baseline = load_sqlite_item::<WorkspaceRepairUserBaseline>(
                 transaction,
                 workspace_key,
@@ -2323,6 +2337,14 @@ fn apply_store_change(
                 WORKSPACE_REPAIR_USER_BASELINE_KEY,
             )?
             .filter(|baseline| baseline.recovery_generation == repair_generation);
+            changed |= merge_repaired_cached_users(
+                transaction,
+                workspace_key,
+                &user_payloads,
+                prior_user_baseline
+                    .as_ref()
+                    .map(|baseline| &baseline.user_payload_hashes),
+            )?;
             changed |= merge_repaired_user_projections(
                 transaction,
                 workspace_key,
@@ -2372,6 +2394,7 @@ fn apply_store_change(
                 WORKSPACE_REPAIR_USER_BASELINE_KEY,
                 &WorkspaceRepairUserBaseline {
                     recovery_generation: repair_generation,
+                    user_payload_hashes: cached_user_payload_hashes(&user_payloads),
                     projections: user_projections,
                 },
             )?;
@@ -2450,7 +2473,7 @@ fn apply_store_change(
             apply_store_unread_snapshot(transaction, workspace_key, workspace_id, snapshot)
         }
         StoreChange::UsersReplaced(users) => sync_users(transaction, workspace_key, users),
-        StoreChange::UserUpsert(user) => upsert_user_projection(transaction, workspace_key, user),
+        StoreChange::UserUpsert(user) => upsert_user(transaction, workspace_key, user),
         StoreChange::MessageDelta {
             channel_id,
             message,
@@ -3176,11 +3199,14 @@ fn sync_users(
     workspace_key: &str,
     users: impl IntoIterator<Item = SlackUser>,
 ) -> Result<bool> {
-    let mut projections = CachedUserProjections::default();
-    for user in users {
-        projections.insert(user)?;
-    }
-    let mut changed = sync_sqlite_kind(
+    let (users, projections) = cached_users(users)?;
+    let mut changed = sync_sqlite_payload_kind(
+        transaction,
+        workspace_key,
+        USER_DIRECTORY_KIND,
+        serialize_cached_users(&users)?,
+    )?;
+    changed |= sync_sqlite_kind(
         transaction,
         workspace_key,
         "user_name",
@@ -3225,12 +3251,14 @@ struct CachedUserProjections {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WorkspaceRepairUserBaseline {
     recovery_generation: u64,
+    #[serde(default)]
+    user_payload_hashes: BTreeMap<String, String>,
     projections: CachedUserProjections,
 }
 
 impl CachedUserProjections {
-    fn insert(&mut self, user: SlackUser) -> Result<()> {
-        let user_id = user_projection_id(&user)?;
+    fn insert(&mut self, user: &SlackUser) -> Result<()> {
+        let user_id = user_projection_id(user)?;
         if let Some(display_name) = user.display_name() {
             self.display_names.insert(user_id.clone(), display_name);
         }
@@ -3251,67 +3279,237 @@ impl CachedUserProjections {
     }
 }
 
-fn upsert_user_projection(
+fn cached_users(
+    users: impl IntoIterator<Item = SlackUser>,
+) -> Result<(BTreeMap<String, SlackUser>, CachedUserProjections)> {
+    let mut directory = BTreeMap::new();
+    for mut user in users {
+        let user_id = user_projection_id(&user)?;
+        user.id = Some(user_id.clone());
+        directory.insert(user_id, user);
+    }
+    let mut projections = CachedUserProjections::default();
+    for user in directory.values() {
+        projections.insert(user)?;
+    }
+    Ok((directory, projections))
+}
+
+fn serialize_cached_users(users: &BTreeMap<String, SlackUser>) -> Result<BTreeMap<String, String>> {
+    users
+        .iter()
+        .map(|(user_id, user)| Ok((user_id.clone(), serialize_cached_user(user)?)))
+        .collect()
+}
+
+fn cached_user_payload_hashes(payloads: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    payloads
+        .iter()
+        .map(|(user_id, payload)| (user_id.clone(), cache_key(payload)))
+        .collect()
+}
+
+fn serialize_cached_user(user: &SlackUser) -> Result<String> {
+    let value = serde_json::to_value(user).context("failed to serialize cached user")?;
+    serde_json::to_string(&canonical_json(value))
+        .context("failed to serialize canonical cached user")
+        .map_err(StoreError::from)
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut values = values.into_iter().collect::<Vec<_>>();
+            values.sort_by(|left, right| left.0.cmp(&right.0));
+            serde_json::Value::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, canonical_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
+}
+
+fn upsert_user(
     transaction: &Transaction<'_>,
     workspace_key: &str,
-    user: SlackUser,
+    mut user: SlackUser,
 ) -> Result<bool> {
     let user_id = user_projection_id(&user)?;
-    let clears_status = user
-        .profile
-        .as_ref()
-        .is_some_and(|profile| profile.contains_status_fields() && profile.status().is_none());
+    user.id = Some(user_id.clone());
+    let cached_user =
+        load_sqlite_item::<SlackUser>(transaction, workspace_key, USER_DIRECTORY_KIND, &user_id)?;
+    if let Some(cached_user) = cached_user.as_ref() {
+        let cached_user_id = user_projection_id(cached_user).map_err(|_| {
+            StoreError::invalid_derived_cache("cached user is missing its keyed id")
+        })?;
+        if cached_user_id != user_id || cached_user.id.as_deref() != Some(user_id.as_str()) {
+            return Err(StoreError::invalid_derived_cache(
+                "cached user id does not match its item key",
+            ));
+        }
+    }
+
+    let directory_cached = cached_user.is_some()
+        || transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = ?2
+             )",
+            params![workspace_key, USER_DIRECTORY_KIND],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if !directory_cached {
+        return upsert_sparse_user_projections(transaction, workspace_key, &user);
+    }
+
+    let cached_user = cached_user
+        .map(|cached| cached.merge_sparse_update(user.clone()))
+        .unwrap_or(user);
+    let mut projections = CachedUserProjections::default();
+    projections.insert(&cached_user)?;
+    let mut changed = upsert_sqlite_payload(
+        transaction,
+        workspace_key,
+        USER_DIRECTORY_KIND,
+        &user_id,
+        &serialize_cached_user(&cached_user)?,
+    )?;
+    changed |= sync_user_projection_item(
+        transaction,
+        workspace_key,
+        "user_name",
+        &user_id,
+        projections.display_names.get(&user_id),
+    )?;
+    changed |= sync_user_projection_item(
+        transaction,
+        workspace_key,
+        "user_full_name",
+        &user_id,
+        projections.full_names.get(&user_id),
+    )?;
+    changed |= sync_user_projection_item(
+        transaction,
+        workspace_key,
+        "user_avatar_url",
+        &user_id,
+        projections.avatar_urls.get(&user_id),
+    )?;
+    changed |= sync_user_projection_item(
+        transaction,
+        workspace_key,
+        "user_aliases",
+        &user_id,
+        projections.aliases.get(&user_id),
+    )?;
+    changed |= sync_user_projection_item(
+        transaction,
+        workspace_key,
+        "user_status",
+        &user_id,
+        projections.statuses.get(&user_id),
+    )?;
+    Ok(changed)
+}
+
+fn upsert_sparse_user_projections(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    user: &SlackUser,
+) -> Result<bool> {
+    let user_id = user_projection_id(user)?;
     let mut projections = CachedUserProjections::default();
     projections.insert(user)?;
     let mut changed = false;
-    for (user_id, display_name) in projections.display_names {
+    for (item_key, display_name) in projections.display_names {
         changed |= upsert_sqlite_item(
             transaction,
             workspace_key,
             "user_name",
-            &user_id,
+            &item_key,
             &display_name,
         )?;
     }
-    for (user_id, full_name) in projections.full_names {
+    for (item_key, full_name) in projections.full_names {
         changed |= upsert_sqlite_item(
             transaction,
             workspace_key,
             "user_full_name",
-            &user_id,
+            &item_key,
             &full_name,
         )?;
     }
-    for (user_id, avatar_url) in projections.avatar_urls {
+    for (item_key, avatar_url) in projections.avatar_urls {
         changed |= upsert_sqlite_item(
             transaction,
             workspace_key,
             "user_avatar_url",
-            &user_id,
+            &item_key,
             &avatar_url,
         )?;
     }
-    for (user_id, aliases) in projections.aliases {
+    for (item_key, aliases) in projections.aliases {
         changed |= upsert_sqlite_item(
             transaction,
             workspace_key,
             "user_aliases",
-            &user_id,
+            &item_key,
             &aliases,
         )?;
     }
-    for (user_id, status) in projections.statuses {
-        changed |=
-            upsert_sqlite_item(transaction, workspace_key, "user_status", &user_id, &status)?;
-    }
-    if clears_status {
-        changed |= transaction.execute(
-            "DELETE FROM workspace_items
-             WHERE workspace_key = ?1 AND kind = 'user_status' AND item_key = ?2",
-            params![workspace_key, user_id],
-        )? > 0;
+    if let Some(profile) = user
+        .profile
+        .as_ref()
+        .filter(|profile| profile.contains_status_fields())
+    {
+        let mut status = load_sqlite_item::<SlackUserStatus>(
+            transaction,
+            workspace_key,
+            "user_status",
+            &user_id,
+        )?
+        .unwrap_or_default();
+        if let Some(text) = profile.status_text.as_ref() {
+            status.text.clone_from(text);
+        }
+        if let Some(emoji) = profile.status_emoji.as_ref() {
+            status.emoji.clone_from(emoji);
+        }
+        if let Some(expiration) = profile.status_expiration {
+            status.expiration = expiration;
+        }
+        changed |= sync_user_projection_item(
+            transaction,
+            workspace_key,
+            "user_status",
+            &user_id,
+            (!status.text.trim().is_empty() || !status.emoji_name().is_empty()).then_some(&status),
+        )?;
     }
     Ok(changed)
+}
+
+fn sync_user_projection_item<T: Serialize>(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    user_id: &str,
+    value: Option<&T>,
+) -> Result<bool> {
+    match value {
+        Some(value) => upsert_sqlite_item(transaction, workspace_key, kind, user_id, value),
+        None => Ok(transaction.execute(
+            "DELETE FROM workspace_items
+             WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+            params![workspace_key, kind, user_id],
+        )? > 0),
+    }
 }
 
 fn merge_repaired_user_projections(
@@ -3358,6 +3556,78 @@ fn merge_repaired_user_projections(
     Ok(changed)
 }
 
+fn merge_repaired_cached_users(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    desired: &BTreeMap<String, String>,
+    previous_hashes: Option<&BTreeMap<String, String>>,
+) -> Result<bool> {
+    let keys = desired
+        .keys()
+        .chain(previous_hashes.iter().flat_map(|values| values.keys()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut changed = false;
+    for user_id in keys {
+        let current = transaction
+            .query_row(
+                "SELECT payload_json FROM workspace_items
+                 WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+                params![workspace_key, USER_DIRECTORY_KIND, user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let desired_payload = desired.get(&user_id);
+        let Some(previous_hashes) = previous_hashes else {
+            if let (None, Some(desired_payload)) = (current.as_ref(), desired_payload) {
+                changed |= insert_sqlite_payload_if_absent(
+                    transaction,
+                    workspace_key,
+                    USER_DIRECTORY_KIND,
+                    &user_id,
+                    desired_payload,
+                )?;
+            }
+            continue;
+        };
+        let Some(previous_hash) = previous_hashes.get(&user_id) else {
+            if let (None, Some(desired_payload)) = (current.as_ref(), desired_payload) {
+                changed |= insert_sqlite_payload_if_absent(
+                    transaction,
+                    workspace_key,
+                    USER_DIRECTORY_KIND,
+                    &user_id,
+                    desired_payload,
+                )?;
+            }
+            continue;
+        };
+        if current.as_deref().map(cache_key).as_ref() != Some(previous_hash) {
+            continue;
+        }
+        changed |= match desired_payload {
+            Some(desired_payload) if cache_key(desired_payload) != previous_hash.as_str() => {
+                upsert_sqlite_payload(
+                    transaction,
+                    workspace_key,
+                    USER_DIRECTORY_KIND,
+                    &user_id,
+                    desired_payload,
+                )?
+            }
+            Some(_) => false,
+            None => {
+                transaction.execute(
+                    "DELETE FROM workspace_items
+                     WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+                    params![workspace_key, USER_DIRECTORY_KIND, user_id],
+                )? > 0
+            }
+        };
+    }
+    Ok(changed)
+}
+
 fn merge_repaired_user_kind<T: Serialize>(
     transaction: &Transaction<'_>,
     workspace_key: &str,
@@ -3367,6 +3637,22 @@ fn merge_repaired_user_kind<T: Serialize>(
 ) -> Result<bool> {
     let desired = serialize_repaired_user_kind(desired)?;
     let previous = previous.map(serialize_repaired_user_kind).transpose()?;
+    merge_repaired_user_payloads(
+        transaction,
+        workspace_key,
+        kind,
+        &desired,
+        previous.as_ref(),
+    )
+}
+
+fn merge_repaired_user_payloads(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    desired: &BTreeMap<String, String>,
+    previous: Option<&BTreeMap<String, String>>,
+) -> Result<bool> {
     let keys = desired
         .keys()
         .chain(previous.iter().flat_map(|values| values.keys()))
@@ -3383,7 +3669,7 @@ fn merge_repaired_user_kind<T: Serialize>(
             )
             .optional()?;
         let desired_payload = desired.get(&item_key);
-        let Some(previous) = previous.as_ref() else {
+        let Some(previous) = previous else {
             if let (None, Some(desired_payload)) = (current.as_ref(), desired_payload) {
                 changed |= insert_sqlite_payload_if_absent(
                     transaction,
@@ -3789,6 +4075,16 @@ fn upsert_sqlite_item<T: Serialize>(
     value: &T,
 ) -> Result<bool> {
     let payload = serde_json::to_string(value).context("failed to serialize cached item")?;
+    upsert_sqlite_payload(transaction, workspace_key, kind, item_key, &payload)
+}
+
+fn upsert_sqlite_payload(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    item_key: &str,
+    payload: &str,
+) -> Result<bool> {
     let changed = transaction.execute(
         "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
          VALUES (?1, ?2, ?3, ?4)
@@ -3830,6 +4126,16 @@ fn sync_sqlite_kind<T: Serialize>(
             ))
         })
         .collect::<Result<HashMap<_, _>>>()?;
+    sync_sqlite_payload_kind(transaction, workspace_key, kind, desired)
+}
+
+fn sync_sqlite_payload_kind(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+    desired: impl IntoIterator<Item = (String, String)>,
+) -> Result<bool> {
+    let desired = desired.into_iter().collect::<HashMap<_, _>>();
     let mut current = HashMap::new();
     {
         let mut statement = transaction.prepare(
@@ -3877,6 +4183,15 @@ fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String),
             conversation.id.clone(),
             &conversation,
         )?;
+    }
+    for user in &state.users {
+        let mut user = user.clone();
+        let user_id = user_projection_id(&user)?;
+        user.id = Some(user_id.clone());
+        items.insert(
+            (USER_DIRECTORY_KIND.to_string(), user_id),
+            serialize_cached_user(&user)?,
+        );
     }
     for (key, value) in &state.user_names {
         insert_state_item(&mut items, "user_name", key.clone(), value)?;
@@ -6137,33 +6452,34 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_user_store_changes_persist_only_safe_projections() {
-        let directory = temp_cache_dir("coordinator-user-projection");
+    fn coordinator_user_store_changes_round_trip_the_full_directory_and_safe_projections() {
+        let directory = temp_cache_dir("coordinator-user-directory");
         let store = WorkspaceStore::new(directory.clone(), "T123:U123");
         runtime().block_on(async {
+            let user = SlackUser {
+                id: Some("U1".into()),
+                name: Some("ada".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Ada".into()),
+                    real_name: Some("Ada Lovelace".into()),
+                    phone: Some("PrivatePhoneCanary".into()),
+                    email: Some("PrivateEmailCanary".into()),
+                    huddle_state_call_id: Some("PrivateHuddleCanary".into()),
+                    fields: HashMap::from([(
+                        "private".into(),
+                        crate::models::SlackProfileField {
+                            value: Some("PrivateCustomFieldCanary".into()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
             let revision = WorkspaceRevision::INITIAL.successor();
             let batch = StoreBatch::new(
                 revision,
-                vec![StoreChange::UsersReplaced(vec![SlackUser {
-                    id: Some("U1".into()),
-                    name: Some("ada".into()),
-                    profile: Some(crate::models::SlackUserProfile {
-                        display_name: Some("Ada".into()),
-                        real_name: Some("Ada Lovelace".into()),
-                        phone: Some("PrivatePhoneCanary".into()),
-                        email: Some("PrivateEmailCanary".into()),
-                        huddle_state_call_id: Some("PrivateHuddleCanary".into()),
-                        fields: HashMap::from([(
-                            "private".into(),
-                            crate::models::SlackProfileField {
-                                value: Some("PrivateCustomFieldCanary".into()),
-                                ..Default::default()
-                            },
-                        )]),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }])],
+                vec![StoreChange::UsersReplaced(vec![user.clone()])],
             )
             .unwrap();
             assert_eq!(
@@ -6175,18 +6491,27 @@ mod tests {
                 store.load_user_names().await.unwrap().get("U1"),
                 Some(&"Ada".to_string())
             );
+            assert_eq!(
+                store.load_bootstrap().await.unwrap().unwrap().users,
+                vec![user]
+            );
             let payloads = store
                 .hub()
                 .await
                 .unwrap()
                 .query(|connection| {
                     let mut statement = connection.prepare(
-                        "SELECT payload_json FROM workspace_items ORDER BY kind, item_key",
+                        "SELECT kind, payload_json
+                         FROM workspace_items
+                         WHERE kind LIKE 'user%'
+                         ORDER BY kind, item_key",
                     )?;
                     let payloads = statement
-                        .query_map([], |row| row.get::<_, String>(0))?
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
                         .collect::<std::result::Result<Vec<_>, _>>()?;
-                    Ok(payloads.join("\n"))
+                    Ok(payloads)
                 })
                 .await
                 .unwrap();
@@ -6196,8 +6521,605 @@ mod tests {
                 "PrivateHuddleCanary",
                 "PrivateCustomFieldCanary",
             ] {
-                assert!(!payloads.contains(private_value));
+                assert!(payloads
+                    .iter()
+                    .any(|(kind, payload)| kind == "user" && payload.contains(private_value)));
+                assert!(payloads
+                    .iter()
+                    .all(|(kind, payload)| { kind == "user" || !payload.contains(private_value) }));
             }
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_users_replaced_exactly_replaces_the_cached_full_directory() {
+        let directory = temp_cache_dir("coordinator-user-directory-replacement");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![StoreChange::UsersReplaced(vec![
+                            SlackUser {
+                                id: Some("U1".into()),
+                                name: Some("removed".into()),
+                                ..Default::default()
+                            },
+                            SlackUser {
+                                id: Some("U2".into()),
+                                name: Some("before".into()),
+                                ..Default::default()
+                            },
+                        ])],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let replacement = vec![
+                SlackUser {
+                    id: Some("U2".into()),
+                    name: Some("after".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        display_name: Some("Updated person".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                SlackUser {
+                    id: Some("U3".into()),
+                    name: Some("added".into()),
+                    ..Default::default()
+                },
+            ];
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            first_revision.successor(),
+                            vec![StoreChange::UsersReplaced(replacement.clone())],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            assert_eq!(
+                store.load_bootstrap().await.unwrap().unwrap().users,
+                replacement
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_users_replaced_uses_only_the_last_duplicate_user_projection() {
+        let directory = temp_cache_dir("coordinator-user-directory-duplicate-replacement");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            apply_test_store_changes(
+                &store,
+                vec![StoreChange::UsersReplaced(vec![
+                    SlackUser {
+                        id: Some("U1".into()),
+                        name: Some("before".into()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            status_text: Some("stale".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    SlackUser {
+                        id: Some("U1".into()),
+                        name: Some("after".into()),
+                        ..Default::default()
+                    },
+                ])],
+            )
+            .await;
+
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(bootstrap.users.len(), 1);
+            assert_eq!(bootstrap.users[0].name.as_deref(), Some("after"));
+            assert_eq!(bootstrap.user_names["U1"], "after");
+            assert!(!bootstrap.user_statuses.contains_key("U1"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn coordinator_user_upsert_merges_sparse_fields_and_preserves_explicit_status_clears() {
+        let directory = temp_cache_dir("coordinator-user-directory-sparse-upsert");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![StoreChange::UsersReplaced(vec![SlackUser {
+                            id: Some("U1".into()),
+                            name: Some("ada".into()),
+                            real_name: Some("Ada Lovelace".into()),
+                            profile: Some(crate::models::SlackUserProfile {
+                                display_name: Some("Ada".into()),
+                                status_text: Some("Heads down".into()),
+                                status_emoji: Some(":construction:".into()),
+                                status_expiration: Some(42),
+                                email: Some("ada@example.test".into()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }])],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision.successor(),
+                        vec![StoreChange::UserUpsert(SlackUser {
+                            id: Some("U1".into()),
+                            profile: Some(crate::models::SlackUserProfile {
+                                huddle_state_call_id: Some("R1".into()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let user = store
+                .load_bootstrap()
+                .await
+                .unwrap()
+                .unwrap()
+                .users
+                .remove(0);
+            assert_eq!(user.name.as_deref(), Some("ada"));
+            assert_eq!(user.real_name.as_deref(), Some("Ada Lovelace"));
+            let profile = user.profile.unwrap();
+            assert_eq!(profile.display_name.as_deref(), Some("Ada"));
+            assert_eq!(profile.status_text.as_deref(), Some("Heads down"));
+            assert_eq!(profile.status_emoji.as_deref(), Some(":construction:"));
+            assert_eq!(profile.status_expiration, Some(42));
+            assert_eq!(profile.email.as_deref(), Some("ada@example.test"));
+            assert_eq!(profile.huddle_state_call_id.as_deref(), Some("R1"));
+
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision.successor().successor(),
+                        vec![StoreChange::UserUpsert(SlackUser {
+                            id: Some("U1".into()),
+                            profile: Some(crate::models::SlackUserProfile {
+                                status_text: Some("Reviewing".into()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            let user_status = bootstrap.users[0].status().unwrap();
+            assert_eq!(user_status.text, "Reviewing");
+            assert_eq!(user_status.emoji, ":construction:");
+            assert_eq!(user_status.expiration, 42);
+            assert_eq!(bootstrap.user_statuses["U1"], user_status);
+
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision.successor().successor().successor(),
+                        vec![StoreChange::UserUpsert(SlackUser {
+                            id: Some("U1".into()),
+                            profile: Some(crate::models::SlackUserProfile {
+                                status_text: Some(String::new()),
+                                status_emoji: Some(String::new()),
+                                status_expiration: Some(0),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            let profile = bootstrap.users[0].profile.as_ref().unwrap();
+            assert_eq!(profile.status_text.as_deref(), Some(""));
+            assert_eq!(profile.status_emoji.as_deref(), Some(""));
+            assert_eq!(profile.status_expiration, Some(0));
+            assert!(!bootstrap.user_statuses.contains_key("U1"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cached_user_upsert_replaces_authoritative_custom_profile_fields() {
+        let directory = temp_cache_dir("coordinator-user-directory-custom-fields");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![StoreChange::UsersReplaced(vec![SlackUser {
+                            id: Some("U1".into()),
+                            profile: Some(crate::models::SlackUserProfile {
+                                fields: HashMap::from([
+                                    (
+                                        "F1".into(),
+                                        crate::models::SlackProfileField {
+                                            value: Some("one".into()),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    (
+                                        "F2".into(),
+                                        crate::models::SlackProfileField {
+                                            value: Some("two".into()),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ]),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }])],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let replacement: SlackUser = serde_json::from_value(serde_json::json!({
+                "id": "U1",
+                "profile": {
+                    "fields": {
+                        "F2": { "value": "updated" }
+                    }
+                }
+            }))
+            .unwrap();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision.successor(),
+                        vec![StoreChange::UserUpsert(replacement)],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            let fields = &bootstrap.users[0].profile.as_ref().unwrap().fields;
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields["F2"].value.as_deref(), Some("updated"));
+
+            let clear: SlackUser = serde_json::from_value(serde_json::json!({
+                "id": "U1",
+                "profile": { "fields": {} }
+            }))
+            .unwrap();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        first_revision.successor().successor(),
+                        vec![StoreChange::UserUpsert(clear)],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(store.load_bootstrap().await.unwrap().unwrap().users[0]
+                .profile
+                .as_ref()
+                .unwrap()
+                .fields
+                .is_empty());
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn user_upsert_before_bulk_discovery_keeps_the_full_directory_empty() {
+        let directory = temp_cache_dir("coordinator-user-directory-pre-bulk-upsert");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            apply_test_store_changes(
+                &store,
+                vec![StoreChange::UserUpsert(SlackUser {
+                    id: Some("U1".into()),
+                    name: Some("partial-person".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        huddle_state_call_id: Some("R1".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })],
+            )
+            .await;
+
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            assert!(bootstrap.users.is_empty());
+            assert_eq!(bootstrap.user_names["U1"], "partial-person");
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn malformed_cached_full_user_resets_the_workspace_cache() {
+        let directory = temp_cache_dir("coordinator-user-directory-corruption");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            apply_test_store_changes(
+                &store,
+                vec![StoreChange::UsersReplaced(vec![SlackUser {
+                    id: Some("U1".into()),
+                    name: Some("ada".into()),
+                    ..Default::default()
+                }])],
+            )
+            .await;
+            store
+                .hub()
+                .await
+                .unwrap()
+                .write({
+                    let workspace_key = store.workspace_key.clone();
+                    move |connection| {
+                        connection.execute(
+                            "UPDATE workspace_items SET payload_json = '{broken'
+                             WHERE workspace_key = ?1 AND kind = 'user' AND item_key = 'U1'",
+                            [workspace_key],
+                        )?;
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap();
+
+            assert!(store.load_bootstrap().await.unwrap().is_none());
+            let remaining: u32 = store
+                .hub()
+                .await
+                .unwrap()
+                .query(|connection| {
+                    connection
+                        .query_row("SELECT count(*) FROM workspace_items", [], |row| row.get(0))
+                        .map_err(StoreError::from)
+                })
+                .await
+                .unwrap();
+            assert_eq!(remaining, 0);
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn invalid_cached_full_user_ids_reset_the_workspace_cache() {
+        for (case, payload) in [
+            ("missing", r#"{"name":"missing-id"}"#),
+            ("mismatched", r#"{"id":"U2","name":"wrong-id"}"#),
+            ("noncanonical", r#"{"id":" U1 ","name":"spaced-id"}"#),
+        ] {
+            let directory =
+                temp_cache_dir(&format!("coordinator-user-directory-{case}-id-corruption"));
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            runtime().block_on(async {
+                apply_test_store_changes(
+                    &store,
+                    vec![StoreChange::UsersReplaced(vec![SlackUser {
+                        id: Some("U1".into()),
+                        name: Some("ada".into()),
+                        ..Default::default()
+                    }])],
+                )
+                .await;
+                store
+                    .hub()
+                    .await
+                    .unwrap()
+                    .write({
+                        let workspace_key = store.workspace_key.clone();
+                        let payload = payload.to_string();
+                        move |connection| {
+                            connection.execute(
+                                "UPDATE workspace_items SET payload_json = ?2
+                                 WHERE workspace_key = ?1 AND kind = 'user' AND item_key = 'U1'",
+                                params![workspace_key, payload],
+                            )?;
+                            Ok(())
+                        }
+                    })
+                    .await
+                    .unwrap();
+
+                assert!(store.load_bootstrap().await.unwrap().is_none(), "{case}");
+            });
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn delayed_workspace_repair_does_not_roll_back_a_newer_cached_full_user() {
+        let directory = temp_cache_dir("coordinator-user-directory-repair-merge");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            let stale_user = SlackUser {
+                id: Some("U1".into()),
+                name: Some("before".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Before".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            store
+                .execute_store_repair_batch(
+                    StoreBatch::new(
+                        first_revision,
+                        vec![StoreChange::WorkspaceRepaired(WorkspaceStoreProjection {
+                            users: vec![stale_user.clone()],
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let second_revision = first_revision.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        second_revision,
+                        vec![StoreChange::UserUpsert(SlackUser {
+                            id: Some("U1".into()),
+                            name: Some("after".into()),
+                            profile: Some(crate::models::SlackUserProfile {
+                                display_name: Some("After".into()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            store
+                .execute_store_repair_batch(
+                    StoreBatch::new(
+                        second_revision,
+                        vec![StoreChange::WorkspaceRepaired(WorkspaceStoreProjection {
+                            users: vec![stale_user],
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let user = &store.load_bootstrap().await.unwrap().unwrap().users[0];
+            assert_eq!(user.name.as_deref(), Some("after"));
+            assert_eq!(user.display_name().as_deref(), Some("After"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn repeated_workspace_repair_uses_canonical_full_user_payloads() {
+        let directory = temp_cache_dir("coordinator-user-directory-canonical-repair");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let revision = WorkspaceRevision::INITIAL.successor();
+            let profile_field = |value: &str| crate::models::SlackProfileField {
+                value: Some(value.to_string()),
+                ..Default::default()
+            };
+            let first_user = SlackUser {
+                id: Some("U1".into()),
+                name: Some("before".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    fields: HashMap::from([
+                        ("zeta".into(), profile_field("last")),
+                        ("alpha".into(), profile_field("first")),
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            store
+                .execute_store_repair_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![StoreChange::WorkspaceRepaired(WorkspaceStoreProjection {
+                            users: vec![first_user],
+                            ..Default::default()
+                        })],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let payload = store
+                .hub()
+                .await
+                .unwrap()
+                .query({
+                    let workspace_key = store.workspace_key.clone();
+                    move |connection| {
+                        connection
+                            .query_row(
+                                "SELECT payload_json FROM workspace_items
+                                 WHERE workspace_key = ?1 AND kind = 'user' AND item_key = 'U1'",
+                                [workspace_key],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .map_err(StoreError::from)
+                    }
+                })
+                .await
+                .unwrap();
+            assert!(payload.find("\"alpha\"").unwrap() < payload.find("\"zeta\"").unwrap());
+
+            let updated_user = SlackUser {
+                id: Some("U1".into()),
+                name: Some("after".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    fields: HashMap::from([
+                        ("alpha".into(), profile_field("first")),
+                        ("zeta".into(), profile_field("last")),
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                store
+                    .execute_store_repair_batch(
+                        StoreBatch::new(
+                            revision,
+                            vec![StoreChange::WorkspaceRepaired(WorkspaceStoreProjection {
+                                users: vec![updated_user.clone()],
+                                ..Default::default()
+                            })],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+            assert_eq!(
+                store.load_bootstrap().await.unwrap().unwrap().users,
+                vec![updated_user]
+            );
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -6266,6 +7188,71 @@ mod tests {
                 StoreBatchExecution::Committed
             );
             assert!(!store.load_user_statuses().await.unwrap().contains_key("U1"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pre_bulk_partial_status_clear_preserves_the_other_projected_fields() {
+        let directory = temp_cache_dir("coordinator-user-partial-status-clear");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let first_revision = WorkspaceRevision::INITIAL.successor();
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            first_revision,
+                            vec![StoreChange::UserUpsert(SlackUser {
+                                id: Some("U1".into()),
+                                profile: Some(crate::models::SlackUserProfile {
+                                    status_text: Some("Heads down".into()),
+                                    status_emoji: Some(":construction:".into()),
+                                    status_expiration: Some(42),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            })],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            assert_eq!(
+                store
+                    .execute_store_batch(
+                        StoreBatch::new(
+                            first_revision.successor(),
+                            vec![StoreChange::UserUpsert(SlackUser {
+                                id: Some("U1".into()),
+                                profile: Some(crate::models::SlackUserProfile {
+                                    status_text: Some(String::new()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            })],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                StoreBatchExecution::Committed
+            );
+
+            let status = &store.load_user_statuses().await.unwrap()["U1"];
+            assert_eq!(status.text, "");
+            assert_eq!(status.emoji, ":construction:");
+            assert_eq!(status.expiration, 42);
+            assert!(store
+                .load_bootstrap()
+                .await
+                .unwrap()
+                .unwrap()
+                .users
+                .is_empty());
         });
         let _ = std::fs::remove_dir_all(directory);
     }

@@ -163,7 +163,7 @@ pub struct HuddlePresence {
 impl HuddlePresence {
     pub fn from_user(user: &SlackUser) -> Option<Self> {
         let profile = user.profile.as_ref()?;
-        if profile.huddle_state != SlackHuddleState::InAHuddle {
+        if profile.huddle_state != Some(SlackHuddleState::InAHuddle) {
             return None;
         }
 

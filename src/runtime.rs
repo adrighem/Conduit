@@ -46,7 +46,8 @@ use crate::slack::{
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
-    StoreBatchExecution, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
+    StoreBatchExecution, StoreError, StoreErrorCategory, SyncFreshness, WorkspaceBootstrap,
+    WorkspaceStore,
 };
 use crate::sync_scheduler::{
     AdmissionRejectionReason, AdmissionToken, CancellationId, FreshnessPolicy, JobOutcome,
@@ -64,8 +65,9 @@ use crate::workspace_state::WorkspaceLifecycleEvent;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
 const CONVERSATION_ENRICHMENT_LIMIT: usize = 30;
-const MAX_UNREAD_REFRESH_PASSES: usize = 3;
-const UNREAD_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(1);
+const USER_DIRECTORY_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+const USER_DIRECTORY_FRESHNESS_OPERATION: &str = "user-directory";
+const USER_DIRECTORY_FRESHNESS_TARGET: &str = "workspace";
 const CONVERSATION_PATCH_BATCH_SIZE: usize = 20;
 const NAVIGATION_TASK_CONCURRENCY: usize = 2;
 const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
@@ -98,7 +100,7 @@ pub enum RuntimeCommand {
     RefreshConversations,
     UpdateAttentionPreferences(AttentionPreferences),
     DiscoverChannels,
-    DiscoverConversations,
+    LoadUserDirectory,
     JoinConversation {
         channel_id: String,
     },
@@ -456,8 +458,8 @@ impl RuntimeCommand {
                 workspace(RuntimeOperation::SocketMode),
                 RuntimeTaskLane::Interactive,
             ),
-            Self::DiscoverConversations => RuntimeCommandDescriptor::request(
-                workspace(RuntimeOperation::ConversationDiscovery),
+            Self::LoadUserDirectory => RuntimeCommandDescriptor::request(
+                workspace(RuntimeOperation::User),
                 RuntimeTaskLane::Background,
             ),
             Self::DiscoverChannels => RuntimeCommandDescriptor::request(
@@ -967,11 +969,12 @@ impl RuntimeEventKind {
             Self::AttentionNotificationCandidate { .. } => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
-            Self::ConversationChannelsDiscovered(_) | Self::ConversationPeopleDiscovered(_) => {
-                OperationContext::new(
-                    RuntimeOperation::ConversationDiscovery,
-                    RuntimeTarget::Workspace,
-                )
+            Self::ConversationChannelsDiscovered(_) => OperationContext::new(
+                RuntimeOperation::ConversationDiscovery,
+                RuntimeTarget::Workspace,
+            ),
+            Self::ConversationPeopleDiscovered(_) => {
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace)
             }
             Self::ConversationOpened { channel_id } | Self::ConversationUpdated { channel_id } => {
                 OperationContext::new(
@@ -1193,6 +1196,7 @@ struct RuntimeConnection {
     read_marks: Arc<Mutex<HashMap<String, String>>>,
     message_handoffs: Arc<Mutex<MessageHandoffResolver>>,
     conversation_star_sync: ConversationStarSyncGate,
+    user_directory_sync: UserDirectorySync,
     user_status_sync: UserStatusSync,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
@@ -1201,6 +1205,125 @@ struct RuntimeConnection {
 }
 
 type ConversationStarSyncGate = Arc<tokio::sync::Mutex<()>>;
+
+#[derive(Clone, Debug, Default)]
+struct UserDirectorySync {
+    state: Arc<Mutex<UserDirectorySyncState>>,
+    refresh: Arc<tokio::sync::Mutex<()>>,
+    hydration_completed: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, Default)]
+struct UserDirectorySyncState {
+    hydration_completed: bool,
+    loaded: bool,
+    last_success_at_ms: Option<u64>,
+    user_groups: Option<Vec<SlackUserGroup>>,
+}
+
+impl UserDirectorySync {
+    fn hydrate(&self, has_cached_users: bool, last_success_at_ms: Option<u64>) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("user directory sync lock poisoned");
+        let notify = !state.hydration_completed;
+        state.hydration_completed = true;
+        state.loaded = has_cached_users;
+        state.last_success_at_ms = last_success_at_ms;
+        drop(state);
+        if notify {
+            self.hydration_completed.notify_waiters();
+        }
+    }
+
+    async fn wait_for_hydration(&self) {
+        loop {
+            let notified = self.hydration_completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .expect("user directory sync lock poisoned")
+                .hydration_completed
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn retain_user_groups(&self, groups: Vec<SlackUserGroup>) {
+        self.state
+            .lock()
+            .expect("user directory sync lock poisoned")
+            .user_groups = Some(groups);
+    }
+
+    fn retained_user_groups(&self) -> Option<Vec<SlackUserGroup>> {
+        self.state
+            .lock()
+            .expect("user directory sync lock poisoned")
+            .user_groups
+            .clone()
+    }
+
+    fn last_success_for_startup(&self) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .expect("user directory sync lock poisoned");
+        state.loaded.then_some(state.last_success_at_ms).flatten()
+    }
+
+    fn last_success_for_manual_open(&self) -> Option<u64> {
+        self.last_success_for_startup()
+    }
+
+    fn refresh_required(&self, now_ms: u64) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("user directory sync lock poisoned");
+        user_directory_refresh_required(state.loaded, now_ms, state.last_success_at_ms)
+    }
+
+    fn record_success(&self, refreshed_at_ms: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("user directory sync lock poisoned");
+        state.loaded = true;
+        state.last_success_at_ms = Some(
+            state
+                .last_success_at_ms
+                .map_or(refreshed_at_ms, |current| current.max(refreshed_at_ms)),
+        );
+    }
+}
+
+fn user_directory_last_success_at_ms(refreshed_at_ms: Option<i64>) -> Option<u64> {
+    refreshed_at_ms.and_then(|value| u64::try_from(value).ok())
+}
+
+fn user_directory_refresh_required(
+    has_cached_users: bool,
+    now_ms: u64,
+    last_success_at_ms: Option<u64>,
+) -> bool {
+    !has_cached_users
+        || last_success_at_ms.is_none_or(|last_success_at_ms| {
+            now_ms.saturating_sub(last_success_at_ms) >= USER_DIRECTORY_MAX_AGE_MS
+        })
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Debug, Default)]
 struct UserStatusSync {
@@ -1232,10 +1355,6 @@ impl UserStatusSync {
             .unwrap_or_default()
     }
 
-    fn is_revision_current(&self, revision: u64) -> bool {
-        self.revision() == revision
-    }
-
     fn is_user_revision_current(&self, user_id: &str, revision: u64) -> bool {
         self.user_revision(user_id) == revision
     }
@@ -1259,17 +1378,6 @@ impl UserStatusSync {
             })
             .collect();
         publish(preserve_user_ids);
-    }
-
-    fn publish_user_snapshot(&self, user_id: &str, base_revision: u64, publish: impl FnOnce(bool)) {
-        let state = self.state.lock().expect("user status sync lock poisoned");
-        let is_current = state
-            .user_revisions
-            .get(user_id)
-            .copied()
-            .unwrap_or_default()
-            == base_revision;
-        publish(is_current);
     }
 }
 
@@ -1547,6 +1655,13 @@ impl WorkspaceReducerAdapter {
             .lock()
             .expect("workspace coordinator lock poisoned")
             .conversations()
+    }
+
+    fn users(&self) -> Vec<SlackUser> {
+        self.coordinator
+            .lock()
+            .expect("workspace coordinator lock poisoned")
+            .users()
     }
 
     fn clear_thread_paging(&self) {
@@ -2247,6 +2362,22 @@ impl RuntimeSyncPlan {
         }
     }
 
+    const fn refresh_if_older_than(
+        target: SyncTargetKey,
+        priority: SyncPriority,
+        replacement: ReplacementClass,
+        max_age_ms: u64,
+    ) -> Self {
+        Self {
+            target,
+            priority,
+            durability: SyncDurability::Ephemeral,
+            freshness: FreshnessPolicy::IfOlderThan { max_age_ms },
+            replacement,
+            retry: RetryPolicy::Never,
+        }
+    }
+
     fn job(self, identity: crate::runtime_sync::RuntimeSyncJobIdentity) -> SyncJob {
         SyncJob::new(
             identity.job_id(),
@@ -2266,6 +2397,7 @@ impl RuntimeSyncPlan {
 enum RuntimeStartupSyncKind {
     EmojiCatalog,
     Membership,
+    UserDirectory,
     UserGroups,
 }
 
@@ -2308,14 +2440,15 @@ fn connected_command_sync_plan(command: &RuntimeCommand) -> Option<RuntimeSyncPl
             SyncPriority::Foreground,
             ReplacementClass::Refresh(RefreshClass::Membership),
         ),
-        RuntimeCommand::DiscoverConversations => RuntimeSyncPlan::ephemeral(
+        RuntimeCommand::LoadUserDirectory => RuntimeSyncPlan::refresh_if_older_than(
             runtime_sync_target(
-                SyncTargetKind::Workspace,
+                SyncTargetKind::UserDirectory,
                 "workspace-operation",
-                &["conversation-discovery"],
+                &["user-directory"],
             ),
-            SyncPriority::Maintenance,
-            ReplacementClass::Refresh(RefreshClass::Workspace),
+            SyncPriority::Interactive,
+            ReplacementClass::Refresh(RefreshClass::UserDirectory),
+            USER_DIRECTORY_MAX_AGE_MS,
         ),
         RuntimeCommand::DiscoverChannels => RuntimeSyncPlan::ephemeral(
             runtime_sync_target(
@@ -2425,6 +2558,16 @@ fn startup_sync_plan(kind: RuntimeStartupSyncKind) -> RuntimeSyncPlan {
             ),
             SyncPriority::Foreground,
             ReplacementClass::Refresh(RefreshClass::Membership),
+        ),
+        RuntimeStartupSyncKind::UserDirectory => RuntimeSyncPlan::refresh_if_older_than(
+            runtime_sync_target(
+                SyncTargetKind::UserDirectory,
+                "workspace-operation",
+                &["user-directory"],
+            ),
+            SyncPriority::Maintenance,
+            ReplacementClass::Refresh(RefreshClass::UserDirectory),
+            USER_DIRECTORY_MAX_AGE_MS,
         ),
         RuntimeStartupSyncKind::UserGroups => RuntimeSyncPlan::ephemeral(
             runtime_sync_target(
@@ -2762,10 +2905,21 @@ impl RuntimeState {
         }
     }
 
+    #[cfg(test)]
     fn admit_sync_request(
         &mut self,
         request: &TrackedRequest,
         plan: RuntimeSyncPlan,
+        work: RuntimeSyncWork,
+    ) -> RuntimeSyncRequestAdmission {
+        self.admit_sync_request_with_last_success(request, plan, None, work)
+    }
+
+    fn admit_sync_request_with_last_success(
+        &mut self,
+        request: &TrackedRequest,
+        plan: RuntimeSyncPlan,
+        last_success_at_ms: Option<u64>,
         work: RuntimeSyncWork,
     ) -> RuntimeSyncRequestAdmission {
         if self.active_session != request.identity.session {
@@ -2817,7 +2971,10 @@ impl RuntimeState {
 
         let identity = self.sync_scheduler.allocate_job_identity();
         let cancellation_id = identity.cancellation_id();
-        match self.sync_scheduler.admit(plan.job(identity), None, work) {
+        match self
+            .sync_scheduler
+            .admit(plan.job(identity), last_success_at_ms, work)
+        {
             Ok(RuntimeSyncAdmissionOutcome::Accepted(receipt)) => {
                 if plan.replacement == ReplacementClass::Refresh(RefreshClass::Membership) {
                     self.pending_membership = None;
@@ -2847,11 +3004,24 @@ impl RuntimeState {
         plan: RuntimeSyncPlan,
         work: RuntimeSyncWork,
     ) -> RuntimeSyncRequestAdmission {
+        self.admit_session_sync_with_last_success(session, plan, None, work)
+    }
+
+    fn admit_session_sync_with_last_success(
+        &mut self,
+        session: SessionId,
+        plan: RuntimeSyncPlan,
+        last_success_at_ms: Option<u64>,
+        work: RuntimeSyncWork,
+    ) -> RuntimeSyncRequestAdmission {
         if self.active_session != session {
             return RuntimeSyncRequestAdmission::Stale;
         }
         let identity = self.sync_scheduler.allocate_job_identity();
-        match self.sync_scheduler.admit(plan.job(identity), None, work) {
+        match self
+            .sync_scheduler
+            .admit(plan.job(identity), last_success_at_ms, work)
+        {
             Ok(RuntimeSyncAdmissionOutcome::Accepted(receipt)) => {
                 if plan.replacement == ReplacementClass::Refresh(RefreshClass::Membership) {
                     self.pending_membership = None;
@@ -3649,6 +3819,20 @@ fn schedule_connected_sync_command(
     plan: RuntimeSyncPlan,
 ) {
     let request = TrackedRequest::for_command(identity, &command);
+    let is_user_directory = matches!(command, RuntimeCommand::LoadUserDirectory);
+    let fresh_directory_state = is_user_directory.then(|| {
+        (
+            connection.workspace.clone(),
+            Arc::clone(&connection.user_cache),
+        )
+    });
+    let last_success_at_ms = is_user_directory
+        .then(|| {
+            connection
+                .user_directory_sync
+                .last_success_for_manual_open()
+        })
+        .flatten();
     let command_reports_failure = matches!(command, RuntimeCommand::RefreshConversations);
     let work_events = events.clone();
     let work = RuntimeSyncWork::new(move |_attempt| {
@@ -3671,7 +3855,7 @@ fn schedule_connected_sync_command(
     let admission = state
         .lock()
         .expect("runtime state lock poisoned")
-        .admit_sync_request(&request, plan, work);
+        .admit_sync_request_with_last_success(&request, plan, last_success_at_ms, work);
     match admission {
         RuntimeSyncRequestAdmission::Accepted(receipt) => {
             spawn_runtime_sync_receipt_monitor(
@@ -3682,7 +3866,12 @@ fn schedule_connected_sync_command(
                 receipt,
             );
         }
-        RuntimeSyncRequestAdmission::SkippedFresh | RuntimeSyncRequestAdmission::Stale => {}
+        RuntimeSyncRequestAdmission::SkippedFresh => {
+            if let Some((workspace, user_cache)) = fresh_directory_state.as_ref() {
+                publish_fresh_user_directory_completion(&events, workspace, user_cache);
+            }
+        }
+        RuntimeSyncRequestAdmission::Stale => {}
         RuntimeSyncRequestAdmission::Rejected(AdmissionRejectionReason::ShuttingDown) => {}
         RuntimeSyncRequestAdmission::Rejected(reason) => {
             crate::debug::log(
@@ -3694,17 +3883,50 @@ fn schedule_connected_sync_command(
     }
 }
 
+fn publish_fresh_user_directory_completion(
+    events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
+    shared_user_names: &Arc<Mutex<HashMap<String, String>>>,
+) {
+    let mut shared_user_names = shared_user_names
+        .lock()
+        .expect("runtime user cache lock poisoned");
+    let users = workspace.users();
+    *shared_user_names = user_display_names(&users);
+    drop(shared_user_names);
+    publish_user_directory_completion(events, users);
+}
+
+fn publish_user_directory_completion(events: &RuntimeEventSender, users: Vec<SlackUser>) {
+    events
+        .unsolicited(OperationContext::new(
+            RuntimeOperation::User,
+            RuntimeTarget::Workspace,
+        ))
+        .send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
+}
+
 fn schedule_session_sync_work(
     state: &Arc<Mutex<RuntimeState>>,
     session: SessionId,
     plan: RuntimeSyncPlan,
     work: RuntimeSyncWork,
 ) {
+    schedule_session_sync_work_with_last_success(state, session, plan, None, work);
+}
+
+fn schedule_session_sync_work_with_last_success(
+    state: &Arc<Mutex<RuntimeState>>,
+    session: SessionId,
+    plan: RuntimeSyncPlan,
+    last_success_at_ms: Option<u64>,
+    work: RuntimeSyncWork,
+) {
     let retained_work = work.clone();
     let admission = state
         .lock()
         .expect("runtime state lock poisoned")
-        .admit_session_sync(session, plan, work);
+        .admit_session_sync_with_last_success(session, plan, last_success_at_ms, work);
     match admission {
         RuntimeSyncRequestAdmission::Accepted(receipt) => {
             spawn_runtime_sync_receipt_monitor(state, session, None, None, receipt);
@@ -3905,6 +4127,7 @@ fn spawn_authentication_task<F>(
                                 256,
                             ))),
                             conversation_star_sync: ConversationStarSyncGate::default(),
+                            user_directory_sync: UserDirectorySync::default(),
                             user_status_sync: UserStatusSync::default(),
                             team_id: auth.team_id.clone(),
                             huddles,
@@ -3973,6 +4196,71 @@ fn spawn_workspace_tasks(
         load_cached_bootstrap(&hydration_events, &hydration_connection).await;
         let _ = hydration_ready_sender.send(());
 
+        let directory_events = hydration_events.with_context(OperationContext::new(
+            RuntimeOperation::User,
+            RuntimeTarget::Workspace,
+        ));
+        let directory_connection = hydration_connection.clone();
+        let directory_last_success = directory_connection
+            .user_directory_sync
+            .last_success_for_startup();
+        let directory_work = RuntimeSyncWork::new(move |_attempt| {
+            let directory_events = directory_events.clone();
+            let directory_connection = directory_connection.clone();
+            async move {
+                let initial_user_names = directory_connection
+                    .user_cache
+                    .lock()
+                    .expect("runtime user cache lock poisoned")
+                    .clone();
+                let mut cached_user_names = initial_user_names.clone();
+                let outcome = load_user_directory_with_api(
+                    &directory_events,
+                    &directory_connection.slack,
+                    &directory_connection.workspace_store,
+                    &directory_connection.workspace,
+                    &mut cached_user_names,
+                    &directory_connection.user_directory_sync,
+                    &directory_connection.user_status_sync,
+                )
+                .await;
+                let mut shared_user_names = directory_connection
+                    .user_cache
+                    .lock()
+                    .expect("runtime user cache lock poisoned");
+                let canonical_user_names =
+                    user_display_names(&directory_connection.workspace.users());
+                apply_user_cache_handoff(
+                    &mut shared_user_names,
+                    &initial_user_names,
+                    canonical_user_names,
+                    UserCacheHandoff::ReplaceAuthoritative,
+                    outcome.is_ok(),
+                );
+                drop(shared_user_names);
+                match outcome {
+                    Ok(_) => JobOutcome::Succeeded,
+                    Err(error) => {
+                        crate::debug::log(
+                            "runtime",
+                            &format!(
+                                "UserDirectoryLoadFailed category={:?}",
+                                RuntimeFailure::from_error(&error).category
+                            ),
+                        );
+                        JobOutcome::PermanentFailure
+                    }
+                }
+            }
+        });
+        schedule_session_sync_work_with_last_success(
+            &state_after_hydration,
+            identity.session,
+            startup_sync_plan(RuntimeStartupSyncKind::UserDirectory),
+            directory_last_success,
+            directory_work,
+        );
+
         let emoji_events = hydration_events.with_context(OperationContext::new(
             RuntimeOperation::Emoji,
             RuntimeTarget::Workspace,
@@ -4024,11 +4312,6 @@ fn spawn_workspace_tasks(
             let refresh_events = refresh_events.clone();
             let refresh_connection = refresh_connection.clone();
             async move {
-                let cached_user_names = refresh_connection
-                    .user_cache
-                    .lock()
-                    .expect("runtime user cache lock poisoned")
-                    .clone();
                 match load_conversations_best_effort_with_api(
                     &refresh_events,
                     &refresh_connection.slack,
@@ -4038,7 +4321,6 @@ fn spawn_workspace_tasks(
                         reducer: &refresh_connection.workspace,
                         conversation_star_sync: &refresh_connection.conversation_star_sync,
                     },
-                    cached_user_names,
                     refresh_connection.team_id.as_deref(),
                     &refresh_connection.huddles,
                 )
@@ -4065,7 +4347,7 @@ fn spawn_workspace_tasks(
             refresh_work,
         );
 
-        let group_events = hydration_events.with_context(OperationContext::new(
+        let group_events = hydration_events.unsolicited(OperationContext::new(
             RuntimeOperation::User,
             RuntimeTarget::Workspace,
         ));
@@ -4074,19 +4356,15 @@ fn spawn_workspace_tasks(
             let group_events = group_events.clone();
             let group_connection = group_connection.clone();
             async move {
-                let cached_user_names = group_connection
-                    .user_cache
-                    .lock()
-                    .expect("runtime user cache lock poisoned")
-                    .clone();
-                match load_user_groups_best_effort_with_api(
+                let groups_result = load_user_groups_best_effort_with_api(
                     &group_events,
                     &group_connection.slack,
-                    &group_connection.workspace_store,
-                    cached_user_names,
+                    &group_connection.user_cache,
+                    &group_connection.workspace,
+                    &group_connection.user_directory_sync,
                 )
-                .await
-                {
+                .await;
+                match groups_result {
                     Ok(()) => JobOutcome::Succeeded,
                     Err(error) => {
                         crate::debug::log(
@@ -4178,21 +4456,41 @@ fn spawn_workspace_tasks(
 
 async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &RuntimeConnection) {
     let Some(store) = connection.workspace_store.as_ref() else {
+        connection.user_directory_sync.hydrate(false, None);
         return;
     };
     let _admission = connection.workspace.publication_admission.lock().await;
-    #[cfg(test)]
-    if let Some(gate) = connection.cached_bootstrap_load_gate.as_ref() {
-        gate.wait_before_send();
-    }
+    let last_success_at_ms = match store
+        .load_sync_freshness(
+            USER_DIRECTORY_FRESHNESS_OPERATION,
+            USER_DIRECTORY_FRESHNESS_TARGET,
+        )
+        .await
+    {
+        Ok(freshness) => freshness
+            .and_then(|freshness| user_directory_last_success_at_ms(freshness.refreshed_at_ms)),
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!("UserDirectoryFreshnessLoadFailed error={error:#}"),
+            );
+            None
+        }
+    };
     let bootstrap = match store.load_bootstrap().await {
         Ok(Some(bootstrap)) => bootstrap,
-        Ok(None) => return,
+        Ok(None) => {
+            connection
+                .user_directory_sync
+                .hydrate(false, last_success_at_ms);
+            return;
+        }
         Err(error) => {
             crate::debug::log(
                 "store",
                 &format!("WorkspaceBootstrapLoadFailed error={error:#}"),
             );
+            connection.user_directory_sync.hydrate(false, None);
             return;
         }
     };
@@ -4200,6 +4498,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     let WorkspaceBootstrap {
         workspace_id,
         conversations,
+        users,
         user_names,
         user_full_names,
         user_avatar_urls,
@@ -4216,35 +4515,43 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             "WorkspaceBootstrapLoaded identified={} conversations={} users={} threads={}",
             !workspace_id.is_empty(),
             conversations.len(),
-            user_names.len(),
+            users.len(),
             thread_catalog.len()
         ),
     );
+    let user_events = events.unsolicited(OperationContext::new(
+        RuntimeOperation::User,
+        RuntimeTarget::Workspace,
+    ));
     if !user_names.is_empty() {
         connection
             .user_cache
             .lock()
             .expect("runtime user cache lock poisoned")
             .extend(user_names.clone());
-        events.send_event(RuntimeEventKind::UserNamesLoaded(user_names));
+        user_events.send_event(RuntimeEventKind::UserNamesLoaded(user_names));
     }
     if !user_full_names.is_empty() {
-        events.send_event(RuntimeEventKind::UserFullNamesLoaded(user_full_names));
+        user_events.send_event(RuntimeEventKind::UserFullNamesLoaded(user_full_names));
     }
     if !user_avatar_urls.is_empty() {
-        events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(user_avatar_urls));
+        user_events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(user_avatar_urls));
     }
     if !user_search_aliases.is_empty() {
-        events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(
+        user_events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(
             user_search_aliases,
         ));
     }
     if !user_statuses.is_empty() {
-        events.send_event(RuntimeEventKind::UserStatusesLoaded {
+        user_events.send_event(RuntimeEventKind::UserStatusesLoaded {
             statuses: user_statuses,
             replace_existing: false,
             preserve_user_ids: HashSet::new(),
         });
+    }
+    #[cfg(test)]
+    if let Some(gate) = connection.cached_bootstrap_load_gate.as_ref() {
+        gate.wait_before_send();
     }
     let persisted = connection
         .workspace
@@ -4253,28 +4560,39 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             MutationOrigin::Cache,
             WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
                 conversations,
+                users: users.clone(),
                 threads: thread_catalog,
                 reaction_actor_states,
                 ..Default::default()
             }),
         )
         .await;
-    match persisted {
+    let hydration_succeeded = match persisted {
         Ok(publication) => {
             for write in publication.writes() {
                 publish_persisted_workspace_write(events, write);
             }
+            true
         }
         Err(error) => {
             crate::debug::log(
                 "store",
                 &format!("WorkspaceBootstrapPublishFailed error={error:#}"),
             );
+            false
         }
-    }
+    };
     if !custom_emojis.is_empty() {
         events.send_event(RuntimeEventKind::EmojiCatalogLoaded(custom_emojis));
     }
+    let has_cached_users = hydration_succeeded && !users.is_empty();
+    if has_cached_users {
+        user_events.send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
+    }
+    connection.user_directory_sync.hydrate(
+        has_cached_users,
+        hydration_succeeded.then_some(last_success_at_ms).flatten(),
+    );
 }
 
 fn select_realtime_credentials(
@@ -4303,6 +4621,267 @@ fn user_avatar_urls(users: &[SlackUser]) -> HashMap<String, String> {
         .collect()
 }
 
+fn user_display_names(users: &[SlackUser]) -> HashMap<String, String> {
+    users
+        .iter()
+        .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
+        .collect()
+}
+
+fn user_directory_snapshot_has_identity(users: &[SlackUser]) -> bool {
+    users.iter().any(|user| {
+        user.id
+            .as_deref()
+            .is_some_and(|user_id| !user_id.trim().is_empty())
+    })
+}
+
+async fn load_user_directory_with_api(
+    events: &RuntimeEventSender,
+    api: &SlackApi,
+    workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+    user_cache: &mut HashMap<String, String>,
+    directory_sync: &UserDirectorySync,
+    user_status_sync: &UserStatusSync,
+) -> Result<bool> {
+    let _refresh = directory_sync.refresh.lock().await;
+    directory_sync.wait_for_hydration().await;
+    if !directory_sync.refresh_required(current_unix_millis()) {
+        let users = workspace.users();
+        *user_cache = user_display_names(&users);
+        publish_user_directory_completion(events, users);
+        return Ok(false);
+    }
+    let events = events.unsolicited(OperationContext::new(
+        RuntimeOperation::User,
+        RuntimeTarget::Workspace,
+    ));
+
+    let status_base_revision = user_status_sync.revision();
+    let users_base_revision = workspace.revision();
+    let snapshot_users = api.users().await?;
+    if !user_directory_snapshot_has_identity(&snapshot_users) {
+        return Err(anyhow!(
+            "Slack user directory response contained no identified users"
+        ));
+    }
+    persist_user_directory_snapshot_and_publish(
+        &events,
+        workspace_store.as_ref(),
+        workspace,
+        user_cache,
+        directory_sync,
+        user_status_sync,
+        status_base_revision,
+        users_base_revision,
+        snapshot_users,
+        current_unix_millis(),
+    )
+    .await?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_user_directory_snapshot_and_publish(
+    events: &RuntimeEventSender,
+    workspace_store: Option<&WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+    user_cache: &mut HashMap<String, String>,
+    directory_sync: &UserDirectorySync,
+    user_status_sync: &UserStatusSync,
+    status_base_revision: u64,
+    users_base_revision: WorkspaceRevision,
+    snapshot_users: Vec<SlackUser>,
+    refreshed_at_ms: u64,
+) -> Result<()> {
+    if !user_directory_snapshot_has_identity(&snapshot_users) {
+        return Err(anyhow!(
+            "Slack user directory response contained no identified users"
+        ));
+    }
+    let _admission = workspace.publication_admission.lock().await;
+    workspace
+        .apply_persisted_and_publish_admitted(
+            workspace_store,
+            events,
+            MutationOrigin::WebApi,
+            WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                users_base_revision,
+                snapshot_users,
+            )),
+            None,
+        )
+        .await?;
+    let users = workspace.users();
+
+    let names = user_display_names(&users);
+    let aliases = users
+        .iter()
+        .filter_map(|user| Some((user.id.clone()?, user.search_aliases())))
+        .collect::<HashMap<_, _>>();
+    let full_names = users
+        .iter()
+        .filter_map(|user| Some((user.id.clone()?, user.full_name()?)))
+        .collect::<HashMap<_, _>>();
+    let avatar_urls = user_avatar_urls(&users);
+    let statuses = user_statuses(&users);
+    *user_cache = names.clone();
+
+    if let Some(store) = workspace_store {
+        store
+            .store_sync_freshness(
+                USER_DIRECTORY_FRESHNESS_OPERATION,
+                USER_DIRECTORY_FRESHNESS_TARGET,
+                SyncFreshness {
+                    refreshed_at_ms: Some(i64::try_from(refreshed_at_ms).unwrap_or(i64::MAX)),
+                    retry_count: 0,
+                    retry_after_ms: None,
+                },
+            )
+            .await?;
+    }
+    directory_sync.record_success(refreshed_at_ms);
+
+    events.send_event(RuntimeEventKind::UserNamesLoaded(names));
+    events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(aliases));
+    events.send_event(RuntimeEventKind::UserFullNamesLoaded(full_names));
+    events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(avatar_urls));
+    user_status_sync.publish_snapshot(status_base_revision, |preserve_user_ids| {
+        events.send_event(RuntimeEventKind::UserStatusesLoaded {
+            statuses,
+            replace_existing: true,
+            preserve_user_ids,
+        });
+    });
+    events.send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
+    publish_retained_user_groups(events, directory_sync, user_cache);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserCacheHandoff {
+    ReplaceAuthoritative,
+    UpsertChanges,
+}
+
+fn user_cache_handoff_for(
+    command: &RuntimeCommand,
+    user_cache_authoritative: bool,
+) -> UserCacheHandoff {
+    if user_cache_authoritative || matches!(command, RuntimeCommand::LoadUserDirectory) {
+        UserCacheHandoff::ReplaceAuthoritative
+    } else {
+        UserCacheHandoff::UpsertChanges
+    }
+}
+
+fn apply_user_cache_handoff(
+    shared: &mut HashMap<String, String>,
+    baseline: &HashMap<String, String>,
+    staged: HashMap<String, String>,
+    handoff: UserCacheHandoff,
+    succeeded: bool,
+) {
+    if !succeeded {
+        return;
+    }
+    match handoff {
+        UserCacheHandoff::ReplaceAuthoritative => *shared = staged,
+        UserCacheHandoff::UpsertChanges => {
+            for (user_id, display_name) in staged {
+                if baseline.get(&user_id) != Some(&display_name) {
+                    shared.insert(user_id, display_name);
+                }
+            }
+        }
+    }
+}
+
+fn user_cache_handoff_succeeded(command_succeeded: bool, user_cache_authoritative: bool) -> bool {
+    command_succeeded || user_cache_authoritative
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_user_lookup_and_publish(
+    events: &RuntimeEventSender,
+    workspace_store: Option<&WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+    user_status_sync: &UserStatusSync,
+    user_id: String,
+    mut user: SlackUser,
+    status_base_revision: u64,
+) -> Result<String> {
+    user.id = Some(user_id.clone());
+    let display_name = user.display_name().unwrap_or_else(|| user_id.clone());
+    let full_name = user.full_name();
+    let avatar_url = user.avatar_url();
+    let status = user.status();
+    let contains_status = user
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.contains_status_fields());
+    let _status_persistence = if contains_status {
+        Some(user_status_sync.persistence.lock().await)
+    } else {
+        None
+    };
+    let status_is_current =
+        user_status_sync.is_user_revision_current(&user_id, status_base_revision);
+    if contains_status && !status_is_current {
+        user = without_user_status(user);
+    }
+
+    let _admission = workspace.publication_admission.lock().await;
+    if let Some(canonical_user) = workspace
+        .users()
+        .into_iter()
+        .find(|user| user.id.as_deref() == Some(user_id.as_str()))
+    {
+        let display_name = canonical_user
+            .display_name()
+            .unwrap_or_else(|| user_id.clone());
+        events.send_event(RuntimeEventKind::UserLoaded {
+            user_id,
+            display_name: display_name.clone(),
+            full_name: canonical_user.full_name(),
+            avatar_url: canonical_user.avatar_url(),
+            status: canonical_user.status(),
+        });
+        return Ok(display_name);
+    }
+
+    workspace
+        .apply_persisted_and_publish_admitted(
+            workspace_store,
+            events,
+            MutationOrigin::WebApi,
+            WorkspaceMutation::UserUpsert(user),
+            Some(RuntimeEventKind::UserLoaded {
+                user_id,
+                display_name: display_name.clone(),
+                full_name,
+                avatar_url,
+                status: status_is_current.then_some(status).flatten(),
+            }),
+        )
+        .await?;
+    Ok(display_name)
+}
+
+async fn serialize_user_lookup_with_directory(
+    directory_sync: &UserDirectorySync,
+    workspace: &WorkspaceReducerAdapter,
+    user_id: &str,
+) -> (tokio::sync::OwnedMutexGuard<()>, Option<SlackUser>) {
+    let serialization = Arc::clone(&directory_sync.refresh).lock_owned().await;
+    let canonical_user = workspace
+        .users()
+        .into_iter()
+        .find(|user| user.id.as_deref() == Some(user_id));
+    (serialization, canonical_user)
+}
+
 async fn handle_connected_command(
     command: RuntimeCommand,
     connection: RuntimeConnection,
@@ -4313,13 +4892,16 @@ async fn handle_connected_command(
         RuntimeCommand::Huddle(command) => return connection.huddles.command(command),
         command => command,
     };
+    let command_user_cache_handoff = user_cache_handoff_for(&command, false);
     let mut slack = Some(connection.slack.clone());
     let mut workspace_store = connection.workspace_store.clone();
-    let mut user_cache = connection
+    let mut user_cache_authoritative = false;
+    let initial_user_cache = connection
         .user_cache
         .lock()
         .expect("runtime user cache lock poisoned")
         .clone();
+    let mut user_cache = initial_user_cache.clone();
     let mut read_marks = connection
         .read_marks
         .lock()
@@ -4333,9 +4915,11 @@ async fn handle_connected_command(
         workspace: &connection.workspace,
         current_user_id: connection.current_user_id.as_deref(),
         user_cache: &mut user_cache,
+        user_cache_authoritative: &mut user_cache_authoritative,
         read_marks: &mut read_marks,
         message_handoffs: &connection.message_handoffs,
         conversation_star_sync: &connection.conversation_star_sync,
+        user_directory_sync: &connection.user_directory_sync,
         user_status_sync: &connection.user_status_sync,
         team_id: connection.team_id.as_deref(),
         workspace_url: connection.workspace_url.as_deref(),
@@ -4343,11 +4927,28 @@ async fn handle_connected_command(
     };
 
     let result = handle_command(command, &mut context).await;
-    connection
+    let user_cache_handoff = if user_cache_authoritative {
+        UserCacheHandoff::ReplaceAuthoritative
+    } else {
+        command_user_cache_handoff
+    };
+    let mut shared_user_cache = connection
         .user_cache
         .lock()
-        .expect("runtime user cache lock poisoned")
-        .extend(user_cache);
+        .expect("runtime user cache lock poisoned");
+    let handed_off_user_cache = if user_cache_handoff == UserCacheHandoff::ReplaceAuthoritative {
+        user_display_names(&connection.workspace.users())
+    } else {
+        user_cache
+    };
+    apply_user_cache_handoff(
+        &mut shared_user_cache,
+        &initial_user_cache,
+        handed_off_user_cache,
+        user_cache_handoff,
+        user_cache_handoff_succeeded(result.is_ok(), user_cache_authoritative),
+    );
+    drop(shared_user_cache);
     let mut shared_read_marks = connection
         .read_marks
         .lock()
@@ -4369,9 +4970,11 @@ struct RuntimeContext<'a> {
     workspace: &'a WorkspaceReducerAdapter,
     current_user_id: Option<&'a str>,
     user_cache: &'a mut HashMap<String, String>,
+    user_cache_authoritative: &'a mut bool,
     read_marks: &'a mut HashMap<String, String>,
     message_handoffs: &'a Arc<Mutex<MessageHandoffResolver>>,
     conversation_star_sync: &'a ConversationStarSyncGate,
+    user_directory_sync: &'a UserDirectorySync,
     user_status_sync: &'a UserStatusSync,
     team_id: Option<&'a str>,
     workspace_url: Option<&'a str>,
@@ -4383,20 +4986,6 @@ struct WorkspacePipelineContext<'a> {
     store: &'a Option<WorkspaceStore>,
     reducer: &'a WorkspaceReducerAdapter,
     conversation_star_sync: &'a ConversationStarSyncGate,
-}
-
-fn cached_conversation_user_ids(
-    conversations: &[SlackConversation],
-    user_cache: &HashMap<String, String>,
-) -> Vec<String> {
-    let mut user_ids = conversations
-        .iter()
-        .flat_map(SlackConversation::display_user_ids)
-        .filter(|user_id| user_cache.contains_key(user_id))
-        .collect::<Vec<_>>();
-    user_ids.sort();
-    user_ids.dedup();
-    user_ids
 }
 
 #[derive(Debug, Clone)]
@@ -4437,6 +5026,35 @@ struct ConversationUnreadRefreshPlan {
     next_queue: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupConversationPlan {
+    enrichment: ConversationUnreadRefreshPlan,
+    history_ids: Vec<String>,
+}
+
+fn startup_conversation_plan(
+    conversations: &[SlackConversation],
+    browser_covered: &HashSet<String>,
+    current_huddle_channels: &HashSet<String>,
+    cached_pending: Vec<String>,
+) -> StartupConversationPlan {
+    let ranked_enrichment = conversation_unread_refresh_candidates(conversations)
+        .into_iter()
+        .filter(|channel_id| !browser_covered.contains(channel_id))
+        .collect();
+    StartupConversationPlan {
+        enrichment: conversation_unread_refresh_plan(
+            cached_pending,
+            ranked_enrichment,
+            CONVERSATION_ENRICHMENT_LIMIT,
+        ),
+        history_ids: channel_history_prefetch_candidates_with_huddles(
+            conversations,
+            current_huddle_channels,
+        ),
+    }
+}
+
 #[cfg(test)]
 fn channel_history_prefetch_candidates(conversations: &[SlackConversation]) -> Vec<String> {
     channel_history_prefetch_candidates_with_huddles(conversations, &HashSet::new())
@@ -4466,18 +5084,17 @@ fn channel_history_prefetch_candidates_with_huddles(
             .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.id.cmp(&right.id))
     });
-    let (mut huddle_candidates, remaining): (Vec<_>, Vec<_>) = candidates
+    let (huddle_candidates, remaining): (Vec<_>, Vec<_>) = candidates
         .into_iter()
         .partition(|candidate| candidate.huddle_metadata);
-    let (urgent_direct_messages, mut remaining): (Vec<_>, Vec<_>) = remaining
+    let (urgent_direct_messages, remaining): (Vec<_>, Vec<_>) = remaining
         .into_iter()
         .partition(|candidate| candidate.unread && candidate.direct_message);
-    huddle_candidates.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
-    remaining.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT.saturating_sub(huddle_candidates.len()));
     huddle_candidates
         .into_iter()
         .chain(urgent_direct_messages)
         .chain(remaining)
+        .take(CHANNEL_HISTORY_PREFETCH_LIMIT)
         .map(|candidate| candidate.id)
         .collect()
 }
@@ -4658,7 +5275,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 ));
             let api = require_slack(context.slack)?.clone();
             let workspace_store = (*context.workspace_store).clone();
-            let cached_user_names = context.user_cache.clone();
             load_conversations_best_effort_with_api(
                 context.events,
                 &api,
@@ -4668,73 +5284,23 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     reducer: context.workspace,
                     conversation_star_sync: context.conversation_star_sync,
                 },
-                cached_user_names,
                 context.team_id,
                 context.huddles,
             )
             .await?;
         }
-        RuntimeCommand::DiscoverConversations => {
-            let api = require_slack(context.slack)?;
-            let status_base_revision = context.user_status_sync.revision();
-            let users_base_revision = context.workspace.revision();
-            let users = api.users().await?;
-            context.workspace.apply(
-                MutationOrigin::WebApi,
-                WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
-                    users_base_revision,
-                    users.clone(),
-                )),
-            );
-            let aliases = users
-                .iter()
-                .filter_map(|user| Some((user.id.clone()?, user.search_aliases())))
-                .collect::<HashMap<_, _>>();
-            let full_names = users
-                .iter()
-                .filter_map(|user| Some((user.id.clone()?, user.full_name()?)))
-                .collect::<HashMap<_, _>>();
-            let avatar_urls = user_avatar_urls(&users);
-            let statuses = user_statuses(&users);
-            if let Some(store) = context.workspace_store.as_ref() {
-                store.store_user_search_aliases(&aliases).await?;
-                store.store_user_full_names(&full_names).await?;
-                store.store_user_avatar_urls(&avatar_urls).await?;
-                let _persistence_guard = context.user_status_sync.persistence.lock().await;
-                if context
-                    .user_status_sync
-                    .is_revision_current(status_base_revision)
-                {
-                    store.store_user_statuses(&statuses).await?;
-                }
-            }
-            context
-                .events
-                .send_event(RuntimeEventKind::UserSearchAliasesLoaded(aliases));
-            context
-                .events
-                .send_event(RuntimeEventKind::UserFullNamesLoaded(full_names));
-            context
-                .events
-                .send_event(RuntimeEventKind::UserAvatarUrlsLoaded(avatar_urls));
-            context
-                .user_status_sync
-                .publish_snapshot(status_base_revision, |preserve_user_ids| {
-                    context
-                        .events
-                        .send_event(RuntimeEventKind::UserStatusesLoaded {
-                            statuses,
-                            replace_existing: true,
-                            preserve_user_ids,
-                        });
-                });
-            context
-                .events
-                .send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
-            let channels = api.discover_conversations().await?;
-            context
-                .events
-                .send_event(RuntimeEventKind::ConversationChannelsDiscovered(channels));
+        RuntimeCommand::LoadUserDirectory => {
+            let api = require_slack(context.slack)?.clone();
+            load_user_directory_with_api(
+                context.events,
+                &api,
+                context.workspace_store,
+                context.workspace,
+                context.user_cache,
+                context.user_directory_sync,
+                context.user_status_sync,
+            )
+            .await?;
         }
         RuntimeCommand::DiscoverChannels => {
             let api = require_slack(context.slack)?;
@@ -5105,54 +5671,58 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     status: None,
                 });
             } else {
+                if context
+                    .user_directory_sync
+                    .refresh_required(current_unix_millis())
+                {
+                    let api = require_slack(context.slack)?.clone();
+                    load_user_directory_with_api(
+                        context.events,
+                        &api,
+                        context.workspace_store,
+                        context.workspace,
+                        context.user_cache,
+                        context.user_directory_sync,
+                        context.user_status_sync,
+                    )
+                    .await?;
+                    *context.user_cache_authoritative = true;
+                }
+                let (_directory_serialization, canonical_user) =
+                    serialize_user_lookup_with_directory(
+                        context.user_directory_sync,
+                        context.workspace,
+                        &user_id,
+                    )
+                    .await;
+                if let Some(user) = canonical_user {
+                    let display_name = user.display_name().unwrap_or_else(|| user_id.clone());
+                    context
+                        .user_cache
+                        .insert(user_id.clone(), display_name.clone());
+                    context.events.send_event(RuntimeEventKind::UserLoaded {
+                        user_id,
+                        display_name,
+                        full_name: user.full_name(),
+                        avatar_url: user.avatar_url(),
+                        status: user.status(),
+                    });
+                    return Ok(());
+                }
                 let status_base_revision = context.user_status_sync.user_revision(&user_id);
                 let api = require_slack(context.slack)?;
                 let user = api.user(&user_id).await?;
-                let display_name = user.display_name().unwrap_or_else(|| user_id.clone());
-                let full_name = user.full_name();
-                let avatar_url = user.avatar_url();
-                let status = user.status();
-                context
-                    .user_cache
-                    .insert(user_id.clone(), display_name.clone());
-                store_user_name(context.workspace_store, &user_id, &display_name).await;
-                if let Some(full_name) = full_name.as_deref() {
-                    store_user_full_name(context.workspace_store, &user_id, full_name).await;
-                }
-                if let Some(avatar_url) = avatar_url.as_deref() {
-                    store_user_avatar_url(context.workspace_store, &user_id, avatar_url).await;
-                }
-                if let Some(store) = context.workspace_store.as_ref() {
-                    let _persistence_guard = context.user_status_sync.persistence.lock().await;
-                    if context
-                        .user_status_sync
-                        .is_user_revision_current(&user_id, status_base_revision)
-                    {
-                        if let Err(error) = store.store_user_status(&user_id, status.clone()).await
-                        {
-                            crate::debug::log(
-                                "store",
-                                &format!(
-                                    "CachedUserStatusStoreFailed user_id={user_id} error={error:#}"
-                                ),
-                            );
-                        }
-                    }
-                }
-                let status_user_id = user_id.clone();
-                context.user_status_sync.publish_user_snapshot(
-                    &status_user_id,
+                let display_name = persist_user_lookup_and_publish(
+                    context.events,
+                    context.workspace_store.as_ref(),
+                    context.workspace,
+                    context.user_status_sync,
+                    user_id.clone(),
+                    user,
                     status_base_revision,
-                    |status_is_current| {
-                        context.events.send_event(RuntimeEventKind::UserLoaded {
-                            user_id,
-                            display_name,
-                            full_name,
-                            avatar_url,
-                            status: status_is_current.then_some(status).flatten(),
-                        });
-                    },
-                );
+                )
+                .await?;
+                context.user_cache.insert(user_id, display_name);
             }
         }
         RuntimeCommand::LoadUserProfile { user_id } => {
@@ -5509,11 +6079,6 @@ fn schedule_realtime_membership_refresh(
         let connection = connection.clone();
         let events = events.clone();
         async move {
-            let cached_user_names = connection
-                .user_cache
-                .lock()
-                .expect("runtime user cache lock poisoned")
-                .clone();
             match load_conversations_best_effort_with_api(
                 &events,
                 &connection.slack,
@@ -5523,7 +6088,6 @@ fn schedule_realtime_membership_refresh(
                     reducer: &connection.workspace,
                     conversation_star_sync: &connection.conversation_star_sync,
                 },
-                cached_user_names,
                 connection.team_id.as_deref(),
                 &connection.huddles,
             )
@@ -5585,7 +6149,7 @@ async fn run_socket_mode(
         let mut persistence_tasks = tokio::task::JoinSet::new();
         // The socket callback is synchronous, so awaiting publication admission
         // would deadlock the transport. One session-scoped ordered actor handles
-        // messages and reactions with or without a store and drains before reconnect.
+        // messages, reactions, and users with or without a store and drains before reconnect.
         let (persistence_sender, persistence_receiver) =
             realtime_persistence_channel(workspace.attention_metrics_handle());
         persistence_tasks.spawn(persist_realtime_events(
@@ -5605,7 +6169,6 @@ async fn run_socket_mode(
         );
         let persistence_for_run = persistence_sender.clone();
         let fallback_for_run = persistence_fallback.clone();
-        let has_store_for_run = workspace_store.is_some();
         let workspace_for_run = workspace.clone();
         let huddles_for_run = huddles.clone();
         let team_id_for_run = team_id.clone();
@@ -5643,7 +6206,10 @@ async fn run_socket_mode(
                 let forward_to_ui = !matches!(&event, SocketModeEvent::RefreshConversations(_));
                 let defer_ordered_ui = matches!(
                     &event,
-                    SocketModeEvent::Message(_) | SocketModeEvent::Reaction(_)
+                    SocketModeEvent::Message(_)
+                        | SocketModeEvent::Reaction(_)
+                        | SocketModeEvent::UserChanged(_)
+                        | SocketModeEvent::UserHuddleChanged(_)
                 );
                 let attention = (forward_to_ui && !defer_ordered_ui)
                     .then(|| apply_realtime_workspace_event(&workspace_for_run, &event))
@@ -5660,30 +6226,24 @@ async fn run_socket_mode(
                     }
                     _ => None,
                 };
-                let status_revision = if forward_to_ui && !defer_ordered_ui {
-                    if let Some(user_id) = status_change_user_id.as_deref() {
-                        Some(user_status_sync_for_run.publish_change(user_id, || {
-                            events_for_run.send_event(RuntimeEventKind::SocketModeEvent {
-                                event: event.clone(),
-                                attention: attention.as_ref().map(|effect| effect.decision.clone()),
-                            });
-                        }))
-                    } else {
-                        events_for_run.send_event(RuntimeEventKind::SocketModeEvent {
-                            event: event.clone(),
-                            attention: attention.as_ref().map(|effect| effect.decision.clone()),
-                        });
-                        None
-                    }
-                } else {
-                    None
-                };
+                let status_revision = status_change_user_id
+                    .as_deref()
+                    .map(|user_id| user_status_sync_for_run.publish_change(user_id, || {}));
+                if forward_to_ui && !defer_ordered_ui {
+                    events_for_run.send_event(RuntimeEventKind::SocketModeEvent {
+                        event: event.clone(),
+                        attention: attention.as_ref().map(|effect| effect.decision.clone()),
+                    });
+                }
                 let persistence_event = match &event {
-                    SocketModeEvent::UserChanged(user)
-                    | SocketModeEvent::UserHuddleChanged(user)
-                        if has_store_for_run =>
-                    {
+                    SocketModeEvent::UserChanged(user) => {
                         Some(RealtimePersistenceEvent::UserChanged {
+                            user: user.clone(),
+                            status_revision,
+                        })
+                    }
+                    SocketModeEvent::UserHuddleChanged(user) => {
+                        Some(RealtimePersistenceEvent::UserHuddleChanged {
                             user: user.clone(),
                             status_revision,
                         })
@@ -5694,9 +6254,7 @@ async fn run_socket_mode(
                     SocketModeEvent::Reaction(_) => Some(RealtimePersistenceEvent::OrderedEvent {
                         event: event.clone(),
                     }),
-                    SocketModeEvent::UserChanged(_)
-                    | SocketModeEvent::UserHuddleChanged(_)
-                    | SocketModeEvent::RefreshConversations(_) => None,
+                    SocketModeEvent::RefreshConversations(_) => None,
                 };
                 if let Some(persistence_event) = persistence_event {
                     if let Err(returned) = persistence_for_run.send(persistence_event) {
@@ -5944,7 +6502,7 @@ fn observe_huddle_socket_event(
                 profile.huddle_state_call_id.is_some()
                     || profile.huddle_state_channel_id.is_some()
                     || profile.huddle_state_expiration_ts.is_some()
-                    || profile.huddle_state != crate::huddles::model::SlackHuddleState::DefaultUnset
+                    || profile.huddle_state.is_some()
             }) =>
         {
             observe_huddle_user(huddles, user)
@@ -6119,6 +6677,10 @@ fn apply_huddle_effects(
 #[derive(Debug)]
 enum RealtimePersistenceEvent {
     UserChanged {
+        user: Box<SlackUser>,
+        status_revision: Option<u64>,
+    },
+    UserHuddleChanged {
         user: Box<SlackUser>,
         status_revision: Option<u64>,
     },
@@ -6348,58 +6910,31 @@ async fn persist_realtime_event(
             user,
             status_revision,
         } => {
-            let Some(store) = store else {
-                return;
-            };
-            let Some(user_id) = user.id.as_deref() else {
-                return;
-            };
-            if let Some(full_name) = user.full_name() {
-                if let Err(error) = store
-                    .store_user_full_names(&HashMap::from([(user_id.to_string(), full_name)]))
-                    .await
-                {
-                    crate::debug::log(
-                        "store",
-                        &format!(
-                            "RealtimeUserFullNameStoreFailed user_id={user_id} error={error:#}"
-                        ),
-                    );
-                }
-            }
-            if let Some(avatar_url) = user.avatar_url() {
-                if let Err(error) = store
-                    .store_user_avatar_urls(&HashMap::from([(user_id.to_string(), avatar_url)]))
-                    .await
-                {
-                    crate::debug::log(
-                        "store",
-                        &format!(
-                            "RealtimeUserAvatarUrlStoreFailed user_id={user_id} error={error:#}"
-                        ),
-                    );
-                }
-            }
-            if user
-                .profile
-                .as_ref()
-                .is_some_and(|profile| profile.contains_status_fields())
-            {
-                let _persistence_guard = user_status_sync.persistence.lock().await;
-                let status_is_current = status_revision.is_none_or(|revision| {
-                    user_status_sync.is_user_revision_current(user_id, revision)
-                });
-                if status_is_current {
-                    if let Err(error) = store.store_user_status(user_id, user.status()).await {
-                        crate::debug::log(
-                            "store",
-                            &format!(
-                                "RealtimeUserStatusStoreFailed user_id={user_id} error={error:#}"
-                            ),
-                        );
-                    }
-                }
-            }
+            persist_realtime_user_change(
+                *user,
+                false,
+                status_revision,
+                store,
+                events,
+                workspace,
+                user_status_sync,
+            )
+            .await;
+        }
+        RealtimePersistenceEvent::UserHuddleChanged {
+            user,
+            status_revision,
+        } => {
+            persist_realtime_user_change(
+                *user,
+                true,
+                status_revision,
+                store,
+                events,
+                workspace,
+                user_status_sync,
+            )
+            .await;
         }
         RealtimePersistenceEvent::Message { event } => {
             if let Some(store) = store {
@@ -6430,6 +6965,102 @@ async fn persist_realtime_event(
                 });
             }
         },
+    }
+}
+
+fn without_user_status(mut user: SlackUser) -> SlackUser {
+    if let Some(profile) = user.profile.as_mut() {
+        profile.status_text = None;
+        profile.status_emoji = None;
+        profile.status_expiration = None;
+    }
+    user
+}
+
+async fn persist_realtime_user_change(
+    user: SlackUser,
+    huddle_changed: bool,
+    status_revision: Option<u64>,
+    store: Option<&WorkspaceStore>,
+    events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
+    user_status_sync: &UserStatusSync,
+) {
+    let contains_status = user
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.contains_status_fields());
+    let _status_persistence = if contains_status {
+        Some(user_status_sync.persistence.lock().await)
+    } else {
+        None
+    };
+    let status_is_current = user.id.as_deref().is_none_or(|user_id| {
+        status_revision
+            .is_none_or(|revision| user_status_sync.is_user_revision_current(user_id, revision))
+    });
+    let user = if contains_status && !status_is_current {
+        without_user_status(user)
+    } else {
+        user
+    };
+    let socket_event = if huddle_changed {
+        SocketModeEvent::UserHuddleChanged(Box::new(user.clone()))
+    } else {
+        SocketModeEvent::UserChanged(Box::new(user.clone()))
+    };
+
+    let _admission = workspace.publication_admission.lock().await;
+    let recovered = match workspace.recover_persisted_admitted(store).await {
+        Ok(publication) => publication,
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "RealtimeUserRecoveryDeferred category={:?}",
+                    error.category()
+                ),
+            );
+            workspace.apply_and_enqueue(
+                store,
+                MutationOrigin::Realtime,
+                WorkspaceMutation::UserUpsert(user),
+            );
+            events.send_event(RuntimeEventKind::SocketModeEvent {
+                event: socket_event,
+                attention: None,
+            });
+            return;
+        }
+    };
+    for write in recovered.writes() {
+        publish_persisted_workspace_write(events, write);
+    }
+    drop(recovered);
+
+    workspace.apply_and_enqueue(
+        store,
+        MutationOrigin::Realtime,
+        WorkspaceMutation::UserUpsert(user),
+    );
+    let persisted = match workspace.recover_persisted_admitted(store).await {
+        Ok(publication) => Some(publication),
+        Err(error) => {
+            crate::debug::log(
+                "store",
+                &format!("RealtimeUserDeltaDeferred category={:?}", error.category()),
+            );
+            None
+        }
+    };
+    events.send_event(RuntimeEventKind::SocketModeEvent {
+        event: socket_event,
+        attention: None,
+    });
+    if let Some(publication) = persisted {
+        for write in publication.writes() {
+            publish_persisted_workspace_write(events, write);
+        }
     }
 }
 
@@ -6868,18 +7499,38 @@ fn socket_mode_reconnect_timing(
 async fn load_user_groups_best_effort_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
-    workspace_store: &Option<WorkspaceStore>,
-    cached_user_names: HashMap<String, String>,
+    shared_user_names: &Arc<Mutex<HashMap<String, String>>>,
+    workspace: &WorkspaceReducerAdapter,
+    directory_sync: &UserDirectorySync,
 ) -> Result<()> {
     let groups = api.user_groups().await?;
+    directory_sync.retain_user_groups(groups);
+    let known_user_names = current_user_group_known_names(shared_user_names, workspace);
+    publish_retained_user_groups(events, directory_sync, &known_user_names);
+    Ok(())
+}
 
-    let (names, members, loaded_user_names) =
-        resolve_user_group_display_data(api, groups, cached_user_names).await;
+fn current_user_group_known_names(
+    shared_user_names: &Arc<Mutex<HashMap<String, String>>>,
+    workspace: &WorkspaceReducerAdapter,
+) -> HashMap<String, String> {
+    let mut known_user_names = shared_user_names
+        .lock()
+        .expect("runtime user cache lock poisoned")
+        .clone();
+    known_user_names.extend(user_display_names(&workspace.users()));
+    known_user_names
+}
 
-    if !loaded_user_names.is_empty() {
-        store_user_names(workspace_store, &loaded_user_names).await;
-        events.send_event(RuntimeEventKind::UserNamesLoaded(loaded_user_names));
-    }
+fn publish_retained_user_groups(
+    events: &RuntimeEventSender,
+    directory_sync: &UserDirectorySync,
+    known_user_names: &HashMap<String, String>,
+) {
+    let Some(groups) = directory_sync.retained_user_groups() else {
+        return;
+    };
+    let (names, members) = resolve_user_group_display_data(groups, known_user_names);
 
     if !names.is_empty() {
         crate::debug::log(
@@ -6888,21 +7539,14 @@ async fn load_user_groups_best_effort_with_api(
         );
         events.send_event(RuntimeEventKind::UserGroupsLoaded { names, members });
     }
-    Ok(())
 }
 
-async fn resolve_user_group_display_data(
-    api: &SlackApi,
+fn resolve_user_group_display_data(
     groups: Vec<SlackUserGroup>,
-    mut known_user_names: HashMap<String, String>,
-) -> (
-    HashMap<String, String>,
-    HashMap<String, Vec<String>>,
-    HashMap<String, String>,
-) {
+    known_user_names: &HashMap<String, String>,
+) -> (HashMap<String, String>, HashMap<String, Vec<String>>) {
     let mut names = HashMap::new();
     let mut members = HashMap::new();
-    let mut loaded_user_names = HashMap::new();
 
     for group in groups {
         if group.id.trim().is_empty() {
@@ -6916,24 +7560,8 @@ async fn resolve_user_group_display_data(
             .iter()
             .filter(|user_id| !user_id.trim().is_empty())
         {
-            if let Some(display_name) = known_user_names.get(user_id).cloned() {
-                member_names.push(display_name);
-                continue;
-            }
-
-            match api.user_display_name(user_id).await {
-                Ok(display_name) => {
-                    known_user_names.insert(user_id.clone(), display_name.clone());
-                    loaded_user_names.insert(user_id.clone(), display_name.clone());
-                    member_names.push(display_name);
-                }
-                Err(error) => {
-                    crate::debug::log(
-                        "runtime",
-                        &format!("UserGroupMemberNameLoadFailed user_id={user_id} error={error:#}"),
-                    );
-                    member_names.push(user_id.clone());
-                }
+            if let Some(display_name) = known_user_names.get(user_id) {
+                member_names.push(display_name.clone());
             }
         }
 
@@ -6944,7 +7572,7 @@ async fn resolve_user_group_display_data(
         }
     }
 
-    (names, members, loaded_user_names)
+    (names, members)
 }
 
 async fn persist_confirmed_conversation_star(
@@ -7131,7 +7759,6 @@ async fn load_conversations_best_effort_with_api(
     api: &SlackApi,
     workspace_url: Option<&str>,
     workspace: WorkspacePipelineContext<'_>,
-    cached_user_names: HashMap<String, String>,
     team_id: Option<&str>,
     huddles: &HuddleActorHandle,
 ) -> Result<()> {
@@ -7162,33 +7789,28 @@ async fn load_conversations_best_effort_with_api(
                 .filter(|conversation| conversation.has_huddle_metadata())
                 .map(|conversation| conversation.id.clone())
                 .collect::<HashSet<_>>();
-            let unread_refresh_candidates =
-                uncovered_conversation_unread_refresh_candidates(&conversations, &browser_covered);
+            let cached_pending = load_pending_unread_refresh_best_effort(workspace.store).await;
+            let startup_plan = startup_conversation_plan(
+                &conversations,
+                &browser_covered,
+                &current_huddle_channels,
+                cached_pending,
+            );
             refresh_conversation_unread_states_best_effort(
                 events,
                 api,
                 workspace.store,
                 workspace.reducer,
-                unread_refresh_candidates,
+                startup_plan.enrichment,
             )
             .await;
-            let refreshed_conversations = workspace.reducer.conversations();
             prefetch_channel_histories_best_effort(
                 events,
                 api,
                 workspace,
-                &refreshed_conversations,
-                &current_huddle_channels,
+                startup_plan.history_ids,
                 team_id,
                 huddles,
-            )
-            .await;
-            refresh_cached_conversation_user_names(
-                events,
-                api,
-                workspace.store,
-                &refreshed_conversations,
-                &cached_user_names,
             )
             .await;
         }
@@ -7200,6 +7822,7 @@ async fn load_conversations_best_effort_with_api(
     Ok(())
 }
 
+#[cfg(test)]
 fn uncovered_conversation_unread_refresh_candidates(
     conversations: &[SlackConversation],
     covered: &HashSet<String>,
@@ -7366,14 +7989,10 @@ async fn apply_browser_unread_snapshot_best_effort(
     covered
 }
 
-async fn refresh_conversation_unread_states_best_effort(
-    events: &RuntimeEventSender,
-    api: &SlackApi,
+async fn load_pending_unread_refresh_best_effort(
     workspace_store: &Option<WorkspaceStore>,
-    workspace: &WorkspaceReducerAdapter,
-    ranked_channel_ids: Vec<String>,
-) {
-    let cached_pending = if let Some(store) = workspace_store.as_ref() {
+) -> Vec<String> {
+    if let Some(store) = workspace_store.as_ref() {
         match store.load_pending_unread_refresh().await {
             Ok(cached_pending) => cached_pending,
             Err(error) => {
@@ -7386,16 +8005,21 @@ async fn refresh_conversation_unread_states_best_effort(
         }
     } else {
         Vec::new()
-    };
+    }
+}
+
+async fn refresh_conversation_unread_states_best_effort(
+    events: &RuntimeEventSender,
+    api: &SlackApi,
+    workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+    plan: ConversationUnreadRefreshPlan,
+) {
     let ConversationUnreadRefreshPlan {
-        batch: mut pending,
+        batch: pending,
         queue,
         next_queue,
-    } = conversation_unread_refresh_plan(
-        cached_pending,
-        ranked_channel_ids,
-        CONVERSATION_ENRICHMENT_LIMIT,
-    );
+    } = plan;
     if let Some(store) = workspace_store.as_ref() {
         if let Err(error) = store.store_pending_unread_refresh(&queue).await {
             crate::debug::log(
@@ -7405,37 +8029,35 @@ async fn refresh_conversation_unread_states_best_effort(
         }
     }
     let mut refresh_batch = PendingConversationRefreshBatch::default();
-    for pass in 0..MAX_UNREAD_REFRESH_PASSES {
-        let mut failed = Vec::new();
-        for channel_id in std::mem::take(&mut pending) {
-            let base_revision = workspace.revision();
-            match api.conversation_with_unread_state(&channel_id).await {
-                Ok((mut details, unread_state)) => {
-                    let unread_snapshot = SlackConversationUnreadSnapshot {
-                        channel_id: channel_id.clone(),
-                        unread_state,
-                        last_read: details
-                            .as_ref()
-                            .and_then(|details| details.last_read_ts().map(str::to_string)),
-                        latest: details
-                            .as_ref()
-                            .and_then(|details| details.latest_message_ts().map(str::to_string)),
-                        mention_count: details
-                            .as_ref()
-                            .and_then(|details| details.extra.get("mention_count")?.as_u64()),
-                        is_open: details
-                            .as_ref()
-                            .and_then(|details| details.extra.get("is_open")?.as_bool()),
-                    };
-                    if let Some(details) = details.as_mut() {
-                        // Cursor metadata is committed atomically with unread state below.
-                        details.extra.remove("last_read");
-                        details.extra.remove("latest");
-                        // The serialized conversation refresh and local toggle path
-                        // exclusively own user-relative star state.
-                        details.is_starred = None;
-                        if details.is_mpim.unwrap_or(false) {
-                            match api.conversation_members(&channel_id).await {
+    for channel_id in pending {
+        let base_revision = workspace.revision();
+        match api.conversation_with_unread_state(&channel_id).await {
+            Ok((mut details, unread_state)) => {
+                let unread_snapshot = SlackConversationUnreadSnapshot {
+                    channel_id: channel_id.clone(),
+                    unread_state,
+                    last_read: details
+                        .as_ref()
+                        .and_then(|details| details.last_read_ts().map(str::to_string)),
+                    latest: details
+                        .as_ref()
+                        .and_then(|details| details.latest_message_ts().map(str::to_string)),
+                    mention_count: details
+                        .as_ref()
+                        .and_then(|details| details.extra.get("mention_count")?.as_u64()),
+                    is_open: details
+                        .as_ref()
+                        .and_then(|details| details.extra.get("is_open")?.as_bool()),
+                };
+                if let Some(details) = details.as_mut() {
+                    // Cursor metadata is committed atomically with unread state below.
+                    details.extra.remove("last_read");
+                    details.extra.remove("latest");
+                    // The serialized conversation refresh and local toggle path
+                    // exclusively own user-relative star state.
+                    details.is_starred = None;
+                    if details.is_mpim.unwrap_or(false) {
+                        match api.conversation_members(&channel_id).await {
                                 Ok(members) => {
                                     details.extra.insert(
                                         "members".to_string(),
@@ -7447,50 +8069,35 @@ async fn refresh_conversation_unread_states_best_effort(
                                     &format!("ConversationMembersRefreshFailed channel_id={channel_id} error={error:#}"),
                                 ),
                             }
-                        }
                     }
-                    crate::debug::log(
+                }
+                crate::debug::log(
                         "runtime",
                         &format!(
                             "ConversationUnreadRefreshed channel_id={channel_id} known={} unread={} display_count={}",
                             unread_state.known, unread_state.has_unread, unread_state.display_count
                         ),
                     );
-                    if !unread_state.known {
-                        failed.push(channel_id.clone());
-                    }
-                    let refresh = SnapshotEnvelope::new(
-                        base_revision,
-                        ConversationRefresh {
-                            metadata: details,
-                            unread: unread_state.known.then_some(unread_snapshot),
-                        },
-                    );
-                    if let Some(ready) = refresh_batch.push(refresh) {
-                        publish_conversation_refresh_batch(
-                            events,
-                            workspace_store,
-                            workspace,
-                            ready,
-                        )
+                let refresh = SnapshotEnvelope::new(
+                    base_revision,
+                    ConversationRefresh {
+                        metadata: details,
+                        unread: unread_state.known.then_some(unread_snapshot),
+                    },
+                );
+                if let Some(ready) = refresh_batch.push(refresh) {
+                    publish_conversation_refresh_batch(events, workspace_store, workspace, ready)
                         .await;
-                    }
-                }
-                Err(error) => {
-                    crate::debug::log(
-                        "runtime",
-                        &format!("ConversationUnreadRefreshFailed channel_id={channel_id} pass={} error={error:#}", pass + 1),
-                    );
-                    failed.push(channel_id);
                 }
             }
-        }
-        pending = failed;
-        if pending.is_empty() {
-            break;
-        }
-        if pass + 1 < MAX_UNREAD_REFRESH_PASSES {
-            tokio::time::sleep(UNREAD_REFRESH_RETRY_DELAY).await;
+            Err(error) => {
+                crate::debug::log(
+                    "runtime",
+                    &format!(
+                        "ConversationUnreadRefreshFailed channel_id={channel_id} error={error:#}"
+                    ),
+                );
+            }
         }
     }
     if let Some(store) = workspace_store.as_ref() {
@@ -7509,8 +8116,7 @@ async fn prefetch_channel_histories_best_effort(
     events: &RuntimeEventSender,
     api: &SlackApi,
     workspace: WorkspacePipelineContext<'_>,
-    conversations: &[SlackConversation],
-    current_huddle_channels: &HashSet<String>,
+    channel_ids: Vec<String>,
     team_id: Option<&str>,
     huddles: &HuddleActorHandle,
 ) {
@@ -7518,8 +8124,6 @@ async fn prefetch_channel_histories_best_effort(
         return;
     };
 
-    let channel_ids =
-        channel_history_prefetch_candidates_with_huddles(conversations, current_huddle_channels);
     if channel_ids.is_empty() {
         return;
     }
@@ -7640,67 +8244,6 @@ async fn publish_prefetched_history_snapshot(
             },
         )
         .await
-}
-
-async fn refresh_cached_conversation_user_names(
-    events: &RuntimeEventSender,
-    api: &SlackApi,
-    workspace_store: &Option<WorkspaceStore>,
-    conversations: &[SlackConversation],
-    cached_user_names: &HashMap<String, String>,
-) {
-    let user_ids = cached_conversation_user_ids(conversations, cached_user_names);
-    if user_ids.is_empty() {
-        return;
-    }
-
-    let mut refreshed = HashMap::new();
-    let mut refreshed_full_names = HashMap::new();
-    let mut refreshed_avatar_urls = HashMap::new();
-    for user_id in user_ids {
-        match api.user(&user_id).await {
-            Ok(user) => {
-                if let Some(full_name) = user.full_name() {
-                    refreshed_full_names.insert(user_id.clone(), full_name);
-                }
-                if let Some(avatar_url) = user.avatar_url() {
-                    refreshed_avatar_urls.insert(user_id.clone(), avatar_url);
-                }
-                refreshed.insert(
-                    user_id.clone(),
-                    user.display_name().unwrap_or_else(|| user_id.clone()),
-                );
-            }
-            Err(error) => crate::debug::log(
-                "runtime",
-                &format!("UserNameRefreshFailed user_id={user_id} error={error:#}"),
-            ),
-        }
-    }
-
-    if refreshed.is_empty() {
-        return;
-    }
-
-    store_user_names(workspace_store, &refreshed).await;
-    events.send_event(RuntimeEventKind::UserNamesLoaded(refreshed));
-    if !refreshed_full_names.is_empty() {
-        store_user_full_names(workspace_store, &refreshed_full_names).await;
-        events.send_event(RuntimeEventKind::UserFullNamesLoaded(refreshed_full_names));
-    }
-    if !refreshed_avatar_urls.is_empty() {
-        if let Some(store) = workspace_store.as_ref() {
-            if let Err(error) = store.store_user_avatar_urls(&refreshed_avatar_urls).await {
-                crate::debug::log(
-                    "store",
-                    &format!("UserAvatarUrlsStoreFailed error={error:#}"),
-                );
-            }
-        }
-        events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(
-            refreshed_avatar_urls,
-        ));
-    }
 }
 
 fn handle_conversations_load_error(events: &RuntimeEventSender, error: &anyhow::Error) {
@@ -8106,104 +8649,6 @@ fn workspace_store_id(auth: &AuthInfo) -> String {
         .unwrap_or("unknown-team");
     let user = auth.user_id.as_deref().unwrap_or("unknown-user");
     format!("{team}:{user}")
-}
-
-async fn store_user_name(
-    workspace_store: &Option<WorkspaceStore>,
-    user_id: &str,
-    display_name: &str,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-
-    if let Err(error) = store.store_user_name(user_id, display_name).await {
-        crate::debug::log(
-            "runtime",
-            &format!("CachedUserNameStoreFailed user_id={user_id} error={error:#}"),
-        );
-    }
-}
-
-async fn store_user_full_name(
-    workspace_store: &Option<WorkspaceStore>,
-    user_id: &str,
-    full_name: &str,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-    if let Err(error) = store
-        .store_user_full_names(&HashMap::from([(
-            user_id.to_string(),
-            full_name.to_string(),
-        )]))
-        .await
-    {
-        crate::debug::log(
-            "store",
-            &format!("UserFullNameStoreFailed user_id={user_id} error={error:#}"),
-        );
-    }
-}
-
-async fn store_user_avatar_url(
-    workspace_store: &Option<WorkspaceStore>,
-    user_id: &str,
-    avatar_url: &str,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-    if let Err(error) = store
-        .store_user_avatar_urls(&HashMap::from([(
-            user_id.to_string(),
-            avatar_url.to_string(),
-        )]))
-        .await
-    {
-        crate::debug::log(
-            "store",
-            &format!("UserAvatarUrlStoreFailed user_id={user_id} error={error:#}"),
-        );
-    }
-}
-
-async fn store_user_full_names(
-    workspace_store: &Option<WorkspaceStore>,
-    user_full_names: &HashMap<String, String>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-    if let Err(error) = store.store_user_full_names(user_full_names).await {
-        crate::debug::log(
-            "store",
-            &format!(
-                "UserFullNamesStoreFailed count={} error={error:#}",
-                user_full_names.len()
-            ),
-        );
-    }
-}
-
-async fn store_user_names(
-    workspace_store: &Option<WorkspaceStore>,
-    user_names: &HashMap<String, String>,
-) {
-    let Some(store) = workspace_store.as_ref() else {
-        return;
-    };
-
-    if let Err(error) = store.store_user_names(user_names).await {
-        crate::debug::log(
-            "runtime",
-            &format!(
-                "CachedUserNamesStoreFailed count={} error={error:#}",
-                user_names.len()
-            ),
-        );
-    }
 }
 
 async fn load_cached_thread(
@@ -9603,8 +10048,17 @@ mod tests {
                 is_channel: Some(true),
                 ..Default::default()
             };
+            let cached_user = SlackUser {
+                id: Some("U1".to_string()),
+                name: Some("ada".to_string()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Ada".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
             let user_names = HashMap::from([("U1".to_string(), "Ada".to_string())]);
-            store.store_user_names(&user_names).await.unwrap();
+            let user_search_aliases = HashMap::from([("U1".to_string(), vec!["Ada".to_string()])]);
             let custom_emojis = HashMap::from([(
                 "shipit".to_string(),
                 "https://example.test/shipit.png".to_string(),
@@ -9641,6 +10095,7 @@ mod tests {
                 &store,
                 vec![
                     StoreChange::ConversationsReplaced(vec![conversation.clone()]),
+                    StoreChange::UsersReplaced(vec![cached_user.clone()]),
                     StoreChange::ThreadCatalogReplaced(thread_records.clone()),
                     StoreChange::ReactionActorStatesReplaced(vec![reaction_actor_state.clone()]),
                 ],
@@ -9693,6 +10148,7 @@ mod tests {
                 read_marks: Arc::new(Mutex::new(HashMap::new())),
                 message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
                 conversation_star_sync: ConversationStarSyncGate::default(),
+                user_directory_sync: UserDirectorySync::default(),
                 user_status_sync: UserStatusSync::default(),
                 team_id: None,
                 huddles,
@@ -9707,12 +10163,14 @@ mod tests {
                     .iter()
                     .map(|event| match &event.kind {
                         RuntimeEventKind::UserNamesLoaded(_) => "users",
+                        RuntimeEventKind::UserSearchAliasesLoaded(_) => "aliases",
                         RuntimeEventKind::WorkspacePatch(_) => "patch",
                         RuntimeEventKind::EmojiCatalogLoaded(_) => "emoji",
+                        RuntimeEventKind::ConversationPeopleDiscovered(_) => "people",
                         other => panic!("unexpected cache projection event {other:?}"),
                     })
                     .collect::<Vec<_>>(),
-                vec!["users", "patch", "emoji"]
+                vec!["users", "aliases", "patch", "emoji", "people"]
             );
             let patches = delivered
                 .iter()
@@ -9727,6 +10185,7 @@ mod tests {
                 patches[0].changes(),
                 [WorkspaceChange::BootstrapReset(data)]
                     if data.conversations == vec![conversation.clone()]
+                        && data.users == vec![cached_user.clone()]
                         && data.threads == canonical_thread_records
                         && data.reaction_actor_states == vec![reaction_actor_state.clone()]
             ));
@@ -9735,6 +10194,21 @@ mod tests {
                     &event.kind,
                     RuntimeEventKind::UserNamesLoaded(names) if names == &user_names
                 )
+            }));
+            assert!(delivered.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    RuntimeEventKind::UserSearchAliasesLoaded(aliases)
+                        if aliases == &user_search_aliases
+                )
+            }));
+            assert!(delivered.iter().any(|event| {
+                event.meta.request.is_none()
+                    && matches!(
+                        &event.kind,
+                        RuntimeEventKind::ConversationPeopleDiscovered(users)
+                            if users == &vec![cached_user.clone()]
+                    )
             }));
             assert!(delivered.iter().any(|event| {
                 matches!(
@@ -9779,13 +10253,18 @@ mod tests {
                     is_channel: Some(true),
                     ..Default::default()
                 };
+                let mut cached_changes = vec![StoreChange::UsersReplaced(vec![SlackUser {
+                    id: Some("U1".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        display_name: Some("Ada".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }])];
                 if cache_has_conversation {
-                    seed_test_conversations(&store, std::slice::from_ref(&cached))
-                        .await
-                        .unwrap();
+                    cached_changes.push(StoreChange::ConversationsReplaced(vec![cached.clone()]));
                 }
-                store
-                    .store_user_names(&HashMap::from([("U1".to_string(), "Ada".to_string())]))
+                apply_test_store_changes(&store, cached_changes)
                     .await
                     .unwrap();
 
@@ -9827,6 +10306,7 @@ mod tests {
                     read_marks: Arc::new(Mutex::new(HashMap::new())),
                     message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
                     conversation_star_sync: ConversationStarSyncGate::default(),
+                    user_directory_sync: UserDirectorySync::default(),
                     user_status_sync: UserStatusSync::default(),
                     team_id: None,
                     huddles,
@@ -9835,6 +10315,7 @@ mod tests {
                         release: Mutex::new(load_release),
                     })),
                 };
+                let hydration_sync = connection.user_directory_sync.clone();
                 let load_events = events.clone();
                 let loading = tokio::spawn(async move {
                     load_cached_bootstrap(&load_events, &connection).await;
@@ -9842,6 +10323,19 @@ mod tests {
                 load_reached
                     .recv_timeout(Duration::from_secs(5))
                     .expect("cache load did not retain admission at the test gate");
+                let hydration_workspace = workspace.clone();
+                let (hydrated_sender, mut hydrated_receiver) = mpsc::unbounded_channel();
+                let hydration_waiter = tokio::spawn(async move {
+                    hydration_sync.wait_for_hydration().await;
+                    hydrated_sender
+                        .send(hydration_workspace.revision())
+                        .unwrap();
+                });
+                tokio::task::yield_now().await;
+                assert!(
+                    hydrated_receiver.try_recv().is_err(),
+                    "directory work must wait until cached users enter the coordinator"
+                );
 
                 let open_workspace = workspace.clone();
                 let open_store = store.clone();
@@ -9870,6 +10364,9 @@ mod tests {
 
                 release_load.send(()).unwrap();
                 loading.await.unwrap();
+                let hydrated_revision = hydrated_receiver.recv().await.unwrap();
+                hydration_waiter.await.unwrap();
+                assert!(hydrated_revision > WorkspaceRevision::INITIAL);
                 opening.await.unwrap().unwrap();
 
                 let ids = workspace
@@ -9900,11 +10397,7 @@ mod tests {
                             _ => None,
                         })
                         .collect::<Vec<_>>(),
-                    if cache_has_conversation {
-                        vec![1, 2]
-                    } else {
-                        vec![1]
-                    }
+                    vec![1, 2]
                 );
                 let _ = std::fs::remove_dir_all(directory);
             }
@@ -15739,6 +16232,299 @@ mod tests {
     }
 
     #[test]
+    fn realtime_user_persistence_stores_the_coordinator_canonical_merge_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-realtime-user-persistence-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+            let cached_user = SlackUser {
+                id: Some("U1".into()),
+                name: Some("ada".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Ada".into()),
+                    real_name: Some("Ada Lovelace".into()),
+                    image_72: Some("https://example.test/ada.png".into()),
+                    status_text: Some("Old".into()),
+                    status_emoji: Some(":older:".into()),
+                    status_expiration: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            apply_test_store_changes(
+                &store,
+                vec![StoreChange::UsersReplaced(vec![cached_user.clone()])],
+            )
+            .await
+            .unwrap();
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    users: vec![cached_user],
+                    ..Default::default()
+                }),
+            );
+            let initial_revision = workspace.revision();
+            let (runtime_events, mut receiver) = mpsc::unbounded_channel();
+            let event_sender = RuntimeEventSender::new(
+                runtime_events,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(1),
+                },
+                OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
+            );
+            let status_sync = UserStatusSync::default();
+            let status_revision = status_sync.publish_change("U1", || {});
+
+            persist_realtime_event(
+                RealtimePersistenceEvent::UserChanged {
+                    user: Box::new(SlackUser {
+                        id: Some("U1".into()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            status_text: Some("Current".into()),
+                            status_emoji: Some(":new:".into()),
+                            status_expiration: Some(0),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    status_revision: Some(status_revision),
+                },
+                Some(&store),
+                Some("U_SELF"),
+                &event_sender,
+                &workspace,
+                &status_sync,
+            )
+            .await;
+
+            assert_eq!(workspace.revision(), initial_revision.successor());
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(bootstrap.users.len(), 1);
+            let stored = &bootstrap.users[0];
+            assert_eq!(stored.display_name().as_deref(), Some("Ada"));
+            assert_eq!(stored.full_name().as_deref(), Some("Ada Lovelace"));
+            assert_eq!(
+                stored.avatar_url().as_deref(),
+                Some("https://example.test/ada.png")
+            );
+            assert_eq!(
+                stored.status().map(|status| status.text),
+                Some("Current".into())
+            );
+            assert!(receiver.try_recv().is_ok(), "user persistence must publish");
+
+            persist_realtime_event(
+                RealtimePersistenceEvent::UserHuddleChanged {
+                    user: Box::new(SlackUser {
+                        id: Some("U1".into()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            huddle_state_call_id: Some("R1".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    status_revision: None,
+                },
+                Some(&store),
+                Some("U_SELF"),
+                &event_sender,
+                &workspace,
+                &status_sync,
+            )
+            .await;
+            assert_eq!(
+                workspace.revision(),
+                initial_revision.successor().successor()
+            );
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(
+                bootstrap.users[0]
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.huddle_state_call_id.as_deref()),
+                Some("R1")
+            );
+            assert!(
+                std::iter::from_fn(|| receiver.try_recv().ok()).any(|event| matches!(
+                    event.kind,
+                    RuntimeEventKind::SocketModeEvent {
+                        event: SocketModeEvent::UserHuddleChanged(_),
+                        ..
+                    }
+                ))
+            );
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn realtime_user_raw_event_waits_until_bulk_directory_publication_finishes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(3)
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-user-directory-publication-order-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
+            let workspace = WorkspaceReducerAdapter::default();
+            let directory_sync = UserDirectorySync::default();
+            let status_sync = UserStatusSync::default();
+            let (events_sender, mut receiver) = mpsc::unbounded_channel();
+            let (patch_started, patch_reached) = std::sync::mpsc::channel();
+            let (release_patch, patch_release) = std::sync::mpsc::channel();
+            let events = RuntimeEventSender {
+                sender: events_sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+                workspace_patch_send_gate: Some(Arc::new(TestWorkspacePatchSendGate {
+                    started: patch_started,
+                    release: Mutex::new(patch_release),
+                })),
+            };
+            let bulk_events = events.clone();
+            let bulk_store = store.clone();
+            let bulk_workspace = workspace.clone();
+            let bulk_directory_sync = directory_sync.clone();
+            let bulk_status_sync = status_sync.clone();
+            let bulk = tokio::spawn(async move {
+                let mut user_cache = HashMap::new();
+                persist_user_directory_snapshot_and_publish(
+                    &bulk_events,
+                    Some(&bulk_store),
+                    &bulk_workspace,
+                    &mut user_cache,
+                    &bulk_directory_sync,
+                    &bulk_status_sync,
+                    0,
+                    WorkspaceRevision::INITIAL,
+                    vec![SlackUser {
+                        id: Some("U1".into()),
+                        name: Some("bulk".into()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            display_name: Some("Bulk".into()),
+                            real_name: Some("Bulk Directory User".into()),
+                            status_text: Some("From snapshot".into()),
+                            status_emoji: Some(":hourglass:".into()),
+                            status_expiration: Some(0),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    42,
+                )
+                .await
+                .unwrap();
+            });
+            patch_reached
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bulk directory patch did not reach its publication gate");
+
+            let realtime_status_revision = status_sync.publish_change("U1", || {});
+            let realtime_events = events.clone();
+            let realtime_store = store.clone();
+            let realtime_workspace = workspace.clone();
+            let realtime_status_sync = status_sync.clone();
+            let realtime = tokio::spawn(async move {
+                persist_realtime_event(
+                    RealtimePersistenceEvent::UserChanged {
+                        user: Box::new(SlackUser {
+                            id: Some("U1".into()),
+                            profile: Some(crate::models::SlackUserProfile {
+                                display_name: Some("Realtime".into()),
+                                status_text: Some("Current".into()),
+                                status_emoji: Some(":zap:".into()),
+                                status_expiration: Some(0),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        status_revision: Some(realtime_status_revision),
+                    },
+                    Some(&realtime_store),
+                    Some("U_SELF"),
+                    &realtime_events,
+                    &realtime_workspace,
+                    &realtime_status_sync,
+                )
+                .await;
+            });
+            tokio::task::yield_now().await;
+            assert!(!realtime.is_finished());
+            assert!(receiver.try_recv().is_err());
+
+            release_patch.send(()).unwrap();
+            bulk.await.unwrap();
+            patch_reached
+                .recv_timeout(Duration::from_secs(5))
+                .expect("realtime user patch did not retain ordered publication");
+            release_patch.send(()).unwrap();
+            realtime.await.unwrap();
+
+            let delivered = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+            let people_position = delivered
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        RuntimeEventKind::ConversationPeopleDiscovered(_)
+                    )
+                })
+                .unwrap();
+            let realtime_position = delivered
+                .iter()
+                .position(|event| {
+                    matches!(
+                        &event.kind,
+                        RuntimeEventKind::SocketModeEvent {
+                            event: SocketModeEvent::UserChanged(user),
+                            ..
+                        } if user.display_name().as_deref() == Some("Realtime")
+                    )
+                })
+                .unwrap();
+            assert!(people_position < realtime_position);
+
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            let stored = bootstrap
+                .users
+                .iter()
+                .find(|user| user.id.as_deref() == Some("U1"))
+                .unwrap();
+            assert_eq!(stored.display_name().as_deref(), Some("Realtime"));
+            assert_eq!(stored.full_name().as_deref(), Some("Bulk Directory User"));
+            assert_eq!(
+                stored.status().map(|status| status.text),
+                Some("Current".into())
+            );
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
     fn socket_message_deltas_wait_for_store_admission_and_persist_post_edit_delete() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -20385,6 +21171,7 @@ mod tests {
                 read_marks: Arc::new(Mutex::new(HashMap::new())),
                 message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
                 conversation_star_sync: ConversationStarSyncGate::default(),
+                user_directory_sync: UserDirectorySync::default(),
                 user_status_sync: UserStatusSync::default(),
                 team_id: Some("T1".into()),
                 huddles,
@@ -20790,6 +21577,7 @@ mod tests {
             read_marks: Arc::new(Mutex::new(HashMap::new())),
             message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(256))),
             conversation_star_sync: ConversationStarSyncGate::default(),
+            user_directory_sync: UserDirectorySync::default(),
             user_status_sync: UserStatusSync::default(),
             team_id: None,
             huddles,
@@ -20986,11 +21774,8 @@ mod tests {
             )
         );
         assert_eq!(
-            RuntimeCommand::DiscoverConversations.operation_context(),
-            OperationContext::new(
-                RuntimeOperation::ConversationDiscovery,
-                RuntimeTarget::Workspace,
-            )
+            RuntimeCommand::LoadUserDirectory.operation_context(),
+            OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace)
         );
         assert_eq!(
             RuntimeCommand::OpenDirectMessage {
@@ -21088,7 +21873,7 @@ mod tests {
         assert_eq!(file_navigation.lane, RuntimeTaskLane::Navigation);
         assert_eq!(file_navigation.navigation_slot, Some(NavigationSlot::Main));
 
-        let background = RuntimeCommand::DiscoverConversations.descriptor();
+        let background = RuntimeCommand::LoadUserDirectory.descriptor();
         assert_eq!(background.lane, RuntimeTaskLane::Background);
         assert_eq!(background.navigation_slot, None);
 
@@ -21172,7 +21957,7 @@ mod tests {
         let scheduled = [
             RuntimeCommand::RefreshConversations,
             RuntimeCommand::DiscoverChannels,
-            RuntimeCommand::DiscoverConversations,
+            RuntimeCommand::LoadUserDirectory,
             RuntimeCommand::LoadHistory {
                 channel_id: "C1".to_string(),
             },
@@ -21392,14 +22177,76 @@ mod tests {
             ReplacementClass::Refresh(RefreshClass::UserDirectory)
         );
 
-        let automatic =
-            connected_command_sync_plan(&RuntimeCommand::DiscoverConversations).unwrap();
-        let manual_discovery =
-            connected_command_sync_plan(&RuntimeCommand::DiscoverChannels).unwrap();
-        assert_eq!(automatic.target, manual_discovery.target);
-        assert_eq!(automatic.replacement, manual_discovery.replacement);
+        let automatic = startup_sync_plan(RuntimeStartupSyncKind::UserDirectory);
+        let manual_directory =
+            connected_command_sync_plan(&RuntimeCommand::LoadUserDirectory).unwrap();
+        assert_eq!(automatic.target, manual_directory.target);
+        assert_eq!(automatic.replacement, manual_directory.replacement);
         assert_eq!(automatic.priority, SyncPriority::Maintenance);
-        assert_eq!(manual_discovery.priority, SyncPriority::Interactive);
+        assert_eq!(manual_directory.priority, SyncPriority::Interactive);
+        assert_eq!(
+            automatic.freshness,
+            FreshnessPolicy::IfOlderThan {
+                max_age_ms: USER_DIRECTORY_MAX_AGE_MS,
+            }
+        );
+        assert_eq!(automatic.freshness, manual_directory.freshness);
+    }
+
+    #[test]
+    fn skipped_fresh_directory_admission_publishes_an_unsolicited_completion_snapshot() {
+        let workspace = WorkspaceReducerAdapter::default();
+        let user = SlackUser {
+            id: Some("U1".into()),
+            profile: Some(crate::models::SlackUserProfile {
+                display_name: Some("Ada".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        workspace.apply(
+            MutationOrigin::Cache,
+            WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                users: vec![user.clone()],
+                ..Default::default()
+            }),
+        );
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let events = RuntimeEventSender::new(
+            sender,
+            RuntimeIdentity {
+                session: SessionId::default().next(),
+                request: RequestId::new(9),
+            },
+            OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+        );
+        let user_cache = Arc::new(Mutex::new(HashMap::from([(
+            "U_REMOVED".into(),
+            "Removed".into(),
+        )])));
+
+        publish_fresh_user_directory_completion(&events, &workspace, &user_cache);
+
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.meta.request, None);
+        assert!(matches!(
+            event.kind,
+            RuntimeEventKind::ConversationPeopleDiscovered(users) if users == vec![user]
+        ));
+        assert_eq!(
+            *user_cache.lock().unwrap(),
+            HashMap::from([("U1".to_string(), "Ada".to_string())])
+        );
+
+        let source = include_str!("runtime.rs");
+        let schedule = source
+            .split_once("fn schedule_connected_sync_command(")
+            .and_then(|(_, tail)| tail.split_once("fn schedule_session_sync_work("))
+            .map(|(body, _)| body)
+            .expect("connected sync scheduling source slice should exist");
+        assert!(schedule.contains("RuntimeSyncRequestAdmission::SkippedFresh =>"));
+        assert!(schedule.contains("publish_fresh_user_directory_completion("));
+        assert!(schedule.contains("RuntimeSyncRequestAdmission::Stale => {}"));
     }
 
     #[test]
@@ -21414,6 +22261,40 @@ mod tests {
         assert!(!startup.contains("spawn_request_task("));
         assert!(!startup.contains(".acquire(RuntimeTaskLane::"));
         assert!(startup.contains("schedule_session_sync_work("));
+    }
+
+    #[test]
+    fn startup_user_groups_are_unsolicited_and_never_fetch_the_directory() {
+        let source = include_str!("runtime.rs");
+        let startup = source
+            .split_once("let group_events =")
+            .and_then(|(_, tail)| tail.split_once("schedule_session_sync_work("))
+            .map(|(body, _)| body)
+            .expect("startup user-group source slice should exist");
+
+        assert!(startup.contains(".unsolicited("));
+        assert!(!startup.contains(".with_context("));
+        assert!(!startup.contains("load_user_directory_with_api("));
+        assert!(startup.contains("load_user_groups_best_effort_with_api("));
+
+        let loader = source
+            .split_once("async fn load_user_groups_best_effort_with_api(")
+            .and_then(|(_, tail)| tail.split_once("fn publish_retained_user_groups("))
+            .map(|(body, _)| body)
+            .expect("user-group loader source slice should exist");
+        let fetch = loader
+            .find("api.user_groups().await?")
+            .expect("group loader should fetch groups");
+        let retain = loader
+            .find("directory_sync.retain_user_groups(groups)")
+            .expect("group loader should retain raw groups");
+        let resolve = loader
+            .find("current_user_group_known_names(")
+            .expect("group loader should resolve current names");
+        let publish = loader
+            .find("publish_retained_user_groups(")
+            .expect("group loader should publish retained groups");
+        assert!(fetch < retain && retain < resolve && resolve < publish);
     }
 
     #[test]
@@ -21754,18 +22635,18 @@ mod tests {
     #[test]
     fn runtime_event_context_uses_loaded_resource_target() {
         let fallback = OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace);
-        for event in [
-            RuntimeEventKind::ConversationChannelsDiscovered(Vec::new()),
-            RuntimeEventKind::ConversationPeopleDiscovered(Vec::new()),
-        ] {
-            assert_eq!(
-                event.operation_context(&fallback),
-                OperationContext::new(
-                    RuntimeOperation::ConversationDiscovery,
-                    RuntimeTarget::Workspace,
-                )
-            );
-        }
+        assert_eq!(
+            RuntimeEventKind::ConversationChannelsDiscovered(Vec::new())
+                .operation_context(&fallback),
+            OperationContext::new(
+                RuntimeOperation::ConversationDiscovery,
+                RuntimeTarget::Workspace,
+            )
+        );
+        assert_eq!(
+            RuntimeEventKind::ConversationPeopleDiscovered(Vec::new()).operation_context(&fallback),
+            OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace)
+        );
 
         let event = RuntimeEventKind::HistoryLoaded {
             channel_id: "C123".to_string(),
@@ -21912,36 +22793,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn cached_conversation_user_ids_selects_known_direct_message_members() {
-        let conversations = vec![
-            SlackConversation {
-                id: "D123".to_string(),
-                user: Some("U123".to_string()),
-                is_im: Some(true),
-                ..Default::default()
-            },
-            SlackConversation {
-                id: "D999".to_string(),
-                user: Some("U999".to_string()),
-                is_im: Some(true),
-                ..Default::default()
-            },
-            SlackConversation {
-                id: "C123".to_string(),
-                user: Some("U123".to_string()),
-                is_channel: Some(true),
-                ..Default::default()
-            },
-        ];
-        let user_cache = HashMap::from([("U123".to_string(), "Ada".to_string())]);
-
-        assert_eq!(
-            cached_conversation_user_ids(&conversations, &user_cache),
-            vec!["U123"]
-        );
-    }
-
     fn channel(id: &str, unread_count: u64, last_read: Option<&str>) -> SlackConversation {
         let mut conversation = SlackConversation {
             id: id.to_string(),
@@ -22031,7 +22882,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_history_prefetch_always_includes_unread_direct_messages() {
+    fn channel_history_prefetch_prioritizes_unread_direct_messages_within_the_limit() {
         let mut conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
             .map(|index| channel(&format!("C{index}"), (index + 10) as u64, None))
             .collect::<Vec<_>>();
@@ -22040,7 +22891,836 @@ mod tests {
         let candidates = channel_history_prefetch_candidates(&conversations);
 
         assert_eq!(candidates.first().map(String::as_str), Some("D-urgent"));
-        assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT + 1);
+        assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT);
+    }
+
+    #[test]
+    fn deterministic_large_startup_plan_enforces_exact_network_bounds() {
+        let conversations = (0..1_430)
+            .map(|index| {
+                if index % 7 == 0 {
+                    dm(&format!("D{index:04}"), u64::try_from(index % 13).unwrap())
+                } else {
+                    channel(
+                        &format!("C{index:04}"),
+                        u64::try_from(index % 17).unwrap(),
+                        None,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let plan =
+            startup_conversation_plan(&conversations, &HashSet::new(), &HashSet::new(), Vec::new());
+
+        assert_eq!(plan.enrichment.batch.len(), CONVERSATION_ENRICHMENT_LIMIT);
+        assert_eq!(plan.history_ids.len(), CHANNEL_HISTORY_PREFETCH_LIMIT);
+        assert_eq!(
+            plan.enrichment.batch.iter().collect::<HashSet<_>>().len(),
+            plan.enrichment.batch.len()
+        );
+        assert_eq!(
+            plan.history_ids.iter().collect::<HashSet<_>>().len(),
+            plan.history_ids.len()
+        );
+    }
+
+    #[test]
+    fn user_directory_refresh_policy_handles_empty_cache_and_the_24_hour_boundary() {
+        let now_ms = 200_000_000;
+        assert!(user_directory_refresh_required(false, now_ms, Some(now_ms)));
+        assert!(user_directory_refresh_required(true, now_ms, None));
+        assert!(!user_directory_refresh_required(
+            true,
+            now_ms,
+            Some(now_ms - USER_DIRECTORY_MAX_AGE_MS + 1),
+        ));
+        assert!(user_directory_refresh_required(
+            true,
+            now_ms,
+            Some(now_ms - USER_DIRECTORY_MAX_AGE_MS),
+        ));
+        assert!(!user_directory_refresh_required(
+            true,
+            now_ms,
+            Some(now_ms + 1),
+        ));
+    }
+
+    #[test]
+    fn user_directory_snapshot_requires_at_least_one_identified_user() {
+        assert!(!user_directory_snapshot_has_identity(&[]));
+        assert!(!user_directory_snapshot_has_identity(&[
+            SlackUser::default(),
+            SlackUser {
+                id: Some("  ".into()),
+                ..Default::default()
+            },
+        ]));
+        assert!(user_directory_snapshot_has_identity(&[SlackUser {
+            id: Some("U1".into()),
+            ..Default::default()
+        }]));
+    }
+
+    #[test]
+    fn authoritative_directory_cache_handoff_replaces_while_user_lookup_upserts() {
+        let baseline = HashMap::from([
+            ("U1".to_string(), "Old Ada".to_string()),
+            ("U_REMOVED".to_string(), "Removed User".to_string()),
+        ]);
+        let mut shared = baseline.clone();
+        shared.insert("U_CONCURRENT".into(), "Concurrent Lookup".into());
+
+        apply_user_cache_handoff(
+            &mut shared,
+            &baseline,
+            HashMap::from([("U1".to_string(), "Directory Ada".to_string())]),
+            UserCacheHandoff::ReplaceAuthoritative,
+            true,
+        );
+        assert_eq!(
+            shared,
+            HashMap::from([("U1".to_string(), "Directory Ada".to_string())])
+        );
+
+        let baseline = shared.clone();
+        shared.insert("U_CONCURRENT".into(), "Newer Concurrent Lookup".into());
+        apply_user_cache_handoff(
+            &mut shared,
+            &baseline,
+            HashMap::from([("U1".to_string(), "Failed Directory".to_string())]),
+            UserCacheHandoff::ReplaceAuthoritative,
+            false,
+        );
+        assert_eq!(
+            shared.get("U_CONCURRENT").map(String::as_str),
+            Some("Newer Concurrent Lookup")
+        );
+        assert_eq!(shared.get("U1").map(String::as_str), Some("Directory Ada"));
+
+        assert!(user_cache_handoff_succeeded(false, true));
+        assert!(!user_cache_handoff_succeeded(false, false));
+        apply_user_cache_handoff(
+            &mut shared,
+            &baseline,
+            HashMap::from([("U1".to_string(), "Refreshed before failure".to_string())]),
+            UserCacheHandoff::ReplaceAuthoritative,
+            user_cache_handoff_succeeded(false, true),
+        );
+        assert_eq!(
+            shared,
+            HashMap::from([("U1".to_string(), "Refreshed before failure".to_string())])
+        );
+
+        let baseline = shared.clone();
+        let mut staged = baseline.clone();
+        staged.insert("U2".into(), "Individual Grace".into());
+        shared.insert("U1".into(), "Newest Ada".into());
+        apply_user_cache_handoff(
+            &mut shared,
+            &baseline,
+            staged,
+            UserCacheHandoff::UpsertChanges,
+            true,
+        );
+        assert_eq!(shared.get("U1").map(String::as_str), Some("Newest Ada"));
+        assert_eq!(
+            shared.get("U2").map(String::as_str),
+            Some("Individual Grace")
+        );
+
+        let concurrent_baseline = HashMap::from([("U_STALE".to_string(), "Stale".to_string())]);
+        let mut concurrent_shared = concurrent_baseline.clone();
+        let concurrent_workspace = WorkspaceReducerAdapter::default();
+        concurrent_workspace.apply(
+            MutationOrigin::WebApi,
+            WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U_MISSING_A".into()),
+                name: Some("Fallback A".into()),
+                ..Default::default()
+            }),
+        );
+        apply_user_cache_handoff(
+            &mut concurrent_shared,
+            &concurrent_baseline,
+            user_display_names(&concurrent_workspace.users()),
+            UserCacheHandoff::ReplaceAuthoritative,
+            true,
+        );
+        concurrent_workspace.apply(
+            MutationOrigin::WebApi,
+            WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U_MISSING_B".into()),
+                name: Some("Fallback B".into()),
+                ..Default::default()
+            }),
+        );
+        apply_user_cache_handoff(
+            &mut concurrent_shared,
+            &concurrent_baseline,
+            user_display_names(&concurrent_workspace.users()),
+            UserCacheHandoff::ReplaceAuthoritative,
+            true,
+        );
+        assert_eq!(
+            concurrent_shared,
+            HashMap::from([
+                ("U_MISSING_A".to_string(), "Fallback A".to_string()),
+                ("U_MISSING_B".to_string(), "Fallback B".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn bulk_directory_paths_use_authoritative_cache_replacement() {
+        assert_eq!(
+            user_cache_handoff_for(&RuntimeCommand::LoadUserDirectory, false),
+            UserCacheHandoff::ReplaceAuthoritative
+        );
+        assert_eq!(
+            user_cache_handoff_for(
+                &RuntimeCommand::LoadUser {
+                    user_id: "U1".into(),
+                },
+                false
+            ),
+            UserCacheHandoff::UpsertChanges
+        );
+        assert_eq!(
+            user_cache_handoff_for(
+                &RuntimeCommand::LoadUser {
+                    user_id: "U1".into(),
+                },
+                true,
+            ),
+            UserCacheHandoff::ReplaceAuthoritative
+        );
+
+        let source = include_str!("runtime.rs");
+        let directory_loader = source
+            .split_once("async fn load_user_directory_with_api(")
+            .and_then(|(_, tail)| {
+                tail.split_once("async fn persist_user_directory_snapshot_and_publish(")
+            })
+            .map(|(body, _)| body)
+            .expect("directory loader source slice should exist");
+        assert!(directory_loader.contains("*user_cache = user_display_names(&users)"));
+        assert!(directory_loader.contains("publish_user_directory_completion(events, users)"));
+
+        let directory_publisher = source
+            .split_once("async fn persist_user_directory_snapshot_and_publish(")
+            .and_then(|(_, tail)| tail.split_once("async fn handle_connected_command("))
+            .map(|(body, _)| body)
+            .expect("directory publisher source slice should exist");
+        assert!(directory_publisher.contains("*user_cache = names.clone()"));
+
+        let connected_handoff = source
+            .split_once("let result = handle_command(command, &mut context).await;")
+            .and_then(|(_, tail)| tail.split_once("let mut shared_read_marks ="))
+            .map(|(body, _)| body)
+            .expect("connected user-cache handoff source slice should exist");
+        let shared_lock = connected_handoff
+            .find(".user_cache\n        .lock()")
+            .expect("authoritative handoff should lock the shared cache");
+        let canonical_snapshot = connected_handoff
+            .find("user_display_names(&connection.workspace.users())")
+            .expect("authoritative handoff should derive current coordinator names");
+        let handoff = connected_handoff
+            .find("apply_user_cache_handoff(")
+            .expect("authoritative cache handoff should be applied");
+        assert!(shared_lock < canonical_snapshot && canonical_snapshot < handoff);
+    }
+
+    #[test]
+    fn stale_cached_directory_refreshes_before_deferred_user_fallback() {
+        let directory_sync = UserDirectorySync::default();
+        let now_ms = current_unix_millis();
+        directory_sync.hydrate(true, Some(now_ms.saturating_sub(USER_DIRECTORY_MAX_AGE_MS)));
+        assert!(directory_sync.refresh_required(now_ms));
+
+        let source = include_str!("runtime.rs");
+        let load_user = source
+            .split_once("RuntimeCommand::LoadUser { user_id } =>")
+            .and_then(|(_, tail)| tail.split_once("RuntimeCommand::LoadUserProfile { user_id } =>"))
+            .map(|(body, _)| body)
+            .expect("load-user command source slice should exist");
+        let refresh_check = load_user
+            .find(".refresh_required(current_unix_millis())")
+            .expect("deferred user lookup should check directory freshness");
+        let directory = load_user
+            .find("load_user_directory_with_api(")
+            .expect("stale deferred lookup should refresh the directory");
+        let serialization = load_user
+            .find("serialize_user_lookup_with_directory(")
+            .expect("fallback should serialize after directory refresh");
+        let fallback = load_user
+            .find("api.user(&user_id).await?")
+            .expect("unknown user should retain a users.info fallback");
+        assert!(refresh_check < directory && directory < serialization && serialization < fallback);
+
+        let baseline = HashMap::from([("U_REMOVED".to_string(), "Removed".to_string())]);
+        let mut shared = baseline.clone();
+        let staged = HashMap::from([
+            ("U1".to_string(), "Directory Ada".to_string()),
+            ("U_UNKNOWN".to_string(), "Deferred Unknown".to_string()),
+        ]);
+        apply_user_cache_handoff(
+            &mut shared,
+            &baseline,
+            staged.clone(),
+            user_cache_handoff_for(
+                &RuntimeCommand::LoadUser {
+                    user_id: "U_UNKNOWN".into(),
+                },
+                true,
+            ),
+            true,
+        );
+        assert_eq!(shared, staged);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    users: vec![SlackUser {
+                        id: Some("U_CACHED".into()),
+                        name: Some("cached".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            );
+            let directory_sync = UserDirectorySync::default();
+            directory_sync.hydrate(true, Some(now_ms.saturating_sub(USER_DIRECTORY_MAX_AGE_MS)));
+            let startup_refresh = Arc::clone(&directory_sync.refresh).lock_owned().await;
+            let lookup_sync = directory_sync.clone();
+            let lookup_workspace = workspace.clone();
+            let (lookup_started_tx, lookup_started_rx) = oneshot::channel();
+            let (fallback_tx, mut fallback_rx) = mpsc::unbounded_channel();
+            let lookup = tokio::spawn(async move {
+                lookup_started_tx.send(()).unwrap();
+                let (_serialization, canonical_user) = serialize_user_lookup_with_directory(
+                    &lookup_sync,
+                    &lookup_workspace,
+                    "U_UNKNOWN",
+                )
+                .await;
+                fallback_tx.send(canonical_user.is_none()).unwrap();
+            });
+            lookup_started_rx.await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(fallback_rx.try_recv().is_err());
+
+            let base_revision = workspace.revision();
+            workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                    base_revision,
+                    vec![SlackUser {
+                        id: Some("U1".into()),
+                        name: Some("directory".into()),
+                        ..Default::default()
+                    }],
+                )),
+            );
+            directory_sync.record_success(now_ms);
+            drop(startup_refresh);
+
+            assert_eq!(fallback_rx.recv().await, Some(true));
+            lookup.await.unwrap();
+            assert!(!directory_sync.refresh_required(now_ms));
+            assert_eq!(workspace.users()[0].id.as_deref(), Some("U1"));
+        });
+    }
+
+    #[test]
+    fn post_lock_fresh_directory_noop_publishes_completion_without_network() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let user = SlackUser {
+                id: Some("U1".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Ada".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    users: vec![user.clone()],
+                    ..Default::default()
+                }),
+            );
+            let directory_sync = UserDirectorySync::default();
+            directory_sync.hydrate(true, Some(current_unix_millis()));
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender::new(
+                sender,
+                RuntimeIdentity {
+                    session: SessionId::default().next(),
+                    request: RequestId::new(10),
+                },
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+            );
+            let api = SlackApi::new(StoredToken {
+                access_token: "test-token".into(),
+                token_type: None,
+                scope: None,
+                refresh_token: None,
+                expires_in: None,
+                expires_at: None,
+                team_id: None,
+                team_name: None,
+                user_id: None,
+                client_id: None,
+                browser_cookie_d: None,
+                user_agent: None,
+            });
+            let mut user_cache = HashMap::from([("U_REMOVED".into(), "Removed".into())]);
+
+            let refreshed = load_user_directory_with_api(
+                &events,
+                &api,
+                &None,
+                &workspace,
+                &mut user_cache,
+                &directory_sync,
+                &UserStatusSync::default(),
+            )
+            .await
+            .unwrap();
+
+            assert!(!refreshed);
+            assert_eq!(
+                user_cache,
+                HashMap::from([("U1".to_string(), "Ada".to_string())])
+            );
+            let completion = receiver.try_recv().unwrap();
+            assert_eq!(completion.meta.request, None);
+            assert!(matches!(
+                completion.kind,
+                RuntimeEventKind::ConversationPeopleDiscovered(users) if users == vec![user]
+            ));
+            assert!(receiver.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn late_user_lookup_cannot_override_a_newer_directory_snapshot() {
+        let source = include_str!("runtime.rs");
+        let load_user = source
+            .split_once("RuntimeCommand::LoadUser { user_id } =>")
+            .and_then(|(_, tail)| tail.split_once("RuntimeCommand::LoadUserProfile { user_id } =>"))
+            .map(|(body, _)| body)
+            .expect("load-user command source slice should exist");
+        let serialization = load_user
+            .find("serialize_user_lookup_with_directory(")
+            .expect("user lookup should share directory serialization");
+        let fetch = load_user
+            .find("api.user(&user_id).await?")
+            .expect("user lookup should fetch the missing user");
+        let persist = load_user
+            .find("persist_user_lookup_and_publish(")
+            .expect("user lookup should use coordinator persistence");
+        assert!(serialization < fetch && fetch < persist);
+        assert!(!load_user.contains("store_user_name("));
+        assert!(!load_user.contains("store_user_full_name("));
+        assert!(!load_user.contains("store_user_avatar_url("));
+
+        let persistence = source
+            .split_once("async fn persist_user_lookup_and_publish(")
+            .and_then(|(_, tail)| tail.split_once("async fn handle_connected_command("))
+            .map(|(body, _)| body)
+            .expect("user lookup persistence source slice should exist");
+        assert!(persistence.contains("WorkspaceMutation::UserUpsert(user)"));
+        assert!(persistence.contains("workspace.publication_admission.lock().await"));
+        assert!(persistence.contains("apply_persisted_and_publish_admitted("));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let workspace = WorkspaceReducerAdapter::default();
+            let directory_sync = UserDirectorySync::default();
+            let user_status_sync = UserStatusSync::default();
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+                workspace_patch_send_gate: None,
+            };
+            let (lookup_started_tx, lookup_started_rx) = oneshot::channel();
+            let (finish_lookup_tx, finish_lookup_rx) = oneshot::channel();
+
+            let lookup_sync = directory_sync.clone();
+            let lookup_workspace = workspace.clone();
+            let lookup_status_sync = user_status_sync.clone();
+            let lookup_events = events.clone();
+            let lookup = tokio::spawn(async move {
+                let _directory_serialization = lookup_sync.refresh.lock().await;
+                lookup_started_tx.send(()).unwrap();
+                finish_lookup_rx.await.unwrap();
+                persist_user_lookup_and_publish(
+                    &lookup_events,
+                    None,
+                    &lookup_workspace,
+                    &lookup_status_sync,
+                    "U1".into(),
+                    SlackUser {
+                        id: Some("U1".into()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            display_name: Some("Stale lookup".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    0,
+                )
+                .await
+                .unwrap();
+            });
+            lookup_started_rx.await.unwrap();
+
+            let directory_workspace = workspace.clone();
+            let directory_status_sync = user_status_sync.clone();
+            let directory_events = events.clone();
+            let directory_gate = directory_sync.clone();
+            let directory = tokio::spawn(async move {
+                let _directory_serialization = directory_gate.refresh.lock().await;
+                let mut user_cache = HashMap::new();
+                persist_user_directory_snapshot_and_publish(
+                    &directory_events,
+                    None,
+                    &directory_workspace,
+                    &mut user_cache,
+                    &directory_gate,
+                    &directory_status_sync,
+                    directory_status_sync.revision(),
+                    directory_workspace.revision(),
+                    vec![SlackUser {
+                        id: Some("U1".into()),
+                        profile: Some(crate::models::SlackUserProfile {
+                            display_name: Some("Fresh directory".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    42,
+                )
+                .await
+                .unwrap();
+            });
+
+            finish_lookup_tx.send(()).unwrap();
+            lookup.await.unwrap();
+            directory.await.unwrap();
+
+            assert_eq!(
+                workspace.users()[0].display_name().as_deref(),
+                Some("Fresh directory")
+            );
+        });
+    }
+
+    #[test]
+    fn user_lookup_discards_fetched_data_when_realtime_wins_before_publication() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::UserUpsert(SlackUser {
+                    id: Some("U1".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        display_name: Some("Realtime Ada".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            );
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+                workspace_patch_send_gate: None,
+            };
+
+            let display_name = persist_user_lookup_and_publish(
+                &events,
+                None,
+                &workspace,
+                &UserStatusSync::default(),
+                "U1".into(),
+                SlackUser {
+                    id: Some("U1".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        display_name: Some("Stale HTTP Ada".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(display_name, "Realtime Ada");
+            assert_eq!(
+                workspace.users()[0].display_name().as_deref(),
+                Some("Realtime Ada")
+            );
+            let completion = receiver.try_recv().unwrap();
+            assert!(matches!(
+                completion.kind,
+                RuntimeEventKind::UserLoaded { display_name, .. }
+                    if display_name == "Realtime Ada"
+            ));
+            assert!(receiver.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn empty_user_directory_snapshot_keeps_cache_and_does_not_record_freshness() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-empty-user-directory-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+            let cached_user = SlackUser {
+                id: Some("U1".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Cached".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            apply_test_store_changes(
+                &store,
+                vec![StoreChange::UsersReplaced(vec![cached_user.clone()])],
+            )
+            .await
+            .unwrap();
+            let workspace = WorkspaceReducerAdapter::default();
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                    users: vec![cached_user.clone()],
+                    ..Default::default()
+                }),
+            );
+            let (sender, _receiver) = mpsc::unbounded_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+                workspace_patch_send_gate: None,
+            };
+            let mut user_cache = HashMap::new();
+            let directory_sync = UserDirectorySync::default();
+            let result = persist_user_directory_snapshot_and_publish(
+                &events,
+                Some(&store),
+                &workspace,
+                &mut user_cache,
+                &directory_sync,
+                &UserStatusSync::default(),
+                0,
+                workspace.revision(),
+                Vec::new(),
+                42,
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert_eq!(workspace.users(), vec![cached_user.clone()]);
+            assert_eq!(
+                store.load_bootstrap().await.unwrap().unwrap().users,
+                vec![cached_user]
+            );
+            assert!(store
+                .load_sync_freshness(
+                    USER_DIRECTORY_FRESHNESS_OPERATION,
+                    USER_DIRECTORY_FRESHNESS_TARGET,
+                )
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(directory_sync.last_success_for_startup(), None);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn user_groups_republish_when_groups_finish_before_the_directory() {
+        let directory_sync = UserDirectorySync::default();
+        directory_sync.retain_user_groups(vec![SlackUserGroup {
+            id: "S1".into(),
+            handle: Some("platform".into()),
+            users: vec!["U1".into(), "U_UNKNOWN".into()],
+            ..Default::default()
+        }]);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let events = RuntimeEventSender::new(
+            sender,
+            RuntimeIdentity {
+                session: SessionId::default().next(),
+                request: RequestId::new(7),
+            },
+            OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+        )
+        .unsolicited(OperationContext::new(
+            RuntimeOperation::User,
+            RuntimeTarget::Workspace,
+        ));
+
+        publish_retained_user_groups(&events, &directory_sync, &HashMap::new());
+        publish_retained_user_groups(
+            &events,
+            &directory_sync,
+            &HashMap::from([("U1".into(), "Ada".into())]),
+        );
+
+        let unresolved = receiver.try_recv().unwrap();
+        assert_eq!(unresolved.meta.request, None);
+        assert!(matches!(
+            unresolved.kind,
+            RuntimeEventKind::UserGroupsLoaded { names, members }
+                if names.get("S1").map(String::as_str) == Some("platform")
+                    && !members.contains_key("S1")
+        ));
+        let resolved = receiver.try_recv().unwrap();
+        assert_eq!(resolved.meta.request, None);
+        assert!(matches!(
+            resolved.kind,
+            RuntimeEventKind::UserGroupsLoaded { members, .. }
+                if members.get("S1") == Some(&vec!["Ada".to_string()])
+        ));
+    }
+
+    #[test]
+    fn user_groups_resolve_current_names_when_directory_finishes_first() {
+        let workspace = WorkspaceReducerAdapter::default();
+        workspace.apply(
+            MutationOrigin::Cache,
+            WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
+                users: vec![SlackUser {
+                    id: Some("U1".into()),
+                    profile: Some(crate::models::SlackUserProfile {
+                        display_name: Some("Directory Ada".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+        let shared_user_names = Arc::new(Mutex::new(HashMap::from([
+            ("U1".into(), "Stale Ada".into()),
+            ("U2".into(), "Cached Grace".into()),
+        ])));
+        let known_names = current_user_group_known_names(&shared_user_names, &workspace);
+        assert_eq!(
+            known_names,
+            HashMap::from([
+                ("U1".into(), "Directory Ada".into()),
+                ("U2".into(), "Cached Grace".into()),
+            ])
+        );
+
+        let directory_sync = UserDirectorySync::default();
+        directory_sync.retain_user_groups(vec![SlackUserGroup {
+            id: "S1".into(),
+            handle: Some("platform".into()),
+            users: vec!["U1".into(), "U2".into(), "U_UNKNOWN".into()],
+            ..Default::default()
+        }]);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let events = RuntimeEventSender::new(
+            sender,
+            RuntimeIdentity {
+                session: SessionId::default().next(),
+                request: RequestId::new(8),
+            },
+            OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
+        )
+        .unsolicited(OperationContext::new(
+            RuntimeOperation::User,
+            RuntimeTarget::Workspace,
+        ));
+
+        publish_retained_user_groups(&events, &directory_sync, &known_names);
+
+        let resolved = receiver.try_recv().unwrap();
+        assert_eq!(resolved.meta.request, None);
+        assert!(matches!(
+            resolved.kind,
+            RuntimeEventKind::UserGroupsLoaded { members, .. }
+                if members.get("S1") == Some(&vec![
+                    "Cached Grace".to_string(),
+                    "Directory Ada".to_string(),
+                ])
+        ));
+    }
+
+    #[test]
+    fn user_directory_network_work_waits_for_cache_hydration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory_sync = UserDirectorySync::default();
+            let waiting_sync = directory_sync.clone();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let waiter = tokio::spawn(async move {
+                waiting_sync.wait_for_hydration().await;
+                sender.send(()).unwrap();
+            });
+
+            tokio::task::yield_now().await;
+            assert!(receiver.try_recv().is_err());
+
+            directory_sync.hydrate(true, Some(42));
+            assert_eq!(receiver.recv().await, Some(()));
+            waiter.await.unwrap();
+            assert_eq!(directory_sync.last_success_for_startup(), Some(42));
+        });
+    }
+
+    #[test]
+    fn persisted_user_directory_freshness_rejects_negative_timestamps() {
+        assert_eq!(user_directory_last_success_at_ms(None), None);
+        assert_eq!(user_directory_last_success_at_ms(Some(-1)), None);
+        assert_eq!(user_directory_last_success_at_ms(Some(42)), Some(42));
     }
 
     #[test]

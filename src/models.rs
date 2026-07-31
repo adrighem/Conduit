@@ -1,3 +1,4 @@
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
@@ -1581,6 +1582,24 @@ pub struct SlackUser {
 }
 
 impl SlackUser {
+    pub(crate) fn merge_sparse_update(mut self, update: Self) -> Self {
+        self.id = update.id;
+        replace_if_present(&mut self.name, update.name);
+        replace_if_present(&mut self.real_name, update.real_name);
+        replace_if_present(&mut self.deleted, update.deleted);
+        replace_if_present(&mut self.is_bot, update.is_bot);
+        replace_if_present(&mut self.tz, update.tz);
+        replace_if_present(&mut self.tz_label, update.tz_label);
+        replace_if_present(&mut self.tz_offset, update.tz_offset);
+        if let Some(profile) = update.profile {
+            match self.profile.as_mut() {
+                Some(cached_profile) => cached_profile.merge_sparse_update(profile),
+                None => self.profile = Some(profile),
+            }
+        }
+        self
+    }
+
     pub fn avatar_url(&self) -> Option<String> {
         let profile = self.profile.as_ref()?;
         profile
@@ -1724,7 +1743,7 @@ impl SlackUserGroup {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct SlackUserProfile {
     pub display_name: Option<String>,
     pub display_name_normalized: Option<String>,
@@ -1744,13 +1763,146 @@ pub struct SlackUserProfile {
     pub image_192: Option<String>,
     pub image_512: Option<String>,
     pub image_original: Option<String>,
-    #[serde(default)]
-    pub huddle_state: SlackHuddleState,
+    pub huddle_state: Option<SlackHuddleState>,
     pub huddle_state_call_id: Option<String>,
     pub huddle_state_channel_id: Option<String>,
     pub huddle_state_expiration_ts: Option<i64>,
-    #[serde(default)]
     pub fields: HashMap<String, SlackProfileField>,
+    pub(crate) custom_fields_presence: CustomFieldsPresence,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct CustomFieldsPresence(bool);
+
+impl PartialEq for SlackUserProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.display_name == other.display_name
+            && self.display_name_normalized == other.display_name_normalized
+            && self.real_name == other.real_name
+            && self.real_name_normalized == other.real_name_normalized
+            && self.status_text == other.status_text
+            && self.status_emoji == other.status_emoji
+            && self.status_expiration == other.status_expiration
+            && self.title == other.title
+            && self.phone == other.phone
+            && self.email == other.email
+            && self.skype == other.skype
+            && self.pronouns == other.pronouns
+            && self.about == other.about
+            && self.location == other.location
+            && self.image_72 == other.image_72
+            && self.image_192 == other.image_192
+            && self.image_512 == other.image_512
+            && self.image_original == other.image_original
+            && self.huddle_state == other.huddle_state
+            && self.huddle_state_call_id == other.huddle_state_call_id
+            && self.huddle_state_channel_id == other.huddle_state_channel_id
+            && self.huddle_state_expiration_ts == other.huddle_state_expiration_ts
+            && self.fields == other.fields
+            && (!self.fields.is_empty()
+                || self.custom_fields_presence == other.custom_fields_presence)
+    }
+}
+
+impl Serialize for SlackUserProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut profile = serializer.serialize_map(Some(23))?;
+        profile.serialize_entry("display_name", &self.display_name)?;
+        profile.serialize_entry("display_name_normalized", &self.display_name_normalized)?;
+        profile.serialize_entry("real_name", &self.real_name)?;
+        profile.serialize_entry("real_name_normalized", &self.real_name_normalized)?;
+        profile.serialize_entry("status_text", &self.status_text)?;
+        profile.serialize_entry("status_emoji", &self.status_emoji)?;
+        profile.serialize_entry("status_expiration", &self.status_expiration)?;
+        profile.serialize_entry("title", &self.title)?;
+        profile.serialize_entry("phone", &self.phone)?;
+        profile.serialize_entry("email", &self.email)?;
+        profile.serialize_entry("skype", &self.skype)?;
+        profile.serialize_entry("pronouns", &self.pronouns)?;
+        profile.serialize_entry("about", &self.about)?;
+        profile.serialize_entry("location", &self.location)?;
+        profile.serialize_entry("image_72", &self.image_72)?;
+        profile.serialize_entry("image_192", &self.image_192)?;
+        profile.serialize_entry("image_512", &self.image_512)?;
+        profile.serialize_entry("image_original", &self.image_original)?;
+        profile.serialize_entry("huddle_state", &self.huddle_state)?;
+        profile.serialize_entry("huddle_state_call_id", &self.huddle_state_call_id)?;
+        profile.serialize_entry("huddle_state_channel_id", &self.huddle_state_channel_id)?;
+        profile.serialize_entry(
+            "huddle_state_expiration_ts",
+            &self.huddle_state_expiration_ts,
+        )?;
+        if self.custom_fields_presence.0 || !self.fields.is_empty() {
+            profile.serialize_entry("fields", &self.fields)?;
+        }
+        profile.end()
+    }
+}
+
+#[derive(Deserialize)]
+struct SlackUserProfileWire {
+    display_name: Option<String>,
+    display_name_normalized: Option<String>,
+    real_name: Option<String>,
+    real_name_normalized: Option<String>,
+    status_text: Option<String>,
+    status_emoji: Option<String>,
+    status_expiration: Option<i64>,
+    title: Option<String>,
+    phone: Option<String>,
+    email: Option<String>,
+    skype: Option<String>,
+    pronouns: Option<String>,
+    about: Option<String>,
+    location: Option<String>,
+    image_72: Option<String>,
+    image_192: Option<String>,
+    image_512: Option<String>,
+    image_original: Option<String>,
+    huddle_state: Option<SlackHuddleState>,
+    huddle_state_call_id: Option<String>,
+    huddle_state_channel_id: Option<String>,
+    huddle_state_expiration_ts: Option<i64>,
+    fields: Option<HashMap<String, SlackProfileField>>,
+}
+
+impl<'de> Deserialize<'de> for SlackUserProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let profile = SlackUserProfileWire::deserialize(deserializer)?;
+        let custom_fields_presence = CustomFieldsPresence(profile.fields.is_some());
+        Ok(Self {
+            display_name: profile.display_name,
+            display_name_normalized: profile.display_name_normalized,
+            real_name: profile.real_name,
+            real_name_normalized: profile.real_name_normalized,
+            status_text: profile.status_text,
+            status_emoji: profile.status_emoji,
+            status_expiration: profile.status_expiration,
+            title: profile.title,
+            phone: profile.phone,
+            email: profile.email,
+            skype: profile.skype,
+            pronouns: profile.pronouns,
+            about: profile.about,
+            location: profile.location,
+            image_72: profile.image_72,
+            image_192: profile.image_192,
+            image_512: profile.image_512,
+            image_original: profile.image_original,
+            huddle_state: profile.huddle_state,
+            huddle_state_call_id: profile.huddle_state_call_id,
+            huddle_state_channel_id: profile.huddle_state_channel_id,
+            huddle_state_expiration_ts: profile.huddle_state_expiration_ts,
+            fields: profile.fields.unwrap_or_default(),
+            custom_fields_presence,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1774,6 +1926,44 @@ impl SlackProfileField {
 }
 
 impl SlackUserProfile {
+    fn merge_sparse_update(&mut self, update: Self) {
+        replace_if_present(&mut self.display_name, update.display_name);
+        replace_if_present(
+            &mut self.display_name_normalized,
+            update.display_name_normalized,
+        );
+        replace_if_present(&mut self.real_name, update.real_name);
+        replace_if_present(&mut self.real_name_normalized, update.real_name_normalized);
+        replace_if_present(&mut self.status_text, update.status_text);
+        replace_if_present(&mut self.status_emoji, update.status_emoji);
+        replace_if_present(&mut self.status_expiration, update.status_expiration);
+        replace_if_present(&mut self.title, update.title);
+        replace_if_present(&mut self.phone, update.phone);
+        replace_if_present(&mut self.email, update.email);
+        replace_if_present(&mut self.skype, update.skype);
+        replace_if_present(&mut self.pronouns, update.pronouns);
+        replace_if_present(&mut self.about, update.about);
+        replace_if_present(&mut self.location, update.location);
+        replace_if_present(&mut self.image_72, update.image_72);
+        replace_if_present(&mut self.image_192, update.image_192);
+        replace_if_present(&mut self.image_512, update.image_512);
+        replace_if_present(&mut self.image_original, update.image_original);
+        replace_if_present(&mut self.huddle_state, update.huddle_state);
+        replace_if_present(&mut self.huddle_state_call_id, update.huddle_state_call_id);
+        replace_if_present(
+            &mut self.huddle_state_channel_id,
+            update.huddle_state_channel_id,
+        );
+        replace_if_present(
+            &mut self.huddle_state_expiration_ts,
+            update.huddle_state_expiration_ts,
+        );
+        if update.custom_fields_presence.0 || !update.fields.is_empty() {
+            self.fields = update.fields;
+            self.custom_fields_presence = CustomFieldsPresence(true);
+        }
+    }
+
     pub fn display_name(&self) -> Option<String> {
         self.display_name
             .as_ref()
@@ -1798,9 +1988,147 @@ impl SlackUserProfile {
     }
 }
 
+fn replace_if_present<T>(current: &mut Option<T>, update: Option<T>) {
+    if update.is_some() {
+        *current = update;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_user_update_preserves_cached_directory_fields_and_applies_explicit_status_clear() {
+        let cached = SlackUser {
+            id: Some("U1".to_string()),
+            name: Some("ada".to_string()),
+            real_name: Some("Ada Lovelace".to_string()),
+            tz: Some("Europe/Amsterdam".to_string()),
+            profile: Some(SlackUserProfile {
+                display_name: Some("Ada".to_string()),
+                image_72: Some("https://example.test/ada.png".to_string()),
+                status_text: Some("Working".to_string()),
+                status_emoji: Some(":computer:".to_string()),
+                status_expiration: Some(42),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let update = SlackUser {
+            id: Some("U1".to_string()),
+            profile: Some(SlackUserProfile {
+                status_text: Some(String::new()),
+                status_emoji: Some(String::new()),
+                status_expiration: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = cached.merge_sparse_update(update);
+
+        assert_eq!(merged.name.as_deref(), Some("ada"));
+        assert_eq!(merged.real_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(merged.tz.as_deref(), Some("Europe/Amsterdam"));
+        let profile = merged.profile.unwrap();
+        assert_eq!(profile.display_name.as_deref(), Some("Ada"));
+        assert_eq!(
+            profile.image_72.as_deref(),
+            Some("https://example.test/ada.png")
+        );
+        assert_eq!(profile.status_text.as_deref(), Some(""));
+        assert_eq!(profile.status_emoji.as_deref(), Some(""));
+        assert_eq!(profile.status_expiration, Some(0));
+    }
+
+    #[test]
+    fn sparse_user_update_distinguishes_missing_and_authoritative_custom_profile_fields() {
+        let cached = SlackUser {
+            id: Some("U1".to_string()),
+            profile: Some(SlackUserProfile {
+                fields: HashMap::from([
+                    (
+                        "F1".to_string(),
+                        SlackProfileField {
+                            value: Some("one".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "F2".to_string(),
+                        SlackProfileField {
+                            value: Some("two".to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let without_fields: SlackUser = serde_json::from_value(serde_json::json!({
+            "id": "U1",
+            "profile": { "status_text": "Focusing" }
+        }))
+        .unwrap();
+        let without_fields = serde_json::from_value(serde_json::to_value(without_fields).unwrap())
+            .expect("a serialized sparse update must remain sparse");
+        let merged = cached.clone().merge_sparse_update(without_fields);
+        assert_eq!(merged.profile.as_ref().unwrap().fields.len(), 2);
+
+        let replacement: SlackUser = serde_json::from_value(serde_json::json!({
+            "id": "U1",
+            "profile": {
+                "fields": {
+                    "F2": { "value": "updated" }
+                }
+            }
+        }))
+        .unwrap();
+        let merged = cached.clone().merge_sparse_update(replacement);
+        let fields = &merged.profile.as_ref().unwrap().fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields["F2"].value.as_deref(), Some("updated"));
+
+        let clear: SlackUser = serde_json::from_value(serde_json::json!({
+            "id": "U1",
+            "profile": { "fields": {} }
+        }))
+        .unwrap();
+        let clear = serde_json::from_value(serde_json::to_value(clear).unwrap())
+            .expect("an explicit custom field clear must survive serialization");
+        let merged = cached.merge_sparse_update(clear);
+        assert!(merged.profile.as_ref().unwrap().fields.is_empty());
+    }
+
+    #[test]
+    fn sparse_user_update_applies_explicit_huddle_state_clear() {
+        let cached = SlackUser {
+            id: Some("U1".to_string()),
+            profile: Some(SlackUserProfile {
+                huddle_state: Some(SlackHuddleState::InAHuddle),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let update = SlackUser {
+            id: Some("U1".to_string()),
+            profile: Some(SlackUserProfile {
+                huddle_state: Some(SlackHuddleState::DefaultUnset),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = cached.merge_sparse_update(update);
+
+        assert_eq!(
+            merged.profile.unwrap().huddle_state,
+            Some(SlackHuddleState::DefaultUnset)
+        );
+    }
 
     #[test]
     fn slack_message_preserves_client_message_identity() {
