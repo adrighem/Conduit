@@ -38,7 +38,7 @@
 ## Phase 5: Incremental GTK and WebKit presentation
 
 - [x] Task: Define SidebarProjection keyed splice/update/reset behavior with 1,430-row regression tests cd2ab3c
-- [ ] Task: Migrate the sidebar to GtkListView, gio::ListStore, and stable single selection
+- [x] Task: Migrate the sidebar to GtkListView, gio::ListStore, and stable single selection ec6dfe2
 - [ ] Task: Define TimelinePresenter document/revision/loading/delta behavior with scroll regression tests
 - [ ] Task: Route one batched TimelineDelta per frame and restrict full document loads
 - [ ] Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers
