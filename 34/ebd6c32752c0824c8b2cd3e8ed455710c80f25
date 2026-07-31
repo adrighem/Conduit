@@ -1,0 +1,30 @@
+Phase: Bounded synchronization and backpressure
+
+Track: workspace_pipeline_rearchitecture_20260720
+
+Automated verification:
+- cargo test --all-targets --no-fail-fast: 1086 passed, 3 ignored
+- cargo check --all-targets: passed
+- cargo fmt --all -- --check: passed
+- meson compile -C _build-task4: passed
+- meson test -C _build-task4 --print-errorlogs: 17 passed
+- git diff --check: passed
+- Independent scheduler, counter privacy, ordering, and membership freshness audits: no remaining blockers
+
+Manual verification:
+- User confirmed startup synchronization remains movable and responsive and cached restart behavior is correct.
+- User confirmed rapid conversation switching, thread navigation, and repeated manual refresh remain responsive without blank/error surfaces or duplicate rows.
+- User confirmed lazy people loading and @ completion filtering.
+- User confirmed scheduler/API diagnostic output and bounded counter behavior.
+- The no-realtime fallback was unavailable because the active workspace has realtime configured.
+
+Fallback evidence:
+Deterministic regressions cover no-transport activation gating, the exact 300000 ms freshness boundary, post-serialization stale rechecks, non-disruptive background failure, deferred admission at capacity, immediate repeat suppression, and forced-refresh precedence over stale work.
+
+Limitations:
+- The no-realtime fallback could not be exercised live without altering valid realtime credentials, so credentials were left untouched.
+- Coverage tooling is not configured; cargo-llvm-cov is unavailable.
+- Strict Clippy is unavailable locally because installed Clippy 0.1.87 does not match rustc 1.95.0.
+
+Rationale:
+The phase has green boundary automation, explicit confirmation of every safely available live behavior, privacy-safe operational diagnostics, and deterministic coverage for the credential-dependent fallback path.
