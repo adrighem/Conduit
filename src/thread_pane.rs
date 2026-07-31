@@ -5,20 +5,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-//! GTK/WebKit presentation boundary for the open thread surface.
+//! GTK geometry boundary for the open thread surface.
 //!
-//! Workspace state decides which thread is open and the window translates runtime events. This
-//! type owns the visual lifecycle so those layers do not also need to coordinate the sidebar,
-//! title, placeholder, and WebView as separate widgets.
-
-use std::time::Instant;
+//! Workspace state decides which thread is open and the window owns timeline document and delta
+//! presentation. This type only coordinates the split view, title, and WebView placement.
 
 use gettextrs::gettext;
 use gtk::prelude::*;
-use webkit6::prelude::WebViewExt;
-
-use crate::message_html::{self, MessageHtmlContext};
-use crate::models::SlackMessage;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ThreadPane {
@@ -50,67 +43,14 @@ impl ThreadPane {
         self.split.shows_sidebar()
     }
 
-    pub(crate) fn show_placeholder(&self, message: &str) {
-        let title = gettext("Thread");
-        self.title.set_title(&title);
+    /// Reveal the thread pane while its document is loading or ready.
+    pub(crate) fn show(&self) {
+        self.title.set_title(&gettext("Thread"));
         self.split.set_show_sidebar(true);
-        self.load_html(&message_html::placeholder_document(&title, message));
     }
 
     pub(crate) fn close(&self) {
+        self.title.set_title(&gettext("Thread"));
         self.split.set_show_sidebar(false);
-        self.load_html(&message_html::placeholder_document(
-            &gettext("Thread"),
-            &gettext("No thread open"),
-        ));
-    }
-
-    pub(crate) fn render(
-        &self,
-        channel_id: &str,
-        messages: &[SlackMessage],
-        context: &MessageHtmlContext,
-        focus_message_ts: Option<&str>,
-    ) {
-        let title = gettext("Thread");
-        self.title.set_title(&title);
-        self.split.set_show_sidebar(true);
-        if messages.is_empty() {
-            self.load_html(&message_html::placeholder_document(
-                &title,
-                &gettext("No replies"),
-            ));
-            return;
-        }
-
-        let started = Instant::now();
-        let html = message_html::conversation_document_with_focus(
-            channel_id,
-            messages,
-            context,
-            focus_message_ts,
-        );
-        log_performance(started, "html_generation", html.len());
-        self.load_html(&html);
-    }
-
-    pub(crate) fn load_html(&self, html: &str) {
-        let started = Instant::now();
-        crate::debug::log("ui", &format!("load_thread_html bytes={}", html.len()));
-        self.web_view
-            .load_html(html, Some(message_html::base_uri()));
-        log_performance(started, "html_load_submit", html.len());
-    }
-}
-
-fn log_performance(started: Instant, operation: &str, bytes: usize) {
-    if crate::debug::enabled() {
-        crate::debug::log(
-            "performance",
-            &format!(
-                "{operation} surface=thread bytes={bytes} elapsed_ms={:.2}",
-                started.elapsed().as_secs_f64() * 1_000.0
-            ),
-        );
     }
 }

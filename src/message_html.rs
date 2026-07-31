@@ -15,6 +15,7 @@ use crate::models::{
     SavedItem, SearchMatch, SearchMessageLocation, SlackAttachment, SlackAttachmentAction,
     SlackFile, SlackMessage, SlackUser, SlackUserStatus,
 };
+use crate::timeline_presenter::TimelineDelta;
 
 mod rich_components;
 mod rich_model;
@@ -49,6 +50,8 @@ pub struct MessageHtmlContext {
     pub read_marker_url: Option<String>,
     pub first_unread_ts: Option<String>,
     pub timeline_generation: Option<u64>,
+    pub timeline_document_generation: Option<u64>,
+    pub timeline_revision: Option<u64>,
     pub(crate) message_control_handles: HashMap<MessageRef, MessageControlHandle>,
 }
 
@@ -171,7 +174,7 @@ pub fn conversation_snapshot_patch(
     context: &MessageHtmlContext,
 ) -> TimelineDomPatch {
     TimelineDomPatch::ReplaceSnapshot {
-        list_html: conversation_list_items_html(channel_id, messages, context),
+        list_html: conversation_list_items_or_empty_html(channel_id, messages, context),
         load_more_html: context
             .load_more_url
             .as_deref()
@@ -257,16 +260,29 @@ pub fn update_user_patch(
 /// JavaScript suitable for `WebView::evaluate_javascript`.
 #[allow(dead_code)]
 pub fn timeline_dom_patch_call(patch: &TimelineDomPatch) -> String {
-    let payload = serde_json::to_string(patch)
-        .expect("timeline DOM patch should serialize")
+    let payload = javascript_data_json(patch, "timeline DOM patch should serialize");
+    format!(
+        "window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch({payload}) : false;"
+    )
+}
+
+/// JavaScript suitable for applying one revisioned delta to a timeline WebView.
+#[allow(dead_code)]
+pub(crate) fn timeline_delta_call(delta: &TimelineDelta) -> String {
+    let payload = javascript_data_json(delta, "timeline delta should serialize");
+    format!(
+        "window.conduitApplyTimelineDelta ? window.conduitApplyTimelineDelta({payload}) : {{status:\"corrupt\",timeline_revision:null}};"
+    )
+}
+
+fn javascript_data_json(value: &impl Serialize, expectation: &str) -> String {
+    serde_json::to_string(value)
+        .expect(expectation)
         .replace('&', "\\u0026")
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029");
-    format!(
-        "window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch({payload}) : false;"
-    )
+        .replace('\u{2029}', "\\u2029")
 }
 
 impl TimelineScrollBehavior {
@@ -686,7 +702,9 @@ pub fn conversation_document_with_focus(
     context: &MessageHtmlContext,
     focus_message_ts: Option<&str>,
 ) -> String {
-    if messages.is_empty() {
+    let revisioned_document =
+        context.timeline_document_generation.is_some() && context.timeline_revision.is_some();
+    if messages.is_empty() && !revisioned_document {
         return placeholder_document(&gettext("Messages"), &gettext("No messages"));
     }
 
@@ -714,6 +732,15 @@ pub fn conversation_document_with_focus(
         .timeline_generation
         .map(|generation| format!(" data-timeline-generation=\"{generation}\""))
         .unwrap_or_default();
+    let presenter_revision_attributes = match (
+        context.timeline_document_generation,
+        context.timeline_revision,
+    ) {
+        (Some(generation), Some(revision)) => format!(
+            " data-timeline-document-generation=\"{generation}\" data-timeline-revision=\"{revision}\""
+        ),
+        _ => String::new(),
+    };
     let read_marker_attribute = context
         .read_marker_url
         .as_deref()
@@ -723,7 +750,7 @@ pub fn conversation_document_with_focus(
         "<main class=\"timeline\" aria-labelledby=\"document-title\" \
          data-timeline-positioning=\"pending\" data-timeline-mode=\"{}\" \
          data-timeline-sticky-key=\"{}\" data-timeline-anchor-key=\"{}\"\
-         {generation_attribute}{focus_attribute}{read_marker_attribute}>{}",
+         {generation_attribute}{presenter_revision_attributes}{focus_attribute}{read_marker_attribute}>{}",
         context.timeline_scroll.js_mode(),
         escape_html(&sticky_key),
         escape_html(&anchor_key),
@@ -735,7 +762,9 @@ pub fn conversation_document_with_focus(
         }
     }
     body.push_str("<ol class=\"message-list\">");
-    body.push_str(&conversation_list_items_html(channel_id, messages, context));
+    body.push_str(&conversation_list_items_or_empty_html(
+        channel_id, messages, context,
+    ));
     body.push_str("</ol>");
     if context.read_marker_url.is_some()
         && context.first_unread_ts.is_none()
@@ -772,6 +801,26 @@ fn conversation_list_items_html(
         html.push_str("</li>");
     }
     html
+}
+
+fn conversation_list_items_or_empty_html(
+    channel_id: &str,
+    messages: &[SlackMessage],
+    context: &MessageHtmlContext,
+) -> String {
+    if !messages.is_empty() {
+        return conversation_list_items_html(channel_id, messages, context);
+    }
+
+    let message = if context.thread_ts.is_some() {
+        gettext("No replies")
+    } else {
+        gettext("No messages")
+    };
+    format!(
+        "<li class=\"message-list-item\" data-timeline-empty=\"true\"><p class=\"placeholder\">{}</p></li>",
+        escape_html(&message)
+    )
 }
 
 pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -> String {
@@ -4095,6 +4144,8 @@ mod tests {
     use crate::activity::{ActivityItem, ActivityKind};
     use crate::message_handoff::{MessageControlRegistry, TimelineSurfaceId};
     use crate::models::{SavedItem, SlackFile, SlackReaction};
+    use crate::timeline_presenter::{TimelinePresenter, TimelinePresenterAction};
+    use crate::workspace_pipeline::TimelineTarget;
     use std::time::Instant;
 
     fn message(text: &str) -> SlackMessage {
@@ -5455,6 +5506,63 @@ mod tests {
     }
 
     #[test]
+    fn conversation_document_emits_complete_presenter_revision_metadata() {
+        let context = MessageHtmlContext {
+            timeline_document_generation: Some(7),
+            timeline_revision: Some(40),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("hello")], &context);
+
+        assert!(
+            html.contains("data-timeline-document-generation=\"7\" data-timeline-revision=\"40\"")
+        );
+    }
+
+    #[test]
+    fn conversation_document_omits_incomplete_presenter_revision_metadata() {
+        for context in [
+            MessageHtmlContext::default(),
+            MessageHtmlContext {
+                timeline_document_generation: Some(7),
+                ..Default::default()
+            },
+            MessageHtmlContext {
+                timeline_revision: Some(40),
+                ..Default::default()
+            },
+        ] {
+            let html = conversation_document("C123", &[message("hello")], &context);
+
+            assert!(!html.contains("data-timeline-document-generation="));
+            assert!(!html.contains("data-timeline-revision="));
+        }
+    }
+
+    #[test]
+    fn empty_presenter_documents_keep_a_revisioned_timeline_root() {
+        for (thread_ts, empty_text) in [(None, "No messages"), (Some("123.456"), "No replies")] {
+            let context = MessageHtmlContext {
+                thread_ts: thread_ts.map(str::to_string),
+                timeline_document_generation: Some(7),
+                timeline_revision: Some(40),
+                ..Default::default()
+            };
+
+            let html = conversation_document("C123", &[], &context);
+
+            assert!(html.contains("data-timeline-document-generation=\"7\""));
+            assert!(html.contains("data-timeline-revision=\"40\""));
+            assert!(html.contains("<ol class=\"message-list\">"));
+            assert!(html.contains("data-timeline-empty=\"true\""));
+            assert!(html.contains(empty_text));
+            assert!(html.contains("window.conduitApplyTimelineDelta"));
+            assert!(html.contains("querySelectorAll(\"[data-timeline-empty]\")"));
+        }
+    }
+
+    #[test]
     fn thread_read_marker_and_scroll_state_are_scoped_to_the_thread() {
         let context = MessageHtmlContext {
             thread_ts: Some("1710000000.000100".into()),
@@ -6016,6 +6124,51 @@ mod tests {
     }
 
     #[test]
+    fn timeline_delta_call_preserves_the_contract_and_escapes_javascript_data() {
+        let target = TimelineTarget::Channel("C123".into());
+        let mut presenter = TimelinePresenter::default();
+        let load = presenter.navigate(target.clone(), None);
+        let [TimelinePresenterAction::LoadDocument(request)] = load.as_slice() else {
+            panic!("expected one document load");
+        };
+        let generation = request.generation();
+        let revision = request.revision();
+        assert!(presenter.document_ready(generation, revision).is_empty());
+        let frame = presenter.queue_operations(
+            &target,
+            None,
+            [TimelineDomPatch::UpdateUser {
+                user_id: "U\"123".into(),
+                name: "Ada & </script>\u{2028}".into(),
+                status_html: "<span>Busy\u{2029}</span>".into(),
+            }],
+        );
+        let [TimelinePresenterAction::ScheduleFrame { generation }] = frame.as_slice() else {
+            panic!("expected one scheduled frame");
+        };
+        let delta = presenter.take_frame(*generation).unwrap();
+
+        let script = timeline_delta_call(&delta);
+
+        assert!(script
+            .starts_with("window.conduitApplyTimelineDelta ? window.conduitApplyTimelineDelta("));
+        assert!(script.contains("\"id\":1"));
+        assert!(script.contains("\"document_generation\":1"));
+        assert!(script.contains("\"base_timeline_revision\":1"));
+        assert!(script.contains("\"timeline_revision\":2"));
+        assert!(script.contains("\"operations\":[{\"type\":\"update-user\""));
+        assert!(!script.contains("source_workspace_revision"));
+        assert!(!script.contains("\"target\""));
+        assert!(script.contains("U\\\"123"));
+        assert!(script.contains("\\u003c/script\\u003e"));
+        assert!(script.contains("\\u0026"));
+        assert!(script.contains("\\u2028"));
+        assert!(script.contains("\\u2029"));
+        assert!(!script.contains("</script>"));
+        assert!(script.ends_with(": {status:\"corrupt\",timeline_revision:null};"));
+    }
+
+    #[test]
     fn message_patch_helpers_render_escaped_standalone_and_region_html() {
         let mut context = MessageHtmlContext::default();
         Arc::make_mut(&mut context.user_names).insert("U123".into(), "Ada <Admin>".into());
@@ -6147,6 +6300,23 @@ mod tests {
             load_more_html,
         });
         assert!(script.contains("\"type\":\"replace-snapshot\""));
+    }
+
+    #[test]
+    fn empty_snapshot_patch_keeps_a_replaceable_timeline_empty_state() {
+        let context = MessageHtmlContext {
+            thread_ts: Some("123.456".into()),
+            ..Default::default()
+        };
+
+        let TimelineDomPatch::ReplaceSnapshot { list_html, .. } =
+            conversation_snapshot_patch("C123", &[], &context)
+        else {
+            panic!("expected snapshot patch");
+        };
+
+        assert!(list_html.contains("data-timeline-empty=\"true\""));
+        assert!(list_html.contains("No replies"));
     }
 
     #[test]

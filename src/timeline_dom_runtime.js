@@ -501,6 +501,9 @@
       if (patch.arrival === "sent") {
         animateSentMessage(content, patch.message_ts, arrivalVisible);
       }
+      list.querySelectorAll("[data-timeline-empty]").forEach(function (emptyState) {
+        emptyState.remove();
+      });
       if (patch.position === "prepend") list.prepend(content);
       else list.append(content);
       return operationChanged;

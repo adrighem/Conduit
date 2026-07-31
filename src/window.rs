@@ -89,6 +89,11 @@ use crate::socket_mode::{
     SocketModeEvent, SocketModeMessageEvent, SocketModeMessageKind, SocketModeReactionEvent,
 };
 use crate::thread_pane::ThreadPane;
+use crate::timeline_presenter::{
+    TimelineDeltaApplyResult, TimelineDocumentGeneration, TimelineDocumentRequest,
+    TimelinePresenter, TimelinePresenterAction, TimelinePresenterState, TimelineRevision,
+};
+use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
     resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
     ConversationOpenPosition, ConversationOpenRenderAction, ConversationSelectionDecision,
@@ -359,6 +364,11 @@ mod imp {
         pub sidebar_error: RefCell<Option<String>>,
         pub current_user_id: RefCell<Option<String>>,
         pub message_view: RefCell<Option<webkit6::WebView>>,
+        pub(super) main_timeline_presenter: RefCell<TimelinePresenter>,
+        pub(super) thread_timeline_presenter: RefCell<TimelinePresenter>,
+        pub(super) main_timeline_load: RefCell<TimelineWebViewLoadBinding>,
+        pub(super) thread_timeline_load: RefCell<TimelineWebViewLoadBinding>,
+        pub(super) timeline_source_revision: Cell<WorkspaceRevision>,
         pub message_font_settings_handler: RefCell<Option<(gtk::Settings, glib::SignalHandlerId)>>,
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub(super) thread_pane_controller: RefCell<Option<ThreadPane>>,
@@ -609,6 +619,80 @@ enum TimelineSurface {
     Thread,
 }
 
+#[derive(Debug, Default)]
+struct TimelineWebViewLoadBinding {
+    pending: Option<TimelineDocumentGeneration>,
+    active: Option<TimelineDocumentGeneration>,
+}
+
+impl TimelineWebViewLoadBinding {
+    fn submit(&mut self, generation: Option<TimelineDocumentGeneration>) {
+        self.pending = generation;
+    }
+
+    fn started(&mut self) {
+        self.active = self.pending.take();
+    }
+
+    fn active_generation(&self) -> Option<TimelineDocumentGeneration> {
+        self.active
+    }
+
+    fn complete(&mut self, generation: TimelineDocumentGeneration) -> bool {
+        if self.active != Some(generation) {
+            return false;
+        }
+        self.active = None;
+        true
+    }
+
+    fn reset(&mut self) {
+        self.pending = None;
+        self.active = None;
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TimelineJavascriptState {
+    document_generation: Option<u64>,
+    timeline_revision: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TimelineJavascriptApplyResult {
+    status: String,
+    timeline_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineDocumentObservation {
+    Ready,
+    Stale,
+    Corrupt,
+}
+
+fn classify_timeline_document_observation(
+    state: Option<&TimelineJavascriptState>,
+    generation: TimelineDocumentGeneration,
+    revision: TimelineRevision,
+) -> TimelineDocumentObservation {
+    match state {
+        Some(state)
+            if state.document_generation == Some(generation.value())
+                && state.timeline_revision == Some(revision.value()) =>
+        {
+            TimelineDocumentObservation::Ready
+        }
+        Some(state)
+            if state.document_generation.is_some()
+                && state.document_generation != Some(generation.value()) =>
+        {
+            TimelineDocumentObservation::Stale
+        }
+        _ => TimelineDocumentObservation::Corrupt,
+    }
+}
+
 struct RealtimeMessagePatch<'a> {
     surface: TimelineSurface,
     channel_id: &'a str,
@@ -617,7 +701,6 @@ struct RealtimeMessagePatch<'a> {
     arrival: Option<TimelineMessageArrival>,
     unread_start: bool,
     thread_ts: Option<&'a str>,
-    fallback: UiInvalidations,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3493,14 +3576,16 @@ impl ConduitWindow {
                 .as_deref(),
         );
 
-        let message_view = self.create_message_web_view(&network_session, text_zoom);
+        let message_view =
+            self.create_message_web_view(&network_session, text_zoom, TimelineSurface::Main);
         let viewer = self.create_media_viewer(&message_view);
         self.imp().message_view_box.append(&viewer.surface_stack);
         *self.imp().message_view.borrow_mut() = Some(message_view.clone());
         *self.imp().media_viewer.borrow_mut() = Some(viewer);
         self.setup_media_viewer_callbacks();
 
-        let thread_view = self.create_message_web_view(&network_session, text_zoom);
+        let thread_view =
+            self.create_message_web_view(&network_session, text_zoom, TimelineSurface::Thread);
         let weak_message_view = message_view.downgrade();
         let weak_thread_view = thread_view.downgrade();
         let thread_pane = ThreadPane::new(
@@ -3524,7 +3609,7 @@ impl ConduitWindow {
         }
 
         self.show_message_placeholder(&gettext("Select a conversation"));
-        self.thread_pane().close();
+        self.close_thread_pane();
     }
 
     fn create_media_viewer(&self, message_view: &webkit6::WebView) -> MediaViewer {
@@ -4018,6 +4103,7 @@ impl ConduitWindow {
         &self,
         network_session: &webkit6::NetworkSession,
         text_zoom: f64,
+        timeline_surface: TimelineSurface,
     ) -> webkit6::WebView {
         let settings = webkit6::Settings::new();
         configure_message_web_view_settings(&settings);
@@ -4081,7 +4167,99 @@ impl ConduitWindow {
             handled
         });
 
+        self.connect_timeline_web_view_lifecycle(timeline_surface, &web_view);
+
         web_view
+    }
+
+    fn connect_timeline_web_view_lifecycle(
+        &self,
+        surface: TimelineSurface,
+        web_view: &webkit6::WebView,
+    ) {
+        let weak_window = self.downgrade();
+        web_view.connect_load_changed(move |web_view, event| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            match event {
+                webkit6::LoadEvent::Started => {
+                    window.timeline_load_binding(surface).borrow_mut().started();
+                }
+                webkit6::LoadEvent::Finished => {
+                    let generation = window
+                        .timeline_load_binding(surface)
+                        .borrow()
+                        .active_generation();
+                    if let Some(generation) = generation {
+                        window.finish_timeline_document_load(surface, web_view, generation);
+                    }
+                }
+                _ => {}
+            }
+        });
+
+        let weak_window = self.downgrade();
+        web_view.connect_load_failed(move |web_view, _, _, error| {
+            let generation = weak_window.upgrade().and_then(|window| {
+                window
+                    .timeline_load_binding(surface)
+                    .borrow()
+                    .active_generation()
+            });
+            if error.matches(gio::IOErrorEnum::Cancelled)
+                || error.matches(webkit6::NetworkError::Cancelled)
+            {
+                return false;
+            }
+            let Some(window) = weak_window.upgrade() else {
+                return false;
+            };
+            let Some(generation) = generation else {
+                return false;
+            };
+            let weak_window = window.downgrade();
+            let weak_web_view = web_view.downgrade();
+            glib::idle_add_local_once(move || {
+                let (Some(window), Some(web_view)) =
+                    (weak_window.upgrade(), weak_web_view.upgrade())
+                else {
+                    return;
+                };
+                if web_view.is_loading()
+                    || !window
+                        .timeline_load_binding(surface)
+                        .borrow_mut()
+                        .complete(generation)
+                {
+                    return;
+                }
+                let presenter_matches = {
+                    let presenter = window.timeline_presenter(surface).borrow();
+                    presenter.state() == TimelinePresenterState::Loading
+                        && presenter.active_generation() == Some(generation)
+                };
+                if presenter_matches {
+                    window.fail_timeline_document_load(surface, generation);
+                }
+            });
+            true
+        });
+
+        let weak_window = self.downgrade();
+        web_view.connect_web_process_terminated(move |_, _| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            window.timeline_load_binding(surface).borrow_mut().reset();
+            let generation = window
+                .timeline_presenter(surface)
+                .borrow()
+                .active_generation();
+            if let Some(generation) = generation {
+                window.fail_timeline_document_load(surface, generation);
+            }
+        });
     }
 
     fn reaction_emoji_picker_model(&self) -> Arc<EmojiPickerModel> {
@@ -5921,26 +6099,169 @@ impl ConduitWindow {
         });
     }
 
-    fn apply_timeline_patch(
+    fn timeline_presenter(&self, surface: TimelineSurface) -> &RefCell<TimelinePresenter> {
+        match surface {
+            TimelineSurface::Main => &self.imp().main_timeline_presenter,
+            TimelineSurface::Thread => &self.imp().thread_timeline_presenter,
+        }
+    }
+
+    fn timeline_load_binding(
         &self,
         surface: TimelineSurface,
-        patch: TimelineDomPatch,
-        fallback: UiInvalidations,
-    ) {
-        let web_view = match surface {
-            TimelineSurface::Main => self.imp().message_view.borrow().clone(),
-            TimelineSurface::Thread => Some(self.thread_pane().web_view()),
-        };
-        let Some(web_view) = web_view else {
-            self.queue_ui_invalidations(fallback);
-            return;
-        };
-        if web_view.is_loading() {
-            self.queue_ui_invalidations(fallback);
-            return;
+    ) -> &RefCell<TimelineWebViewLoadBinding> {
+        match surface {
+            TimelineSurface::Main => &self.imp().main_timeline_load,
+            TimelineSurface::Thread => &self.imp().thread_timeline_load,
         }
+    }
 
-        let script = message_html::timeline_dom_patch_call(&patch);
+    fn timeline_web_view(&self, surface: TimelineSurface) -> Option<webkit6::WebView> {
+        match surface {
+            TimelineSurface::Main => self.imp().message_view.borrow().clone(),
+            TimelineSurface::Thread => self
+                .imp()
+                .thread_pane_controller
+                .borrow()
+                .as_ref()
+                .map(ThreadPane::web_view),
+        }
+    }
+
+    fn timeline_source_revision(&self) -> Option<WorkspaceRevision> {
+        let revision = self.imp().timeline_source_revision.get();
+        (revision != WorkspaceRevision::INITIAL).then_some(revision)
+    }
+
+    fn current_timeline_target(&self, surface: TimelineSurface) -> Option<TimelineTarget> {
+        let state = self.imp().workspace.view.borrow();
+        let channel_id = state.visible_channel_id()?.to_string();
+        match surface {
+            TimelineSurface::Main => Some(TimelineTarget::Channel(channel_id)),
+            TimelineSurface::Thread => Some(TimelineTarget::Thread {
+                channel_id,
+                thread_ts: state.selected_thread_ts()?.to_string(),
+            }),
+        }
+    }
+
+    fn begin_timeline_navigation(
+        &self,
+        surface: TimelineSurface,
+        target: TimelineTarget,
+    ) -> TimelineDocumentRequest {
+        let actions = self
+            .timeline_presenter(surface)
+            .borrow_mut()
+            .navigate(target, self.timeline_source_revision());
+        let mut actions = actions.into_iter();
+        let request = match actions.next() {
+            Some(TimelinePresenterAction::LoadDocument(request)) => request,
+            _ => unreachable!("timeline navigation must request its initial document"),
+        };
+        debug_assert!(actions.next().is_none());
+        request
+    }
+
+    fn timeline_target_is_active(&self, surface: TimelineSurface, target: &TimelineTarget) -> bool {
+        self.timeline_presenter(surface)
+            .borrow()
+            .active_target()
+            .is_some_and(|active| active == target)
+    }
+
+    fn queue_timeline_patch(
+        &self,
+        surface: TimelineSurface,
+        target: &TimelineTarget,
+        patch: TimelineDomPatch,
+    ) {
+        let actions = {
+            let mut presenter = self.timeline_presenter(surface).borrow_mut();
+            presenter.queue_operations(target, self.timeline_source_revision(), [patch])
+        };
+        self.handle_timeline_presenter_actions(surface, actions);
+    }
+
+    fn handle_timeline_presenter_actions(
+        &self,
+        surface: TimelineSurface,
+        actions: Vec<TimelinePresenterAction>,
+    ) {
+        for action in actions {
+            match action {
+                TimelinePresenterAction::LoadDocument(request) => {
+                    self.render_timeline_document_request(surface, request);
+                }
+                TimelinePresenterAction::ScheduleFrame { generation } => {
+                    self.schedule_timeline_frame(surface, generation);
+                }
+            }
+        }
+    }
+
+    fn schedule_timeline_frame(
+        &self,
+        surface: TimelineSurface,
+        generation: TimelineDocumentGeneration,
+    ) {
+        let weak_window = self.downgrade();
+        self.add_tick_callback(move |_, _| {
+            if let Some(window) = weak_window.upgrade() {
+                window.flush_timeline_frame(surface, generation);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn flush_timeline_frame(
+        &self,
+        surface: TimelineSurface,
+        generation: TimelineDocumentGeneration,
+    ) {
+        let (delta, counters) = {
+            let mut presenter = self.timeline_presenter(surface).borrow_mut();
+            let delta = presenter.take_frame(generation);
+            (delta, presenter.counters())
+        };
+        let Some(delta) = delta else {
+            return;
+        };
+        crate::debug::log(
+            "ui",
+            &format!(
+                "timeline_delta_submit surface={} generation={} base_revision={} revision={} operations={} source_revision={:?} document_loads={} deltas={} delta_operations={} peak_pending={} revision_mismatches={} corruptions={}",
+                match surface {
+                    TimelineSurface::Main => "main",
+                    TimelineSurface::Thread => "thread",
+                },
+                delta.document_generation().value(),
+                delta.base_revision().value(),
+                delta.revision().value(),
+                delta.operations().len(),
+                delta
+                    .source_workspace_revision()
+                    .map(WorkspaceRevision::value),
+                counters.document_loads,
+                counters.deltas,
+                counters.delta_operations,
+                counters.peak_pending_operations,
+                counters.revision_mismatches,
+                counters.corruptions,
+            ),
+        );
+        let delta_id = delta.id();
+        let script = message_html::timeline_delta_call(&delta);
+        let Some(web_view) = self.timeline_web_view(surface) else {
+            let actions = self.timeline_presenter(surface).borrow_mut().acknowledge(
+                generation,
+                delta_id,
+                TimelineDeltaApplyResult::Corrupt,
+            );
+            self.handle_timeline_presenter_actions(surface, actions);
+            return;
+        };
+
         let weak_window = self.downgrade();
         web_view.evaluate_javascript(
             &script,
@@ -5948,14 +6269,108 @@ impl ConduitWindow {
             None,
             None::<&gio::Cancellable>,
             move |result| {
-                let applied = result.is_ok_and(|value| value.to_boolean());
-                if !applied {
-                    if let Some(window) = weak_window.upgrade() {
-                        window.queue_ui_invalidations(fallback);
-                    }
-                }
+                let apply_result = result
+                    .ok()
+                    .and_then(|value| value.to_json(0))
+                    .and_then(|json| {
+                        serde_json::from_str::<TimelineJavascriptApplyResult>(json.as_str()).ok()
+                    })
+                    .and_then(|result| {
+                        TimelineDeltaApplyResult::from_status(
+                            &result.status,
+                            result.timeline_revision,
+                        )
+                    })
+                    .unwrap_or(TimelineDeltaApplyResult::Corrupt);
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                let actions = window.timeline_presenter(surface).borrow_mut().acknowledge(
+                    generation,
+                    delta_id,
+                    apply_result,
+                );
+                window.handle_timeline_presenter_actions(surface, actions);
             },
         );
+    }
+
+    fn finish_timeline_document_load(
+        &self,
+        surface: TimelineSurface,
+        web_view: &webkit6::WebView,
+        generation: TimelineDocumentGeneration,
+    ) {
+        let expected_revision = {
+            let presenter = self.timeline_presenter(surface).borrow();
+            if presenter.state() != TimelinePresenterState::Loading
+                || presenter.active_generation() != Some(generation)
+            {
+                return;
+            }
+            let Some(revision) = presenter.active_revision() else {
+                return;
+            };
+            revision
+        };
+
+        let weak_window = self.downgrade();
+        web_view.evaluate_javascript(
+            "window.conduitTimelineState ? window.conduitTimelineState() : null;",
+            None,
+            None,
+            None::<&gio::Cancellable>,
+            move |result| {
+                let state = result
+                    .ok()
+                    .and_then(|value| value.to_json(0))
+                    .and_then(|json| {
+                        serde_json::from_str::<TimelineJavascriptState>(json.as_str()).ok()
+                    });
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                let observation = classify_timeline_document_observation(
+                    state.as_ref(),
+                    generation,
+                    expected_revision,
+                );
+                if observation == TimelineDocumentObservation::Stale {
+                    return;
+                }
+                if !window
+                    .timeline_load_binding(surface)
+                    .borrow_mut()
+                    .complete(generation)
+                {
+                    return;
+                }
+                let actions = if observation == TimelineDocumentObservation::Ready {
+                    window
+                        .timeline_presenter(surface)
+                        .borrow_mut()
+                        .document_ready(generation, expected_revision)
+                } else {
+                    window
+                        .timeline_presenter(surface)
+                        .borrow_mut()
+                        .document_failed(generation)
+                };
+                window.handle_timeline_presenter_actions(surface, actions);
+            },
+        );
+    }
+
+    fn fail_timeline_document_load(
+        &self,
+        surface: TimelineSurface,
+        generation: TimelineDocumentGeneration,
+    ) {
+        let actions = self
+            .timeline_presenter(surface)
+            .borrow_mut()
+            .document_failed(generation);
+        self.handle_timeline_presenter_actions(surface, actions);
     }
 
     fn apply_realtime_message_patch(&self, request: RealtimeMessagePatch<'_>) {
@@ -6003,7 +6418,19 @@ impl ConduitWindow {
                 None,
             ),
         };
-        self.apply_timeline_patch(request.surface, patch, request.fallback);
+        let target = match request.surface {
+            TimelineSurface::Main => TimelineTarget::Channel(request.channel_id.to_string()),
+            TimelineSurface::Thread => {
+                let Some(thread_ts) = request.thread_ts else {
+                    return;
+                };
+                TimelineTarget::Thread {
+                    channel_id: request.channel_id.to_string(),
+                    thread_ts: thread_ts.to_string(),
+                }
+            }
+        };
+        self.queue_timeline_patch(request.surface, &target, patch);
     }
 
     fn configure_auth_ui(&self) {
@@ -6651,8 +7078,7 @@ impl ConduitWindow {
             }
             ThreadOpenOutcome::RequestFresh => {
                 self.set_status(&gettext("Loading thread"));
-                self.thread_pane()
-                    .show_placeholder(&gettext("Loading thread"));
+                self.show_thread_pending();
                 self.send_command(RuntimeCommand::LoadThread {
                     channel_id: channel_id.to_string(),
                     ts: ts.to_string(),
@@ -6660,8 +7086,7 @@ impl ConduitWindow {
             }
             ThreadOpenOutcome::AwaitFresh => {
                 self.set_status(&gettext("Loading thread"));
-                self.thread_pane()
-                    .show_placeholder(&gettext("Loading thread"));
+                self.show_thread_pending();
             }
             ThreadOpenOutcome::Ignored => {}
         }
@@ -6690,7 +7115,7 @@ impl ConduitWindow {
 
     fn render_closed_thread(&self) {
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
-        self.thread_pane().close();
+        self.close_thread_pane();
     }
 
     fn handle_message_view_uri(&self, uri: &str) -> bool {
@@ -7184,6 +7609,7 @@ impl ConduitWindow {
         imp.navigation_history.borrow_mut().clear();
         imp.restoring_navigation.set(false);
         imp.profile_visible.set(false);
+        imp.timeline_source_revision.set(WorkspaceRevision::INITIAL);
         self.sync_back_button();
         *imp.current_user_id.borrow_mut() = None;
         *imp.workspace_id.borrow_mut() = None;
@@ -7235,7 +7661,7 @@ impl ConduitWindow {
         imp.workspace_status_label.set_label("");
         imp.message_status_label.set_label("");
         imp.workspace_split.set_show_content(false);
-        self.thread_pane().close();
+        self.close_thread_pane();
         self.sync_workspace_chrome();
         let sidebar_reset = imp
             .sidebar_projection
@@ -7550,7 +7976,10 @@ impl ConduitWindow {
 
     fn show_thread_error(&self, error: &str) {
         let message = localized_replies_error(error);
-        self.thread_pane().show_placeholder(&message);
+        self.load_thread_html(&message_html::placeholder_document(
+            &gettext("Thread"),
+            &message,
+        ));
     }
 
     fn mark_image_asset_failed(&self, key: &str) {
@@ -7579,13 +8008,17 @@ impl ConduitWindow {
                 && messages_use_image_asset(state.current_thread_messages(), key);
             (state.main_view(), main, thread)
         };
+        let main_target = self.current_timeline_target(TimelineSurface::Main);
+        let thread_target = self.current_timeline_target(TimelineSurface::Thread);
 
         if main_uses_asset {
-            self.apply_timeline_patch(
-                TimelineSurface::Main,
-                message_html::update_image_patch(key, source.clone()),
-                UiInvalidations::MAIN,
-            );
+            if let Some(target) = main_target.as_ref() {
+                self.queue_timeline_patch(
+                    TimelineSurface::Main,
+                    target,
+                    message_html::update_image_patch(key, source.clone()),
+                );
+            }
         } else if !matches!(
             main_view,
             MainMessageView::Conversation | MainMessageView::Placeholder
@@ -7593,11 +8026,13 @@ impl ConduitWindow {
             self.queue_ui_invalidations(UiInvalidations::MAIN);
         }
         if thread_uses_asset {
-            self.apply_timeline_patch(
-                TimelineSurface::Thread,
-                message_html::update_image_patch(key, source),
-                UiInvalidations::THREAD,
-            );
+            if let Some(target) = thread_target.as_ref() {
+                self.queue_timeline_patch(
+                    TimelineSurface::Thread,
+                    target,
+                    message_html::update_image_patch(key, source),
+                );
+            }
         }
     }
 
@@ -7618,6 +8053,7 @@ impl ConduitWindow {
             );
             return;
         };
+        self.imp().timeline_source_revision.set(revision);
 
         remove_patch_departures_from_discovery(
             &mut self.imp().discovered_channels.borrow_mut(),
@@ -7915,17 +8351,26 @@ impl ConduitWindow {
             .unwrap_or_else(|| user_id.to_string());
         let status = self.imp().user_statuses.borrow().get(user_id).cloned();
         let custom_emojis = self.imp().custom_emojis.borrow().clone();
+        let main_target = self.current_timeline_target(TimelineSurface::Main);
+        let thread_target = self.current_timeline_target(TimelineSurface::Thread);
 
         if main_reaction_user {
             // Reaction tooltips contain resolved participant names but do not yet
             // expose individual participant nodes for a targeted DOM update.
             self.queue_ui_invalidations(UiInvalidations::MAIN);
         } else if main_uses_user {
-            self.apply_timeline_patch(
-                TimelineSurface::Main,
-                message_html::update_user_patch(user_id, &name, status.as_ref(), &custom_emojis),
-                UiInvalidations::MAIN,
-            );
+            if let Some(target) = main_target.as_ref() {
+                self.queue_timeline_patch(
+                    TimelineSurface::Main,
+                    target,
+                    message_html::update_user_patch(
+                        user_id,
+                        &name,
+                        status.as_ref(),
+                        &custom_emojis,
+                    ),
+                );
+            }
         } else if !matches!(
             main_view,
             MainMessageView::Conversation | MainMessageView::Placeholder
@@ -7935,11 +8380,18 @@ impl ConduitWindow {
         if thread_reaction_user {
             self.queue_ui_invalidations(UiInvalidations::THREAD);
         } else if thread_uses_user {
-            self.apply_timeline_patch(
-                TimelineSurface::Thread,
-                message_html::update_user_patch(user_id, &name, status.as_ref(), &custom_emojis),
-                UiInvalidations::THREAD,
-            );
+            if let Some(target) = thread_target.as_ref() {
+                self.queue_timeline_patch(
+                    TimelineSurface::Thread,
+                    target,
+                    message_html::update_user_patch(
+                        user_id,
+                        &name,
+                        status.as_ref(),
+                        &custom_emojis,
+                    ),
+                );
+            }
         }
     }
 
@@ -9403,7 +9855,7 @@ impl ConduitWindow {
         self.refresh_conversation_title_status(channel_id);
         self.restore_channel_draft(channel_id);
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
-        self.thread_pane().close();
+        self.close_thread_pane();
         imp.workspace_split.set_show_content(true);
         self.render_conversations();
 
@@ -9427,19 +9879,13 @@ impl ConduitWindow {
                 }
             }
             ConversationSelectionDecision::RequestFresh => {
-                self.load_message_html(&message_html::placeholder_document(
-                    &gettext("Messages"),
-                    &gettext("Loading messages"),
-                ));
+                self.show_main_pending(&gettext("Loading messages"));
                 self.send_command(RuntimeCommand::LoadHistory {
                     channel_id: channel_id.to_string(),
                 });
             }
             ConversationSelectionDecision::AwaitFresh => {
-                self.load_message_html(&message_html::placeholder_document(
-                    &gettext("Messages"),
-                    &gettext("Loading messages"),
-                ));
+                self.show_main_pending(&gettext("Loading messages"));
             }
         }
     }
@@ -9477,34 +9923,8 @@ impl ConduitWindow {
         let imp = self.imp();
         imp.message_title
             .set_title(&self.conversation_title(channel_id));
-        let mut context = self.message_html_context(None);
-        context.message_control_handles =
-            self.replace_message_control_handles(TimelineSurfaceId::Main, channel_id, &messages);
-        if !imp.workspace.view.borrow().has_channel_context(channel_id) {
-            context.load_more_url = self.channel_load_more_url(channel_id);
-        }
-        let (has_unread, last_read, unread_count) = imp
-            .workspace
-            .conversations()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    conversation.last_read_ts().map(ToString::to_string),
-                    conversation.unread_activity_count(),
-                )
-            })
-            .unwrap_or_default();
-        let first_unread_ts = has_unread
-            .then(|| first_unread_message_ts(&messages, last_read.as_deref(), unread_count))
-            .flatten();
-        if context.thread_ts.is_none() {
-            context.read_marker_url = Some(message_html::mark_read_action_url(channel_id, "0"));
-        }
-        if first_unread_ts.is_some() {
-            context.first_unread_ts = first_unread_ts.clone();
-        }
-        context.timeline_scroll = scroll_behavior;
+        let mut context =
+            self.conversation_timeline_context(channel_id, &messages, scroll_behavior);
         let active_open_generation = imp
             .conversation_opening
             .borrow()
@@ -9525,10 +9945,7 @@ impl ConduitWindow {
                 .borrow()
                 .active_waits_for_explicit_target(channel_id)
         {
-            self.load_message_html(&message_html::placeholder_document(
-                &gettext("Messages"),
-                &gettext("Loading message context"),
-            ));
+            self.show_main_pending(&gettext("Loading message context"));
             return;
         }
         let explicit_focus_ts = imp
@@ -9563,16 +9980,27 @@ impl ConduitWindow {
                 .borrow_mut()
                 .note_render_requested(generation)
         });
+        let target = TimelineTarget::Channel(channel_id.to_string());
         match render_action {
             Some(ConversationOpenRenderAction::HoldReconciliation) => {}
             Some(ConversationOpenRenderAction::Reconcile) => {
-                self.apply_timeline_patch(
+                self.queue_timeline_patch(
                     TimelineSurface::Main,
+                    &target,
                     message_html::conversation_snapshot_patch(channel_id, &messages, &context),
-                    UiInvalidations::MAIN,
+                );
+            }
+            None if self.timeline_target_is_active(TimelineSurface::Main, &target) => {
+                self.queue_timeline_patch(
+                    TimelineSurface::Main,
+                    &target,
+                    message_html::conversation_snapshot_patch(channel_id, &messages, &context),
                 );
             }
             Some(ConversationOpenRenderAction::InitialDocument) | None => {
+                let request = self.begin_timeline_navigation(TimelineSurface::Main, target);
+                context.timeline_document_generation = Some(request.generation().value());
+                context.timeline_revision = Some(request.revision().value());
                 let html = generate_html("conversation", || {
                     message_html::conversation_document_with_focus(
                         channel_id,
@@ -9581,10 +10009,43 @@ impl ConduitWindow {
                         focus_message_ts.as_deref(),
                     )
                 });
-                self.load_message_html(&html);
+                self.submit_timeline_document(TimelineSurface::Main, &request, &html);
             }
         }
         self.queue_history_render_followups(channel_id, messages);
+    }
+
+    fn conversation_timeline_context(
+        &self,
+        channel_id: &str,
+        messages: &[SlackMessage],
+        scroll_behavior: TimelineScrollBehavior,
+    ) -> MessageHtmlContext {
+        let imp = self.imp();
+        let mut context = self.message_html_context(None);
+        context.message_control_handles =
+            self.replace_message_control_handles(TimelineSurfaceId::Main, channel_id, messages);
+        if !imp.workspace.view.borrow().has_channel_context(channel_id) {
+            context.load_more_url = self.channel_load_more_url(channel_id);
+        }
+        let (has_unread, last_read, unread_count) = imp
+            .workspace
+            .conversations()
+            .get(channel_id)
+            .map(|conversation| {
+                (
+                    conversation.has_unread_activity(),
+                    conversation.last_read_ts().map(ToString::to_string),
+                    conversation.unread_activity_count(),
+                )
+            })
+            .unwrap_or_default();
+        context.first_unread_ts = has_unread
+            .then(|| first_unread_message_ts(messages, last_read.as_deref(), unread_count))
+            .flatten();
+        context.read_marker_url = Some(message_html::mark_read_action_url(channel_id, "0"));
+        context.timeline_scroll = scroll_behavior;
+        context
     }
 
     fn reconcile_current_conversation_snapshot(&self) {
@@ -9626,9 +10087,51 @@ impl ConduitWindow {
     ) {
         let imp = self.imp();
         self.request_image_assets(messages.iter());
+        let mut context = self.thread_timeline_context(channel_id, ts, &messages, scroll_behavior);
+        let focus_message_ts = imp
+            .workspace
+            .view
+            .borrow_mut()
+            .take_thread_focus_for_render(channel_id, ts, &messages);
+        let target = TimelineTarget::Thread {
+            channel_id: channel_id.to_string(),
+            thread_ts: ts.to_string(),
+        };
+        if self.timeline_target_is_active(TimelineSurface::Thread, &target) {
+            self.queue_timeline_patch(
+                TimelineSurface::Thread,
+                &target,
+                message_html::conversation_snapshot_patch(channel_id, &messages, &context),
+            );
+            self.thread_pane().show();
+            return;
+        }
+
+        let request = self.begin_timeline_navigation(TimelineSurface::Thread, target);
+        context.timeline_document_generation = Some(request.generation().value());
+        context.timeline_revision = Some(request.revision().value());
+        let html = generate_html("thread", || {
+            message_html::conversation_document_with_focus(
+                channel_id,
+                &messages,
+                &context,
+                focus_message_ts.as_deref(),
+            )
+        });
+        self.submit_timeline_document(TimelineSurface::Thread, &request, &html);
+    }
+
+    fn thread_timeline_context(
+        &self,
+        channel_id: &str,
+        ts: &str,
+        messages: &[SlackMessage],
+        scroll_behavior: TimelineScrollBehavior,
+    ) -> MessageHtmlContext {
+        let imp = self.imp();
         let mut context = self.message_html_context(Some(ts));
         context.message_control_handles =
-            self.replace_message_control_handles(TimelineSurfaceId::Thread, channel_id, &messages);
+            self.replace_message_control_handles(TimelineSurfaceId::Thread, channel_id, messages);
         if !imp
             .workspace
             .view
@@ -9640,13 +10143,86 @@ impl ConduitWindow {
         context.timeline_scroll = scroll_behavior;
         context.read_marker_url = SlackMessage::latest_ts(messages.iter())
             .map(|latest_ts| message_html::mark_thread_read_action_url(channel_id, ts, &latest_ts));
-        let focus_message_ts = imp
-            .workspace
-            .view
-            .borrow_mut()
-            .take_thread_focus_for_render(channel_id, ts, &messages);
-        self.thread_pane()
-            .render(channel_id, &messages, &context, focus_message_ts.as_deref());
+        context
+    }
+
+    fn render_timeline_document_request(
+        &self,
+        surface: TimelineSurface,
+        request: TimelineDocumentRequest,
+    ) {
+        crate::debug::log(
+            "ui",
+            &format!(
+                "timeline_document_request surface={} generation={} revision={} reason={:?} source_revision={:?}",
+                match surface {
+                    TimelineSurface::Main => "main",
+                    TimelineSurface::Thread => "thread",
+                },
+                request.generation().value(),
+                request.revision().value(),
+                request.reason(),
+                request.source_workspace_revision().map(WorkspaceRevision::value),
+            ),
+        );
+
+        let snapshot = self.current_message_snapshot();
+        match (surface, request.target().clone()) {
+            (TimelineSurface::Main, TimelineTarget::Channel(channel_id))
+                if snapshot.main_view == MainMessageView::Conversation
+                    && snapshot.channel_id.as_deref() == Some(channel_id.as_str()) =>
+            {
+                let mut context = self.conversation_timeline_context(
+                    &channel_id,
+                    &snapshot.channel_messages,
+                    TimelineScrollBehavior::Preserve,
+                );
+                context.timeline_document_generation = Some(request.generation().value());
+                context.timeline_revision = Some(request.revision().value());
+                let html = generate_html("conversation-recovery", || {
+                    message_html::conversation_document_with_focus(
+                        &channel_id,
+                        &snapshot.channel_messages,
+                        &context,
+                        None,
+                    )
+                });
+                self.submit_timeline_document(TimelineSurface::Main, &request, &html);
+            }
+            (
+                TimelineSurface::Thread,
+                TimelineTarget::Thread {
+                    channel_id,
+                    thread_ts,
+                },
+            ) if snapshot.channel_id.as_deref() == Some(channel_id.as_str())
+                && snapshot.thread_ts.as_deref() == Some(thread_ts.as_str()) =>
+            {
+                let mut context = self.thread_timeline_context(
+                    &channel_id,
+                    &thread_ts,
+                    &snapshot.thread_messages,
+                    TimelineScrollBehavior::Preserve,
+                );
+                context.timeline_document_generation = Some(request.generation().value());
+                context.timeline_revision = Some(request.revision().value());
+                let html = generate_html("thread-recovery", || {
+                    message_html::conversation_document_with_focus(
+                        &channel_id,
+                        &snapshot.thread_messages,
+                        &context,
+                        None,
+                    )
+                });
+                self.submit_timeline_document(TimelineSurface::Thread, &request, &html);
+            }
+            _ => {
+                let mut presenter = self.timeline_presenter(surface).borrow_mut();
+                if presenter.active_generation() == Some(request.generation()) {
+                    presenter.detach();
+                }
+            }
+        }
     }
 
     fn populate_unreads(&self, items: Vec<ActivityItem>) {
@@ -9869,7 +10445,6 @@ impl ConduitWindow {
                     arrival,
                     unread_start,
                     thread_ts: None,
-                    fallback: UiInvalidations::MAIN,
                 });
             } else {
                 self.queue_ui_invalidations(UiInvalidations::MAIN);
@@ -9895,7 +10470,6 @@ impl ConduitWindow {
                         arrival,
                         unread_start: false,
                         thread_ts: Some(&thread_ts),
-                        fallback: UiInvalidations::THREAD,
                     });
                 } else {
                     self.queue_ui_invalidations(UiInvalidations::THREAD);
@@ -9938,13 +10512,14 @@ impl ConduitWindow {
                 return;
             };
             if outcome.render_channel {
+                let target = TimelineTarget::Channel(update.channel_id.clone());
                 let patch = message_html::message_region_patch(
                     &update.channel_id,
                     &updated_message,
                     &self.message_patch_context(None, &updated_message),
                     TimelineMessageRegion::Responses,
                 );
-                self.apply_timeline_patch(TimelineSurface::Main, patch, UiInvalidations::MAIN);
+                self.queue_timeline_patch(TimelineSurface::Main, &target, patch);
             }
             if outcome.render_thread {
                 let thread_ts = self.selected_thread_ts();
@@ -9954,7 +10529,13 @@ impl ConduitWindow {
                     &self.message_patch_context(thread_ts.as_deref(), &updated_message),
                     TimelineMessageRegion::Responses,
                 );
-                self.apply_timeline_patch(TimelineSurface::Thread, patch, UiInvalidations::THREAD);
+                if let Some(thread_ts) = thread_ts {
+                    let target = TimelineTarget::Thread {
+                        channel_id: update.channel_id.clone(),
+                        thread_ts,
+                    };
+                    self.queue_timeline_patch(TimelineSurface::Thread, &target, patch);
+                }
             }
         }
     }
@@ -10796,18 +11377,103 @@ impl ConduitWindow {
     }
 
     fn load_message_html(&self, html: &str) {
-        if let Some(web_view) = self.imp().message_view.borrow().as_ref() {
-            let started = Instant::now();
-            crate::debug::log("ui", &format!("load_message_html bytes={}", html.len()));
-            web_view.load_html(html, Some(message_html::base_uri()));
-            log_performance(started, |elapsed_ms| {
-                format!(
-                    "html_load_submit surface=main bytes={} elapsed_ms={:.2}",
-                    html.len(),
-                    elapsed_ms
-                )
-            });
+        self.timeline_presenter(TimelineSurface::Main)
+            .borrow_mut()
+            .detach();
+        self.submit_surface_document(TimelineSurface::Main, None, html);
+    }
+
+    fn show_main_pending(&self, status: &str) {
+        self.timeline_presenter(TimelineSurface::Main)
+            .borrow_mut()
+            .detach();
+        if let Some(web_view) = self.timeline_web_view(TimelineSurface::Main) {
+            web_view.set_visible(false);
         }
+        self.set_status(status);
+    }
+
+    fn load_thread_html(&self, html: &str) {
+        self.timeline_presenter(TimelineSurface::Thread)
+            .borrow_mut()
+            .detach();
+        self.thread_pane().show();
+        self.submit_surface_document(TimelineSurface::Thread, None, html);
+    }
+
+    fn show_thread_pending(&self) {
+        self.timeline_presenter(TimelineSurface::Thread)
+            .borrow_mut()
+            .detach();
+        let thread_pane = self.thread_pane();
+        thread_pane.web_view().set_visible(false);
+        thread_pane.show();
+    }
+
+    fn submit_timeline_document(
+        &self,
+        surface: TimelineSurface,
+        request: &TimelineDocumentRequest,
+        html: &str,
+    ) {
+        let is_current = self
+            .timeline_presenter(surface)
+            .borrow()
+            .active_generation()
+            == Some(request.generation());
+        if !is_current {
+            return;
+        }
+        if surface == TimelineSurface::Thread {
+            self.thread_pane().show();
+        }
+        self.submit_surface_document(surface, Some(request.generation()), html);
+    }
+
+    fn submit_surface_document(
+        &self,
+        surface: TimelineSurface,
+        generation: Option<TimelineDocumentGeneration>,
+        html: &str,
+    ) {
+        let Some(web_view) = self.timeline_web_view(surface) else {
+            return;
+        };
+        self.timeline_load_binding(surface)
+            .borrow_mut()
+            .submit(generation);
+        web_view.set_visible(true);
+        let started = Instant::now();
+        crate::debug::log(
+            "ui",
+            &format!(
+                "html_load_submit surface={} bytes={}",
+                match surface {
+                    TimelineSurface::Main => "main",
+                    TimelineSurface::Thread => "thread",
+                },
+                html.len()
+            ),
+        );
+        web_view.load_html(html, Some(message_html::base_uri()));
+        log_performance(started, |elapsed_ms| {
+            format!(
+                "html_load_submit surface={} bytes={} elapsed_ms={:.2}",
+                match surface {
+                    TimelineSurface::Main => "main",
+                    TimelineSurface::Thread => "thread",
+                },
+                html.len(),
+                elapsed_ms
+            )
+        });
+    }
+
+    fn close_thread_pane(&self) {
+        self.timeline_presenter(TimelineSurface::Thread)
+            .borrow_mut()
+            .detach();
+        self.thread_pane().close();
     }
 
     fn thread_pane(&self) -> ThreadPane {
@@ -11086,6 +11752,8 @@ impl ConduitWindow {
             load_more_url: None,
             timeline_scroll: TimelineScrollBehavior::Preserve,
             timeline_generation: None,
+            timeline_document_generation: None,
+            timeline_revision: None,
             image_assets: imp
                 .image_assets
                 .borrow()
@@ -11364,6 +12032,124 @@ fn update_huddle_device_picker(
 mod tests {
     use super::*;
     use crate::sidebar::SidebarRowModel;
+
+    #[test]
+    fn webview_load_binding_keeps_superseded_events_with_their_own_generation() {
+        let mut presenter = TimelinePresenter::default();
+        let first_actions = presenter.navigate(TimelineTarget::Channel("C1".into()), None);
+        let [TimelinePresenterAction::LoadDocument(first)] = first_actions.as_slice() else {
+            panic!("expected first document");
+        };
+        let first = first.generation();
+        let second_actions = presenter.navigate(TimelineTarget::Channel("C2".into()), None);
+        let [TimelinePresenterAction::LoadDocument(second)] = second_actions.as_slice() else {
+            panic!("expected second document");
+        };
+        let second_revision = second.revision();
+        let second = second.generation();
+        let mut binding = TimelineWebViewLoadBinding::default();
+
+        binding.submit(Some(first));
+        binding.started();
+        binding.submit(Some(second));
+
+        assert!(binding.complete(first));
+        binding.started();
+        assert_eq!(binding.active_generation(), Some(second));
+        assert!(binding.complete(second));
+        assert_eq!(binding.active_generation(), None);
+
+        binding.submit(Some(first));
+        binding.started();
+        binding.submit(Some(second));
+        binding.started();
+        assert!(!binding.complete(first));
+        assert_eq!(binding.active_generation(), Some(second));
+
+        let stale_state = TimelineJavascriptState {
+            document_generation: Some(first.value()),
+            timeline_revision: Some(1),
+        };
+        assert_eq!(
+            classify_timeline_document_observation(Some(&stale_state), second, second_revision,),
+            TimelineDocumentObservation::Stale
+        );
+        assert_eq!(
+            classify_timeline_document_observation(None, second, second_revision),
+            TimelineDocumentObservation::Corrupt
+        );
+    }
+
+    #[test]
+    fn timeline_webview_io_stays_behind_the_presenter_adapter() {
+        let production = include_str!("window.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        let presenter_adapter = production
+            .split_once("    fn timeline_presenter(&self")
+            .unwrap()
+            .1
+            .split_once("    fn apply_realtime_message_patch")
+            .unwrap()
+            .0;
+        let thread_open = production
+            .split_once("    fn open_thread(&self")
+            .unwrap()
+            .1
+            .split_once("    fn open_message_context")
+            .unwrap()
+            .0;
+        let conversation_select = production
+            .split_once("    fn select_conversation_target(")
+            .unwrap()
+            .1
+            .split_once("    fn request_channel_history")
+            .unwrap()
+            .0;
+        let explicit_target_wait = production
+            .split_once("        if opening_position.is_none()")
+            .unwrap()
+            .1
+            .split_once("        let explicit_focus_ts")
+            .unwrap()
+            .0;
+        let history_render = production
+            .split_once("    fn populate_history_with_scroll(")
+            .unwrap()
+            .1
+            .split_once("    fn conversation_timeline_context")
+            .unwrap()
+            .0;
+        let thread_render = production
+            .split_once("    fn populate_thread(")
+            .unwrap()
+            .1
+            .split_once("    fn thread_timeline_context")
+            .unwrap()
+            .0;
+
+        assert_eq!(production.matches(".load_html(").count(), 1);
+        assert!(!production.contains("timeline_dom_patch_call"));
+        assert!(presenter_adapter.contains("message_html::timeline_delta_call"));
+        assert!(presenter_adapter.contains("target: &TimelineTarget"));
+        assert!(presenter_adapter.contains("queue_operations(target"));
+        assert!(!presenter_adapter.contains("active_target().cloned()"));
+        assert!(presenter_adapter.contains(".acknowledge("));
+        assert!(presenter_adapter.contains("self.add_tick_callback"));
+        assert!(production.contains("connect_load_changed"));
+        assert!(production.contains("connect_load_failed"));
+        assert!(production.contains("connect_web_process_terminated"));
+        assert!(thread_open.contains("self.show_thread_pending();"));
+        assert!(!thread_open.contains("load_thread_html"));
+        assert!(!thread_open.contains("show_placeholder"));
+        assert!(conversation_select.contains("self.show_main_pending"));
+        assert!(!conversation_select.contains("load_message_html"));
+        assert!(explicit_target_wait.contains("self.show_main_pending"));
+        assert!(!explicit_target_wait.contains("load_message_html"));
+        assert!(!history_render.contains("load_message_html"));
+        assert!(!thread_render.contains("load_thread_html"));
+    }
 
     #[test]
     fn lazy_user_directory_is_requested_only_by_consumers() {

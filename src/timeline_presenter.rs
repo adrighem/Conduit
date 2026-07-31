@@ -49,12 +49,6 @@ impl TimelineRevision {
 #[serde(transparent)]
 pub(crate) struct TimelineDeltaId(u64);
 
-impl TimelineDeltaId {
-    pub(crate) fn value(self) -> u64 {
-        self.0
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimelineDocumentLoadReason {
     InitialNavigation,
@@ -135,10 +129,6 @@ impl TimelineDelta {
 
     pub(crate) fn operations(&self) -> &[TimelineDomPatch] {
         &self.operations
-    }
-
-    pub(crate) fn target(&self) -> &TimelineTarget {
-        &self.target
     }
 
     pub(crate) fn source_workspace_revision(&self) -> Option<WorkspaceRevision> {
@@ -333,6 +323,23 @@ impl TimelinePresenter {
         self.schedule_frame_if_ready()
     }
 
+    pub(crate) fn document_failed(
+        &mut self,
+        generation: TimelineDocumentGeneration,
+    ) -> Vec<TimelinePresenterAction> {
+        let Some(active) = self.active.as_ref() else {
+            self.counters.stale_callbacks = self.counters.stale_callbacks.saturating_add(1);
+            return Vec::new();
+        };
+        if active.generation != generation {
+            self.counters.stale_callbacks = self.counters.stale_callbacks.saturating_add(1);
+            return Vec::new();
+        }
+
+        self.counters.corruptions = self.counters.corruptions.saturating_add(1);
+        self.recover_document(TimelineDocumentLoadReason::Corruption)
+    }
+
     pub(crate) fn take_frame(
         &mut self,
         generation: TimelineDocumentGeneration,
@@ -448,10 +455,12 @@ impl TimelinePresenter {
         self.active.as_ref().map(|active| active.revision)
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_operations(&self) -> usize {
         self.pending.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_in_flight_delta(&self) -> bool {
         self.in_flight.is_some()
     }
@@ -749,6 +758,30 @@ mod tests {
     }
 
     #[test]
+    fn one_hundred_changes_before_the_frame_form_one_delta() {
+        let (mut presenter, request) = ready_presenter(channel("C1"));
+
+        for index in 0..100 {
+            let actions = presenter.queue_operations(
+                &channel("C1"),
+                Some(workspace_revision(8)),
+                [insert(&index.to_string())],
+            );
+            if index == 0 {
+                assert_eq!(schedule_generation(&actions), request.generation());
+            } else {
+                assert!(actions.is_empty());
+            }
+        }
+
+        let delta = presenter.take_frame(request.generation()).unwrap();
+        assert_eq!(delta.operations().len(), 100);
+        assert_eq!(presenter.counters().frame_schedules, 1);
+        assert_eq!(presenter.counters().deltas, 1);
+        assert_eq!(presenter.counters().delta_operations, 100);
+    }
+
+    #[test]
     fn same_workspace_revision_structural_and_enrichment_changes_are_accepted() {
         let (mut presenter, request) = ready_presenter(channel("C1"));
         let source = Some(workspace_revision(9));
@@ -822,6 +855,23 @@ mod tests {
         assert_eq!(presenter.pending_operations(), 0);
         assert_eq!(presenter.counters().revision_mismatches, 1);
         assert_eq!(presenter.counters().revision_mismatch_loads, 1);
+    }
+
+    #[test]
+    fn matching_document_failure_requests_one_corruption_reload() {
+        let mut presenter = TimelinePresenter::default();
+        let request = load_action(&presenter.navigate(channel("C1"), None)).clone();
+
+        let actions = presenter.document_failed(request.generation());
+        let recovery = load_action(&actions);
+
+        assert_eq!(recovery.reason(), TimelineDocumentLoadReason::Corruption);
+        assert!(recovery.generation() > request.generation());
+        assert_eq!(presenter.counters().corruptions, 1);
+        assert_eq!(presenter.counters().corruption_loads, 1);
+        assert!(presenter.document_failed(request.generation()).is_empty());
+        assert_eq!(presenter.counters().corruption_loads, 1);
+        assert_eq!(presenter.counters().stale_callbacks, 1);
     }
 
     #[test]
