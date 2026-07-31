@@ -41,7 +41,7 @@
 - [x] Task: Migrate the sidebar to GtkListView, gio::ListStore, and stable single selection ec6dfe2
 - [x] Task: Define TimelinePresenter document/revision/loading/delta behavior with scroll regression tests 029b8d1
 - [x] Task: Route one batched TimelineDelta per frame and restrict full document loads 3d28d14
-- [ ] Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers
+- [x] Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers c5b9d8d
 - [ ] Task: Conductor - User Manual Verification 'Incremental GTK and WebKit presentation' (Protocol in workflow.md)
 
 ## Phase 6: Expansion and cleanup
