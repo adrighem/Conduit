@@ -161,6 +161,7 @@ impl WorkspaceSessionState {
         *self.conversation_patches.borrow_mut() = ConversationPatchConsumer::default();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn conversation_patch_revision(&self) -> WorkspaceRevision {
         self.conversation_patches.borrow().revision
     }

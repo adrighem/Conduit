@@ -47,7 +47,7 @@ use crate::thread_catalog::ThreadRecord;
 use crate::sync_scheduler::{
     SyncScheduler, SchedulerConfig, SyncJob, SyncPriority, SyncTargetKey, SyncTargetKind,
     SyncDurability, FreshnessPolicy, ReplacementClass, RetryPolicy, SyncJobId, CancellationId,
-    JobRun, JobOutcome, CompletionOutcome, AdmissionOutcome, RefreshClass,
+    JobOutcome, CompletionOutcome, AdmissionOutcome, RefreshClass,
 };
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
@@ -1203,6 +1203,7 @@ impl RuntimeTaskLimits {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum SyncJobPayload {
     WorkspaceStartup,
@@ -3026,7 +3027,7 @@ async fn run_job_payload(
                 }
             }
         }
-        SyncJobPayload::LoadThread { channel_id, ts } => {
+        SyncJobPayload::LoadThread { .. } => {
             // Placeholder/no-op for threads if needed
         }
         SyncJobPayload::MembershipSync { channel_id } => {
@@ -5565,6 +5566,7 @@ fn socket_mode_reconnect_timing(
     }
 }
 
+#[allow(dead_code)]
 async fn load_user_groups_best_effort_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
@@ -5596,6 +5598,7 @@ async fn load_user_groups_best_effort_with_api(
     }
 }
 
+#[allow(dead_code)]
 async fn resolve_user_group_display_data(
     api: &SlackApi,
     groups: Vec<SlackUserGroup>,

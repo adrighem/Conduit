@@ -1595,6 +1595,7 @@ impl WorkspaceStore {
         self.load_kind_map("custom_emoji").await
     }
 
+    #[allow(dead_code)]
     pub async fn store_custom_emojis(&self, emojis: &HashMap<String, String>) -> Result<()> {
         self.store_kind_map("custom_emoji", emojis.clone(), true)
             .await

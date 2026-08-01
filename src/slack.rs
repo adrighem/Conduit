@@ -518,6 +518,7 @@ impl SlackApi {
     /// Lists workspace-defined emoji. Slack represents aliases as
     /// `alias:target`, which is intentionally preserved for catalog-level
     /// resolution.
+    #[allow(dead_code)]
     pub async fn custom_emojis(&self) -> Result<HashMap<String, String>> {
         let response: EmojiListResponse = self.post_form("emoji.list", &[]).await?;
         Ok(response.emoji)
@@ -795,6 +796,7 @@ impl SlackApi {
         Ok(response.file)
     }
 
+    #[allow(dead_code)]
     pub async fn user_display_name(&self, user_id: &str) -> Result<String> {
         Ok(self
             .user(user_id)
@@ -859,6 +861,7 @@ impl SlackApi {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn user_groups(&self) -> Result<Vec<SlackUserGroup>> {
         let response: UserGroupsListResponse = self
             .post_form("usergroups.list", &[("include_users", "true".to_string())])
@@ -2297,6 +2300,7 @@ struct UserProfileResponse {
 }
 impl_slack_response!(UserProfileResponse);
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct UserGroupsListResponse {
     ok: bool,
@@ -2305,6 +2309,7 @@ struct UserGroupsListResponse {
 }
 impl_slack_response!(UserGroupsListResponse);
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct EmojiListResponse {
     ok: bool,

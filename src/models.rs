@@ -1701,6 +1701,7 @@ impl SlackUserStatus {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SlackUserGroup {
     pub id: String,
