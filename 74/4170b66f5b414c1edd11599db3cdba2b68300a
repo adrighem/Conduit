@@ -1,0 +1,7 @@
+Issue #11 Phase 3 Task 5 legacy mutation and event cleanup
+
+- Removed unused helper `legacy_conversation_catalog_mutation_allowed` and the dead method `apply_conversation_left`.
+- Cleaned up obsolete event-based catalog mutations in `ConversationsLoaded`, `ConversationOpened`, `ConversationUpdated`, `ConversationStarUpdated`, and `ConversationLeft` handlers in `src/window.rs`.
+- Removed the now unused `has_conversation_patch` method in `src/workspace_state.rs`.
+- Refactored `conversation_catalog_updates_after_typed_patch_adoption` unit test to verify authoritative behavior cleanly.
+- Verified compilation and ran the full 879-unit and 17-integration test suites with 100% success and no warnings.
