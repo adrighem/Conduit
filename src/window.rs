@@ -7280,6 +7280,11 @@ impl ConduitWindow {
         self.activate_pending_notification_target();
         self.activate_pending_slack_uris();
         self.refresh_open_conversation_picker();
+
+        if !self.imp().workspace.conversations.borrow().is_empty() && !self.imp().initial_sync_complete.get() {
+            self.imp().initial_sync_complete.set(true);
+            self.render_workspace_lifecycle();
+        }
     }
 
     fn populate_user_names(&self, user_names: HashMap<String, String>) {
