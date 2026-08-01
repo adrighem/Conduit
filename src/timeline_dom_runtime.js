@@ -231,7 +231,7 @@
         if (entry.isIntersecting) visible.add(ts); else visible.delete(ts);
       });
       schedule();
-    }, { threshold: 0.01 });
+    }, { threshold: 0.90 });
     function observeUnreadMessages() {
       const boundary = document.querySelector(".unread-separator");
       if (!boundary) return;
