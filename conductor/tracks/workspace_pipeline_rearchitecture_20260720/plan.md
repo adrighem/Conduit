@@ -23,8 +23,8 @@
 - [x] Task: Execute each coordinator StoreBatch atomically and in revision order 640658d
 - [x] Task: Deliver revisioned conversation WorkspacePatch values to presentation 0e39acd
 - [x] Task: Route cache, API, and realtime conversation changes through the coordinator 3c1adf8
-- [~] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations
-- [ ] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md)
+- [x] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations 744170b
+- [~] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md)
 
 ## Phase 4: Bounded synchronization and backpressure
 
