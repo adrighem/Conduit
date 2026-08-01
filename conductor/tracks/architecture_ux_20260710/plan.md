@@ -11,4 +11,4 @@
 - [x] Task: Modernize semantic message HTML/CSS and localization 2794a90
 - [x] Task: Complete notification, unread-surface, search-navigation, and draft UX f02d63b
 - [x] Task: Run full regression validation and synchronize architecture documentation 6c3e196
-- [~] Task: Conductor - User Manual Verification 'Architecture and UX modernization' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Architecture and UX modernization' (Protocol in workflow.md)
