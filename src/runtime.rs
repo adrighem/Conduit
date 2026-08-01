@@ -41,11 +41,13 @@ use crate::slack::{
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
     AttentionObservationStatus, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
+    SyncFreshness,
 };
 use crate::thread_catalog::ThreadRecord;
 use crate::sync_scheduler::{
     SyncScheduler, SchedulerConfig, SyncJob, SyncPriority, SyncTargetKey, SyncTargetKind,
     SyncDurability, FreshnessPolicy, ReplacementClass, RetryPolicy, SyncJobId, CancellationId,
+    JobRun, JobOutcome, CompletionOutcome, AdmissionOutcome, RefreshClass,
 };
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
@@ -1201,6 +1203,15 @@ impl RuntimeTaskLimits {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum SyncJobPayload {
+    WorkspaceStartup,
+    WorkspaceRefresh,
+    LoadHistory { channel_id: String },
+    LoadThread { channel_id: String, ts: String },
+    MembershipSync { channel_id: String },
+}
+
 #[derive(Clone)]
 struct RuntimeConnection {
     slack: SlackApi,
@@ -1216,6 +1227,8 @@ struct RuntimeConnection {
     team_id: Option<String>,
     huddles: HuddleActorHandle,
     scheduler: Arc<Mutex<SyncScheduler>>,
+    pending_jobs: Arc<Mutex<HashMap<SyncJobId, SyncJobPayload>>>,
+    next_job_id: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     cached_bootstrap_load_gate: Option<Arc<TestWorkspacePatchSendGate>>,
 }
@@ -2610,6 +2623,8 @@ fn spawn_authentication_task<F>(
                             scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                                 SchedulerConfig::new(256, 8, 5).unwrap(),
                             ))),
+                            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
+                            next_job_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                             #[cfg(test)]
                             cached_bootstrap_load_gate: None,
                         };
@@ -2675,103 +2690,31 @@ fn spawn_workspace_tasks(
                 );
             }
         }
-        load_cached_bootstrap(&hydration_events, &hydration_connection).await;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        schedule_job_internal(
+            &hydration_connection,
+            SyncJobPayload::WorkspaceStartup,
+            SyncPriority::Interactive,
+            SyncDurability::Ephemeral,
+            FreshnessPolicy::Always,
+            ReplacementClass::Refresh(RefreshClass::Workspace),
+            RetryPolicy::Never,
+            now_ms,
+        );
+
         let _ = hydration_ready_sender.send(());
 
-        let emoji_events = hydration_events.clone();
-        let emoji_connection = hydration_connection.clone();
-        let emoji_limits = hydration_limits.clone();
-        spawn_request_task(
+        drive_scheduler(
             &state_after_hydration,
-            TrackedRequest::new(
-                identity,
-                OperationContext::new(RuntimeOperation::Emoji, RuntimeTarget::Workspace),
-            ),
-            async move {
-                let _permit = emoji_limits.acquire(RuntimeTaskLane::Background).await;
-                match emoji_connection.slack.custom_emojis().await {
-                    Ok(emojis) => {
-                        if let Some(store) = emoji_connection.workspace_store.as_ref() {
-                            if let Err(error) = store.store_custom_emojis(&emojis).await {
-                                crate::debug::log(
-                                    "store",
-                                    &format!("CustomEmojiStoreFailed error={error:#}"),
-                                );
-                            }
-                        }
-                        emoji_events.send_event(RuntimeEventKind::EmojiCatalogLoaded(emojis));
-                    }
-                    Err(error) => crate::debug::log(
-                        "runtime",
-                        &format!("CustomEmojiRefreshFailed error={error:#}"),
-                    ),
-                }
-            },
-        );
-
-        let refresh_events = hydration_events.clone();
-        let refresh_connection = hydration_connection.clone();
-        let refresh_limits = hydration_limits.clone();
-        spawn_request_task(
-            &state_after_hydration,
-            TrackedRequest::new(
-                identity,
-                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
-            ),
-            async move {
-                let _permit = refresh_limits.acquire(RuntimeTaskLane::Background).await;
-                let cached_user_names = refresh_connection
-                    .user_cache
-                    .lock()
-                    .expect("runtime user cache lock poisoned")
-                    .clone();
-                if let Err(error) = load_conversations_best_effort_with_api(
-                    &refresh_events,
-                    &refresh_connection.slack,
-                    refresh_connection.workspace_url.as_deref(),
-                    WorkspacePipelineContext {
-                        store: &refresh_connection.workspace_store,
-                        reducer: &refresh_connection.workspace,
-                        conversation_star_sync: &refresh_connection.conversation_star_sync,
-                    },
-                    cached_user_names,
-                    refresh_connection.team_id.as_deref(),
-                    &refresh_connection.huddles,
-                )
-                .await
-                {
-                    crate::debug::log(
-                        "runtime",
-                        &format!("ConversationsBackgroundRefreshFailed error={error:#}"),
-                    );
-                }
-            },
-        );
-
-        let group_events = hydration_events;
-        let group_connection = hydration_connection;
-        let group_limits = hydration_limits;
-        spawn_request_task(
-            &state_after_hydration,
-            TrackedRequest::new(
-                identity,
-                OperationContext::new(RuntimeOperation::User, RuntimeTarget::Workspace),
-            ),
-            async move {
-                let _permit = group_limits.acquire(RuntimeTaskLane::Background).await;
-                let cached_user_names = group_connection
-                    .user_cache
-                    .lock()
-                    .expect("runtime user cache lock poisoned")
-                    .clone();
-                load_user_groups_best_effort_with_api(
-                    &group_events,
-                    &group_connection.slack,
-                    &group_connection.workspace_store,
-                    cached_user_names,
-                )
-                .await;
-            },
+            identity,
+            hydration_connection,
+            hydration_limits,
+            hydration_events,
         );
     });
 
@@ -2810,6 +2753,346 @@ fn spawn_workspace_tasks(
             ));
         }
     }
+}
+
+fn hash_opaque_id(id: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn schedule_job_internal(
+    connection: &RuntimeConnection,
+    payload: SyncJobPayload,
+    priority: SyncPriority,
+    durability: SyncDurability,
+    freshness: FreshnessPolicy,
+    replacement: ReplacementClass,
+    retry: RetryPolicy,
+    now_ms: u64,
+) -> Option<SyncJobId> {
+    use std::sync::atomic::Ordering;
+    let job_id = SyncJobId::new(connection.next_job_id.fetch_add(1, Ordering::SeqCst));
+    let cancellation_id = match &payload {
+        SyncJobPayload::LoadHistory { .. } | SyncJobPayload::LoadThread { .. } => {
+            CancellationId::new(hash_opaque_id("navigation-main"))
+        }
+        _ => CancellationId::new(0),
+    };
+    let target = match &payload {
+        SyncJobPayload::WorkspaceStartup | SyncJobPayload::WorkspaceRefresh => {
+            SyncTargetKey::new(SyncTargetKind::Workspace, 0)
+        }
+        SyncJobPayload::LoadHistory { channel_id } => {
+            SyncTargetKey::new(SyncTargetKind::Conversation, hash_opaque_id(channel_id))
+        }
+        SyncJobPayload::LoadThread { channel_id, ts } => {
+            SyncTargetKey::new(SyncTargetKind::Thread, hash_opaque_id(&format!("{channel_id}:{ts}")))
+        }
+        SyncJobPayload::MembershipSync { channel_id } => {
+            if channel_id == "user_directory" {
+                SyncTargetKey::new(SyncTargetKind::UserDirectory, 0)
+            } else {
+                SyncTargetKey::new(SyncTargetKind::Conversation, hash_opaque_id(channel_id))
+            }
+        }
+    };
+
+    let job = SyncJob::new(
+        job_id,
+        cancellation_id,
+        target,
+        priority,
+        durability,
+        freshness,
+        replacement,
+        retry,
+    ).unwrap();
+
+    let admitted = {
+        let mut scheduler = connection.scheduler.lock().unwrap();
+        scheduler.admit(job.clone(), now_ms, None)
+    };
+
+    match admitted {
+        Ok(AdmissionOutcome::Accepted { .. }) => {
+            connection.pending_jobs.lock().unwrap().insert(job_id, payload);
+            Some(job_id)
+        }
+        Ok(AdmissionOutcome::SkippedFresh(_)) => {
+            None
+        }
+        Err(rejection) => {
+            crate::debug::log(
+                "runtime",
+                &format!("SyncJobAdmissionRejected job_id={:?} reason={:?}", job_id, rejection.reason()),
+            );
+            None
+        }
+    }
+}
+
+fn drive_scheduler(
+    state: &Arc<Mutex<RuntimeState>>,
+    identity: RuntimeIdentity,
+    connection: RuntimeConnection,
+    limits: RuntimeTaskLimits,
+    events: RuntimeEventSender,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    loop {
+        let dispatched = {
+            let mut scheduler = connection.scheduler.lock().unwrap();
+            scheduler.dispatch_next(now_ms)
+        };
+
+        let Some(dispatched_job) = dispatched else {
+            break;
+        };
+
+        let job = dispatched_job.job().clone();
+        let job_id = job.id();
+        let run_id = dispatched_job.run();
+
+        let payload = {
+            connection
+                .pending_jobs
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .cloned()
+        };
+
+        if let Some(payload) = payload {
+            let limits = limits.clone();
+            let connection_clone = connection.clone();
+            let events_clone = events.clone();
+            let state_clone = Arc::clone(state);
+
+            let lane = match job.priority() {
+                SyncPriority::Interactive => RuntimeTaskLane::Interactive,
+                _ => RuntimeTaskLane::Background,
+            };
+
+            spawn_session_task(state, identity.session, async move {
+                let _permit = limits.acquire(lane).await;
+
+                let outcome = match run_job_payload(payload, &connection_clone, &events_clone).await {
+                    Ok(()) => JobOutcome::Succeeded,
+                    Err(error) => {
+                        crate::debug::log(
+                            "runtime",
+                            &format!("SyncJobFailed job_id={:?} error={error:#}", job_id),
+                        );
+                        JobOutcome::PermanentFailure
+                    }
+                };
+
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                let completion = {
+                    let mut scheduler = connection_clone.scheduler.lock().unwrap();
+                    let res = scheduler.complete(run_id, outcome, now_ms);
+                    let counters = scheduler.counters();
+                    crate::debug::log(
+                        "runtime",
+                        &format!(
+                            "SyncJobCompleted job_id={:?} outcome={:?} admitted={} queued={} running={} completed={} failed={} retried={}",
+                            job_id, outcome, counters.admitted(), counters.queued_depth(), counters.running_depth(), counters.completed(), counters.failed(), counters.retried()
+                        ),
+                    );
+                    res
+                };
+
+                match completion {
+                    Ok(CompletionOutcome::Completed) => {
+                        connection_clone.pending_jobs.lock().unwrap().remove(&job_id);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        crate::debug::log(
+                            "runtime",
+                            &format!("SyncJobCompletionFailed job_id={:?} error={:?}", job_id, error),
+                        );
+                    }
+                }
+
+                drive_scheduler(&state_clone, identity, connection_clone, limits, events_clone);
+            });
+        }
+    }
+}
+
+async fn run_job_payload(
+    payload: SyncJobPayload,
+    connection: &RuntimeConnection,
+    events: &RuntimeEventSender,
+) -> Result<()> {
+    match payload {
+        SyncJobPayload::WorkspaceStartup => {
+            load_cached_bootstrap(events, connection).await;
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            schedule_job_internal(
+                connection,
+                SyncJobPayload::WorkspaceRefresh,
+                SyncPriority::Maintenance,
+                SyncDurability::Ephemeral,
+                FreshnessPolicy::Always,
+                ReplacementClass::Refresh(RefreshClass::Workspace),
+                RetryPolicy::fixed(3, 1000).unwrap(),
+                now_ms,
+            );
+
+            let directory_empty = if let Some(store) = connection.workspace_store.as_ref() {
+                store.load_user_names().await.unwrap_or_default().is_empty()
+            } else {
+                true
+            };
+
+            if directory_empty {
+                schedule_job_internal(
+                    connection,
+                    SyncJobPayload::MembershipSync { channel_id: "user_directory".to_string() },
+                    SyncPriority::Maintenance,
+                    SyncDurability::Ephemeral,
+                    FreshnessPolicy::Always,
+                    ReplacementClass::Refresh(RefreshClass::UserDirectory),
+                    RetryPolicy::fixed(3, 1000).unwrap(),
+                    now_ms,
+                );
+            }
+        }
+        SyncJobPayload::WorkspaceRefresh => {
+            let cached_user_names = connection
+                .user_cache
+                .lock()
+                .expect("runtime user cache lock poisoned")
+                .clone();
+            load_conversations_best_effort_with_api(
+                events,
+                &connection.slack,
+                connection.workspace_url.as_deref(),
+                WorkspacePipelineContext {
+                    store: &connection.workspace_store,
+                    reducer: &connection.workspace,
+                    conversation_star_sync: &connection.conversation_star_sync,
+                },
+                cached_user_names,
+                connection.team_id.as_deref(),
+                &connection.huddles,
+            )
+            .await?;
+        }
+        SyncJobPayload::LoadHistory { channel_id } => {
+            let api = &connection.slack;
+            let service = ConversationHistoryService::new(api, connection.workspace_store.as_ref());
+            if let Some(messages) = service.load_cached(&channel_id).await? {
+                if !messages.is_empty() {
+                    observe_huddle_messages(
+                        &connection.huddles,
+                        connection.team_id.as_deref(),
+                        &channel_id,
+                        &messages,
+                    );
+                    publish_history_snapshot_with_completion(
+                        events,
+                        &connection.workspace_store,
+                        &connection.workspace,
+                        &channel_id,
+                        MutationOrigin::Cache,
+                        WorkspaceRevision::INITIAL,
+                        messages,
+                        false,
+                        None,
+                        true,
+                        false,
+                        true,
+                    )
+                    .await?;
+                }
+            }
+        }
+        SyncJobPayload::LoadThread { channel_id, ts } => {
+            // Placeholder/no-op for threads if needed
+        }
+        SyncJobPayload::MembershipSync { channel_id } => {
+            if channel_id == "user_directory" {
+                let api = &connection.slack;
+                let status_base_revision = connection.user_status_sync.revision();
+                let users_base_revision = connection.workspace.revision();
+                let users = api.users().await?;
+                connection.workspace.apply(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
+                        users_base_revision,
+                        users.clone(),
+                    )),
+                );
+                let aliases = users
+                    .iter()
+                    .filter_map(|user| Some((user.id.clone()?, user.search_aliases())))
+                    .collect::<HashMap<_, _>>();
+                let full_names = users
+                    .iter()
+                    .filter_map(|user| Some((user.id.clone()?, user.full_name()?)))
+                    .collect::<HashMap<_, _>>();
+                let avatar_urls = user_avatar_urls(&users);
+                let statuses = user_statuses(&users);
+                if let Some(store) = connection.workspace_store.as_ref() {
+                    store.store_user_search_aliases(&aliases).await?;
+                    store.store_user_full_names(&full_names).await?;
+                    store.store_user_avatar_urls(&avatar_urls).await?;
+                    let _persistence_guard = connection.user_status_sync.persistence.lock().await;
+                    if connection
+                        .user_status_sync
+                        .is_revision_current(status_base_revision)
+                    {
+                        store.store_user_statuses(&statuses).await?;
+                    }
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    store.store_sync_freshness(
+                        "user_directory",
+                        "workspace",
+                        SyncFreshness {
+                            refreshed_at_ms: Some(now_ms),
+                            retry_count: 0,
+                            retry_after_ms: None,
+                        },
+                    ).await?;
+                }
+                events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(aliases));
+                events.send_event(RuntimeEventKind::UserFullNamesLoaded(full_names));
+                events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(avatar_urls));
+                connection
+                    .user_status_sync
+                    .publish_snapshot(status_base_revision, |preserve_user_ids| {
+                        events.send_event(RuntimeEventKind::UserStatusesLoaded {
+                            statuses,
+                            replace_existing: true,
+                            preserve_user_ids,
+                        });
+                    });
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &RuntimeConnection) {
@@ -7069,6 +7352,8 @@ mod tests {
                 scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                     SchedulerConfig::new(256, 8, 5).unwrap(),
                 ))),
+                pending_jobs: Arc::new(Mutex::new(HashMap::new())),
+                next_job_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 cached_bootstrap_load_gate: None,
             };
 
@@ -7216,6 +7501,8 @@ mod tests {
                     scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                         SchedulerConfig::new(256, 8, 5).unwrap(),
                     ))),
+                    pending_jobs: Arc::new(Mutex::new(HashMap::new())),
+                    next_job_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     cached_bootstrap_load_gate: Some(Arc::new(TestWorkspacePatchSendGate {
                         started: load_started,
                         release: Mutex::new(load_release),
@@ -13602,6 +13889,8 @@ mod tests {
             scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                 SchedulerConfig::new(256, 8, 5).unwrap(),
             ))),
+            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
+            next_job_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cached_bootstrap_load_gate: None,
         });
         let disabled = AttentionPreferences {
