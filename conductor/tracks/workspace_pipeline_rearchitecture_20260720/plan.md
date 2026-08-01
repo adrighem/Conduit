@@ -17,14 +17,14 @@
 - [x] Task: Preserve read overlays and deduplicate message/send/echo identities with timeline invariants a7e44a2
 - [x] Task: Conductor - User Manual Verification 'Canonical reducer pipeline' (Protocol in workflow.md) 854789b
 
-## Phase 3: Authoritative conversation adoption
+## Phase 3: Authoritative conversation adoption [checkpoint: 744170b]
 
 - [x] Task: Define failing end-to-end tests for authoritative conversation membership and metadata e113608
 - [x] Task: Execute each coordinator StoreBatch atomically and in revision order 640658d
 - [x] Task: Deliver revisioned conversation WorkspacePatch values to presentation 0e39acd
 - [x] Task: Route cache, API, and realtime conversation changes through the coordinator 3c1adf8
 - [x] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations 744170b
-- [~] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md) 744170b
 
 ## Phase 4: Bounded synchronization and backpressure
 
