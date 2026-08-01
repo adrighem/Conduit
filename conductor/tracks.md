@@ -29,11 +29,6 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [x] Track: Architecture and usability modernization
-*Link: [./conductor/tracks/architecture_ux_20260710/](./conductor/tracks/architecture_ux_20260710/)*
-
----
-
 ## [x] Track: Runtime architecture hardening
 *Link: [./conductor/tracks/runtime_architecture_20260716/](./conductor/tracks/runtime_architecture_20260716/)*
 
