@@ -2950,7 +2950,7 @@ async fn run_job_payload(
             schedule_job_internal(
                 connection,
                 SyncJobPayload::WorkspaceRefresh,
-                SyncPriority::Maintenance,
+                SyncPriority::Interactive,
                 SyncDurability::Ephemeral,
                 FreshnessPolicy::Always,
                 ReplacementClass::Refresh(RefreshClass::Workspace),
