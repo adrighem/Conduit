@@ -19,7 +19,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Near instant channel loading
+## [x] Track: Near instant channel loading
 *Link: [./conductor/tracks/instant_channel_loading_20260707/](./conductor/tracks/instant_channel_loading_20260707/)*
 
 ---
