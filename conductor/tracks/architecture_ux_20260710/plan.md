@@ -1,6 +1,6 @@
 # Architecture and Usability Modernization Plan
 
-## Phase 1: Architecture and UX modernization
+## Phase 1: Architecture and UX modernization [checkpoint: 39653d3]
 
 - [x] Task: Serialize workspace cache updates and add concurrent-write coverage 5cfb369
 - [x] Task: Add runtime session/request identity and stale-response guards 313b05f
@@ -11,4 +11,4 @@
 - [x] Task: Modernize semantic message HTML/CSS and localization 2794a90
 - [x] Task: Complete notification, unread-surface, search-navigation, and draft UX f02d63b
 - [x] Task: Run full regression validation and synchronize architecture documentation 6c3e196
-- [x] Task: Conductor - User Manual Verification 'Architecture and UX modernization' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Architecture and UX modernization' (Protocol in workflow.md) 39653d3
