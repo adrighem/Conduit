@@ -165,10 +165,6 @@ impl WorkspaceSessionState {
         self.conversation_patches.borrow().revision
     }
 
-    pub(crate) fn has_conversation_patch(&self) -> bool {
-        self.conversation_patch_revision() > WorkspaceRevision::INITIAL
-    }
-
     #[cfg(test)]
     pub(crate) fn apply_conversation_patch(
         &self,

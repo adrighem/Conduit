@@ -1248,10 +1248,6 @@ fn sidebar_context_menu_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -
         || (key == gtk::gdk::Key::F10 && state.contains(gtk::gdk::ModifierType::SHIFT_MASK))
 }
 
-fn legacy_conversation_catalog_mutation_allowed(workspace: &WorkspaceSessionState) -> bool {
-    !workspace.has_conversation_patch()
-}
-
 fn conversation_sync_completion_needs_catalog_sync(workspace_ready: bool) -> bool {
     !workspace_ready
 }
@@ -4908,16 +4904,12 @@ impl ConduitWindow {
                     self.restore_workspace_status();
                 }
             }
-            RuntimeEventKind::ConversationsLoaded(conversations) => {
+            RuntimeEventKind::ConversationsLoaded(_conversations) => {
                 if !self.imp().connect_requested.get() {
-                    if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
-                        self.populate_conversations(conversations);
-                    } else {
-                        self.imp()
-                            .pending_opened_conversation_ids
-                            .borrow_mut()
-                            .clear();
-                    }
+                    self.imp()
+                        .pending_opened_conversation_ids
+                        .borrow_mut()
+                        .clear();
                     self.restore_workspace_status();
                 }
             }
@@ -4954,40 +4946,14 @@ impl ConduitWindow {
                     &imp.user_names.borrow(),
                     imp.current_user_id.borrow().as_deref(),
                 );
-                if legacy_conversation_catalog_mutation_allowed(&imp.workspace) {
-                    imp.workspace
-                        .conversations
-                        .borrow_mut()
-                        .upsert_metadata(conversation);
-                    imp.pending_opened_conversation_ids
-                        .borrow_mut()
-                        .insert(channel_id.clone());
-                    self.sync_conversations_from_catalog();
-                }
                 self.select_conversation(&channel_id, &title);
             }
-            RuntimeEventKind::ConversationUpdated(conversation) => {
-                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
-                    self.imp()
-                        .workspace
-                        .conversations
-                        .borrow_mut()
-                        .upsert_metadata(conversation);
-                    self.sync_conversations_from_catalog();
-                }
+            RuntimeEventKind::ConversationUpdated(_conversation) => {
                 self.refresh_current_conversation_title();
                 self.set_status(&gettext("People added"));
             }
             RuntimeEventKind::ConversationStarUpdated(conversation) => {
                 let starred = conversation.is_starred();
-                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
-                    self.imp()
-                        .workspace
-                        .conversations
-                        .borrow_mut()
-                        .upsert_metadata(conversation);
-                    self.sync_conversations_from_catalog();
-                }
                 self.set_status(&gettext(if starred {
                     "Conversation starred"
                 } else {
@@ -5011,12 +4977,8 @@ impl ConduitWindow {
                     "Status updated"
                 }));
             }
-            RuntimeEventKind::ConversationLeft { channel_id } => {
-                if legacy_conversation_catalog_mutation_allowed(&self.imp().workspace) {
-                    self.apply_conversation_left(&channel_id);
-                } else {
-                    self.set_status(&gettext("Left channel"));
-                }
+            RuntimeEventKind::ConversationLeft { channel_id: _ } => {
+                self.set_status(&gettext("Left channel"));
             }
             RuntimeEventKind::ConversationsPatched {
                 conversations,
@@ -7931,49 +7893,6 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::LeaveConversation {
             channel_id: channel_id.to_string(),
         });
-    }
-
-    fn apply_conversation_left(&self, channel_id: &str) {
-        let was_visible = self.visible_channel_id().as_deref() == Some(channel_id);
-        let removed = self
-            .imp()
-            .workspace
-            .conversations
-            .borrow_mut()
-            .remove(channel_id);
-        self.imp()
-            .workspace
-            .view
-            .borrow_mut()
-            .remove_conversation(channel_id);
-
-        if removed
-            .as_ref()
-            .is_some_and(sidebar_conversation_leave_requires_confirmation)
-        {
-            self.imp()
-                .discovered_channels
-                .borrow_mut()
-                .retain(|conversation| conversation.id != channel_id);
-        }
-        self.imp()
-            .pending_opened_conversation_ids
-            .borrow_mut()
-            .remove(channel_id);
-        self.imp()
-            .local_read_ts_by_channel
-            .borrow_mut()
-            .remove(channel_id);
-
-        if was_visible {
-            let title = gettext("Select a conversation");
-            self.imp().message_title.set_title(&title);
-            self.show_message_placeholder(&title);
-            self.render_closed_thread();
-        }
-        self.sync_conversations_from_catalog();
-        self.refresh_open_conversation_picker();
-        self.set_status(&gettext("Left channel"));
     }
 
     fn mark_channel_read_through_latest(&self, channel_id: &str) {
@@ -11581,18 +11500,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_conversation_catalog_mutations_stop_after_typed_patch_adoption() {
+    fn conversation_catalog_updates_after_typed_patch_adoption() {
         let state = WorkspaceSessionState::default();
-        assert!(legacy_conversation_catalog_mutation_allowed(&state));
-        state
-            .conversations
-            .borrow_mut()
-            .upsert_metadata(SlackConversation {
-                id: "C1".to_string(),
-                name: Some("legacy".to_string()),
-                ..Default::default()
-            });
-
         let patch = crate::workspace_pipeline::WorkspacePatch::new(
             crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor(),
             vec![
@@ -11605,18 +11514,6 @@ mod tests {
         )
         .unwrap();
         state.apply_conversation_patch(&patch).unwrap();
-        assert!(!legacy_conversation_catalog_mutation_allowed(&state));
-
-        if legacy_conversation_catalog_mutation_allowed(&state) {
-            state
-                .conversations
-                .borrow_mut()
-                .upsert_metadata(SlackConversation {
-                    id: "C1".to_string(),
-                    name: Some("rollback".to_string()),
-                    ..Default::default()
-                });
-        }
         state.view.borrow_mut().select_conversation("C1");
         assert_eq!(
             state
