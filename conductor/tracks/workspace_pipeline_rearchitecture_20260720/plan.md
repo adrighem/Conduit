@@ -26,13 +26,13 @@
 - [x] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations 744170b
 - [x] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md) 744170b
 
-## Phase 4: Bounded synchronization and backpressure
+## Phase 4: Bounded synchronization and backpressure [checkpoint: 6590ad0]
 
 - [x] Task: Integrate the validated bounded SyncJob scheduler after authoritative conversation adoption
 - [x] Task: Move startup, manual refresh, navigation, and membership-event scheduling onto the bounded scheduler
 - [x] Task: Enforce startup enrichment/history limits and lazy 24-hour user-directory loading
 - [x] Task: Add scheduler/API tracing counters and no-realtime stale-check behavior
-- [~] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md) 6590ad0
 
 ## Phase 5: Incremental GTK and WebKit presentation
 
