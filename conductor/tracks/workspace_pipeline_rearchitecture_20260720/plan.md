@@ -22,8 +22,8 @@
 - [x] Task: Define failing end-to-end tests for authoritative conversation membership and metadata e113608
 - [x] Task: Execute each coordinator StoreBatch atomically and in revision order 640658d
 - [x] Task: Deliver revisioned conversation WorkspacePatch values to presentation 0e39acd
-- [~] Task: Route cache, API, and realtime conversation changes through the coordinator
-- [ ] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations
+- [x] Task: Route cache, API, and realtime conversation changes through the coordinator 3c1adf8
+- [~] Task: Remove the replaced legacy persistence, runtime events, and GTK catalog mutations
 - [ ] Task: Conductor - User Manual Verification 'Authoritative conversation adoption' (Protocol in workflow.md)
 
 ## Phase 4: Bounded synchronization and backpressure
