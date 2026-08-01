@@ -43,6 +43,10 @@ use crate::store::{
     AttentionObservationStatus, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
 };
 use crate::thread_catalog::ThreadRecord;
+use crate::sync_scheduler::{
+    SyncScheduler, SchedulerConfig, SyncJob, SyncPriority, SyncTargetKey, SyncTargetKind,
+    SyncDurability, FreshnessPolicy, ReplacementClass, RetryPolicy, SyncJobId, CancellationId,
+};
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
     MessageAttentionEffect, MessageMutationKind, MutationOrigin, SnapshotEnvelope, StoreBatch,
@@ -1211,6 +1215,7 @@ struct RuntimeConnection {
     user_status_sync: UserStatusSync,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
+    scheduler: Arc<Mutex<SyncScheduler>>,
     #[cfg(test)]
     cached_bootstrap_load_gate: Option<Arc<TestWorkspacePatchSendGate>>,
 }
@@ -2602,6 +2607,9 @@ fn spawn_authentication_task<F>(
                             user_status_sync: UserStatusSync::default(),
                             team_id: auth.team_id.clone(),
                             huddles,
+                            scheduler: Arc::new(Mutex::new(SyncScheduler::new(
+                                SchedulerConfig::new(256, 8, 5).unwrap(),
+                            ))),
                             #[cfg(test)]
                             cached_bootstrap_load_gate: None,
                         };
@@ -7058,6 +7066,9 @@ mod tests {
                 user_status_sync: UserStatusSync::default(),
                 team_id: None,
                 huddles,
+                scheduler: Arc::new(Mutex::new(SyncScheduler::new(
+                    SchedulerConfig::new(256, 8, 5).unwrap(),
+                ))),
                 cached_bootstrap_load_gate: None,
             };
 
@@ -7202,6 +7213,9 @@ mod tests {
                     user_status_sync: UserStatusSync::default(),
                     team_id: None,
                     huddles,
+                    scheduler: Arc::new(Mutex::new(SyncScheduler::new(
+                        SchedulerConfig::new(256, 8, 5).unwrap(),
+                    ))),
                     cached_bootstrap_load_gate: Some(Arc::new(TestWorkspacePatchSendGate {
                         started: load_started,
                         release: Mutex::new(load_release),
@@ -13585,6 +13599,9 @@ mod tests {
             user_status_sync: UserStatusSync::default(),
             team_id: None,
             huddles,
+            scheduler: Arc::new(Mutex::new(SyncScheduler::new(
+                SchedulerConfig::new(256, 8, 5).unwrap(),
+            ))),
             cached_bootstrap_load_gate: None,
         });
         let disabled = AttentionPreferences {

@@ -28,8 +28,8 @@
 
 ## Phase 4: Bounded synchronization and backpressure
 
-- [~] Task: Integrate the validated bounded SyncJob scheduler after authoritative conversation adoption
-- [ ] Task: Move startup, manual refresh, navigation, and membership-event scheduling onto the bounded scheduler
+- [x] Task: Integrate the validated bounded SyncJob scheduler after authoritative conversation adoption
+- [~] Task: Move startup, manual refresh, navigation, and membership-event scheduling onto the bounded scheduler
 - [ ] Task: Enforce startup enrichment/history limits and lazy 24-hour user-directory loading
 - [ ] Task: Add scheduler/API tracing counters and no-realtime stale-check behavior
 - [ ] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md)
