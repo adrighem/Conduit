@@ -1,0 +1,7 @@
+Task: Restore strict Clippy after restricted asset delivery
+
+Summary: Replaced manual ceiling division in encoded preview bounds with integer div_ceil.
+
+Modified: src/runtime.rs
+
+Rationale: Preserve the exact base64 size bound while satisfying the Rust 1.97 manual_div_ceil lint.
