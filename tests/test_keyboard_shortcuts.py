@@ -80,18 +80,11 @@ def visible_window_ids(name: str) -> list[str]:
 
 
 def focus_window(window_id: str) -> None:
-    # Ask the window manager first so GTK receives normal activation state.
-    # A newly mapped window or dialog transition can briefly leave the target
-    # unmapped. Retry instead of issuing a direct X focus request that races it.
+    # Prefer normal window-manager activation. Some Xvfb/xfwm4 combinations
+    # never publish the client ID as _NET_ACTIVE_WINDOW even after a successful
+    # map, so fall back to direct X focus before declaring the window unusable.
     deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
-        active = subprocess.run(
-            ["xdotool", "getactivewindow"],
-            capture_output=True,
-            text=True,
-        )
-        if active.returncode == 0 and active.stdout.strip() == window_id:
-            break
         try:
             activation = subprocess.run(
                 ["xdotool", "windowactivate", "--sync", window_id],
@@ -101,14 +94,20 @@ def focus_window(window_id: str) -> None:
             )
         except subprocess.TimeoutExpired:
             activation = None
-        if activation is not None and activation.returncode != 0:
+        if activation is not None and activation.returncode == 0:
             time.sleep(0.1)
-            continue
+            return
+        focus = subprocess.run(
+            ["xdotool", "windowfocus", window_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if focus.returncode == 0:
+            time.sleep(0.1)
+            return
         time.sleep(0.1)
     else:
         raise AssertionError(f"window {window_id} did not become activatable")
-    # Give GTK one main-loop iteration to apply the activation transition.
-    time.sleep(0.1)
 
 
 def press(window_id: str, *keys: str) -> None:
