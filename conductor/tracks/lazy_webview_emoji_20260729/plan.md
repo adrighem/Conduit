@@ -20,5 +20,5 @@
 ## Phase 3: Animated status emoji
 
 - [x] Task: Add failing status-picker coverage for animated custom emoji 520dab2
-- [~] Task: Preserve animation when rendering custom emoji in the status picker
-- [ ] Task: Conductor - User Manual Verification 'Animated status emoji' (Protocol in workflow.md)
+- [x] Task: Preserve animation when rendering custom emoji in the status picker a4fcab4
+- [~] Task: Conductor - User Manual Verification 'Animated status emoji' (Protocol in workflow.md)
