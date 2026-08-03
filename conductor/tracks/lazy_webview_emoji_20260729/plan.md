@@ -9,10 +9,16 @@
 - [x] Task: Align the native status emoji picker with the bounded reaction-picker layout 47ee7eb
 - [x] Task: Conductor - User Manual Verification 'Bounded on-demand emoji picker' (Protocol in workflow.md) cc481cf
 
-## Phase 2: Lazy thread WebView lifecycle
+## Phase 2: Lazy thread WebView lifecycle [checkpoint: d2292ea]
 
 - [x] Task: Add failing lifecycle coverage proving no thread WebView exists at startup 466b6f1
 - [x] Task: Make ThreadPane create its WebView on the first thread open 9e415cf
 - [x] Task: Implement and document the measured close and reopen lifecycle 929dbf8
 - [x] Task: Record release-build HTML, latency, scroll, and process-tree PSS results 8dee011
-- [~] Task: Conductor - User Manual Verification 'Lazy thread WebView lifecycle' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Lazy thread WebView lifecycle' (Protocol in workflow.md) d2292ea
+
+## Phase 3: Animated status emoji
+
+- [~] Task: Add failing status-picker coverage for animated custom emoji
+- [ ] Task: Preserve animation when rendering custom emoji in the status picker
+- [ ] Task: Conductor - User Manual Verification 'Animated status emoji' (Protocol in workflow.md)
