@@ -6,6 +6,7 @@
 - [x] Task: Define a generation-scoped native picker query and result protocol d9382e8
 - [x] Task: Replace eager emoji markup with a lightweight picker shell and bounded materialization c115324
 - [x] Task: Preserve search, categories, custom emoji, keyboard, cancellation, focus, and reactions c115324
+- [x] Task: Align the native status emoji picker with the bounded reaction-picker layout 47ee7eb
 - [ ] Task: Conductor - User Manual Verification 'Bounded on-demand emoji picker' (Protocol in workflow.md)
 
 ## Phase 2: Lazy thread WebView lifecycle
