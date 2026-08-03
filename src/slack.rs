@@ -26,8 +26,8 @@ use crate::slack_message_wire::{deserialize_message, deserialize_messages};
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
-const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PREVIEW_VIDEO_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PREVIEW_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_PREVIEW_VIDEO_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -892,13 +892,7 @@ impl SlackApi {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .map(str::trim)
-            .filter(|value| {
-                value.starts_with("image/")
-                    || matches!(
-                        *value,
-                        "video/mp4" | "video/webm" | "video/quicktime" | "video/ogg"
-                    )
-            })
+            .filter(|value| supported_preview_mime_type(value))
             .ok_or_else(|| {
                 SlackError::validation(
                     "Slack attachment preview returned an unsupported content type",
@@ -1972,6 +1966,21 @@ fn supported_media_mime_type(content_type: &str) -> Option<&str> {
     .then_some(mime_type)
 }
 
+pub(crate) fn supported_preview_mime_type(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/avif"
+            | "video/mp4"
+            | "video/webm"
+            | "video/quicktime"
+            | "video/ogg"
+    )
+}
+
 fn ensure_media_size(size: Option<u64>) -> Result<()> {
     if size.is_some_and(|size| size > MAX_MEDIA_DOWNLOAD_BYTES) {
         return Err(SlackError::validation("Slack media is larger than 1 GiB"));
@@ -2939,6 +2948,13 @@ mod tests {
         assert_eq!(supported_media_mime_type("audio/mpeg"), None);
         assert_eq!(supported_media_mime_type("text/html"), None);
         assert_eq!(supported_media_mime_type("application/octet-stream"), None);
+
+        for mime_type in ["image/png", "image/jpeg", "image/webp", "video/mp4"] {
+            assert!(supported_preview_mime_type(mime_type));
+        }
+        for mime_type in ["image/svg+xml", "text/html", "application/octet-stream"] {
+            assert!(!supported_preview_mime_type(mime_type));
+        }
     }
 
     #[test]

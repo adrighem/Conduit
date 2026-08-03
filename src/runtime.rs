@@ -35,8 +35,9 @@ use crate::models::{
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::{recent_history_preview, ConversationHistoryService};
 use crate::slack::{
-    DownloadedPreviewAsset, SlackApi, SlackError, SlackErrorCategory, SlackMessagePage,
-    SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
+    supported_preview_mime_type, DownloadedPreviewAsset, SlackApi, SlackError, SlackErrorCategory,
+    SlackMessagePage, SlackUnreadSnapshot, SlackUnreadSnapshotRecord, MAX_PREVIEW_IMAGE_BYTES,
+    MAX_PREVIEW_VIDEO_BYTES,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
@@ -72,6 +73,28 @@ const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const ATTACHMENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const ATTACHMENT_BASENAME_MAX_BYTES: usize = 180;
+const MAX_CACHED_PREVIEW_DATA_URI_BYTES: u64 = ((MAX_PREVIEW_VIDEO_BYTES as u64 + 2) / 3) * 4 + 128;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewAsset {
+    pub(crate) mime_type: String,
+    pub(crate) bytes: Arc<[u8]>,
+}
+
+impl PreviewAsset {
+    pub(crate) fn new(mime_type: String, bytes: Vec<u8>) -> Option<Self> {
+        let max_bytes = preview_asset_max_bytes(&mime_type)?;
+        (!bytes.is_empty() && bytes.len() <= max_bytes).then_some(Self {
+            mime_type,
+            bytes: bytes.into(),
+        })
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        preview_asset_max_bytes(&self.mime_type)
+            .is_some_and(|max_bytes| !self.bytes.is_empty() && self.bytes.len() <= max_bytes)
+    }
+}
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
@@ -902,7 +925,7 @@ pub enum RuntimeEventKind {
     EmojiCatalogLoaded(HashMap<String, String>),
     ImageAssetLoaded {
         key: String,
-        data_uri: String,
+        asset: PreviewAsset,
     },
     ImageAssetFailed {
         key: String,
@@ -2008,22 +2031,26 @@ impl ImageAssetCache {
         Self { directory }
     }
 
-    async fn load(&self, key: &str) -> Result<Option<String>> {
+    async fn load(&self, key: &str) -> Result<Option<PreviewAsset>> {
         let path = self.path_for_key(key);
-        match tokio::fs::read_to_string(&path).await {
-            Ok(data_uri)
-                if data_uri.starts_with("data:image/") || data_uri.starts_with("data:video/") =>
-            {
-                Ok(Some(data_uri))
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.len() > MAX_CACHED_PREVIEW_DATA_URI_BYTES => return Ok(None),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect cached image {}", path.display()));
             }
-            Ok(_) => Ok(None),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        }
+        match tokio::fs::read_to_string(&path).await {
+            Ok(data_uri) => Ok(preview_asset_from_data_uri(&data_uri)),
             Err(error) => Err(error)
                 .with_context(|| format!("failed to read cached image {}", path.display())),
         }
     }
 
-    async fn store(&self, key: &str, data_uri: &str) -> Result<()> {
+    async fn store(&self, key: &str, asset: &PreviewAsset) -> Result<()> {
+        let data_uri = preview_asset_data_uri(asset);
         tokio::fs::create_dir_all(&self.directory)
             .await
             .with_context(|| {
@@ -2034,7 +2061,7 @@ impl ImageAssetCache {
             })?;
 
         let path = self.path_for_key(key);
-        tokio::fs::write(&path, data_uri)
+        tokio::fs::write(&path, &data_uri)
             .await
             .with_context(|| format!("failed to write cached image {}", path.display()))
     }
@@ -2045,7 +2072,7 @@ impl ImageAssetCache {
     }
 }
 
-fn image_asset_cache_key(key: &str) -> String {
+pub(crate) fn image_asset_cache_key(key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -2252,12 +2279,33 @@ impl Drop for RemoveFileOnDrop {
     }
 }
 
-fn preview_asset_data_uri(asset: DownloadedPreviewAsset) -> String {
+fn preview_asset_data_uri(asset: &PreviewAsset) -> String {
     format!(
         "data:{};base64,{}",
         asset.mime_type,
-        BASE64.encode(asset.bytes)
+        BASE64.encode(&asset.bytes)
     )
+}
+
+fn preview_asset_from_data_uri(data_uri: &str) -> Option<PreviewAsset> {
+    if data_uri.len() as u64 > MAX_CACHED_PREVIEW_DATA_URI_BYTES {
+        return None;
+    }
+    let (mime_type, encoded) = data_uri.strip_prefix("data:")?.split_once(";base64,")?;
+    let max_bytes = preview_asset_max_bytes(mime_type)?;
+    if encoded.len() > ((max_bytes + 2) / 3) * 4 {
+        return None;
+    }
+    let bytes = BASE64.decode(encoded).ok()?;
+    PreviewAsset::new(mime_type.to_string(), bytes)
+}
+
+fn preview_asset_max_bytes(mime_type: &str) -> Option<usize> {
+    supported_preview_mime_type(mime_type).then_some(if mime_type.starts_with("video/") {
+        MAX_PREVIEW_VIDEO_BYTES
+    } else {
+        MAX_PREVIEW_IMAGE_BYTES
+    })
 }
 
 impl AppRuntime {
@@ -4160,14 +4208,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 &format!("LoadImageAsset key={}", crate::debug::url_for_log(&key)),
             );
             match context.image_cache.load(&key).await {
-                Ok(Some(data_uri)) => {
+                Ok(Some(asset)) => {
                     crate::debug::log(
                         "runtime",
                         &format!("ImageAssetCacheHit key={}", crate::debug::url_for_log(&key)),
                     );
                     context
                         .events
-                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, data_uri });
+                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, asset });
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -4181,7 +4229,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             }
 
             match api.download_preview_asset(&url).await {
-                Ok(asset) => {
+                Ok(downloaded) => {
+                    let DownloadedPreviewAsset { mime_type, bytes } = downloaded;
+                    let asset = PreviewAsset::new(mime_type, bytes)
+                        .ok_or_else(|| anyhow!("downloaded preview asset failed validation"))?;
                     crate::debug::log(
                         "runtime",
                         &format!(
@@ -4191,8 +4242,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                             asset.bytes.len()
                         ),
                     );
-                    let data_uri = preview_asset_data_uri(asset);
-                    if let Err(error) = context.image_cache.store(&key, &data_uri).await {
+                    if let Err(error) = context.image_cache.store(&key, &asset).await {
                         crate::debug::log(
                             "runtime",
                             &format!(
@@ -4203,7 +4253,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     }
                     context
                         .events
-                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, data_uri });
+                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, asset });
                 }
                 Err(error) => {
                     crate::debug::log(
@@ -15598,11 +15648,9 @@ mod tests {
                 None
             );
 
+            let image = PreviewAsset::new("image/png".to_string(), b"image".to_vec()).unwrap();
             cache
-                .store(
-                    "https://files.example/image.png",
-                    "data:image/png;base64,abc",
-                )
+                .store("https://files.example/image.png", &image)
                 .await
                 .expect("cache store failed");
 
@@ -15610,28 +15658,43 @@ mod tests {
                 cache
                     .load("https://files.example/image.png")
                     .await
-                    .expect("cache load failed")
-                    .as_deref(),
-                Some("data:image/png;base64,abc")
+                    .expect("cache load failed"),
+                Some(image)
             );
 
+            let video = PreviewAsset::new("video/mp4".to_string(), b"video".to_vec()).unwrap();
             cache
-                .store(
-                    "https://files.example/video.mp4",
-                    "data:video/mp4;base64,def",
-                )
+                .store("https://files.example/video.mp4", &video)
                 .await
                 .expect("cache store failed");
             assert_eq!(
                 cache
                     .load("https://files.example/video.mp4")
                     .await
-                    .expect("cache load failed")
-                    .as_deref(),
-                Some("data:video/mp4;base64,def")
+                    .expect("cache load failed"),
+                Some(video)
             );
+
+            tokio::fs::create_dir_all(&directory).await.unwrap();
+            let oversized_path = cache.path_for_key("oversized");
+            let oversized_file = std::fs::File::create(&oversized_path).unwrap();
+            oversized_file
+                .set_len(MAX_CACHED_PREVIEW_DATA_URI_BYTES + 1)
+                .unwrap();
+            assert_eq!(cache.load("oversized").await.unwrap(), None);
         });
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn preview_asset_data_rejects_unsafe_mime_and_oversized_payloads() {
+        assert!(preview_asset_from_data_uri("data:image/svg+xml;base64,PHN2Zz4=").is_none());
+        assert!(preview_asset_from_data_uri("data:text/html;base64,PGgxPk5vPC9oMT4=").is_none());
+        assert!(preview_asset_from_data_uri("data:image/png,not-base64").is_none());
+
+        let oversized = vec![0_u8; MAX_PREVIEW_IMAGE_BYTES + 1];
+        let data_uri = format!("data:image/png;base64,{}", BASE64.encode(oversized));
+        assert!(preview_asset_from_data_uri(&data_uri).is_none());
     }
 }

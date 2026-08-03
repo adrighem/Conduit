@@ -58,8 +58,8 @@ use crate::message_handoff::{
     MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
 use crate::message_html::{
-    self, MessageHtmlContext, TimelineDomPatch, TimelineInsertPosition, TimelineMessageArrival,
-    TimelineMessageRegion, TimelineScrollBehavior,
+    self, MessageHtmlContext, TimelineAssetKind, TimelineDomPatch, TimelineInsertPosition,
+    TimelineMessageArrival, TimelineMessageRegion, TimelineScrollBehavior,
 };
 use crate::models::{
     slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
@@ -69,9 +69,9 @@ use crate::models::{
 use crate::realtime::{RealtimePhase, RealtimeStatus};
 use crate::rendering;
 use crate::runtime::{
-    AppRuntime, OperationContext, RequestId, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
-    RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity, RuntimeOperation,
-    RuntimeTarget, SessionId,
+    image_asset_cache_key, AppRuntime, OperationContext, PreviewAsset, RequestId, RuntimeCommand,
+    RuntimeEvent, RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory,
+    RuntimeIdentity, RuntimeOperation, RuntimeTarget, SessionId,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
@@ -362,6 +362,8 @@ mod imp {
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub(super) thread_pane_controller: RefCell<Option<ThreadPane>>,
         pub image_assets: RefCell<HashMap<String, String>>,
+        pub video_asset_keys: RefCell<HashSet<String>>,
+        pub(super) conduit_assets: Rc<RefCell<HashMap<String, PreviewAsset>>>,
         pub pending_image_assets: RefCell<HashSet<String>>,
         pub failed_image_assets: RefCell<HashSet<String>>,
         pub custom_emojis: RefCell<Arc<HashMap<String, String>>>,
@@ -917,6 +919,34 @@ fn timeline_surface_invalidation(surface: TimelineSurface) -> UiInvalidations {
         TimelineSurface::Main => UiInvalidations::MAIN,
         TimelineSurface::Thread => UiInvalidations::THREAD,
     }
+}
+
+fn conduit_asset_request_key(uri: &str) -> Option<String> {
+    let parsed = url::Url::parse(uri).ok()?;
+    if parsed.scheme() != "conduit-asset"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let key = parsed.host_str()?;
+    (key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| key.to_string())
+}
+
+fn conduit_asset_for_request(
+    uri: &str,
+    assets: &HashMap<String, PreviewAsset>,
+) -> Option<PreviewAsset> {
+    let key = conduit_asset_request_key(uri)?;
+    assets.get(&key).filter(|asset| asset.is_valid()).cloned()
 }
 
 fn generate_html(label: &str, render: impl FnOnce() -> String) -> String {
@@ -3458,6 +3488,7 @@ impl ConduitWindow {
     }
 
     fn setup_message_view(&self) {
+        let web_context = self.create_message_web_context();
         let network_session = self.create_message_network_session();
         let font_settings = gtk::Settings::default();
         let text_zoom = message_text_zoom(
@@ -3467,7 +3498,7 @@ impl ConduitWindow {
                 .as_deref(),
         );
 
-        let message_view = self.create_message_web_view(&network_session, text_zoom);
+        let message_view = self.create_message_web_view(&web_context, &network_session, text_zoom);
         self.connect_timeline_load(&message_view, TimelineSurface::Main);
         let viewer = self.create_media_viewer(&message_view);
         self.imp().message_view_box.append(&viewer.surface_stack);
@@ -3475,7 +3506,7 @@ impl ConduitWindow {
         *self.imp().media_viewer.borrow_mut() = Some(viewer);
         self.setup_media_viewer_callbacks();
 
-        let thread_view = self.create_message_web_view(&network_session, text_zoom);
+        let thread_view = self.create_message_web_view(&web_context, &network_session, text_zoom);
         self.connect_timeline_load(&thread_view, TimelineSurface::Thread);
         let weak_message_view = message_view.downgrade();
         let weak_thread_view = thread_view.downgrade();
@@ -4002,8 +4033,36 @@ impl ConduitWindow {
         webkit6::NetworkSession::new(Some(&data_dir), Some(&cache_dir))
     }
 
+    fn create_message_web_context(&self) -> webkit6::WebContext {
+        let context = webkit6::WebContext::new();
+        let assets = Rc::clone(&self.imp().conduit_assets);
+        context.register_uri_scheme("conduit-asset", move |request| {
+            let asset = request
+                .uri()
+                .as_deref()
+                .and_then(|uri| conduit_asset_for_request(uri, &assets.borrow()));
+            let Some(asset) = asset else {
+                let mut error = glib::Error::new(
+                    gio::IOErrorEnum::NotFound,
+                    "unknown or invalid Conduit asset",
+                );
+                request.finish_error(&mut error);
+                return;
+            };
+            let length = asset.bytes.len() as i64;
+            let bytes = glib::Bytes::from_owned(asset.bytes);
+            let stream = gio::MemoryInputStream::from_bytes(&bytes);
+            request.finish(&stream, length, Some(&asset.mime_type));
+        });
+        if let Some(security_manager) = context.security_manager() {
+            security_manager.register_uri_scheme_as_secure("conduit-asset");
+        }
+        context
+    }
+
     fn create_message_web_view(
         &self,
+        web_context: &webkit6::WebContext,
         network_session: &webkit6::NetworkSession,
         text_zoom: f64,
     ) -> webkit6::WebView {
@@ -4014,6 +4073,7 @@ impl ConduitWindow {
             .register_script_message_handler(EMOJI_PICKER_MESSAGE_HANDLER, None);
 
         let web_view = webkit6::WebView::builder()
+            .web_context(web_context)
             .network_session(network_session)
             .settings(&settings)
             .user_content_manager(&user_content_manager)
@@ -5654,7 +5714,7 @@ impl ConduitWindow {
                 self.populate_user_groups(names, members);
             }
             RuntimeEventKind::EmojiCatalogLoaded(emojis) => self.replace_custom_emojis(emojis),
-            RuntimeEventKind::ImageAssetLoaded { key, data_uri } => {
+            RuntimeEventKind::ImageAssetLoaded { key, asset } => {
                 crate::debug::log(
                     "ui",
                     &format!("ImageAssetLoaded key={}", crate::debug::url_for_log(&key)),
@@ -5662,10 +5722,18 @@ impl ConduitWindow {
                 let imp = self.imp();
                 imp.pending_image_assets.borrow_mut().remove(&key);
                 imp.failed_image_assets.borrow_mut().remove(&key);
+                let cache_key = image_asset_cache_key(&key);
+                let source = format!("conduit-asset://{cache_key}");
+                if asset.mime_type.starts_with("video/") {
+                    imp.video_asset_keys.borrow_mut().insert(key.clone());
+                } else {
+                    imp.video_asset_keys.borrow_mut().remove(&key);
+                }
+                imp.conduit_assets.borrow_mut().insert(cache_key, asset);
                 imp.image_assets
                     .borrow_mut()
-                    .insert(key.clone(), data_uri.clone());
-                self.patch_image_asset(&key, Some(data_uri));
+                    .insert(key.clone(), source.clone());
+                self.patch_image_asset(&key, Some(source));
             }
             RuntimeEventKind::ImageAssetFailed { key } => {
                 crate::debug::log(
@@ -7246,6 +7314,8 @@ impl ConduitWindow {
         *imp.workspace_url.borrow_mut() = None;
         *imp.sidebar_error.borrow_mut() = None;
         imp.image_assets.borrow_mut().clear();
+        imp.video_asset_keys.borrow_mut().clear();
+        imp.conduit_assets.borrow_mut().clear();
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
         *imp.custom_emojis.borrow_mut() = Arc::default();
@@ -7581,6 +7651,12 @@ impl ConduitWindow {
         let imp = self.imp();
         imp.pending_image_assets.borrow_mut().remove(key);
         imp.failed_image_assets.borrow_mut().insert(key.to_string());
+        imp.video_asset_keys.borrow_mut().remove(key);
+        if let Some(source) = imp.image_assets.borrow_mut().remove(key) {
+            if let Some(cache_key) = conduit_asset_request_key(&source) {
+                imp.conduit_assets.borrow_mut().remove(&cache_key);
+            }
+        }
         self.patch_image_asset(key, None);
     }
 
@@ -7607,7 +7683,15 @@ impl ConduitWindow {
         if main_uses_asset {
             self.apply_timeline_patch(
                 TimelineSurface::Main,
-                message_html::update_image_patch(key, source.clone()),
+                message_html::update_image_patch(
+                    key,
+                    source.clone(),
+                    if self.imp().video_asset_keys.borrow().contains(key) {
+                        TimelineAssetKind::Video
+                    } else {
+                        TimelineAssetKind::Image
+                    },
+                ),
                 UiInvalidations::MAIN,
             );
         } else if !matches!(
@@ -7619,7 +7703,15 @@ impl ConduitWindow {
         if thread_uses_asset {
             self.apply_timeline_patch(
                 TimelineSurface::Thread,
-                message_html::update_image_patch(key, source),
+                message_html::update_image_patch(
+                    key,
+                    source,
+                    if self.imp().video_asset_keys.borrow().contains(key) {
+                        TimelineAssetKind::Video
+                    } else {
+                        TimelineAssetKind::Image
+                    },
+                ),
                 UiInvalidations::THREAD,
             );
         }
@@ -11177,6 +11269,13 @@ impl ConduitWindow {
                 .filter(|(key, _)| image_keys.is_none_or(|keys| keys.contains(*key)))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+            video_asset_keys: imp
+                .video_asset_keys
+                .borrow()
+                .iter()
+                .filter(|key| image_keys.is_none_or(|keys| keys.contains(*key)))
+                .cloned()
+                .collect(),
             failed_image_urls: imp
                 .failed_image_assets
                 .borrow()
@@ -11782,6 +11881,38 @@ mod tests {
         TimelineDocument::Conversation("C123".to_string())
     }
 
+    #[test]
+    fn conduit_asset_requests_require_an_exact_known_cache_key() {
+        let key = "a".repeat(64);
+        assert_eq!(
+            conduit_asset_request_key(&format!("conduit-asset://{key}")),
+            Some(key.clone())
+        );
+        for uri in [
+            "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "conduit-asset://unknown",
+            "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/path",
+            "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?query=1",
+            "conduit-asset://user@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert_eq!(conduit_asset_request_key(uri), None, "{uri}");
+        }
+
+        let asset = PreviewAsset::new("image/png".to_string(), b"png".to_vec()).unwrap();
+        let assets = HashMap::from([(key.clone(), asset.clone())]);
+        assert_eq!(
+            conduit_asset_for_request(&format!("conduit-asset://{key}"), &assets),
+            Some(asset)
+        );
+        assert_eq!(
+            conduit_asset_for_request(
+                "conduit-asset://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &assets,
+            ),
+            None
+        );
+    }
+
     fn timeline_delta(
         base: usize,
         revision: usize,
@@ -12024,6 +12155,7 @@ mod tests {
             TimelineDomPatch::UpdateImage {
                 asset_key: "asset".to_string(),
                 source: Some("conduit-asset://asset".to_string()),
+                media_kind: TimelineAssetKind::Image,
             },
             TimelineScrollBehavior::StickToBottom,
         ));

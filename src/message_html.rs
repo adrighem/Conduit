@@ -43,6 +43,7 @@ pub struct MessageHtmlContext {
     pub load_more_url: Option<String>,
     pub timeline_scroll: TimelineScrollBehavior,
     pub image_assets: HashMap<String, String>,
+    pub video_asset_keys: HashSet<String>,
     pub failed_image_urls: HashSet<String>,
     pub recent_reactions: Vec<String>,
     pub custom_emojis: Arc<HashMap<String, String>>,
@@ -109,6 +110,7 @@ pub enum TimelineDomPatch {
     UpdateImage {
         asset_key: String,
         source: Option<String>,
+        media_kind: TimelineAssetKind,
     },
     UpdateUser {
         user_id: String,
@@ -129,6 +131,13 @@ pub enum TimelineInsertPosition {
 #[serde(rename_all = "kebab-case")]
 pub enum TimelineMessageArrival {
     Sent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimelineAssetKind {
+    Image,
+    Video,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -230,10 +239,12 @@ pub fn message_region_patch(
 pub fn update_image_patch(
     asset_key: impl Into<String>,
     source: Option<String>,
+    media_kind: TimelineAssetKind,
 ) -> TimelineDomPatch {
     TimelineDomPatch::UpdateImage {
         asset_key: asset_key.into(),
         source,
+        media_kind,
     }
 }
 
@@ -2057,7 +2068,9 @@ fn message_avatar_html(
     let source = user_avatar_url
         .or_else(|| message.avatar_url())
         .and_then(|url| context.image_assets.get(url))
-        .filter(|source| source.starts_with("data:image/"));
+        .filter(|source| {
+            source.starts_with("data:image/") || source.starts_with("conduit-asset://")
+        });
     if let Some(source) = source {
         return format!(
             "<img class=\"message-avatar\" src=\"{}\" alt=\"\" aria-hidden=\"true\">",
@@ -3242,6 +3255,7 @@ fn video_figure_html(
         .image_assets
         .get(poster_key)
         .is_some_and(|asset| asset.starts_with("data:video/"))
+        || context.video_asset_keys.contains(poster_key)
     {
         let src = context.image_assets.get(poster_key).unwrap();
         format!(
@@ -4488,7 +4502,8 @@ mod tests {
             )])),
             image_assets: HashMap::from([(
                 avatar_url.to_string(),
-                "data:image/png;base64,YXZhdGFy".to_string(),
+                "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
             )]),
             ..Default::default()
         };
@@ -4499,7 +4514,7 @@ mod tests {
 
         let html = conversation_document("C123", &messages, &context);
         assert_eq!(html.matches("class=\"message-avatar\"").count(), 1);
-        assert!(html.contains("src=\"data:image/png;base64,YXZhdGFy\""));
+        assert!(html.contains("src=\"conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
         assert!(html.contains("alt=\"\" aria-hidden=\"true\""));
 
         let fallback = conversation_document(
@@ -6016,6 +6031,8 @@ mod tests {
         for region in ["body", "attachments", "responses"] {
             assert!(html.contains(&format!("data-message-region=\"{region}\"")));
         }
+        assert!(!html.contains("ResizeObserver"));
+        assert!(html.contains("addEventListener(\"load\""));
     }
 
     #[test]

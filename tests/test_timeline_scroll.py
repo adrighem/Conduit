@@ -53,11 +53,13 @@ START_PROBE = r"""
     const initialGap = bottomGap();
 
     document.querySelector(".timeline").style.width = "260px";
+    window.dispatchEvent(new Event("resize"));
     await waitForBottom(false);
     const reflowGap = bottomGap();
 
     await waitForBottom(true);
     document.getElementById("delayed").style.height = "700px";
+    document.getElementById("delayed").dispatchEvent(new Event("load"));
     await waitForBottom(false);
     const delayedExpansionGap = bottomGap();
 
@@ -113,6 +115,7 @@ START_PROBE = r"""
       .classList.contains("sent-message-arrival");
     window.matchMedia = originalMatchMedia;
 
+    await nextFrame();
     await nextFrame();
     await nextFrame();
     const anchor = document.querySelector('[data-message-ts="10"]');
@@ -233,7 +236,7 @@ html, body {{ margin: 0; padding: 0; }}
 <main class="timeline" data-timeline-positioning="pending"
  data-timeline-mode="preserve" data-focus-message-ts="10"
  data-timeline-sticky-key="test:sticky" data-timeline-anchor-key="test:anchor"><ol class="message-list">{messages}</ol>
-<div id="delayed"></div></main>
+<img id="delayed" alt=""></main>
 <script>{timeline_script}</script>
 </body></html>"""
 

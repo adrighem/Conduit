@@ -372,9 +372,12 @@
     if (!initialPositionPending) rememberStoredViewport();
   }, { passive: true });
   window.addEventListener("resize", preserveViewportAnchorAfterResize, { passive: true });
-  if ("ResizeObserver" in window) {
-    const timelineResizeObserver = new ResizeObserver(preserveViewportAnchorAfterResize);
-    if (timeline) timelineResizeObserver.observe(timeline);
+  if (timeline) {
+    timeline.addEventListener("load", function (event) {
+      if (event.target && event.target.matches && event.target.matches("img, video")) {
+        preserveViewportAnchorAfterResize();
+      }
+    }, true);
   }
   document.addEventListener("click", function (event) {
     const target = event.target && event.target.closest
@@ -493,7 +496,7 @@
         if (targets.length === 0) return false;
         targets.forEach(function (target) {
           if (typeof patch.source === "string") {
-            const isVideo = patch.source.startsWith("data:video/");
+            const isVideo = patch.media_kind === "video";
             if ((isVideo && target.matches("video")) || (!isVideo && target.matches("img"))) {
               target.src = patch.source;
             } else if (isVideo) {
