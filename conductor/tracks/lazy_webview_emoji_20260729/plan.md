@@ -14,5 +14,5 @@
 - [x] Task: Add failing lifecycle coverage proving no thread WebView exists at startup 466b6f1
 - [x] Task: Make ThreadPane create its WebView on the first thread open 9e415cf
 - [x] Task: Implement and document the measured close and reopen lifecycle 929dbf8
-- [ ] Task: Record release-build HTML, latency, scroll, and process-tree PSS results
-- [ ] Task: Conductor - User Manual Verification 'Lazy thread WebView lifecycle' (Protocol in workflow.md)
+- [x] Task: Record release-build HTML, latency, scroll, and process-tree PSS results 8dee011
+- [~] Task: Conductor - User Manual Verification 'Lazy thread WebView lifecycle' (Protocol in workflow.md)
