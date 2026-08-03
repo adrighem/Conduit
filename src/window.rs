@@ -77,7 +77,8 @@ use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
     self, diff_keyed_sidebar_items, ConversationKind, ConversationPickerAction,
     ConversationPickerItem, ConversationPickerSections, KeyedSidebarItem, SidebarItemKey,
-    SidebarItemModel, SidebarRowModel, SidebarSectionKind,
+    SidebarItemModel, SidebarProjection, SidebarProjectionOperation, SidebarRowModel,
+    SidebarSectionKind,
 };
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::slack_link::{
@@ -371,7 +372,7 @@ mod imp {
         pub(super) message_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) thread_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
-        pub(super) sidebar_items: RefCell<Vec<KeyedSidebarItem>>,
+        pub(super) sidebar_projection: RefCell<SidebarProjection>,
         pub(super) sidebar_rows: RefCell<HashMap<SidebarItemKey, gtk::ListBoxRow>>,
         pub(super) sidebar_filter_generation: Cell<u64>,
         pub(super) picker_filter_generation: Cell<u64>,
@@ -6808,7 +6809,7 @@ impl ConduitWindow {
         self.thread_pane().close();
         self.sync_workspace_chrome();
         self.clear_list(&imp.conversation_list);
-        imp.sidebar_items.borrow_mut().clear();
+        imp.sidebar_projection.borrow_mut().reconcile(&[]);
         imp.sidebar_rows.borrow_mut().clear();
         imp.sidebar_row_actions.borrow_mut().clear();
         self.show_message_placeholder(&gettext("Select a conversation"));
@@ -7965,14 +7966,16 @@ impl ConduitWindow {
 
     fn reconcile_sidebar(&self, next_items: Vec<KeyedSidebarItem>) {
         let imp = self.imp();
-        let previous_items = imp.sidebar_items.borrow().clone();
-        let diff = diff_keyed_sidebar_items(&previous_items, &next_items);
-        let previous_keys = previous_items
-            .iter()
-            .map(|item| &item.key)
-            .collect::<Vec<_>>();
-        let next_keys = next_items.iter().map(|item| &item.key).collect::<Vec<_>>();
-        let structure_changed = previous_keys != next_keys;
+        let mut projection = imp.sidebar_projection.borrow_mut();
+        let diff = diff_keyed_sidebar_items(projection.items(), &next_items);
+        let operations = projection.reconcile(&next_items);
+        let structure_changed = operations.iter().any(|operation| {
+            matches!(
+                operation,
+                SidebarProjectionOperation::Reset | SidebarProjectionOperation::Splice { .. }
+            )
+        });
+        drop(projection);
 
         {
             let mut rows = imp.sidebar_rows.borrow_mut();
@@ -8050,7 +8053,6 @@ impl ConduitWindow {
         }
         imp.conversation_list.select_row(selected);
         drop(rows);
-        *imp.sidebar_items.borrow_mut() = next_items;
     }
 
     fn register_sidebar_row_action(&self, row_index: i32, model: &SidebarRowModel) {

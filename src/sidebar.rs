@@ -232,6 +232,119 @@ pub struct SidebarModelDiff {
     pub updated: Vec<(SidebarItemKey, usize)>,
 }
 
+/// Incremental operations over the projection's current keyed item sequence.
+/// Positions refer to the new sequence returned by [`SidebarProjection::items`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarProjectionOperation {
+    Reset,
+    Splice {
+        position: usize,
+        removed: usize,
+        inserted: usize,
+    },
+    Update {
+        position: usize,
+    },
+}
+
+/// Pure keyed projection consumed by the GTK sidebar model.
+#[derive(Debug, Default)]
+pub struct SidebarProjection {
+    items: Vec<KeyedSidebarItem>,
+}
+
+impl SidebarProjection {
+    pub fn items(&self) -> &[KeyedSidebarItem] {
+        &self.items
+    }
+
+    pub fn reconcile(&mut self, next: &[KeyedSidebarItem]) -> Vec<SidebarProjectionOperation> {
+        if self.items == next {
+            return Vec::new();
+        }
+
+        let operations = if self.items.is_empty()
+            || !keyed_sidebar_items_are_unique(&self.items)
+            || !keyed_sidebar_items_are_unique(next)
+        {
+            (!next.is_empty())
+                .then_some(SidebarProjectionOperation::Reset)
+                .into_iter()
+                .collect()
+        } else if self.items.len() == next.len()
+            && self
+                .items
+                .iter()
+                .zip(next)
+                .all(|(previous, next)| previous.key == next.key)
+        {
+            self.items
+                .iter()
+                .zip(next)
+                .enumerate()
+                .filter(|(_, (previous, next))| previous.model != next.model)
+                .map(|(position, _)| SidebarProjectionOperation::Update { position })
+                .collect()
+        } else {
+            sidebar_projection_structural_operations(&self.items, next)
+        };
+
+        self.items = next.to_vec();
+        operations
+    }
+}
+
+fn keyed_sidebar_items_are_unique(items: &[KeyedSidebarItem]) -> bool {
+    let mut keys = HashSet::with_capacity(items.len());
+    items.iter().all(|item| keys.insert(&item.key))
+}
+
+fn sidebar_projection_structural_operations(
+    previous: &[KeyedSidebarItem],
+    next: &[KeyedSidebarItem],
+) -> Vec<SidebarProjectionOperation> {
+    let prefix = previous
+        .iter()
+        .zip(next)
+        .take_while(|(previous, next)| previous.key == next.key)
+        .count();
+    let suffix = previous[prefix..]
+        .iter()
+        .rev()
+        .zip(next[prefix..].iter().rev())
+        .take_while(|(previous, next)| previous.key == next.key)
+        .count();
+    let mut operations = vec![SidebarProjectionOperation::Splice {
+        position: prefix,
+        removed: previous.len() - prefix - suffix,
+        inserted: next.len() - prefix - suffix,
+    }];
+
+    operations.extend(
+        previous[..prefix]
+            .iter()
+            .zip(&next[..prefix])
+            .enumerate()
+            .filter(|(_, (previous, next))| previous.model != next.model)
+            .map(|(position, _)| SidebarProjectionOperation::Update { position }),
+    );
+
+    let previous_suffix = &previous[previous.len() - suffix..];
+    let next_suffix_start = next.len() - suffix;
+    operations.extend(
+        previous_suffix
+            .iter()
+            .zip(&next[next_suffix_start..])
+            .enumerate()
+            .filter(|(_, (previous, next))| previous.model != next.model)
+            .map(|(offset, _)| SidebarProjectionOperation::Update {
+                position: next_suffix_start + offset,
+            }),
+    );
+
+    operations
+}
+
 impl SidebarListModel {
     #[cfg(test)]
     pub fn keyed_items(&self) -> Vec<KeyedSidebarItem> {
@@ -3245,5 +3358,67 @@ mod tests {
         assert_eq!(diff.inserted.len(), 1);
         assert!(diff.moved.is_empty());
         assert!(diff.updated.is_empty());
+    }
+
+    #[test]
+    fn sidebar_projection_resets_once_then_ignores_identical_models() {
+        let items = SidebarListModel::Rows(vec![row("C1", 0, false)]).keyed_items();
+        let mut projection = SidebarProjection::default();
+
+        assert_eq!(
+            projection.reconcile(&items),
+            vec![SidebarProjectionOperation::Reset]
+        );
+        assert_eq!(projection.items(), items);
+        assert!(projection.reconcile(&items).is_empty());
+    }
+
+    #[test]
+    fn sidebar_projection_updates_one_row_in_a_large_workspace() {
+        let rows = (0..1_430)
+            .map(|index| row(&format!("C{index}"), 0, false))
+            .collect::<Vec<_>>();
+        let mut next = SidebarListModel::Rows(rows).keyed_items();
+        let mut projection = SidebarProjection::default();
+        assert_eq!(
+            projection.reconcile(&next),
+            vec![SidebarProjectionOperation::Reset]
+        );
+
+        let SidebarItemModel::Conversation(changed) = &mut next[713].model else {
+            panic!("expected conversation row");
+        };
+        changed.unread_count = 4;
+        changed.unread = true;
+
+        assert_eq!(
+            projection.reconcile(&next),
+            vec![SidebarProjectionOperation::Update { position: 713 }]
+        );
+    }
+
+    #[test]
+    fn sidebar_projection_splices_only_a_local_structural_change() {
+        let rows = (0..1_430)
+            .map(|index| row(&format!("C{index}"), 0, false))
+            .collect::<Vec<_>>();
+        let initial = SidebarListModel::Rows(rows).keyed_items();
+        let mut next = initial.clone();
+        let inserted = SidebarListModel::Rows(vec![row("C-new", 0, false)])
+            .keyed_items()
+            .pop()
+            .unwrap();
+        next.insert(713, inserted);
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&initial);
+
+        assert_eq!(
+            projection.reconcile(&next),
+            vec![SidebarProjectionOperation::Splice {
+                position: 713,
+                removed: 0,
+                inserted: 1,
+            }]
+        );
     }
 }
