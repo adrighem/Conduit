@@ -11,7 +11,7 @@
 //! type owns the visual lifecycle so those layers do not also need to coordinate the sidebar,
 //! title, placeholder, and WebView as separate widgets.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -25,7 +25,8 @@ use crate::message_html;
 pub(crate) struct ThreadPane {
     split: adw::OverlaySplitView,
     title: adw::WindowTitle,
-    web_view: webkit6::WebView,
+    view_box: gtk::Box,
+    web_view: Rc<RefCell<Option<webkit6::WebView>>>,
     web_view_creations: Rc<Cell<usize>>,
 }
 
@@ -34,27 +35,37 @@ impl ThreadPane {
         split: &adw::OverlaySplitView,
         title: &adw::WindowTitle,
         view_box: &gtk::Box,
-        web_view: webkit6::WebView,
     ) -> Self {
-        view_box.append(&web_view);
         Self {
             split: split.clone(),
             title: title.clone(),
-            web_view,
-            web_view_creations: Rc::new(Cell::new(1)),
+            view_box: view_box.clone(),
+            web_view: Rc::new(RefCell::new(None)),
+            web_view_creations: Rc::new(Cell::new(0)),
         }
     }
 
     pub(crate) fn has_web_view(&self) -> bool {
-        true
+        self.web_view.borrow().is_some()
     }
 
     pub(crate) fn web_view_creation_count(&self) -> usize {
         self.web_view_creations.get()
     }
 
-    pub(crate) fn web_view(&self) -> webkit6::WebView {
-        self.web_view.clone()
+    pub(crate) fn web_view(&self) -> Option<webkit6::WebView> {
+        self.web_view.borrow().clone()
+    }
+
+    pub(crate) fn attach_web_view(&self, web_view: webkit6::WebView) -> webkit6::WebView {
+        if let Some(existing) = self.web_view() {
+            return existing;
+        }
+        self.view_box.append(&web_view);
+        self.web_view.replace(Some(web_view.clone()));
+        self.web_view_creations
+            .set(self.web_view_creations.get() + 1);
+        web_view
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -83,10 +94,12 @@ impl ThreadPane {
     }
 
     pub(crate) fn load_html(&self, html: &str) {
+        let Some(web_view) = self.web_view() else {
+            return;
+        };
         let started = Instant::now();
         crate::debug::log("ui", &format!("load_thread_html bytes={}", html.len()));
-        self.web_view
-            .load_html(html, Some(message_html::base_uri()));
+        web_view.load_html(html, Some(message_html::base_uri()));
         log_performance(started, "html_load_submit", html.len());
     }
 }

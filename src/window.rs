@@ -3718,25 +3718,26 @@ impl ConduitWindow {
         *self.imp().media_viewer.borrow_mut() = Some(viewer);
         self.setup_media_viewer_callbacks();
 
-        let thread_view = self.create_message_web_view(&web_context, &network_session, text_zoom);
-        self.connect_timeline_load(&thread_view, TimelineSurface::Thread);
         let weak_message_view = message_view.downgrade();
-        let weak_thread_view = thread_view.downgrade();
         let thread_pane = ThreadPane::new(
             &self.imp().thread_split.get(),
             &self.imp().thread_title.get(),
             &self.imp().thread_view_box.get(),
-            thread_view,
         );
         *self.imp().thread_pane_controller.borrow_mut() = Some(thread_pane);
 
         if let Some(font_settings) = font_settings {
+            let weak_window = self.downgrade();
             let handler = font_settings.connect_gtk_font_name_notify(move |settings| {
                 let text_zoom = message_text_zoom(settings.gtk_font_name().as_deref());
-                for weak_view in [&weak_message_view, &weak_thread_view] {
-                    if let Some(view) = weak_view.upgrade() {
-                        view.set_zoom_level(text_zoom);
-                    }
+                if let Some(view) = weak_message_view.upgrade() {
+                    view.set_zoom_level(text_zoom);
+                }
+                if let Some(view) = weak_window
+                    .upgrade()
+                    .and_then(|window| window.thread_pane().web_view())
+                {
+                    view.set_zoom_level(text_zoom);
                 }
             });
             *self.imp().message_font_settings_handler.borrow_mut() = Some((font_settings, handler));
@@ -4340,6 +4341,32 @@ impl ConduitWindow {
         web_view
     }
 
+    fn ensure_thread_web_view(&self) -> webkit6::WebView {
+        let thread_pane = self.thread_pane();
+        if let Some(web_view) = thread_pane.web_view() {
+            return web_view;
+        }
+
+        let message_view = self
+            .imp()
+            .message_view
+            .borrow()
+            .clone()
+            .expect("main message WebView should be initialized");
+        let web_context = message_view
+            .web_context()
+            .expect("main message WebView should have a WebContext");
+        let network_session = message_view
+            .network_session()
+            .expect("main message WebView should have a NetworkSession");
+        let thread_view =
+            self.create_message_web_view(&web_context, &network_session, message_view.zoom_level());
+        self.connect_timeline_load(&thread_view, TimelineSurface::Thread);
+        let thread_view = thread_pane.attach_web_view(thread_view);
+        record_test_web_view_lifecycle(self);
+        thread_view
+    }
+
     fn reaction_emoji_picker_model(&self) -> Arc<EmojiPickerModel> {
         if let Some(model) = self.imp().reaction_emoji_picker_model.borrow().as_ref() {
             return model.clone();
@@ -4399,7 +4426,7 @@ impl ConduitWindow {
 
             let main_view = window.imp().message_view.borrow().clone();
             let thread_view = window.thread_pane().web_view();
-            for web_view in main_view.into_iter().chain([thread_view]) {
+            for web_view in main_view.into_iter().chain(thread_view) {
                 web_view.evaluate_javascript(
                     CANCEL_REACTION_PICKER_SCRIPT,
                     None,
@@ -6222,7 +6249,7 @@ impl ConduitWindow {
         let fallback = timeline_surface_invalidation(surface);
         let web_view = match surface {
             TimelineSurface::Main => self.imp().message_view.borrow().clone(),
-            TimelineSurface::Thread => Some(self.thread_pane().web_view()),
+            TimelineSurface::Thread => self.thread_pane().web_view(),
         };
         let Some(web_view) = web_view else {
             self.timeline_presenter(surface).borrow_mut().patch_failed();
@@ -6971,8 +6998,7 @@ impl ConduitWindow {
             }
             ThreadOpenOutcome::RequestFresh => {
                 self.set_status(&gettext("Loading thread"));
-                self.thread_pane()
-                    .show_placeholder(&gettext("Loading thread"));
+                self.show_thread_placeholder(&gettext("Loading thread"));
                 self.send_command(RuntimeCommand::LoadThread {
                     channel_id: channel_id.to_string(),
                     ts: ts.to_string(),
@@ -6980,8 +7006,7 @@ impl ConduitWindow {
             }
             ThreadOpenOutcome::AwaitFresh => {
                 self.set_status(&gettext("Loading thread"));
-                self.thread_pane()
-                    .show_placeholder(&gettext("Loading thread"));
+                self.show_thread_placeholder(&gettext("Loading thread"));
             }
             ThreadOpenOutcome::Ignored => {}
         }
@@ -11195,7 +11220,10 @@ impl ConduitWindow {
                     web_view.load_html(&html, Some(message_html::base_uri()));
                 }
             }
-            TimelineSurface::Thread => self.thread_pane().load_document(&html),
+            TimelineSurface::Thread => {
+                self.ensure_thread_web_view();
+                self.thread_pane().load_document(&html);
+            }
         }
         log_performance(started, |elapsed_ms| {
             format!(
@@ -11219,6 +11247,7 @@ impl ConduitWindow {
         self.timeline_presenter(TimelineSurface::Thread)
             .borrow_mut()
             .reset();
+        self.ensure_thread_web_view();
         self.thread_pane().show_placeholder(message);
     }
 

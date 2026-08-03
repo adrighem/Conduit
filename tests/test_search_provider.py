@@ -28,6 +28,13 @@ def wait_until(predicate, timeout: float = 30.0, interval: float = 0.1):
     raise AssertionError(f"condition was not met within {timeout:.1f}s")
 
 
+def read_json(path: Path) -> dict[str, object] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
 def call(environment: dict[str, str], method: str, *arguments: str) -> str:
     return subprocess.run(
         [
@@ -139,9 +146,11 @@ def main() -> None:
             encoding="utf-8",
         )
         environment = os.environ.copy()
+        lifecycle_path = root / "webview-lifecycle.json"
         environment.update(
             {
                 "CONDUIT_RESOURCE_PATH": str(resource),
+                "CONDUIT_TEST_WEBVIEW_LIFECYCLE_FILE": str(lifecycle_path),
                 "CONDUIT_TEST_WORKSPACE": "1",
                 "CONDUIT_TEST_OPEN_TARGET_FILE": str(root / "opened-target.json"),
                 "GSETTINGS_SCHEMA_DIR": str(root),
@@ -154,6 +163,7 @@ def main() -> None:
             [
                 "dbus-update-activation-environment",
                 "CONDUIT_RESOURCE_PATH",
+                "CONDUIT_TEST_WEBVIEW_LIFECYCLE_FILE",
                 "CONDUIT_TEST_WORKSPACE",
                 "CONDUIT_TEST_OPEN_TARGET_FILE",
                 "GSETTINGS_SCHEMA_DIR",
@@ -207,6 +217,8 @@ def main() -> None:
             "workspace_id": "Test Workspace",
             "channel_id": "C_TEST",
         }
+        startup_lifecycle = wait_until(lambda: read_json(lifecycle_path))
+        assert startup_lifecycle["thread_web_view_creations"] == 0
 
         target_path.unlink()
         subprocess.run(
@@ -236,6 +248,16 @@ def main() -> None:
             "channel_id": "C_TEST",
             "thread_ts": "1710000000.000100",
         }
+        first_open_lifecycle = wait_until(
+            lambda: (
+                state
+                if (state := read_json(lifecycle_path))
+                and state.get("thread_web_view_creations") == 1
+                else None
+            )
+        )
+        assert first_open_lifecycle["thread_web_view"] is True
+        assert first_open_lifecycle["thread_widget_children"] == 1
 
         # Closing a window with manually parented composer popovers must not
         # wedge GtkTextView disposal in a repeated warning loop.
