@@ -1,0 +1,7 @@
+Task: Route one batched TimelineDelta per frame and restrict full document loads
+
+Summary: Wired per-WebView TimelinePresenter state into main and thread surfaces; queued patches during load; emitted one serialized TimelineDelta on each GTK frame; kept empty timelines incrementally patchable; recovered revision mismatch and failed DOM application with controlled reloads.
+
+Modified: src/window.rs, src/message_html.rs, src/timeline_dom_runtime.js, src/thread_pane.rs, tests/test_timeline_scroll.py
+
+Rationale: Avoid repeated full WebKit document replacement while preserving revision, scroll anchoring, loading, and corruption recovery contracts. Coverage tooling is not configured; behavior is covered by pure Rust tests and the production WebKit headless test.
