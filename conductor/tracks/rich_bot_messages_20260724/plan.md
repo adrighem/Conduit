@@ -52,6 +52,6 @@
 
 ## Phase 6: Animated GIF shares
 
-- [~] Task: Add failing Block Kit, file-share, asset-request, and render coverage for animated GIFs
-- [ ] Task: Preserve Slack file images and animated GIF thumbnails through normalization and rendering
+- [x] Task: Add failing Block Kit, file-share, asset-request, and render coverage for animated GIFs 7b9ab05
+- [~] Task: Preserve Slack file images and animated GIF thumbnails through normalization and rendering
 - [ ] Task: Conductor - User Manual Verification 'Animated GIF shares' (Protocol in workflow.md)
