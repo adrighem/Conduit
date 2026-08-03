@@ -1,0 +1,7 @@
+Phase: Bounded on-demand emoji picker
+
+Automated verification: 891 Rust tests passed with 3 ignored; all 17 serial Meson suites passed; final-head CI, CodeQL, and guarded release automation passed.
+
+Manual verification: User confirmed pass on 2026-08-03 for status picker layout, category and paging controls, Unicode and custom search, keyboard behavior, emoji and no-emoji status save, and reaction picker scroll preservation.
+
+Outcome: Phase 1 accepted. Phase 2 may begin.
