@@ -1,0 +1,9 @@
+Task: Add failing lifecycle coverage proving no thread WebView exists at startup
+
+Summary: Added a production GTK startup observation seam and extended the existing window-state headless test to require one main WebView, zero thread WebViews, zero thread renderer creations, and an empty thread widget container before any thread opens.
+
+Files: src/thread_pane.rs, src/window.rs, tests/test_window_state.py
+
+Rationale: The integration assertion observes actual window construction rather than a disconnected policy model.
+
+Red result: Window state persistence failed at thread_web_view == false because current startup eagerly creates the thread renderer. This commit remains local until the following implementation restores green.
