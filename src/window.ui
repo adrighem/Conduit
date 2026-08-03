@@ -302,9 +302,8 @@
                               <object class="GtkScrolledWindow">
                                 <property name="vexpand">True</property>
                                 <property name="child">
-                                  <object class="GtkListBox" id="conversation_list">
-                                    <property name="selection-mode">single</property>
-                                    <property name="activate-on-single-click">True</property>
+                                  <object class="GtkListView" id="conversation_list">
+                                    <property name="single-click-activate">True</property>
                                     <style>
                                       <class name="navigation-sidebar"/>
                                     </style>

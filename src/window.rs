@@ -75,11 +75,12 @@ use crate::runtime::{
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
-    self, diff_keyed_sidebar_items, ConversationKind, ConversationPickerAction,
-    ConversationPickerItem, ConversationPickerSections, KeyedSidebarItem, SidebarItemKey,
-    SidebarItemModel, SidebarProjection, SidebarProjectionOperation, SidebarRowModel,
-    SidebarSectionKind,
+    self, ConversationKind, ConversationPickerAction, ConversationPickerItem,
+    ConversationPickerSections, KeyedSidebarItem, SidebarItemModel, SidebarProjection,
+    SidebarProjectionOperation, SidebarSectionKind,
 };
+#[cfg(test)]
+use crate::sidebar::{SidebarItemKey, SidebarRowModel};
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::slack_link::{
     resolve_slack_uri, slack_app_web_fallback, SlackFileAction, SlackUri, SlackUriResolution,
@@ -237,7 +238,7 @@ mod imp {
         #[template_child]
         pub sidebar_all_filter_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
-        pub conversation_list: TemplateChild<gtk::ListBox>,
+        pub conversation_list: TemplateChild<gtk::ListView>,
         #[template_child]
         pub workspace_status_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -319,8 +320,6 @@ mod imp {
         pub discovered_channels: RefCell<Vec<SlackConversation>>,
         pub discovered_users: RefCell<Vec<SlackUser>>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
-        pub(super) sidebar_row_actions: RefCell<HashMap<i32, SidebarRowAction>>,
-        pub(super) sidebar_section_actions: RefCell<HashMap<i32, SidebarSectionKind>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<Arc<HashMap<String, String>>>,
@@ -373,7 +372,6 @@ mod imp {
         pub(super) thread_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
         pub(super) sidebar_projection: RefCell<SidebarProjection>,
-        pub(super) sidebar_rows: RefCell<HashMap<SidebarItemKey, gtk::ListBoxRow>>,
         pub(super) sidebar_filter_generation: Cell<u64>,
         pub(super) picker_filter_generation: Cell<u64>,
         pub(super) picker_population_generation: Cell<u64>,
@@ -415,6 +413,7 @@ mod imp {
             obj.configure_accessibility();
             obj.configure_auth_ui();
             obj.setup_settings();
+            obj.setup_sidebar_list();
             obj.setup_callbacks();
             if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
                 let huddle_test = std::env::var_os("CONDUIT_TEST_HUDDLE").is_some();
@@ -949,14 +948,6 @@ struct MediaViewer {
 }
 
 impl SidebarRowAction {
-    fn from_model(model: &SidebarRowModel) -> Self {
-        Self {
-            channel_id: model.id.clone(),
-            title: model.title.clone(),
-            action: ConversationPickerAction::OpenConversation,
-        }
-    }
-
     fn from_picker_item(item: &ConversationPickerItem) -> Self {
         Self {
             channel_id: item.row.id.clone(),
@@ -982,6 +973,57 @@ fn sidebar_section_accessible_label(title: &str, collapsed: bool) -> String {
             gettext("Collapse")
         }
     )
+}
+
+fn sidebar_list_store() -> gio::ListStore {
+    gio::ListStore::new::<glib::BoxedAnyObject>()
+}
+
+fn boxed_sidebar_item(item: &KeyedSidebarItem) -> glib::BoxedAnyObject {
+    glib::BoxedAnyObject::new(item.clone())
+}
+
+fn apply_sidebar_store_operations(
+    store: &gio::ListStore,
+    items: &[KeyedSidebarItem],
+    operations: &[SidebarProjectionOperation],
+) {
+    for operation in operations {
+        match *operation {
+            SidebarProjectionOperation::Reset => {
+                let additions = items.iter().map(boxed_sidebar_item).collect::<Vec<_>>();
+                store.splice(0, store.n_items(), &additions);
+            }
+            SidebarProjectionOperation::Splice {
+                position,
+                removed,
+                inserted,
+            } => {
+                let additions = items[position..position + inserted]
+                    .iter()
+                    .map(boxed_sidebar_item)
+                    .collect::<Vec<_>>();
+                store.splice(position as u32, removed as u32, &additions);
+            }
+            SidebarProjectionOperation::Update { position } => {
+                let replacement = boxed_sidebar_item(&items[position]);
+                store.splice(position as u32, 1, &[replacement]);
+            }
+        }
+    }
+}
+
+fn sidebar_selected_position(items: &[KeyedSidebarItem]) -> u32 {
+    items
+        .iter()
+        .position(|item| {
+            matches!(
+                &item.model,
+                SidebarItemModel::Conversation(model) if model.selected
+            )
+        })
+        .and_then(|position| u32::try_from(position).ok())
+        .unwrap_or(gtk::INVALID_LIST_POSITION)
 }
 
 fn toggle_sidebar_section_state(
@@ -3805,6 +3847,53 @@ impl ConduitWindow {
         self.add_controller(controller);
     }
 
+    fn setup_sidebar_list(&self) {
+        let factory = gtk::SignalListItemFactory::new();
+        let weak_window = self.downgrade();
+        factory.connect_bind(move |_, object| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else {
+                return;
+            };
+            let item = boxed.borrow::<KeyedSidebarItem>();
+            let (selectable, activatable) = match item.model {
+                SidebarItemModel::Placeholder(_) => (false, false),
+                SidebarItemModel::SectionHeader { .. } => (false, true),
+                SidebarItemModel::Conversation(_) => (true, true),
+            };
+            list_item.set_selectable(selectable);
+            list_item.set_activatable(activatable);
+            list_item.set_child(Some(&window.sidebar_item_widget(&item)));
+        });
+        factory.connect_unbind(|_, object| {
+            if let Some(list_item) = object.downcast_ref::<gtk::ListItem>() {
+                list_item.set_child(None::<&gtk::Widget>);
+            }
+        });
+
+        let store = sidebar_list_store();
+        let selection = gtk::SingleSelection::new(Some(store));
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
+        selection.set_selected(gtk::INVALID_LIST_POSITION);
+
+        let imp = self.imp();
+        imp.conversation_list.set_factory(Some(&factory));
+        imp.conversation_list.set_model(Some(&selection));
+
+        let weak_window = self.downgrade();
+        imp.conversation_list.connect_activate(move |_, position| {
+            if let Some(window) = weak_window.upgrade() {
+                window.activate_sidebar_item(position);
+            }
+        });
+    }
+
     fn setup_callbacks(&self) {
         let imp = self.imp();
 
@@ -3895,13 +3984,6 @@ impl ConduitWindow {
         imp.sidebar_all_filter_button.connect_toggled(move |_| {
             if let Some(window) = weak_window.upgrade() {
                 window.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-            }
-        });
-
-        let weak_window = self.downgrade();
-        imp.conversation_list.connect_row_activated(move |_, row| {
-            if let Some(window) = weak_window.upgrade() {
-                window.activate_sidebar_row(row.index());
             }
         });
 
@@ -6768,8 +6850,6 @@ impl ConduitWindow {
         imp.pending_upload_drafts.borrow_mut().clear();
         imp.discovered_channels.borrow_mut().clear();
         imp.discovered_users.borrow_mut().clear();
-        imp.sidebar_row_actions.borrow_mut().clear();
-        imp.sidebar_section_actions.borrow_mut().clear();
         *imp.user_names.borrow_mut() = Arc::default();
         *imp.user_full_names.borrow_mut() = Arc::default();
         *imp.user_avatar_urls.borrow_mut() = Arc::default();
@@ -6808,10 +6888,7 @@ impl ConduitWindow {
         imp.workspace_split.set_show_content(false);
         self.thread_pane().close();
         self.sync_workspace_chrome();
-        self.clear_list(&imp.conversation_list);
-        imp.sidebar_projection.borrow_mut().reconcile(&[]);
-        imp.sidebar_rows.borrow_mut().clear();
-        imp.sidebar_row_actions.borrow_mut().clear();
+        self.reconcile_sidebar(Vec::new());
         self.show_message_placeholder(&gettext("Select a conversation"));
     }
 
@@ -7685,40 +7762,47 @@ impl ConduitWindow {
             .unwrap_or(false)
     }
 
-    fn sidebar_item_row(&self, item: &KeyedSidebarItem) -> gtk::ListBoxRow {
+    fn sidebar_item_widget(&self, item: &KeyedSidebarItem) -> gtk::Widget {
         match &item.model {
-            SidebarItemModel::Placeholder(placeholder) => {
-                let row = gtk::ListBoxRow::new();
-                row.set_selectable(false);
-                row.set_activatable(false);
-                row.set_child(Some(&self.placeholder_label(placeholder.label())));
-                row
-            }
+            SidebarItemModel::Placeholder(placeholder) => self
+                .placeholder_label(placeholder.label())
+                .upcast::<gtk::Widget>(),
             SidebarItemModel::SectionHeader {
                 title, collapsed, ..
-            } => self.sidebar_section_row(title, *collapsed),
+            } => self.sidebar_section_widget(title, *collapsed),
             SidebarItemModel::Conversation(model) => {
                 let row = sidebar_row_widget(
                     model,
                     SidebarRowLayout::sidebar(),
                     &self.imp().custom_emojis.borrow(),
                 );
-                self.attach_sidebar_context_menu(&row, &model.id);
-                row
+                let content = row
+                    .child()
+                    .expect("sidebar conversation row should have content");
+                row.set_child(None::<&gtk::Widget>);
+                let accessible_label = model.accessible_label();
+                content.set_focusable(true);
+                content.set_tooltip_text(Some(&accessible_label));
+                content.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
+                self.attach_sidebar_context_menu(&content, &model.id);
+                content
             }
         }
     }
 
-    fn attach_sidebar_context_menu(&self, row: &gtk::ListBoxRow, channel_id: &str) {
+    fn attach_sidebar_context_menu(&self, row: &gtk::Widget, channel_id: &str) {
         row.set_focusable(true);
 
         let gesture = gtk::GestureClick::new();
         gesture.set_button(3);
         let weak_window = self.downgrade();
-        let row_for_menu = row.clone();
+        let weak_row = row.downgrade();
         let channel_id_for_pointer = channel_id.to_string();
         gesture.connect_pressed(move |_, _, x, y| {
             let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let Some(row_for_menu) = weak_row.upgrade() else {
                 return;
             };
             window.show_sidebar_context_menu(
@@ -7732,13 +7816,16 @@ impl ConduitWindow {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak_window = self.downgrade();
-        let row_for_menu = row.clone();
+        let weak_row = row.downgrade();
         let channel_id_for_keyboard = channel_id.to_string();
         keys.connect_key_pressed(move |_, key, _, state| {
             if !sidebar_context_menu_key(key, state) {
                 return glib::Propagation::Proceed;
             }
             let Some(window) = weak_window.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(row_for_menu) = weak_row.upgrade() else {
                 return glib::Propagation::Proceed;
             };
             window.show_sidebar_context_menu(
@@ -7758,7 +7845,7 @@ impl ConduitWindow {
 
     fn show_sidebar_context_menu(
         &self,
-        row: &gtk::ListBoxRow,
+        row: &gtk::Widget,
         channel_id: &str,
         pointing_to: Option<gtk::gdk::Rectangle>,
     ) {
@@ -7931,15 +8018,7 @@ impl ConduitWindow {
         }
     }
 
-    fn sidebar_section_row(&self, title: &str, collapsed: bool) -> gtk::ListBoxRow {
-        let header_row = gtk::ListBoxRow::new();
-        header_row.set_selectable(false);
-        header_row.set_activatable(true);
-        header_row.set_focusable(true);
-        header_row.update_property(&[gtk::accessible::Property::Label(
-            &sidebar_section_accessible_label(title, collapsed),
-        )]);
-
+    fn sidebar_section_widget(&self, title: &str, collapsed: bool) -> gtk::Widget {
         let header = gtk::Label::new(Some(title));
         header.set_xalign(0.0);
         header.set_hexpand(true);
@@ -7958,127 +8037,51 @@ impl ConduitWindow {
         disclosure.set_accessible_role(gtk::AccessibleRole::Presentation);
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+        content.set_focusable(true);
+        content.update_property(&[gtk::accessible::Property::Label(
+            &sidebar_section_accessible_label(title, collapsed),
+        )]);
         content.append(&disclosure);
         content.append(&header);
-        header_row.set_child(Some(&content));
-        header_row
+        content.upcast()
     }
 
     fn reconcile_sidebar(&self, next_items: Vec<KeyedSidebarItem>) {
         let imp = self.imp();
+        let selection = imp
+            .conversation_list
+            .model()
+            .and_downcast::<gtk::SingleSelection>()
+            .expect("sidebar list should own a single-selection model");
+        let store = selection
+            .model()
+            .and_downcast::<gio::ListStore>()
+            .expect("sidebar selection should own a list store");
         let mut projection = imp.sidebar_projection.borrow_mut();
-        let diff = diff_keyed_sidebar_items(projection.items(), &next_items);
         let operations = projection.reconcile(&next_items);
-        let structure_changed = operations.iter().any(|operation| {
-            matches!(
-                operation,
-                SidebarProjectionOperation::Reset | SidebarProjectionOperation::Splice { .. }
-            )
-        });
+        apply_sidebar_store_operations(&store, projection.items(), &operations);
+        let selected_position = sidebar_selected_position(projection.items());
         drop(projection);
-
-        {
-            let mut rows = imp.sidebar_rows.borrow_mut();
-            for key in &diff.removed {
-                rows.remove(key);
-            }
-            for (_, key) in &diff.inserted {
-                if let Some(item) = next_items.iter().find(|item| &item.key == key) {
-                    rows.insert(key.clone(), self.sidebar_item_row(item));
-                }
-            }
-            for (key, index) in &diff.updated {
-                let Some(existing) = rows.get(key) else {
-                    continue;
-                };
-                let replacement = self.sidebar_item_row(&next_items[*index]);
-                existing.set_selectable(replacement.is_selectable());
-                existing.set_activatable(replacement.is_activatable());
-                existing.set_focusable(replacement.is_focusable());
-                existing.set_tooltip_text(replacement.tooltip_text().as_deref());
-                match &next_items[*index].model {
-                    SidebarItemModel::SectionHeader {
-                        title, collapsed, ..
-                    } => {
-                        existing.update_property(&[gtk::accessible::Property::Label(
-                            &sidebar_section_accessible_label(title, *collapsed),
-                        )]);
-                    }
-                    SidebarItemModel::Conversation(model) => {
-                        existing.update_property(&[gtk::accessible::Property::Label(
-                            &model.accessible_label(),
-                        )]);
-                    }
-                    SidebarItemModel::Placeholder(_) => {}
-                }
-                if let Some(child) = replacement.child() {
-                    replacement.set_child(None::<&gtk::Widget>);
-                    existing.set_child(Some(&child));
-                }
-            }
-        }
-
-        if structure_changed {
-            self.clear_list(&imp.conversation_list);
-            let rows = imp.sidebar_rows.borrow();
-            for item in &next_items {
-                if let Some(row) = rows.get(&item.key) {
-                    imp.conversation_list.append(row);
-                }
-            }
-        }
-
-        imp.sidebar_row_actions.borrow_mut().clear();
-        imp.sidebar_section_actions.borrow_mut().clear();
-        let rows = imp.sidebar_rows.borrow();
-        let mut selected = None;
-        for item in &next_items {
-            let Some(row) = rows.get(&item.key) else {
-                continue;
-            };
-            match &item.model {
-                SidebarItemModel::SectionHeader { kind, .. } => {
-                    imp.sidebar_section_actions
-                        .borrow_mut()
-                        .insert(row.index(), *kind);
-                }
-                SidebarItemModel::Conversation(model) => {
-                    self.register_sidebar_row_action(row.index(), model);
-                    if model.selected && selected.is_none() {
-                        selected = Some(row);
-                    }
-                }
-                SidebarItemModel::Placeholder(_) => {}
-            }
-        }
-        imp.conversation_list.select_row(selected);
-        drop(rows);
+        selection.set_selected(selected_position);
     }
 
-    fn register_sidebar_row_action(&self, row_index: i32, model: &SidebarRowModel) {
-        self.imp()
-            .sidebar_row_actions
-            .borrow_mut()
-            .insert(row_index, SidebarRowAction::from_model(model));
-    }
-
-    fn activate_sidebar_row(&self, row_index: i32) {
-        if let Some(section) = self
+    fn activate_sidebar_item(&self, position: u32) {
+        let item = self
             .imp()
-            .sidebar_section_actions
+            .sidebar_projection
             .borrow()
-            .get(&row_index)
-            .copied()
-        {
-            self.toggle_sidebar_section(section);
-            return;
-        }
-        let action =
-            sidebar_row_action_for_index(&self.imp().sidebar_row_actions.borrow(), row_index);
-
-        if let Some(action) = action {
-            let title = self.conversation_title(&action.channel_id);
-            self.select_conversation(&action.channel_id, &title);
+            .items()
+            .get(position as usize)
+            .cloned();
+        match item.map(|item| item.model) {
+            Some(SidebarItemModel::SectionHeader { kind, .. }) => {
+                self.toggle_sidebar_section(kind);
+            }
+            Some(SidebarItemModel::Conversation(model)) => {
+                let title = self.conversation_title(&model.id);
+                self.select_conversation(&model.id, &title);
+            }
+            Some(SidebarItemModel::Placeholder(_)) | None => {}
         }
     }
 
@@ -11326,6 +11329,80 @@ mod tests {
         }
     }
 
+    fn keyed_sidebar_row(id: &str, title: &str, selected: bool) -> KeyedSidebarItem {
+        let mut row = sidebar_row(id, title);
+        row.selected = selected;
+        KeyedSidebarItem {
+            key: SidebarItemKey::Conversation {
+                section: None,
+                id: id.to_string(),
+            },
+            model: SidebarItemModel::Conversation(row),
+        }
+    }
+
+    #[test]
+    fn sidebar_list_store_replaces_only_updated_projection_items() {
+        let store = sidebar_list_store();
+        let mut projection = SidebarProjection::default();
+        let initial = (0..1_430)
+            .map(|index| {
+                keyed_sidebar_row(
+                    &format!("C{index}"),
+                    &format!("Channel {index}"),
+                    index == 700,
+                )
+            })
+            .collect::<Vec<_>>();
+        let operations = projection.reconcile(&initial);
+        apply_sidebar_store_operations(&store, projection.items(), &operations);
+        let retained_before = store.item(699).unwrap();
+        let updated_before = store.item(700).unwrap();
+
+        let mut next = initial;
+        let SidebarItemModel::Conversation(row) = &mut next[700].model else {
+            unreachable!();
+        };
+        row.unread = true;
+        row.unread_count = 4;
+        let operations = projection.reconcile(&next);
+        apply_sidebar_store_operations(&store, projection.items(), &operations);
+
+        assert_eq!(store.n_items(), 1_430);
+        assert_eq!(store.item(699).unwrap(), retained_before);
+        assert_ne!(store.item(700).unwrap(), updated_before);
+        assert_eq!(sidebar_selected_position(projection.items()), 700);
+    }
+
+    #[test]
+    fn sidebar_list_store_splice_preserves_selection_by_model_identity() {
+        let store = sidebar_list_store();
+        let mut projection = SidebarProjection::default();
+        let initial = vec![
+            keyed_sidebar_row("C1", "One", false),
+            keyed_sidebar_row("C2", "Two", true),
+            keyed_sidebar_row("C3", "Three", false),
+        ];
+        let operations = projection.reconcile(&initial);
+        apply_sidebar_store_operations(&store, projection.items(), &operations);
+        let selected_before = store.item(1).unwrap();
+        let suffix_before = store.item(2).unwrap();
+
+        let next = vec![
+            keyed_sidebar_row("C0", "Zero", false),
+            keyed_sidebar_row("C1", "One", false),
+            keyed_sidebar_row("C2", "Two", true),
+            keyed_sidebar_row("C3", "Three", false),
+        ];
+        let operations = projection.reconcile(&next);
+        apply_sidebar_store_operations(&store, projection.items(), &operations);
+
+        assert_eq!(store.n_items(), 4);
+        assert_eq!(store.item(2).unwrap(), selected_before);
+        assert_eq!(store.item(3).unwrap(), suffix_before);
+        assert_eq!(sidebar_selected_position(projection.items()), 2);
+    }
+
     #[test]
     fn picker_population_flattens_sections_and_preserves_bounded_order() {
         let sections = ConversationPickerSections {
@@ -11907,20 +11984,6 @@ mod tests {
             text: Some(text.to_string()),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn sidebar_row_action_uses_conversation_id_and_resolved_title() {
-        let model = sidebar_row("D123", "Mohamed Moulay");
-
-        assert_eq!(
-            SidebarRowAction::from_model(&model),
-            SidebarRowAction {
-                channel_id: "D123".to_string(),
-                title: "Mohamed Moulay".to_string(),
-                action: ConversationPickerAction::OpenConversation,
-            }
-        );
     }
 
     #[test]

@@ -221,17 +221,6 @@ pub struct KeyedSidebarItem {
     pub model: SidebarItemModel,
 }
 
-/// The minimal set of keyed changes needed to reconcile two sidebar models.
-/// Positions refer to the new model. Updated entries retain their widget
-/// identity; inserted and removed entries require widget changes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SidebarModelDiff {
-    pub removed: Vec<SidebarItemKey>,
-    pub inserted: Vec<(usize, SidebarItemKey)>,
-    pub moved: Vec<(SidebarItemKey, usize)>,
-    pub updated: Vec<(SidebarItemKey, usize)>,
-}
-
 /// Incremental operations over the projection's current keyed item sequence.
 /// Positions refer to the new sequence returned by [`SidebarProjection::items`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,47 +388,6 @@ impl SidebarListModel {
                 })
                 .collect(),
         }
-    }
-}
-
-pub fn diff_keyed_sidebar_items(
-    previous: &[KeyedSidebarItem],
-    next: &[KeyedSidebarItem],
-) -> SidebarModelDiff {
-    let previous_by_key: HashMap<_, _> = previous
-        .iter()
-        .enumerate()
-        .map(|(index, item)| (&item.key, (index, &item.model)))
-        .collect();
-    let next_keys: HashSet<_> = next.iter().map(|item| &item.key).collect();
-
-    let removed = previous
-        .iter()
-        .filter(|item| !next_keys.contains(&item.key))
-        .map(|item| item.key.clone())
-        .collect();
-    let mut inserted = Vec::new();
-    let mut moved = Vec::new();
-    let mut updated = Vec::new();
-
-    for (next_index, item) in next.iter().enumerate() {
-        let Some((previous_index, previous_model)) = previous_by_key.get(&item.key) else {
-            inserted.push((next_index, item.key.clone()));
-            continue;
-        };
-        if *previous_index != next_index {
-            moved.push((item.key.clone(), next_index));
-        }
-        if *previous_model != &item.model {
-            updated.push((item.key.clone(), next_index));
-        }
-    }
-
-    SidebarModelDiff {
-        removed,
-        inserted,
-        moved,
-        updated,
     }
 }
 
@@ -3307,57 +3255,6 @@ mod tests {
             placeholder.keyed_items_with_collapsed_sections(&collapsed),
             placeholder.keyed_items()
         );
-    }
-
-    #[test]
-    fn keyed_sidebar_diff_retains_identity_for_content_updates_and_moves() {
-        let previous =
-            SidebarListModel::Rows(vec![row("C1", 0, false), row("C2", 0, false)]).keyed_items();
-        let next = SidebarListModel::Rows(vec![
-            row("C2", 3, true),
-            row("C3", 0, false),
-            row("C1", 0, false),
-        ])
-        .keyed_items();
-
-        let diff = diff_keyed_sidebar_items(&previous, &next);
-        assert!(diff.removed.is_empty());
-        assert_eq!(
-            diff.inserted,
-            vec![(
-                1,
-                SidebarItemKey::Conversation {
-                    section: None,
-                    id: "C3".to_string(),
-                }
-            )]
-        );
-        assert_eq!(diff.moved.len(), 2);
-        assert_eq!(
-            diff.updated,
-            vec![(
-                SidebarItemKey::Conversation {
-                    section: None,
-                    id: "C2".to_string(),
-                },
-                0
-            )]
-        );
-    }
-
-    #[test]
-    fn keyed_sidebar_diff_removes_obsolete_placeholder() {
-        let previous = SidebarListModel::Placeholder(SidebarPlaceholder::Loading).keyed_items();
-        let next = SidebarListModel::Rows(vec![row("C1", 0, false)]).keyed_items();
-
-        let diff = diff_keyed_sidebar_items(&previous, &next);
-        assert_eq!(
-            diff.removed,
-            vec![SidebarItemKey::Placeholder(SidebarPlaceholder::Loading)]
-        );
-        assert_eq!(diff.inserted.len(), 1);
-        assert!(diff.moved.is_empty());
-        assert!(diff.updated.is_empty());
     }
 
     #[test]
