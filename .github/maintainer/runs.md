@@ -461,3 +461,14 @@
 - Exact-head CI `30470145716` passes strict default/native Clippy and both Meson configurations.
 - Exact-head CodeQL `30470043566` passes for Actions, JavaScript/TypeScript, Python, and Rust.
 - PR:18 remains unmerged. The live desktop, Slack, sandbox, and privacy checklist is the only remaining release gate.
+
+## 2026-08-03 Architecture Backlog Review
+
+- Live backlog: ISSUE:9-13 open; PR:19 is the only open pull request and does not implement them.
+- ISSUE:12 work completed locally:
+  - `91303bb` fixes startup follow-up scheduler admission
+  - `5cb5167` defines keyed reset/splice/update sidebar projection behavior
+  - 1,430-row regression tests keep one update and one insertion local
+- Validation: rustfmt passes, 883 default tests pass with 3 ignored, Cargo check passes, and Meson compilation passes.
+- Local strict Clippy remains unavailable because installed Clippy reports Rust 1.87 while the project requires Rust 1.88 or newer.
+- No issue comment, label, closure, pull request action, merge, push, or release was performed.

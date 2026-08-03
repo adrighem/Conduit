@@ -189,3 +189,11 @@
 - Publish Slack's accepted message to GTK before awaiting recoverable SQLite and thread-catalog persistence.
 - Keep deferred draft deletion durable by marking it pending until GSettings confirms the write and forcing pending state through the close flush.
 - Defer optimistic message rows until Conduit has a server-reconcilable `client_msg_id` design covering API responses, Socket Mode races, retries, and visible error state.
+
+## 2026-08-03 Architecture Backlog Review
+
+- Keep all five open architecture issues. No live implementation PR covers ISSUE:9-13; PR:19 is release metadata only.
+- Continue the existing Conductor sequence instead of opening competing tracks: finish ISSUE:12 incremental presentation, implement ISSUE:9 at the asset seam, then complete ISSUE:11 and ISSUE:13 ownership cleanup. Resume ISSUE:10 after its live picker checkpoint.
+- Fixed ISSUE:12's startup scheduler integration first because constant cancellation identity `0` deterministically rejected follow-up refresh and user-directory jobs.
+- Established a pure keyed `SidebarProjection` before changing GTK widgets. Large-workspace tests require one row update or insertion to remain local.
+- No public GitHub action was taken.
