@@ -2764,6 +2764,16 @@ fn hash_opaque_id(id: &str) -> u64 {
     hasher.finish()
 }
 
+fn sync_job_cancellation_id(payload: &SyncJobPayload, job_sequence: u64) -> CancellationId {
+    // Navigation jobs share one slot; every other active job needs a unique identity.
+    match payload {
+        SyncJobPayload::LoadHistory { .. } | SyncJobPayload::LoadThread { .. } => {
+            CancellationId::new(hash_opaque_id("navigation-main"))
+        }
+        _ => CancellationId::new(job_sequence),
+    }
+}
+
 fn schedule_job_internal(
     connection: &RuntimeConnection,
     payload: SyncJobPayload,
@@ -2775,13 +2785,9 @@ fn schedule_job_internal(
     now_ms: u64,
 ) -> Option<SyncJobId> {
     use std::sync::atomic::Ordering;
-    let job_id = SyncJobId::new(connection.next_job_id.fetch_add(1, Ordering::SeqCst));
-    let cancellation_id = match &payload {
-        SyncJobPayload::LoadHistory { .. } | SyncJobPayload::LoadThread { .. } => {
-            CancellationId::new(hash_opaque_id("navigation-main"))
-        }
-        _ => CancellationId::new(0),
-    };
+    let job_sequence = connection.next_job_id.fetch_add(1, Ordering::SeqCst);
+    let job_id = SyncJobId::new(job_sequence);
+    let cancellation_id = sync_job_cancellation_id(&payload, job_sequence);
     let target = match &payload {
         SyncJobPayload::WorkspaceStartup | SyncJobPayload::WorkspaceRefresh => {
             SyncTargetKey::new(SyncTargetKind::Workspace, 0)
@@ -14262,6 +14268,22 @@ mod tests {
                 RuntimeTarget::Huddle("active".to_string()),
             )
         );
+    }
+
+    #[test]
+    fn follow_up_workspace_sync_jobs_have_distinct_cancellation_ids() {
+        let startup = sync_job_cancellation_id(&SyncJobPayload::WorkspaceStartup, 0);
+        let refresh = sync_job_cancellation_id(&SyncJobPayload::WorkspaceRefresh, 1);
+        let directory = sync_job_cancellation_id(
+            &SyncJobPayload::MembershipSync {
+                channel_id: "user_directory".to_string(),
+            },
+            2,
+        );
+
+        assert_ne!(startup, refresh);
+        assert_ne!(startup, directory);
+        assert_ne!(refresh, directory);
     }
 
     #[test]
