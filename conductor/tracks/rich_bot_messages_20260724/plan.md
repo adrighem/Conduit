@@ -49,3 +49,9 @@
 - [x] Task: Preserve public direct preview images and discover canonical private images c3a7eb1
 - [x] Task: Harden repeated headless window activation during CI validation 60a64b7
 - [x] Task: Conductor - User Manual Verification 'URL preview images' (Protocol in workflow.md) 07fa1e0
+
+## Phase 6: Animated GIF shares
+
+- [~] Task: Add failing Block Kit, file-share, asset-request, and render coverage for animated GIFs
+- [ ] Task: Preserve Slack file images and animated GIF thumbnails through normalization and rendering
+- [ ] Task: Conductor - User Manual Verification 'Animated GIF shares' (Protocol in workflow.md)
