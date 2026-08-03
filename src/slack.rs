@@ -870,14 +870,15 @@ impl SlackApi {
     }
 
     pub async fn download_preview_asset(&self, url: &str) -> Result<DownloadedPreviewAsset> {
-        let request = if is_trusted_slack_download_url(url) {
-            self.authenticated_request(Method::GET, url)
-        } else if is_trusted_avatar_url(url) {
-            self.http.get(url)
-        } else {
+        if !supports_native_preview_asset_url(url) {
             return Err(SlackError::validation(
                 "preview URL is not a trusted Slack asset URL",
             ));
+        }
+        let request = if is_trusted_slack_download_url(url) {
+            self.authenticated_request(Method::GET, url)
+        } else {
+            self.http.get(url)
         };
         let response = request
             .send()
@@ -1931,6 +1932,10 @@ fn is_trusted_avatar_url(url: &str) -> bool {
             "a.slack-edge.com" | "avatars.slack-edge.com" | "secure.gravatar.com"
         )
     })
+}
+
+pub(crate) fn supports_native_preview_asset_url(url: &str) -> bool {
+    is_trusted_slack_download_url(url) || is_trusted_avatar_url(url)
 }
 
 fn ensure_trusted_slack_download_url(url: &str) -> Result<()> {
@@ -3021,6 +3026,12 @@ mod tests {
         )
         .is_ok());
         assert!(ensure_trusted_slack_download_url("https://evil.example/preview.png").is_err());
+        assert!(supports_native_preview_asset_url(
+            "https://files.slack.com/files-pri/T1-F1/download/report.pdf"
+        ));
+        assert!(!supports_native_preview_asset_url(
+            "https://images.example.test/card.png"
+        ));
     }
 
     #[test]
@@ -3042,6 +3053,9 @@ mod tests {
         ));
         assert!(!is_trusted_avatar_url(
             "https://token@secure.gravatar.com/avatar/hash.jpg"
+        ));
+        assert!(supports_native_preview_asset_url(
+            "https://avatars.slack-edge.com/2026-01-01/avatar_72.png"
         ));
     }
 

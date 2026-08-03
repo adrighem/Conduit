@@ -229,6 +229,21 @@ impl MessageDocument {
         &self.nodes
     }
 
+    pub fn image_urls(&self) -> impl Iterator<Item = &str> {
+        self.nodes.iter().filter_map(|node| {
+            let image = match node {
+                MessageNode::Image(image) => Some(image),
+                MessageNode::Section {
+                    accessory: Some(MessageAccessory::Image(image)),
+                    ..
+                } => Some(image),
+                MessageNode::Attachment(attachment) => attachment.image.as_ref(),
+                _ => None,
+            }?;
+            image.url.as_deref().and_then(non_empty)
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -407,5 +422,48 @@ mod tests {
         assert!(document.has_visible_content());
         assert_eq!(document.visible_text(), "Request review");
         assert_eq!(document.accessible_text(), "Request review\nApprove");
+    }
+
+    #[test]
+    fn image_urls_cover_blocks_accessories_and_attachments() {
+        let image = |url: &str| MessageImage {
+            url: Some(url.to_string()),
+            alt: "Preview".to_string(),
+            title: None,
+        };
+        let document = MessageDocument::new(
+            vec![
+                MessageNode::Image(image("https://files.slack.com/block.png")),
+                MessageNode::Section {
+                    text: None,
+                    fields: Vec::new(),
+                    accessory: Some(MessageAccessory::Image(image(
+                        "https://files.slack.com/accessory.png",
+                    ))),
+                },
+                MessageNode::Attachment(Box::new(MessageAttachment {
+                    color: None,
+                    pretext: None,
+                    author: None,
+                    title: None,
+                    text: None,
+                    fallback: None,
+                    fields: Vec::new(),
+                    image: Some(image("https://files.slack.com/attachment.png")),
+                    actions: Vec::new(),
+                    footer: None,
+                })),
+            ],
+            None,
+        );
+
+        assert_eq!(
+            document.image_urls().collect::<Vec<_>>(),
+            vec![
+                "https://files.slack.com/block.png",
+                "https://files.slack.com/accessory.png",
+                "https://files.slack.com/attachment.png",
+            ]
+        );
     }
 }

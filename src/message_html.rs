@@ -5057,6 +5057,58 @@ mod tests {
     }
 
     #[test]
+    fn canonical_url_previews_use_direct_public_and_managed_private_images() {
+        let public_url = "https://images.example.test/card.png";
+        let public = crate::slack_message_wire::normalize_cached_message(
+            crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                "ts": "1710000000.000200",
+                "attachments": [{
+                    "title": "Public preview",
+                    "image_url": public_url
+                }]
+            }))
+            .into_message()
+            .expect("public preview should normalize"),
+        );
+
+        let public_html = conversation_document("C123", &[public], &MessageHtmlContext::default());
+        assert!(public_html.contains(&format!("src=\"{public_url}\"")));
+        assert!(!public_html.contains("<div class=\"image-placeholder\""));
+
+        let private_url = "https://files.slack.com/files-pri/T123-F123/card.png";
+        let private = crate::slack_message_wire::normalize_cached_message(
+            crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                "ts": "1710000000.000300",
+                "attachments": [{
+                    "title": "Private preview",
+                    "image_url": private_url
+                }]
+            }))
+            .into_message()
+            .expect("private preview should normalize"),
+        );
+        let pending_html = conversation_document(
+            "C123",
+            std::slice::from_ref(&private),
+            &MessageHtmlContext::default(),
+        );
+        assert!(pending_html.contains("Loading image preview"));
+        assert!(!pending_html.contains(&format!("src=\"{private_url}\"")));
+
+        let source = format!("conduit-asset://{}", "a".repeat(64));
+        let loaded_html = conversation_document(
+            "C123",
+            &[private],
+            &MessageHtmlContext {
+                image_assets: HashMap::from([(private_url.to_string(), source.clone())]),
+                ..Default::default()
+            },
+        );
+        assert!(loaded_html.contains(&format!("src=\"{source}\"")));
+        assert!(!loaded_html.contains(&format!("src=\"{private_url}\"")));
+    }
+
+    #[test]
     fn canonical_app_author_never_receives_person_actions_or_presence() {
         let mut message: SlackMessage = serde_json::from_value(serde_json::json!({
             "ts": "1710000000.000100",

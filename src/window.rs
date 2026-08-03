@@ -3332,6 +3332,13 @@ fn attachment_image_asset_request(
         .image_url
         .as_deref()
         .or(attachment.thumb_url.as_deref())?;
+    native_preview_asset_request(url)
+}
+
+fn native_preview_asset_request(url: &str) -> Option<(String, String)> {
+    if !crate::slack::supports_native_preview_asset_url(url) {
+        return None;
+    }
     Some((url.to_string(), url.to_string()))
 }
 
@@ -3356,6 +3363,12 @@ fn message_image_asset_requests<'a>(
                 .into_iter()
                 .flatten()
                 .filter_map(attachment_image_asset_request),
+        );
+        requests.extend(
+            message
+                .document
+                .image_urls()
+                .filter_map(native_preview_asset_request),
         );
         if let Some(url) = message
             .user
