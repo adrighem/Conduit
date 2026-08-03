@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -555,18 +555,9 @@ mod imp {
                         let weak_window = obj.downgrade();
                         glib::timeout_add_local_once(Duration::from_millis(100), move || {
                             if let Some(window) = weak_window.upgrade() {
-                                let emoji_url = std::env::var("CONDUIT_TEST_STATUS_EMOJI_PORT")
-                                    .ok()
-                                    .and_then(|port| port.parse::<u16>().ok())
-                                    .map(|port| {
-                                        format!("http://127.0.0.1:{port}/late-status-parrot.gif")
-                                    })
-                                    .unwrap_or_else(|| {
-                                        "https://emoji.example/late-status-parrot.gif".to_string()
-                                    });
                                 window.replace_custom_emojis(HashMap::from([(
                                     "late_status_parrot".to_string(),
-                                    emoji_url,
+                                    "https://emoji.example/late-status-parrot.gif".to_string(),
                                 )]));
                             }
                         });
@@ -2388,6 +2379,103 @@ fn status_emoji_result_label(entry: &EmojiPickerResultEntry) -> String {
     }
 }
 
+fn record_test_status_emoji_animation_frame() {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_ANIMATION_FILE") else {
+        return;
+    };
+    let frame_updates = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|state| serde_json::from_str::<serde_json::Value>(&state).ok())
+        .and_then(|state| state.get("frame_updates")?.as_u64())
+        .unwrap_or_default()
+        + 1;
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({ "frame_updates": frame_updates }).to_string(),
+    );
+}
+
+fn record_test_status_emoji_animation_error(stage: &str) {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_ANIMATION_FILE") else {
+        return;
+    };
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({ "error": stage, "frame_updates": 0 }).to_string(),
+    );
+}
+
+fn set_status_emoji_animation_frame(
+    picture: &gtk::Picture,
+    animation: &gdk_pixbuf::PixbufAnimationIter,
+) {
+    picture.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&animation.pixbuf())));
+    record_test_status_emoji_animation_frame();
+}
+
+fn schedule_status_emoji_animation_frame(
+    weak_picture: glib::WeakRef<gtk::Picture>,
+    animation: Rc<gdk_pixbuf::PixbufAnimationIter>,
+) {
+    let delay = animation
+        .delay_time()
+        .filter(|delay| !delay.is_zero())
+        .unwrap_or(Duration::from_millis(100))
+        .max(Duration::from_millis(16));
+    glib::timeout_add_local_once(delay, move || {
+        let Some(picture) = weak_picture.upgrade() else {
+            return;
+        };
+        if animation.advance(SystemTime::now()) {
+            set_status_emoji_animation_frame(&picture, &animation);
+        }
+        schedule_status_emoji_animation_frame(weak_picture, animation);
+    });
+}
+
+fn status_emoji_custom_picture(url: &str, label: &str) -> gtk::Picture {
+    let picture = gtk::Picture::new();
+    picture.set_alternative_text(Some(label));
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_size_request(30, 30);
+
+    let weak_picture = picture.downgrade();
+    let file = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE")
+        .map(gio::File::for_path)
+        .unwrap_or_else(|| gio::File::for_uri(url));
+    file.read_async(
+        glib::Priority::DEFAULT,
+        gio::Cancellable::NONE,
+        move |stream| {
+            let Ok(stream) = stream else {
+                record_test_status_emoji_animation_error("open");
+                return;
+            };
+            let weak_picture = weak_picture.clone();
+            gdk_pixbuf::PixbufAnimation::from_stream_async(
+                &stream,
+                gio::Cancellable::NONE,
+                move |animation| {
+                    let Some(picture) = weak_picture.upgrade() else {
+                        return;
+                    };
+                    let Ok(animation) = animation else {
+                        record_test_status_emoji_animation_error("decode");
+                        return;
+                    };
+                    let frame = Rc::new(animation.iter(Some(SystemTime::now())));
+                    set_status_emoji_animation_frame(&picture, &frame);
+                    if !animation.is_static_image() {
+                        schedule_status_emoji_animation_frame(weak_picture, frame);
+                    }
+                },
+            );
+        },
+    );
+    picture
+}
+
 fn status_emoji_picker_choice(entry: &EmojiPickerResultEntry) -> gtk::FlowBoxChild {
     let child = gtk::FlowBoxChild::new();
     child.set_tooltip_text(Some(&format!(":{}:", entry.name)));
@@ -2401,12 +2489,7 @@ fn status_emoji_picker_choice(entry: &EmojiPickerResultEntry) -> gtk::FlowBoxChi
         EmojiPickerResultValueKind::CustomImage
             if entry.value.starts_with("https://") || entry.value.starts_with("http://") =>
         {
-            let picture = gtk::Picture::for_file(&gio::File::for_uri(&entry.value));
-            picture.set_alternative_text(Some(&entry.label));
-            picture.set_can_shrink(true);
-            picture.set_content_fit(gtk::ContentFit::Contain);
-            picture.set_size_request(30, 30);
-            picture.upcast()
+            status_emoji_custom_picture(&entry.value, &entry.label).upcast()
         }
         EmojiPickerResultValueKind::CustomImage => {
             let label = gtk::Label::new(Some(&format!(":{}:", entry.name)));

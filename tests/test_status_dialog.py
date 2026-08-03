@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 
 
@@ -21,21 +19,6 @@ ANIMATED_GIF = bytes.fromhex(
     "030100000021f90400000000002c000000000200020000020284510021f904000a"
     "0000002c0000000002000200800000ff00000002028451003b"
 )
-
-
-class EmojiHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        if self.path != "/late-status-parrot.gif":
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "image/gif")
-        self.send_header("Content-Length", str(len(ANIMATED_GIF)))
-        self.end_headers()
-        self.wfile.write(ANIMATED_GIF)
-
-    def log_message(self, _format: str, *_args: object) -> None:
-        pass
 
 
 def wait_until(predicate, timeout: float = 20.0, interval: float = 0.1):
@@ -93,14 +76,13 @@ def main() -> None:
     binary = Path(os.environ["CONDUIT_TEST_BINARY"])
     resource = Path(os.environ["CONDUIT_TEST_RESOURCE"])
     schema = Path(os.environ["CONDUIT_TEST_SCHEMA"])
-    emoji_server = ThreadingHTTPServer(("127.0.0.1", 0), EmojiHandler)
-    emoji_server_thread = threading.Thread(target=emoji_server.serve_forever, daemon=True)
-    emoji_server_thread.start()
 
     with tempfile.TemporaryDirectory(
         prefix="conduit-status-ui-", ignore_cleanup_errors=True
     ) as temporary:
         root = Path(temporary)
+        animated_emoji = root / "late-status-parrot.gif"
+        animated_emoji.write_bytes(ANIMATED_GIF)
         shutil.copy2(schema, root / schema.name)
         subprocess.run(
             ["glib-compile-schemas", "--strict", str(root)],
@@ -114,7 +96,7 @@ def main() -> None:
                 "CONDUIT_RESOURCE_PATH": str(resource),
                 "CONDUIT_TEST_WORKSPACE": "1",
                 "CONDUIT_TEST_STATUS_DIALOG": "1",
-                "CONDUIT_TEST_STATUS_EMOJI_PORT": str(emoji_server.server_port),
+                "CONDUIT_TEST_STATUS_EMOJI_FILE": str(animated_emoji),
                 "GSETTINGS_SCHEMA_DIR": str(root),
                 "XDG_CACHE_HOME": str(root / "cache"),
                 "XDG_CONFIG_HOME": str(root / "config"),
@@ -156,7 +138,6 @@ def main() -> None:
                 "emoji_popup_visible": False,
                 "emoji_selected_name": "house",
                 "emoji_selected_visible_name": None,
-                "expect_animation": True,
             },
             {
                 "name": "late-custom-filter",
@@ -178,6 +159,7 @@ def main() -> None:
                 "emoji_popup_visible": True,
                 "emoji_selected_name": "house",
                 "emoji_selected_visible_name": None,
+                "expect_animation": True,
             },
             {
                 "name": "default-grid",
@@ -240,6 +222,11 @@ def main() -> None:
                 wait_for_window(process)
 
                 def expected_state() -> dict | None:
+                    if process.poll() is not None:
+                        _, stderr = process.communicate()
+                        raise AssertionError(
+                            f"Conduit exited with {process.returncode}:\n{stderr}"
+                        )
                     if not state_path.exists():
                         return None
                     try:
@@ -314,7 +301,17 @@ def main() -> None:
                             return False
                         return animation.get("frame_updates", 0) >= 2
 
-                    wait_until(animation_advanced, timeout=5.0)
+                    try:
+                        wait_until(animation_advanced, timeout=5.0)
+                    except AssertionError as error:
+                        observed = (
+                            animation_path.read_text(encoding="utf-8")
+                            if animation_path.exists()
+                            else "<missing>"
+                        )
+                        raise AssertionError(
+                            f"{error}; last animation state: {observed}"
+                        ) from error
 
                 quit_application(environment)
                 assert process.wait(timeout=10) == 0
@@ -330,9 +327,6 @@ def main() -> None:
                         process.kill()
                         process.wait(timeout=5)
 
-        emoji_server.shutdown()
-        emoji_server.server_close()
-        emoji_server_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
