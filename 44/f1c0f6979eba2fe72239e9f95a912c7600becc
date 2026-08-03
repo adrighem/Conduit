@@ -1,0 +1,7 @@
+Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers
+
+Summary: Replaced timeline data URIs with known SHA-256 conduit-asset hosts; served only registered assets from a private WebKit context; shared bytes without base64 document copies; bounded cache reads to 16 MiB payloads; enforced an exact raster/video MIME allowlist; carried media kind through DOM deltas; replaced the root ResizeObserver with window-resize and captured media-load correction.
+
+Modified: src/runtime.rs, src/slack.rs, src/window.rs, src/message_html.rs, src/timeline_dom_runtime.js, tests/test_timeline_scroll.py
+
+Rationale: Prevent arbitrary scheme resolution and oversized/active-content cache reads while reducing document memory and observer churn. Coverage tooling is not configured; Rust and production WebKit headless regressions cover the boundary.
