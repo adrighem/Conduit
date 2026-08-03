@@ -509,4 +509,5 @@
 - Added bounded model tests and expanded the production GTK status-dialog smoke test for lazy materialization, layout, categories, paging, custom search, close, and reopen behavior.
 - Local sanitized validation: rustfmt, Cargo check, 891 tests with 3 ignored, Meson compile, cross-picker headless tests, and all 17 serial Meson suites pass. Visual inspection confirmed the full picker remains visible beside the status dialog.
 - Coverage tooling is not configured. Local strict Clippy remains unavailable because installed Clippy is Rust 1.87 while CI uses the project toolchain.
+- Exact-head CI first exposed Rust 1.97's `type_complexity` lint on the picker callback. Commit `46e1f95` introduced a named handler type, after which CI `30809821964`, CodeQL `30809821289`, and guarded release automation `30810336492` passed.
 - No issue comments, labels, closures, or pull request actions were performed.
