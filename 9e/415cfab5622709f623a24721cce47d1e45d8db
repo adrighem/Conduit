@@ -1,0 +1,9 @@
+Task: Make ThreadPane create its WebView on the first thread open
+
+Summary: Kept the GTK ThreadPane shell eager but made its WebView shared optional state, materialized it through the normal configured WebView path on the first real placeholder/document load, reused the main WebContext, NetworkSession, and zoom, and made close, Escape, font updates, and frame flushes optional-view safe. Added an integration transition assertion from zero startup creations to one first-open creation.
+
+Files: src/thread_pane.rs, src/window.rs, tests/test_search_provider.py
+
+Rationale: Removes the secondary renderer from startup without changing the WebKit security/session configuration or recreating it on incidental paths.
+
+Validation: Meson compile passed; GNOME search provider and Window state persistence headless suites passed; rustfmt, Python parsing, and diff checks passed.
