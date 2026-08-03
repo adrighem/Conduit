@@ -138,6 +138,7 @@ def main() -> None:
                 "emoji_popup_visible": False,
                 "emoji_selected_name": "house",
                 "emoji_selected_visible_name": None,
+                "emoji_selected_summary_kind": "unicode",
             },
             {
                 "name": "late-custom-filter",
@@ -159,6 +160,7 @@ def main() -> None:
                 "emoji_popup_visible": True,
                 "emoji_selected_name": "house",
                 "emoji_selected_visible_name": None,
+                "emoji_selected_summary_kind": "unicode",
                 "expect_animation": True,
             },
             {
@@ -222,6 +224,7 @@ def main() -> None:
                 "emoji_popup_visible": True,
                 "emoji_selected_name": "house",
                 "emoji_selected_visible_name": None,
+                "emoji_selected_summary_kind": "unicode",
             },
         ]
 

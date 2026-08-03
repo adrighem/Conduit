@@ -150,7 +150,7 @@ struct UserStatusPresentation {
     accessible_text: String,
 }
 
-type StatusEmojiChoiceHandler = Rc<dyn Fn(&str, &str)>;
+type StatusEmojiChoiceHandler = Rc<dyn Fn(Option<EmojiPickerResultEntry>)>;
 
 #[derive(Debug, Clone)]
 struct StatusEmojiPickerModel {
@@ -160,6 +160,7 @@ struct StatusEmojiPickerModel {
 #[derive(Debug, Clone)]
 struct StatusEmojiPicker {
     row: adw::ActionRow,
+    selected_preview: gtk::Box,
     popover: gtk::Popover,
     search: gtk::SearchEntry,
     page: StatusEmojiPickerPage,
@@ -2341,16 +2342,12 @@ impl StatusEmojiPickerModel {
         name.is_empty() || self.emojis.entries().iter().any(|entry| entry.name == name)
     }
 
-    fn selected_label(&self, name: &str) -> String {
-        if name.is_empty() {
-            return gettext("No emoji");
-        }
+    fn selected_entry(&self, name: &str) -> Option<EmojiPickerResultEntry> {
         self.emojis
             .entries()
             .iter()
             .find(|entry| entry.name == name)
-            .map(status_emoji_entry_label)
-            .unwrap_or_else(|| format!(":{name}:"))
+            .map(EmojiPickerResultEntry::from)
     }
 
     fn page(&self, query: &str, category: Option<&str>, offset: usize) -> EmojiPickerResult {
@@ -2366,13 +2363,6 @@ impl StatusEmojiPickerModel {
     }
 }
 
-fn status_emoji_entry_label(entry: &EmojiEntry) -> String {
-    match entry.value {
-        EmojiValue::Unicode(glyph) => format!("{glyph} :{}: - {}", entry.name, entry.label),
-        EmojiValue::CustomImage(_) => format!(":{}: - {}", entry.name, entry.label),
-    }
-}
-
 fn status_emoji_result_label(entry: &EmojiPickerResultEntry) -> String {
     match entry.value_kind {
         EmojiPickerResultValueKind::Unicode => {
@@ -2382,6 +2372,46 @@ fn status_emoji_result_label(entry: &EmojiPickerResultEntry) -> String {
             format!(":{}: - {}", entry.name, entry.label)
         }
     }
+}
+
+fn update_status_emoji_selected_preview(
+    preview: &gtk::Box,
+    row: &adw::ActionRow,
+    selection: Option<&EmojiPickerResultEntry>,
+) {
+    while let Some(child) = preview.first_child() {
+        preview.remove(&child);
+    }
+
+    let Some(selection) = selection else {
+        preview.set_visible(false);
+        row.set_subtitle(&gettext("No emoji"));
+        return;
+    };
+    let visual: gtk::Widget = match selection.value_kind {
+        EmojiPickerResultValueKind::Unicode => {
+            let label = gtk::Label::new(Some(&selection.value));
+            label.add_css_class("title-3");
+            label.update_property(&[gtk::accessible::Property::Label(
+                &selection.accessible_label,
+            )]);
+            label.upcast()
+        }
+        EmojiPickerResultValueKind::CustomImage
+            if selection.value.starts_with("https://")
+                || selection.value.starts_with("http://") =>
+        {
+            status_emoji_custom_picture(&selection.value, &selection.accessible_label).upcast()
+        }
+        EmojiPickerResultValueKind::CustomImage => {
+            preview.set_visible(false);
+            row.set_subtitle(&status_emoji_result_label(selection));
+            return;
+        }
+    };
+    preview.append(&visual);
+    preview.set_visible(true);
+    row.set_subtitle(&format!("- {}", selection.label));
 }
 
 fn record_test_status_emoji_animation_frame() {
@@ -2687,13 +2717,14 @@ impl StatusEmojiPicker {
             "Choose a status emoji",
         ))]);
 
-        let selected_label = source.borrow().selected_label(&selected_name.borrow());
-        let row = adw::ActionRow::builder()
-            .title(gettext("Emoji"))
-            .subtitle(selected_label)
-            .build();
+        let row = adw::ActionRow::builder().title(gettext("Emoji")).build();
+        let selected_preview = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        selected_preview.set_valign(gtk::Align::Center);
+        row.add_prefix(&selected_preview);
         row.add_suffix(&button);
         row.set_activatable_widget(Some(&button));
+        let selection = source.borrow().selected_entry(&selected_name.borrow());
+        update_status_emoji_selected_preview(&selected_preview, &row, selection.as_ref());
 
         let page = StatusEmojiPickerPage {
             grid: grid.clone(),
@@ -2737,14 +2768,19 @@ impl StatusEmojiPicker {
         let on_selected: Rc<dyn Fn(&str)> = Rc::new(on_selected);
         let select_choice: StatusEmojiChoiceHandler = {
             let selected_name = selected_name.clone();
+            let weak_preview = selected_preview.downgrade();
             let weak_row = row.downgrade();
             let weak_popover = popover.downgrade();
             let weak_search = search.downgrade();
             let on_selected = on_selected.clone();
-            Rc::new(move |name, label| {
+            Rc::new(move |selection| {
+                let name = selection
+                    .as_ref()
+                    .map(|selection| selection.name.as_str())
+                    .unwrap_or_default();
                 selected_name.replace(name.to_string());
-                if let Some(row) = weak_row.upgrade() {
-                    row.set_subtitle(label);
+                if let (Some(preview), Some(row)) = (weak_preview.upgrade(), weak_row.upgrade()) {
+                    update_status_emoji_selected_preview(&preview, &row, selection.as_ref());
                 }
                 on_selected(name);
                 if let Some(search) = weak_search.upgrade() {
@@ -2767,7 +2803,7 @@ impl StatusEmojiPicker {
                 else {
                     return;
                 };
-                select_choice(&choice.name, &status_emoji_result_label(&choice));
+                select_choice(Some(choice));
             });
         }
 
@@ -2781,7 +2817,7 @@ impl StatusEmojiPicker {
                 let Some(choice) = visible_choices.borrow().first().cloned() else {
                     return;
                 };
-                select_choice(&choice.name, &status_emoji_result_label(&choice));
+                select_choice(Some(choice));
             });
         }
 
@@ -2902,7 +2938,7 @@ impl StatusEmojiPicker {
 
         {
             let select_choice = select_choice.clone();
-            clear_button.connect_clicked(move |_| select_choice("", &gettext("No emoji")));
+            clear_button.connect_clicked(move |_| select_choice(None));
         }
 
         {
@@ -2935,6 +2971,7 @@ impl StatusEmojiPicker {
 
         Self {
             row,
+            selected_preview,
             popover,
             search,
             page,
@@ -2980,7 +3017,11 @@ impl StatusEmojiPicker {
     }
 
     fn selected_summary_kind(&self) -> &'static str {
-        "text"
+        match self.selected_preview.first_child() {
+            Some(child) if child.is::<gtk::Picture>() => "custom-image",
+            Some(child) if child.is::<gtk::Label>() => "unicode",
+            _ => "text",
+        }
     }
 
     fn category_count(&self) -> usize {
@@ -3003,8 +3044,8 @@ impl StatusEmojiPicker {
         let selected_name = self.selected_name();
         self.source
             .replace(StatusEmojiPickerModel::new(custom_emojis, &selected_name));
-        self.row
-            .set_subtitle(&self.source.borrow().selected_label(&selected_name));
+        let selection = self.source.borrow().selected_entry(&selected_name);
+        update_status_emoji_selected_preview(&self.selected_preview, &self.row, selection.as_ref());
         if self.popover.is_visible() {
             self.page.populate(
                 &self.source.borrow(),
@@ -13439,8 +13480,11 @@ mod tests {
         let selected = StatusEmojiPickerModel::new(&HashMap::new(), ":still_loading:");
         assert!(selected.contains("still_loading"));
         assert_eq!(
-            selected.selected_label("still_loading"),
-            ":still_loading: - still loading"
+            selected
+                .selected_entry("still_loading")
+                .as_ref()
+                .map(status_emoji_result_label),
+            Some(":still_loading: - still loading".to_string())
         );
 
         let custom = HashMap::from([(
