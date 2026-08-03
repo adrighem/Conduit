@@ -493,11 +493,16 @@ mod imp {
                 );
                 *self.discovered_users.borrow_mut() = test_users;
                 if status_test && std::env::var_os("CONDUIT_TEST_STATUS_PRESET").is_some() {
+                    let emoji = if std::env::var_os("CONDUIT_TEST_STATUS_CUSTOM_PRESET").is_some() {
+                        ":late_status_parrot:"
+                    } else {
+                        ":house:"
+                    };
                     Arc::make_mut(&mut self.user_statuses.borrow_mut()).insert(
                         "UTEST".to_string(),
                         SlackUserStatus {
                             text: "Working remotely".to_string(),
-                            emoji: ":house:".to_string(),
+                            emoji: emoji.to_string(),
                             expiration: 0,
                         },
                     );
@@ -2972,6 +2977,10 @@ impl StatusEmojiPicker {
             .borrow()
             .get(selected as usize)
             .map(|choice| choice.name.clone())
+    }
+
+    fn selected_summary_kind(&self) -> &'static str {
+        "text"
     }
 
     fn category_count(&self) -> usize {
@@ -11751,6 +11760,7 @@ fn write_status_dialog_test_state(window: &ConduitWindow, state: &StatusDialogSt
             "emoji_contains_late_custom": state.emoji_picker.contains("late_status_parrot"),
             "emoji_selected_name": state.emoji_picker.selected_name(),
             "emoji_selected_visible_name": state.emoji_picker.selected_visible_name(),
+            "emoji_selected_summary_kind": state.emoji_picker.selected_summary_kind(),
             "expiration_choice_count": state.expiration_choice_count,
             "save_enabled": state.dialog.is_response_enabled("save"),
             "clear_available": state.dialog.has_response("clear"),

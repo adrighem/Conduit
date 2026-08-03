@@ -162,6 +162,28 @@ def main() -> None:
                 "expect_animation": True,
             },
             {
+                "name": "selected-custom-summary",
+                "extra_environment": {
+                    "CONDUIT_TEST_STATUS_CUSTOM_PRESET": "1",
+                    "CONDUIT_TEST_STATUS_LATE_EMOJI": "1",
+                    "CONDUIT_TEST_STATUS_PRESET": "1",
+                },
+                "save_enabled": True,
+                "clear_available": True,
+                "status_has_value": True,
+                "header_subtitle": "● Working remotely",
+                "maximum_width": None,
+                "emoji_query": "",
+                "emoji_first_visible_name": None,
+                "emoji_contains_late_custom": True,
+                "emoji_visible_count": 0,
+                "emoji_popup_visible": False,
+                "emoji_selected_name": "late_status_parrot",
+                "emoji_selected_visible_name": None,
+                "emoji_selected_summary_kind": "custom-image",
+                "expect_animation": True,
+            },
+            {
                 "name": "default-grid",
                 "extra_environment": {
                     "CONDUIT_TEST_STATUS_OPEN_EMOJI": "1",
@@ -270,6 +292,8 @@ def main() -> None:
                         == case["emoji_selected_name"]
                         and state.get("emoji_selected_visible_name")
                         == case["emoji_selected_visible_name"]
+                        and state.get("emoji_selected_summary_kind")
+                        == case.get("emoji_selected_summary_kind", "text")
                         and state.get("expiration_choice_count") == 6
                         and state.get("save_enabled") == case["save_enabled"]
                         and state.get("clear_available") == case["clear_available"]
