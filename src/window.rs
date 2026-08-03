@@ -14618,4 +14618,39 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn public_link_unfurl_images_are_left_to_the_web_view() {
+        let image_url = "https://images.example.test/card.png".to_string();
+        let messages = [SlackMessage {
+            attachments: Some(vec![crate::models::SlackAttachment {
+                image_url: Some(image_url),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }];
+
+        assert!(message_image_asset_requests(&messages, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn canonical_link_unfurl_images_remain_native_asset_requests() {
+        let image_url = "https://files.slack.com/files-pri/T123-F123/card.png".to_string();
+        let message = crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+            "ts": "1710000000.000200",
+            "attachments": [{
+                "title": "Private preview",
+                "image_url": image_url
+            }]
+        }))
+        .into_message()
+        .expect("message should normalize");
+        let message = crate::slack_message_wire::normalize_cached_message(message);
+
+        assert!(message.attachments.is_none());
+        assert_eq!(
+            message_image_asset_requests(&[message], &HashMap::new()),
+            vec![(image_url.clone(), image_url)]
+        );
+    }
 }

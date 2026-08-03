@@ -85,6 +85,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rich_message::MessageNode;
 
     #[derive(Deserialize)]
     struct MessageEnvelope {
@@ -127,5 +128,34 @@ mod tests {
 
         assert_eq!(message.attachments.as_ref().map(Vec::len), Some(1));
         assert!(message.document.has_visible_content());
+    }
+
+    #[test]
+    fn link_unfurl_image_survives_canonical_cache_normalization() {
+        let image_url = "https://files.slack.com/files-pri/T123-F123/card.png";
+        let message = SlackMessageWire::from_value(serde_json::json!({
+            "ts": "1710000000.000200",
+            "attachments": [{
+                "title": "Example site",
+                "title_link": "https://example.test/article",
+                "image_url": image_url
+            }]
+        }))
+        .into_message()
+        .expect("message should normalize");
+
+        let message = normalize_cached_message(message);
+
+        assert!(message.attachments.is_none());
+        let [MessageNode::Attachment(attachment)] = message.document.nodes() else {
+            panic!("expected one canonical attachment");
+        };
+        assert_eq!(
+            attachment
+                .image
+                .as_ref()
+                .and_then(|image| image.url.as_deref()),
+            Some(image_url)
+        );
     }
 }
