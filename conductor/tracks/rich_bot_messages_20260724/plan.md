@@ -42,3 +42,9 @@
 - [x] Task: Add shared synthetic Bob/Jira fixtures and contributor documentation for extending rich messages e41bb50
 - [x] Task: Run formatting, strict Clippy, Rust tests, Meson builds, DOM/headless tests, Release, and CodeQL 2628864
 - [x] Task: Conductor - User Manual Verification 'Acceptance and documentation' (Protocol in workflow.md) c17fdea
+
+## Phase 5: URL preview images
+
+- [~] Task: Add failing policy and canonical-discovery coverage for URL preview images
+- [ ] Task: Preserve public direct preview images and discover canonical private images
+- [ ] Task: Conductor - User Manual Verification 'URL preview images' (Protocol in workflow.md)
