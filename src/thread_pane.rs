@@ -17,8 +17,7 @@ use gettextrs::gettext;
 use gtk::prelude::*;
 use webkit6::prelude::WebViewExt;
 
-use crate::message_html::{self, MessageHtmlContext};
-use crate::models::SlackMessage;
+use crate::message_html;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ThreadPane {
@@ -65,33 +64,10 @@ impl ThreadPane {
         ));
     }
 
-    pub(crate) fn render(
-        &self,
-        channel_id: &str,
-        messages: &[SlackMessage],
-        context: &MessageHtmlContext,
-        focus_message_ts: Option<&str>,
-    ) {
-        let title = gettext("Thread");
-        self.title.set_title(&title);
+    pub(crate) fn load_document(&self, html: &str) {
+        self.title.set_title(&gettext("Thread"));
         self.split.set_show_sidebar(true);
-        if messages.is_empty() {
-            self.load_html(&message_html::placeholder_document(
-                &title,
-                &gettext("No replies"),
-            ));
-            return;
-        }
-
-        let started = Instant::now();
-        let html = message_html::conversation_document_with_focus(
-            channel_id,
-            messages,
-            context,
-            focus_message_ts,
-        );
-        log_performance(started, "html_generation", html.len());
-        self.load_html(&html);
+        self.load_html(html);
     }
 
     pub(crate) fn load_html(&self, html: &str) {

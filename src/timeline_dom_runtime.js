@@ -424,10 +424,9 @@
     return true;
   }
 
-  window.conduitApplyTimelinePatch = function (patch) {
+  function applyTimelinePatch(patch, arrivalVisible) {
     if (!patch || typeof patch.type !== "string") return false;
-    return withPreservedScroll(function (arrivalVisible) {
-      if (patch.type === "replace-snapshot") {
+    if (patch.type === "replace-snapshot") {
         const list = document.querySelector(".message-list");
         if (
           !list ||
@@ -554,7 +553,21 @@
         });
         return true;
       }
-      return false;
+    return false;
+  }
+
+  window.conduitApplyTimelinePatch = function (patch) {
+    return withPreservedScroll(function (arrivalVisible) {
+      return applyTimelinePatch(patch, arrivalVisible);
+    });
+  };
+
+  window.conduitApplyTimelineDelta = function (patches) {
+    if (!Array.isArray(patches) || patches.length === 0) return false;
+    return withPreservedScroll(function (arrivalVisible) {
+      return patches.every(function (patch) {
+        return applyTimelinePatch(patch, arrivalVisible);
+      });
     });
   };
 })();

@@ -156,11 +156,16 @@ START_PROBE = r"""
         '" style="min-height:' + (80 + index % 3 * 20) + 'px">Snapshot ' + index +
         ' with changed wrapping and dimensions.</article></li>';
     }).join("");
-    const snapshotApplied = window.conduitApplyTimelinePatch({
+    const snapshotApplied = window.conduitApplyTimelineDelta([{
       type: "replace-snapshot",
       list_html: snapshotHtml,
       load_more_html: '<nav class="timeline-action"><a href="conduit://load-older">Older</a></nav>'
-    });
+    }, {
+      type: "replace-message",
+      message_ts: "10",
+      html: '<article class="message" data-message-ts="10" style="min-height:100px">Snapshot 10 batched replacement.</article>',
+      part_html: ""
+    }]);
     await wait(100);
     const snapshotAnchor = document.querySelector('[data-message-ts="10"]');
     const snapshotAnchorDelta = snapshotAnchor.getBoundingClientRect().top - snapshotAnchorTop;
@@ -316,7 +321,7 @@ html, body {{ margin: 0; padding: 0; }}
     assert payload["replacementInlineHeight"] == "240px", payload
     assert abs(payload["anchorDelta"]) <= 2, payload
     assert payload["snapshotApplied"] is True, payload
-    assert payload["snapshotText"] == "Snapshot 10 with changed wrapping and dimensions.", payload
+    assert payload["snapshotText"] == "Snapshot 10 batched replacement.", payload
     assert abs(payload["snapshotAnchorDelta"]) <= 2, payload
     assert payload["snapshotLoadMore"] == "Older", payload
 

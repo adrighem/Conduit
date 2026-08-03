@@ -257,16 +257,28 @@ pub fn update_user_patch(
 /// JavaScript suitable for `WebView::evaluate_javascript`.
 #[allow(dead_code)]
 pub fn timeline_dom_patch_call(patch: &TimelineDomPatch) -> String {
-    let payload = serde_json::to_string(patch)
-        .expect("timeline DOM patch should serialize")
+    let payload = timeline_dom_payload(patch);
+    format!(
+        "window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch({payload}) : false;"
+    )
+}
+
+/// JavaScript suitable for applying one frame's timeline patches in one WebKit call.
+pub fn timeline_dom_delta_call(patches: &[TimelineDomPatch]) -> String {
+    let payload = timeline_dom_payload(patches);
+    format!(
+        "window.conduitApplyTimelineDelta ? window.conduitApplyTimelineDelta({payload}) : false;"
+    )
+}
+
+fn timeline_dom_payload<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    serde_json::to_string(value)
+        .expect("timeline DOM data should serialize")
         .replace('&', "\\u0026")
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029");
-    format!(
-        "window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch({payload}) : false;"
-    )
+        .replace('\u{2029}', "\\u2029")
 }
 
 impl TimelineScrollBehavior {
@@ -686,10 +698,6 @@ pub fn conversation_document_with_focus(
     context: &MessageHtmlContext,
     focus_message_ts: Option<&str>,
 ) -> String {
-    if messages.is_empty() {
-        return placeholder_document(&gettext("Messages"), &gettext("No messages"));
-    }
-
     let groups = message_groups(messages, context.first_unread_ts.as_deref());
     debug::log(
         "render",
@@ -734,7 +742,15 @@ pub fn conversation_document_with_focus(
             body.push_str(&load_more_action_html(url, &gettext("Load older messages")));
         }
     }
-    body.push_str("<ol class=\"message-list\">");
+    let empty_label = if context.thread_ts.is_some() {
+        gettext("No replies")
+    } else {
+        gettext("No messages")
+    };
+    body.push_str(&format!(
+        "<ol class=\"message-list\" data-empty-label=\"{}\">",
+        escape_html(&empty_label)
+    ));
     body.push_str(&conversation_list_items_html(channel_id, messages, context));
     body.push_str("</ol>");
     if context.read_marker_url.is_some()
@@ -1092,6 +1108,14 @@ a:hover {{
 
 .message-list-item {{
   display: block;
+}}
+
+.message-list:empty::before {{
+  display: block;
+  padding-block: 24px;
+  color: var(--muted);
+  text-align: center;
+  content: attr(data-empty-label);
 }}
 
 .unread-separator {{
@@ -5995,6 +6019,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_conversation_document_remains_incrementally_patchable() {
+        let html = conversation_document("C123", &[], &MessageHtmlContext::default());
+
+        assert!(html.contains(timeline_dom_runtime_script()));
+        assert!(html.contains("class=\"message-list\""));
+        assert!(html.contains("data-empty-label=\"No messages\""));
+    }
+
+    #[test]
     fn patch_call_serializes_untrusted_values_as_javascript_data() {
         let patch = update_user_patch(
             "U\"123",
@@ -6008,6 +6041,31 @@ mod tests {
         );
         let script = timeline_dom_patch_call(&patch);
 
+        assert!(script.contains("U\\\"123"));
+        assert!(script.contains("\\u003c/script\\u003e"));
+        assert!(script.contains("\\u0026"));
+        assert!(script.contains("\\u2028"));
+        assert!(!script.contains("</script>"));
+    }
+
+    #[test]
+    fn delta_call_batches_patches_and_serializes_untrusted_values_as_data() {
+        let patches = vec![
+            TimelineDomPatch::RemoveMessage {
+                message_ts: "1710000000.000100".to_string(),
+            },
+            TimelineDomPatch::UpdateUser {
+                user_id: "U\"123".to_string(),
+                name: "Ada & </script>\u{2028}".to_string(),
+                status_html: String::new(),
+            },
+        ];
+
+        let script = timeline_dom_delta_call(&patches);
+
+        assert_eq!(script.matches("conduitApplyTimelineDelta").count(), 2);
+        assert_eq!(script.matches("remove-message").count(), 1);
+        assert_eq!(script.matches("update-user").count(), 1);
         assert!(script.contains("U\\\"123"));
         assert!(script.contains("\\u003c/script\\u003e"));
         assert!(script.contains("\\u0026"));
