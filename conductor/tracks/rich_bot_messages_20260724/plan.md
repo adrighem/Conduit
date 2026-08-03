@@ -45,6 +45,6 @@
 
 ## Phase 5: URL preview images
 
-- [~] Task: Add failing policy and canonical-discovery coverage for URL preview images
-- [ ] Task: Preserve public direct preview images and discover canonical private images
+- [x] Task: Add failing policy and canonical-discovery coverage for URL preview images b20288a
+- [~] Task: Preserve public direct preview images and discover canonical private images
 - [ ] Task: Conductor - User Manual Verification 'URL preview images' (Protocol in workflow.md)
