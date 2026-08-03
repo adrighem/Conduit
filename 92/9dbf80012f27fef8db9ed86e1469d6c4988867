@@ -1,0 +1,9 @@
+Task: Implement and document the measured close and reopen lifecycle
+
+Summary: Extended the production integration seam to record visibility, exercised open, return-to-conversation, and reopen through real application actions, and documented the lazy-create/retain-until-disposal policy and observed renderer counts.
+
+Files: src/window.rs, tests/test_search_provider.py, tests/test_window_state.py, conductor/tracks/lazy_webview_emoji_20260729/measurements.md
+
+Rationale: Retaining the one materialized WebView preserves immediate reopen and current navigation/focus/scroll behavior while startup remains renderer-free; teardown is deferred until release measurements justify it.
+
+Validation: Meson compile passed; GNOME search provider and Window state persistence headless suites passed; the observed creation sequence was 0 at startup, 1 at first open, 1 after close, and 1 after reopen.
