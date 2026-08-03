@@ -1,0 +1,1 @@
+Exact-head validation for 750c9ba3842c30df6aca8871f89ceb3e26038abb: two consecutive local Meson runs passed 17/17. GitHub CI 30824247470 succeeded, including Rust 1.97.1 strict lint and both Meson build variants. CodeQL 30824247001 succeeded. Guarded Release 30825027821 succeeded.
