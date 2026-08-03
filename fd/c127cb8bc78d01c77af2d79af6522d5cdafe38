@@ -1,0 +1,7 @@
+Task: Migrate sidebar to GtkListView, gio::ListStore, and stable single selection
+
+Summary: Replaced eager GtkListBox row reconciliation with a virtualized ListView backed by projection-driven ListStore splices and updates. Selection and activation now resolve from authoritative keyed models; context-menu controllers avoid widget reference cycles.
+
+Modified files: src/sidebar.rs, src/window.rs, src/window.ui
+
+Rationale: Large workspaces now preserve unaffected model objects and materialize only visible widgets instead of rebuilding every sidebar row.
