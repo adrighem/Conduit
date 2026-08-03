@@ -1,0 +1,7 @@
+Task: Define SidebarProjection keyed splice/update/reset behavior with 1,430-row regression tests
+
+Summary: Added pure keyed projection operations, large-workspace update and insertion regression coverage, and projection-backed state for existing sidebar reconciliation.
+
+Modified files: src/sidebar.rs, src/window.rs
+
+Rationale: Establish a tested GTK-independent incremental model contract before replacing GtkListBox with gio::ListStore and GtkListView.
