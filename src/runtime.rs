@@ -40,15 +40,15 @@ use crate::slack::{
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
-    AttentionObservationStatus, StoreError, StoreErrorCategory, WorkspaceBootstrap, WorkspaceStore,
-    SyncFreshness,
+    AttentionObservationStatus, StoreError, StoreErrorCategory, SyncFreshness, WorkspaceBootstrap,
+    WorkspaceStore,
+};
+use crate::sync_scheduler::{
+    AdmissionOutcome, CancellationId, CompletionOutcome, FreshnessPolicy, JobOutcome, RefreshClass,
+    ReplacementClass, RetryPolicy, SchedulerConfig, SyncDurability, SyncJob, SyncJobId,
+    SyncPriority, SyncScheduler, SyncTargetKey, SyncTargetKind,
 };
 use crate::thread_catalog::ThreadRecord;
-use crate::sync_scheduler::{
-    SyncScheduler, SchedulerConfig, SyncJob, SyncPriority, SyncTargetKey, SyncTargetKind,
-    SyncDurability, FreshnessPolicy, ReplacementClass, RetryPolicy, SyncJobId, CancellationId,
-    JobOutcome, CompletionOutcome, AdmissionOutcome, RefreshClass,
-};
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
     MessageAttentionEffect, MessageMutationKind, MutationOrigin, SnapshotEnvelope, StoreBatch,
@@ -2795,9 +2795,10 @@ fn schedule_job_internal(
         SyncJobPayload::LoadHistory { channel_id } => {
             SyncTargetKey::new(SyncTargetKind::Conversation, hash_opaque_id(channel_id))
         }
-        SyncJobPayload::LoadThread { channel_id, ts } => {
-            SyncTargetKey::new(SyncTargetKind::Thread, hash_opaque_id(&format!("{channel_id}:{ts}")))
-        }
+        SyncJobPayload::LoadThread { channel_id, ts } => SyncTargetKey::new(
+            SyncTargetKind::Thread,
+            hash_opaque_id(&format!("{channel_id}:{ts}")),
+        ),
         SyncJobPayload::MembershipSync { channel_id } => {
             if channel_id == "user_directory" {
                 SyncTargetKey::new(SyncTargetKind::UserDirectory, 0)
@@ -2816,7 +2817,8 @@ fn schedule_job_internal(
         freshness,
         replacement,
         retry,
-    ).unwrap();
+    )
+    .unwrap();
 
     let admitted = {
         let mut scheduler = connection.scheduler.lock().unwrap();
@@ -2825,16 +2827,22 @@ fn schedule_job_internal(
 
     match admitted {
         Ok(AdmissionOutcome::Accepted { .. }) => {
-            connection.pending_jobs.lock().unwrap().insert(job_id, payload);
+            connection
+                .pending_jobs
+                .lock()
+                .unwrap()
+                .insert(job_id, payload);
             Some(job_id)
         }
-        Ok(AdmissionOutcome::SkippedFresh(_)) => {
-            None
-        }
+        Ok(AdmissionOutcome::SkippedFresh(_)) => None,
         Err(rejection) => {
             crate::debug::log(
                 "runtime",
-                &format!("SyncJobAdmissionRejected job_id={:?} reason={:?}", job_id, rejection.reason()),
+                &format!(
+                    "SyncJobAdmissionRejected job_id={:?} reason={:?}",
+                    job_id,
+                    rejection.reason()
+                ),
             );
             None
         }
@@ -2890,7 +2898,8 @@ fn drive_scheduler(
             spawn_session_task(state, identity.session, async move {
                 let _permit = limits.acquire(lane).await;
 
-                let outcome = match run_job_payload(payload, &connection_clone, &events_clone).await {
+                let outcome = match run_job_payload(payload, &connection_clone, &events_clone).await
+                {
                     Ok(()) => JobOutcome::Succeeded,
                     Err(error) => {
                         crate::debug::log(
@@ -2922,18 +2931,31 @@ fn drive_scheduler(
 
                 match completion {
                     Ok(CompletionOutcome::Completed) => {
-                        connection_clone.pending_jobs.lock().unwrap().remove(&job_id);
+                        connection_clone
+                            .pending_jobs
+                            .lock()
+                            .unwrap()
+                            .remove(&job_id);
                     }
                     Ok(_) => {}
                     Err(error) => {
                         crate::debug::log(
                             "runtime",
-                            &format!("SyncJobCompletionFailed job_id={:?} error={:?}", job_id, error),
+                            &format!(
+                                "SyncJobCompletionFailed job_id={:?} error={:?}",
+                                job_id, error
+                            ),
                         );
                     }
                 }
 
-                drive_scheduler(&state_clone, identity, connection_clone, limits, events_clone);
+                drive_scheduler(
+                    &state_clone,
+                    identity,
+                    connection_clone,
+                    limits,
+                    events_clone,
+                );
             });
         }
     }
@@ -2973,7 +2995,9 @@ async fn run_job_payload(
             if directory_empty {
                 schedule_job_internal(
                     connection,
-                    SyncJobPayload::MembershipSync { channel_id: "user_directory".to_string() },
+                    SyncJobPayload::MembershipSync {
+                        channel_id: "user_directory".to_string(),
+                    },
                     SyncPriority::Maintenance,
                     SyncDurability::Ephemeral,
                     FreshnessPolicy::Always,
@@ -3074,28 +3098,31 @@ async fn run_job_payload(
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as i64;
-                    store.store_sync_freshness(
-                        "user_directory",
-                        "workspace",
-                        SyncFreshness {
-                            refreshed_at_ms: Some(now_ms),
-                            retry_count: 0,
-                            retry_after_ms: None,
-                        },
-                    ).await?;
+                    store
+                        .store_sync_freshness(
+                            "user_directory",
+                            "workspace",
+                            SyncFreshness {
+                                refreshed_at_ms: Some(now_ms),
+                                retry_count: 0,
+                                retry_after_ms: None,
+                            },
+                        )
+                        .await?;
                 }
                 events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(aliases));
                 events.send_event(RuntimeEventKind::UserFullNamesLoaded(full_names));
                 events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(avatar_urls));
-                connection
-                    .user_status_sync
-                    .publish_snapshot(status_base_revision, |preserve_user_ids| {
+                connection.user_status_sync.publish_snapshot(
+                    status_base_revision,
+                    |preserve_user_ids| {
                         events.send_event(RuntimeEventKind::UserStatusesLoaded {
                             statuses,
                             replace_existing: true,
                             preserve_user_ids,
                         });
-                    });
+                    },
+                );
             }
         }
     }
