@@ -481,3 +481,13 @@
 - Local sanitized validation: rustfmt and Cargo check pass; 886 tests pass with 3 ignored; Meson compile and all 9 headless UI suites pass.
 - Exact-head sidebar validation: CI `30792968943`, CodeQL `30792968448`, and Release `30793496222` pass.
 - No issue comments, labels, closures, or pull request actions were performed.
+
+## 2026-08-03 ISSUE:12 Timeline Frame Batching
+
+- Wired main and thread WebViews to per-surface `TimelinePresenter` state in `b1f136a`.
+- Loading queues now drain as one serialized `TimelineDelta` per GTK frame; snapshot, realtime, user, and asset changes share the same path.
+- Full timeline documents are limited to initial/document navigation plus revision-mismatch or DOM-corruption recovery.
+- Empty conversations and threads retain the incremental runtime and localized empty state.
+- Local sanitized validation: rustfmt, Cargo check, 889 tests with 3 ignored, Meson compile, and all 17 Meson suites pass. The real WebKit scroll test applies a two-patch delta in one call.
+- Coverage tooling is not configured. Local strict Clippy remains unavailable because installed Clippy reports Rust 1.87 while the project requires Rust 1.88 or newer.
+- No issue comments, labels, closures, or pull request actions were performed.
