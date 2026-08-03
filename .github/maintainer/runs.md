@@ -491,3 +491,12 @@
 - Local sanitized validation: rustfmt, Cargo check, 889 tests with 3 ignored, Meson compile, and all 17 Meson suites pass. The real WebKit scroll test applies a two-patch delta in one call.
 - Coverage tooling is not configured. Local strict Clippy remains unavailable because installed Clippy reports Rust 1.87 while the project requires Rust 1.88 or newer.
 - No issue comments, labels, closures, or pull request actions were performed.
+
+## 2026-08-03 ISSUE:12 Restricted Timeline Assets
+
+- Replaced embedded preview data with known-key `conduit-asset://<sha256>` delivery in `44f1c0f`.
+- Cache/download/scheme boundaries enforce an exact raster/video MIME allowlist and 8/16 MiB payload bounds; oversized legacy cache files are rejected before reading.
+- Scheme responses share immutable bytes, unknown or malformed keys fail closed, and video kind remains explicit in DOM patches.
+- Removed the timeline root `ResizeObserver`; window resize and captured image/video load events preserve anchors.
+- Local sanitized validation: rustfmt, Cargo check, 891 tests with 3 ignored, Meson compile, and all 17 serial Meson suites pass. A parallel-only X11 keyboard activation race reproduced twice and passed both isolated reruns.
+- No issue comments, labels, closures, or pull request actions were performed.
