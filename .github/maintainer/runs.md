@@ -499,4 +499,14 @@
 - Scheme responses share immutable bytes, unknown or malformed keys fail closed, and video kind remains explicit in DOM patches.
 - Removed the timeline root `ResizeObserver`; window resize and captured image/video load events preserve anchors.
 - Local sanitized validation: rustfmt, Cargo check, 891 tests with 3 ignored, Meson compile, and all 17 serial Meson suites pass. A parallel-only X11 keyboard activation race reproduced twice and passed both isolated reruns.
+- Exact-head CI initially found Rust 1.97's `manual_div_ceil` lint; `a99cd59` replaced both manual ceiling divisions, and the new exact head passed default/native strict Clippy, both Meson matrices, CodeQL, and release validation.
+- No issue comments, labels, closures, or pull request actions were performed.
+
+## 2026-08-03 ISSUE:10 Native Status Emoji Grid
+
+- Replaced the eager native status emoji list with the reaction picker's search, horizontal categories, eight-column grid, custom emoji tiles, and 64-result paging in `47ee7eb`.
+- Kept an explicit no-emoji action and existing status save semantics; native tiles materialize only while the chooser is open and no additional WebView is created.
+- Added bounded model tests and expanded the production GTK status-dialog smoke test for lazy materialization, layout, categories, paging, custom search, close, and reopen behavior.
+- Local sanitized validation: rustfmt, Cargo check, 891 tests with 3 ignored, Meson compile, cross-picker headless tests, and all 17 serial Meson suites pass. Visual inspection confirmed the full picker remains visible beside the status dialog.
+- Coverage tooling is not configured. Local strict Clippy remains unavailable because installed Clippy is Rust 1.87 while CI uses the project toolchain.
 - No issue comments, labels, closures, or pull request actions were performed.
