@@ -1,0 +1,7 @@
+Task: Align the native status emoji picker with the bounded reaction-picker layout
+
+Summary: Replaced the eager status emoji list with a native reaction-style search, category tabs, eight-column grid, custom emoji tiles, explicit no-emoji action, and bounded 64-result paging. Materializes tiles only while open and reuses EmojiPickerModel without another WebView.
+
+Modified: src/emoji.rs, src/window.rs, tests/test_status_dialog.py, conductor/tracks/lazy_webview_emoji_20260729/spec.md, conductor/tracks/lazy_webview_emoji_20260729/metadata.json
+
+Rationale: Give status selection the preferred reaction-picker UX while keeping GTK integration, bounded widgets, shared query behavior, and existing status save semantics. Coverage tooling is not configured; 891 tests passed with 3 ignored and all 17 serial Meson suites passed.
