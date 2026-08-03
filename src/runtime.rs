@@ -2700,11 +2700,13 @@ fn spawn_workspace_tasks(
         schedule_job_internal(
             &hydration_connection,
             SyncJobPayload::WorkspaceStartup,
-            SyncPriority::Interactive,
-            SyncDurability::Ephemeral,
-            FreshnessPolicy::Always,
-            ReplacementClass::Refresh(RefreshClass::Workspace),
-            RetryPolicy::Never,
+            SyncJobPolicy {
+                priority: SyncPriority::Interactive,
+                durability: SyncDurability::Ephemeral,
+                freshness: FreshnessPolicy::Always,
+                replacement: ReplacementClass::Refresh(RefreshClass::Workspace),
+                retry: RetryPolicy::Never,
+            },
             now_ms,
         );
 
@@ -2774,14 +2776,18 @@ fn sync_job_cancellation_id(payload: &SyncJobPayload, job_sequence: u64) -> Canc
     }
 }
 
-fn schedule_job_internal(
-    connection: &RuntimeConnection,
-    payload: SyncJobPayload,
+struct SyncJobPolicy {
     priority: SyncPriority,
     durability: SyncDurability,
     freshness: FreshnessPolicy,
     replacement: ReplacementClass,
     retry: RetryPolicy,
+}
+
+fn schedule_job_internal(
+    connection: &RuntimeConnection,
+    payload: SyncJobPayload,
+    policy: SyncJobPolicy,
     now_ms: u64,
 ) -> Option<SyncJobId> {
     use std::sync::atomic::Ordering;
@@ -2812,11 +2818,11 @@ fn schedule_job_internal(
         job_id,
         cancellation_id,
         target,
-        priority,
-        durability,
-        freshness,
-        replacement,
-        retry,
+        policy.priority,
+        policy.durability,
+        policy.freshness,
+        policy.replacement,
+        policy.retry,
     )
     .unwrap();
 
@@ -2978,11 +2984,13 @@ async fn run_job_payload(
             schedule_job_internal(
                 connection,
                 SyncJobPayload::WorkspaceRefresh,
-                SyncPriority::Interactive,
-                SyncDurability::Ephemeral,
-                FreshnessPolicy::Always,
-                ReplacementClass::Refresh(RefreshClass::Workspace),
-                RetryPolicy::fixed(3, 1000).unwrap(),
+                SyncJobPolicy {
+                    priority: SyncPriority::Interactive,
+                    durability: SyncDurability::Ephemeral,
+                    freshness: FreshnessPolicy::Always,
+                    replacement: ReplacementClass::Refresh(RefreshClass::Workspace),
+                    retry: RetryPolicy::fixed(3, 1000).unwrap(),
+                },
                 now_ms,
             );
 
@@ -2998,11 +3006,13 @@ async fn run_job_payload(
                     SyncJobPayload::MembershipSync {
                         channel_id: "user_directory".to_string(),
                     },
-                    SyncPriority::Maintenance,
-                    SyncDurability::Ephemeral,
-                    FreshnessPolicy::Always,
-                    ReplacementClass::Refresh(RefreshClass::UserDirectory),
-                    RetryPolicy::fixed(3, 1000).unwrap(),
+                    SyncJobPolicy {
+                        priority: SyncPriority::Maintenance,
+                        durability: SyncDurability::Ephemeral,
+                        freshness: FreshnessPolicy::Always,
+                        replacement: ReplacementClass::Refresh(RefreshClass::UserDirectory),
+                        retry: RetryPolicy::fixed(3, 1000).unwrap(),
+                    },
                     now_ms,
                 );
             }
