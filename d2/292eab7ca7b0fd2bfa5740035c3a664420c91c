@@ -1,0 +1,9 @@
+Phase: Lazy thread WebView lifecycle
+
+Checkpoint: d2292ea
+
+Automated verification: Exact-head CI 30817337591, CodeQL 30817337576, and guarded release automation 30818103640 passed at 014708a. Local validation passed 891 Rust tests with 3 ignored measurements and all 17 Meson suites.
+
+Measured outcome: Startup process-tree PSS decreased by 45,255 KiB (20.5%) and one process while first-open and retained-reopen latency remained flat.
+
+Manual verification: User confirmed first thread open, close/reopen lifecycle, focus, scroll, and reaction-picker behavior passed on 2026-08-03.
