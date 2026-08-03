@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -37,8 +38,10 @@ START_PROBE = r"""
     window.scrollTo(0, 420);
     const initialScroll = window.scrollY;
 
+    const initialOpenStarted = performance.now();
     opener.click();
     await waitFor(() => document.querySelectorAll(".emoji-choice").length === 64);
+    const initialOpenMs = performance.now() - initialOpenStarted;
     const initialChoices = Array.from(document.querySelectorAll(".emoji-choice"));
     const staleDiscarded = !initialChoices.some((choice) => choice.dataset.emojiName === "stale");
     const bounded = initialChoices.length === 64;
@@ -119,6 +122,7 @@ START_PROBE = r"""
       customRendered,
       searchMatchedCustom,
       focusRestored,
+      initialOpenMs,
       scrollDelta,
       reactionScrollDelta,
       closedAfterReaction: !picker.open
@@ -341,6 +345,8 @@ Add reaction</button>
     assert payload["customRendered"] is True, payload
     assert payload["searchMatchedCustom"] is True, payload
     assert payload["focusRestored"] is True, payload
+    assert isinstance(payload["initialOpenMs"], (int, float)), payload
+    assert payload["initialOpenMs"] > 0, payload
     assert abs(payload["scrollDelta"]) <= 2, payload
     assert abs(payload["reactionScrollDelta"]) <= 2, payload
     assert payload["closedAfterReaction"] is True, payload
@@ -348,6 +354,8 @@ Add reaction</button>
     assert any(request["query"] == "party parr" for request in requests), requests
     assert any(request["offset"] == 64 for request in requests), requests
     assert reaction_uris and "name=workspace_party" in reaction_uris[-1], reaction_uris
+    if os.environ.get("CONDUIT_MEASURE_EMOJI_PICKER") == "1":
+        print(json.dumps(payload, sort_keys=True))
 
 
 if __name__ == "__main__":
