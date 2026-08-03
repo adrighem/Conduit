@@ -91,6 +91,7 @@ use crate::socket_mode::{
 };
 use crate::thread_catalog::ThreadCatalog;
 use crate::thread_pane::ThreadPane;
+use crate::workspace_pipeline::WorkspaceRevision;
 use crate::workspace_state::{
     resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
     ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
@@ -594,6 +595,237 @@ enum ComposerTarget {
 enum TimelineSurface {
     Main,
     Thread,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+enum TimelineDocument {
+    Conversation(String),
+    Thread { channel_id: String, ts: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct TimelineDelta {
+    document: TimelineDocument,
+    base_revision: WorkspaceRevision,
+    revision: WorkspaceRevision,
+    patches: Vec<TimelineDomPatch>,
+    scroll: TimelineScrollBehavior,
+}
+
+#[allow(dead_code)]
+impl TimelineDelta {
+    fn new(
+        document: TimelineDocument,
+        base_revision: WorkspaceRevision,
+        revision: WorkspaceRevision,
+        patches: Vec<TimelineDomPatch>,
+        scroll: TimelineScrollBehavior,
+    ) -> Option<Self> {
+        // Derived presentation enrichments (for example a delayed asset) can
+        // stay on the same authoritative workspace revision.
+        (revision >= base_revision && !patches.is_empty()).then_some(Self {
+            document,
+            base_revision,
+            revision,
+            patches,
+            scroll,
+        })
+    }
+
+    fn base_revision(&self) -> WorkspaceRevision {
+        self.base_revision
+    }
+
+    fn revision(&self) -> WorkspaceRevision {
+        self.revision
+    }
+
+    fn patches(&self) -> &[TimelineDomPatch] {
+        &self.patches
+    }
+
+    fn scroll(&self) -> TimelineScrollBehavior {
+        self.scroll
+    }
+
+    fn merge(&mut self, next: Self) {
+        debug_assert_eq!(self.document, next.document);
+        debug_assert_eq!(self.revision, next.base_revision);
+        self.revision = next.revision;
+        self.patches.extend(next.patches);
+        self.scroll = merge_timeline_delta_scroll(self.scroll, next.scroll);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum TimelinePresenterAction {
+    LoadDocument,
+    ReloadDocument,
+    ScheduleFrame,
+    Queued,
+    Ready,
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+struct TimelinePresenter {
+    document: Option<TimelineDocument>,
+    presented_revision: WorkspaceRevision,
+    loading: bool,
+    pending: Option<TimelineDelta>,
+    pinned_to_bottom: bool,
+    user_scrolled: bool,
+}
+
+#[allow(dead_code)]
+impl TimelinePresenter {
+    fn begin_document(
+        &mut self,
+        document: TimelineDocument,
+        revision: WorkspaceRevision,
+        scroll: TimelineScrollBehavior,
+    ) -> TimelinePresenterAction {
+        self.document = Some(document);
+        self.presented_revision = revision;
+        self.loading = true;
+        self.pending = None;
+        self.pinned_to_bottom = matches!(
+            scroll,
+            TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
+        );
+        self.user_scrolled = false;
+        TimelinePresenterAction::LoadDocument
+    }
+
+    fn document_loaded(
+        &mut self,
+        document: &TimelineDocument,
+        revision: WorkspaceRevision,
+    ) -> TimelinePresenterAction {
+        if self.document.as_ref() != Some(document) || self.presented_revision != revision {
+            return self.require_reload();
+        }
+        self.loading = false;
+        if self.pending.is_some() {
+            TimelinePresenterAction::ScheduleFrame
+        } else {
+            TimelinePresenterAction::Ready
+        }
+    }
+
+    fn queue_delta(&mut self, mut delta: TimelineDelta) -> TimelinePresenterAction {
+        let expected_revision = self
+            .pending
+            .as_ref()
+            .map(TimelineDelta::revision)
+            .unwrap_or(self.presented_revision);
+        if self.document.as_ref() != Some(&delta.document)
+            || delta.base_revision != expected_revision
+        {
+            return self.require_reload();
+        }
+
+        delta.scroll = effective_timeline_delta_scroll(
+            delta.scroll,
+            self.pinned_to_bottom,
+            self.user_scrolled,
+        );
+        if let Some(pending) = self.pending.as_mut() {
+            pending.merge(delta);
+            TimelinePresenterAction::Queued
+        } else {
+            self.pending = Some(delta);
+            if self.loading {
+                TimelinePresenterAction::Queued
+            } else {
+                TimelinePresenterAction::ScheduleFrame
+            }
+        }
+    }
+
+    fn take_frame(&mut self) -> Option<TimelineDelta> {
+        if self.loading {
+            return None;
+        }
+        let delta = self.pending.take()?;
+        debug_assert_eq!(delta.base_revision, self.presented_revision);
+        self.presented_revision = delta.revision;
+        Some(delta)
+    }
+
+    fn note_user_scrolled(&mut self) {
+        self.user_scrolled = true;
+        self.pinned_to_bottom = false;
+        if let Some(pending) = self.pending.as_mut() {
+            pending.scroll = effective_timeline_delta_scroll(pending.scroll, false, true);
+        }
+    }
+
+    fn note_pinned_to_bottom(&mut self) {
+        self.user_scrolled = false;
+        self.pinned_to_bottom = true;
+    }
+
+    fn patch_failed(&mut self) -> TimelinePresenterAction {
+        self.require_reload()
+    }
+
+    fn presented_revision(&self) -> WorkspaceRevision {
+        self.presented_revision
+    }
+
+    fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    fn require_reload(&mut self) -> TimelinePresenterAction {
+        self.loading = true;
+        self.pending = None;
+        TimelinePresenterAction::ReloadDocument
+    }
+}
+
+fn effective_timeline_delta_scroll(
+    requested: TimelineScrollBehavior,
+    pinned_to_bottom: bool,
+    user_scrolled: bool,
+) -> TimelineScrollBehavior {
+    if requested == TimelineScrollBehavior::PreservePrepend {
+        TimelineScrollBehavior::PreservePrepend
+    } else if user_scrolled || !pinned_to_bottom {
+        TimelineScrollBehavior::Preserve
+    } else if matches!(
+        requested,
+        TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
+    ) {
+        TimelineScrollBehavior::StickToBottom
+    } else {
+        TimelineScrollBehavior::Preserve
+    }
+}
+
+fn merge_timeline_delta_scroll(
+    current: TimelineScrollBehavior,
+    next: TimelineScrollBehavior,
+) -> TimelineScrollBehavior {
+    if current == TimelineScrollBehavior::PreservePrepend
+        || next == TimelineScrollBehavior::PreservePrepend
+    {
+        TimelineScrollBehavior::PreservePrepend
+    } else if matches!(
+        current,
+        TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
+    ) || matches!(
+        next,
+        TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
+    ) {
+        TimelineScrollBehavior::StickToBottom
+    } else {
+        TimelineScrollBehavior::Preserve
+    }
 }
 
 struct RealtimeMessagePatch<'a> {
@@ -11302,6 +11534,228 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    fn timeline_revision(value: usize) -> WorkspaceRevision {
+        (0..value).fold(WorkspaceRevision::INITIAL, |revision, _| {
+            revision.successor()
+        })
+    }
+
+    fn timeline_document() -> TimelineDocument {
+        TimelineDocument::Conversation("C123".to_string())
+    }
+
+    fn timeline_delta(
+        base: usize,
+        revision: usize,
+        patch: TimelineDomPatch,
+        scroll: TimelineScrollBehavior,
+    ) -> TimelineDelta {
+        TimelineDelta::new(
+            timeline_document(),
+            timeline_revision(base),
+            timeline_revision(revision),
+            vec![patch],
+            scroll,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn timeline_presenter_queues_loading_deltas_and_batches_one_frame() {
+        let document = timeline_document();
+        let mut presenter = TimelinePresenter::default();
+        assert_eq!(
+            presenter.begin_document(
+                document.clone(),
+                timeline_revision(1),
+                TimelineScrollBehavior::Bottom,
+            ),
+            TimelinePresenterAction::LoadDocument
+        );
+
+        let patches = [
+            TimelineDomPatch::InsertMessage {
+                position: TimelineInsertPosition::Append,
+                message_ts: "insert".to_string(),
+                arrival: None,
+                html: "<li>insert</li>".to_string(),
+            },
+            TimelineDomPatch::ReplaceMessage {
+                message_ts: "edit".to_string(),
+                arrival: None,
+                html: "<article>edit</article>".to_string(),
+                part_html: "<div>edit</div>".to_string(),
+            },
+            TimelineDomPatch::RemoveMessage {
+                message_ts: "delete".to_string(),
+            },
+            TimelineDomPatch::UpdateUser {
+                user_id: "U1".to_string(),
+                name: "Ada".to_string(),
+                status_html: String::new(),
+            },
+        ];
+        for (offset, patch) in patches.into_iter().enumerate() {
+            assert_eq!(
+                presenter.queue_delta(timeline_delta(
+                    1 + offset,
+                    2 + offset,
+                    patch,
+                    TimelineScrollBehavior::StickToBottom,
+                )),
+                TimelinePresenterAction::Queued
+            );
+        }
+
+        assert_eq!(
+            presenter.document_loaded(&document, timeline_revision(1)),
+            TimelinePresenterAction::ScheduleFrame
+        );
+        let batch = presenter.take_frame().unwrap();
+        assert_eq!(batch.base_revision(), timeline_revision(1));
+        assert_eq!(batch.revision(), timeline_revision(5));
+        assert_eq!(batch.patches().len(), 4);
+        assert_eq!(batch.scroll(), TimelineScrollBehavior::StickToBottom);
+        assert_eq!(presenter.presented_revision(), timeline_revision(5));
+        assert_eq!(presenter.take_frame(), None);
+    }
+
+    #[test]
+    fn timeline_presenter_revision_or_document_mismatch_requires_reload() {
+        let document = timeline_document();
+        let mut presenter = TimelinePresenter::default();
+        presenter.begin_document(
+            document.clone(),
+            timeline_revision(3),
+            TimelineScrollBehavior::Preserve,
+        );
+        presenter.document_loaded(&document, timeline_revision(3));
+
+        assert_eq!(
+            presenter.queue_delta(timeline_delta(
+                1,
+                4,
+                TimelineDomPatch::RemoveMessage {
+                    message_ts: "stale".to_string(),
+                },
+                TimelineScrollBehavior::Preserve,
+            )),
+            TimelinePresenterAction::ReloadDocument
+        );
+        assert!(presenter.is_loading());
+        assert_eq!(presenter.take_frame(), None);
+
+        let other = TimelineDocument::Conversation("C999".to_string());
+        let mismatched = TimelineDelta::new(
+            other,
+            timeline_revision(3),
+            timeline_revision(4),
+            vec![TimelineDomPatch::RemoveMessage {
+                message_ts: "other".to_string(),
+            }],
+            TimelineScrollBehavior::Preserve,
+        )
+        .unwrap();
+        assert_eq!(
+            presenter.queue_delta(mismatched),
+            TimelinePresenterAction::ReloadDocument
+        );
+
+        presenter.begin_document(
+            document.clone(),
+            timeline_revision(3),
+            TimelineScrollBehavior::Preserve,
+        );
+        presenter.document_loaded(&document, timeline_revision(3));
+        assert_eq!(
+            presenter.patch_failed(),
+            TimelinePresenterAction::ReloadDocument
+        );
+        assert!(presenter.is_loading());
+    }
+
+    #[test]
+    fn timeline_presenter_preserves_prepend_anchor_across_enrichment() {
+        let document = timeline_document();
+        let mut presenter = TimelinePresenter::default();
+        presenter.begin_document(
+            document.clone(),
+            timeline_revision(1),
+            TimelineScrollBehavior::Preserve,
+        );
+        presenter.document_loaded(&document, timeline_revision(1));
+        assert_eq!(
+            presenter.queue_delta(timeline_delta(
+                1,
+                2,
+                TimelineDomPatch::RemoveMessage {
+                    message_ts: "older".to_string(),
+                },
+                TimelineScrollBehavior::PreservePrepend,
+            )),
+            TimelinePresenterAction::ScheduleFrame
+        );
+        assert_eq!(
+            presenter.queue_delta(timeline_delta(
+                2,
+                3,
+                TimelineDomPatch::UpdateUser {
+                    user_id: "U1".to_string(),
+                    name: "Ada".to_string(),
+                    status_html: String::new(),
+                },
+                TimelineScrollBehavior::Preserve,
+            )),
+            TimelinePresenterAction::Queued
+        );
+
+        assert_eq!(
+            presenter.take_frame().unwrap().scroll(),
+            TimelineScrollBehavior::PreservePrepend
+        );
+    }
+
+    #[test]
+    fn timeline_presenter_user_scroll_cancels_bottom_and_delayed_media_following() {
+        let document = timeline_document();
+        let mut presenter = TimelinePresenter::default();
+        presenter.begin_document(
+            document.clone(),
+            timeline_revision(1),
+            TimelineScrollBehavior::Bottom,
+        );
+        presenter.document_loaded(&document, timeline_revision(1));
+        presenter.note_user_scrolled();
+        presenter.queue_delta(timeline_delta(
+            1,
+            1,
+            TimelineDomPatch::UpdateImage {
+                asset_key: "asset".to_string(),
+                source: Some("conduit-asset://asset".to_string()),
+            },
+            TimelineScrollBehavior::StickToBottom,
+        ));
+
+        assert_eq!(
+            presenter.take_frame().unwrap().scroll(),
+            TimelineScrollBehavior::Preserve
+        );
+
+        presenter.note_pinned_to_bottom();
+        presenter.queue_delta(timeline_delta(
+            1,
+            2,
+            TimelineDomPatch::RemoveMessage {
+                message_ts: "new".to_string(),
+            },
+            TimelineScrollBehavior::StickToBottom,
+        ));
+        assert_eq!(
+            presenter.take_frame().unwrap().scroll(),
+            TimelineScrollBehavior::StickToBottom
+        );
     }
 
     fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {
