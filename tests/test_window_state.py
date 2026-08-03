@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -43,6 +44,13 @@ def wait_for_window(process: subprocess.Popen[str]) -> str:
         return next(iter(result.stdout.splitlines()), None)
 
     return wait_until(find_window)
+
+
+def read_json(path: Path) -> dict[str, object] | None:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
 
 
 def visible_window_ids(name: str) -> list[str]:
@@ -255,9 +263,11 @@ def main() -> None:
             text=True,
         )
         environment = os.environ.copy()
+        lifecycle_file = root / "webview-lifecycle.json"
         environment.update(
             {
                 "CONDUIT_RESOURCE_PATH": str(resource),
+                "CONDUIT_TEST_WEBVIEW_LIFECYCLE_FILE": str(lifecycle_file),
                 "CONDUIT_TEST_WORKSPACE": "1",
                 "GSETTINGS_BACKEND": "keyfile",
                 "GSETTINGS_SCHEMA_DIR": str(root),
@@ -271,6 +281,11 @@ def main() -> None:
         try:
             environment["CONDUIT_TEST_INITIAL_SYNC"] = "1"
             process, window_id = run_application(binary, environment)
+            lifecycle = wait_until(lambda: read_json(lifecycle_file))
+            assert lifecycle["main_web_view"] is True
+            assert lifecycle["thread_web_view"] is False
+            assert lifecycle["thread_web_view_creations"] == 0
+            assert lifecycle["thread_widget_children"] == 0
             verify_initial_sync_interactive(window_id)
             stop_application(process, environment)
             process = None

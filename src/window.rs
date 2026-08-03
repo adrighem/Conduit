@@ -3744,6 +3744,7 @@ impl ConduitWindow {
 
         self.show_message_placeholder(&gettext("Select a conversation"));
         self.close_thread_pane();
+        record_test_web_view_lifecycle(self);
     }
 
     fn connect_timeline_load(&self, web_view: &webkit6::WebView, surface: TimelineSurface) {
@@ -11554,6 +11555,29 @@ fn set_huddle_button_state(button: &gtk::Button, icon_name: &str, label: &str) {
     button.set_icon_name(icon_name);
     button.set_tooltip_text(Some(label));
     button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
+fn record_test_web_view_lifecycle(window: &ConduitWindow) {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_WEBVIEW_LIFECYCLE_FILE") else {
+        return;
+    };
+    let imp = window.imp();
+    let mut thread_widget_children = 0;
+    let mut child = imp.thread_view_box.first_child();
+    while let Some(widget) = child {
+        thread_widget_children += 1;
+        child = widget.next_sibling();
+    }
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({
+            "main_web_view": imp.message_view.borrow().is_some(),
+            "thread_web_view": window.thread_pane().has_web_view(),
+            "thread_web_view_creations": window.thread_pane().web_view_creation_count(),
+            "thread_widget_children": thread_widget_children,
+        })
+        .to_string(),
+    );
 }
 
 fn record_test_huddle_surface(window: &imp::ConduitWindow) {

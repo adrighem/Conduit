@@ -11,6 +11,8 @@
 //! type owns the visual lifecycle so those layers do not also need to coordinate the sidebar,
 //! title, placeholder, and WebView as separate widgets.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Instant;
 
 use gettextrs::gettext;
@@ -24,6 +26,7 @@ pub(crate) struct ThreadPane {
     split: adw::OverlaySplitView,
     title: adw::WindowTitle,
     web_view: webkit6::WebView,
+    web_view_creations: Rc<Cell<usize>>,
 }
 
 impl ThreadPane {
@@ -38,7 +41,16 @@ impl ThreadPane {
             split: split.clone(),
             title: title.clone(),
             web_view,
+            web_view_creations: Rc::new(Cell::new(1)),
         }
+    }
+
+    pub(crate) fn has_web_view(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn web_view_creation_count(&self) -> usize {
+        self.web_view_creations.get()
     }
 
     pub(crate) fn web_view(&self) -> webkit6::WebView {
