@@ -1,0 +1,9 @@
+Task: Preserve animation when rendering custom emoji in the status picker
+
+Summary: Replaced the status grid's static GtkPicture file loader with asynchronous GdkPixbufAnimation decoding and delay-aware frame scheduling. Static formats continue through the same decoder; animation timers stop when their weak picture target disappears. Corrected the regression fixture to use a local GIF file because the headless runner has no HTTP GIO backend.
+
+Files: src/window.rs, tests/test_status_dialog.py
+
+Rationale: GtkPicture's file constructor exposes only a static frame for animated custom emoji. Explicitly advancing PixbufAnimation frames preserves motion without adding another WebView or blocking the GTK main thread.
+
+Validation: Meson compile passed without warnings; Status dialog and current-user header passed and observed at least two frames from the two-frame GIF.
