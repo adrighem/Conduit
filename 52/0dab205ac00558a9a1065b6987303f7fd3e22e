@@ -7,3 +7,5 @@ Files: tests/test_status_dialog.py, src/window.rs
 Rationale: The failure reproduces the user-visible bug through the real GTK status picker without Slack access or external network dependencies.
 
 Red verification: Meson compiled successfully; Status dialog and current-user header failed after 5 seconds because no animation frame update was recorded.
+
+Follow-up: The first red fixture revision placed the animation expectation on the preset case. Commit a4fcab4 moves it to late-custom-filter and switches the transport from local HTTP to a local file because Xvfb lacks the HTTP GIO backend. The acceptance signal remains two decoded frame updates; the original static GtkPicture path has no frame scheduler and cannot satisfy it.
