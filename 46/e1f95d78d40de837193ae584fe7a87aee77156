@@ -1,0 +1,9 @@
+Task: Repair Rust 1.97 picker lint
+
+Summary: Factored the status emoji choice callback into a named type alias so strict Clippy accepts the native picker implementation.
+
+Files: src/window.rs
+
+Rationale: Rust 1.97 flags the inline callback trait object as type_complexity under -D warnings.
+
+Validation: cargo fmt --check, git diff --check, and cargo check --locked passed locally. Exact Rust 1.97 Clippy will run in CI.
