@@ -45,7 +45,10 @@ use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::emoji::{
     emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
-    EmojiPickerGenerationGate, EmojiPickerModel, EmojiPickerMove, EmojiPickerQuery, EmojiValue,
+    EmojiPickerGenerationGate, EmojiPickerModel, EmojiPickerMove, EmojiPickerQuery,
+    EmojiPickerResult, EmojiPickerResultEntry, EmojiPickerResultValueKind, EmojiValue,
+    EMOJI_PICKER_CATEGORIES, EMOJI_PICKER_MAX_QUERY_CHARS, EMOJI_PICKER_PROTOCOL_VERSION,
+    EMOJI_PICKER_RESULT_LIMIT,
 };
 use crate::huddles::fallback::external_huddle_url;
 use crate::huddles::presentation::{present_huddle, HuddlePrimaryAction};
@@ -147,12 +150,6 @@ struct UserStatusPresentation {
     accessible_text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StatusEmojiChoice {
-    name: String,
-    label: String,
-}
-
 #[derive(Debug, Clone)]
 struct StatusEmojiPickerModel {
     emojis: EmojiPickerModel,
@@ -163,11 +160,27 @@ struct StatusEmojiPicker {
     row: adw::ActionRow,
     popover: gtk::Popover,
     search: gtk::SearchEntry,
-    visible_model: gtk::StringList,
-    visible_choices: Rc<RefCell<Vec<StatusEmojiChoice>>>,
-    selection: gtk::SingleSelection,
+    page: StatusEmojiPickerPage,
     source: Rc<RefCell<StatusEmojiPickerModel>>,
     selected_name: Rc<RefCell<String>>,
+    active_category: Rc<RefCell<String>>,
+    offset: Rc<Cell<usize>>,
+    category_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StatusEmojiPickerPage {
+    grid: gtk::FlowBox,
+    empty_label: gtk::Label,
+    category_bar: gtk::Widget,
+    page_controls: gtk::Widget,
+    page_status: gtk::Label,
+    previous: gtk::Button,
+    next: gtk::Button,
+    visible_choices: Rc<RefCell<Vec<EmojiPickerResultEntry>>>,
+    total: Rc<Cell<usize>>,
+    has_previous: Rc<Cell<bool>>,
+    has_more: Rc<Cell<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2333,29 +2346,16 @@ impl StatusEmojiPickerModel {
             .unwrap_or_else(|| format!(":{name}:"))
     }
 
-    fn search(&self, query: &str) -> Vec<StatusEmojiChoice> {
-        let normalized_query = query.trim().to_lowercase();
-        let mut choices = Vec::new();
-        if normalized_query.is_empty()
-            || gettext("No emoji")
-                .to_lowercase()
-                .contains(&normalized_query)
-        {
-            choices.push(StatusEmojiChoice {
-                name: String::new(),
-                label: gettext("No emoji"),
-            });
-        }
-        choices.extend(
-            self.emojis
-                .search(query)
-                .into_iter()
-                .map(|entry| StatusEmojiChoice {
-                    name: entry.name.clone(),
-                    label: status_emoji_entry_label(&entry),
-                }),
-        );
-        choices
+    fn page(&self, query: &str, category: Option<&str>, offset: usize) -> EmojiPickerResult {
+        self.emojis
+            .query(&EmojiPickerQuery {
+                version: EMOJI_PICKER_PROTOCOL_VERSION,
+                generation: 1,
+                query: query.chars().take(EMOJI_PICKER_MAX_QUERY_CHARS).collect(),
+                category: category.map(str::to_string),
+                offset,
+            })
+            .expect("status emoji picker creates valid bounded queries")
     }
 }
 
@@ -2366,34 +2366,108 @@ fn status_emoji_entry_label(entry: &EmojiEntry) -> String {
     }
 }
 
-fn populate_status_emoji_picker_results(
-    source: &StatusEmojiPickerModel,
-    query: &str,
-    visible_model: &gtk::StringList,
-    visible_choices: &RefCell<Vec<StatusEmojiChoice>>,
-) {
-    let choices = source.search(query);
-    let labels = choices
-        .iter()
-        .map(|choice| choice.label.as_str())
-        .collect::<Vec<_>>();
-    visible_model.splice(0, visible_model.n_items(), &labels);
-    visible_choices.replace(choices);
+fn status_emoji_result_label(entry: &EmojiPickerResultEntry) -> String {
+    match entry.value_kind {
+        EmojiPickerResultValueKind::Unicode => {
+            format!("{} :{}: - {}", entry.value, entry.name, entry.label)
+        }
+        EmojiPickerResultValueKind::CustomImage => {
+            format!(":{}: - {}", entry.name, entry.label)
+        }
+    }
 }
 
-fn sync_status_emoji_picker_selection(
-    visible_choices: &RefCell<Vec<StatusEmojiChoice>>,
-    selected_name: &RefCell<String>,
-    selection: &gtk::SingleSelection,
-) {
-    let selected_name = selected_name.borrow();
-    let position = visible_choices
-        .borrow()
-        .iter()
-        .position(|choice| choice.name == selected_name.as_str())
-        .map(|position| position as u32)
-        .unwrap_or(gtk::INVALID_LIST_POSITION);
-    selection.set_selected(position);
+fn status_emoji_picker_choice(entry: &EmojiPickerResultEntry) -> gtk::FlowBoxChild {
+    let child = gtk::FlowBoxChild::new();
+    child.set_tooltip_text(Some(&format!(":{}:", entry.name)));
+    child.update_property(&[gtk::accessible::Property::Label(&entry.accessible_label)]);
+    let content: gtk::Widget = match entry.value_kind {
+        EmojiPickerResultValueKind::Unicode => {
+            let label = gtk::Label::new(Some(&entry.value));
+            label.add_css_class("title-3");
+            label.upcast()
+        }
+        EmojiPickerResultValueKind::CustomImage
+            if entry.value.starts_with("https://") || entry.value.starts_with("http://") =>
+        {
+            let picture = gtk::Picture::for_file(&gio::File::for_uri(&entry.value));
+            picture.set_alternative_text(Some(&entry.label));
+            picture.set_can_shrink(true);
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_size_request(30, 30);
+            picture.upcast()
+        }
+        EmojiPickerResultValueKind::CustomImage => {
+            let label = gtk::Label::new(Some(&format!(":{}:", entry.name)));
+            label.upcast()
+        }
+    };
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    content.set_margin_start(6);
+    content.set_margin_end(6);
+    child.set_child(Some(&content));
+    child
+}
+
+impl StatusEmojiPickerPage {
+    fn clear(&self) {
+        while let Some(child) = self.grid.first_child() {
+            self.grid.remove(&child);
+        }
+        self.visible_choices.borrow_mut().clear();
+        self.total.set(0);
+        self.has_previous.set(false);
+        self.has_more.set(false);
+        self.page_status.set_label("");
+        self.page_controls.set_visible(false);
+        self.empty_label.set_visible(false);
+    }
+
+    fn populate(
+        &self,
+        source: &StatusEmojiPickerModel,
+        query: &str,
+        category: &str,
+        offset: usize,
+        selected_name: &str,
+    ) {
+        let category = query.trim().is_empty().then_some(category);
+        let result = source.page(query, category, offset);
+        self.clear();
+        for entry in &result.entries {
+            self.grid.insert(&status_emoji_picker_choice(entry), -1);
+        }
+        self.visible_choices.replace(result.entries);
+        self.total.set(result.total);
+        self.has_previous.set(result.has_previous);
+        self.has_more.set(result.has_more);
+        self.previous.set_sensitive(result.has_previous);
+        self.next.set_sensitive(result.has_more);
+        self.category_bar.set_visible(query.trim().is_empty());
+        self.empty_label
+            .set_visible(self.visible_choices.borrow().is_empty());
+        self.page_controls
+            .set_visible(result.has_previous || result.has_more);
+        let end = result.offset + self.visible_choices.borrow().len();
+        let page_label = if result.total == 0 {
+            String::new()
+        } else {
+            format!("{}-{end} / {}", result.offset + 1, result.total)
+        };
+        self.page_status.set_label(&page_label);
+        self.grid.unselect_all();
+        if let Some(index) = self
+            .visible_choices
+            .borrow()
+            .iter()
+            .position(|choice| choice.name == selected_name)
+        {
+            if let Some(child) = self.grid.child_at_index(index as i32) {
+                self.grid.select_child(&child);
+            }
+        }
+    }
 }
 
 impl StatusEmojiPicker {
@@ -2409,75 +2483,103 @@ impl StatusEmojiPicker {
             custom_emojis,
             selected_emoji,
         )));
-        let visible_model = gtk::StringList::new(&[]);
         let visible_choices = Rc::new(RefCell::new(Vec::new()));
+        let active_category = Rc::new(RefCell::new(EMOJI_PICKER_CATEGORIES[0].to_string()));
+        let offset = Rc::new(Cell::new(0_usize));
 
-        let factory = gtk::SignalListItemFactory::new();
-        factory.connect_setup(|_, object| {
-            let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
-                return;
-            };
-            let label = gtk::Label::new(None);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            label.set_hexpand(true);
-            label.set_margin_top(6);
-            label.set_margin_bottom(6);
-            label.set_margin_start(8);
-            label.set_margin_end(8);
-            label.set_xalign(0.0);
-            item.set_child(Some(&label));
-        });
-        factory.connect_bind(|_, object| {
-            let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
-                return;
-            };
-            let Some(label) = item.child().and_downcast::<gtk::Label>() else {
-                return;
-            };
-            let Some(value) = item.item().and_downcast::<gtk::StringObject>() else {
-                return;
-            };
-            label.set_label(&value.string());
-            label.update_property(&[gtk::accessible::Property::Label(value.string().as_str())]);
-        });
-
-        let selection = gtk::SingleSelection::new(Some(visible_model.clone()));
-        selection.set_autoselect(false);
-        selection.set_can_unselect(true);
-        selection.set_selected(gtk::INVALID_LIST_POSITION);
-        let list = gtk::ListView::new(Some(selection.clone()), Some(factory));
-        list.set_single_click_activate(true);
-        list.add_css_class("navigation-sidebar");
-        list.update_property(&[gtk::accessible::Property::Label(&gettext(
+        let grid = gtk::FlowBox::new();
+        grid.set_activate_on_single_click(true);
+        grid.set_column_spacing(4);
+        grid.set_row_spacing(4);
+        grid.set_homogeneous(true);
+        grid.set_min_children_per_line(6);
+        grid.set_max_children_per_line(8);
+        grid.set_selection_mode(gtk::SelectionMode::Single);
+        grid.update_property(&[gtk::accessible::Property::Label(&gettext(
             "Status emoji choices",
         ))]);
 
         let search = gtk::SearchEntry::new();
         search.set_placeholder_text(Some(&gettext("Search emoji")));
         search.update_property(&[gtk::accessible::Property::Label(&gettext("Search emoji"))]);
-        search.set_key_capture_widget(Some(&list));
+        search.set_key_capture_widget(Some(&grid));
+
+        let category_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        let mut category_buttons = Vec::new();
+        let mut first_category_button: Option<gtk::ToggleButton> = None;
+        for category in EMOJI_PICKER_CATEGORIES {
+            let category_button = gtk::ToggleButton::with_label(category);
+            category_button.add_css_class("flat");
+            if let Some(first) = first_category_button.as_ref() {
+                category_button.set_group(Some(first));
+            } else {
+                category_button.set_active(true);
+                first_category_button = Some(category_button.clone());
+            }
+            category_box.append(&category_button);
+            category_buttons.push(((*category).to_string(), category_button));
+        }
+        let category_scroller = gtk::ScrolledWindow::new();
+        category_scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+        category_scroller.set_child(Some(&category_box));
+
+        let empty_label = gtk::Label::new(Some(&gettext("No emoji found")));
+        empty_label.add_css_class("dim-label");
+        empty_label.set_margin_top(16);
+        empty_label.set_margin_bottom(16);
+        empty_label.set_visible(false);
 
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        scroller.set_min_content_width(320);
+        scroller.set_min_content_width(420);
         scroller.set_min_content_height(280);
         scroller.set_max_content_height(360);
         scroller.set_propagate_natural_height(true);
-        scroller.set_child(Some(&list));
+        scroller.set_child(Some(&grid));
+
+        let previous = gtk::Button::with_label(&gettext("Previous"));
+        previous.add_css_class("flat");
+        let page_status = gtk::Label::new(None);
+        page_status.set_hexpand(true);
+        page_status.add_css_class("dim-label");
+        let next = gtk::Button::with_label(&gettext("Next"));
+        next.add_css_class("flat");
+        let page_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        page_controls.append(&previous);
+        page_controls.append(&page_status);
+        page_controls.append(&next);
+        page_controls.set_visible(false);
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let heading = gtk::Label::new(Some(&gettext("Choose emoji")));
+        heading.add_css_class("heading");
+        heading.set_xalign(0.0);
+        heading.set_hexpand(true);
+        let clear_button = gtk::Button::with_label(&gettext("No emoji"));
+        clear_button.add_css_class("flat");
+        header.append(&heading);
+        header.append(&clear_button);
 
         let picker_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        picker_content.set_size_request(480, -1);
         picker_content.set_margin_top(8);
         picker_content.set_margin_bottom(8);
         picker_content.set_margin_start(8);
         picker_content.set_margin_end(8);
+        picker_content.append(&header);
         picker_content.append(&search);
+        picker_content.append(&category_scroller);
         picker_content.append(&scroller);
+        picker_content.append(&empty_label);
+        picker_content.append(&page_controls);
 
         let popover = gtk::Popover::new();
         popover.set_autohide(true);
+        popover.set_position(gtk::PositionType::Left);
         popover.set_child(Some(&picker_content));
 
         let button = gtk::MenuButton::new();
+        button.set_direction(gtk::ArrowType::Left);
         button.set_icon_name("pan-down-symbolic");
         button.set_popover(Some(&popover));
         button.set_tooltip_text(Some(&gettext("Choose a status emoji")));
@@ -2494,63 +2596,85 @@ impl StatusEmojiPicker {
         row.add_suffix(&button);
         row.set_activatable_widget(Some(&button));
 
-        populate_status_emoji_picker_results(
-            &source.borrow(),
-            "",
-            &visible_model,
-            &visible_choices,
-        );
-        sync_status_emoji_picker_selection(&visible_choices, &selected_name, &selection);
+        let page = StatusEmojiPickerPage {
+            grid: grid.clone(),
+            empty_label,
+            category_bar: category_scroller.upcast(),
+            page_controls: page_controls.upcast(),
+            page_status,
+            previous: previous.clone(),
+            next: next.clone(),
+            visible_choices: visible_choices.clone(),
+            total: Rc::new(Cell::new(0)),
+            has_previous: Rc::new(Cell::new(false)),
+            has_more: Rc::new(Cell::new(false)),
+        };
 
         {
             let source = source.clone();
-            let visible_model = visible_model.clone();
-            let visible_choices = visible_choices.clone();
+            let page = page.clone();
             let selected_name = selected_name.clone();
-            let selection = selection.clone();
+            let active_category = active_category.clone();
+            let offset = offset.clone();
+            let weak_popover = popover.downgrade();
             search.connect_search_changed(move |search| {
-                populate_status_emoji_picker_results(
+                if !weak_popover
+                    .upgrade()
+                    .is_some_and(|popover| popover.is_visible())
+                {
+                    return;
+                }
+                offset.set(0);
+                page.populate(
                     &source.borrow(),
                     search.text().as_str(),
-                    &visible_model,
-                    &visible_choices,
+                    &active_category.borrow(),
+                    0,
+                    &selected_name.borrow(),
                 );
-                sync_status_emoji_picker_selection(&visible_choices, &selected_name, &selection);
             });
         }
 
         let on_selected: Rc<dyn Fn(&str)> = Rc::new(on_selected);
-        {
-            let visible_choices = visible_choices.clone();
+        let select_choice: Rc<dyn Fn(&str, &str)> = {
             let selected_name = selected_name.clone();
             let weak_row = row.downgrade();
             let weak_popover = popover.downgrade();
             let weak_search = search.downgrade();
             let on_selected = on_selected.clone();
-            list.connect_activate(move |_, position| {
-                let Some(choice) = visible_choices.borrow().get(position as usize).cloned() else {
-                    return;
-                };
-                selected_name.replace(choice.name.clone());
+            Rc::new(move |name, label| {
+                selected_name.replace(name.to_string());
                 if let Some(row) = weak_row.upgrade() {
-                    row.set_subtitle(&choice.label);
+                    row.set_subtitle(label);
                 }
-                on_selected(&choice.name);
+                on_selected(name);
                 if let Some(search) = weak_search.upgrade() {
                     search.set_text("");
                 }
                 if let Some(popover) = weak_popover.upgrade() {
                     popover.popdown();
                 }
+            })
+        };
+
+        {
+            let visible_choices = visible_choices.clone();
+            let select_choice = select_choice.clone();
+            grid.connect_child_activated(move |_, child| {
+                let Some(choice) = visible_choices
+                    .borrow()
+                    .get(child.index() as usize)
+                    .cloned()
+                else {
+                    return;
+                };
+                select_choice(&choice.name, &status_emoji_result_label(&choice));
             });
         }
 
         {
             let visible_choices = visible_choices.clone();
-            let selected_name = selected_name.clone();
-            let weak_row = row.downgrade();
-            let weak_popover = popover.downgrade();
-            let on_selected = on_selected.clone();
+            let select_choice = select_choice.clone();
             search.connect_activate(move |search| {
                 if search.text().trim().is_empty() {
                     return;
@@ -2558,31 +2682,21 @@ impl StatusEmojiPicker {
                 let Some(choice) = visible_choices.borrow().first().cloned() else {
                     return;
                 };
-                selected_name.replace(choice.name.clone());
-                if let Some(row) = weak_row.upgrade() {
-                    row.set_subtitle(&choice.label);
-                }
-                on_selected(&choice.name);
-                search.set_text("");
-                if let Some(popover) = weak_popover.upgrade() {
-                    popover.popdown();
-                }
+                select_choice(&choice.name, &status_emoji_result_label(&choice));
             });
         }
 
         {
-            let weak_list = list.downgrade();
-            let selection = selection.clone();
-            let visible_model = visible_model.clone();
+            let weak_grid = grid.downgrade();
             let controller = gtk::EventControllerKey::new();
             controller.connect_key_pressed(move |_, key, _, _| {
                 if key != gtk::gdk::Key::Down {
                     return glib::Propagation::Proceed;
                 }
-                if visible_model.n_items() > 0 {
-                    selection.set_selected(0);
-                    if let Some(list) = weak_list.upgrade() {
-                        list.grab_focus();
+                if let Some(grid) = weak_grid.upgrade() {
+                    if let Some(child) = grid.child_at_index(0) {
+                        grid.select_child(&child);
+                        child.grab_focus();
                     }
                 }
                 glib::Propagation::Stop
@@ -2592,21 +2706,104 @@ impl StatusEmojiPicker {
 
         {
             let weak_search = search.downgrade();
-            let weak_list = list.downgrade();
-            let selection = selection.clone();
+            let source = source.clone();
+            let page = page.clone();
+            let active_category = active_category.clone();
+            let selected_name = selected_name.clone();
+            let offset = offset.clone();
             popover.connect_visible_notify(move |popover| {
                 if popover.is_visible() {
                     if let Some(search) = weak_search.upgrade() {
+                        offset.set(0);
+                        page.populate(
+                            &source.borrow(),
+                            search.text().as_str(),
+                            &active_category.borrow(),
+                            0,
+                            &selected_name.borrow(),
+                        );
                         search.grab_focus();
-                    }
-                    let selected = selection.selected();
-                    if selected != gtk::INVALID_LIST_POSITION {
-                        if let Some(list) = weak_list.upgrade() {
-                            list.scroll_to(selected, gtk::ListScrollFlags::NONE, None);
-                        }
                     }
                 }
             });
+        }
+
+        for (category, category_button) in category_buttons {
+            let source = source.clone();
+            let page = page.clone();
+            let search = search.clone();
+            let active_category = active_category.clone();
+            let selected_name = selected_name.clone();
+            let offset = offset.clone();
+            category_button.connect_toggled(move |button| {
+                if !button.is_active() {
+                    return;
+                }
+                active_category.replace(category.clone());
+                offset.set(0);
+                if search.text().is_empty() {
+                    page.populate(
+                        &source.borrow(),
+                        "",
+                        &active_category.borrow(),
+                        0,
+                        &selected_name.borrow(),
+                    );
+                } else {
+                    search.set_text("");
+                }
+            });
+        }
+
+        {
+            let source = source.clone();
+            let page = page.clone();
+            let search = search.clone();
+            let active_category = active_category.clone();
+            let selected_name = selected_name.clone();
+            let offset = offset.clone();
+            previous.connect_clicked(move |_| {
+                if !page.has_previous.get() {
+                    return;
+                }
+                let next_offset = offset.get().saturating_sub(EMOJI_PICKER_RESULT_LIMIT);
+                offset.set(next_offset);
+                page.populate(
+                    &source.borrow(),
+                    search.text().as_str(),
+                    &active_category.borrow(),
+                    next_offset,
+                    &selected_name.borrow(),
+                );
+            });
+        }
+
+        {
+            let source = source.clone();
+            let page = page.clone();
+            let search = search.clone();
+            let active_category = active_category.clone();
+            let selected_name = selected_name.clone();
+            let offset = offset.clone();
+            next.connect_clicked(move |_| {
+                if !page.has_more.get() {
+                    return;
+                }
+                let next_offset = offset.get() + page.visible_choices.borrow().len();
+                offset.set(next_offset);
+                page.populate(
+                    &source.borrow(),
+                    search.text().as_str(),
+                    &active_category.borrow(),
+                    next_offset,
+                    &selected_name.borrow(),
+                );
+            });
+        }
+
+        {
+            let select_choice = select_choice.clone();
+            clear_button.connect_clicked(move |_| select_choice("", &gettext("No emoji")));
         }
 
         {
@@ -2620,10 +2817,13 @@ impl StatusEmojiPicker {
 
         {
             let weak_search = search.downgrade();
+            let page = page.clone();
+            let offset = offset.clone();
             popover.connect_closed(move |_| {
+                page.clear();
+                offset.set(0);
                 if let Some(search) = weak_search.upgrade() {
                     search.set_text("");
-                    search.emit_by_name::<()>("search-changed", &[]);
                 }
             });
         }
@@ -2638,11 +2838,12 @@ impl StatusEmojiPicker {
             row,
             popover,
             search,
-            visible_model,
-            visible_choices,
-            selection,
+            page,
             source,
             selected_name,
+            active_category,
+            offset,
+            category_count: EMOJI_PICKER_CATEGORIES.len(),
         }
     }
 
@@ -2659,25 +2860,36 @@ impl StatusEmojiPicker {
     }
 
     fn visible_choice_count(&self) -> u32 {
-        self.visible_model.n_items()
+        self.page.visible_choices.borrow().len() as u32
     }
 
     fn first_visible_name(&self) -> Option<String> {
-        self.visible_choices
+        self.page
+            .visible_choices
             .borrow()
             .first()
             .map(|choice| choice.name.clone())
     }
 
     fn selected_visible_name(&self) -> Option<String> {
-        let selected = self.selection.selected();
-        if selected == gtk::INVALID_LIST_POSITION {
-            return None;
-        }
-        self.visible_choices
+        let selected = self.page.grid.selected_children().first()?.index();
+        self.page
+            .visible_choices
             .borrow()
             .get(selected as usize)
             .map(|choice| choice.name.clone())
+    }
+
+    fn category_count(&self) -> usize {
+        self.category_count
+    }
+
+    fn page_total(&self) -> usize {
+        self.page.total.get()
+    }
+
+    fn active_category(&self) -> String {
+        self.active_category.borrow().clone()
     }
 
     fn contains(&self, name: &str) -> bool {
@@ -2690,17 +2902,15 @@ impl StatusEmojiPicker {
             .replace(StatusEmojiPickerModel::new(custom_emojis, &selected_name));
         self.row
             .set_subtitle(&self.source.borrow().selected_label(&selected_name));
-        populate_status_emoji_picker_results(
-            &self.source.borrow(),
-            self.search.text().as_str(),
-            &self.visible_model,
-            &self.visible_choices,
-        );
-        sync_status_emoji_picker_selection(
-            &self.visible_choices,
-            &self.selected_name,
-            &self.selection,
-        );
+        if self.popover.is_visible() {
+            self.page.populate(
+                &self.source.borrow(),
+                self.search.text().as_str(),
+                &self.active_category.borrow(),
+                self.offset.get(),
+                &selected_name,
+            );
+        }
     }
 }
 
@@ -11381,6 +11591,10 @@ fn write_status_dialog_test_state(window: &ConduitWindow, state: &StatusDialogSt
             "dialog_heading": state.dialog.heading().map(|heading| heading.to_string()),
             "emoji_search": true,
             "emoji_filter_ready": state.emoji_picker.popover.child().is_some(),
+            "emoji_layout": "reaction-grid",
+            "emoji_category_count": state.emoji_picker.category_count(),
+            "emoji_active_category": state.emoji_picker.active_category(),
+            "emoji_page_total": state.emoji_picker.page_total(),
             "emoji_popup_visible": state.emoji_picker.popover.is_visible(),
             "emoji_query": state.emoji_picker.search.text().to_string(),
             "emoji_choice_count": state.emoji_picker.source_choice_count(),
@@ -13024,21 +13238,38 @@ mod tests {
     }
 
     #[test]
-    fn status_emoji_picker_searches_the_entire_compatible_source_without_truncation() {
+    fn status_emoji_picker_pages_the_entire_compatible_source_by_shared_category() {
         let custom = HashMap::from([(
             "party_parrot".to_string(),
             "https://emoji.example/party-parrot.gif".to_string(),
         )]);
         let model = StatusEmojiPickerModel::new(&custom, "");
-        let all = model.search("");
+        let smileys = model.page("", Some("Smileys"), 0);
 
-        assert_eq!(all.len(), model.choice_count());
-        assert_eq!(all.first().map(|choice| choice.name.as_str()), Some(""));
-        assert!(all.iter().any(|choice| choice.name == "wales"));
-        assert!(all.iter().any(|choice| choice.name == "party_parrot"));
+        assert_eq!(
+            smileys.entries.len(),
+            crate::emoji::EMOJI_PICKER_RESULT_LIMIT
+        );
+        assert!(smileys.has_more);
+        assert_eq!(smileys.offset, 0);
+        let next_smileys = model.page("", Some("Smileys"), EMOJI_PICKER_RESULT_LIMIT);
+        assert!(next_smileys.has_previous);
+        assert_eq!(next_smileys.offset, EMOJI_PICKER_RESULT_LIMIT);
+        assert_eq!(next_smileys.total, smileys.total);
+        assert!(next_smileys.entries.len() <= EMOJI_PICKER_RESULT_LIMIT);
+        let workspace = model.page("", Some("Workspace"), 0);
+        assert!(workspace
+            .entries
+            .iter()
+            .any(|choice| choice.name == "party_parrot"));
+        assert!(model
+            .page(&"x".repeat(EMOJI_PICKER_MAX_QUERY_CHARS + 1), None, 0,)
+            .entries
+            .is_empty());
         assert_eq!(
             model
-                .search("PARTY parr")
+                .page("PARTY parr", None, 0)
+                .entries
                 .first()
                 .map(|choice| choice.name.as_str()),
             Some("party_parrot")
@@ -13062,10 +13293,14 @@ mod tests {
         assert!(refreshed.contains("still_loading"));
         assert_eq!(
             refreshed
-                .search("rocket")
+                .page("rocket", None, 0)
+                .entries
                 .first()
-                .map(|choice| choice.label.as_str()),
-            Some(":rocket: - rocket")
+                .map(|choice| (choice.name.as_str(), choice.value_kind)),
+            Some((
+                "rocket",
+                crate::emoji::EmojiPickerResultValueKind::CustomImage
+            ))
         );
     }
 

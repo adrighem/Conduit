@@ -18,8 +18,10 @@ picker shell backed by bounded native queries.
 5. Category browsing, custom emoji, type-ahead search, keyboard navigation, accessible labels,
    Escape cancellation, focus restoration, and reaction selection preserve the behavior delivered
    for issues #4 and #5.
-6. Adding or removing a reaction does not reset the timeline scroll position.
-7. Release-build measurements record initial HTML size, cold render time, first picker-open
+6. The native status emoji chooser uses the reaction picker's search, category, grid, and bounded
+   paging layout without creating another WebView.
+7. Adding or removing a reaction does not reset the timeline scroll position.
+8. Release-build measurements record initial HTML size, cold render time, first picker-open
    latency, thread reopen latency, and process-tree proportional set size before and after.
 
 ## Acceptance Criteria
@@ -31,6 +33,8 @@ picker shell backed by bounded native queries.
 - Picker result materialization has an explicit upper bound independent of catalogue size.
 - Picker search, categories, custom emoji, keyboard movement, cancellation, focus restoration, and
   reactions pass automated and headless regression coverage.
+- Status emoji selection uses the same bounded category-grid interaction while retaining the
+  explicit no-emoji choice and status-dialog save behavior.
 - Main and thread timelines retain their scroll position across picker use and reaction updates.
 - Reproducible release-build before/after measurements are recorded without credentials or private
   workspace content.

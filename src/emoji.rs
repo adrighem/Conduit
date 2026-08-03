@@ -126,8 +126,8 @@ fn canonical_emoji_name(name: &str) -> String {
     canonical
 }
 
-/// Widget-independent emoji picker data. Both the native composer popover and
-/// the WebView reaction picker are rendered from this model.
+/// Widget-independent emoji picker data. The native composer and status
+/// pickers and the WebView reaction picker are rendered from this model.
 #[derive(Debug, Clone)]
 pub struct EmojiPickerModel {
     entries: Vec<EmojiEntry>,

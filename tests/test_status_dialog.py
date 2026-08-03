@@ -105,12 +105,12 @@ def main() -> None:
                 "header_subtitle": "",
                 "maximum_width": None,
                 "emoji_query": "",
-                "emoji_first_visible_name": "",
+                "emoji_first_visible_name": None,
                 "emoji_contains_late_custom": False,
-                "emoji_visible_count": None,
+                "emoji_visible_count": 0,
                 "emoji_popup_visible": False,
                 "emoji_selected_name": "",
-                "emoji_selected_visible_name": "",
+                "emoji_selected_visible_name": None,
             },
             {
                 "name": "preset-narrow",
@@ -124,12 +124,12 @@ def main() -> None:
                 "header_subtitle": "🏠 Working remotely",
                 "maximum_width": 400,
                 "emoji_query": "",
-                "emoji_first_visible_name": "",
+                "emoji_first_visible_name": None,
                 "emoji_contains_late_custom": False,
-                "emoji_visible_count": None,
+                "emoji_visible_count": 0,
                 "emoji_popup_visible": False,
                 "emoji_selected_name": "house",
-                "emoji_selected_visible_name": "house",
+                "emoji_selected_visible_name": None,
             },
             {
                 "name": "late-custom-filter",
@@ -153,6 +153,24 @@ def main() -> None:
                 "emoji_selected_visible_name": None,
             },
             {
+                "name": "default-grid",
+                "extra_environment": {
+                    "CONDUIT_TEST_STATUS_OPEN_EMOJI": "1",
+                },
+                "save_enabled": False,
+                "clear_available": False,
+                "status_has_value": False,
+                "header_subtitle": "",
+                "maximum_width": None,
+                "emoji_query": "",
+                "emoji_first_visible_name": "grinning",
+                "emoji_contains_late_custom": False,
+                "emoji_visible_count": 64,
+                "emoji_popup_visible": True,
+                "emoji_selected_name": "",
+                "emoji_selected_visible_name": None,
+            },
+            {
                 "name": "late-custom-reopen",
                 "extra_environment": {
                     "CONDUIT_TEST_STATUS_EMOJI_QUERY": "late status parr",
@@ -167,12 +185,12 @@ def main() -> None:
                 "header_subtitle": "🏠 Working remotely",
                 "maximum_width": None,
                 "emoji_query": "",
-                "emoji_first_visible_name": "",
+                "emoji_first_visible_name": "grinning",
                 "emoji_contains_late_custom": True,
-                "emoji_visible_count": None,
+                "emoji_visible_count": 64,
                 "emoji_popup_visible": True,
                 "emoji_selected_name": "house",
-                "emoji_selected_visible_name": "house",
+                "emoji_selected_visible_name": None,
             },
         ]
 
@@ -208,12 +226,22 @@ def main() -> None:
                         if expected_visible_count is None
                         else visible_count == expected_visible_count
                     )
+                    page_total = state.get("emoji_page_total")
+                    page_total_matches = (
+                        page_total >= visible_count
+                        if case["emoji_popup_visible"]
+                        else page_total == 0
+                    )
                     if (
                         state.get("dialog_heading") == "Set a status"
                         and state.get("emoji_search") is True
                         and state.get("emoji_filter_ready") is True
+                        and state.get("emoji_layout") == "reaction-grid"
+                        and state.get("emoji_category_count") == 10
+                        and state.get("emoji_active_category") == "Smileys"
                         and state.get("emoji_choice_count", 0) > 1_800
                         and visible_count_matches
+                        and page_total_matches
                         and state.get("emoji_query") == case["emoji_query"]
                         and state.get("emoji_first_visible_name")
                         == case["emoji_first_visible_name"]
