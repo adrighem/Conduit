@@ -43,9 +43,9 @@
 - [x] Task: Run formatting, strict Clippy, Rust tests, Meson builds, DOM/headless tests, Release, and CodeQL 2628864
 - [x] Task: Conductor - User Manual Verification 'Acceptance and documentation' (Protocol in workflow.md) c17fdea
 
-## Phase 5: URL preview images
+## Phase 5: URL preview images [checkpoint: 07fa1e0]
 
 - [x] Task: Add failing policy and canonical-discovery coverage for URL preview images b20288a
 - [x] Task: Preserve public direct preview images and discover canonical private images c3a7eb1
 - [x] Task: Harden repeated headless window activation during CI validation 60a64b7
-- [ ] Task: Conductor - User Manual Verification 'URL preview images' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'URL preview images' (Protocol in workflow.md) 07fa1e0
