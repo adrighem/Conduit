@@ -47,5 +47,5 @@
 
 - [x] Task: Add failing policy and canonical-discovery coverage for URL preview images b20288a
 - [x] Task: Preserve public direct preview images and discover canonical private images c3a7eb1
-- [~] Task: Harden repeated headless window activation during CI validation
+- [x] Task: Harden repeated headless window activation during CI validation 60a64b7
 - [ ] Task: Conductor - User Manual Verification 'URL preview images' (Protocol in workflow.md)
