@@ -472,3 +472,12 @@
 - Validation: rustfmt passes, 883 default tests pass with 3 ignored, Cargo check passes, and Meson compilation passes.
 - Local strict Clippy remains unavailable because installed Clippy reports Rust 1.87 while the project requires Rust 1.88 or newer.
 - No issue comment, label, closure, pull request action, merge, push, or release was performed.
+
+## 2026-08-03 ISSUE:12 Incremental Presentation
+
+- Pushed startup scheduler admission repair and its strict-Clippy follow-up.
+- Replaced the eager `GtkListBox` sidebar with virtualized `GtkListView`, `gio::ListStore`, and stable model-driven selection in `fdc127c`.
+- Added `TimelinePresenter` document, revision, loading queue, one-frame batch, reload, and scroll behavior in `9a37fad`.
+- Local sanitized validation: rustfmt and Cargo check pass; 886 tests pass with 3 ignored; Meson compile and all 9 headless UI suites pass.
+- Exact-head sidebar validation: CI `30792968943`, CodeQL `30792968448`, and Release `30793496222` pass.
+- No issue comments, labels, closures, or pull request actions were performed.
