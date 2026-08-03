@@ -150,6 +150,8 @@ struct UserStatusPresentation {
     accessible_text: String,
 }
 
+type StatusEmojiChoiceHandler = Rc<dyn Fn(&str, &str)>;
+
 #[derive(Debug, Clone)]
 struct StatusEmojiPickerModel {
     emojis: EmojiPickerModel,
@@ -2636,7 +2638,7 @@ impl StatusEmojiPicker {
         }
 
         let on_selected: Rc<dyn Fn(&str)> = Rc::new(on_selected);
-        let select_choice: Rc<dyn Fn(&str, &str)> = {
+        let select_choice: StatusEmojiChoiceHandler = {
             let selected_name = selected_name.clone();
             let weak_row = row.downgrade();
             let weak_popover = popover.downgrade();
