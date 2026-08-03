@@ -5109,6 +5109,73 @@ mod tests {
     }
 
     #[test]
+    fn slack_file_gif_block_renders_image_instead_of_alt_text_only() {
+        let image_url = "https://files.slack.com/files-pri/F1/animated.gif";
+        let source = format!("conduit-asset://{}", "b".repeat(64));
+        let message = crate::slack_message_wire::normalize_cached_message(
+            crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                "ts": "1710000001.000200",
+                "thread_ts": "1710000000.000100",
+                "text": "shared a GIF",
+                "blocks": [{
+                    "type": "image",
+                    "slack_file": {"url": image_url},
+                    "alt_text": "shared a GIF"
+                }]
+            }))
+            .into_message()
+            .expect("GIF block should normalize"),
+        );
+        let html = conversation_document(
+            "C123",
+            &[message],
+            &MessageHtmlContext {
+                image_assets: HashMap::from([(image_url.to_string(), source.clone())]),
+                ..Default::default()
+            },
+        );
+
+        assert!(html.contains("shared a GIF"));
+        assert!(html.contains(&format!("src=\"{source}\"")));
+        assert!(html.contains("class=\"image-attachment\""));
+        assert!(!html.contains("class=\"image-alt\""));
+    }
+
+    #[test]
+    fn file_share_gif_renders_animated_thumbnail_in_thread() {
+        let animated_url = "https://files.slack.com/files-tmb/F1/animated-480.gif";
+        let source = format!("conduit-asset://{}", "c".repeat(64));
+        let message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000001.000200",
+            "thread_ts": "1710000000.000100",
+            "text": "shared a GIF",
+            "files": [{
+                "id": "F1",
+                "title": "Reaction GIF",
+                "mimetype": "image/gif",
+                "url_private_download": "https://files.slack.com/files-pri/F1/original.gif",
+                "thumb_480": "https://files.slack.com/files-tmb/F1/static-480.png",
+                "thumb_480_gif": animated_url
+            }]
+        }))
+        .unwrap();
+        let html = conversation_document(
+            "C123",
+            &[message],
+            &MessageHtmlContext {
+                thread_ts: Some("1710000000.000100".to_string()),
+                image_assets: HashMap::from([(animated_url.to_string(), source.clone())]),
+                ..Default::default()
+            },
+        );
+
+        assert!(html.contains("shared a GIF"));
+        assert!(html.contains(&format!("src=\"{source}\"")));
+        assert!(!html.contains("static-480.png"));
+        assert!(!html.contains("Loading image preview"));
+    }
+
+    #[test]
     fn canonical_app_author_never_receives_person_actions_or_presence() {
         let mut message: SlackMessage = serde_json::from_value(serde_json::json!({
             "ts": "1710000000.000100",

@@ -372,4 +372,47 @@ mod tests {
         assert!(!debug.contains("private-callback"));
         assert!(!debug.contains("private-approval-value"));
     }
+
+    #[test]
+    fn normalizes_slack_file_urls_for_image_blocks_and_accessories() {
+        let document = normalize_blocks(
+            &serde_json::json!([
+                {
+                    "type": "image",
+                    "slack_file": {
+                        "url": "https://files.slack.com/files-pri/F1/animated.gif"
+                    },
+                    "alt_text": "shared a GIF"
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "Reaction"},
+                    "accessory": {
+                        "type": "image",
+                        "slack_file": {
+                            "url": "https://files.slack.com/files-pri/F2/accessory.gif"
+                        },
+                        "alt_text": "animated reaction"
+                    }
+                }
+            ]),
+            "Choose",
+            "More actions",
+        );
+
+        let [RichNode::Image(image), RichNode::Section { accessory, .. }] = document.nodes() else {
+            panic!("expected image block and section");
+        };
+        assert_eq!(
+            image.url.as_deref(),
+            Some("https://files.slack.com/files-pri/F1/animated.gif")
+        );
+        let Some(RichAccessory::Image(accessory)) = accessory else {
+            panic!("expected image accessory");
+        };
+        assert_eq!(
+            accessory.url.as_deref(),
+            Some("https://files.slack.com/files-pri/F2/accessory.gif")
+        );
+    }
 }

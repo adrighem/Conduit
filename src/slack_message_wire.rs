@@ -158,4 +158,37 @@ mod tests {
             Some(image_url)
         );
     }
+
+    #[test]
+    fn slack_file_id_image_resolves_to_animated_message_file() {
+        let animated_url = "https://files.slack.com/files-tmb/F1/animated-360.gif";
+        let message = SlackMessageWire::from_value(serde_json::json!({
+            "ts": "1710000001.000200",
+            "thread_ts": "1710000000.000100",
+            "text": "shared a GIF",
+            "blocks": [{
+                "type": "image",
+                "slack_file": {"id": "F1"},
+                "alt_text": "shared a GIF"
+            }],
+            "files": [{
+                "id": "F1",
+                "mimetype": "image/gif",
+                "url_private": "https://files.slack.com/files-pri/F1/original.gif",
+                "thumb_360": "https://files.slack.com/files-tmb/F1/static-360.png",
+                "thumb_360_gif": animated_url
+            }]
+        }))
+        .into_message()
+        .expect("GIF reply should normalize");
+
+        let message = normalize_cached_message(message);
+        assert_eq!(message.thread_root_ts(), Some("1710000000.000100"));
+        assert_eq!(message.files.as_ref().map(Vec::len), Some(1));
+        let [MessageNode::Image(image)] = message.document.nodes() else {
+            panic!("expected canonical image");
+        };
+        assert_eq!(image.url.as_deref(), Some(animated_url));
+        assert_eq!(message.document.image_urls().next(), Some(animated_url));
+    }
 }

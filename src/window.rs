@@ -14666,4 +14666,46 @@ mod tests {
             vec![(image_url.clone(), image_url)]
         );
     }
+
+    #[test]
+    fn gif_file_requests_animated_thumbnail_instead_of_static_preview() {
+        let animated_url = "https://files.slack.com/files-tmb/F1/animated-480.gif";
+        let message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000001.000200",
+            "thread_ts": "1710000000.000100",
+            "text": "shared a GIF",
+            "files": [{
+                "id": "F1",
+                "mimetype": "image/gif",
+                "url_private": "https://files.slack.com/files-pri/F1/original.gif",
+                "thumb_480": "https://files.slack.com/files-tmb/F1/static-480.png",
+                "thumb_480_gif": animated_url
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            message_image_asset_requests(&[message], &HashMap::new()),
+            vec![(animated_url.to_string(), animated_url.to_string())]
+        );
+    }
+
+    #[test]
+    fn cached_canonical_image_remains_eligible_for_dom_asset_patch() {
+        let image_url = "https://files.slack.com/files-pri/F1/animated.gif";
+        let message = crate::slack_message_wire::normalize_cached_message(
+            crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                "ts": "1710000001.000200",
+                "blocks": [{
+                    "type": "image",
+                    "slack_file": {"url": image_url},
+                    "alt_text": "shared a GIF"
+                }]
+            }))
+            .into_message()
+            .expect("GIF block should normalize"),
+        );
+
+        assert!(messages_use_image_asset(&[message], image_url));
+    }
 }

@@ -2586,6 +2586,34 @@ mod tests {
     }
 
     #[test]
+    fn gif_file_prefers_animated_thumbnail_then_original() {
+        let animated: SlackFile = serde_json::from_value(serde_json::json!({
+            "mimetype": "image/gif",
+            "url_private": "https://files.example/original.gif",
+            "thumb_480": "https://files.example/static-480.png",
+            "thumb_360": "https://files.example/static-360.png",
+            "thumb_480_gif": "https://files.example/animated-480.gif",
+            "thumb_360_gif": "https://files.example/animated-360.gif"
+        }))
+        .unwrap();
+        assert_eq!(
+            animated.preview_url(),
+            Some("https://files.example/animated-480.gif")
+        );
+
+        let original: SlackFile = serde_json::from_value(serde_json::json!({
+            "mimetype": "image/gif",
+            "url_private": "https://files.example/original.gif",
+            "thumb_480": "https://files.example/static-480.png"
+        }))
+        .unwrap();
+        assert_eq!(
+            original.preview_url(),
+            Some("https://files.example/original.gif")
+        );
+    }
+
+    #[test]
     fn file_download_prefers_private_download_and_never_permalink() {
         let mut file = SlackFile {
             permalink: Some("https://workspace.slack.com/files/U1/F1".to_string()),
