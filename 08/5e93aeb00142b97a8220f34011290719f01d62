@@ -1,0 +1,1 @@
+Phase 4 verification: selected animated custom status emoji renders as a moving image beside its readable label. User reported pass on 2026-08-03. Automated coverage and exact-head CI 30824247470, CodeQL 30824247001, and Release 30825027821 succeeded before checkpointing.
