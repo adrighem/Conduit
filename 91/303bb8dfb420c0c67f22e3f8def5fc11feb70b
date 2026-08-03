@@ -1,0 +1,7 @@
+Task: Fix startup scheduler follow-up admission regression
+
+Summary: Give non-navigation sync jobs unique cancellation identities. Startup can now enqueue workspace refresh and user-directory work, allowing SyncCompleted to clear the persistent syncing status.
+
+Modified files: src/runtime.rs
+
+Rationale: SyncScheduler treats cancellation IDs as active identities; constant zero caused deterministic duplicate rejection.
