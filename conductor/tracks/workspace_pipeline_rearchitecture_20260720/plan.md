@@ -33,6 +33,7 @@
 - [x] Task: Enforce startup enrichment/history limits and lazy 24-hour user-directory loading
 - [x] Task: Add scheduler/API tracing counters and no-realtime stale-check behavior
 - [x] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md) 6590ad0
+- [x] Task: Fix startup scheduler follow-up admission regression 91303bb
 
 ## Phase 5: Incremental GTK and WebKit presentation
 
