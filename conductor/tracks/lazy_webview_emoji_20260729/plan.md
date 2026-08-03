@@ -17,8 +17,8 @@
 - [x] Task: Record release-build HTML, latency, scroll, and process-tree PSS results 8dee011
 - [x] Task: Conductor - User Manual Verification 'Lazy thread WebView lifecycle' (Protocol in workflow.md) d2292ea
 
-## Phase 3: Animated status emoji
+## Phase 3: Animated status emoji [checkpoint: 378a585]
 
 - [x] Task: Add failing status-picker coverage for animated custom emoji 520dab2
 - [x] Task: Preserve animation when rendering custom emoji in the status picker a4fcab4
-- [~] Task: Conductor - User Manual Verification 'Animated status emoji' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Animated status emoji' (Protocol in workflow.md) 378a585
