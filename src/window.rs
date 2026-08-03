@@ -555,9 +555,18 @@ mod imp {
                         let weak_window = obj.downgrade();
                         glib::timeout_add_local_once(Duration::from_millis(100), move || {
                             if let Some(window) = weak_window.upgrade() {
+                                let emoji_url = std::env::var("CONDUIT_TEST_STATUS_EMOJI_PORT")
+                                    .ok()
+                                    .and_then(|port| port.parse::<u16>().ok())
+                                    .map(|port| {
+                                        format!("http://127.0.0.1:{port}/late-status-parrot.gif")
+                                    })
+                                    .unwrap_or_else(|| {
+                                        "https://emoji.example/late-status-parrot.gif".to_string()
+                                    });
                                 window.replace_custom_emojis(HashMap::from([(
                                     "late_status_parrot".to_string(),
-                                    "https://emoji.example/late-status-parrot.gif".to_string(),
+                                    emoji_url,
                                 )]));
                             }
                         });
