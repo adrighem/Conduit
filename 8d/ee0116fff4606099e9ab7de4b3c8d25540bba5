@@ -1,0 +1,9 @@
+Task: Record release-build HTML, latency, scroll, and process-tree PSS results
+
+Summary: Added picker-open timing output to the existing bounded WebKit fixture and documented five-run eager-versus-lazy release lifecycle measurements.
+
+Files: tests/test_emoji_picker.py, conductor/tracks/lazy_webview_emoji_20260729/measurements.md
+
+Rationale: The lazy renderer removes one startup process and 45,255 KiB PSS (20.5%) while first-open and retained-reopen latency remain effectively flat. The existing retain-until-window-disposal policy is supported by the converged post-open memory profile.
+
+Validation: cargo fmt and cargo check passed; 891 Rust tests passed with 3 ignored measurements; all 17 Meson suites passed; bounded picker samples were 58, 65, and 71 ms with 0 px scroll delta.
