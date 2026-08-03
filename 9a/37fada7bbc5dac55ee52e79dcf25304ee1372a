@@ -1,0 +1,7 @@
+Task: Define TimelinePresenter document, revision, loading, delta, and scroll behavior
+
+Summary: Added a pure revision-aware presenter contract that queues contiguous deltas during document loading, batches pending patches for one frame, reloads on document/revision mismatch or patch failure, and preserves anchoring across pagination, delayed media, and user scrolling.
+
+Modified files: src/window.rs
+
+Rationale: Establish deterministic WebKit presentation state and regression coverage before wiring frame scheduling and restricting full document loads.
