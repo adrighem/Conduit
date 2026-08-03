@@ -1,0 +1,7 @@
+Task: Resolve CI lint for scheduler admission fix
+
+Summary: Group scheduler admission policy fields into one typed value, keeping the helper below Clippy's argument limit without suppressing lint.
+
+Modified files: src/runtime.rs
+
+Rationale: Preserve strict CI while keeping scheduler policy calls explicit.
