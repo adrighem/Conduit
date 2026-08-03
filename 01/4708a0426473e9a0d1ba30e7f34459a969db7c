@@ -3,3 +3,5 @@ CI follow-up for issue #10
 Summary: Returned the newly attached thread WebView directly to satisfy Rust 1.97's let_and_return lint; no runtime behavior changed. Updated the maintainer record with the attributable CI diagnosis.
 
 Validation: cargo fmt and cargo check passed; Meson compile passed; GNOME search provider and Window state persistence suites passed.
+
+Remote validation: exact-head CI 30817337591, CodeQL push run 30817337576, and guarded release automation 30818103640 passed for 014708a.
