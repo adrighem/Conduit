@@ -4361,8 +4361,7 @@ impl ConduitWindow {
         let thread_view =
             self.create_message_web_view(&web_context, &network_session, message_view.zoom_level());
         self.connect_timeline_load(&thread_view, TimelineSurface::Thread);
-        let thread_view = thread_pane.attach_web_view(thread_view);
-        thread_view
+        thread_pane.attach_web_view(thread_view)
     }
 
     fn reaction_emoji_picker_model(&self) -> Arc<EmojiPickerModel> {
