@@ -73,7 +73,8 @@ const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const ATTACHMENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const ATTACHMENT_BASENAME_MAX_BYTES: usize = 180;
-const MAX_CACHED_PREVIEW_DATA_URI_BYTES: u64 = ((MAX_PREVIEW_VIDEO_BYTES as u64 + 2) / 3) * 4 + 128;
+const MAX_CACHED_PREVIEW_DATA_URI_BYTES: u64 =
+    (MAX_PREVIEW_VIDEO_BYTES as u64).div_ceil(3) * 4 + 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviewAsset {
@@ -2293,7 +2294,7 @@ fn preview_asset_from_data_uri(data_uri: &str) -> Option<PreviewAsset> {
     }
     let (mime_type, encoded) = data_uri.strip_prefix("data:")?.split_once(";base64,")?;
     let max_bytes = preview_asset_max_bytes(mime_type)?;
-    if encoded.len() > ((max_bytes + 2) / 3) * 4 {
+    if encoded.len() > max_bytes.div_ceil(3) * 4 {
         return None;
     }
     let bytes = BASE64.decode(encoded).ok()?;
