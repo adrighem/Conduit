@@ -26,5 +26,5 @@
 ## Phase 4: Selected status emoji preview
 
 - [x] Task: Add failing coverage for the selected custom emoji preview a01e496
-- [~] Task: Render selected custom emoji images and animation beside status text
-- [ ] Task: Conductor - User Manual Verification 'Selected status emoji preview' (Protocol in workflow.md)
+- [x] Task: Render selected custom emoji images and animation beside status text 51522cd
+- [~] Task: Conductor - User Manual Verification 'Selected status emoji preview' (Protocol in workflow.md)
