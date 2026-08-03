@@ -3745,7 +3745,6 @@ impl ConduitWindow {
 
         self.show_message_placeholder(&gettext("Select a conversation"));
         self.close_thread_pane();
-        record_test_web_view_lifecycle(self);
     }
 
     fn connect_timeline_load(&self, web_view: &webkit6::WebView, surface: TimelineSurface) {
@@ -4363,7 +4362,6 @@ impl ConduitWindow {
             self.create_message_web_view(&web_context, &network_session, message_view.zoom_level());
         self.connect_timeline_load(&thread_view, TimelineSurface::Thread);
         let thread_view = thread_pane.attach_web_view(thread_view);
-        record_test_web_view_lifecycle(self);
         thread_view
     }
 
@@ -11223,6 +11221,7 @@ impl ConduitWindow {
             TimelineSurface::Thread => {
                 self.ensure_thread_web_view();
                 self.thread_pane().load_document(&html);
+                record_test_web_view_lifecycle(self);
             }
         }
         log_performance(started, |elapsed_ms| {
@@ -11241,6 +11240,7 @@ impl ConduitWindow {
             .borrow_mut()
             .reset();
         self.thread_pane().close();
+        record_test_web_view_lifecycle(self);
     }
 
     fn show_thread_placeholder(&self, message: &str) {
@@ -11249,6 +11249,7 @@ impl ConduitWindow {
             .reset();
         self.ensure_thread_web_view();
         self.thread_pane().show_placeholder(message);
+        record_test_web_view_lifecycle(self);
     }
 
     fn thread_pane(&self) -> ThreadPane {
@@ -11603,6 +11604,7 @@ fn record_test_web_view_lifecycle(window: &ConduitWindow) {
             "main_web_view": imp.message_view.borrow().is_some(),
             "thread_web_view": window.thread_pane().has_web_view(),
             "thread_web_view_creations": window.thread_pane().web_view_creation_count(),
+            "thread_open": window.thread_pane().is_open(),
             "thread_widget_children": thread_widget_children,
         })
         .to_string(),

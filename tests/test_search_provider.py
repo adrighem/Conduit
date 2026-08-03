@@ -257,7 +257,78 @@ def main() -> None:
             )
         )
         assert first_open_lifecycle["thread_web_view"] is True
+        assert first_open_lifecycle["thread_open"] is True
         assert first_open_lifecycle["thread_widget_children"] == 1
+
+        target_path.unlink()
+        subprocess.run(
+            [
+                "gdbus",
+                "call",
+                "--session",
+                "--dest",
+                APP_ID,
+                "--object-path",
+                "/eu/vanadrighem/conduit",
+                "--method",
+                "org.gtk.Actions.Activate",
+                "open-conversation",
+                "[<('Test Workspace', 'C_TEST')>]",
+                "{}",
+            ],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        wait_until(target_path.exists)
+        closed_lifecycle = wait_until(
+            lambda: (
+                state
+                if (state := read_json(lifecycle_path))
+                and state.get("thread_open") is False
+                else None
+            )
+        )
+        assert closed_lifecycle["thread_web_view_creations"] == 1
+        assert closed_lifecycle["thread_web_view"] is True
+        assert closed_lifecycle["thread_widget_children"] == 1
+
+        target_path.unlink()
+        subprocess.run(
+            [
+                "gdbus",
+                "call",
+                "--session",
+                "--dest",
+                APP_ID,
+                "--object-path",
+                "/eu/vanadrighem/conduit",
+                "--method",
+                "org.gtk.Actions.Activate",
+                "open-thread",
+                "[<('Test Workspace', 'C_TEST', '1710000000.000100')>]",
+                "{}",
+            ],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        wait_until(target_path.exists)
+        reopened_lifecycle = wait_until(
+            lambda: (
+                state
+                if (state := read_json(lifecycle_path))
+                and state.get("thread_open") is True
+                else None
+            )
+        )
+        assert reopened_lifecycle["thread_web_view_creations"] == 1
+        assert reopened_lifecycle["thread_web_view"] is True
+        assert reopened_lifecycle["thread_widget_children"] == 1
 
         # Closing a window with manually parented composer popovers must not
         # wedge GtkTextView disposal in a repeated warning loop.

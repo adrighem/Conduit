@@ -53,3 +53,30 @@ The after-state keeps only the picker shell and category tabs in the initial doc
 choices are requested from the native model when the picker opens and each result page is bounded
 to 64 entries. The generation time remains a single cold release-test sample; document bytes and
 picker choice count remain deterministic.
+
+## Lazy thread WebView lifecycle
+
+Date: 2026-08-03
+
+The production GNOME search-provider integration test opens a real Conduit window, observes the
+thread renderer state, opens a thread through the application action, navigates back to the
+conversation, and reopens the same thread. It uses only the synthetic test workspace and no Slack
+credentials or private workspace content.
+
+Reproduce with:
+
+```sh
+meson test -C _build --no-rebuild --print-errorlogs "GNOME search provider"
+```
+
+| Lifecycle point | Thread WebView creations | WebView retained | Thread visible |
+| --- | ---: | --- | --- |
+| Startup | 0 | No | No |
+| First thread open | 1 | Yes | Yes |
+| Return to conversation | 1 | Yes | No |
+| Reopen thread | 1 | Yes | Yes |
+
+The selected policy is lazy creation followed by retention until window disposal. Retention keeps
+reopen behavior immediate and preserves the loaded renderer while removing all secondary WebView
+construction from startup. Teardown remains deliberately out of scope until release-build memory
+and reopen-latency measurements show that reclaiming the renderer outweighs recreation cost.

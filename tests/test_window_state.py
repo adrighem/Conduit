@@ -285,6 +285,7 @@ def main() -> None:
             assert lifecycle["main_web_view"] is True
             assert lifecycle["thread_web_view"] is False
             assert lifecycle["thread_web_view_creations"] == 0
+            assert lifecycle["thread_open"] is False
             assert lifecycle["thread_widget_children"] == 0
             verify_initial_sync_interactive(window_id)
             stop_application(process, environment)
