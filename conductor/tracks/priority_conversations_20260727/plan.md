@@ -23,7 +23,7 @@
 - [x] Task: Add formatting toolbars, native rich editing, and emoji insertion to message and reply composers 467cc7d
 - [x] Task: Send and restore Slack rich-text blocks with accessible plain-text fallbacks 62a0d7a
 - [x] Task: Add regressions for compact overflow, rich response rendering, and logical newlines 0512bd8
-- [~] Task: Keep composer controls compact and preserve rich formatting and newlines after Send
+- [x] Task: Keep composer controls compact and preserve rich formatting and newlines after Send 6921b56
 - [ ] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md)
 
 ## Phase 4: Inline staged media
