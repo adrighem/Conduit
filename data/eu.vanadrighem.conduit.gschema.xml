@@ -42,9 +42,9 @@
 			<description>Keywords and phrases that make an incoming message relevant for desktop notifications.</description>
 		</key>
 		<key name="recent-reactions" type="as">
-			<default>['smile', 'thumbsup', 'white_check_mark']</default>
-			<summary>Recently used message reactions</summary>
-			<description>The three most recently used emoji reaction names shown in message quick actions.</description>
+			<default>[]</default>
+			<summary>Recent message reaction history</summary>
+			<description>The 20 most recently added reaction names used to rank four message quick actions.</description>
 		</key>
 		<key name="window-width" type="i">
 			<default>1120</default>

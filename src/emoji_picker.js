@@ -239,6 +239,21 @@
     search.focus();
     requestResults(0);
   });
+  document.addEventListener("mouseout", function (event) {
+    let owner = event.target.closest(".message-part, .message");
+    while (owner) {
+      if (!event.relatedTarget || !owner.contains(event.relatedTarget)) {
+        owner.querySelectorAll(".quick-actions details.more-actions[open]").forEach(
+          function (menu) {
+            menu.open = false;
+          }
+        );
+      }
+      owner = owner.parentElement
+        ? owner.parentElement.closest(".message-part, .message")
+        : null;
+    }
+  });
 
   picker.querySelector(".picker-close").addEventListener("click", cancelPicker);
   picker.addEventListener("cancel", cancelPicker);

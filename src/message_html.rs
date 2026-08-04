@@ -5,6 +5,7 @@ use gettextrs::gettext;
 use serde::Serialize;
 
 use crate::activity::ActivityItem;
+use crate::config;
 use crate::debug;
 use crate::emoji::{
     EmojiCatalog, EmojiEntry, EmojiValue, EMOJI_PICKER_CATEGORIES, EMOJI_PICKER_MAX_QUERY_CHARS,
@@ -27,6 +28,7 @@ const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 pub(crate) const MESSAGE_BASE_FONT_SIZE_CSS_PX: f64 = 14.0;
 const TIMESTAMP_LOCALIZATION_SCRIPT: &str = include_str!("timestamp_localization.js");
 const RICH_MESSAGE_CSS: &str = include_str!("message_html/message.css");
+const QUICK_REACTION_LIMIT: usize = 4;
 static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
@@ -3734,16 +3736,40 @@ fn action_thread_ts<'a>(
 }
 
 fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
-    let requested = context.recent_reactions.iter().map(String::as_str).chain([
+    let mut usage = HashMap::new();
+    for (index, name) in context
+        .recent_reactions
+        .iter()
+        .take(config::RECENT_REACTION_HISTORY_LIMIT)
+        .map(String::as_str)
+        .enumerate()
+    {
+        if name.trim().is_empty() {
+            continue;
+        }
+        let (count, _) = usage.entry(name).or_insert((0usize, index));
+        *count += 1;
+    }
+    let mut ranked = usage.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(
+        |(left_name, (left_count, left_recency)), (right_name, (right_count, right_recency))| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_recency.cmp(right_recency))
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
+    let requested = ranked.into_iter().map(|(name, _)| name).chain([
         "smile",
         "thumbsup",
         "white_check_mark",
+        "heart",
     ]);
     let mut seen = HashSet::new();
     requested
         .filter(|name| seen.insert(*name))
         .filter_map(|name| emoji_entry(name, context))
-        .take(3)
+        .take(QUICK_REACTION_LIMIT)
         .collect()
 }
 
@@ -5512,9 +5538,9 @@ mod tests {
     #[test]
     fn quick_reactions_rank_frequency_within_latest_twenty_uses() {
         let mut history = [
-            "heart", "eyes", "thumbsup", "fire", "heart", "eyes", "thumbsup", "fire",
-            "heart", "eyes", "thumbsup", "fire", "heart", "eyes", "thumbsup", "heart",
-            "eyes", "heart", "heart", "rocket",
+            "heart", "eyes", "thumbsup", "fire", "heart", "eyes", "thumbsup", "fire", "heart",
+            "eyes", "thumbsup", "fire", "heart", "eyes", "thumbsup", "heart", "eyes", "heart",
+            "heart", "rocket",
         ]
         .into_iter()
         .map(str::to_string)

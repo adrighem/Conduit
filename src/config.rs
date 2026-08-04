@@ -9,6 +9,7 @@ pub const NOTIFICATIONS_MENTIONS_AND_NAMES_V1_KEY: &str = "notifications-mention
 pub const NOTIFICATIONS_NAMES_AND_ALIASES_V1_KEY: &str = "notifications-names-and-aliases-v1";
 pub const NOTIFICATIONS_THREAD_REPLIES_V1_KEY: &str = "notifications-thread-replies-v1";
 pub const RECENT_REACTIONS_KEY: &str = "recent-reactions";
+pub const RECENT_REACTION_HISTORY_LIMIT: usize = 20;
 pub const SIDEBAR_SHOW_UNREADS_SECTION_KEY: &str = "sidebar-show-unreads-section";
 pub const WINDOW_HEIGHT_KEY: &str = "window-height";
 pub const WINDOW_MAXIMIZED_KEY: &str = "window-maximized";

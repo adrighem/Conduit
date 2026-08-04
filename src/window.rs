@@ -3301,15 +3301,15 @@ fn promoted_recent_reactions<'a>(
     names: impl IntoIterator<Item = &'a str>,
     name: &str,
 ) -> Vec<String> {
-    let mut promoted = Vec::with_capacity(3);
+    let mut promoted = Vec::with_capacity(config::RECENT_REACTION_HISTORY_LIMIT);
     if !name.trim().is_empty() {
         promoted.push(name.to_string());
     }
     for existing in names {
-        if promoted.len() == 3 {
+        if promoted.len() == config::RECENT_REACTION_HISTORY_LIMIT {
             break;
         }
-        if !existing.trim().is_empty() && !promoted.iter().any(|value| value == existing) {
+        if !existing.trim().is_empty() {
             promoted.push(existing.to_string());
         }
     }
@@ -7418,7 +7418,9 @@ impl ConduitWindow {
                 let name = query_param(url, "name").unwrap_or_else(|| "thumbsup".to_string());
                 let add = query_param(url, "add").is_none_or(|value| value == "true");
                 let thread_ts = query_param(url, "thread_ts");
-                self.remember_recent_reaction(&name);
+                if add {
+                    self.remember_recent_reaction(&name);
+                }
                 self.send_command(RuntimeCommand::SetReaction {
                     channel_id,
                     ts,
@@ -14580,10 +14582,8 @@ mod tests {
         let existing = (0..20)
             .map(|index| format!("emoji_{index}"))
             .collect::<Vec<_>>();
-        let history = promoted_recent_reactions(
-            existing.iter().map(String::as_str),
-            existing[0].as_str(),
-        );
+        let history =
+            promoted_recent_reactions(existing.iter().map(String::as_str), existing[0].as_str());
         let mut expected = vec![existing[0].clone()];
         expected.extend(existing[..19].iter().cloned());
 
