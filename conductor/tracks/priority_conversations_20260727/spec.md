@@ -41,6 +41,20 @@ change Slack's private VIP list.
     person catalog is empty or still loading.
 19. Refresh an open New message picker when person discovery completes while
     preserving its search text and current selection where possible.
+20. Provide matching native formatting toolbars for channel messages and thread
+    replies with bold, italic, underline, strikethrough, inline code, bulleted
+    list, numbered list, quote, code block, and emoji controls.
+21. Present formatting directly in the GTK text editor while retaining readable
+    text, person mentions, undo behavior, and keyboard-first editing.
+22. Publish formatted messages as Slack `rich_text` blocks with an accessible
+    plain-text fallback, including structured lists, quotes, and preformatted
+    blocks rather than lossy visual-only markup.
+23. Preserve rich formatting and canonical person mentions across local draft
+    save and restore, while remaining compatible with existing plain-text drafts.
+24. Let users stage multiple image and video files in either composer, preview
+    them inline with remove controls, and defer upload until Send.
+25. Complete staged uploads together so media and the formatted composition
+    appear as one Slack file-share message in the selected channel or thread.
 
 ## Acceptance Criteria
 
@@ -64,6 +78,17 @@ change Slack's private VIP list.
   names where identity data is available.
 - New message presents a modal picker shell before people discovery completes
   and replaces its loading or empty state when eligible people arrive.
+- Pure composer tests cover rich span validation, Slack rich-text JSON, legacy
+  draft fallback, rich draft round trips, Unicode offsets, mentions, lists,
+  quotes, and preformatted blocks.
+- Both composers expose the same accessible formatting and emoji controls and
+  render applied inline and paragraph styles directly in their text views.
+- Rich posts include a complete plain-text fallback for notifications and
+  screen readers plus structured `rich_text` blocks for Slack clients.
+- File selection and image paste create removable composer previews without
+  starting network upload; Send completes all staged media in one file share.
+- Staged-media tests cover multiple upload URLs, one completion request,
+  thread targeting, progress, temporary-file cleanup, and draft restoration.
 - A successful toggle updates persisted conversation state and rerenders the sidebar.
 - `cargo fmt --check`, Rust tests, `cargo check`, Meson compile, and Meson tests pass in a sanitized allowlisted environment.
 
@@ -74,6 +99,10 @@ change Slack's private VIP list.
 - Use stable conversation IDs for toggle targets.
 - Do not log credentials, browser-session data, message bodies, or complete environments.
 - Do not add a new dependency.
+- Keep GTK buffer tags and filesystem paths local to presentation and draft
+  state; runtime and Slack API boundaries receive typed composition payloads.
+- Use Slack's documented `chat.postMessage` and external-file-upload block
+  parameters. Do not invent client-only markup or upload endpoints.
 
 ## Out of Scope
 
@@ -82,3 +111,5 @@ change Slack's private VIP list.
 - Custom Slack sidebar sections or ordering.
 - Multi-workspace support.
 - Replacing the existing conversation list widget.
+- Arbitrary Block Kit layout authoring, interactive controls, tables, or canvas
+  composition.

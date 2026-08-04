@@ -16,3 +16,17 @@
 - [x] Task: Add failing coverage for opening New message before people discovery completes dd28cd3
 - [x] Task: Open New message immediately and refresh it when people arrive d204494
 - [~] Task: Conductor - User Manual Verification 'Reliable new-message picker' (Protocol in workflow.md)
+
+## Phase 3: WYSIWYG rich-text composer
+
+- [~] Task: Add failing rich document, draft, and Slack payload coverage
+- [ ] Task: Add formatting toolbars, native rich editing, and emoji insertion to message and reply composers
+- [ ] Task: Send and restore Slack rich-text blocks with accessible plain-text fallbacks
+- [ ] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md)
+
+## Phase 4: Inline staged media
+
+- [ ] Task: Add failing staged-media draft and batch-upload coverage
+- [ ] Task: Preview removable image and video attachments inside both composers
+- [ ] Task: Send staged media and rich text as one Slack file-share message
+- [ ] Task: Conductor - User Manual Verification 'Inline staged media' (Protocol in workflow.md)
