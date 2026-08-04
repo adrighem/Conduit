@@ -1,0 +1,5 @@
+Task: Send and restore Slack rich-text blocks with accessible plain-text fallbacks.
+
+Implementation slice: chat.postMessage now accepts optional rich blocks alongside canonical fallback text and thread targeting; RuntimeCommand carries blocks without exposing message or block contents in trace fields.
+
+Verification: rich post request coverage and cargo check pass.
