@@ -1,0 +1,5 @@
+Task: Add failing rich document, draft, and Slack payload coverage.
+
+Coverage: composer tests specify Unicode-safe inline style spans, canonical user mentions, Slack rich_text block JSON, structured bullet lists, quotes, preformatted blocks, attachment-bearing rich draft round trips, and legacy draft distinction.
+
+Red verification: the targeted composer tests failed to compile because the rich document model, payload serializer, and versioned draft codec do not exist yet.
