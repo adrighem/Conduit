@@ -17,6 +17,7 @@ APPLICATION_PATH = "/eu/vanadrighem/conduit"
 EXPECTED_SIZE = (920, 640)
 SIZE_TOLERANCE = 4
 SWITCHER_TITLE = "Switch conversation"
+NEW_MESSAGE_TITLE = "New message"
 
 
 def wait_until(predicate, timeout: float = 15.0, interval: float = 0.1):
@@ -291,6 +292,13 @@ def main() -> None:
             stop_application(process, environment)
             process = None
             environment.pop("CONDUIT_TEST_INITIAL_SYNC")
+
+            environment["CONDUIT_TEST_EMPTY_NEW_MESSAGE"] = "1"
+            process, _ = run_application(binary, environment)
+            wait_until(lambda: visible_window_ids(NEW_MESSAGE_TITLE))
+            stop_application(process, environment)
+            process = None
+            environment.pop("CONDUIT_TEST_EMPTY_NEW_MESSAGE")
 
             process, window_id = run_application(binary, environment)
             resize_window(window_id, EXPECTED_SIZE)

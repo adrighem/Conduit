@@ -440,6 +440,8 @@ mod imp {
                 let huddle_test = std::env::var_os("CONDUIT_TEST_HUDDLE").is_some();
                 let status_test = std::env::var_os("CONDUIT_TEST_STATUS_DIALOG").is_some();
                 let initial_sync_test = std::env::var_os("CONDUIT_TEST_INITIAL_SYNC").is_some();
+                let empty_new_message_test =
+                    std::env::var_os("CONDUIT_TEST_EMPTY_NEW_MESSAGE").is_some();
                 if status_test && std::env::var_os("CONDUIT_TEST_STATUS_NARROW").is_some() {
                     obj.set_default_size(360, 720);
                 }
@@ -453,7 +455,19 @@ mod imp {
                     user_id: (huddle_test || status_test).then(|| "UTEST".to_string()),
                     ..AuthInfo::default()
                 });
-                if initial_sync_test {
+                if initial_sync_test || empty_new_message_test {
+                    if empty_new_message_test {
+                        let weak_window = obj.downgrade();
+                        glib::idle_add_local_once(move || {
+                            if let Some(window) = weak_window.upgrade() {
+                                let _ = gtk::prelude::WidgetExt::activate_action(
+                                    &window,
+                                    "win.new-message",
+                                    None,
+                                );
+                            }
+                        });
+                    }
                     return;
                 }
                 obj.populate_conversations(vec![SlackConversation {
