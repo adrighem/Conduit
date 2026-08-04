@@ -1,0 +1,7 @@
+Task: Preserve attachment-embedded image blocks through canonical normalization and rendering.
+
+Root cause: the reported Slack response stores an animated image block inside a legacy attachment. SlackAttachment did not deserialize attachment blocks, so canonicalization discarded the image and retained only the fallback text.
+
+Implementation: deserialize attachment blocks, normalize them with file context before legacy attachment fallback, render the normalized image node, and avoid duplicate fallback text when embedded blocks are usable. Raw attachment wire content remains discarded after canonicalization.
+
+Verification: focused nested GIF regression passed; cargo test passed (906 passed, 3 ignored); cargo fmt and application compilation passed. Meson ran 16 checks successfully; the unrelated keyboard-shortcuts UI check repeatedly failed at X11 window activation before exercising message rendering.
