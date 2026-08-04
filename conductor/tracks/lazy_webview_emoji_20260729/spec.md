@@ -23,6 +23,10 @@ picker shell backed by bounded native queries.
 7. Adding or removing a reaction does not reset the timeline scroll position.
 8. Release-build measurements record initial HTML size, cold render time, first picker-open
    latency, thread reopen latency, and process-tree proportional set size before and after.
+9. Slack skin-tone modifier sequences such as `:+1::skin-tone-3:` resolve through the shared emoji
+   catalog and render as one composed Unicode emoji in message and thread text, reaction chips and
+   tooltips, quick reactions, and user-status surfaces. Unsupported or inapplicable combinations
+   remain literal instead of rendering a misleading partial sequence.
 
 ## Acceptance Criteria
 
@@ -38,6 +42,8 @@ picker shell backed by bounded native queries.
 - Main and thread timelines retain their scroll position across picker use and reaction updates.
 - Reproducible release-build before/after measurements are recorded without credentials or private
   workspace content.
+- Slack `skin-tone-2` through `skin-tone-6` modifiers render with compatible Unicode emoji on every
+  catalog-backed surface, while malformed, standalone, and inapplicable modifiers remain visible.
 
 ## Out of Scope
 

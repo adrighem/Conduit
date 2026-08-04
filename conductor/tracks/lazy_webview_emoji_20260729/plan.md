@@ -33,4 +33,10 @@
 
 - [x] Task: Add failing ranking, bounded-history, four-button, and hover-close coverage bf96cc2
 - [x] Task: Rank four quick reactions by frequency across the latest 20 additions and close overflow on hover end 8528d0a
-- [~] Task: Conductor - User Manual Verification 'Usage-ranked quick reactions' (Protocol in workflow.md)
+- [ ] Task: Conductor - User Manual Verification 'Usage-ranked quick reactions' (Protocol in workflow.md)
+
+## Phase 6: Slack skin-tone emoji modifiers
+
+- [~] Task: Add failing shared-catalog and surface coverage for adjacent Slack skin-tone modifiers
+- [ ] Task: Resolve compatible Slack skin-tone modifiers through every catalog-backed renderer
+- [ ] Task: Conductor - User Manual Verification 'Slack skin-tone emoji modifiers' (Protocol in workflow.md)
