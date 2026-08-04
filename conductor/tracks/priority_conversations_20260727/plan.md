@@ -14,5 +14,5 @@
 ## Phase 2: Reliable new-message picker
 
 - [x] Task: Add failing coverage for opening New message before people discovery completes dd28cd3
-- [~] Task: Open New message immediately and refresh it when people arrive
-- [ ] Task: Conductor - User Manual Verification 'Reliable new-message picker' (Protocol in workflow.md)
+- [x] Task: Open New message immediately and refresh it when people arrive d204494
+- [~] Task: Conductor - User Manual Verification 'Reliable new-message picker' (Protocol in workflow.md)
