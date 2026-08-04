@@ -1,0 +1,5 @@
+Task: Add formatting toolbars, native rich editing, and emoji insertion to message and reply composers.
+
+Implementation: both GTK composers now share accessible wrapping toolbars for bold, italic, underline, strikethrough, inline code, bullet and numbered lists, quote, code block, and the full native emoji picker. Selection formatting applies immediately; active formats carry into new text; rich tags drive draft and Slack serialization.
+
+Verification: cargo check is warning-free; toolbar contract test, Meson compile, and headless Window state persistence pass.
