@@ -36,10 +36,12 @@ use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
 use crate::composer::{
-    completion_key_action, emoji_token_at_caret, hydrate_composer_mentions, mention_candidates,
+    completion_key_action, decode_rich_composer_draft, emoji_token_at_caret,
+    encode_rich_composer_draft, hydrate_composer_mentions, mention_candidates,
     mention_token_at_caret, replace_emoji_token, replace_mention_token, search_mention_candidates,
     serialize_composer_mentions, text_view_enter_action, text_view_text, CompletionKeyAction,
-    EmojiToken, MentionCandidate, MentionSpan, MentionToken, TextViewEnterAction,
+    ComposerBlockKind, ComposerBlockSpan, ComposerStyleSpan, ComposerTextStyle, EmojiToken,
+    MentionCandidate, MentionSpan, MentionToken, RichComposerDraft, TextViewEnterAction,
 };
 use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
@@ -630,6 +632,16 @@ enum ComposerTarget {
     Message,
     Thread,
 }
+
+const COMPOSER_BOLD_TAG: &str = "composer-bold";
+const COMPOSER_ITALIC_TAG: &str = "composer-italic";
+const COMPOSER_UNDERLINE_TAG: &str = "composer-underline";
+const COMPOSER_STRIKE_TAG: &str = "composer-strike";
+const COMPOSER_CODE_TAG: &str = "composer-code";
+const COMPOSER_BULLETED_LIST_TAG: &str = "composer-bulleted-list";
+const COMPOSER_NUMBERED_LIST_TAG: &str = "composer-numbered-list";
+const COMPOSER_QUOTE_TAG: &str = "composer-quote";
+const COMPOSER_PREFORMATTED_TAG: &str = "composer-preformatted";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimelineSurface {
@@ -4731,6 +4743,7 @@ impl ConduitWindow {
         });
 
         for target in COMPOSER_TARGETS {
+            self.ensure_composer_format_tags(target);
             self.setup_composer_completion(target);
         }
 
@@ -4958,8 +4971,8 @@ impl ConduitWindow {
         let thread_key = self
             .selected_thread_ts()
             .and_then(|thread_ts| self.draft_key(&channel_id, Some(&thread_ts)));
-        let message_text = self.composer_canonical_text(ComposerTarget::Message);
-        let thread_text = self.composer_canonical_text(ComposerTarget::Thread);
+        let message_text = self.composer_draft_storage(ComposerTarget::Message);
+        let thread_text = self.composer_draft_storage(ComposerTarget::Thread);
         {
             let mut drafts = self.imp().drafts.borrow_mut();
             let mut changed = drafts.upsert(channel_key, &message_text);
@@ -5005,7 +5018,11 @@ impl ConduitWindow {
                     .map(ToString::to_string)
             })
             .unwrap_or_default();
-        self.set_composer_canonical_text(ComposerTarget::Message, &text);
+        if let Some(draft) = decode_rich_composer_draft(&text) {
+            self.set_composer_rich_draft(ComposerTarget::Message, &draft);
+        } else {
+            self.set_composer_canonical_text(ComposerTarget::Message, &text);
+        }
     }
 
     fn restore_thread_draft(&self, channel_id: &str, thread_ts: &str) {
@@ -5019,7 +5036,11 @@ impl ConduitWindow {
                     .map(ToString::to_string)
             })
             .unwrap_or_default();
-        self.set_composer_canonical_text(ComposerTarget::Thread, &text);
+        if let Some(draft) = decode_rich_composer_draft(&text) {
+            self.set_composer_rich_draft(ComposerTarget::Thread, &draft);
+        } else {
+            self.set_composer_canonical_text(ComposerTarget::Thread, &text);
+        }
     }
 
     fn remember_submitted_draft(
@@ -5054,9 +5075,9 @@ impl ConduitWindow {
         });
         let current_text = (current_key.as_ref() == Some(&key)).then(|| {
             if thread_ts.is_some() {
-                self.composer_canonical_text(ComposerTarget::Thread)
+                self.composer_draft_storage(ComposerTarget::Thread)
             } else {
-                self.composer_canonical_text(ComposerTarget::Message)
+                self.composer_draft_storage(ComposerTarget::Message)
             }
         });
         let stored_text = self
@@ -5099,9 +5120,9 @@ impl ConduitWindow {
                 .is_none_or(|thread_ts| self.selected_thread_ts().as_deref() == Some(thread_ts));
         let current_text = current_target_matches.then(|| {
             if thread_ts.is_some() {
-                self.composer_canonical_text(ComposerTarget::Thread)
+                self.composer_draft_storage(ComposerTarget::Thread)
             } else {
-                self.composer_canonical_text(ComposerTarget::Message)
+                self.composer_draft_storage(ComposerTarget::Message)
             }
         });
         let stored_text = self
@@ -5398,6 +5419,211 @@ impl ConduitWindow {
     fn composer_canonical_text(&self, target: ComposerTarget) -> String {
         let text = text_view_text(&self.composer_text_view(target));
         serialize_composer_mentions(&text, &self.composer_mention_spans(target))
+    }
+
+    fn ensure_composer_format_tags(&self, target: ComposerTarget) {
+        let table = self.composer_text_view(target).buffer().tag_table();
+        for tag in [
+            gtk::TextTag::builder()
+                .name(COMPOSER_BOLD_TAG)
+                .weight(700)
+                .build(),
+            gtk::TextTag::builder()
+                .name(COMPOSER_ITALIC_TAG)
+                .style(gtk::pango::Style::Italic)
+                .build(),
+            gtk::TextTag::builder()
+                .name(COMPOSER_UNDERLINE_TAG)
+                .underline(gtk::pango::Underline::Single)
+                .build(),
+            gtk::TextTag::builder()
+                .name(COMPOSER_STRIKE_TAG)
+                .strikethrough(true)
+                .build(),
+            gtk::TextTag::builder()
+                .name(COMPOSER_CODE_TAG)
+                .family("monospace")
+                .build(),
+            gtk::TextTag::builder()
+                .name(COMPOSER_BULLETED_LIST_TAG)
+                .left_margin(24)
+                .build(),
+            gtk::TextTag::builder()
+                .name(COMPOSER_NUMBERED_LIST_TAG)
+                .left_margin(24)
+                .build(),
+            gtk::TextTag::builder()
+                .name(COMPOSER_QUOTE_TAG)
+                .left_margin(24)
+                .style(gtk::pango::Style::Italic)
+                .build(),
+            gtk::TextTag::builder()
+                .name(COMPOSER_PREFORMATTED_TAG)
+                .family("monospace")
+                .left_margin(18)
+                .right_margin(18)
+                .build(),
+        ] {
+            let Some(name) = tag.name() else {
+                continue;
+            };
+            if table.lookup(name.as_str()).is_none() {
+                table.add(&tag);
+            }
+        }
+    }
+
+    fn composer_style_at(iter: &gtk::TextIter) -> ComposerTextStyle {
+        let tags = iter
+            .tags()
+            .into_iter()
+            .filter_map(|tag| tag.name())
+            .collect::<HashSet<_>>();
+        ComposerTextStyle {
+            bold: tags.contains(COMPOSER_BOLD_TAG),
+            italic: tags.contains(COMPOSER_ITALIC_TAG),
+            underline: tags.contains(COMPOSER_UNDERLINE_TAG),
+            strike: tags.contains(COMPOSER_STRIKE_TAG),
+            code: tags.contains(COMPOSER_CODE_TAG),
+        }
+    }
+
+    fn composer_block_at(iter: &gtk::TextIter) -> Option<ComposerBlockKind> {
+        let tags = iter
+            .tags()
+            .into_iter()
+            .filter_map(|tag| tag.name())
+            .collect::<HashSet<_>>();
+        [
+            (COMPOSER_BULLETED_LIST_TAG, ComposerBlockKind::BulletedList),
+            (COMPOSER_NUMBERED_LIST_TAG, ComposerBlockKind::NumberedList),
+            (COMPOSER_QUOTE_TAG, ComposerBlockKind::Quote),
+            (COMPOSER_PREFORMATTED_TAG, ComposerBlockKind::Preformatted),
+        ]
+        .into_iter()
+        .find_map(|(name, kind)| tags.contains(name).then_some(kind))
+    }
+
+    fn composer_style_spans(&self, target: ComposerTarget) -> Vec<ComposerStyleSpan> {
+        let buffer = self.composer_text_view(target).buffer();
+        let length = buffer.char_count().max(0) as usize;
+        let mut spans = Vec::new();
+        let mut start = 0;
+        let mut current = ComposerTextStyle::default();
+        for offset in 0..length {
+            let style = Self::composer_style_at(&buffer.iter_at_offset(offset as i32));
+            if style != current {
+                if current != ComposerTextStyle::default() {
+                    spans.push(ComposerStyleSpan {
+                        start,
+                        end: offset,
+                        style: current,
+                    });
+                }
+                start = offset;
+                current = style;
+            }
+        }
+        if current != ComposerTextStyle::default() {
+            spans.push(ComposerStyleSpan {
+                start,
+                end: length,
+                style: current,
+            });
+        }
+        spans
+    }
+
+    fn composer_block_spans(&self, target: ComposerTarget) -> Vec<ComposerBlockSpan> {
+        let text_view = self.composer_text_view(target);
+        let buffer = text_view.buffer();
+        let text = text_view_text(&text_view);
+        let characters = text.chars().collect::<Vec<_>>();
+        let mut spans = Vec::new();
+        let mut line_start = 0;
+        for line_end in characters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, character)| (*character == '\n').then_some(index))
+            .chain(std::iter::once(characters.len()))
+        {
+            if line_start < line_end {
+                let iter = buffer.iter_at_offset(line_start as i32);
+                if let Some(kind) = Self::composer_block_at(&iter) {
+                    spans.push(ComposerBlockSpan {
+                        start: line_start,
+                        end: line_end,
+                        kind,
+                    });
+                }
+            }
+            line_start = line_end.saturating_add(1);
+        }
+        spans
+    }
+
+    fn composer_rich_draft(&self, target: ComposerTarget) -> RichComposerDraft {
+        RichComposerDraft {
+            text: text_view_text(&self.composer_text_view(target)),
+            mentions: self.composer_mention_spans(target),
+            styles: self.composer_style_spans(target),
+            blocks: self.composer_block_spans(target),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn composer_draft_storage(&self, target: ComposerTarget) -> String {
+        let draft = self.composer_rich_draft(target);
+        if draft.text.trim().is_empty() && draft.attachments.is_empty() {
+            String::new()
+        } else {
+            encode_rich_composer_draft(&draft)
+        }
+    }
+
+    fn set_composer_rich_draft(&self, target: ComposerTarget, draft: &RichComposerDraft) {
+        self.ensure_composer_format_tags(target);
+        self.clear_composer_mentions(target);
+        let buffer = self.composer_text_view(target).buffer();
+        buffer.set_text(&draft.text);
+        let length = buffer.char_count().max(0) as usize;
+        for span in &draft.styles {
+            if span.start >= span.end || span.end > length {
+                continue;
+            }
+            let start = buffer.iter_at_offset(span.start as i32);
+            let end = buffer.iter_at_offset(span.end as i32);
+            for (enabled, name) in [
+                (span.style.bold, COMPOSER_BOLD_TAG),
+                (span.style.italic, COMPOSER_ITALIC_TAG),
+                (span.style.underline, COMPOSER_UNDERLINE_TAG),
+                (span.style.strike, COMPOSER_STRIKE_TAG),
+                (span.style.code, COMPOSER_CODE_TAG),
+            ] {
+                if enabled {
+                    buffer.apply_tag_by_name(name, &start, &end);
+                }
+            }
+        }
+        for span in &draft.blocks {
+            if span.start >= span.end || span.end > length {
+                continue;
+            }
+            let tag = match span.kind {
+                ComposerBlockKind::BulletedList => COMPOSER_BULLETED_LIST_TAG,
+                ComposerBlockKind::NumberedList => COMPOSER_NUMBERED_LIST_TAG,
+                ComposerBlockKind::Quote => COMPOSER_QUOTE_TAG,
+                ComposerBlockKind::Preformatted => COMPOSER_PREFORMATTED_TAG,
+            };
+            buffer.apply_tag_by_name(
+                tag,
+                &buffer.iter_at_offset(span.start as i32),
+                &buffer.iter_at_offset(span.end as i32),
+            );
+        }
+        for mention in &draft.mentions {
+            self.add_composer_mention(target, mention.clone());
+        }
     }
 
     fn set_composer_canonical_text(&self, target: ComposerTarget, text: &str) {
@@ -6851,22 +7077,20 @@ impl ConduitWindow {
             self.set_status("Select a conversation");
             return;
         };
-        let text = self
-            .composer_canonical_text(ComposerTarget::Message)
-            .trim()
-            .to_string();
-        if text.is_empty() {
+        let draft = self.composer_rich_draft(ComposerTarget::Message);
+        let Some(payload) = draft.slack_payload() else {
             return;
-        }
+        };
+        let submitted = encode_rich_composer_draft(&draft);
 
-        if !self.remember_submitted_draft(&channel_id, None, &text) {
+        if !self.remember_submitted_draft(&channel_id, None, &submitted) {
             self.set_status(&gettext("A message is already being sent."));
             return;
         }
         self.send_command(RuntimeCommand::PostMessage {
             channel_id,
-            text,
-            blocks_json: None,
+            text: payload.fallback_text,
+            blocks_json: Some(payload.blocks_json),
             thread_ts: None,
         });
         imp.send_button.set_sensitive(false);
@@ -6883,22 +7107,20 @@ impl ConduitWindow {
             self.set_status("Open a thread");
             return;
         };
-        let text = self
-            .composer_canonical_text(ComposerTarget::Thread)
-            .trim()
-            .to_string();
-        if text.is_empty() {
+        let draft = self.composer_rich_draft(ComposerTarget::Thread);
+        let Some(payload) = draft.slack_payload() else {
             return;
-        }
+        };
+        let submitted = encode_rich_composer_draft(&draft);
 
-        if !self.remember_submitted_draft(&channel_id, Some(&thread_ts), &text) {
+        if !self.remember_submitted_draft(&channel_id, Some(&thread_ts), &submitted) {
             self.set_status(&gettext("A reply is already being sent."));
             return;
         }
         self.send_command(RuntimeCommand::PostMessage {
             channel_id,
-            text,
-            blocks_json: None,
+            text: payload.fallback_text,
+            blocks_json: Some(payload.blocks_json),
             thread_ts: Some(thread_ts),
         });
         imp.thread_send_button.set_sensitive(false);
@@ -6971,10 +7193,17 @@ impl ConduitWindow {
             return;
         };
         self.flush_current_drafts();
+        let submitted_draft = initial_comment.as_ref().map(|_| {
+            self.composer_draft_storage(if thread_ts.is_some() {
+                ComposerTarget::Thread
+            } else {
+                ComposerTarget::Message
+            })
+        });
         if !record_upload_submission(
             &mut self.imp().pending_upload_drafts.borrow_mut(),
             key,
-            initial_comment.clone(),
+            submitted_draft,
         ) {
             self.set_status(&gettext("A file is already being uploaded here."));
             if remove_after_upload {
