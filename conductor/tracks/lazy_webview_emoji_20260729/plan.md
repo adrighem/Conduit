@@ -31,6 +31,6 @@
 
 ## Phase 5: Usage-ranked quick reactions
 
-- [~] Task: Add failing ranking, bounded-history, four-button, and hover-close coverage
-- [ ] Task: Rank four quick reactions by frequency across the latest 20 additions and close overflow on hover end
+- [x] Task: Add failing ranking, bounded-history, four-button, and hover-close coverage bf96cc2
+- [~] Task: Rank four quick reactions by frequency across the latest 20 additions and close overflow on hover end
 - [ ] Task: Conductor - User Manual Verification 'Usage-ranked quick reactions' (Protocol in workflow.md)
