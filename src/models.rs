@@ -1051,6 +1051,7 @@ impl SlackAttachmentAction {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackAttachment {
     pub id: Option<u64>,
+    pub blocks: Option<Value>,
     pub fallback: Option<String>,
     pub color: Option<String>,
     pub pretext: Option<String>,
@@ -1250,6 +1251,7 @@ impl SlackMessage {
         nodes.extend(
             crate::rich_message_normalize::normalize_attachments(
                 self.attachments.as_deref().unwrap_or_default(),
+                self.files.as_deref().unwrap_or_default(),
             )
             .nodes,
         );

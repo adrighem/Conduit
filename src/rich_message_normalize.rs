@@ -248,13 +248,25 @@ fn block_text(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(crate) fn normalize_attachments(attachments: &[SlackAttachment]) -> RichDocument {
-    let nodes = attachments
-        .iter()
-        .filter_map(normalize_attachment)
-        .map(Box::new)
-        .map(RichNode::Attachment)
-        .collect();
+pub(crate) fn normalize_attachments(
+    attachments: &[SlackAttachment],
+    files: &[SlackFile],
+) -> RichDocument {
+    let mut nodes = Vec::new();
+    for attachment in attachments {
+        if let Some(blocks) = attachment.blocks.as_ref() {
+            let embedded =
+                normalize_blocks_with_files(blocks, "Choose an option", "More actions", files)
+                    .nodes;
+            if !embedded.is_empty() {
+                nodes.extend(embedded);
+                continue;
+            }
+        }
+        if let Some(attachment) = normalize_attachment(attachment) {
+            nodes.push(RichNode::Attachment(Box::new(attachment)));
+        }
+    }
     RichDocument::new(nodes, None)
 }
 
@@ -388,7 +400,7 @@ mod tests {
     #[test]
     fn normalizes_attachment_color_and_drops_callback_metadata() {
         let message = test_fixtures::bob_message();
-        let document = normalize_attachments(message.attachments.as_deref().unwrap());
+        let document = normalize_attachments(message.attachments.as_deref().unwrap(), &[]);
         let debug = format!("{document:?}");
 
         assert!(debug.contains("#2eb67d"));

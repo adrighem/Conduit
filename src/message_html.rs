@@ -2943,6 +2943,7 @@ fn attachments_html(
     } else {
         crate::rich_message_normalize::normalize_attachments(
             message.attachments.as_deref().unwrap_or_default(),
+            message.files.as_deref().unwrap_or_default(),
         )
     };
     let mut attachments = if document.is_empty() {
