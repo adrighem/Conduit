@@ -28,3 +28,9 @@
 - [x] Task: Add failing coverage for the selected custom emoji preview a01e496
 - [x] Task: Render selected custom emoji images and animation beside status text 51522cd
 - [x] Task: Conductor - User Manual Verification 'Selected status emoji preview' (Protocol in workflow.md) 085e93a
+
+## Phase 5: Usage-ranked quick reactions
+
+- [~] Task: Add failing ranking, bounded-history, four-button, and hover-close coverage
+- [ ] Task: Rank four quick reactions by frequency across the latest 20 additions and close overflow on hover end
+- [ ] Task: Conductor - User Manual Verification 'Usage-ranked quick reactions' (Protocol in workflow.md)
