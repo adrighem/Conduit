@@ -191,4 +191,46 @@ mod tests {
         assert_eq!(image.url.as_deref(), Some(animated_url));
         assert_eq!(message.document.image_urls().next(), Some(animated_url));
     }
+
+    #[test]
+    fn attachment_embedded_image_block_survives_canonical_normalization() {
+        let image_url = "https://media.example.test/animated.gif";
+        let message = SlackMessageWire::from_value(serde_json::json!({
+            "ts": "1710000001.000300",
+            "thread_ts": "1710000000.000100",
+            "attachments": [{
+                "id": 1,
+                "fallback": "shared a GIF",
+                "blocks": [{
+                    "type": "image",
+                    "block_id": "animated-image",
+                    "image_url": image_url,
+                    "image_width": 480,
+                    "image_height": 270,
+                    "image_bytes": 123456,
+                    "is_animated": true,
+                    "alt_text": "shared a GIF",
+                    "fallback": "shared a GIF",
+                    "title": {
+                        "type": "plain_text",
+                        "text": "Animated reaction",
+                        "emoji": true
+                    }
+                }]
+            }]
+        }))
+        .into_message()
+        .expect("embedded GIF block should normalize");
+
+        let message = normalize_cached_message(message);
+
+        assert!(message.attachments.is_none());
+        let [MessageNode::Image(image)] = message.document.nodes() else {
+            panic!("expected one canonical image instead of a fallback-only attachment");
+        };
+        assert_eq!(image.url.as_deref(), Some(image_url));
+        assert_eq!(image.alt, "shared a GIF");
+        assert_eq!(image.title.as_deref(), Some("Animated reaction"));
+        assert_eq!(message.document.image_urls().next(), Some(image_url));
+    }
 }
