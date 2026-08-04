@@ -1,0 +1,5 @@
+Task: Send and restore Slack rich-text blocks with accessible plain-text fallbacks.
+
+Coverage: Slack request parameter coverage requires chat.postMessage to retain the channel, canonical accessible fallback text, rich_text blocks, thread target, and client message ID.
+
+Red verification: the targeted test failed because no rich-aware post_message_params boundary exists.
