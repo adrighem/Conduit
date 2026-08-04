@@ -4719,6 +4719,53 @@ mod tests {
     }
 
     #[test]
+    fn renders_slack_skin_tones_across_text_rich_reactions_quick_actions_and_status() {
+        let mut plain = message("Approved :+1::skin-tone-3: :rocket::skin-tone-3:");
+        plain.reactions = Some(vec![SlackReaction {
+            name: Some("+1::skin-tone-4".to_string()),
+            count: Some(1),
+            users: None,
+        }]);
+        let mut rich = message("rich fallback");
+        rich.ts = "1710000000.000200".to_string();
+        rich.blocks = Some(serde_json::json!([
+            {
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [{"type": "emoji", "name": "+1::skin-tone-2"}]
+                }]
+            }
+        ]));
+        rich.refresh_canonical_content();
+        let context = MessageHtmlContext {
+            user_statuses: Arc::new(HashMap::from([(
+                "U123".to_string(),
+                SlackUserStatus {
+                    text: "Approved".to_string(),
+                    emoji: ":+1::skin-tone-6:".to_string(),
+                    expiration: 0,
+                },
+            )])),
+            recent_reactions: vec!["+1::skin-tone-5".to_string()],
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[plain, rich], &context);
+
+        assert!(html.contains("title=\":+1::skin-tone-3:\" role=\"img\""));
+        assert!(html.contains(">👍🏼</span>"));
+        assert!(html.contains(":rocket::skin-tone-3:"));
+        assert!(html.contains(">👍🏽 1</a>"));
+        assert!(html.contains("name=%2B1%3A%3Askin-tone-4&amp;add=true"));
+        assert!(html.contains("name=%2B1%3A%3Askin-tone-5&amp;add=true"));
+        assert!(html.contains(">👍🏾</a>"));
+        assert!(html.contains("class=\"user-status\""));
+        assert!(html.contains(">👍🏿</span>"));
+        assert!(html.contains(">👍🏻</span>"));
+    }
+
+    #[test]
     fn workspace_emoji_render_in_messages_and_quick_actions_without_eager_picker_data() {
         let context = MessageHtmlContext {
             custom_emojis: Arc::new(HashMap::from([

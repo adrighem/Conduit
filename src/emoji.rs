@@ -370,6 +370,32 @@ mod tests {
     }
 
     #[test]
+    fn catalog_resolves_slack_skin_tone_modifier_sequences() {
+        let custom = HashMap::from([("approval".to_string(), "alias:+1".to_string())]);
+        let catalog = EmojiCatalog::new(&custom);
+
+        for (name, expected) in [
+            ("+1::skin-tone-2", "👍🏻"),
+            ("+1::skin-tone-3", "👍🏼"),
+            ("+1::skin-tone-4", "👍🏽"),
+            ("+1::skin-tone-5", "👍🏾"),
+            ("+1::skin-tone-6", "👍🏿"),
+            ("approval::skin-tone-3", "👍🏼"),
+        ] {
+            assert_eq!(catalog.resolve(name), Some(EmojiValue::Unicode(expected)));
+        }
+
+        for name in [
+            "skin-tone-3",
+            "+1::skin-tone-1",
+            "+1::skin-tone-7",
+            "rocket::skin-tone-3",
+        ] {
+            assert_eq!(catalog.resolve(name), None, "resolved {name}");
+        }
+    }
+
+    #[test]
     fn exact_custom_emoji_shadows_unicode_canonical_name_fallback() {
         let custom = HashMap::from([(
             "face_with_raised_eyebrow".to_string(),

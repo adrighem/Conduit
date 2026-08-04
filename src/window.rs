@@ -13506,6 +13506,17 @@ mod tests {
             Some(":still_loading: - still loading".to_string())
         );
 
+        let toned = StatusEmojiPickerModel::new(&HashMap::new(), ":+1::skin-tone-3:");
+        assert_eq!(
+            toned
+                .selected_entry("+1::skin-tone-3")
+                .map(|entry| (entry.value_kind, entry.value)),
+            Some((
+                crate::emoji::EmojiPickerResultValueKind::Unicode,
+                "👍🏼".to_string(),
+            ))
+        );
+
         let custom = HashMap::from([(
             "rocket".to_string(),
             "https://emoji.example/custom-rocket.gif".to_string(),
@@ -13566,6 +13577,21 @@ mod tests {
             Some(UserStatusPresentation {
                 subtitle: "Focus time".to_string(),
                 accessible_text: "Focus time".to_string(),
+            })
+        );
+        assert_eq!(
+            user_status_presentation(
+                &SlackUserStatus {
+                    text: "Approved".to_string(),
+                    emoji: ":+1::skin-tone-3:".to_string(),
+                    ..Default::default()
+                },
+                &custom,
+                100,
+            ),
+            Some(UserStatusPresentation {
+                subtitle: "👍🏼 Approved".to_string(),
+                accessible_text: "Approved".to_string(),
             })
         );
         assert_eq!(
