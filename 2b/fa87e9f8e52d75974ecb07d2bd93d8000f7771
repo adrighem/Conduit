@@ -1,0 +1,9 @@
+Task: Send staged media and rich text as one Slack file-share message
+
+Summary: Composer Send now snapshots ordered attachments and optional rich blocks, uploads every file, completes one Slack file-share request, preserves failed drafts, removes owned temp files only after success, and immediately hides/reset progress in the correct pane.
+
+Files: src/window.rs, src/runtime.rs, src/slack.rs
+
+Rationale: Preserve WYSIWYG formatting and attachment ordering while making selection non-mutating and terminal state race-safe.
+
+Tests: cargo test --quiet: 926 passed, 3 ignored; mock two-file upload verifies one completion with rich blocks.
