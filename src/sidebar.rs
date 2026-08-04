@@ -2536,6 +2536,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_switcher_ranks_unread_dms_then_unread_channels_then_read() {
+        let mut direct = dm("D1", "U1");
+        direct.unread_count = Some(1);
+        let mut group = mpim("M1", "triage");
+        group.unread_count = Some(1);
+        let mut unread_channel = channel("C1", "alpha-channel");
+        unread_channel.unread_count = Some(1);
+        let read_channel = channel("A1", "aardvark-channel");
+        let user_names = HashMap::from([("U1".to_string(), "Zoe".to_string())]);
+
+        let items = conversation_switcher_items(
+            &[read_channel, unread_channel, direct, group],
+            &user_names,
+            None,
+            "",
+        );
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["M1", "D1", "C1", "A1"]
+        );
+    }
+
+    #[test]
     fn sidebar_relevance_band_precedes_existing_unread_count_sort() {
         let mut alphabetical = channel("C1", "alpha-support");
         alphabetical.unread_count = Some(10);
@@ -2557,6 +2584,32 @@ mod tests {
                 .map(|row| row.title.as_str())
                 .collect::<Vec<_>>(),
             vec!["#zebra-supp", "#alpha-support"]
+        );
+    }
+
+    #[test]
+    fn sidebar_search_places_unread_categories_after_relevance() {
+        let exact_read = channel("X9", "1");
+        let mut unread_direct = dm("D1", "U9");
+        unread_direct.unread_count = Some(1);
+        let mut unread_channel = channel("C1", "alpha");
+        unread_channel.unread_count = Some(1);
+        let read_fallback = channel("A1", "aardvark");
+        let user_names = HashMap::from([("U9".to_string(), "Zoe".to_string())]);
+
+        let rows = list_rows(build_sidebar_list(
+            &[exact_read, unread_direct, unread_channel, read_fallback],
+            &user_names,
+            SidebarBuildOptions {
+                query: "1",
+                show_all: true,
+                ..Default::default()
+            },
+        ));
+
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["X9", "D1", "C1", "A1"]
         );
     }
 
@@ -3093,6 +3146,38 @@ mod tests {
                 .map(|item| item.row.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["U2", "C2", "U1", "C1"]
+        );
+    }
+
+    #[test]
+    fn conversation_picker_ranks_unread_categories_before_discovery_ties() {
+        let mut unread_direct = dm("D1", "U9");
+        unread_direct.unread_count = Some(1);
+        let mut unread_channel = channel("C1", "alpha");
+        unread_channel.unread_count = Some(1);
+        let user_names = HashMap::from([("U9".to_string(), "Zoe".to_string())]);
+
+        let sections = conversation_picker_sections(
+            &[unread_channel, unread_direct],
+            &[channel("A1", "aardvark")],
+            &[SlackUser {
+                id: Some("U1".to_string()),
+                real_name: Some("Beta".to_string()),
+                ..Default::default()
+            }],
+            &user_names,
+            None,
+            "1",
+        );
+
+        assert_eq!(
+            sections
+                .search_results
+                .expect("expected flat search results")
+                .iter()
+                .map(|item| item.row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["D1", "C1", "U1", "A1"]
         );
     }
 
