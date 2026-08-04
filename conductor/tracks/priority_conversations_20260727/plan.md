@@ -29,6 +29,6 @@
 ## Phase 4: Inline staged media
 
 - [x] Task: Add failing staged-media draft, batch-upload, and terminal-progress coverage 0c8f23f
-- [~] Task: Preview removable image and video attachments inside both composers
-- [ ] Task: Send staged media and rich text as one Slack file-share message
+- [x] Task: Preview removable image and video attachments inside both composers e9ed127
+- [~] Task: Send staged media and rich text as one Slack file-share message
 - [ ] Task: Conductor - User Manual Verification 'Inline staged media' (Protocol in workflow.md)
