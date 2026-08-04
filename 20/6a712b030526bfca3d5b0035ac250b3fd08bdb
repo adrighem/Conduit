@@ -1,0 +1,7 @@
+Task: Render Slack skin-tone modifier sequences everywhere.
+
+Implementation: The shared emoji catalog resolves Slack compound names with emojis::with_skin_tone, including aliases. The adjacent shortcode parser consumes a base and skin-tone modifier atomically. Reaction API names remain exact. Status picker selections use catalog resolution. Invalid or inapplicable pairs remain literal.
+
+Verification: cargo fmt --check, cargo check, 908 Rust tests passed with 3 ignored, and all 17 Meson tests passed.
+
+Schema: Slack represents the tone in the compound emoji name, such as wave::skin-tone-2.
