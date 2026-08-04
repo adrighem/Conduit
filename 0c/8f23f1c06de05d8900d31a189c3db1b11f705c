@@ -1,0 +1,9 @@
+Task: Add failing staged-media draft, batch-upload, and terminal-progress coverage
+
+Summary: Added regressions requiring attachment placeholders in both composers, deferred network work until Send, one rich-block batch upload, and immediate progress reset on completion.
+
+Files: src/window.rs, src/slack.rs
+
+Rationale: Lock the requested compose-first lifecycle before replacing the immediate single-file upload path.
+
+Tests: Targeted tests confirmed red for missing attachment UI and blocks upload parameters.
