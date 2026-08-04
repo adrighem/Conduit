@@ -38,5 +38,5 @@
 ## Phase 6: Slack skin-tone emoji modifiers
 
 - [x] Task: Add failing shared-catalog and surface coverage for adjacent Slack skin-tone modifiers c686215
-- [~] Task: Resolve compatible Slack skin-tone modifiers through every catalog-backed renderer
-- [ ] Task: Conductor - User Manual Verification 'Slack skin-tone emoji modifiers' (Protocol in workflow.md)
+- [x] Task: Resolve compatible Slack skin-tone modifiers through every catalog-backed renderer 206a712
+- [~] Task: Conductor - User Manual Verification 'Slack skin-tone emoji modifiers' (Protocol in workflow.md)
