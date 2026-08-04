@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::models::SlackAttachment;
+use crate::models::{SlackAttachment, SlackFile};
 
 use crate::rich_message::{
     MessageAccessory as RichAccessory, MessageAttachment as RichAttachment,
@@ -9,16 +9,17 @@ use crate::rich_message::{
     RichInline, RichInlineStyle, RichTextNode,
 };
 
-pub(crate) fn normalize_blocks(
+pub(crate) fn normalize_blocks_with_files(
     blocks: &Value,
     choose_option_label: &str,
     more_actions_label: &str,
+    files: &[SlackFile],
 ) -> RichDocument {
     let nodes = blocks
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|block| normalize_block(block, choose_option_label, more_actions_label))
+        .filter_map(|block| normalize_block(block, choose_option_label, more_actions_label, files))
         .collect();
     RichDocument::new(nodes, None)
 }
@@ -27,6 +28,7 @@ fn normalize_block(
     block: &Value,
     choose_option_label: &str,
     more_actions_label: &str,
+    files: &[SlackFile],
 ) -> Option<RichNode> {
     match block.get("type")?.as_str()? {
         "header" => block_text(block).map(RichNode::Header),
@@ -40,7 +42,7 @@ fn normalize_block(
                 .filter_map(block_text)
                 .collect::<Vec<_>>();
             let accessory = block.get("accessory").and_then(|accessory| {
-                normalize_accessory(accessory, choose_option_label, more_actions_label)
+                normalize_accessory(accessory, choose_option_label, more_actions_label, files)
             });
             (text.is_some() || !fields.is_empty() || accessory.is_some()).then_some(
                 RichNode::Section {
@@ -61,7 +63,7 @@ fn normalize_block(
             (!elements.is_empty()).then_some(RichNode::Context(elements))
         }
         "divider" => Some(RichNode::Divider),
-        "image" => normalize_image(block).map(RichNode::Image),
+        "image" => normalize_image(block, files).map(RichNode::Image),
         "actions" => {
             let controls = block
                 .get("elements")
@@ -92,14 +94,15 @@ fn normalize_accessory(
     value: &Value,
     choose_option_label: &str,
     more_actions_label: &str,
+    files: &[SlackFile],
 ) -> Option<RichAccessory> {
     if value.get("type").and_then(Value::as_str) == Some("image") {
-        return normalize_image(value).map(RichAccessory::Image);
+        return normalize_image(value, files).map(RichAccessory::Image);
     }
     normalize_control(value, choose_option_label, more_actions_label).map(RichAccessory::Control)
 }
 
-fn normalize_image(value: &Value) -> Option<RichImage> {
+fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
     let alt = value
         .get("alt_text")
         .and_then(Value::as_str)
@@ -108,6 +111,22 @@ fn normalize_image(value: &Value) -> Option<RichImage> {
     let url = value
         .get("image_url")
         .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("slack_file")
+                .and_then(|file| file.get("url"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            let file_id = value
+                .get("slack_file")
+                .and_then(|file| file.get("id"))
+                .and_then(Value::as_str)?;
+            files
+                .iter()
+                .find(|file| file.id.as_deref() == Some(file_id))
+                .and_then(SlackFile::preview_url)
+        })
         .map(ToString::to_string);
     let title = value
         .get("title")
@@ -341,7 +360,12 @@ mod tests {
     #[test]
     fn normalizes_valid_jira_siblings_without_sensitive_control_data() {
         let message = test_fixtures::jira_message();
-        let document = normalize_blocks(message.blocks.as_ref().unwrap(), "Choose", "More actions");
+        let document = normalize_blocks_with_files(
+            message.blocks.as_ref().unwrap(),
+            "Choose",
+            "More actions",
+            &[],
+        );
 
         assert_eq!(document.nodes.len(), 4);
         let debug = format!("{document:?}");
@@ -375,7 +399,7 @@ mod tests {
 
     #[test]
     fn normalizes_slack_file_urls_for_image_blocks_and_accessories() {
-        let document = normalize_blocks(
+        let document = normalize_blocks_with_files(
             &serde_json::json!([
                 {
                     "type": "image",
@@ -398,6 +422,7 @@ mod tests {
             ]),
             "Choose",
             "More actions",
+            &[],
         );
 
         let [RichNode::Image(image), RichNode::Section { accessory, .. }] = document.nodes() else {

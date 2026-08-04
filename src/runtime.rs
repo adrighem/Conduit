@@ -15663,6 +15663,21 @@ mod tests {
                 Some(image)
             );
 
+            let gif =
+                PreviewAsset::new("image/gif".to_string(), b"GIF89a-animated-frames".to_vec())
+                    .unwrap();
+            cache
+                .store("https://files.example/animated.gif", &gif)
+                .await
+                .expect("cache store failed");
+            assert_eq!(
+                cache
+                    .load("https://files.example/animated.gif")
+                    .await
+                    .expect("cache load failed"),
+                Some(gif)
+            );
+
             let video = PreviewAsset::new("video/mp4".to_string(), b"video".to_vec()).unwrap();
             cache
                 .store("https://files.example/video.mp4", &video)

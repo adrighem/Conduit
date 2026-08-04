@@ -3402,6 +3402,10 @@ fn messages_use_image_asset(messages: &[SlackMessage], key: &str) -> bool {
                 .flatten()
                 .filter_map(attachment_image_asset_request)
                 .any(|(candidate, _)| candidate == key)
+            || message
+                .document
+                .image_urls()
+                .any(|candidate| candidate == key)
     })
 }
 

@@ -2514,10 +2514,11 @@ fn message_body_html(
             return rendered;
         }
     } else if let Some(blocks) = message.blocks.as_ref() {
-        let document = crate::rich_message_normalize::normalize_blocks(
+        let document = crate::rich_message_normalize::normalize_blocks_with_files(
             blocks,
             &gettext("Choose an option"),
             &gettext("More actions"),
+            message.files.as_deref().unwrap_or_default(),
         );
         let rendered = if document.is_empty() {
             String::new()
@@ -2959,6 +2960,7 @@ fn attachments_html(
             .as_deref()
             .unwrap_or_default()
             .iter()
+            .filter(|file| !file_is_rendered_in_document(message, file))
             .map(|file| {
                 let label = file.display_title();
                 if let (Some(channel_id), Some(kind), Some(url)) =
@@ -3004,6 +3006,28 @@ fn attachments_html(
     } else {
         format!("<div class=\"attachments\">{}</div>", attachments.concat())
     }
+}
+
+fn file_is_rendered_in_document(message: &SlackMessage, file: &SlackFile) -> bool {
+    message.document.image_urls().any(|document_url| {
+        [
+            file.url_private.as_deref(),
+            file.url_private_download.as_deref(),
+            file.url_static_preview.as_deref(),
+            file.thumb_480_gif.as_deref(),
+            file.thumb_360_gif.as_deref(),
+            file.thumb_480.as_deref(),
+            file.thumb_360.as_deref(),
+            file.thumb_720.as_deref(),
+            file.thumb_1024.as_deref(),
+            file.thumb_160.as_deref(),
+            file.thumb_80.as_deref(),
+            file.thumb_64.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|file_url| file_url == document_url)
+    })
 }
 
 #[allow(dead_code)]
@@ -5173,6 +5197,42 @@ mod tests {
         assert!(html.contains(&format!("src=\"{source}\"")));
         assert!(!html.contains("static-480.png"));
         assert!(!html.contains("Loading image preview"));
+    }
+
+    #[test]
+    fn slack_file_id_block_deduplicates_matching_file_attachment() {
+        let animated_url = "https://files.slack.com/files-tmb/F1/animated-360.gif";
+        let source = format!("conduit-asset://{}", "d".repeat(64));
+        let message = crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+            "ts": "1710000001.000200",
+            "thread_ts": "1710000000.000100",
+            "text": "shared a GIF",
+            "blocks": [{
+                "type": "image",
+                "slack_file": {"id": "F1"},
+                "alt_text": "shared a GIF"
+            }],
+            "files": [{
+                "id": "F1",
+                "title": "Reaction GIF",
+                "mimetype": "image/gif",
+                "url_private_download": "https://files.slack.com/files-pri/F1/original.gif",
+                "thumb_360_gif": animated_url
+            }]
+        }))
+        .into_message()
+        .expect("GIF reply should normalize");
+        let html = conversation_document(
+            "C123",
+            &[message],
+            &MessageHtmlContext {
+                thread_ts: Some("1710000000.000100".to_string()),
+                image_assets: HashMap::from([(animated_url.to_string(), source)]),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(html.matches("class=\"image-attachment\"").count(), 1);
     }
 
     #[test]

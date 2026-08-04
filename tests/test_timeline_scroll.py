@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 import sys
@@ -16,6 +17,13 @@ try:
 except (ImportError, ValueError) as error:
     print(f"SKIP: WebKit GTK introspection is unavailable: {error}")
     raise SystemExit(77)
+
+
+ANIMATED_GIF = bytes.fromhex(
+    "47494638396102000200f00000ff000000000021ff0b4e45545343415045322e30"
+    "030100000021f904000a0000002c000000000200020000020284510021f904000a"
+    "0000002c0000000002000200800000ff00000002028451003b"
+)
 
 
 START_PROBE = r"""
@@ -173,6 +181,19 @@ START_PROBE = r"""
     const snapshotAnchor = document.querySelector('[data-message-ts="10"]');
     const snapshotAnchorDelta = snapshotAnchor.getBoundingClientRect().top - snapshotAnchorTop;
 
+    const gifApplied = window.conduitApplyTimelinePatch({
+      type: "update-image",
+      asset_key: "animated-gif",
+      source: window.animatedGifSource,
+      media_kind: "image"
+    });
+    const animatedGif = document.querySelector('img[data-image-key="animated-gif"]');
+    animatedGif.loading = "eager";
+    animatedGif.src = window.animatedGifSource;
+    animatedGif.scrollIntoView({ block: "center" });
+    for (let attempt = 0; attempt < 40 && !animatedGif.complete; attempt += 1) {
+      await wait(25);
+    }
     window.timelineScrollResult = {
       initialFocusDelta,
       initialPending,
@@ -199,7 +220,11 @@ START_PROBE = r"""
       snapshotApplied,
       snapshotText: snapshotAnchor.textContent,
       snapshotAnchorDelta,
-      snapshotLoadMore: document.querySelector(".timeline-action").textContent
+      snapshotLoadMore: document.querySelector(".timeline-action").textContent,
+      gifApplied,
+      gifElement: animatedGif.tagName,
+      gifNaturalWidth: animatedGif.naturalWidth,
+      gifSourceIsGif: animatedGif.currentSrc.startsWith("data:image/gif;base64,")
     };
   })().catch((error) => {
     window.timelineScrollError = String(error && error.stack ? error.stack : error);
@@ -225,6 +250,9 @@ def main() -> None:
         f'This content deliberately spans several words and lines.</article></li>'
         for index in range(1, 22)
     )
+    animated_gif_source = "data:image/gif;base64," + base64.b64encode(
+        ANIMATED_GIF
+    ).decode("ascii")
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
 html, body {{ margin: 0; padding: 0; }}
@@ -237,6 +265,9 @@ html, body {{ margin: 0; padding: 0; }}
  data-timeline-mode="preserve" data-focus-message-ts="10"
  data-timeline-sticky-key="test:sticky" data-timeline-anchor-key="test:anchor"><ol class="message-list">{messages}</ol>
 <img id="delayed" alt=""></main>
+<div data-image-key="animated-gif" data-image-alt="Animated GIF"
+ data-image-unavailable="GIF unavailable">Loading GIF</div>
+<script>window.animatedGifSource = {json.dumps(animated_gif_source)};</script>
 <script>{timeline_script}</script>
 </body></html>"""
 
@@ -327,6 +358,10 @@ html, body {{ margin: 0; padding: 0; }}
     assert payload["snapshotText"] == "Snapshot 10 batched replacement.", payload
     assert abs(payload["snapshotAnchorDelta"]) <= 2, payload
     assert payload["snapshotLoadMore"] == "Older", payload
+    assert payload["gifApplied"] is True, payload
+    assert payload["gifElement"] == "IMG", payload
+    assert payload["gifNaturalWidth"] == 2, payload
+    assert payload["gifSourceIsGif"] is True, payload
 
 
 if __name__ == "__main__":

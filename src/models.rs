@@ -778,7 +778,9 @@ pub struct SlackFile {
     pub thumb_80: Option<String>,
     pub thumb_160: Option<String>,
     pub thumb_360: Option<String>,
+    pub thumb_360_gif: Option<String>,
     pub thumb_480: Option<String>,
+    pub thumb_480_gif: Option<String>,
     pub thumb_720: Option<String>,
     pub thumb_1024: Option<String>,
     pub thumb_video: Option<String>,
@@ -806,6 +808,19 @@ impl SlackFile {
     }
 
     pub fn preview_url(&self) -> Option<&str> {
+        if self.is_gif() {
+            return self
+                .thumb_480_gif
+                .as_deref()
+                .or(self.thumb_360_gif.as_deref())
+                .or(self.url_private.as_deref())
+                .or(self.url_private_download.as_deref())
+                .or(self.thumb_480.as_deref())
+                .or(self.thumb_360.as_deref())
+                .or(self.thumb_160.as_deref())
+                .or(self.thumb_80.as_deref())
+                .or(self.thumb_64.as_deref());
+        }
         self.url_static_preview
             .as_deref()
             .or(self.thumb_480.as_deref())
@@ -832,6 +847,16 @@ impl SlackFile {
         self.mimetype
             .as_deref()
             .is_some_and(|mimetype| mimetype.starts_with("image/"))
+    }
+
+    fn is_gif(&self) -> bool {
+        self.mimetype
+            .as_deref()
+            .is_some_and(|mimetype| mimetype.eq_ignore_ascii_case("image/gif"))
+            || self
+                .filetype
+                .as_deref()
+                .is_some_and(|filetype| filetype.eq_ignore_ascii_case("gif"))
     }
 
     pub fn detail_label(&self) -> String {
@@ -1213,10 +1238,11 @@ impl SlackMessage {
         let mut nodes = Vec::new();
         if let Some(blocks) = self.blocks.as_ref() {
             nodes.extend(
-                crate::rich_message_normalize::normalize_blocks(
+                crate::rich_message_normalize::normalize_blocks_with_files(
                     blocks,
                     "Choose an option",
                     "More actions",
+                    self.files.as_deref().unwrap_or_default(),
                 )
                 .nodes,
             );
