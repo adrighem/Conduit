@@ -97,6 +97,12 @@ impl PreviewAsset {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UploadAttachment {
+    pub path: PathBuf,
+    pub remove_after_upload: bool,
+}
+
 #[derive(Debug)]
 pub enum RuntimeCommand {
     LoadStoredToken,
@@ -218,12 +224,11 @@ pub enum RuntimeCommand {
     SetCurrentUserStatus {
         status: SlackUserStatus,
     },
-    UploadFile {
+    UploadFiles {
         channel_id: String,
         thread_ts: Option<String>,
-        path: PathBuf,
-        initial_comment: Option<String>,
-        remove_after_upload: bool,
+        attachments: Vec<UploadAttachment>,
+        blocks_json: Option<String>,
     },
     Huddle(HuddleCommand),
 }
@@ -648,7 +653,7 @@ impl RuntimeCommand {
                 workspace(RuntimeOperation::UserStatus),
                 RuntimeTaskLane::Interactive,
             ),
-            Self::UploadFile {
+            Self::UploadFiles {
                 channel_id,
                 thread_ts,
                 ..
@@ -2265,18 +2270,10 @@ async fn maintain_attachment_cache(protected: Option<PathBuf>) {
     }
 }
 
-struct RemoveFileOnDrop(Option<PathBuf>);
-
-impl RemoveFileOnDrop {
-    fn new(enabled: bool, path: &Path) -> Self {
-        Self(enabled.then(|| path.to_path_buf()))
-    }
-}
-
-impl Drop for RemoveFileOnDrop {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = std::fs::remove_file(path);
+fn remove_completed_upload_files(attachments: &[UploadAttachment]) {
+    for attachment in attachments {
+        if attachment.remove_after_upload {
+            let _ = std::fs::remove_file(&attachment.path);
         }
     }
 }
@@ -4516,14 +4513,12 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 }
             }
         }
-        RuntimeCommand::UploadFile {
+        RuntimeCommand::UploadFiles {
             channel_id,
             thread_ts,
-            path,
-            initial_comment,
-            remove_after_upload,
+            attachments,
+            blocks_json,
         } => {
-            let _temporary_upload = RemoveFileOnDrop::new(remove_after_upload, &path);
             let api = require_slack(context.slack)?;
             context
                 .events
@@ -4532,12 +4527,16 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     label: "Preparing upload".to_string(),
                 });
             let progress_events = context.events.clone();
+            let paths = attachments
+                .iter()
+                .map(|attachment| attachment.path.clone())
+                .collect::<Vec<_>>();
             let upload = api
-                .upload_file(
+                .upload_files(
                     &channel_id,
                     thread_ts.as_deref(),
-                    &path,
-                    initial_comment.as_deref(),
+                    &paths,
+                    blocks_json.as_deref(),
                     move |update| {
                         progress_events.send_event(RuntimeEventKind::FileUploadProgress {
                             fraction: update.fraction,
@@ -4546,12 +4545,18 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     },
                 )
                 .await;
-            let file = upload?;
-            let label = file
-                .title
-                .or(file.name)
-                .or(file.id)
-                .unwrap_or_else(|| "file".to_string());
+            let files = upload?;
+            remove_completed_upload_files(&attachments);
+            let label = if files.len() == 1 {
+                let mut files = files;
+                let file = files.remove(0);
+                file.title
+                    .or(file.name)
+                    .or(file.id)
+                    .unwrap_or_else(|| "file".to_string())
+            } else {
+                format!("{} files", files.len())
+            };
             context
                 .events
                 .send_event(RuntimeEventKind::FileUploaded(label));
@@ -10958,12 +10963,14 @@ mod tests {
             thread_ts: None,
         }
         .supersedes_previous());
-        assert!(!RuntimeCommand::UploadFile {
+        assert!(!RuntimeCommand::UploadFiles {
             channel_id: "C1".to_string(),
             thread_ts: None,
-            path: PathBuf::from("example.txt"),
-            initial_comment: None,
-            remove_after_upload: false,
+            attachments: vec![UploadAttachment {
+                path: PathBuf::from("example.txt"),
+                remove_after_upload: false,
+            }],
+            blocks_json: None,
         }
         .supersedes_previous());
     }
@@ -14139,20 +14146,30 @@ mod tests {
     }
 
     #[test]
-    fn temporary_upload_guard_removes_staged_file() {
-        let path = std::env::temp_dir().join(format!(
+    fn completed_upload_cleanup_removes_only_owned_staged_files() {
+        let owned = std::env::temp_dir().join(format!(
             "conduit-upload-cleanup-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         ));
-        std::fs::write(&path, b"screenshot").unwrap();
+        let source = owned.with_extension("source");
+        std::fs::write(&owned, b"screenshot").unwrap();
+        std::fs::write(&source, b"source").unwrap();
 
-        {
-            let _guard = RemoveFileOnDrop::new(true, &path);
-            assert!(path.exists());
-        }
+        remove_completed_upload_files(&[
+            UploadAttachment {
+                path: owned.clone(),
+                remove_after_upload: true,
+            },
+            UploadAttachment {
+                path: source.clone(),
+                remove_after_upload: false,
+            },
+        ]);
 
-        assert!(!path.exists());
+        assert!(!owned.exists());
+        assert!(source.exists());
+        std::fs::remove_file(source).unwrap();
     }
 
     #[test]
@@ -14314,12 +14331,14 @@ mod tests {
         .descriptor();
         assert_eq!(image.lane, RuntimeTaskLane::Image);
 
-        let upload = RuntimeCommand::UploadFile {
+        let upload = RuntimeCommand::UploadFiles {
             channel_id: "C123".to_string(),
             thread_ts: None,
-            path: PathBuf::from("upload.png"),
-            initial_comment: None,
-            remove_after_upload: false,
+            attachments: vec![UploadAttachment {
+                path: PathBuf::from("upload.png"),
+                remove_after_upload: false,
+            }],
+            blocks_json: None,
         }
         .descriptor();
         assert_eq!(upload.lane, RuntimeTaskLane::Upload);

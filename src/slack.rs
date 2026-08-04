@@ -1211,71 +1211,93 @@ impl SlackApi {
         Ok(())
     }
 
-    pub async fn upload_file<F>(
+    pub async fn upload_files<F>(
         &self,
         channel_id: &str,
         thread_ts: Option<&str>,
-        path: &Path,
-        initial_comment: Option<&str>,
+        paths: &[PathBuf],
+        blocks_json: Option<&str>,
         progress: F,
-    ) -> Result<SlackFile>
+    ) -> Result<Vec<SlackFile>>
     where
         F: Fn(UploadProgressUpdate),
     {
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| SlackError::validation("file path has no valid filename"))?
-            .to_string();
-        let metadata = tokio::fs::metadata(path)
-            .await
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if metadata.len() > MAX_UPLOAD_BYTES {
-            return Err(SlackError::validation(format!(
-                "{} is larger than 1 GiB",
-                path.display()
-            )));
+        if paths.is_empty() {
+            return Err(SlackError::validation("select at least one file"));
+        }
+        let count = paths.len() as f64;
+        let mut pending_files = Vec::with_capacity(paths.len());
+
+        for (index, path) in paths.iter().enumerate() {
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| SlackError::validation("file path has no valid filename"))?
+                .to_string();
+            let metadata = tokio::fs::metadata(path)
+                .await
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            if metadata.len() > MAX_UPLOAD_BYTES {
+                return Err(SlackError::validation(format!(
+                    "{} is larger than 1 GiB",
+                    path.display()
+                )));
+            }
+
+            let base = index as f64 / count * 0.85;
+            let span = 0.85 / count;
+            progress(UploadProgressUpdate::new(
+                base + span * 0.15,
+                &format!("Reading {filename}"),
+            ));
+            let bytes = tokio::fs::read(path)
+                .await
+                .with_context(|| format!("failed to read {}", path.display()))?;
+
+            progress(UploadProgressUpdate::new(
+                base + span * 0.35,
+                "Requesting upload URL",
+            ));
+            let upload: UploadUrlResponse = self
+                .post_form(
+                    "files.getUploadURLExternal",
+                    &[
+                        ("filename", filename.clone()),
+                        ("length", bytes.len().to_string()),
+                    ],
+                )
+                .await?;
+
+            progress(UploadProgressUpdate::new(
+                base + span * 0.60,
+                &format!("Uploading {filename}"),
+            ));
+            self.http
+                .post(&upload.upload_url)
+                .body(bytes)
+                .send()
+                .await
+                .context("failed to upload file bytes to Slack upload URL")?
+                .error_for_status()
+                .context("Slack upload URL returned an HTTP error")?;
+            pending_files.push(json!({ "id": upload.file_id, "title": filename }));
+            progress(UploadProgressUpdate::new(base + span, "File data uploaded"));
         }
 
-        progress(UploadProgressUpdate::new(0.15, "Reading file"));
-        let bytes = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-
-        progress(UploadProgressUpdate::new(0.35, "Requesting upload URL"));
-        let upload: UploadUrlResponse = self
-            .post_form(
-                "files.getUploadURLExternal",
-                &[
-                    ("filename", filename.clone()),
-                    ("length", bytes.len().to_string()),
-                ],
-            )
-            .await?;
-
-        progress(UploadProgressUpdate::new(0.60, "Uploading file"));
-        self.http
-            .post(&upload.upload_url)
-            .body(bytes)
-            .send()
-            .await
-            .context("failed to upload file bytes to Slack upload URL")?
-            .error_for_status()
-            .context("Slack upload URL returned an HTTP error")?;
-
         progress(UploadProgressUpdate::new(0.90, "Completing upload"));
-        let files = json!([{ "id": upload.file_id, "title": filename }]).to_string();
-        let params = complete_upload_params(files, channel_id, thread_ts, initial_comment);
+        let files = Value::Array(pending_files).to_string();
+        let params = complete_upload_params(files, channel_id, thread_ts, blocks_json);
         let complete: CompleteUploadResponse = self
             .post_form("files.completeUploadExternal", &params)
             .await?;
 
         progress(UploadProgressUpdate::new(1.0, "Upload complete"));
-        complete
-            .files
-            .into_iter()
-            .next()
-            .ok_or_else(|| SlackError::validation("Slack did not return uploaded file metadata"))
+        if complete.files.is_empty() {
+            return Err(SlackError::validation(
+                "Slack did not return uploaded file metadata",
+            ));
+        }
+        Ok(complete.files)
     }
 
     async fn post_form<T>(&self, method: &str, params: &[(&str, String)]) -> Result<T>
@@ -1651,14 +1673,14 @@ fn complete_upload_params(
     files: String,
     channel_id: &str,
     thread_ts: Option<&str>,
-    initial_comment: Option<&str>,
+    blocks_json: Option<&str>,
 ) -> Vec<(&'static str, String)> {
     let mut params = vec![("files", files), ("channel_id", channel_id.to_string())];
     if let Some(thread_ts) = thread_ts.filter(|thread_ts| !thread_ts.trim().is_empty()) {
         params.push(("thread_ts", thread_ts.to_string()));
     }
-    if let Some(initial_comment) = initial_comment.filter(|comment| !comment.trim().is_empty()) {
-        params.push(("initial_comment", initial_comment.to_string()));
+    if let Some(blocks_json) = blocks_json.filter(|blocks| !blocks.trim().is_empty()) {
+        params.push(("blocks", blocks_json.to_string()));
     }
     params
 }
@@ -3096,12 +3118,11 @@ mod tests {
             "files-json".to_string(),
             "C123",
             Some("1710000000.000100"),
-            Some("See screenshot"),
+            None,
         );
 
         assert!(params.contains(&("channel_id", "C123".to_string())));
         assert!(params.contains(&("thread_ts", "1710000000.000100".to_string())));
-        assert!(params.contains(&("initial_comment", "See screenshot".to_string())));
     }
 
     #[test]
@@ -3116,6 +3137,105 @@ mod tests {
 
         assert!(params.contains(&("blocks", blocks.to_string())));
         assert!(!params.iter().any(|(name, _)| *name == "initial_comment"));
+    }
+
+    #[test]
+    fn batch_upload_completes_ordered_files_once_with_rich_blocks() {
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-batch-upload-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).expect("upload fixture directory should exist");
+        let paths = [directory.join("first.txt"), directory.join("second.txt")];
+        std::fs::write(&paths[0], b"first").expect("first upload fixture should be written");
+        std::fs::write(&paths[1], b"second").expect("second upload fixture should be written");
+
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let server_base = format!("http://{address}");
+        let upload_base = server_base.clone();
+        let received = thread::spawn(move || {
+            let mut observations = Vec::new();
+            let mut upload_url_index = 0;
+            for _ in 0..5 {
+                let mut request = server.recv().expect("mock Slack request should arrive");
+                let path = request.url().to_string();
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("mock Slack request body should be readable");
+                let response = if path == "/api/files.getUploadURLExternal" {
+                    upload_url_index += 1;
+                    Response::from_string(format!(
+                        r#"{{"ok":true,"upload_url":"{upload_base}/upload/{upload_url_index}","file_id":"F{upload_url_index}"}}"#
+                    ))
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    )
+                } else if path.starts_with("/upload/") {
+                    Response::from_string("")
+                } else if path == "/api/files.completeUploadExternal" {
+                    Response::from_string(
+                        r#"{"ok":true,"files":[{"id":"F1","name":"first.txt"},{"id":"F2","name":"second.txt"}]}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    )
+                } else {
+                    panic!("unexpected mock Slack path {path}");
+                };
+                request
+                    .respond(response)
+                    .expect("mock Slack response should be sent");
+                observations.push((path, body));
+            }
+            observations
+        });
+
+        let blocks = r#"[{"type":"rich_text","elements":[]}]"#;
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("{server_base}/api");
+        let files = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.upload_files("C123", Some("1.0"), &paths, Some(blocks), |_| {}))
+            .expect("batch upload should complete");
+
+        assert_eq!(files.len(), 2);
+        let observations = received.join().expect("mock Slack server should finish");
+        assert_eq!(
+            observations
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/api/files.getUploadURLExternal",
+                "/upload/1",
+                "/api/files.getUploadURLExternal",
+                "/upload/2",
+                "/api/files.completeUploadExternal",
+            ]
+        );
+        let complete_body = observations
+            .iter()
+            .find_map(|(path, body)| (path == "/api/files.completeUploadExternal").then_some(body))
+            .expect("completion request should be present");
+        let form = url::form_urlencoded::parse(complete_body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(form.get("channel_id").map(String::as_str), Some("C123"));
+        assert_eq!(form.get("thread_ts").map(String::as_str), Some("1.0"));
+        assert_eq!(form.get("blocks").map(String::as_str), Some(blocks));
+        assert!(!form.contains_key("initial_comment"));
+        let uploaded: Value = serde_json::from_str(form.get("files").expect("files form value"))
+            .expect("files form value should be JSON");
+        assert_eq!(uploaded.as_array().map(Vec::len), Some(2));
+        assert_eq!(uploaded[0]["id"], "F1");
+        assert_eq!(uploaded[1]["id"], "F2");
+        std::fs::remove_dir_all(directory).expect("upload fixtures should be removed");
     }
 
     #[test]

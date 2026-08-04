@@ -77,7 +77,7 @@ use crate::rendering;
 use crate::runtime::{
     image_asset_cache_key, AppRuntime, OperationContext, PreviewAsset, RequestId, RuntimeCommand,
     RuntimeEvent, RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory,
-    RuntimeIdentity, RuntimeOperation, RuntimeTarget, SessionId,
+    RuntimeIdentity, RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
@@ -2063,6 +2063,17 @@ fn submitted_draft_matches(
     current_text
         .or(stored_text)
         .is_some_and(|text| text.trim() == submitted)
+}
+
+fn remove_submitted_attachments(
+    current: &mut RichComposerDraft,
+    submitted: &RichComposerDraft,
+) -> bool {
+    let before = current.attachments.len();
+    current
+        .attachments
+        .retain(|attachment| !submitted.attachments.contains(attachment));
+    current.attachments.len() != before
 }
 
 fn draft_persist_required(drafts_changed: bool, persist_pending: bool) -> bool {
@@ -5223,6 +5234,7 @@ impl ConduitWindow {
         } else {
             self.set_composer_canonical_text(ComposerTarget::Message, &text);
         }
+        self.sync_composer_submission_state(ComposerTarget::Message, channel_id, None);
     }
 
     fn restore_thread_draft(&self, channel_id: &str, thread_ts: &str) {
@@ -5240,6 +5252,30 @@ impl ConduitWindow {
             self.set_composer_rich_draft(ComposerTarget::Thread, &draft);
         } else {
             self.set_composer_canonical_text(ComposerTarget::Thread, &text);
+        }
+        self.sync_composer_submission_state(ComposerTarget::Thread, channel_id, Some(thread_ts));
+    }
+
+    fn sync_composer_submission_state(
+        &self,
+        target: ComposerTarget,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+    ) {
+        let Some(key) = self.draft_key(channel_id, thread_ts) else {
+            self.set_composer_submission_sensitive(target, true);
+            self.reset_composer_upload_progress(target);
+            return;
+        };
+        let post_pending = self.imp().pending_sent_drafts.borrow().contains_key(&key);
+        let upload_pending = self.imp().pending_upload_drafts.borrow().contains_key(&key);
+        self.set_composer_submission_sensitive(target, !post_pending && !upload_pending);
+        if upload_pending {
+            let progress = self.composer_upload_progress(target);
+            progress.set_visible(true);
+            progress.set_text(Some("Uploading"));
+        } else {
+            self.reset_composer_upload_progress(target);
         }
     }
 
@@ -5312,39 +5348,63 @@ impl ConduitWindow {
         let Some(submitted) = submitted else {
             return;
         };
+        let Some(submitted_draft) = decode_rich_composer_draft(submitted) else {
+            return;
+        };
         let Some(key) = self.draft_key(channel_id, thread_ts) else {
             return;
         };
         let current_target_matches = self.visible_channel_id().as_deref() == Some(channel_id)
             && thread_ts
                 .is_none_or(|thread_ts| self.selected_thread_ts().as_deref() == Some(thread_ts));
-        let current_text = current_target_matches.then(|| {
-            if thread_ts.is_some() {
-                self.composer_draft_storage(ComposerTarget::Thread)
-            } else {
-                self.composer_draft_storage(ComposerTarget::Message)
-            }
-        });
+        let target = if thread_ts.is_some() {
+            ComposerTarget::Thread
+        } else {
+            ComposerTarget::Message
+        };
+        let current_draft = current_target_matches.then(|| self.composer_rich_draft(target));
+        let current_text = current_draft.as_ref().map(encode_rich_composer_draft);
         let stored_text = self
             .imp()
             .drafts
             .borrow()
             .get(&key)
             .map(ToString::to_string);
-        if !submitted_draft_matches(current_text.as_deref(), stored_text.as_deref(), submitted) {
+
+        if current_text
+            .as_deref()
+            .is_some_and(|text| text.trim() == submitted)
+        {
+            if stored_text.is_some_and(|text| text.trim() == submitted)
+                && self.imp().drafts.borrow_mut().remove(&key)
+            {
+                self.schedule_draft_persist();
+            }
+            self.set_composer_canonical_text(target, "");
             return;
         }
 
-        if stored_text.is_some_and(|text| text.trim() == submitted)
-            && self.imp().drafts.borrow_mut().remove(&key)
-        {
-            self.schedule_draft_persist();
+        if let Some(mut current_draft) = current_draft {
+            if remove_submitted_attachments(&mut current_draft, &submitted_draft) {
+                self.set_composer_attachments(target, current_draft.attachments);
+                self.save_current_drafts();
+            }
+            return;
         }
-        if current_text.is_some() {
-            if thread_ts.is_some() {
-                self.set_composer_canonical_text(ComposerTarget::Thread, "");
-            } else {
-                self.set_composer_canonical_text(ComposerTarget::Message, "");
+
+        let Some(mut stored_draft) = stored_text.as_deref().and_then(decode_rich_composer_draft)
+        else {
+            return;
+        };
+        if remove_submitted_attachments(&mut stored_draft, &submitted_draft) {
+            let updated =
+                if stored_draft.text.trim().is_empty() && stored_draft.attachments.is_empty() {
+                    String::new()
+                } else {
+                    encode_rich_composer_draft(&stored_draft)
+                };
+            if self.imp().drafts.borrow_mut().upsert(key, &updated) {
+                self.schedule_draft_persist();
             }
         }
     }
@@ -5475,11 +5535,32 @@ impl ConduitWindow {
         }
     }
 
+    fn composer_send_button(&self, target: ComposerTarget) -> gtk::Button {
+        match target {
+            ComposerTarget::Message => self.imp().send_button.get(),
+            ComposerTarget::Thread => self.imp().thread_send_button.get(),
+        }
+    }
+
     fn composer_upload_progress(&self, target: ComposerTarget) -> gtk::ProgressBar {
         match target {
             ComposerTarget::Message => self.imp().upload_progress.get(),
             ComposerTarget::Thread => self.imp().thread_upload_progress.get(),
         }
+    }
+
+    fn set_composer_submission_sensitive(&self, target: ComposerTarget, sensitive: bool) {
+        self.composer_send_button(target).set_sensitive(sensitive);
+        self.composer_upload_button(target).set_sensitive(sensitive);
+        self.composer_attachment_host(target)
+            .set_sensitive(sensitive);
+    }
+
+    fn reset_composer_upload_progress(&self, target: ComposerTarget) {
+        let progress = self.composer_upload_progress(target);
+        progress.set_visible(false);
+        progress.set_fraction(0.0);
+        progress.set_text(None);
     }
 
     fn set_composer_attachments(
@@ -7230,17 +7311,20 @@ impl ConduitWindow {
                 channel_id,
                 message,
             } => {
-                self.set_status("Message sent");
                 let thread_ts = posted_message_thread_ts(&meta.context, &channel_id, &message);
                 let mut message = *message;
                 if let Some(thread_ts) = thread_ts.as_deref() {
                     message.thread_ts = Some(thread_ts.to_string());
                 }
                 self.complete_submitted_draft(&channel_id, thread_ts.as_deref());
-                if thread_ts.is_some() {
-                    self.imp().thread_send_button.set_sensitive(true);
-                } else {
-                    self.imp().send_button.set_sensitive(true);
+                if self.mutation_target_is_active(&channel_id, thread_ts.as_deref()) {
+                    let target = if thread_ts.is_some() {
+                        ComposerTarget::Thread
+                    } else {
+                        ComposerTarget::Message
+                    };
+                    self.set_composer_submission_sensitive(target, true);
+                    self.set_status("Message sent");
                 }
                 let outcome = self.apply_timeline_message(
                     &channel_id,
@@ -7293,19 +7377,26 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::FileUploadProgress { fraction, label } => {
-                let imp = self.imp();
-                imp.upload_progress.set_visible(true);
-                imp.upload_progress.set_fraction(fraction);
-                imp.upload_progress.set_text(Some(&label));
-                self.set_status(&label);
+                if let RuntimeTarget::Upload {
+                    channel_id,
+                    thread_ts,
+                } = &meta.context.target
+                {
+                    if self.mutation_target_is_active(channel_id, thread_ts.as_deref()) {
+                        let target = if thread_ts.is_some() {
+                            ComposerTarget::Thread
+                        } else {
+                            ComposerTarget::Message
+                        };
+                        let upload_progress = self.composer_upload_progress(target);
+                        upload_progress.set_visible(true);
+                        upload_progress.set_fraction(fraction);
+                        upload_progress.set_text(Some(&label));
+                        self.set_status(&label);
+                    }
+                }
             }
             RuntimeEventKind::FileUploaded(name) => {
-                let imp = self.imp();
-                imp.upload_button.set_sensitive(true);
-                imp.thread_send_button.set_sensitive(true);
-                imp.upload_progress.set_fraction(1.0);
-                imp.upload_progress.set_text(Some("Upload complete"));
-                self.set_status(&format!("Uploaded {name}"));
                 let upload_target = match &meta.context.target {
                     RuntimeTarget::Upload {
                         channel_id,
@@ -7314,8 +7405,22 @@ impl ConduitWindow {
                     _ => None,
                 };
                 if let Some((channel_id, thread_ts)) = upload_target {
+                    if self.mutation_target_is_active(channel_id, thread_ts) {
+                        let target = if thread_ts.is_some() {
+                            ComposerTarget::Thread
+                        } else {
+                            ComposerTarget::Message
+                        };
+                        self.set_composer_submission_sensitive(target, true);
+                        let upload_progress = self.composer_upload_progress(target);
+                        upload_progress.set_visible(false);
+                        upload_progress.set_fraction(0.0);
+                        upload_progress.set_text(None);
+                        self.set_status(&format!("Uploaded {name}"));
+                    }
                     let submitted = self.draft_key(channel_id, thread_ts).and_then(|key| {
-                        imp.pending_upload_drafts
+                        self.imp()
+                            .pending_upload_drafts
                             .borrow_mut()
                             .remove(&key)
                             .flatten()
@@ -7856,59 +7961,97 @@ impl ConduitWindow {
     }
 
     fn post_current_message(&self) {
-        let imp = self.imp();
-        let Some(channel_id) = self.visible_channel_id() else {
-            self.set_status("Select a conversation");
-            return;
-        };
-        let draft = self.composer_rich_draft(ComposerTarget::Message);
-        let Some(payload) = draft.slack_payload() else {
-            return;
-        };
-        let submitted = encode_rich_composer_draft(&draft);
-
-        if !self.remember_submitted_draft(&channel_id, None, &submitted) {
-            self.set_status(&gettext("A message is already being sent."));
-            return;
-        }
-        self.send_command(RuntimeCommand::PostMessage {
-            channel_id,
-            text: payload.fallback_text,
-            blocks_json: Some(payload.blocks_json),
-            thread_ts: None,
-        });
-        imp.send_button.set_sensitive(false);
-        self.set_status("Sending message");
+        self.submit_composer(ComposerTarget::Message);
     }
 
     fn post_thread_reply(&self) {
-        let imp = self.imp();
+        self.submit_composer(ComposerTarget::Thread);
+    }
+
+    fn submit_composer(&self, target: ComposerTarget) {
         let Some(channel_id) = self.visible_channel_id() else {
             self.set_status("Select a conversation");
             return;
         };
-        let Some(thread_ts) = self.selected_thread_ts() else {
-            self.set_status("Open a thread");
-            return;
+        let thread_ts = match target {
+            ComposerTarget::Message => None,
+            ComposerTarget::Thread => {
+                let Some(thread_ts) = self.selected_thread_ts() else {
+                    self.set_status("Open a thread");
+                    return;
+                };
+                Some(thread_ts)
+            }
         };
-        let draft = self.composer_rich_draft(ComposerTarget::Thread);
-        let Some(payload) = draft.slack_payload() else {
-            return;
-        };
-        let submitted = encode_rich_composer_draft(&draft);
-
-        if !self.remember_submitted_draft(&channel_id, Some(&thread_ts), &submitted) {
-            self.set_status(&gettext("A reply is already being sent."));
+        let draft = self.composer_rich_draft(target);
+        let payload = draft.slack_payload();
+        if payload.is_none() && draft.attachments.is_empty() {
             return;
         }
-        self.send_command(RuntimeCommand::PostMessage {
+        let submitted = encode_rich_composer_draft(&draft);
+        let Some(key) = self.draft_key(&channel_id, thread_ts.as_deref()) else {
+            self.set_status("No Slack workspace is active");
+            return;
+        };
+        if self.imp().pending_sent_drafts.borrow().contains_key(&key)
+            || self.imp().pending_upload_drafts.borrow().contains_key(&key)
+        {
+            self.set_status(&gettext(match target {
+                ComposerTarget::Message => "A message is already being sent.",
+                ComposerTarget::Thread => "A reply is already being sent.",
+            }));
+            return;
+        }
+
+        if draft.attachments.is_empty() {
+            let Some(payload) = payload else {
+                return;
+            };
+            if !self.remember_submitted_draft(&channel_id, thread_ts.as_deref(), &submitted) {
+                return;
+            }
+            self.send_command(RuntimeCommand::PostMessage {
+                channel_id,
+                text: payload.fallback_text,
+                blocks_json: Some(payload.blocks_json),
+                thread_ts,
+            });
+            self.set_composer_submission_sensitive(target, false);
+            self.set_status(match target {
+                ComposerTarget::Message => "Sending message",
+                ComposerTarget::Thread => "Sending reply",
+            });
+            return;
+        }
+
+        self.flush_current_drafts();
+        if !record_upload_submission(
+            &mut self.imp().pending_upload_drafts.borrow_mut(),
+            key,
+            Some(submitted),
+        ) {
+            return;
+        }
+        let attachments = draft
+            .attachments
+            .into_iter()
+            .map(|attachment| UploadAttachment {
+                path: attachment.path,
+                remove_after_upload: attachment.remove_after_upload,
+            })
+            .collect();
+        self.send_command(RuntimeCommand::UploadFiles {
             channel_id,
-            text: payload.fallback_text,
-            blocks_json: Some(payload.blocks_json),
-            thread_ts: Some(thread_ts),
+            thread_ts,
+            attachments,
+            blocks_json: payload.map(|payload| payload.blocks_json),
         });
-        imp.thread_send_button.set_sensitive(false);
-        self.set_status("Sending reply");
+        self.set_composer_submission_sensitive(target, false);
+        let progress = self.composer_upload_progress(target);
+        progress.set_visible(true);
+        progress.set_fraction(0.0);
+        progress.set_text(Some("Starting upload"));
+        self.set_status("Starting upload");
     }
 
     fn choose_file_for_upload(&self, target: ComposerTarget) {
@@ -8665,12 +8808,10 @@ impl ConduitWindow {
         *imp.custom_emojis.borrow_mut() = Arc::default();
         self.set_composer_canonical_text(ComposerTarget::Message, "");
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
-        imp.send_button.set_sensitive(true);
-        imp.thread_send_button.set_sensitive(true);
-        imp.upload_button.set_sensitive(true);
-        imp.upload_progress.set_visible(false);
-        imp.upload_progress.set_fraction(0.0);
-        imp.upload_progress.set_text(None);
+        for target in COMPOSER_TARGETS {
+            self.set_composer_submission_sensitive(target, true);
+            self.reset_composer_upload_progress(target);
+        }
         imp.sidebar_filter_entry.set_text("");
         imp.sidebar_unread_filter_button.set_active(false);
         imp.sidebar_all_filter_button.set_active(false);
@@ -8913,12 +9054,13 @@ impl ConduitWindow {
                 thread_ts,
             } => {
                 self.discard_submitted_draft(&channel_id, thread_ts.as_deref());
-                if thread_ts.is_some() {
-                    self.imp().thread_send_button.set_sensitive(true);
-                } else {
-                    self.imp().send_button.set_sensitive(true);
-                }
                 if self.mutation_target_is_active(&channel_id, thread_ts.as_deref()) {
+                    let target = if thread_ts.is_some() {
+                        ComposerTarget::Thread
+                    } else {
+                        ComposerTarget::Message
+                    };
+                    self.set_composer_submission_sensitive(target, true);
                     self.set_status(error);
                 }
             }
@@ -8951,16 +9093,17 @@ impl ConduitWindow {
                 channel_id,
                 thread_ts,
             } => {
-                let imp = self.imp();
                 if let Some(key) = self.draft_key(&channel_id, thread_ts.as_deref()) {
-                    imp.pending_upload_drafts.borrow_mut().remove(&key);
+                    self.imp().pending_upload_drafts.borrow_mut().remove(&key);
                 }
-                imp.upload_button.set_sensitive(true);
-                imp.thread_send_button.set_sensitive(true);
-                imp.upload_progress.set_visible(false);
-                imp.upload_progress.set_fraction(0.0);
-                imp.upload_progress.set_text(Some("Upload failed"));
                 if self.mutation_target_is_active(&channel_id, thread_ts.as_deref()) {
+                    let target = if thread_ts.is_some() {
+                        ComposerTarget::Thread
+                    } else {
+                        ComposerTarget::Message
+                    };
+                    self.set_composer_submission_sensitive(target, true);
+                    self.reset_composer_upload_progress(target);
                     self.set_status(error);
                 }
             }
@@ -15164,6 +15307,33 @@ mod tests {
             posted_message_thread_ts(&context, "C123", &SlackMessage::default()).as_deref(),
             Some("parent")
         );
+    }
+
+    #[test]
+    fn completed_upload_removes_sent_attachments_but_keeps_new_draft_edits() {
+        let sent = ComposerAttachmentDraft {
+            path: PathBuf::from("sent.png"),
+            remove_after_upload: true,
+        };
+        let added_later = ComposerAttachmentDraft {
+            path: PathBuf::from("later.mp4"),
+            remove_after_upload: false,
+        };
+        let submitted = RichComposerDraft {
+            text: "first message".to_string(),
+            attachments: vec![sent.clone()],
+            ..Default::default()
+        };
+        let mut current = RichComposerDraft {
+            text: "next message".to_string(),
+            attachments: vec![sent, added_later.clone()],
+            ..Default::default()
+        };
+
+        assert!(remove_submitted_attachments(&mut current, &submitted));
+        assert_eq!(current.text, "next message");
+        assert_eq!(current.attachments, vec![added_later]);
+        assert!(!remove_submitted_attachments(&mut current, &submitted));
     }
 
     #[test]
