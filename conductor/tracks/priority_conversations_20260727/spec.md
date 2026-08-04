@@ -55,6 +55,15 @@ change Slack's private VIP list.
     them inline with remove controls, and defer upload until Send.
 25. Complete staged uploads together so media and the formatted composition
     appear as one Slack file-share message in the selected channel or thread.
+26. Keep each formatting toolbar compact and start-aligned, leaving unused
+    horizontal space after its controls and moving trailing controls into an
+    ellipsis overflow menu when the composer is too narrow.
+27. Preserve submitted formatting through Slack response normalization and the
+    immediate local timeline update, including underline styling.
+28. Render LF, CRLF, CR, and Unicode line separators consistently in incoming
+    rich text without collapsing or duplicating logical line breaks.
+29. Hide and reset upload progress after terminal success while retaining the
+    staged composition on failure for retry.
 
 ## Acceptance Criteria
 
@@ -85,10 +94,15 @@ change Slack's private VIP list.
   render applied inline and paragraph styles directly in their text views.
 - Rich posts include a complete plain-text fallback for notifications and
   screen readers plus structured `rich_text` blocks for Slack clients.
+- Rich-post regressions cover the GTK snapshot boundary, Slack response
+  normalization, underline rendering, and embedded logical line breaks.
+- Formatting controls remain start-aligned at their natural width and every
+  hidden control remains reachable from an ellipsis overflow menu.
 - File selection and image paste create removable composer previews without
   starting network upload; Send completes all staged media in one file share.
 - Staged-media tests cover multiple upload URLs, one completion request,
-  thread targeting, progress, temporary-file cleanup, and draft restoration.
+  thread targeting, terminal progress cleanup, retry retention, temporary-file
+  cleanup, and draft restoration.
 - A successful toggle updates persisted conversation state and rerenders the sidebar.
 - `cargo fmt --check`, Rust tests, `cargo check`, Meson compile, and Meson tests pass in a sanitized allowlisted environment.
 

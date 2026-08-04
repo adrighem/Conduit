@@ -22,11 +22,13 @@
 - [x] Task: Add failing rich document, draft, and Slack payload coverage 0c48aa4
 - [x] Task: Add formatting toolbars, native rich editing, and emoji insertion to message and reply composers 467cc7d
 - [x] Task: Send and restore Slack rich-text blocks with accessible plain-text fallbacks 62a0d7a
-- [~] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md)
+- [~] Task: Add regressions for compact overflow, rich response rendering, and logical newlines
+- [ ] Task: Keep composer controls compact and preserve rich formatting and newlines after Send
+- [ ] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md)
 
 ## Phase 4: Inline staged media
 
-- [ ] Task: Add failing staged-media draft and batch-upload coverage
+- [ ] Task: Add failing staged-media draft, batch-upload, and terminal-progress coverage
 - [ ] Task: Preview removable image and video attachments inside both composers
 - [ ] Task: Send staged media and rich text as one Slack file-share message
 - [ ] Task: Conductor - User Manual Verification 'Inline staged media' (Protocol in workflow.md)
