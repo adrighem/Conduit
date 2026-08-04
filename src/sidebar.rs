@@ -80,6 +80,7 @@ pub struct SidebarRowModel {
     pub muted: bool,
     pub external: bool,
     pub huddle_active: bool,
+    pub user_deleted: bool,
     pub search_aliases: Vec<String>,
     pub status: Option<SlackUserStatus>,
 }
@@ -467,6 +468,7 @@ impl SidebarRowModel {
             muted: conversation.is_muted_conversation(),
             external: conversation.is_external_conversation(),
             huddle_active: options.active_huddle_channel_id == Some(conversation.id.as_str()),
+            user_deleted: kind == ConversationKind::DirectMessage && conversation.is_user_deleted(),
             search_aliases,
             status: (kind == ConversationKind::DirectMessage)
                 .then_some(conversation.user.as_deref())
@@ -741,9 +743,11 @@ pub(crate) fn filter_conversation_switcher_rows(
             right_score
                 .band()
                 .cmp(&left_score.band())
+                .then_with(|| compare_unread_category(left, right))
                 .then_with(|| {
                     compare_participant_coverage(left, right, Some(&participant_coverage))
                 })
+                .then_with(|| compare_user_deleted(left, right))
                 .then_with(|| (left_sort_key, &left.id).cmp(&(right_sort_key, &right.id)))
         },
     );
@@ -922,6 +926,7 @@ pub fn conversation_picker_sections_with_statuses(
                 muted: false,
                 external: false,
                 huddle_active: false,
+                user_deleted: false,
                 search_aliases: user.search_aliases(),
                 status: user
                     .status()
@@ -969,7 +974,9 @@ fn sort_picker_items(
 ) {
     items.sort_by(|left, right| {
         compare_relevance(&left.row, &right.row, query)
+            .then_with(|| compare_unread_category(&left.row, &right.row))
             .then_with(|| compare_participant_coverage(&left.row, &right.row, participant_coverage))
+            .then_with(|| compare_user_deleted(&left.row, &right.row))
             .then_with(|| {
                 title_sort_key(&left.row.title)
                     .cmp(&title_sort_key(&right.row.title))
@@ -1265,7 +1272,9 @@ fn sort_search_rows(
 ) {
     rows.sort_by(|left, right| {
         compare_relevance(left, right, Some(query))
+            .then_with(|| compare_unread_category(left, right))
             .then_with(|| compare_participant_coverage(left, right, Some(participant_coverage)))
+            .then_with(|| compare_user_deleted(left, right))
             .then_with(|| {
                 (title_sort_key(&left.title), &left.id)
                     .cmp(&(title_sort_key(&right.title), &right.id))
@@ -1297,6 +1306,23 @@ fn compare_participant_coverage(
         });
 
     (right.matched * left.total).cmp(&(left.matched * right.total))
+}
+
+fn compare_unread_category(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
+    unread_category(left).cmp(&unread_category(right))
+}
+
+fn unread_category(row: &SidebarRowModel) -> u8 {
+    match (row.unread, row.kind) {
+        (true, ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage) => 0,
+        (true, ConversationKind::PublicChannel | ConversationKind::PrivateChannel) => 1,
+        (true, ConversationKind::Unknown) => 2,
+        (false, _) => 3,
+    }
+}
+
+fn compare_user_deleted(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
+    left.user_deleted.cmp(&right.user_deleted)
 }
 
 fn sort_unread_rows(rows: &mut [SidebarRowModel], query: Option<&SearchQuery>) {
@@ -1426,6 +1452,7 @@ mod tests {
             muted: false,
             external: false,
             huddle_active: false,
+            user_deleted: false,
             search_aliases: Vec::new(),
             status: None,
         }

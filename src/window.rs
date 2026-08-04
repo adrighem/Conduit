@@ -12628,6 +12628,7 @@ mod tests {
             muted: false,
             external: false,
             huddle_active: false,
+            user_deleted: false,
             search_aliases: Vec::new(),
             status: None,
         }
