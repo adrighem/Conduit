@@ -1,0 +1,5 @@
+Task: Add failing shared-catalog and surface coverage for adjacent Slack skin-tone modifiers.
+
+Coverage: Slack skin-tone-2 through skin-tone-6 catalog resolution, alias bases, invalid and inapplicable combinations, adjacent mrkdwn and Block Kit emoji rendering, reaction chips and mutation names, usage-ranked quick actions, WebView author status, native current-user status, and the Set Status selected preview.
+
+Red verification: all focused regressions failed. The catalog returned no compound emoji, message rendering split the adjacent tokens, the status picker synthesized an empty custom image, and native status presentation fell back to a dot.
