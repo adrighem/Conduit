@@ -20,9 +20,9 @@
 ## Phase 3: WYSIWYG rich-text composer
 
 - [x] Task: Add failing rich document, draft, and Slack payload coverage 0c48aa4
-- [~] Task: Add formatting toolbars, native rich editing, and emoji insertion to message and reply composers
+- [x] Task: Add formatting toolbars, native rich editing, and emoji insertion to message and reply composers 467cc7d
 - [x] Task: Send and restore Slack rich-text blocks with accessible plain-text fallbacks 62a0d7a
-- [ ] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md)
+- [~] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md)
 
 ## Phase 4: Inline staged media
 
