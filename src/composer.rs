@@ -19,8 +19,11 @@
  */
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use gtk::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 
 use crate::models::SlackUser;
 use crate::search::{
@@ -56,7 +59,7 @@ pub struct MentionCandidate {
     pub search_aliases: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MentionSpan {
     pub start: usize,
     pub end: usize,
@@ -75,6 +78,348 @@ pub struct MentionInsertion {
 pub struct HydratedComposerText {
     pub text: String,
     pub mentions: Vec<MentionSpan>,
+}
+
+const RICH_COMPOSER_DRAFT_PREFIX: &str = "conduit-rich-v1:";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComposerTextStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    pub code: bool,
+}
+
+impl ComposerTextStyle {
+    fn merge(&mut self, other: Self) {
+        self.bold |= other.bold;
+        self.italic |= other.italic;
+        self.underline |= other.underline;
+        self.strike |= other.strike;
+        self.code |= other.code;
+    }
+
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerStyleSpan {
+    pub start: usize,
+    pub end: usize,
+    pub style: ComposerTextStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerBlockKind {
+    BulletedList,
+    NumberedList,
+    Quote,
+    Preformatted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerBlockSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: ComposerBlockKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerAttachmentDraft {
+    pub path: PathBuf,
+    pub remove_after_upload: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RichComposerDraft {
+    pub text: String,
+    pub mentions: Vec<MentionSpan>,
+    pub styles: Vec<ComposerStyleSpan>,
+    pub blocks: Vec<ComposerBlockSpan>,
+    pub attachments: Vec<ComposerAttachmentDraft>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerMessagePayload {
+    pub fallback_text: String,
+    pub blocks_json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerLine {
+    start: usize,
+    end: usize,
+}
+
+impl RichComposerDraft {
+    pub fn slack_payload(&self) -> Option<ComposerMessagePayload> {
+        if self.text.trim().is_empty() {
+            return None;
+        }
+
+        let elements = composer_rich_text_elements(self);
+        let blocks = vec![json!({
+            "type": "rich_text",
+            "elements": elements,
+        })];
+        Some(ComposerMessagePayload {
+            fallback_text: serialize_composer_mentions(&self.text, &self.mentions),
+            blocks_json: serde_json::to_string(&blocks).ok()?,
+        })
+    }
+}
+
+pub fn encode_rich_composer_draft(draft: &RichComposerDraft) -> String {
+    serde_json::to_string(draft)
+        .map(|draft| format!("{RICH_COMPOSER_DRAFT_PREFIX}{draft}"))
+        .unwrap_or_default()
+}
+
+pub fn decode_rich_composer_draft(stored: &str) -> Option<RichComposerDraft> {
+    serde_json::from_str(stored.strip_prefix(RICH_COMPOSER_DRAFT_PREFIX)?).ok()
+}
+
+fn composer_lines(text: &str) -> Vec<ComposerLine> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, character) in characters.iter().enumerate() {
+        if *character == '\n' {
+            lines.push(ComposerLine { start, end: index });
+            start = index + 1;
+        }
+    }
+    lines.push(ComposerLine {
+        start,
+        end: characters.len(),
+    });
+    lines
+}
+
+fn composer_line_kind(
+    blocks: &[ComposerBlockSpan],
+    line: ComposerLine,
+    text_length: usize,
+) -> Option<ComposerBlockKind> {
+    blocks
+        .iter()
+        .filter(|span| span.start < span.end && span.end <= text_length)
+        .find(|span| span.start <= line.start && span.end >= line.end)
+        .map(|span| span.kind)
+}
+
+fn composer_rich_text_elements(draft: &RichComposerDraft) -> Vec<Value> {
+    let text_length = draft.text.chars().count();
+    let lines = composer_lines(&draft.text);
+    let mut elements = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let kind = composer_line_kind(&draft.blocks, lines[index], text_length);
+        let mut end_index = index + 1;
+        while end_index < lines.len()
+            && composer_line_kind(&draft.blocks, lines[end_index], text_length) == kind
+        {
+            end_index += 1;
+        }
+
+        match kind {
+            Some(ComposerBlockKind::BulletedList | ComposerBlockKind::NumberedList) => {
+                let style = if kind == Some(ComposerBlockKind::BulletedList) {
+                    "bullet"
+                } else {
+                    "ordered"
+                };
+                let items = lines[index..end_index]
+                    .iter()
+                    .map(|line| {
+                        json!({
+                            "type": "rich_text_section",
+                            "elements": composer_inline_elements(draft, line.start, line.end),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                elements.push(json!({
+                    "type": "rich_text_list",
+                    "style": style,
+                    "indent": 0,
+                    "elements": items,
+                }));
+            }
+            Some(ComposerBlockKind::Quote | ComposerBlockKind::Preformatted) => {
+                let element_type = if kind == Some(ComposerBlockKind::Quote) {
+                    "rich_text_quote"
+                } else {
+                    "rich_text_preformatted"
+                };
+                elements.push(json!({
+                    "type": element_type,
+                    "elements": composer_inline_elements(
+                        draft,
+                        lines[index].start,
+                        lines[end_index - 1].end,
+                    ),
+                }));
+            }
+            None => {
+                elements.push(json!({
+                    "type": "rich_text_section",
+                    "elements": composer_inline_elements(
+                        draft,
+                        lines[index].start,
+                        lines[end_index - 1].end,
+                    ),
+                }));
+            }
+        }
+        index = end_index;
+    }
+
+    elements
+}
+
+fn composer_inline_elements(draft: &RichComposerDraft, start: usize, end: usize) -> Vec<Value> {
+    let characters = draft.text.chars().collect::<Vec<_>>();
+    let start = start.min(characters.len());
+    let end = end.min(characters.len()).max(start);
+    let mentions = valid_composer_mentions(&draft.text, &draft.mentions);
+    let styles = draft
+        .styles
+        .iter()
+        .filter(|span| {
+            span.start < span.end
+                && span.end <= characters.len()
+                && !span.style.is_empty()
+                && span.start < end
+                && start < span.end
+        })
+        .collect::<Vec<_>>();
+    let mut boundaries = vec![start, end];
+    for span in &styles {
+        boundaries.push(span.start.max(start));
+        boundaries.push(span.end.min(end));
+    }
+    for mention in &mentions {
+        if mention.start < end && start < mention.end {
+            boundaries.push(mention.start.max(start));
+            boundaries.push(mention.end.min(end));
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut elements = Vec::new();
+    for pair in boundaries.windows(2) {
+        let segment_start = pair[0];
+        let segment_end = pair[1];
+        if segment_start == segment_end {
+            continue;
+        }
+        let mut style = ComposerTextStyle::default();
+        for span in &styles {
+            if span.start <= segment_start && span.end >= segment_end {
+                style.merge(span.style);
+            }
+        }
+        if let Some(mention) = mentions
+            .iter()
+            .find(|mention| mention.start == segment_start && mention.end == segment_end)
+        {
+            elements.push(styled_rich_element(
+                json!({"type": "user", "user_id": mention.user_id}),
+                style,
+            ));
+            continue;
+        }
+
+        let text = characters[segment_start..segment_end]
+            .iter()
+            .collect::<String>();
+        elements.extend(composer_text_elements(&text, style));
+    }
+    elements
+}
+
+fn composer_text_elements(text: &str, style: ComposerTextStyle) -> Vec<Value> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut elements = Vec::new();
+    let mut cursor = 0;
+    let mut plain_start = 0;
+    while cursor < characters.len() {
+        if characters[cursor] != ':' {
+            cursor += 1;
+            continue;
+        }
+        let Some(relative_end) = characters[cursor + 1..]
+            .iter()
+            .position(|character| *character == ':')
+        else {
+            cursor += 1;
+            continue;
+        };
+        let shortcode_end = cursor + 1 + relative_end;
+        let name = characters[cursor + 1..shortcode_end]
+            .iter()
+            .collect::<String>();
+        let valid = !name.is_empty() && name.chars().all(is_shortcode_character);
+        if !valid {
+            cursor += 1;
+            continue;
+        }
+        if plain_start < cursor {
+            elements.push(styled_rich_element(
+                json!({
+                    "type": "text",
+                    "text": characters[plain_start..cursor].iter().collect::<String>(),
+                }),
+                style,
+            ));
+        }
+        elements.push(styled_rich_element(
+            json!({"type": "emoji", "name": name}),
+            style,
+        ));
+        cursor = shortcode_end + 1;
+        plain_start = cursor;
+    }
+    if plain_start < characters.len() {
+        elements.push(styled_rich_element(
+            json!({
+                "type": "text",
+                "text": characters[plain_start..].iter().collect::<String>(),
+            }),
+            style,
+        ));
+    }
+    elements
+}
+
+fn styled_rich_element(mut element: Value, style: ComposerTextStyle) -> Value {
+    if style.is_empty() {
+        return element;
+    }
+    let mut style_json = Map::new();
+    for (name, enabled) in [
+        ("bold", style.bold),
+        ("italic", style.italic),
+        ("underline", style.underline),
+        ("strike", style.strike),
+        ("code", style.code),
+    ] {
+        if enabled {
+            style_json.insert(name.to_string(), Value::Bool(true));
+        }
+    }
+    if let Some(object) = element.as_object_mut() {
+        object.insert("style".to_string(), Value::Object(style_json));
+    }
+    element
 }
 
 fn is_shortcode_character(character: char) -> bool {
@@ -342,9 +687,9 @@ fn spans_overlap(left: &MentionSpan, right: &MentionSpan) -> bool {
     left.start < right.end && right.start < left.end
 }
 
-pub fn serialize_composer_mentions(text: &str, spans: &[MentionSpan]) -> String {
+fn valid_composer_mentions<'a>(text: &str, spans: &'a [MentionSpan]) -> Vec<&'a MentionSpan> {
     let characters = text.chars().collect::<Vec<_>>();
-    let valid = spans
+    let mut valid = spans
         .iter()
         .enumerate()
         .filter(|(_, span)| valid_mention_span(span, &characters))
@@ -357,8 +702,13 @@ pub fn serialize_composer_mentions(text: &str, spans: &[MentionSpan]) -> String 
         })
         .map(|(_, span)| span)
         .collect::<Vec<_>>();
-    let mut valid = valid;
     valid.sort_by_key(|span| (span.start, span.end));
+    valid
+}
+
+pub fn serialize_composer_mentions(text: &str, spans: &[MentionSpan]) -> String {
+    let characters = text.chars().collect::<Vec<_>>();
+    let valid = valid_composer_mentions(text, spans);
 
     let mut serialized = String::with_capacity(text.len());
     let mut cursor = 0;
