@@ -275,7 +275,11 @@ mod imp {
         #[template_child]
         pub message_composer: TemplateChild<gtk::Box>,
         #[template_child]
-        pub message_format_toolbar: TemplateChild<gtk::FlowBox>,
+        pub message_format_breakpoint: TemplateChild<adw::BreakpointBin>,
+        #[template_child]
+        pub message_format_toolbar: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub message_format_overflow: TemplateChild<gtk::MenuButton>,
         #[template_child]
         pub thread_split: TemplateChild<adw::OverlaySplitView>,
         #[template_child]
@@ -325,7 +329,11 @@ mod imp {
         #[template_child]
         pub thread_entry: TemplateChild<gtk::TextView>,
         #[template_child]
-        pub thread_format_toolbar: TemplateChild<gtk::FlowBox>,
+        pub thread_format_breakpoint: TemplateChild<adw::BreakpointBin>,
+        #[template_child]
+        pub thread_format_toolbar: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub thread_format_overflow: TemplateChild<gtk::MenuButton>,
         #[template_child]
         pub thread_send_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -5375,10 +5383,24 @@ impl ConduitWindow {
         }
     }
 
-    fn composer_format_host(&self, target: ComposerTarget) -> gtk::FlowBox {
+    fn composer_format_host(&self, target: ComposerTarget) -> gtk::Box {
         match target {
             ComposerTarget::Message => self.imp().message_format_toolbar.get(),
             ComposerTarget::Thread => self.imp().thread_format_toolbar.get(),
+        }
+    }
+
+    fn composer_format_breakpoint(&self, target: ComposerTarget) -> adw::BreakpointBin {
+        match target {
+            ComposerTarget::Message => self.imp().message_format_breakpoint.get(),
+            ComposerTarget::Thread => self.imp().thread_format_breakpoint.get(),
+        }
+    }
+
+    fn composer_format_overflow(&self, target: ComposerTarget) -> gtk::MenuButton {
+        match target {
+            ComposerTarget::Message => self.imp().message_format_overflow.get(),
+            ComposerTarget::Thread => self.imp().thread_format_overflow.get(),
         }
     }
 
@@ -5414,6 +5436,17 @@ impl ConduitWindow {
         )
     }
 
+    fn composer_overflow_action(action: ComposerFormatAction) -> bool {
+        matches!(
+            action,
+            ComposerFormatAction::BulletedList
+                | ComposerFormatAction::NumberedList
+                | ComposerFormatAction::Quote
+                | ComposerFormatAction::CodeBlock
+                | ComposerFormatAction::Emoji
+        )
+    }
+
     fn setup_composer_toolbar(&self, target: ComposerTarget) {
         let host = self.composer_format_host(target);
         host.update_property(&[gtk::accessible::Property::Label(&gettext(match target {
@@ -5422,11 +5455,17 @@ impl ConduitWindow {
         }))]);
         let updating = Rc::new(Cell::new(false));
         let mut buttons = HashMap::new();
+        let mut collapsed_widgets = Vec::new();
+        let overflow = self.composer_format_overflow(target);
+        host.remove(&overflow);
         let weak_window = self.downgrade();
         let emoji_picker =
             StatusEmojiPicker::new_for_composer(&self.imp().custom_emojis.borrow(), move |name| {
                 if let Some(window) = weak_window.upgrade() {
                     window.insert_composer_emoji(target, name);
+                    if let Some(popover) = window.composer_format_overflow(target).popover() {
+                        popover.popdown();
+                    }
                 }
             });
         if let Some(menu_button) = emoji_picker
@@ -5445,10 +5484,16 @@ impl ConduitWindow {
                 button.update_property(&[gtk::accessible::Property::Label(&gettext(
                     control.accessible_name,
                 ))]);
-                let popover = emoji_picker.popover.clone();
-                popover.set_parent(&button);
-                button.connect_clicked(move |_| popover.popup());
+                let weak_window = self.downgrade();
+                button.connect_clicked(move |button| {
+                    if let Some(window) = weak_window.upgrade() {
+                        window.popup_composer_emoji(target, button);
+                    }
+                });
                 host.append(&button);
+                if Self::composer_overflow_action(control.action) {
+                    collapsed_widgets.push(button.upcast::<gtk::Widget>());
+                }
                 continue;
             }
 
@@ -5470,8 +5515,71 @@ impl ConduitWindow {
                 }
             });
             host.append(&button);
+            if Self::composer_overflow_action(control.action) {
+                collapsed_widgets.push(button.clone().upcast::<gtk::Widget>());
+            }
             buttons.insert(control.action, button);
         }
+
+        host.append(&overflow);
+
+        let overflow_content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        overflow_content.set_margin_top(6);
+        overflow_content.set_margin_bottom(6);
+        overflow_content.set_margin_start(6);
+        overflow_content.set_margin_end(6);
+        let overflow_popover = gtk::Popover::new();
+        overflow_popover.set_child(Some(&overflow_content));
+        overflow.set_popover(Some(&overflow_popover));
+        for control in composer_format_controls()
+            .into_iter()
+            .filter(|control| Self::composer_overflow_action(control.action))
+        {
+            let button = gtk::Button::with_label(&gettext(control.accessible_name));
+            button.add_css_class("flat");
+            button.update_property(&[gtk::accessible::Property::Label(&gettext(
+                control.accessible_name,
+            ))]);
+            if control.action == ComposerFormatAction::Emoji {
+                let weak_window = self.downgrade();
+                button.connect_clicked(move |button| {
+                    if let Some(window) = weak_window.upgrade() {
+                        window.popup_composer_emoji(target, button);
+                    }
+                });
+            } else {
+                let weak_window = self.downgrade();
+                let popover = overflow_popover.clone();
+                let action = control.action;
+                button.connect_clicked(move |_| {
+                    let Some(window) = weak_window.upgrade() else {
+                        return;
+                    };
+                    let primary = window
+                        .composer_toolbar(target)
+                        .borrow()
+                        .as_ref()
+                        .and_then(|toolbar| toolbar.buttons.get(&action).cloned());
+                    if let Some(primary) = primary {
+                        primary.set_active(!primary.is_active());
+                    }
+                    popover.popdown();
+                });
+            }
+            overflow_content.append(&button);
+        }
+
+        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            420.0,
+            adw::LengthUnit::Sp,
+        ));
+        for widget in collapsed_widgets {
+            breakpoint.add_setter(&widget, "visible", Some(&false.to_value()));
+        }
+        breakpoint.add_setter(&overflow, "visible", Some(&true.to_value()));
+        self.composer_format_breakpoint(target)
+            .add_breakpoint(breakpoint);
 
         *self.composer_toolbar(target).borrow_mut() = Some(ComposerToolbar {
             buttons,
@@ -5480,8 +5588,11 @@ impl ConduitWindow {
         });
 
         let buffer = self.composer_text_view(target).buffer();
+        let pending_format = Rc::new(RefCell::new(None::<(i32, i32, Vec<ComposerFormatAction>)>));
         let weak_window = self.downgrade();
+        let pending_format_for_insert = pending_format.clone();
         buffer.connect_insert_text(move |_, location, text| {
+            pending_format_for_insert.borrow_mut().take();
             let Some(window) = weak_window.upgrade() else {
                 return;
             };
@@ -5504,24 +5615,31 @@ impl ConduitWindow {
             }
             let start = location.offset().max(0);
             let end = start.saturating_add(text.chars().count() as i32);
-            let weak_window = window.downgrade();
-            glib::idle_add_local_once(move || {
-                let Some(window) = weak_window.upgrade() else {
-                    return;
-                };
-                let buffer = window.composer_text_view(target).buffer();
-                if end > buffer.char_count() {
-                    return;
+            pending_format_for_insert
+                .borrow_mut()
+                .replace((start, end, actions));
+        });
+
+        let weak_window = self.downgrade();
+        buffer.connect_changed(move |_| {
+            let Some((start, end, actions)) = pending_format.borrow_mut().take() else {
+                return;
+            };
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let buffer = window.composer_text_view(target).buffer();
+            if end > buffer.char_count() {
+                return;
+            }
+            let start = buffer.iter_at_offset(start);
+            let end = buffer.iter_at_offset(end);
+            for action in actions {
+                if let Some(tag) = Self::composer_format_tag(action) {
+                    buffer.apply_tag_by_name(tag, &start, &end);
                 }
-                let start = buffer.iter_at_offset(start);
-                let end = buffer.iter_at_offset(end);
-                for action in actions {
-                    if let Some(tag) = Self::composer_format_tag(action) {
-                        buffer.apply_tag_by_name(tag, &start, &end);
-                    }
-                }
-                window.schedule_draft_save();
-            });
+            }
+            window.schedule_draft_save();
         });
 
         let weak_window = self.downgrade();
@@ -5533,6 +5651,23 @@ impl ConduitWindow {
             }
         });
         self.refresh_composer_toolbar(target);
+    }
+
+    fn popup_composer_emoji(&self, target: ComposerTarget, anchor: &impl IsA<gtk::Widget>) {
+        let popover = self
+            .composer_toolbar(target)
+            .borrow()
+            .as_ref()
+            .map(|toolbar| toolbar.emoji_picker.popover.clone());
+        let Some(popover) = popover else {
+            return;
+        };
+        popover.popdown();
+        if popover.parent().is_some() {
+            popover.unparent();
+        }
+        popover.set_parent(anchor);
+        popover.popup();
     }
 
     fn insert_composer_emoji(&self, target: ComposerTarget, name: &str) {

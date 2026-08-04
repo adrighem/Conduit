@@ -226,6 +226,7 @@ fn normalize_inline_style(value: Option<&Value>) -> RichInlineStyle {
     RichInlineStyle {
         bold: style_flag(value, "bold"),
         italic: style_flag(value, "italic"),
+        underline: style_flag(value, "underline"),
         strike: style_flag(value, "strike"),
         code: style_flag(value, "code"),
     }

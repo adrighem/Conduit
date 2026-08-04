@@ -1114,6 +1114,15 @@ impl SlackApi {
         let response: PostMessageResponse = self.post_form("chat.postMessage", &params).await?;
         let mut message = response.message;
         message.client_msg_id.get_or_insert(client_msg_id);
+        if message.blocks.is_none() {
+            if let Some(blocks) = blocks_json
+                .filter(|blocks| !blocks.trim().is_empty())
+                .and_then(|blocks| serde_json::from_str::<Value>(blocks).ok())
+            {
+                message.blocks = Some(blocks);
+                message.refresh_canonical_content();
+            }
+        }
         Ok(message)
     }
 

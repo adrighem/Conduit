@@ -542,12 +542,25 @@
                                       </object>
                                     </child>
                                     <child>
-                                      <object class="GtkFlowBox" id="message_format_toolbar">
-                                        <property name="selection-mode">none</property>
-                                        <property name="column-spacing">2</property>
-                                        <property name="row-spacing">2</property>
-                                        <property name="max-children-per-line">10</property>
-                                        <property name="accessible-role">toolbar</property>
+                                      <object class="AdwBreakpointBin" id="message_format_breakpoint">
+                                        <property name="child">
+                                          <object class="GtkBox" id="message_format_toolbar">
+                                            <property name="orientation">horizontal</property>
+                                            <property name="spacing">2</property>
+                                            <property name="halign">start</property>
+                                            <property name="accessible-role">toolbar</property>
+                                            <child>
+                                              <object class="GtkMenuButton" id="message_format_overflow">
+                                                <property name="icon-name">view-more-symbolic</property>
+                                                <property name="tooltip-text" translatable="yes">More formatting</property>
+                                                <property name="visible">False</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </property>
                                       </object>
                                     </child>
                                     <child>
@@ -651,12 +664,25 @@
                                       </object>
                                     </child>
                                     <child>
-                                      <object class="GtkFlowBox" id="thread_format_toolbar">
-                                        <property name="selection-mode">none</property>
-                                        <property name="column-spacing">2</property>
-                                        <property name="row-spacing">2</property>
-                                        <property name="max-children-per-line">10</property>
-                                        <property name="accessible-role">toolbar</property>
+                                      <object class="AdwBreakpointBin" id="thread_format_breakpoint">
+                                        <property name="child">
+                                          <object class="GtkBox" id="thread_format_toolbar">
+                                            <property name="orientation">horizontal</property>
+                                            <property name="spacing">2</property>
+                                            <property name="halign">start</property>
+                                            <property name="accessible-role">toolbar</property>
+                                            <child>
+                                              <object class="GtkMenuButton" id="thread_format_overflow">
+                                                <property name="icon-name">view-more-symbolic</property>
+                                                <property name="tooltip-text" translatable="yes">More formatting</property>
+                                                <property name="visible">False</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </property>
                                       </object>
                                     </child>
                                     <child>

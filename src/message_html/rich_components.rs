@@ -162,16 +162,16 @@ fn render_inlines(inlines: &[RichInline], context: &MessageHtmlContext) -> Strin
 
 fn render_inline(inline: &RichInline, context: &MessageHtmlContext) -> String {
     let (mut html, style) = match inline {
-        RichInline::Text { text, style } => (super::escape_html(text), *style),
+        RichInline::Text { text, style } => (escape_inline_html(text), *style),
         RichInline::Link { url, label, style } => {
             let html = if super::is_http_url(url) {
                 format!(
                     "<a href=\"{}\" rel=\"noreferrer noopener\">{}</a>",
                     super::escape_html(url),
-                    super::escape_html(label)
+                    escape_inline_html(label)
                 )
             } else {
-                super::escape_html(label)
+                escape_inline_html(label)
             };
             (html, *style)
         }
@@ -208,6 +208,13 @@ fn render_inline(inline: &RichInline, context: &MessageHtmlContext) -> String {
     html
 }
 
+fn escape_inline_html(text: &str) -> String {
+    let normalized = text
+        .replace("\r\n", "\n")
+        .replace(['\r', '\u{2028}', '\u{2029}'], "\n");
+    super::escape_html(&normalized).replace('\n', "<br>")
+}
+
 fn apply_style(html: &mut String, style: RichInlineStyle) {
     if style.code {
         *html = format!("<code>{html}</code>");
@@ -220,6 +227,9 @@ fn apply_style(html: &mut String, style: RichInlineStyle) {
     }
     if style.strike {
         *html = format!("<s>{html}</s>");
+    }
+    if style.underline {
+        *html = format!("<u>{html}</u>");
     }
 }
 

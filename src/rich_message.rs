@@ -180,6 +180,8 @@ pub enum RichInline {
 pub struct RichInlineStyle {
     pub(crate) bold: bool,
     pub(crate) italic: bool,
+    #[serde(default)]
+    pub(crate) underline: bool,
     pub(crate) strike: bool,
     pub(crate) code: bool,
 }
