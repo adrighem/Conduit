@@ -275,6 +275,8 @@ mod imp {
         #[template_child]
         pub message_composer: TemplateChild<gtk::Box>,
         #[template_child]
+        pub message_format_toolbar: TemplateChild<gtk::FlowBox>,
+        #[template_child]
         pub thread_split: TemplateChild<adw::OverlaySplitView>,
         #[template_child]
         pub thread_resize_handle: TemplateChild<gtk::Separator>,
@@ -322,6 +324,8 @@ mod imp {
         pub thread_view_box: TemplateChild<gtk::Box>,
         #[template_child]
         pub thread_entry: TemplateChild<gtk::TextView>,
+        #[template_child]
+        pub thread_format_toolbar: TemplateChild<gtk::FlowBox>,
         #[template_child]
         pub thread_send_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -390,6 +394,8 @@ mod imp {
         pub realtime_status: Cell<RealtimeStatus>,
         pub(super) message_composer_completion: RefCell<Option<ComposerCompletion>>,
         pub(super) thread_composer_completion: RefCell<Option<ComposerCompletion>>,
+        pub(super) message_composer_toolbar: RefCell<Option<ComposerToolbar>>,
+        pub(super) thread_composer_toolbar: RefCell<Option<ComposerToolbar>>,
         pub(super) message_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) thread_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
@@ -611,6 +617,17 @@ mod imp {
                     completion.popover.popdown();
                     if completion.popover.parent().is_some() {
                         completion.popover.unparent();
+                    }
+                }
+            }
+            for toolbar in [
+                &self.message_composer_toolbar,
+                &self.thread_composer_toolbar,
+            ] {
+                if let Some(toolbar) = toolbar.borrow_mut().take() {
+                    toolbar.emoji_picker.popover.popdown();
+                    if toolbar.emoji_picker.popover.parent().is_some() {
+                        toolbar.emoji_picker.popover.unparent();
                     }
                 }
             }
@@ -1090,6 +1107,89 @@ struct ComposerCompletion {
     list: gtk::ListBox,
     entries: Vec<ComposerCompletionEntry>,
     token: Option<ComposerCompletionToken>,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum ComposerFormatAction {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    InlineCode,
+    BulletedList,
+    NumberedList,
+    Quote,
+    CodeBlock,
+    Emoji,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComposerFormatControl {
+    action: ComposerFormatAction,
+    label: &'static str,
+    accessible_name: &'static str,
+}
+
+fn composer_format_controls() -> &'static [ComposerFormatControl] {
+    &[
+        ComposerFormatControl {
+            action: ComposerFormatAction::Bold,
+            label: "B",
+            accessible_name: "Bold",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::Italic,
+            label: "I",
+            accessible_name: "Italic",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::Underline,
+            label: "U",
+            accessible_name: "Underline",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::Strike,
+            label: "S",
+            accessible_name: "Strikethrough",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::InlineCode,
+            label: "`",
+            accessible_name: "Inline code",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::BulletedList,
+            label: "•",
+            accessible_name: "Bulleted list",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::NumberedList,
+            label: "1.",
+            accessible_name: "Numbered list",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::Quote,
+            label: "❝",
+            accessible_name: "Quote",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::CodeBlock,
+            label: "```",
+            accessible_name: "Code block",
+        },
+        ComposerFormatControl {
+            action: ComposerFormatAction::Emoji,
+            label: "☺",
+            accessible_name: "Emoji",
+        },
+    ]
+}
+
+#[derive(Debug, Clone)]
+struct ComposerToolbar {
+    buttons: HashMap<ComposerFormatAction, gtk::ToggleButton>,
+    updating: Rc<Cell<bool>>,
+    emoji_picker: StatusEmojiPicker,
 }
 
 fn composer_emoji_preview(entry: &EmojiEntry) -> gtk::Widget {
@@ -2652,6 +2752,35 @@ impl StatusEmojiPicker {
         selected_emoji: &str,
         on_selected: impl Fn(&str) + 'static,
     ) -> Self {
+        Self::new_with_options(
+            custom_emojis,
+            selected_emoji,
+            Some(gettext("No emoji")),
+            gettext("Choose a status emoji"),
+            on_selected,
+        )
+    }
+
+    fn new_for_composer(
+        custom_emojis: &HashMap<String, String>,
+        on_selected: impl Fn(&str) + 'static,
+    ) -> Self {
+        Self::new_with_options(
+            custom_emojis,
+            "",
+            None,
+            gettext("Insert emoji"),
+            on_selected,
+        )
+    }
+
+    fn new_with_options(
+        custom_emojis: &HashMap<String, String>,
+        selected_emoji: &str,
+        clear_label: Option<String>,
+        tooltip: String,
+        on_selected: impl Fn(&str) + 'static,
+    ) -> Self {
         let selected_name = Rc::new(RefCell::new(
             selected_emoji.trim().trim_matches(':').to_string(),
         ));
@@ -2731,10 +2860,13 @@ impl StatusEmojiPicker {
         heading.add_css_class("heading");
         heading.set_xalign(0.0);
         heading.set_hexpand(true);
-        let clear_button = gtk::Button::with_label(&gettext("No emoji"));
-        clear_button.add_css_class("flat");
         header.append(&heading);
-        header.append(&clear_button);
+        let clear_button = clear_label.map(|label| {
+            let button = gtk::Button::with_label(&label);
+            button.add_css_class("flat");
+            header.append(&button);
+            button
+        });
 
         let picker_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
         picker_content.set_size_request(480, -1);
@@ -2758,11 +2890,9 @@ impl StatusEmojiPicker {
         button.set_direction(gtk::ArrowType::Left);
         button.set_icon_name("pan-down-symbolic");
         button.set_popover(Some(&popover));
-        button.set_tooltip_text(Some(&gettext("Choose a status emoji")));
+        button.set_tooltip_text(Some(&tooltip));
         button.set_valign(gtk::Align::Center);
-        button.update_property(&[gtk::accessible::Property::Label(&gettext(
-            "Choose a status emoji",
-        ))]);
+        button.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
 
         let row = adw::ActionRow::builder().title(gettext("Emoji")).build();
         let selected_preview = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -2983,7 +3113,7 @@ impl StatusEmojiPicker {
             });
         }
 
-        {
+        if let Some(clear_button) = clear_button {
             let select_choice = select_choice.clone();
             clear_button.connect_clicked(move |_| select_choice(None));
         }
@@ -4744,6 +4874,7 @@ impl ConduitWindow {
 
         for target in COMPOSER_TARGETS {
             self.ensure_composer_format_tags(target);
+            self.setup_composer_toolbar(target);
             self.setup_composer_completion(target);
         }
 
@@ -5244,6 +5375,263 @@ impl ConduitWindow {
         }
     }
 
+    fn composer_format_host(&self, target: ComposerTarget) -> gtk::FlowBox {
+        match target {
+            ComposerTarget::Message => self.imp().message_format_toolbar.get(),
+            ComposerTarget::Thread => self.imp().thread_format_toolbar.get(),
+        }
+    }
+
+    fn composer_toolbar(&self, target: ComposerTarget) -> &RefCell<Option<ComposerToolbar>> {
+        match target {
+            ComposerTarget::Message => &self.imp().message_composer_toolbar,
+            ComposerTarget::Thread => &self.imp().thread_composer_toolbar,
+        }
+    }
+
+    fn composer_format_tag(action: ComposerFormatAction) -> Option<&'static str> {
+        match action {
+            ComposerFormatAction::Bold => Some(COMPOSER_BOLD_TAG),
+            ComposerFormatAction::Italic => Some(COMPOSER_ITALIC_TAG),
+            ComposerFormatAction::Underline => Some(COMPOSER_UNDERLINE_TAG),
+            ComposerFormatAction::Strike => Some(COMPOSER_STRIKE_TAG),
+            ComposerFormatAction::InlineCode => Some(COMPOSER_CODE_TAG),
+            ComposerFormatAction::BulletedList => Some(COMPOSER_BULLETED_LIST_TAG),
+            ComposerFormatAction::NumberedList => Some(COMPOSER_NUMBERED_LIST_TAG),
+            ComposerFormatAction::Quote => Some(COMPOSER_QUOTE_TAG),
+            ComposerFormatAction::CodeBlock => Some(COMPOSER_PREFORMATTED_TAG),
+            ComposerFormatAction::Emoji => None,
+        }
+    }
+
+    fn composer_block_action(action: ComposerFormatAction) -> bool {
+        matches!(
+            action,
+            ComposerFormatAction::BulletedList
+                | ComposerFormatAction::NumberedList
+                | ComposerFormatAction::Quote
+                | ComposerFormatAction::CodeBlock
+        )
+    }
+
+    fn setup_composer_toolbar(&self, target: ComposerTarget) {
+        let host = self.composer_format_host(target);
+        host.update_property(&[gtk::accessible::Property::Label(&gettext(match target {
+            ComposerTarget::Message => "Message formatting",
+            ComposerTarget::Thread => "Reply formatting",
+        }))]);
+        let updating = Rc::new(Cell::new(false));
+        let mut buttons = HashMap::new();
+        let weak_window = self.downgrade();
+        let emoji_picker =
+            StatusEmojiPicker::new_for_composer(&self.imp().custom_emojis.borrow(), move |name| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.insert_composer_emoji(target, name);
+                }
+            });
+        if let Some(menu_button) = emoji_picker
+            .row
+            .activatable_widget()
+            .and_downcast::<gtk::MenuButton>()
+        {
+            menu_button.set_popover(None::<&gtk::Popover>);
+        }
+
+        for control in composer_format_controls() {
+            if control.action == ComposerFormatAction::Emoji {
+                let button = gtk::Button::with_label(control.label);
+                button.add_css_class("flat");
+                button.set_tooltip_text(Some(&gettext(control.accessible_name)));
+                button.update_property(&[gtk::accessible::Property::Label(&gettext(
+                    control.accessible_name,
+                ))]);
+                let popover = emoji_picker.popover.clone();
+                popover.set_parent(&button);
+                button.connect_clicked(move |_| popover.popup());
+                host.append(&button);
+                continue;
+            }
+
+            let button = gtk::ToggleButton::with_label(control.label);
+            button.add_css_class("flat");
+            button.set_tooltip_text(Some(&gettext(control.accessible_name)));
+            button.update_property(&[gtk::accessible::Property::Label(&gettext(
+                control.accessible_name,
+            ))]);
+            let weak_window = self.downgrade();
+            let updating_for_toggle = updating.clone();
+            let action = control.action;
+            button.connect_toggled(move |button| {
+                if updating_for_toggle.get() {
+                    return;
+                }
+                if let Some(window) = weak_window.upgrade() {
+                    window.apply_composer_format(target, action, button.is_active());
+                }
+            });
+            host.append(&button);
+            buttons.insert(control.action, button);
+        }
+
+        *self.composer_toolbar(target).borrow_mut() = Some(ComposerToolbar {
+            buttons,
+            updating,
+            emoji_picker,
+        });
+
+        let buffer = self.composer_text_view(target).buffer();
+        let weak_window = self.downgrade();
+        buffer.connect_insert_text(move |_, location, text| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let (updating, actions) = {
+                let toolbar = window.composer_toolbar(target).borrow();
+                let Some(toolbar) = toolbar.as_ref() else {
+                    return;
+                };
+                (
+                    toolbar.updating.get(),
+                    toolbar
+                        .buttons
+                        .iter()
+                        .filter_map(|(action, button)| button.is_active().then_some(*action))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            if updating || actions.is_empty() || text.is_empty() {
+                return;
+            }
+            let start = location.offset().max(0);
+            let end = start.saturating_add(text.chars().count() as i32);
+            let weak_window = window.downgrade();
+            glib::idle_add_local_once(move || {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                let buffer = window.composer_text_view(target).buffer();
+                if end > buffer.char_count() {
+                    return;
+                }
+                let start = buffer.iter_at_offset(start);
+                let end = buffer.iter_at_offset(end);
+                for action in actions {
+                    if let Some(tag) = Self::composer_format_tag(action) {
+                        buffer.apply_tag_by_name(tag, &start, &end);
+                    }
+                }
+                window.schedule_draft_save();
+            });
+        });
+
+        let weak_window = self.downgrade();
+        buffer.connect_mark_set(move |_, _, mark| {
+            if mark.name().as_deref() == Some("insert") {
+                if let Some(window) = weak_window.upgrade() {
+                    window.refresh_composer_toolbar(target);
+                }
+            }
+        });
+        self.refresh_composer_toolbar(target);
+    }
+
+    fn insert_composer_emoji(&self, target: ComposerTarget, name: &str) {
+        let name = name.trim().trim_matches(':');
+        if name.is_empty() {
+            return;
+        }
+        let text_view = self.composer_text_view(target);
+        let buffer = text_view.buffer();
+        buffer.insert_at_cursor(&format!(":{name}:"));
+        text_view.grab_focus();
+    }
+
+    fn apply_composer_format(
+        &self,
+        target: ComposerTarget,
+        action: ComposerFormatAction,
+        active: bool,
+    ) {
+        let Some(tag) = Self::composer_format_tag(action) else {
+            return;
+        };
+        let buffer = self.composer_text_view(target).buffer();
+        let selection = buffer.selection_bounds();
+        if Self::composer_block_action(action) {
+            if active {
+                if let Some(toolbar) = self.composer_toolbar(target).borrow().as_ref() {
+                    toolbar.updating.set(true);
+                    for (other_action, button) in &toolbar.buttons {
+                        if *other_action != action && Self::composer_block_action(*other_action) {
+                            button.set_active(false);
+                        }
+                    }
+                    toolbar.updating.set(false);
+                }
+            }
+            let (mut start, mut end) = selection.unwrap_or_else(|| {
+                let insert = buffer.iter_at_offset(buffer.cursor_position());
+                (insert, insert)
+            });
+            start.set_line_offset(0);
+            if !end.ends_line() {
+                let _ = end.forward_to_line_end();
+            }
+            for block_tag in [
+                COMPOSER_BULLETED_LIST_TAG,
+                COMPOSER_NUMBERED_LIST_TAG,
+                COMPOSER_QUOTE_TAG,
+                COMPOSER_PREFORMATTED_TAG,
+            ] {
+                buffer.remove_tag_by_name(block_tag, &start, &end);
+            }
+            if active && start.offset() < end.offset() {
+                buffer.apply_tag_by_name(tag, &start, &end);
+            }
+        } else if let Some((start, end)) = selection {
+            if active {
+                buffer.apply_tag_by_name(tag, &start, &end);
+            } else {
+                buffer.remove_tag_by_name(tag, &start, &end);
+            }
+        }
+        self.schedule_draft_save();
+        self.composer_text_view(target).grab_focus();
+    }
+
+    fn refresh_composer_toolbar(&self, target: ComposerTarget) {
+        let buffer = self.composer_text_view(target).buffer();
+        let offset = buffer.cursor_position().max(0);
+        let probe = buffer.iter_at_offset(if offset > 0 { offset - 1 } else { offset });
+        let style = Self::composer_style_at(&probe);
+        let block = Self::composer_block_at(&probe);
+        let toolbar = self.composer_toolbar(target).borrow();
+        let Some(toolbar) = toolbar.as_ref() else {
+            return;
+        };
+        toolbar.updating.set(true);
+        for (action, button) in &toolbar.buttons {
+            let active = match action {
+                ComposerFormatAction::Bold => style.bold,
+                ComposerFormatAction::Italic => style.italic,
+                ComposerFormatAction::Underline => style.underline,
+                ComposerFormatAction::Strike => style.strike,
+                ComposerFormatAction::InlineCode => style.code,
+                ComposerFormatAction::BulletedList => {
+                    block == Some(ComposerBlockKind::BulletedList)
+                }
+                ComposerFormatAction::NumberedList => {
+                    block == Some(ComposerBlockKind::NumberedList)
+                }
+                ComposerFormatAction::Quote => block == Some(ComposerBlockKind::Quote),
+                ComposerFormatAction::CodeBlock => block == Some(ComposerBlockKind::Preformatted),
+                ComposerFormatAction::Emoji => false,
+            };
+            button.set_active(active);
+        }
+        toolbar.updating.set(false);
+    }
+
     fn composer_completion(&self, target: ComposerTarget) -> &RefCell<Option<ComposerCompletion>> {
         match target {
             ComposerTarget::Message => &self.imp().message_composer_completion,
@@ -5583,6 +5971,9 @@ impl ConduitWindow {
 
     fn set_composer_rich_draft(&self, target: ComposerTarget, draft: &RichComposerDraft) {
         self.ensure_composer_format_tags(target);
+        if let Some(toolbar) = self.composer_toolbar(target).borrow().as_ref() {
+            toolbar.updating.set(true);
+        }
         self.clear_composer_mentions(target);
         let buffer = self.composer_text_view(target).buffer();
         buffer.set_text(&draft.text);
@@ -5624,12 +6015,19 @@ impl ConduitWindow {
         for mention in &draft.mentions {
             self.add_composer_mention(target, mention.clone());
         }
+        if let Some(toolbar) = self.composer_toolbar(target).borrow().as_ref() {
+            toolbar.updating.set(false);
+        }
+        self.refresh_composer_toolbar(target);
     }
 
     fn set_composer_canonical_text(&self, target: ComposerTarget, text: &str) {
         let names = self.imp().user_names.borrow();
         let hydrated = hydrate_composer_mentions(text, &names);
         drop(names);
+        if let Some(toolbar) = self.composer_toolbar(target).borrow().as_ref() {
+            toolbar.updating.set(true);
+        }
         self.clear_composer_mentions(target);
         self.composer_text_view(target)
             .buffer()
@@ -5637,6 +6035,10 @@ impl ConduitWindow {
         for mention in hydrated.mentions {
             self.add_composer_mention(target, mention);
         }
+        if let Some(toolbar) = self.composer_toolbar(target).borrow().as_ref() {
+            toolbar.updating.set(false);
+        }
+        self.refresh_composer_toolbar(target);
     }
 
     fn setup_composer_completion(&self, target: ComposerTarget) {
@@ -8129,6 +8531,16 @@ impl ConduitWindow {
                 .emoji_picker
                 .refresh_catalog(&self.imp().custom_emojis.borrow());
             write_status_dialog_test_state(self, state);
+        }
+        for toolbar in [
+            &self.imp().message_composer_toolbar,
+            &self.imp().thread_composer_toolbar,
+        ] {
+            if let Some(toolbar) = toolbar.borrow().as_ref() {
+                toolbar
+                    .emoji_picker
+                    .refresh_catalog(&self.imp().custom_emojis.borrow());
+            }
         }
         self.queue_ui_invalidations(
             UiInvalidations::SIDEBAR

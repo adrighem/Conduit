@@ -542,6 +542,15 @@
                                       </object>
                                     </child>
                                     <child>
+                                      <object class="GtkFlowBox" id="message_format_toolbar">
+                                        <property name="selection-mode">none</property>
+                                        <property name="column-spacing">2</property>
+                                        <property name="row-spacing">2</property>
+                                        <property name="max-children-per-line">10</property>
+                                        <property name="accessible-role">toolbar</property>
+                                      </object>
+                                    </child>
+                                    <child>
                                       <object class="GtkBox">
                                         <property name="orientation">horizontal</property>
                                         <property name="spacing">6</property>
@@ -639,6 +648,15 @@
                                         <style>
                                           <class name="caption"/>
                                         </style>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkFlowBox" id="thread_format_toolbar">
+                                        <property name="selection-mode">none</property>
+                                        <property name="column-spacing">2</property>
+                                        <property name="row-spacing">2</property>
+                                        <property name="max-children-per-line">10</property>
+                                        <property name="accessible-role">toolbar</property>
                                       </object>
                                     </child>
                                     <child>
