@@ -1,0 +1,7 @@
+Task: Add regressions for compact overflow, rich response rendering, and logical newlines
+
+Summary: Added failing coverage for complete inline style rendering, mixed logical line breaks, submitted rich-block recovery when Slack omits blocks from the immediate response, compact responsive toolbar hosts, and synchronous active-format application.
+
+Files: src/message_html.rs, src/slack.rs, src/window.rs
+
+Rationale: Reproduce the manual failures at the rendering, response, toolbar, and GTK snapshot boundaries before implementation.
