@@ -1,0 +1,5 @@
+Task: Send and restore Slack rich-text blocks with accessible plain-text fallbacks.
+
+Implementation slice: added a Unicode-offset rich draft model for text styles, paragraph styles, canonical mentions, and staged attachments; added a versioned JSON draft codec and Slack rich_text serializer with readable fallback text.
+
+Verification: all three new composer contract tests pass.
