@@ -1,0 +1,5 @@
+Task: Add failing coverage for opening New message before people discovery completes.
+
+Coverage: tests/test_window_state.py launches the test workspace without discovered users, activates win.new-message, and requires the modal New message window to appear.
+
+Red verification: Window state persistence failed after 15 seconds because show_people_picker returned before creating the dialog when its people collection was empty.
