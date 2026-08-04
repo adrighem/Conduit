@@ -3081,6 +3081,26 @@ mod tests {
     }
 
     #[test]
+    fn rich_message_post_keeps_accessible_fallback_and_blocks() {
+        let params = post_message_params(
+            "C123",
+            "Hello <@UADA>",
+            Some(r#"[{"type":"rich_text"}]"#),
+            Some("1710000000.000100"),
+            "client-message-id",
+        );
+
+        assert!(params.contains(&("channel", "C123".to_string())));
+        assert!(params.contains(&("text", "Hello <@UADA>".to_string())));
+        assert!(params.contains(&(
+            "blocks",
+            r#"[{"type":"rich_text"}]"#.to_string()
+        )));
+        assert!(params.contains(&("thread_ts", "1710000000.000100".to_string())));
+        assert!(params.contains(&("client_msg_id", "client-message-id".to_string())));
+    }
+
+    #[test]
     fn starred_conversation_ids_are_paginated_and_ignore_message_stars() {
         let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
         let address = server
