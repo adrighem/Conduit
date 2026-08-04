@@ -14796,6 +14796,33 @@ mod tests {
     }
 
     #[test]
+    fn both_composers_host_the_complete_rich_formatting_bar() {
+        let template = include_str!("window.ui");
+        for host in ["message_format_toolbar", "thread_format_toolbar"] {
+            assert!(template.contains(host), "missing composer toolbar {host}");
+        }
+
+        assert_eq!(
+            composer_format_controls()
+                .iter()
+                .map(|control| control.accessible_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "Bold",
+                "Italic",
+                "Underline",
+                "Strikethrough",
+                "Inline code",
+                "Bulleted list",
+                "Numbered list",
+                "Quote",
+                "Code block",
+                "Emoji",
+            ]
+        );
+    }
+
+    #[test]
     fn thread_sidebar_resize_follows_end_edge_and_clamps() {
         assert_eq!(
             resized_end_sidebar_fraction(400.0, -100.0, 1_000.0),
