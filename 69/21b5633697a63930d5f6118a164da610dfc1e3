@@ -1,0 +1,9 @@
+Task: Keep composer controls compact and preserve rich formatting/newlines after Send
+
+Summary: Replaced wrapping toolbars with start-aligned responsive bars and ellipsis overflow, applied active formatting synchronously, restored submitted rich blocks when Slack omits them, and rendered underline plus logical line separators.
+
+Files: src/window.ui, src/window.rs, src/slack.rs, src/rich_message.rs, src/rich_message_normalize.rs, src/message_html/rich_components.rs
+
+Rationale: Preserve the WYSIWYG document across the immediate post response while keeping the composer usable at narrow widths and rendering Slack newline variants consistently.
+
+Tests: cargo test rich_ (18 passed)
