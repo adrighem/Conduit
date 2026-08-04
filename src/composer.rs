@@ -881,4 +881,128 @@ mod tests {
         assert_eq!(hydrated.text, source);
         assert!(hydrated.mentions.is_empty());
     }
+
+    #[test]
+    fn rich_payload_preserves_unicode_styles_and_mentions() {
+        let draft = RichComposerDraft {
+            text: "Hi @Ada 👋".to_string(),
+            mentions: vec![MentionSpan {
+                start: 3,
+                end: 7,
+                user_id: "UADA".to_string(),
+                label: "@Ada".to_string(),
+            }],
+            styles: vec![
+                ComposerStyleSpan {
+                    start: 0,
+                    end: 2,
+                    style: ComposerTextStyle {
+                        bold: true,
+                        ..Default::default()
+                    },
+                },
+                ComposerStyleSpan {
+                    start: 3,
+                    end: 7,
+                    style: ComposerTextStyle {
+                        underline: true,
+                        ..Default::default()
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+
+        let payload = draft.slack_payload().expect("non-empty payload");
+        let blocks: serde_json::Value =
+            serde_json::from_str(&payload.blocks_json).expect("valid blocks JSON");
+
+        assert_eq!(payload.fallback_text, "Hi <@UADA> 👋");
+        assert_eq!(blocks[0]["type"], "rich_text");
+        assert_eq!(blocks[0]["elements"][0]["type"], "rich_text_section");
+        assert_eq!(
+            blocks[0]["elements"][0]["elements"],
+            serde_json::json!([
+                {"type": "text", "text": "Hi", "style": {"bold": true}},
+                {"type": "text", "text": " "},
+                {"type": "user", "user_id": "UADA", "style": {"underline": true}},
+                {"type": "text", "text": " 👋"}
+            ])
+        );
+    }
+
+    #[test]
+    fn rich_payload_structures_lists_quotes_and_code_blocks() {
+        let draft = RichComposerDraft {
+            text: "one\ntwo\nquoted\nlet x = 1;\nplain".to_string(),
+            blocks: vec![
+                ComposerBlockSpan {
+                    start: 0,
+                    end: 7,
+                    kind: ComposerBlockKind::BulletedList,
+                },
+                ComposerBlockSpan {
+                    start: 8,
+                    end: 14,
+                    kind: ComposerBlockKind::Quote,
+                },
+                ComposerBlockSpan {
+                    start: 15,
+                    end: 25,
+                    kind: ComposerBlockKind::Preformatted,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let payload = draft.slack_payload().expect("non-empty payload");
+        let blocks: serde_json::Value =
+            serde_json::from_str(&payload.blocks_json).expect("valid blocks JSON");
+        let elements = blocks[0]["elements"].as_array().expect("rich elements");
+
+        assert_eq!(elements[0]["type"], "rich_text_list");
+        assert_eq!(elements[0]["style"], "bullet");
+        assert_eq!(elements[0]["elements"].as_array().map(Vec::len), Some(2));
+        assert_eq!(elements[1]["type"], "rich_text_quote");
+        assert_eq!(elements[2]["type"], "rich_text_preformatted");
+        assert_eq!(elements[3]["type"], "rich_text_section");
+        assert_eq!(payload.fallback_text, draft.text);
+    }
+
+    #[test]
+    fn rich_drafts_round_trip_and_legacy_text_remains_distinct() {
+        let draft = RichComposerDraft {
+            text: "Draft @Ada".to_string(),
+            mentions: vec![MentionSpan {
+                start: 6,
+                end: 10,
+                user_id: "UADA".to_string(),
+                label: "@Ada".to_string(),
+            }],
+            styles: vec![ComposerStyleSpan {
+                start: 0,
+                end: 5,
+                style: ComposerTextStyle {
+                    italic: true,
+                    ..Default::default()
+                },
+            }],
+            blocks: vec![ComposerBlockSpan {
+                start: 0,
+                end: 10,
+                kind: ComposerBlockKind::Quote,
+            }],
+            attachments: vec![ComposerAttachmentDraft {
+                path: std::path::PathBuf::from("/tmp/preview.png"),
+                remove_after_upload: true,
+            }],
+        };
+
+        let stored = encode_rich_composer_draft(&draft);
+
+        assert!(stored.starts_with("conduit-rich-v1:"));
+        assert_eq!(decode_rich_composer_draft(&stored), Some(draft));
+        assert_eq!(decode_rich_composer_draft("legacy <@UADA> draft"), None);
+        assert_eq!(decode_rich_composer_draft("conduit-rich-v1:{broken"), None);
+    }
 }
