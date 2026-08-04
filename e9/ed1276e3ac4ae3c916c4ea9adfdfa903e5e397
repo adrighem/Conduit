@@ -1,0 +1,9 @@
+Task: Preview removable image and video attachments inside both composers
+
+Summary: File selection and image paste now stage persistent draft attachments, render image/video/file cards with remove controls in message and thread composers, and preserve referenced clipboard files during startup cleanup.
+
+Files: src/window.rs, src/window.ui
+
+Rationale: Make attachment selection part of composition rather than an immediate network mutation, while retaining draft ownership semantics.
+
+Tests: Preview-kind and referenced-staging tests pass; end-to-end batch submission regression remains red for the next task.
