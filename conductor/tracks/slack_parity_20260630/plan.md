@@ -32,5 +32,5 @@
 ## Phase 5: Unread-Aware Conversation Ranking
 - [x] Task: Add failing sidebar-filter and conversation-switcher unread-category ranking coverage 6ad51a8
 - [x] Task: Add failing final-priority coverage for a deactivated `Csaba Karpati` direct-message conversation 92cc903
-- [~] Task: Rank equal-relevance matches by unread category and demote deactivated direct messages before alphabetic ordering
-- [ ] Task: Conductor - User Manual Verification 'Unread-Aware Conversation Ranking' (Protocol in workflow.md)
+- [x] Task: Rank equal-relevance matches by unread category and demote deactivated direct messages before alphabetic ordering 028bc3f
+- [~] Task: Conductor - User Manual Verification 'Unread-Aware Conversation Ranking' (Protocol in workflow.md)
