@@ -1,0 +1,5 @@
+Task: Open New message immediately and refresh it when people arrive.
+
+Implementation: the people picker now owns refreshable view state, always presents a loading or empty shell, requests fresh discovery, rebuilds rows on ConversationPeopleDiscovered, and preserves query and selected IDs across refreshes.
+
+Verification: cargo check passed; all 915 Rust tests passed (912 passed, 3 ignored); the Window state persistence regression passed headlessly.
