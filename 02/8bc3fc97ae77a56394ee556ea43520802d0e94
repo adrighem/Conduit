@@ -1,0 +1,7 @@
+Task: Rank equal-relevance conversation matches by unread category and demote deactivated direct messages before alphabetic ordering.
+
+Implementation: src/sidebar.rs adds shared unread and deleted-user comparators to sidebar search, loaded switcher results, and global picker results. src/window.rs updates the test row model. Deactivated direct messages remain searchable.
+
+Rationale: Keep relevance primary, prioritize unread direct/group DMs over unread channels, preserve participant coverage, then place Slack is_user_deleted DMs below active results before title and ID tie-breakers.
+
+Verification: 65 sidebar tests passed; full Rust suite passed with 912 tests and 3 ignored; cargo check, format, Meson compile, and Meson test passed. The cached Csaba Karpati DM reports is_user_deleted=true and matches the regression fixture.
