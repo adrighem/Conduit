@@ -1,0 +1,5 @@
+Task: Add formatting toolbars, native rich editing, and emoji insertion to message and reply composers.
+
+Coverage: the window contract requires matching toolbar hosts for both composers and the complete accessible control order: five inline styles, four paragraph styles, and emoji.
+
+Red verification: the targeted test failed because no shared composer format-control contract exists; the template also has no toolbar hosts.
