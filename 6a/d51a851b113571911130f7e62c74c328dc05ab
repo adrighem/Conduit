@@ -1,0 +1,7 @@
+Task: Add failing sidebar-filter and conversation-switcher unread-category ranking coverage.
+
+Coverage: src/sidebar.rs verifies empty switcher ordering, sidebar search relevance precedence, and global picker ordering across loaded conversations and discovery results.
+
+Expected order: relevance band first, then unread direct/group direct messages, unread channels, and read conversations.
+
+Red verification: all three regressions failed. Existing ordering used participant coverage and alphabetic title without an unread category.
