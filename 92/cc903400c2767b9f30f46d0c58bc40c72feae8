@@ -1,0 +1,7 @@
+Task: Add failing final-priority coverage for a deactivated Csaba Karpati direct-message conversation.
+
+Coverage: src/sidebar.rs retains the deactivated DM in sidebar search, the loaded-conversation switcher, and the global picker, but expects an otherwise tied active-user DM to rank first.
+
+Rationale: Slack is_user_deleted marks the existing direct-message conversation without hiding its history.
+
+Red verification: all three projections returned CONV_CSABA before CONV_ZOE through alphabetic fallback.
