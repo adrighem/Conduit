@@ -40,8 +40,9 @@ use crate::composer::{
     encode_rich_composer_draft, hydrate_composer_mentions, mention_candidates,
     mention_token_at_caret, replace_emoji_token, replace_mention_token, search_mention_candidates,
     serialize_composer_mentions, text_view_enter_action, text_view_text, CompletionKeyAction,
-    ComposerBlockKind, ComposerBlockSpan, ComposerStyleSpan, ComposerTextStyle, EmojiToken,
-    MentionCandidate, MentionSpan, MentionToken, RichComposerDraft, TextViewEnterAction,
+    ComposerAttachmentDraft, ComposerBlockKind, ComposerBlockSpan, ComposerStyleSpan,
+    ComposerTextStyle, EmojiToken, MentionCandidate, MentionSpan, MentionToken, RichComposerDraft,
+    TextViewEnterAction,
 };
 use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
@@ -281,6 +282,8 @@ mod imp {
         #[template_child]
         pub message_format_overflow: TemplateChild<gtk::MenuButton>,
         #[template_child]
+        pub message_attachment_previews: TemplateChild<gtk::FlowBox>,
+        #[template_child]
         pub thread_split: TemplateChild<adw::OverlaySplitView>,
         #[template_child]
         pub thread_resize_handle: TemplateChild<gtk::Separator>,
@@ -334,6 +337,12 @@ mod imp {
         pub thread_format_toolbar: TemplateChild<gtk::Box>,
         #[template_child]
         pub thread_format_overflow: TemplateChild<gtk::MenuButton>,
+        #[template_child]
+        pub thread_attachment_previews: TemplateChild<gtk::FlowBox>,
+        #[template_child]
+        pub thread_upload_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub thread_upload_progress: TemplateChild<gtk::ProgressBar>,
         #[template_child]
         pub thread_send_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -406,6 +415,8 @@ mod imp {
         pub(super) thread_composer_toolbar: RefCell<Option<ComposerToolbar>>,
         pub(super) message_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) thread_mentions: RefCell<Vec<ComposerMentionMark>>,
+        pub(super) message_attachments: RefCell<Vec<ComposerAttachmentDraft>>,
+        pub(super) thread_attachments: RefCell<Vec<ComposerAttachmentDraft>>,
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
         pub(super) main_timeline_presenter: RefCell<TimelinePresenter>,
         pub(super) thread_timeline_presenter: RefCell<TimelinePresenter>,
@@ -658,6 +669,29 @@ enum ComposerTarget {
     Thread,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerAttachmentPreviewKind {
+    Image,
+    Video,
+    File,
+}
+
+fn composer_attachment_preview_kind(path: &Path) -> ComposerAttachmentPreviewKind {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("apng" | "avif" | "bmp" | "gif" | "heic" | "jpeg" | "jpg" | "png" | "webp") => {
+            ComposerAttachmentPreviewKind::Image
+        }
+        Some("avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "webm") => {
+            ComposerAttachmentPreviewKind::Video
+        }
+        _ => ComposerAttachmentPreviewKind::File,
+    }
+}
+
 const COMPOSER_BOLD_TAG: &str = "composer-bold";
 const COMPOSER_ITALIC_TAG: &str = "composer-italic";
 const COMPOSER_UNDERLINE_TAG: &str = "composer-underline";
@@ -667,6 +701,7 @@ const COMPOSER_BULLETED_LIST_TAG: &str = "composer-bulleted-list";
 const COMPOSER_NUMBERED_LIST_TAG: &str = "composer-numbered-list";
 const COMPOSER_QUOTE_TAG: &str = "composer-quote";
 const COMPOSER_PREFORMATTED_TAG: &str = "composer-preformatted";
+const MAX_COMPOSER_ATTACHMENTS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimelineSurface {
@@ -2096,17 +2131,40 @@ fn screenshot_filename() -> String {
     format!("Screenshot-{timestamp}-{:08x}.png", rand::random::<u32>())
 }
 
-fn clear_stale_upload_staging() {
+fn referenced_staged_uploads(drafts: &Drafts, directory: &Path) -> HashSet<PathBuf> {
+    drafts
+        .to_persisted()
+        .into_values()
+        .filter_map(|stored| decode_rich_composer_draft(&stored))
+        .flat_map(|draft| draft.attachments)
+        .filter(|attachment| {
+            attachment.remove_after_upload && attachment.path.parent() == Some(directory)
+        })
+        .map(|attachment| attachment.path)
+        .collect()
+}
+
+fn clear_stale_upload_staging(drafts: &Drafts) {
     let directory = config::upload_staging_dir();
-    if let Err(error) = std::fs::remove_dir_all(&directory) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            crate::debug::log(
-                "ui",
-                &format!(
-                    "StaleUploadCleanupFailed path={} error={error}",
-                    directory.display()
-                ),
-            );
+    let referenced = referenced_staged_uploads(drafts, &directory);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            crate::debug::log("ui", &format!("StaleUploadCleanupFailed error={error}"));
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if referenced.contains(&path) {
+            continue;
+        }
+        let removable = entry
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_file() || file_type.is_symlink());
+        if removable {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -4831,7 +4889,7 @@ impl ConduitWindow {
     fn setup_callbacks(&self) {
         let imp = self.imp();
 
-        clear_stale_upload_staging();
+        clear_stale_upload_staging(&self.imp().drafts.borrow());
         self.setup_window_actions();
         self.connect_close_request(|window| {
             window.flush_persistent_state();
@@ -4850,7 +4908,10 @@ impl ConduitWindow {
             window.post_current_message()
         });
         self.connect_widget(&imp.upload_button.get(), |window| {
-            window.choose_file_for_upload()
+            window.choose_file_for_upload(ComposerTarget::Message)
+        });
+        self.connect_widget(&imp.thread_upload_button.get(), |window| {
+            window.choose_file_for_upload(ComposerTarget::Thread)
         });
         self.connect_widget(&imp.thread_send_button.get(), |window| {
             window.post_thread_reply()
@@ -5308,7 +5369,14 @@ impl ConduitWindow {
             window.refresh_conversations()
         });
         self.add_window_action("focus-composer", |window| window.focus_composer());
-        self.add_window_action("upload-file", |window| window.choose_file_for_upload());
+        self.add_window_action("upload-file", |window| {
+            let target = if window.thread_pane().is_open() {
+                ComposerTarget::Thread
+            } else {
+                ComposerTarget::Message
+            };
+            window.choose_file_for_upload(target);
+        });
         self.add_window_action("close-thread", |window| window.close_thread());
 
         let shortcut_controller = gtk::ShortcutController::new();
@@ -5380,6 +5448,175 @@ impl ConduitWindow {
         match target {
             ComposerTarget::Message => self.imp().message_entry.get(),
             ComposerTarget::Thread => self.imp().thread_entry.get(),
+        }
+    }
+
+    fn composer_attachments(
+        &self,
+        target: ComposerTarget,
+    ) -> &RefCell<Vec<ComposerAttachmentDraft>> {
+        match target {
+            ComposerTarget::Message => &self.imp().message_attachments,
+            ComposerTarget::Thread => &self.imp().thread_attachments,
+        }
+    }
+
+    fn composer_attachment_host(&self, target: ComposerTarget) -> gtk::FlowBox {
+        match target {
+            ComposerTarget::Message => self.imp().message_attachment_previews.get(),
+            ComposerTarget::Thread => self.imp().thread_attachment_previews.get(),
+        }
+    }
+
+    fn composer_upload_button(&self, target: ComposerTarget) -> gtk::Button {
+        match target {
+            ComposerTarget::Message => self.imp().upload_button.get(),
+            ComposerTarget::Thread => self.imp().thread_upload_button.get(),
+        }
+    }
+
+    fn composer_upload_progress(&self, target: ComposerTarget) -> gtk::ProgressBar {
+        match target {
+            ComposerTarget::Message => self.imp().upload_progress.get(),
+            ComposerTarget::Thread => self.imp().thread_upload_progress.get(),
+        }
+    }
+
+    fn set_composer_attachments(
+        &self,
+        target: ComposerTarget,
+        attachments: Vec<ComposerAttachmentDraft>,
+    ) {
+        *self.composer_attachments(target).borrow_mut() = attachments;
+        self.render_composer_attachments(target);
+    }
+
+    fn stage_composer_attachment(
+        &self,
+        target: ComposerTarget,
+        path: PathBuf,
+        remove_after_upload: bool,
+    ) {
+        if !path.is_file() {
+            self.set_status(&gettext("The selected attachment is no longer available."));
+            if remove_after_upload {
+                let _ = std::fs::remove_file(path);
+            }
+            return;
+        }
+        let mut attachments = self.composer_attachments(target).borrow_mut();
+        if attachments.len() >= MAX_COMPOSER_ATTACHMENTS {
+            self.set_status(&gettext("A message can contain up to 10 attachments."));
+            if remove_after_upload {
+                let _ = std::fs::remove_file(path);
+            }
+            return;
+        }
+        if attachments.iter().any(|attachment| attachment.path == path) {
+            self.set_status(&gettext("That attachment is already in this message."));
+            return;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        attachments.push(ComposerAttachmentDraft {
+            path,
+            remove_after_upload,
+        });
+        drop(attachments);
+        self.render_composer_attachments(target);
+        self.schedule_draft_save();
+        self.composer_text_view(target).grab_focus();
+        self.set_status(&format!("Added {name}"));
+    }
+
+    fn remove_composer_attachment(&self, target: ComposerTarget, path: &Path) {
+        let removed = {
+            let mut attachments = self.composer_attachments(target).borrow_mut();
+            attachments
+                .iter()
+                .position(|attachment| attachment.path == path)
+                .map(|position| attachments.remove(position))
+        };
+        let Some(removed) = removed else {
+            return;
+        };
+        if removed.remove_after_upload {
+            let _ = std::fs::remove_file(&removed.path);
+        }
+        self.render_composer_attachments(target);
+        self.schedule_draft_save();
+        self.composer_text_view(target).grab_focus();
+    }
+
+    fn render_composer_attachments(&self, target: ComposerTarget) {
+        let host = self.composer_attachment_host(target);
+        while let Some(child) = host.first_child() {
+            host.remove(&child);
+        }
+        let attachments = self.composer_attachments(target).borrow().clone();
+        host.set_visible(!attachments.is_empty());
+        for attachment in attachments {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            row.add_css_class("card");
+            row.set_margin_top(6);
+            row.set_margin_bottom(6);
+            row.set_margin_start(6);
+            row.set_margin_end(6);
+            row.set_size_request(180, -1);
+
+            let preview: gtk::Widget = match composer_attachment_preview_kind(&attachment.path) {
+                ComposerAttachmentPreviewKind::Image => {
+                    let picture = gtk::Picture::for_file(&gio::File::for_path(&attachment.path));
+                    picture.set_can_shrink(true);
+                    picture.set_content_fit(gtk::ContentFit::Cover);
+                    picture.set_size_request(72, 54);
+                    picture.upcast()
+                }
+                ComposerAttachmentPreviewKind::Video => {
+                    let image = gtk::Image::from_icon_name("video-x-generic-symbolic");
+                    image.set_pixel_size(32);
+                    image.upcast()
+                }
+                ComposerAttachmentPreviewKind::File => {
+                    let image = gtk::Image::from_icon_name("mail-attachment-symbolic");
+                    image.set_pixel_size(32);
+                    image.upcast()
+                }
+            };
+            row.append(&preview);
+
+            let name = attachment
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment");
+            let label = gtk::Label::new(Some(name));
+            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            label.set_max_width_chars(18);
+            label.set_tooltip_text(Some(name));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            row.append(&label);
+
+            let remove = gtk::Button::from_icon_name("window-close-symbolic");
+            remove.add_css_class("flat");
+            remove.set_tooltip_text(Some(&gettext("Remove attachment")));
+            remove.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{}: {name}",
+                gettext("Remove attachment")
+            ))]);
+            let path = attachment.path.clone();
+            let weak_window = self.downgrade();
+            remove.connect_clicked(move |_| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.remove_composer_attachment(target, &path);
+                }
+            });
+            row.append(&remove);
+            host.insert(&row, -1);
         }
     }
 
@@ -6091,7 +6328,7 @@ impl ConduitWindow {
             mentions: self.composer_mention_spans(target),
             styles: self.composer_style_spans(target),
             blocks: self.composer_block_spans(target),
-            attachments: Vec::new(),
+            attachments: self.composer_attachments(target).borrow().clone(),
         }
     }
 
@@ -6153,6 +6390,15 @@ impl ConduitWindow {
         if let Some(toolbar) = self.composer_toolbar(target).borrow().as_ref() {
             toolbar.updating.set(false);
         }
+        self.set_composer_attachments(
+            target,
+            draft
+                .attachments
+                .iter()
+                .filter(|attachment| attachment.path.is_file())
+                .cloned()
+                .collect(),
+        );
         self.refresh_composer_toolbar(target);
     }
 
@@ -6173,6 +6419,7 @@ impl ConduitWindow {
         if let Some(toolbar) = self.composer_toolbar(target).borrow().as_ref() {
             toolbar.updating.set(false);
         }
+        self.set_composer_attachments(target, Vec::new());
         self.refresh_composer_toolbar(target);
     }
 
@@ -7664,32 +7911,23 @@ impl ConduitWindow {
         self.set_status("Sending reply");
     }
 
-    fn choose_file_for_upload(&self) {
-        let Some(channel_id) = self.visible_channel_id() else {
+    fn choose_file_for_upload(&self, target: ComposerTarget) {
+        if self.visible_channel_id().is_none() {
             self.set_status("Select a conversation");
             return;
-        };
-        let Some(upload_key) = self.draft_key(&channel_id, None) else {
-            self.set_status("No Slack workspace is active");
-            return;
-        };
-        if self
-            .imp()
-            .pending_upload_drafts
-            .borrow()
-            .contains_key(&upload_key)
-        {
-            self.set_status(&gettext("A file is already being uploaded here."));
+        }
+        if target == ComposerTarget::Thread && self.selected_thread_ts().is_none() {
+            self.set_status("Open a thread before adding an attachment");
             return;
         }
-        let initial_comment = self
-            .composer_canonical_text(ComposerTarget::Message)
-            .trim()
-            .to_string();
+        if self.composer_attachments(target).borrow().len() >= MAX_COMPOSER_ATTACHMENTS {
+            self.set_status(&gettext("A message can contain up to 10 attachments."));
+            return;
+        }
 
         let dialog = gtk::FileDialog::builder()
-            .title("Upload File")
-            .accept_label("Upload")
+            .title("Add Attachment")
+            .accept_label("Add")
             .modal(true)
             .build();
 
@@ -7698,72 +7936,10 @@ impl ConduitWindow {
             if let Ok(file) = result {
                 if let Some(path) = file.path() {
                     if let Some(window) = weak_window.upgrade() {
-                        let initial_comment =
-                            (!initial_comment.is_empty()).then(|| initial_comment.clone());
-                        window.begin_file_upload(&channel_id, None, path, initial_comment, false);
+                        window.stage_composer_attachment(target, path, false);
                     }
                 }
             }
-        });
-    }
-
-    fn begin_file_upload(
-        &self,
-        channel_id: &str,
-        thread_ts: Option<&str>,
-        path: PathBuf,
-        initial_comment: Option<String>,
-        remove_after_upload: bool,
-    ) {
-        if self.imp().runtime.borrow().is_none() {
-            self.set_status("No Slack workspace is active");
-            if remove_after_upload {
-                let _ = std::fs::remove_file(path);
-            }
-            return;
-        }
-        let Some(key) = self.draft_key(channel_id, thread_ts) else {
-            self.set_status("No Slack workspace is active");
-            if remove_after_upload {
-                let _ = std::fs::remove_file(path);
-            }
-            return;
-        };
-        self.flush_current_drafts();
-        let submitted_draft = initial_comment.as_ref().map(|_| {
-            self.composer_draft_storage(if thread_ts.is_some() {
-                ComposerTarget::Thread
-            } else {
-                ComposerTarget::Message
-            })
-        });
-        if !record_upload_submission(
-            &mut self.imp().pending_upload_drafts.borrow_mut(),
-            key,
-            submitted_draft,
-        ) {
-            self.set_status(&gettext("A file is already being uploaded here."));
-            if remove_after_upload {
-                let _ = std::fs::remove_file(path);
-            }
-            return;
-        }
-
-        let imp = self.imp();
-        if thread_ts.is_some() {
-            imp.thread_send_button.set_sensitive(false);
-        } else {
-            imp.upload_button.set_sensitive(false);
-        }
-        imp.upload_progress.set_visible(true);
-        imp.upload_progress.set_fraction(0.0);
-        imp.upload_progress.set_text(Some("Starting upload"));
-        self.send_command(RuntimeCommand::UploadFile {
-            channel_id: channel_id.to_string(),
-            thread_ts: thread_ts.map(ToString::to_string),
-            path,
-            initial_comment,
-            remove_after_upload,
         });
     }
 
@@ -7779,32 +7955,20 @@ impl ConduitWindow {
             let Some(window) = weak_window.upgrade() else {
                 return;
             };
-            let Some(channel_id) = window.visible_channel_id() else {
+            if window.visible_channel_id().is_none() {
                 window.set_status("Select a conversation before pasting an image");
                 return;
-            };
-            let thread_ts = if thread {
-                let Some(thread_ts) = window.selected_thread_ts() else {
-                    window.set_status("Open a thread before pasting an image here");
-                    return;
-                };
-                Some(thread_ts)
-            } else {
-                None
-            };
+            }
+            if thread && window.selected_thread_ts().is_none() {
+                window.set_status("Open a thread before pasting an image here");
+                return;
+            }
             let target = if thread {
                 ComposerTarget::Thread
             } else {
                 ComposerTarget::Message
             };
-            let initial_comment = window.composer_canonical_text(target).trim().to_string();
-            let initial_comment = (!initial_comment.is_empty()).then_some(initial_comment);
-            window.read_clipboard_image_for_upload(
-                clipboard,
-                &channel_id,
-                thread_ts.as_deref(),
-                initial_comment,
-            );
+            window.read_clipboard_image_for_upload(clipboard, target);
         });
     }
 
@@ -7824,26 +7988,15 @@ impl ConduitWindow {
             ) else {
                 return glib::Propagation::Proceed;
             };
-            let Some(channel_id) = window.visible_channel_id() else {
+            if window.visible_channel_id().is_none() {
                 window.set_status("Select a conversation before pasting an image");
                 return glib::Propagation::Stop;
-            };
-            let thread_ts = match target {
-                ComposerTarget::Message => None,
-                ComposerTarget::Thread => {
-                    let Some(thread_ts) = window.selected_thread_ts() else {
-                        window.set_status("Open a thread before pasting an image here");
-                        return glib::Propagation::Stop;
-                    };
-                    Some(thread_ts)
-                }
-            };
-            window.read_clipboard_image_for_upload(
-                clipboard,
-                &channel_id,
-                thread_ts.as_deref(),
-                None,
-            );
+            }
+            if target == ComposerTarget::Thread && window.selected_thread_ts().is_none() {
+                window.set_status("Open a thread before pasting an image here");
+                return glib::Propagation::Stop;
+            }
+            window.read_clipboard_image_for_upload(clipboard, target);
             glib::Propagation::Stop
         });
         self.add_controller(controller);
@@ -7877,12 +8030,8 @@ impl ConduitWindow {
     fn read_clipboard_image_for_upload(
         &self,
         clipboard: gtk::gdk::Clipboard,
-        channel_id: &str,
-        thread_ts: Option<&str>,
-        initial_comment: Option<String>,
+        target: ComposerTarget,
     ) {
-        let channel_id = channel_id.to_string();
-        let thread_ts = thread_ts.map(ToString::to_string);
         let weak_window = self.downgrade();
         clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| {
             let Some(window) = weak_window.upgrade() else {
@@ -7911,13 +8060,7 @@ impl ConduitWindow {
                 window.set_status(&format!("Could not encode clipboard image: {error}"));
                 return;
             }
-            window.begin_file_upload(
-                &channel_id,
-                thread_ts.as_deref(),
-                path,
-                initial_comment,
-                true,
-            );
+            window.stage_composer_attachment(target, path, true);
         });
     }
 
@@ -15073,6 +15216,55 @@ mod tests {
     }
 
     #[test]
+    fn composer_attachment_previews_distinguish_images_videos_and_files() {
+        assert_eq!(
+            composer_attachment_preview_kind(Path::new("diagram.PNG")),
+            ComposerAttachmentPreviewKind::Image
+        );
+        assert_eq!(
+            composer_attachment_preview_kind(Path::new("demo.webm")),
+            ComposerAttachmentPreviewKind::Video
+        );
+        assert_eq!(
+            composer_attachment_preview_kind(Path::new("notes.pdf")),
+            ComposerAttachmentPreviewKind::File
+        );
+    }
+
+    #[test]
+    fn stale_staging_cleanup_preserves_files_referenced_by_drafts() {
+        let directory = PathBuf::from("/tmp/conduit-staging");
+        let retained = directory.join("retained.png");
+        let draft = RichComposerDraft {
+            attachments: vec![
+                ComposerAttachmentDraft {
+                    path: retained.clone(),
+                    remove_after_upload: true,
+                },
+                ComposerAttachmentDraft {
+                    path: directory.join("source.png"),
+                    remove_after_upload: false,
+                },
+                ComposerAttachmentDraft {
+                    path: PathBuf::from("/tmp/external.png"),
+                    remove_after_upload: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut drafts = Drafts::default();
+        drafts.upsert(
+            DraftKey::new("T1:U1", "C1", None),
+            &encode_rich_composer_draft(&draft),
+        );
+
+        assert_eq!(
+            referenced_staged_uploads(&drafts, &directory),
+            HashSet::from([retained])
+        );
+    }
+
+    #[test]
     fn sidebar_leave_action_is_only_available_for_active_channels() {
         let public_channel = SlackConversation {
             is_channel: Some(true),
@@ -15401,7 +15593,10 @@ mod tests {
             "thread_upload_button",
             "thread_upload_progress",
         ] {
-            assert!(template.contains(required), "missing attachment UI {required}");
+            assert!(
+                template.contains(required),
+                "missing attachment UI {required}"
+            );
         }
 
         let source = include_str!("window.rs");

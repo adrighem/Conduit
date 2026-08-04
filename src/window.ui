@@ -419,6 +419,16 @@
                                       </object>
                                     </child>
                                     <child>
+                                      <object class="GtkFlowBox" id="message_attachment_previews">
+                                        <property name="visible">False</property>
+                                        <property name="selection-mode">none</property>
+                                        <property name="column-spacing">6</property>
+                                        <property name="row-spacing">6</property>
+                                        <property name="max-children-per-line">4</property>
+                                        <property name="accessible-role">list</property>
+                                      </object>
+                                    </child>
+                                    <child>
                                       <object class="GtkBox">
                                         <property name="orientation">vertical</property>
                                         <property name="hexpand">True</property>
@@ -564,6 +574,16 @@
                                       </object>
                                     </child>
                                     <child>
+                                      <object class="GtkFlowBox" id="thread_attachment_previews">
+                                        <property name="visible">False</property>
+                                        <property name="selection-mode">none</property>
+                                        <property name="column-spacing">6</property>
+                                        <property name="row-spacing">6</property>
+                                        <property name="max-children-per-line">3</property>
+                                        <property name="accessible-role">list</property>
+                                      </object>
+                                    </child>
+                                    <child>
                                       <object class="GtkBox">
                                         <property name="orientation">horizontal</property>
                                         <property name="spacing">6</property>
@@ -587,7 +607,7 @@
                                         <child>
                                           <object class="GtkButton" id="upload_button">
                                             <property name="icon-name">mail-attachment-symbolic</property>
-                                            <property name="tooltip-text" translatable="yes">Upload File</property>
+                                            <property name="tooltip-text" translatable="yes">Add Attachment</property>
                                           </object>
                                         </child>
                                         <child>
@@ -707,6 +727,12 @@
                                           </object>
                                         </child>
                                         <child>
+                                          <object class="GtkButton" id="thread_upload_button">
+                                            <property name="icon-name">mail-attachment-symbolic</property>
+                                            <property name="tooltip-text" translatable="yes">Add Attachment</property>
+                                          </object>
+                                        </child>
+                                        <child>
                                           <object class="GtkButton" id="thread_send_button">
                                             <property name="icon-name">mail-send-symbolic</property>
                                             <property name="tooltip-text" translatable="yes">Send Reply</property>
@@ -715,6 +741,12 @@
                                             </style>
                                           </object>
                                         </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkProgressBar" id="thread_upload_progress">
+                                        <property name="visible">False</property>
+                                        <property name="show-text">True</property>
                                       </object>
                                     </child>
                                   </object>
