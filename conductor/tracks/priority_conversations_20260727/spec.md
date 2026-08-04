@@ -37,6 +37,10 @@ change Slack's private VIP list.
     Slack's canonical `<@USER_ID>` mention form.
 17. Preserve completed mentions through draft save and restore without
     notifying a stale person after the visible mention text is edited.
+18. Open the New message picker immediately, including while the workspace
+    person catalog is empty or still loading.
+19. Refresh an open New message picker when person discovery completes while
+    preserving its search text and current selection where possible.
 
 ## Acceptance Criteria
 
@@ -58,6 +62,8 @@ change Slack's private VIP list.
   ID, and remain searchable from the full loaded catalog.
 - Draft round trips preserve canonical mention IDs while restoring readable
   names where identity data is available.
+- New message presents a modal picker shell before people discovery completes
+  and replaces its loading or empty state when eligible people arrive.
 - A successful toggle updates persisted conversation state and rerenders the sidebar.
 - `cargo fmt --check`, Rust tests, `cargo check`, Meson compile, and Meson tests pass in a sanitized allowlisted environment.
 

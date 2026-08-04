@@ -10,3 +10,9 @@
 - [x] Task: Add a DM Profile context action using the existing main-webview flow 8947521
 - [x] Task: Add person @ completion to message and thread composers 7c88040
 - [x] Task: Conductor - User Manual Verification 'Starred priority conversations' (Protocol in workflow.md) 11efc64
+
+## Phase 2: Reliable new-message picker
+
+- [~] Task: Add failing coverage for opening New message before people discovery completes
+- [ ] Task: Open New message immediately and refresh it when people arrive
+- [ ] Task: Conductor - User Manual Verification 'Reliable new-message picker' (Protocol in workflow.md)
