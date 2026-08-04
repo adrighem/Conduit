@@ -195,6 +195,7 @@ pub enum RuntimeCommand {
     PostMessage {
         channel_id: String,
         text: String,
+        blocks_json: Option<String>,
         thread_ts: Option<String>,
     },
     SetReaction {
@@ -4379,11 +4380,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         RuntimeCommand::PostMessage {
             channel_id,
             text,
+            blocks_json,
             thread_ts,
         } => {
             let api = require_slack(context.slack)?;
             let mut message = api
-                .post_message(&channel_id, &text, thread_ts.as_deref())
+                .post_message(
+                    &channel_id,
+                    &text,
+                    blocks_json.as_deref(),
+                    thread_ts.as_deref(),
+                )
                 .await?;
             if message.user.is_none() {
                 message.user = context.current_user_id.map(str::to_string);
@@ -10629,6 +10636,7 @@ mod tests {
         let command = RuntimeCommand::PostMessage {
             channel_id: "C123".to_string(),
             text: "do not trace this message".to_string(),
+            blocks_json: Some("do not trace these blocks".to_string()),
             thread_ts: None,
         };
 
@@ -10639,6 +10647,7 @@ mod tests {
         assert_eq!(fields.operation, RuntimeOperation::PostMessage);
         assert_eq!(fields.target, "message:C123:main");
         assert!(!format!("{fields:?}").contains("do not trace this message"));
+        assert!(!format!("{fields:?}").contains("do not trace these blocks"));
     }
 
     #[test]
@@ -10892,6 +10901,7 @@ mod tests {
             let command = RuntimeCommand::PostMessage {
                 channel_id: "C1".to_string(),
                 text: "hello".to_string(),
+                blocks_json: None,
                 thread_ts: None,
             };
             let first = TrackedRequest::for_command(

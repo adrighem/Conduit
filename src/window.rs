@@ -6866,6 +6866,7 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::PostMessage {
             channel_id,
             text,
+            blocks_json: None,
             thread_ts: None,
         });
         imp.send_button.set_sensitive(false);
@@ -6897,6 +6898,7 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::PostMessage {
             channel_id,
             text,
+            blocks_json: None,
             thread_ts: Some(thread_ts),
         });
         imp.thread_send_button.set_sensitive(false);
@@ -7618,6 +7620,7 @@ impl ConduitWindow {
                 window.send_command(RuntimeCommand::PostMessage {
                     channel_id: action.channel_id,
                     text: permalink.clone(),
+                    blocks_json: None,
                     thread_ts: None,
                 });
                 window.set_status("Forwarding message");

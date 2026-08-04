@@ -1105,17 +1105,11 @@ impl SlackApi {
         &self,
         channel_id: &str,
         text: &str,
+        blocks_json: Option<&str>,
         thread_ts: Option<&str>,
     ) -> Result<SlackMessage> {
         let client_msg_id = next_client_message_id();
-        let mut params = vec![
-            ("channel", channel_id.to_string()),
-            ("text", text.to_string()),
-            ("client_msg_id", client_msg_id.clone()),
-        ];
-        if let Some(thread_ts) = thread_ts {
-            params.push(("thread_ts", thread_ts.to_string()));
-        }
+        let params = post_message_params(channel_id, text, blocks_json, thread_ts, &client_msg_id);
 
         let response: PostMessageResponse = self.post_form("chat.postMessage", &params).await?;
         let mut message = response.message;
@@ -1621,6 +1615,27 @@ fn normalized_optional_string(value: Option<String>) -> Option<String> {
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_string())
     })
+}
+
+fn post_message_params(
+    channel_id: &str,
+    text: &str,
+    blocks_json: Option<&str>,
+    thread_ts: Option<&str>,
+    client_msg_id: &str,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![
+        ("channel", channel_id.to_string()),
+        ("text", text.to_string()),
+        ("client_msg_id", client_msg_id.to_string()),
+    ];
+    if let Some(blocks_json) = blocks_json.filter(|blocks| !blocks.trim().is_empty()) {
+        params.push(("blocks", blocks_json.to_string()));
+    }
+    if let Some(thread_ts) = thread_ts.filter(|thread_ts| !thread_ts.trim().is_empty()) {
+        params.push(("thread_ts", thread_ts.to_string()));
+    }
+    params
 }
 
 fn complete_upload_params(
@@ -3092,10 +3107,7 @@ mod tests {
 
         assert!(params.contains(&("channel", "C123".to_string())));
         assert!(params.contains(&("text", "Hello <@UADA>".to_string())));
-        assert!(params.contains(&(
-            "blocks",
-            r#"[{"type":"rich_text"}]"#.to_string()
-        )));
+        assert!(params.contains(&("blocks", r#"[{"type":"rich_text"}]"#.to_string())));
         assert!(params.contains(&("thread_ts", "1710000000.000100".to_string())));
         assert!(params.contains(&("client_msg_id", "client-message-id".to_string())));
     }
