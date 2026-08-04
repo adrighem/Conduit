@@ -73,6 +73,14 @@ impl<'a> EmojiCatalog<'a> {
                 return Some(EmojiValue::CustomImage(value.clone()));
             }
         }
+        if let Some((base, skin_tone)) = slack_skin_tone(name) {
+            let EmojiValue::Unicode(base) = self.resolve_with_seen(base, seen)? else {
+                return None;
+            };
+            return emojis::get(base)
+                .and_then(|emoji| emoji.with_skin_tone(skin_tone))
+                .map(|emoji| EmojiValue::Unicode(emoji.as_str()));
+        }
         emojis::get_by_shortcode(name)
             .or_else(|| {
                 UNICODE_BY_CANONICAL_NAME
@@ -107,6 +115,22 @@ impl<'a> EmojiCatalog<'a> {
         }));
         entries
     }
+}
+
+fn slack_skin_tone(name: &str) -> Option<(&str, emojis::SkinTone)> {
+    let (base, modifier) = name.rsplit_once("::skin-tone-")?;
+    if base.is_empty() {
+        return None;
+    }
+    let skin_tone = match modifier {
+        "2" => emojis::SkinTone::Light,
+        "3" => emojis::SkinTone::MediumLight,
+        "4" => emojis::SkinTone::Medium,
+        "5" => emojis::SkinTone::MediumDark,
+        "6" => emojis::SkinTone::Dark,
+        _ => return None,
+    };
+    Some((base, skin_tone))
 }
 
 fn canonical_emoji_name(name: &str) -> String {

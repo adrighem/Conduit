@@ -4057,12 +4057,22 @@ fn render_emoji_shortcode(text: &str, context: &MessageHtmlContext) -> Option<(S
         return None;
     }
 
-    let shortcode = &text[..end + 1];
-    let emoji = EmojiCatalog::new(&context.custom_emojis).resolve(code);
+    let mut consumed = end + 1;
+    let mut resolved_code = code.to_string();
+    if let Some((modifier, modifier_len)) = adjacent_skin_tone_shortcode(&text[consumed..]) {
+        resolved_code.push_str("::");
+        resolved_code.push_str(modifier);
+        consumed += modifier_len;
+    }
+    let shortcode = &text[..consumed];
+    let emoji = EmojiCatalog::new(&context.custom_emojis).resolve(&resolved_code);
     if debug::enabled() {
         debug::log(
             "render",
-            &format!("emoji shortcode=:{code}: mapped={}", emoji.is_some()),
+            &format!(
+                "emoji shortcode=:{resolved_code}: mapped={}",
+                emoji.is_some()
+            ),
         );
     }
 
@@ -4070,14 +4080,30 @@ fn render_emoji_shortcode(text: &str, context: &MessageHtmlContext) -> Option<(S
         .map(|emoji| {
             format!(
                 "<span class=\"emoji\" title=\":{}:\" role=\"img\" aria-label=\"{}\">{}</span>",
-                escape_html(code),
-                escape_html(&code.replace(['_', '-'], " ")),
+                escape_html(&resolved_code),
+                escape_html(&resolved_code.replace(['_', '-'], " ")),
                 emoji_value_html(&emoji, false),
             )
         })
         .unwrap_or_else(|| escape_html(shortcode));
 
-    Some((rendered, end + 1))
+    Some((rendered, consumed))
+}
+
+fn adjacent_skin_tone_shortcode(text: &str) -> Option<(&str, usize)> {
+    if !text.starts_with(":skin-tone-") {
+        return None;
+    }
+    let end = text[1..].find(':')? + 1;
+    let modifier = &text[1..end];
+    if modifier.len() > 64
+        || !modifier.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+')
+        })
+    {
+        return None;
+    }
+    Some((modifier, end + 1))
 }
 
 fn render_wrapped(

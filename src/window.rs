@@ -2306,7 +2306,8 @@ impl StatusEmojiPickerModel {
     fn new(custom_emojis: &HashMap<String, String>, selected_emoji: &str) -> Self {
         // Slack status emoji are submitted as team-enabled shortcodes. Keep the
         // picker to catalog entries that have a valid shortcode name.
-        let catalog_entries = EmojiCatalog::new(custom_emojis).entries();
+        let catalog = EmojiCatalog::new(custom_emojis);
+        let catalog_entries = catalog.entries();
         let workspace_names = catalog_entries
             .iter()
             .filter(|entry| entry.category == "Workspace")
@@ -2325,7 +2326,9 @@ impl StatusEmojiPickerModel {
                 name: selected_emoji.to_string(),
                 label: selected_emoji.replace(['_', '-'], " "),
                 category: "Current status",
-                value: EmojiValue::CustomImage(String::new()),
+                value: catalog
+                    .resolve(selected_emoji)
+                    .unwrap_or_else(|| EmojiValue::CustomImage(String::new())),
             });
         }
 
