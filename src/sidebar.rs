@@ -2563,6 +2563,45 @@ mod tests {
     }
 
     #[test]
+    fn deactivated_csaba_dm_is_final_priority_before_alphabetic_ordering() {
+        let active = dm("CONV_ZOE", "U_ZOE");
+        let mut csaba = dm("CONV_CSABA", "U_CSABA");
+        csaba
+            .extra
+            .insert("is_user_deleted".to_string(), serde_json::json!(true));
+        let user_names = HashMap::from([
+            ("U_CSABA".to_string(), "Csaba Karpati".to_string()),
+            ("U_ZOE".to_string(), "Zoe Adams".to_string()),
+        ]);
+        let conversations = [csaba, active];
+
+        let sidebar_rows = list_rows(build_sidebar_list(
+            &conversations,
+            &user_names,
+            SidebarBuildOptions {
+                query: "conv",
+                show_all: true,
+                ..Default::default()
+            },
+        ));
+        let switcher_rows = conversation_switcher_items(&conversations, &user_names, None, "conv");
+        let picker_rows =
+            conversation_picker_sections(&conversations, &[], &[], &user_names, None, "conv")
+                .search_results
+                .expect("search should retain deactivated direct messages")
+                .into_iter()
+                .map(|item| item.row)
+                .collect::<Vec<_>>();
+
+        for rows in [sidebar_rows, switcher_rows, picker_rows] {
+            assert_eq!(
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                vec!["CONV_ZOE", "CONV_CSABA"]
+            );
+        }
+    }
+
+    #[test]
     fn sidebar_relevance_band_precedes_existing_unread_count_sort() {
         let mut alphabetical = channel("C1", "alpha-support");
         alphabetical.unread_count = Some(10);
