@@ -34,6 +34,20 @@ START_PROBE = r"""
     const picker = document.getElementById("emoji-picker");
     const opener = document.getElementById("opener");
     const search = document.getElementById("emoji-search");
+    const overflow = document.getElementById("overflow");
+    const overflowSummary = overflow.querySelector("summary");
+    const overflowMenu = overflow.querySelector(".more-actions-menu");
+    overflow.open = true;
+    overflowSummary.dispatchEvent(new MouseEvent("mouseout", {
+      bubbles: true,
+      relatedTarget: overflowMenu
+    }));
+    const overflowStaysOpenInside = overflow.open;
+    overflowSummary.dispatchEvent(new MouseEvent("mouseout", {
+      bubbles: true,
+      relatedTarget: document.body
+    }));
+    const overflowClosesAfterHover = !overflow.open;
     stage = "initial open";
     window.scrollTo(0, 420);
     const initialScroll = window.scrollY;
@@ -125,7 +139,9 @@ START_PROBE = r"""
       initialOpenMs,
       scrollDelta,
       reactionScrollDelta,
-      closedAfterReaction: !picker.open
+      closedAfterReaction: !picker.open,
+      overflowStaysOpenInside,
+      overflowClosesAfterHover
     };
   })().catch((error) => {
     window.emojiPickerTestError = stage + ": " + String(error) +
@@ -178,6 +194,14 @@ body {{ min-height: 1800px; }}
 <button id="opener" data-open-emoji-picker
  data-reaction-template="conduit://reaction?channel=C1&amp;ts=1&amp;name=__REACTION__&amp;add=true">
 Add reaction</button>
+<article class="message">
+  <nav class="quick-actions">
+    <details id="overflow" class="more-actions">
+      <summary>More actions</summary>
+      <div class="more-actions-menu"><a href="#noop">No-op</a></div>
+    </details>
+  </nav>
+</article>
 <dialog id="emoji-picker" aria-labelledby="emoji-picker-title"
  data-emoji-protocol-version="1" data-emoji-result-limit="64"
  data-emoji-max-query-chars="128">
@@ -350,6 +374,8 @@ Add reaction</button>
     assert abs(payload["scrollDelta"]) <= 2, payload
     assert abs(payload["reactionScrollDelta"]) <= 2, payload
     assert payload["closedAfterReaction"] is True, payload
+    assert payload["overflowStaysOpenInside"] is True, payload
+    assert payload["overflowClosesAfterHover"] is True, payload
     assert any(request["category"] == "Workspace" for request in requests), requests
     assert any(request["query"] == "party parr" for request in requests), requests
     assert any(request["offset"] == 64 for request in requests), requests

@@ -14576,15 +14576,19 @@ mod tests {
     }
 
     #[test]
-    fn recent_reactions_are_promoted_deduplicated_and_bounded() {
-        assert_eq!(
-            promoted_recent_reactions(["thumbsup", "heart", "eyes", "fire"], "heart"),
-            vec!["heart", "thumbsup", "eyes"]
+    fn recent_reaction_history_keeps_duplicates_and_latest_twenty_uses() {
+        let existing = (0..20)
+            .map(|index| format!("emoji_{index}"))
+            .collect::<Vec<_>>();
+        let history = promoted_recent_reactions(
+            existing.iter().map(String::as_str),
+            existing[0].as_str(),
         );
-        assert_eq!(
-            promoted_recent_reactions(["thumbsup", "heart"], "rocket"),
-            vec!["rocket", "thumbsup", "heart"]
-        );
+        let mut expected = vec![existing[0].clone()];
+        expected.extend(existing[..19].iter().cloned());
+
+        assert_eq!(history, expected);
+        assert_eq!(history.len(), 20);
     }
 
     #[test]

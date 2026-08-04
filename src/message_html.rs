@@ -5443,6 +5443,7 @@ mod tests {
                 "heart".to_string(),
                 "thumbsup".to_string(),
                 "eyes".to_string(),
+                "fire".to_string(),
             ],
             ..Default::default()
         };
@@ -5487,9 +5488,12 @@ mod tests {
         let quick_actions = &quick_actions[..quick_actions.find("</nav>").unwrap()];
         let recent = quick_actions.find("name=heart").unwrap();
         let picker = quick_actions.find("data-open-emoji-picker").unwrap();
+        let reactions = &quick_actions[..picker];
         let thread = quick_actions.find("conduit://thread?").unwrap();
         let forward = quick_actions.find("conduit://forward?").unwrap();
         let more = quick_actions.find("class=\"more-actions\"").unwrap();
+        assert_eq!(reactions.matches("conduit://reaction?").count(), 4);
+        assert!(reactions.contains("name=fire"));
         assert!(recent < picker && picker < thread && thread < forward && forward < more);
         for unavailable_action in [
             "Edit message",
@@ -5503,6 +5507,46 @@ mod tests {
             assert!(!html.contains(unavailable_action), "{unavailable_action}");
         }
         assert!(!html.contains("Remove +1"));
+    }
+
+    #[test]
+    fn quick_reactions_rank_frequency_within_latest_twenty_uses() {
+        let mut history = [
+            "heart", "eyes", "thumbsup", "fire", "heart", "eyes", "thumbsup", "fire",
+            "heart", "eyes", "thumbsup", "fire", "heart", "eyes", "thumbsup", "heart",
+            "eyes", "heart", "heart", "rocket",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        history.extend((0..20).map(|_| "rocket".to_string()));
+        let context = MessageHtmlContext {
+            recent_reactions: history,
+            ..Default::default()
+        };
+
+        let names = recent_reactions(&context)
+            .into_iter()
+            .map(|emoji| emoji.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["heart", "eyes", "thumbsup", "fire"]);
+
+        let tie_context = MessageHtmlContext {
+            recent_reactions: [
+                "eyes", "heart", "thumbsup", "fire", "fire", "thumbsup", "heart", "eyes",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            ..Default::default()
+        };
+        let tied_names = recent_reactions(&tie_context)
+            .into_iter()
+            .map(|emoji| emoji.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tied_names, ["eyes", "heart", "thumbsup", "fire"]);
     }
 
     #[test]
