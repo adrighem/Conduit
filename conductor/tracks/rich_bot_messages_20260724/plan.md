@@ -50,10 +50,10 @@
 - [x] Task: Harden repeated headless window activation during CI validation 60a64b7
 - [x] Task: Conductor - User Manual Verification 'URL preview images' (Protocol in workflow.md) 07fa1e0
 
-## Phase 6: Animated GIF shares
+## Phase 6: Animated GIF shares [checkpoint: 31e9f44]
 
 - [x] Task: Add failing Block Kit, file-share, asset-request, and render coverage for animated GIFs 7b9ab05
 - [x] Task: Preserve Slack file images and animated GIF thumbnails through normalization and rendering 8129099
 - [x] Task: Add failing coverage for image blocks nested inside legacy attachments 2e7a549
 - [x] Task: Preserve attachment-embedded image blocks through canonical normalization and rendering fbe931c
-- [~] Task: Conductor - User Manual Verification 'Animated GIF shares' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Animated GIF shares' (Protocol in workflow.md) 31e9f44
