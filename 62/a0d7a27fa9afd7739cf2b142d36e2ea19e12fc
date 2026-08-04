@@ -1,0 +1,5 @@
+Task: Send and restore Slack rich-text blocks with accessible plain-text fallbacks.
+
+Implementation slice: composer state now extracts GTK inline and paragraph tags into versioned drafts, restores valid spans and mentions, sends rich_text blocks with canonical fallback text, and compares the complete rich draft before clearing after send or upload.
+
+Verification: cargo check, rich payload tests, Slack request test, and draft-focused tests pass without warnings.
