@@ -1,7 +1,7 @@
 pkgdatadir = get_option('prefix') / get_option('datadir') / meson.project_name()
 gnome = import('gnome')
 
-gnome.compile_resources('conduit',
+conduit_resources = gnome.compile_resources('conduit',
   'conduit.gresource.xml',
   gresource_bundle: true,
   install: true,
@@ -65,6 +65,7 @@ cargo_build = custom_target(
   build_by_default: true,
   build_always_stale: true,
   output: meson.project_name(),
+  depends: conduit_resources,
   console: true,
   install: true,
   install_dir: get_option('bindir'),

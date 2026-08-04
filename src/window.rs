@@ -701,6 +701,7 @@ const COMPOSER_BULLETED_LIST_TAG: &str = "composer-bulleted-list";
 const COMPOSER_NUMBERED_LIST_TAG: &str = "composer-numbered-list";
 const COMPOSER_QUOTE_TAG: &str = "composer-quote";
 const COMPOSER_PREFORMATTED_TAG: &str = "composer-preformatted";
+const COMPOSER_FORMAT_OVERFLOW_WIDTH_SP: f64 = 540.0;
 const MAX_COMPOSER_ATTACHMENTS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5889,7 +5890,7 @@ impl ConduitWindow {
 
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
-            420.0,
+            COMPOSER_FORMAT_OVERFLOW_WIDTH_SP,
             adw::LengthUnit::Sp,
         ));
         for widget in collapsed_widgets {
@@ -15715,6 +15716,20 @@ mod tests {
                 template.contains(&format!("AdwBreakpointBin\" id=\"{breakpoint}")),
                 "missing responsive composer toolbar {breakpoint}"
             );
+            let breakpoint_start = template
+                .find(&format!("AdwBreakpointBin\" id=\"{breakpoint}"))
+                .expect("composer breakpoint should exist");
+            let child_start = template[breakpoint_start..]
+                .find("<property name=\"child\">")
+                .map(|offset| breakpoint_start + offset)
+                .expect("composer breakpoint should contain its child");
+            let breakpoint_properties = &template[breakpoint_start..child_start];
+            assert!(
+                breakpoint_properties.contains("<property name=\"width-request\">300</property>")
+            );
+            assert!(
+                breakpoint_properties.contains("<property name=\"height-request\">34</property>")
+            );
         }
         for overflow in ["message_format_overflow", "thread_format_overflow"] {
             assert!(
@@ -15752,6 +15767,7 @@ mod tests {
             .expect("composer toolbar setup should be bounded");
         assert!(setup.contains("connect_changed"));
         assert!(!setup.contains("idle_add_local_once"));
+        assert!(setup.contains("COMPOSER_FORMAT_OVERFLOW_WIDTH_SP"));
     }
 
     #[test]
@@ -15768,6 +15784,28 @@ mod tests {
                 "missing attachment UI {required}"
             );
         }
+
+        let message_composer = template
+            .find("GtkBox\" id=\"message_composer")
+            .expect("message composer should exist");
+        let message_previews = template
+            .find("GtkFlowBox\" id=\"message_attachment_previews")
+            .expect("message attachment previews should exist");
+        let message_entry = template
+            .find("GtkTextView\" id=\"message_entry")
+            .expect("message entry should exist");
+        assert!(message_composer < message_previews && message_previews < message_entry);
+
+        let thread_pane = template
+            .find("GtkBox\" id=\"thread_pane")
+            .expect("thread pane should exist");
+        let thread_previews = template
+            .find("GtkFlowBox\" id=\"thread_attachment_previews")
+            .expect("thread attachment previews should exist");
+        let thread_entry = template
+            .find("GtkTextView\" id=\"thread_entry")
+            .expect("thread entry should exist");
+        assert!(thread_pane < thread_previews && thread_previews < thread_entry);
 
         let source = include_str!("window.rs");
         let chooser = source

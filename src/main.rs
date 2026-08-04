@@ -65,7 +65,7 @@ use config::{APPLICATION_ID, GETTEXT_PACKAGE, LOCALEDIR, PKGDATADIR};
 use gettextrs::{bind_textdomain_codeset, bindtextdomain, setlocale, textdomain, LocaleCategory};
 use gtk::prelude::*;
 use gtk::{gio, glib};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() -> glib::ExitCode {
     http_client::ensure_tls_crypto_provider();
@@ -100,22 +100,53 @@ fn main() -> glib::ExitCode {
 }
 
 fn resource_path() -> PathBuf {
+    let installed_resource = PathBuf::from(PKGDATADIR).join("conduit.gresource");
+    let executable = std::env::current_exe().ok();
+    resource_candidates(
+        std::env::var_os("CONDUIT_RESOURCE_PATH").map(PathBuf::from),
+        Path::new(PKGDATADIR),
+        executable.as_deref(),
+    )
+    .into_iter()
+    .find(|path| path.exists())
+    .unwrap_or(installed_resource)
+}
+
+fn resource_candidates(
+    explicit: Option<PathBuf>,
+    package_data_dir: &Path,
+    executable: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-
-    if let Some(path) = std::env::var_os("CONDUIT_RESOURCE_PATH") {
-        candidates.push(PathBuf::from(path));
+    if let Some(path) = explicit {
+        candidates.push(path);
     }
-
-    candidates.push(PathBuf::from(PKGDATADIR).join("conduit.gresource"));
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("conduit.gresource"));
-        }
+    if let Some(parent) = executable.and_then(Path::parent) {
+        candidates.push(parent.join("conduit.gresource"));
     }
-
+    candidates.push(package_data_dir.join("conduit.gresource"));
     candidates
-        .into_iter()
-        .find(|path| path.exists())
-        .unwrap_or_else(|| PathBuf::from(PKGDATADIR).join("conduit.gresource"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn executable_local_resource_precedes_installed_resource() {
+        let candidates = resource_candidates(
+            None,
+            Path::new("/installed/share/conduit"),
+            Some(Path::new("/workspace/_build/src/conduit")),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/workspace/_build/src/conduit.gresource"),
+                PathBuf::from("/installed/share/conduit/conduit.gresource"),
+            ]
+        );
+    }
 }

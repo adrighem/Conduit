@@ -257,6 +257,15 @@ def test_local_meson_suite_enforces_strict_rust_lints() -> None:
     assert "suite: 'rust-lint'" in rust_build
 
 
+def test_cargo_build_depends_on_compiled_resources() -> None:
+    rust_build = read("src/meson.build")
+    assert "conduit_resources = gnome.compile_resources" in rust_build
+    cargo_build = rust_build.split("cargo_build = custom_target", 1)[1].split(
+        "cargo_test_args", 1
+    )[0]
+    assert "depends: conduit_resources" in cargo_build
+
+
 def test_release_workflow_builds_validates_and_publishes_all_assets() -> None:
     workflow = read(".github/workflows/release.yml")
     jobs = workflow_jobs(workflow)
@@ -561,6 +570,7 @@ def main() -> None:
         test_release_versions_are_synchronized,
         test_rust_toolchain_is_pinned_across_local_ci_and_release,
         test_local_meson_suite_enforces_strict_rust_lints,
+        test_cargo_build_depends_on_compiled_resources,
         test_release_workflow_builds_validates_and_publishes_all_assets,
         test_generated_release_pull_requests_use_verified_dispatched_ci,
         test_release_build_tests_reuse_the_release_profile,
