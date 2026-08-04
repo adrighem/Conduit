@@ -18,6 +18,7 @@ Conduit should feel closer to Slack's default browser/app workflow. The sidebar 
 - The switcher must search across all loaded conversations, not only currently visible sidebar rows.
 - Within each search-relevance band, rank unread direct and group direct messages before unread channels, then rank read conversations.
 - Keep participant coverage, normalized title, and conversation ID as deterministic tie-breakers after the unread category.
+- Keep deactivated-user direct-message conversations discoverable, but rank them after active-user results when earlier ranking categories tie and immediately before alphabetic ordering.
 - Selecting a switcher result must open the conversation and close the switcher.
 - Prefer cached history immediately when switching conversations.
 - Avoid sending duplicate fresh history requests when the selected conversation already has cached in-memory messages.
@@ -31,6 +32,7 @@ Conduit should feel closer to Slack's default browser/app workflow. The sidebar 
 - Ctrl-K opens a modal conversation switcher; Escape or close dismisses it.
 - Typing in the switcher filters conversations by resolved title or ID.
 - Sidebar search and the conversation switcher keep relevance primary, then order equal-band matches as unread direct messages, unread channels, and read conversations.
+- A direct-message conversation whose Slack user is deleted sorts below otherwise tied active-user and channel results, while remaining searchable.
 - Activating a switcher row opens the selected conversation.
 - Re-selecting a conversation with in-memory history renders immediately and does not enqueue another `LoadHistory`.
 - `cargo test`, `cargo check`, and `meson compile -C _build` pass.
