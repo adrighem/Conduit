@@ -16,6 +16,8 @@ Conduit should feel closer to Slack's default browser/app workflow. The sidebar 
 - Provide an obvious local override to show all loaded conversations when the user needs to find older/dormant items.
 - Add a Ctrl-K shortcut that opens a conversation switcher.
 - The switcher must search across all loaded conversations, not only currently visible sidebar rows.
+- Within each search-relevance band, rank unread direct and group direct messages before unread channels, then rank read conversations.
+- Keep participant coverage, normalized title, and conversation ID as deterministic tie-breakers after the unread category.
 - Selecting a switcher result must open the conversation and close the switcher.
 - Prefer cached history immediately when switching conversations.
 - Avoid sending duplicate fresh history requests when the selected conversation already has cached in-memory messages.
@@ -28,6 +30,7 @@ Conduit should feel closer to Slack's default browser/app workflow. The sidebar 
 - The default sidebar hides dormant/closed low-value entries, while a toggle exposes all loaded conversations.
 - Ctrl-K opens a modal conversation switcher; Escape or close dismisses it.
 - Typing in the switcher filters conversations by resolved title or ID.
+- Sidebar search and the conversation switcher keep relevance primary, then order equal-band matches as unread direct messages, unread channels, and read conversations.
 - Activating a switcher row opens the selected conversation.
 - Re-selecting a conversation with in-memory history renders immediately and does not enqueue another `LoadHistory`.
 - `cargo test`, `cargo check`, and `meson compile -C _build` pass.

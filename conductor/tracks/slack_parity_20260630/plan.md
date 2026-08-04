@@ -28,3 +28,8 @@
   - [x] Sub-task: Avoid duplicate `LoadHistory` commands for current cached conversation history
   - [x] Sub-task: Keep explicit refresh behavior available
 - [x] Task: Conductor - User Manual Verification 'Quick History Switching' (Protocol in workflow.md) afaa24e
+
+## Phase 5: Unread-Aware Conversation Ranking
+- [~] Task: Add failing sidebar-filter and conversation-switcher unread-category ranking coverage
+- [ ] Task: Rank equal-relevance matches as unread direct messages, unread channels, then read conversations
+- [ ] Task: Conductor - User Manual Verification 'Unread-Aware Conversation Ranking' (Protocol in workflow.md)
