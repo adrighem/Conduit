@@ -15393,6 +15393,49 @@ mod tests {
     }
 
     #[test]
+    fn composer_attachments_stage_in_both_panes_and_submit_as_one_batch() {
+        let template = include_str!("window.ui");
+        for required in [
+            "message_attachment_previews",
+            "thread_attachment_previews",
+            "thread_upload_button",
+            "thread_upload_progress",
+        ] {
+            assert!(template.contains(required), "missing attachment UI {required}");
+        }
+
+        let source = include_str!("window.rs");
+        let chooser = source
+            .split_once("fn choose_file_for_upload")
+            .and_then(|(_, source)| source.split_once("fn connect_image_paste"))
+            .map(|(source, _)| source)
+            .expect("attachment chooser should be bounded");
+        assert!(chooser.contains("stage_composer_attachment"));
+        assert!(!chooser.contains("RuntimeCommand::UploadFile"));
+
+        let submit = source
+            .split_once("fn post_current_message")
+            .and_then(|(_, source)| source.split_once("fn choose_file_for_upload"))
+            .map(|(source, _)| source)
+            .expect("composer submission should be bounded");
+        assert!(submit.contains("RuntimeCommand::UploadFiles"));
+    }
+
+    #[test]
+    fn completed_upload_hides_and_resets_progress() {
+        let source = include_str!("window.rs");
+        let completed = source
+            .split_once("RuntimeEventKind::FileUploaded")
+            .and_then(|(_, source)| source.split_once("log_performance"))
+            .map(|(source, _)| source)
+            .expect("completed upload handler should be bounded");
+
+        assert!(completed.contains("upload_progress.set_visible(false)"));
+        assert!(completed.contains("upload_progress.set_fraction(0.0)"));
+        assert!(!completed.contains("set_text(Some(\"Upload complete\"))"));
+    }
+
+    #[test]
     fn thread_sidebar_resize_follows_end_edge_and_clamps() {
         assert_eq!(
             resized_end_sidebar_fraction(400.0, -100.0, 1_000.0),

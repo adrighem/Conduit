@@ -3105,6 +3105,20 @@ mod tests {
     }
 
     #[test]
+    fn completed_batch_upload_uses_rich_blocks_without_initial_comment() {
+        let blocks = r#"[{"type":"rich_text"}]"#;
+        let params = complete_upload_params(
+            "files-json".to_string(),
+            "C123",
+            Some("1710000000.000100"),
+            Some(blocks),
+        );
+
+        assert!(params.contains(&("blocks", blocks.to_string())));
+        assert!(!params.iter().any(|(name, _)| *name == "initial_comment"));
+    }
+
+    #[test]
     fn rich_message_post_keeps_accessible_fallback_and_blocks() {
         let params = post_message_params(
             "C123",
