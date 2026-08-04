@@ -337,6 +337,7 @@ mod imp {
         pub discovered_channels: RefCell<Vec<SlackConversation>>,
         pub discovered_users: RefCell<Vec<SlackUser>>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
+        pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
         pub user_names: RefCell<Arc<HashMap<String, String>>>,
@@ -1217,6 +1218,23 @@ struct ConversationPickerView {
     search: gtk::SearchEntry,
     actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
     include_discovery: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PeoplePickerRow {
+    user_id: String,
+    searchable_name: String,
+    check: gtk::CheckButton,
+    row: gtk::ListBoxRow,
+}
+
+#[derive(Debug, Clone)]
+struct PeoplePickerView {
+    list: gtk::ListBox,
+    search: gtk::SearchEntry,
+    confirm: gtk::Button,
+    rows: Rc<RefCell<Vec<PeoplePickerRow>>>,
+    excluded_user_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5784,6 +5802,7 @@ impl ConduitWindow {
                 self.populate_user_avatar_urls(avatar_urls);
                 *self.imp().discovered_users.borrow_mut() = users;
                 self.refresh_open_conversation_picker();
+                self.refresh_open_people_picker(true);
                 for target in COMPOSER_TARGETS {
                     self.refresh_composer_completion(target);
                 }
@@ -9298,29 +9317,6 @@ impl ConduitWindow {
     ) where
         F: Fn(&Self, Vec<String>) + 'static,
     {
-        let excluded = excluded_user_ids.iter().collect::<HashSet<_>>();
-        let current_user_id = self.imp().current_user_id.borrow().clone();
-        let mut people = self
-            .imp()
-            .discovered_users
-            .borrow()
-            .iter()
-            .filter(|user| !user.deleted.unwrap_or(false) && !user.is_bot.unwrap_or(false))
-            .filter_map(|user| {
-                let id = user.id.as_ref()?.trim();
-                let name = user.direct_message_name()?;
-                (!id.is_empty()
-                    && Some(id) != current_user_id.as_deref()
-                    && !excluded.contains(&id.to_string()))
-                .then(|| (id.to_string(), name))
-            })
-            .collect::<Vec<_>>();
-        people.sort_by_key(|(_, name)| name.to_lowercase());
-        if people.is_empty() {
-            self.set_status(&gettext("No people available"));
-            return;
-        }
-
         let dialog = gtk::Window::builder()
             .title(title)
             .transient_for(self)
@@ -9339,20 +9335,6 @@ impl ConduitWindow {
         container.append(&search);
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::None);
-        let rows = people
-            .into_iter()
-            .map(|(id, name)| {
-                let check = gtk::CheckButton::with_label(&name);
-                check.set_margin_top(6);
-                check.set_margin_bottom(6);
-                check.set_margin_start(9);
-                check.set_margin_end(9);
-                let row = gtk::ListBoxRow::new();
-                row.set_child(Some(&check));
-                list.append(&row);
-                (id, name.to_lowercase(), check, row)
-            })
-            .collect::<Vec<_>>();
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_vexpand(true);
         scroller.set_child(Some(&list));
@@ -9361,19 +9343,23 @@ impl ConduitWindow {
         confirm.add_css_class("suggested-action");
         confirm.set_sensitive(false);
         container.append(&confirm);
-        let rows = Rc::new(rows);
-        for (_, _, check, _) in rows.iter() {
-            let rows = rows.clone();
-            let confirm = confirm.clone();
-            check.connect_toggled(move |_| {
-                confirm.set_sensitive(rows.iter().any(|(_, _, check, _)| check.is_active()));
-            });
-        }
+        let rows = Rc::new(RefCell::new(Vec::<PeoplePickerRow>::new()));
+        let has_discovered_people = !self.imp().discovered_users.borrow().is_empty();
+        *self.imp().people_picker_view.borrow_mut() = Some(PeoplePickerView {
+            list: list.clone(),
+            search: search.clone(),
+            confirm: confirm.clone(),
+            rows: rows.clone(),
+            excluded_user_ids: excluded_user_ids.iter().cloned().collect(),
+        });
+
         let rows_for_search = rows.clone();
         search.connect_search_changed(move |search| {
             let query = search.text().trim().to_lowercase();
-            for (_, name, _, row) in rows_for_search.iter() {
-                row.set_visible(query.is_empty() || name.contains(&query));
+            for person in rows_for_search.borrow().iter() {
+                person
+                    .row
+                    .set_visible(query.is_empty() || person.searchable_name.contains(&query));
             }
         });
         let weak_window = self.downgrade();
@@ -9381,17 +9367,113 @@ impl ConduitWindow {
         let on_submit = Rc::new(on_submit);
         confirm.connect_clicked(move |_| {
             let user_ids = rows
+                .borrow()
                 .iter()
-                .filter(|(_, _, check, _)| check.is_active())
-                .map(|(id, _, _, _)| id.clone())
+                .filter(|person| person.check.is_active())
+                .map(|person| person.user_id.clone())
                 .collect::<Vec<_>>();
             if let Some(window) = weak_window.upgrade() {
                 on_submit(&window, user_ids);
                 dialog_for_submit.close();
             }
         });
+
+        let weak_window = self.downgrade();
+        let list_for_close = list.clone();
+        dialog.connect_close_request(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                let mut active = window.imp().people_picker_view.borrow_mut();
+                if active
+                    .as_ref()
+                    .is_some_and(|view| view.list == list_for_close)
+                {
+                    active.take();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+
         dialog.present();
         search.grab_focus();
+        self.refresh_open_people_picker(has_discovered_people);
+        self.send_command(RuntimeCommand::DiscoverConversations);
+    }
+
+    fn refresh_open_people_picker(&self, discovery_complete: bool) {
+        let Some(view) = self.imp().people_picker_view.borrow().clone() else {
+            return;
+        };
+        let selected_user_ids = view
+            .rows
+            .borrow()
+            .iter()
+            .filter(|person| person.check.is_active())
+            .map(|person| person.user_id.clone())
+            .collect::<HashSet<_>>();
+        let current_user_id = self.imp().current_user_id.borrow().clone();
+        let mut people = self
+            .imp()
+            .discovered_users
+            .borrow()
+            .iter()
+            .filter(|user| !user.deleted.unwrap_or(false) && !user.is_bot.unwrap_or(false))
+            .filter_map(|user| {
+                let id = user.id.as_ref()?.trim();
+                let name = user.direct_message_name()?;
+                (!id.is_empty()
+                    && Some(id) != current_user_id.as_deref()
+                    && !view.excluded_user_ids.contains(id))
+                .then(|| (id.to_string(), name))
+            })
+            .collect::<Vec<_>>();
+        people.sort_by_key(|(_, name)| name.to_lowercase());
+
+        self.clear_list(&view.list);
+        view.rows.borrow_mut().clear();
+        if people.is_empty() {
+            view.confirm.set_sensitive(false);
+            self.append_placeholder(
+                &view.list,
+                &gettext(if discovery_complete {
+                    "No people available"
+                } else {
+                    "Loading people…"
+                }),
+            );
+            return;
+        }
+
+        let query = view.search.text().trim().to_lowercase();
+        for (user_id, name) in people {
+            let searchable_name = name.to_lowercase();
+            let check = gtk::CheckButton::with_label(&name);
+            check.set_margin_top(6);
+            check.set_margin_bottom(6);
+            check.set_margin_start(9);
+            check.set_margin_end(9);
+            check.set_active(selected_user_ids.contains(&user_id));
+            let row = gtk::ListBoxRow::new();
+            row.set_child(Some(&check));
+            row.set_visible(query.is_empty() || searchable_name.contains(&query));
+            view.list.append(&row);
+            view.rows.borrow_mut().push(PeoplePickerRow {
+                user_id,
+                searchable_name,
+                check: check.clone(),
+                row,
+            });
+            let rows = view.rows.clone();
+            let confirm = view.confirm.clone();
+            check.connect_toggled(move |_| {
+                confirm.set_sensitive(rows.borrow().iter().any(|person| person.check.is_active()));
+            });
+        }
+        view.confirm.set_sensitive(
+            view.rows
+                .borrow()
+                .iter()
+                .any(|person| person.check.is_active()),
+        );
     }
 
     fn show_new_channel_dialog(&self) {
