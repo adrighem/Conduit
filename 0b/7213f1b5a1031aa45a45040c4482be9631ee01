@@ -1,0 +1,7 @@
+Task: Fix manual composer verification regressions
+
+Summary: Prefer executable-local UI resources over installed fallback, make the Cargo build depend on the compiled resource bundle, place attachment previews in their matching composers, and activate toolbar overflow before clipping.
+
+Modified files: src/main.rs, src/meson.build, src/window.rs, src/window.ui, tests/test_release_automation.py
+
+Rationale: Prevent stale build-tree UI bundles from aborting GTK template initialization and keep both composer layouts usable during manual verification.
