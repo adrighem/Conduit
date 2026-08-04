@@ -3113,6 +3113,50 @@ mod tests {
     }
 
     #[test]
+    fn rich_message_post_restores_submitted_blocks_when_response_omits_them() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"message":{"ts":"1710000000.000100","text":"Hello"}}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            body
+        });
+        let blocks = r#"[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"text","text":"Hello","style":{"bold":true}}]}]}]"#;
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+
+        let message = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.post_message("C123", "Hello", Some(blocks), None))
+            .expect("message should post");
+
+        assert!(matches!(
+            message.document.nodes(),
+            [crate::rich_message::MessageNode::RichText(_)]
+        ));
+        let body = received.join().expect("mock Slack server should finish");
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(form.get("blocks").map(String::as_str), Some(blocks));
+    }
+
+    #[test]
     fn starred_conversation_ids_are_paginated_and_ignore_message_stars() {
         let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
         let address = server

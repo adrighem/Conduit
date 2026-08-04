@@ -15213,6 +15213,20 @@ mod tests {
         for host in ["message_format_toolbar", "thread_format_toolbar"] {
             assert!(template.contains(host), "missing composer toolbar {host}");
         }
+        for breakpoint in ["message_format_breakpoint", "thread_format_breakpoint"] {
+            assert!(
+                template.contains(&format!("AdwBreakpointBin\" id=\"{breakpoint}")),
+                "missing responsive composer toolbar {breakpoint}"
+            );
+        }
+        for overflow in ["message_format_overflow", "thread_format_overflow"] {
+            assert!(
+                template.contains(overflow),
+                "missing toolbar overflow {overflow}"
+            );
+        }
+        assert!(!template.contains("GtkFlowBox\" id=\"message_format_toolbar"));
+        assert!(!template.contains("GtkFlowBox\" id=\"thread_format_toolbar"));
 
         assert_eq!(
             composer_format_controls()
@@ -15232,6 +15246,15 @@ mod tests {
                 "Emoji",
             ]
         );
+
+        let source = include_str!("window.rs");
+        let setup = source
+            .split_once("fn setup_composer_toolbar")
+            .and_then(|(_, source)| source.split_once("fn insert_composer_emoji"))
+            .map(|(source, _)| source)
+            .expect("composer toolbar setup should be bounded");
+        assert!(setup.contains("connect_changed"));
+        assert!(!setup.contains("idle_add_local_once"));
     }
 
     #[test]

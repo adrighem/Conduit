@@ -5467,6 +5467,37 @@ mod tests {
     }
 
     #[test]
+    fn rich_text_preserves_all_inline_styles_and_logical_line_breaks() {
+        let mut message = message("");
+        message.blocks = Some(serde_json::json!([{
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [{
+                    "type": "text",
+                    "text": "Hello\r\nIs this working\rKürtőskalács\u{2028}Still here\u{2029}Done",
+                    "style": {
+                        "bold": true,
+                        "italic": true,
+                        "underline": true,
+                        "strike": true,
+                        "code": true
+                    }
+                }]
+            }]
+        }]));
+        message.refresh_canonical_content();
+
+        let html = conversation_document("C123", &[message], &MessageHtmlContext::default());
+
+        assert!(html.contains("<u><s><em><strong><code>"));
+        assert!(html.contains("Hello<br>Is this working<br>Kürtőskalács<br>Still here<br>Done"));
+        assert!(!html.contains('\r'));
+        assert!(!html.contains("\u{2028}"));
+        assert!(!html.contains("\u{2029}"));
+    }
+
+    #[test]
     fn unsupported_structured_message_has_a_nonblank_handoff_fallback() {
         let mut message = message("");
         message.blocks = Some(serde_json::json!([{ "type": "future_widget" }]));
