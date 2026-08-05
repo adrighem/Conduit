@@ -64,6 +64,11 @@ change Slack's private VIP list.
     rich text without collapsing or duplicating logical line breaks.
 29. Hide and reset upload progress after terminal success while retaining the
     staged composition on failure for retry.
+30. Persist the last selected conversation when application state is flushed
+    and reopen it after the conversation catalog becomes available on the next
+    launch.
+31. Never let a pending restoration override a newer user, notification, or
+    Slack URI selection; a missing saved conversation must not block startup.
 
 ## Acceptance Criteria
 
@@ -103,6 +108,10 @@ change Slack's private VIP list.
 - Staged-media tests cover multiple upload URLs, one completion request,
   thread targeting, terminal progress cleanup, retry retention, temporary-file
   cleanup, and draft restoration.
+- Settings and restart coverage proves the selected conversation ID survives a
+  clean shutdown and is reopened only after that conversation is available.
+- Empty, missing, or superseded restoration targets leave navigation usable
+  and never override a newer selection.
 - A successful toggle updates persisted conversation state and rerenders the sidebar.
 - `cargo fmt --check`, Rust tests, `cargo check`, Meson compile, and Meson tests pass in a sanitized allowlisted environment.
 
@@ -127,3 +136,4 @@ change Slack's private VIP list.
 - Replacing the existing conversation list widget.
 - Arbitrary Block Kit layout authoring, interactive controls, tables, or canvas
   composition.
+- Restoring a thread, message focus, or timeline scroll position.

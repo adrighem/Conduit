@@ -34,3 +34,8 @@
 - [x] Task: Send staged media and rich text as one Slack file-share message 2bfa87e
 - [x] Task: Fix manual composer verification regressions 0b7213f
 - [ ] Task: Conductor - User Manual Verification 'Inline staged media' (Protocol in workflow.md)
+
+## Phase 5: Last conversation restoration
+
+- [~] Task: Persist and restore the last selected conversation with restart coverage
+- [ ] Task: Conductor - User Manual Verification 'Last conversation restoration' (Protocol in workflow.md)
