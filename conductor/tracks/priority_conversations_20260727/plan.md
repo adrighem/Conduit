@@ -37,5 +37,5 @@
 
 ## Phase 5: Last conversation restoration
 
-- [~] Task: Persist and restore the last selected conversation with restart coverage
+- [x] Task: Persist and restore the last selected conversation with restart coverage 725a59c
 - [ ] Task: Conductor - User Manual Verification 'Last conversation restoration' (Protocol in workflow.md)
