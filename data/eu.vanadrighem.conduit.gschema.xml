@@ -46,6 +46,11 @@
 			<summary>Recent message reaction history</summary>
 			<description>The 20 most recently added reaction names used to rank four message quick actions.</description>
 		</key>
+		<key name="last-conversation-v1" type="(ss)">
+			<default>('', '')</default>
+			<summary>Last selected conversation</summary>
+			<description>The workspace identity and conversation selected when Conduit last closed.</description>
+		</key>
 		<key name="window-width" type="i">
 			<default>1120</default>
 			<summary>Main window width</summary>

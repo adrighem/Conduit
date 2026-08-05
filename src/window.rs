@@ -363,6 +363,7 @@ mod imp {
         pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
+        pub(super) pending_last_conversation: RefCell<Option<LastConversation>>,
         pub user_names: RefCell<Arc<HashMap<String, String>>>,
         pub user_full_names: RefCell<Arc<HashMap<String, String>>>,
         pub user_avatar_urls: RefCell<Arc<HashMap<String, String>>>,
@@ -499,12 +500,21 @@ mod imp {
                     }
                     return;
                 }
-                obj.populate_conversations(vec![SlackConversation {
+                let mut test_conversations = vec![SlackConversation {
                     id: test_channel_id.to_string(),
                     name: Some("general".to_string()),
                     is_channel: Some(true),
                     ..SlackConversation::default()
-                }]);
+                }];
+                if std::env::var_os("CONDUIT_TEST_CONVERSATION_RESTORE").is_some() {
+                    test_conversations.push(SlackConversation {
+                        id: "C_RESTORED".to_string(),
+                        name: Some("restored".to_string()),
+                        is_channel: Some(true),
+                        ..SlackConversation::default()
+                    });
+                }
+                obj.populate_conversations(test_conversations);
                 let test_users = vec![
                     SlackUser {
                         id: Some("UADA".to_string()),
@@ -553,7 +563,14 @@ mod imp {
                     obj.refresh_workspace_title_status();
                 }
                 obj.apply_workspace_lifecycle(WorkspaceLifecycleEvent::SyncCompleted);
-                obj.select_conversation(test_channel_id, "#general");
+                if let Some(channel_id) = std::env::var_os("CONDUIT_TEST_SELECT_CONVERSATION")
+                    .and_then(|channel_id| channel_id.into_string().ok())
+                {
+                    let title = obj.conversation_title(&channel_id);
+                    obj.select_conversation(&channel_id, &title);
+                } else if obj.selected_channel_id().is_none() {
+                    obj.select_conversation(test_channel_id, "#general");
+                }
                 if huddle_test {
                     let huddle = crate::huddles::model::ActiveHuddle {
                         team_id: "TTEST".to_string(),
@@ -2094,6 +2111,68 @@ fn workspace_identity(auth: &AuthInfo) -> Option<String> {
         || workspace.to_string(),
         |user| format!("{workspace}:{user}"),
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LastConversation {
+    workspace_id: String,
+    channel_id: String,
+}
+
+impl LastConversation {
+    fn new(workspace_id: &str, channel_id: &str) -> Option<Self> {
+        let workspace_id = workspace_id.trim();
+        let channel_id = channel_id.trim();
+        if workspace_id.is_empty() || channel_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            workspace_id: workspace_id.to_string(),
+            channel_id: channel_id.to_string(),
+        })
+    }
+
+    fn to_settings_value(&self) -> (String, String) {
+        (self.workspace_id.clone(), self.channel_id.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LastConversationRestoreDecision {
+    Wait,
+    Select(String),
+    Discard,
+    Superseded,
+}
+
+fn last_conversation_restore_decision(
+    pending: &LastConversation,
+    workspace_id: Option<&str>,
+    selected_channel_id: Option<&str>,
+    authoritative: bool,
+    explicit_intent_opened: bool,
+    conversations: &[SlackConversation],
+) -> LastConversationRestoreDecision {
+    if explicit_intent_opened || selected_channel_id.is_some() {
+        return LastConversationRestoreDecision::Superseded;
+    }
+    let Some(workspace_id) = workspace_id else {
+        return LastConversationRestoreDecision::Wait;
+    };
+    if workspace_id != pending.workspace_id {
+        return LastConversationRestoreDecision::Discard;
+    }
+    if conversations
+        .iter()
+        .any(|conversation| conversation.id == pending.channel_id)
+    {
+        return LastConversationRestoreDecision::Select(pending.channel_id.clone());
+    }
+    if authoritative {
+        LastConversationRestoreDecision::Discard
+    } else {
+        LastConversationRestoreDecision::Wait
+    }
 }
 
 fn submitted_draft_matches(
@@ -5098,6 +5177,12 @@ impl ConduitWindow {
         let settings = gio::Settings::new(config::APPLICATION_ID);
         self.restore_window_state(&settings);
         *self.imp().drafts.borrow_mut() = DraftSettings::new(settings.clone()).load();
+        let (workspace_id, channel_id) = settings
+            .value(config::LAST_CONVERSATION_KEY)
+            .get::<(String, String)>()
+            .unwrap_or_default();
+        *self.imp().pending_last_conversation.borrow_mut() =
+            LastConversation::new(&workspace_id, &channel_id);
         let weak_window = self.downgrade();
         settings.connect_changed(
             Some(config::SIDEBAR_SHOW_UNREADS_SECTION_KEY),
@@ -5143,6 +5228,90 @@ impl ConduitWindow {
                 crate::debug::log("settings", &format!("WindowStateSaveFailed error={error}"));
             }
         }
+    }
+
+    fn persist_last_conversation(&self, conversation: Option<&LastConversation>) {
+        let Some(settings) = self.imp().settings.borrow().as_ref().cloned() else {
+            return;
+        };
+        let value = conversation
+            .map(LastConversation::to_settings_value)
+            .unwrap_or_default();
+        if let Err(error) = settings.set_value(config::LAST_CONVERSATION_KEY, &value.to_variant()) {
+            crate::debug::log(
+                "settings",
+                &format!("LastConversationSaveFailed error={error}"),
+            );
+        }
+    }
+
+    fn save_selected_conversation(&self) {
+        let workspace_id = self.imp().workspace_id.borrow().clone();
+        let channel_id = self.selected_channel_id();
+        let Some(conversation) = workspace_id
+            .as_deref()
+            .zip(channel_id.as_deref())
+            .and_then(|(workspace_id, channel_id)| LastConversation::new(workspace_id, channel_id))
+        else {
+            return;
+        };
+        self.persist_last_conversation(Some(&conversation));
+    }
+
+    fn clear_last_conversation(&self) {
+        self.imp().pending_last_conversation.borrow_mut().take();
+        self.persist_last_conversation(None);
+    }
+
+    fn validate_last_conversation_workspace(&self) {
+        let pending = self.imp().pending_last_conversation.borrow().clone();
+        let workspace_id = self.imp().workspace_id.borrow().clone();
+        if pending
+            .as_ref()
+            .zip(workspace_id.as_deref())
+            .is_some_and(|(pending, workspace_id)| pending.workspace_id != workspace_id)
+        {
+            self.clear_last_conversation();
+        }
+    }
+
+    fn restore_last_conversation(&self, authoritative: bool, explicit_intent_opened: bool) {
+        let Some(pending) = self.imp().pending_last_conversation.borrow().clone() else {
+            return;
+        };
+        let workspace_id = self.imp().workspace_id.borrow().clone();
+        let selected_channel_id = self.selected_channel_id();
+        let conversations = self.imp().workspace.conversations.borrow().conversations();
+        match last_conversation_restore_decision(
+            &pending,
+            workspace_id.as_deref(),
+            selected_channel_id.as_deref(),
+            authoritative,
+            explicit_intent_opened,
+            &conversations,
+        ) {
+            LastConversationRestoreDecision::Wait => {}
+            LastConversationRestoreDecision::Select(channel_id) => {
+                self.imp().pending_last_conversation.borrow_mut().take();
+                let title = self.conversation_title(&channel_id);
+                self.select_conversation(&channel_id, &title);
+            }
+            LastConversationRestoreDecision::Discard => self.clear_last_conversation(),
+            LastConversationRestoreDecision::Superseded => {
+                self.imp().pending_last_conversation.borrow_mut().take();
+                if selected_channel_id.is_some() {
+                    self.save_selected_conversation();
+                } else {
+                    self.persist_last_conversation(None);
+                }
+            }
+        }
+    }
+
+    fn activate_pending_navigation_intents(&self) -> bool {
+        let notification_opened = self.activate_pending_notification_target();
+        let slack_uri_opened = self.activate_pending_slack_uris();
+        notification_opened || slack_uri_opened
     }
 
     fn draft_key(&self, channel_id: &str, thread_ts: Option<&str>) -> Option<DraftKey> {
@@ -5203,6 +5372,7 @@ impl ConduitWindow {
 
     pub(crate) fn flush_persistent_state(&self) {
         self.flush_current_drafts();
+        self.save_selected_conversation();
         self.save_window_state();
     }
 
@@ -6905,6 +7075,7 @@ impl ConduitWindow {
             RuntimeEventKind::RuntimeStartFailed(error) => self.show_session_error(&error.message),
             RuntimeEventKind::SignedOut => {
                 self.imp().connect_requested.set(false);
+                self.clear_last_conversation();
                 self.show_login("Choose a workspace to continue");
             }
             RuntimeEventKind::Authenticated(auth) => {
@@ -6923,6 +7094,8 @@ impl ConduitWindow {
                     ) {
                         self.sync_conversations_from_catalog();
                     }
+                    let explicit_intent_opened = self.activate_pending_navigation_intents();
+                    self.restore_last_conversation(true, explicit_intent_opened);
                     self.restore_workspace_status();
                 }
             }
@@ -8802,6 +8975,7 @@ impl ConduitWindow {
     pub(crate) fn show_connect_requested(&self) {
         self.send_session_command(RuntimeCommand::Disconnect);
         self.imp().connect_requested.set(true);
+        self.clear_last_conversation();
         self.imp()
             .workspace
             .transition_lifecycle(WorkspaceLifecycleEvent::SignedOut);
@@ -8895,6 +9069,7 @@ impl ConduitWindow {
 
     fn show_workspace(&self, auth: AuthInfo) {
         *self.imp().workspace_id.borrow_mut() = workspace_identity(&auth);
+        self.validate_last_conversation_workspace();
         self.imp().workspace_ready.set(false);
         self.imp().initial_sync_complete.set(false);
         if let (Some(user_id), Some(user_name)) = (auth.user_id.as_deref(), auth.user.as_deref()) {
@@ -8919,8 +9094,7 @@ impl ConduitWindow {
         self.imp().workspace_split.set_show_content(false);
         self.sync_workspace_chrome();
         self.render_workspace_lifecycle();
-        self.activate_pending_notification_target();
-        self.activate_pending_slack_uris();
+        self.activate_pending_navigation_intents();
     }
 
     fn set_status(&self, status: &str) {
@@ -9286,6 +9460,8 @@ impl ConduitWindow {
         &self,
         patch: &crate::workspace_pipeline::WorkspacePatch,
     ) {
+        let selected_before = self.selected_channel_id();
+        let pending_before = self.imp().pending_last_conversation.borrow().clone();
         let revision = patch.revision();
         let application = {
             let local_reads = self.imp().local_read_ts_by_channel.borrow();
@@ -9319,6 +9495,13 @@ impl ConduitWindow {
         );
         for removal in application.removals() {
             let channel_id = removal.channel_id();
+            if selected_before.as_deref() == Some(channel_id)
+                || pending_before
+                    .as_ref()
+                    .is_some_and(|pending| pending.channel_id == channel_id)
+            {
+                self.clear_last_conversation();
+            }
             self.imp()
                 .pending_opened_conversation_ids
                 .borrow_mut()
@@ -9390,8 +9573,8 @@ impl ConduitWindow {
             self.refresh_current_conversation_title();
         }
         self.imp().workspace_ready.set(true);
-        self.activate_pending_notification_target();
-        self.activate_pending_slack_uris();
+        let explicit_intent_opened = self.activate_pending_navigation_intents();
+        self.restore_last_conversation(false, explicit_intent_opened);
         self.refresh_open_conversation_picker();
 
         if !self.imp().workspace.conversations.borrow().is_empty()
@@ -11152,6 +11335,8 @@ impl ConduitWindow {
                 ));
             }
         }
+        self.imp().pending_last_conversation.borrow_mut().take();
+        self.save_selected_conversation();
     }
 
     fn request_channel_history(&self, channel_id: &str) {
@@ -12994,6 +13179,7 @@ fn record_test_web_view_lifecycle(window: &ConduitWindow) {
             "thread_web_view_creations": window.thread_pane().web_view_creation_count(),
             "thread_open": window.thread_pane().is_open(),
             "thread_widget_children": thread_widget_children,
+            "selected_channel": window.selected_channel_id(),
         })
         .to_string(),
     );
@@ -15405,6 +15591,99 @@ mod tests {
         assert!(draft_persist_required(false, true));
         assert!(draft_persist_required(true, false));
         assert!(!draft_persist_required(false, false));
+    }
+
+    #[test]
+    fn last_conversation_restore_handles_cache_authority_and_navigation_precedence() {
+        let conversations = vec![SlackConversation {
+            id: "C_RESTORED".to_string(),
+            name: Some("restored".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        }];
+        let restored = LastConversation::new("T_TEST:U_TEST", "C_RESTORED").unwrap();
+        let missing = LastConversation::new("T_TEST:U_TEST", "C_MISSING").unwrap();
+
+        assert_eq!(
+            last_conversation_restore_decision(
+                &restored,
+                Some("T_TEST:U_TEST"),
+                None,
+                false,
+                false,
+                &conversations,
+            ),
+            LastConversationRestoreDecision::Select("C_RESTORED".to_string())
+        );
+        assert_eq!(
+            last_conversation_restore_decision(
+                &missing,
+                Some("T_TEST:U_TEST"),
+                None,
+                false,
+                false,
+                &conversations,
+            ),
+            LastConversationRestoreDecision::Wait
+        );
+        assert_eq!(
+            last_conversation_restore_decision(
+                &missing,
+                Some("T_TEST:U_TEST"),
+                None,
+                true,
+                false,
+                &conversations,
+            ),
+            LastConversationRestoreDecision::Discard
+        );
+        assert_eq!(
+            last_conversation_restore_decision(
+                &restored,
+                Some("T_TEST:U_TEST"),
+                Some("C_NEW"),
+                false,
+                false,
+                &conversations,
+            ),
+            LastConversationRestoreDecision::Superseded
+        );
+        assert_eq!(
+            last_conversation_restore_decision(
+                &restored,
+                Some("T_TEST:U_TEST"),
+                None,
+                false,
+                true,
+                &conversations,
+            ),
+            LastConversationRestoreDecision::Superseded
+        );
+        assert_eq!(
+            last_conversation_restore_decision(
+                &restored,
+                Some("T_OTHER:U_TEST"),
+                None,
+                false,
+                false,
+                &conversations,
+            ),
+            LastConversationRestoreDecision::Discard
+        );
+        assert_eq!(
+            restored.to_settings_value(),
+            ("T_TEST:U_TEST".to_string(), "C_RESTORED".to_string())
+        );
+        assert_eq!(
+            LastConversation::new(" ", "C_RESTORED"),
+            None,
+            "empty workspace identities are never persisted"
+        );
+        assert_eq!(
+            LastConversation::new("T_TEST:U_TEST", " "),
+            None,
+            "empty conversation IDs are never persisted"
+        );
     }
 
     #[test]

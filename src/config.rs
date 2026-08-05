@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub const APPLICATION_ID: &str = "eu.vanadrighem.conduit";
+pub const LAST_CONVERSATION_KEY: &str = "last-conversation-v1";
 pub const MESSAGE_DRAFTS_KEY: &str = "message-drafts";
 pub const NOTIFICATIONS_DIRECT_MESSAGES_V1_KEY: &str = "notifications-direct-messages-v1";
 pub const NOTIFICATIONS_ENABLED_V1_KEY: &str = "notifications-enabled-v1";

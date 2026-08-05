@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Verify that main-window size and maximized state survive a restart."""
+"""Verify that main-window and conversation state survive a restart."""
 
 from __future__ import annotations
 
@@ -18,6 +18,9 @@ EXPECTED_SIZE = (920, 640)
 SIZE_TOLERANCE = 4
 SWITCHER_TITLE = "Switch conversation"
 NEW_MESSAGE_TITLE = "New message"
+LAST_CONVERSATION_KEY = "last-conversation-v1"
+RESTORED_CHANNEL_ID = "C_RESTORED"
+TEST_WORKSPACE_ID = "Test Workspace"
 
 
 def wait_until(predicate, timeout: float = 15.0, interval: float = 0.1):
@@ -52,6 +55,16 @@ def read_json(path: Path) -> dict[str, object] | None:
         return json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def setting_value(environment: dict[str, str], key: str) -> str:
+    return subprocess.run(
+        ["gsettings", "get", APP_ID, key],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def visible_window_ids(name: str) -> list[str]:
@@ -277,6 +290,7 @@ def main() -> None:
                 "XDG_DATA_HOME": str(root / "data"),
             }
         )
+        assert setting_value(environment, LAST_CONVERSATION_KEY) == "('', '')"
 
         process: subprocess.Popen[str] | None = None
         try:
@@ -299,6 +313,32 @@ def main() -> None:
             stop_application(process, environment)
             process = None
             environment.pop("CONDUIT_TEST_EMPTY_NEW_MESSAGE")
+
+            environment["CONDUIT_TEST_CONVERSATION_RESTORE"] = "1"
+            environment["CONDUIT_TEST_SELECT_CONVERSATION"] = RESTORED_CHANNEL_ID
+            lifecycle_file.unlink(missing_ok=True)
+            process, _ = run_application(binary, environment)
+            wait_until(
+                lambda: (read_json(lifecycle_file) or {}).get("selected_channel")
+                == RESTORED_CHANNEL_ID
+            )
+            stop_application(process, environment)
+            process = None
+            assert (
+                setting_value(environment, LAST_CONVERSATION_KEY)
+                == f"('{TEST_WORKSPACE_ID}', '{RESTORED_CHANNEL_ID}')"
+            )
+
+            environment.pop("CONDUIT_TEST_SELECT_CONVERSATION")
+            lifecycle_file.unlink(missing_ok=True)
+            process, _ = run_application(binary, environment)
+            wait_until(
+                lambda: (read_json(lifecycle_file) or {}).get("selected_channel")
+                == RESTORED_CHANNEL_ID
+            )
+            stop_application(process, environment)
+            process = None
+            environment.pop("CONDUIT_TEST_CONVERSATION_RESTORE")
 
             process, window_id = run_application(binary, environment)
             resize_window(window_id, EXPECTED_SIZE)
