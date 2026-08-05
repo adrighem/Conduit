@@ -6122,7 +6122,7 @@ impl ConduitWindow {
         overflow_popover.set_child(Some(&overflow_content));
         overflow.set_popover(Some(&overflow_popover));
         for control in composer_format_controls()
-            .into_iter()
+            .iter()
             .filter(|control| Self::composer_overflow_action(control.action))
         {
             let button = gtk::Button::with_label(&gettext(control.accessible_name));
