@@ -413,6 +413,7 @@ mod imp {
         pub(super) thread_composer_completion: RefCell<Option<ComposerCompletion>>,
         pub(super) message_composer_toolbar: RefCell<Option<ComposerToolbar>>,
         pub(super) thread_composer_toolbar: RefCell<Option<ComposerToolbar>>,
+        pub(super) composer_format_css_provider: RefCell<Option<gtk::CssProvider>>,
         pub(super) message_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) thread_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) message_attachments: RefCell<Vec<ComposerAttachmentDraft>>,
@@ -618,6 +619,9 @@ mod imp {
         }
 
         fn dispose(&self) {
+            if let Some(provider) = self.composer_format_css_provider.borrow_mut().take() {
+                gtk::style_context_remove_provider_for_display(&self.obj().display(), &provider);
+            }
             if let Some((settings, handler)) =
                 self.message_font_settings_handler.borrow_mut().take()
             {
@@ -701,8 +705,27 @@ const COMPOSER_BULLETED_LIST_TAG: &str = "composer-bulleted-list";
 const COMPOSER_NUMBERED_LIST_TAG: &str = "composer-numbered-list";
 const COMPOSER_QUOTE_TAG: &str = "composer-quote";
 const COMPOSER_PREFORMATTED_TAG: &str = "composer-preformatted";
-const COMPOSER_FORMAT_OVERFLOW_WIDTH_SP: f64 = 540.0;
+const COMPOSER_FORMAT_CONTROL_SIZE: i32 = 34;
+const COMPOSER_FORMAT_CONTROL_SPACING: i32 = 2;
+const COMPOSER_FORMAT_CONTROL_CSS: &str = r#"
+button.composer-format-control,
+menubutton.composer-format-control,
+menubutton.composer-format-control > button {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+}
+"#;
 const MAX_COMPOSER_ATTACHMENTS: usize = 10;
+
+fn composer_format_toolbar_width(control_count: usize) -> i32 {
+    let control_count = i32::try_from(control_count).expect("composer control count fits i32");
+    if control_count == 0 {
+        return 0;
+    }
+    control_count * COMPOSER_FORMAT_CONTROL_SIZE
+        + (control_count - 1) * COMPOSER_FORMAT_CONTROL_SPACING
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimelineSurface {
@@ -1227,6 +1250,23 @@ fn composer_format_controls() -> &'static [ComposerFormatControl] {
             accessible_name: "Emoji",
         },
     ]
+}
+
+fn configure_composer_format_control<T>(button: &T)
+where
+    T: IsA<gtk::Button> + IsA<gtk::Widget>,
+{
+    button.add_css_class("composer-format-control");
+    button.set_can_shrink(true);
+    button.set_hexpand(false);
+    button.set_size_request(COMPOSER_FORMAT_CONTROL_SIZE, COMPOSER_FORMAT_CONTROL_SIZE);
+}
+
+fn configure_composer_format_menu_control(button: &gtk::MenuButton) {
+    button.add_css_class("composer-format-control");
+    button.set_can_shrink(true);
+    button.set_hexpand(false);
+    button.set_size_request(COMPOSER_FORMAT_CONTROL_SIZE, COMPOSER_FORMAT_CONTROL_SIZE);
 }
 
 #[derive(Debug, Clone)]
@@ -5766,8 +5806,24 @@ impl ConduitWindow {
         )
     }
 
+    fn ensure_composer_format_control_css(&self) {
+        if self.imp().composer_format_css_provider.borrow().is_some() {
+            return;
+        }
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(COMPOSER_FORMAT_CONTROL_CSS);
+        gtk::style_context_add_provider_for_display(
+            &self.display(),
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        *self.imp().composer_format_css_provider.borrow_mut() = Some(provider);
+    }
+
     fn setup_composer_toolbar(&self, target: ComposerTarget) {
+        self.ensure_composer_format_control_css();
         let host = self.composer_format_host(target);
+        host.set_spacing(COMPOSER_FORMAT_CONTROL_SPACING);
         host.update_property(&[gtk::accessible::Property::Label(&gettext(match target {
             ComposerTarget::Message => "Message formatting",
             ComposerTarget::Thread => "Reply formatting",
@@ -5776,6 +5832,7 @@ impl ConduitWindow {
         let mut buttons = HashMap::new();
         let mut collapsed_widgets = Vec::new();
         let overflow = self.composer_format_overflow(target);
+        configure_composer_format_menu_control(&overflow);
         host.remove(&overflow);
         let weak_window = self.downgrade();
         let emoji_picker =
@@ -5798,6 +5855,7 @@ impl ConduitWindow {
         for control in composer_format_controls() {
             if control.action == ComposerFormatAction::Emoji {
                 let button = gtk::Button::with_label(control.label);
+                configure_composer_format_control(&button);
                 button.add_css_class("flat");
                 button.set_tooltip_text(Some(&gettext(control.accessible_name)));
                 button.update_property(&[gtk::accessible::Property::Label(&gettext(
@@ -5817,6 +5875,7 @@ impl ConduitWindow {
             }
 
             let button = gtk::ToggleButton::with_label(control.label);
+            configure_composer_format_control(&button);
             button.add_css_class("flat");
             button.set_tooltip_text(Some(&gettext(control.accessible_name)));
             button.update_property(&[gtk::accessible::Property::Label(&gettext(
@@ -5888,17 +5947,21 @@ impl ConduitWindow {
             overflow_content.append(&button);
         }
 
+        let full_control_count = composer_format_controls().len();
+        let compact_control_count = full_control_count - collapsed_widgets.len() + 1;
+        let breakpoint_bin = self.composer_format_breakpoint(target);
+        breakpoint_bin.set_width_request(composer_format_toolbar_width(compact_control_count));
+        breakpoint_bin.set_height_request(COMPOSER_FORMAT_CONTROL_SIZE);
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
-            COMPOSER_FORMAT_OVERFLOW_WIDTH_SP,
-            adw::LengthUnit::Sp,
+            f64::from(composer_format_toolbar_width(full_control_count) - 1),
+            adw::LengthUnit::Px,
         ));
         for widget in collapsed_widgets {
             breakpoint.add_setter(&widget, "visible", Some(&false.to_value()));
         }
         breakpoint.add_setter(&overflow, "visible", Some(&true.to_value()));
-        self.composer_format_breakpoint(target)
-            .add_breakpoint(breakpoint);
+        breakpoint_bin.add_breakpoint(breakpoint);
 
         *self.composer_toolbar(target).borrow_mut() = Some(ComposerToolbar {
             buttons,
@@ -15716,20 +15779,6 @@ mod tests {
                 template.contains(&format!("AdwBreakpointBin\" id=\"{breakpoint}")),
                 "missing responsive composer toolbar {breakpoint}"
             );
-            let breakpoint_start = template
-                .find(&format!("AdwBreakpointBin\" id=\"{breakpoint}"))
-                .expect("composer breakpoint should exist");
-            let child_start = template[breakpoint_start..]
-                .find("<property name=\"child\">")
-                .map(|offset| breakpoint_start + offset)
-                .expect("composer breakpoint should contain its child");
-            let breakpoint_properties = &template[breakpoint_start..child_start];
-            assert!(
-                breakpoint_properties.contains("<property name=\"width-request\">300</property>")
-            );
-            assert!(
-                breakpoint_properties.contains("<property name=\"height-request\">34</property>")
-            );
         }
         for overflow in ["message_format_overflow", "thread_format_overflow"] {
             assert!(
@@ -15767,7 +15816,43 @@ mod tests {
             .expect("composer toolbar setup should be bounded");
         assert!(setup.contains("connect_changed"));
         assert!(!setup.contains("idle_add_local_once"));
-        assert!(setup.contains("COMPOSER_FORMAT_OVERFLOW_WIDTH_SP"));
+        assert!(setup.contains("configure_composer_format_control"));
+    }
+
+    #[test]
+    fn composer_format_controls_are_square_and_overflow_at_exact_width() {
+        assert_eq!(COMPOSER_FORMAT_CONTROL_SIZE, 34);
+        assert_eq!(composer_format_toolbar_width(0), 0);
+        assert_eq!(composer_format_toolbar_width(1), 34);
+        assert_eq!(composer_format_toolbar_width(6), 214);
+        assert_eq!(composer_format_toolbar_width(10), 358);
+
+        let source = include_str!("window.rs");
+        let sizing = source
+            .split_once("fn configure_composer_format_control")
+            .and_then(|(_, source)| source.split_once("fn configure_composer_format_menu_control"))
+            .map(|(source, _)| source)
+            .expect("composer control sizing should be bounded");
+        assert!(sizing.contains("set_size_request("));
+        assert_eq!(sizing.matches("COMPOSER_FORMAT_CONTROL_SIZE").count(), 2);
+        assert!(sizing.contains("composer-format-control"));
+
+        let css = source
+            .split_once("fn ensure_composer_format_control_css")
+            .and_then(|(_, source)| source.split_once("fn setup_composer_toolbar"))
+            .map(|(source, _)| source)
+            .expect("composer control CSS setup should be bounded");
+        assert!(css.contains("COMPOSER_FORMAT_CONTROL_CSS"));
+        assert!(css.contains("style_context_add_provider_for_display"));
+
+        let setup = source
+            .split_once("fn setup_composer_toolbar")
+            .and_then(|(_, source)| source.split_once("fn insert_composer_emoji"))
+            .map(|(source, _)| source)
+            .expect("composer toolbar setup should be bounded");
+        assert!(setup.contains("composer_format_toolbar_width(compact_control_count)"));
+        assert!(setup.contains("composer_format_toolbar_width(full_control_count)"));
+        assert!(setup.contains("adw::LengthUnit::Px"));
     }
 
     #[test]
