@@ -16,6 +16,7 @@ use crate::models::{
     SavedItem, SearchMatch, SearchMessageLocation, SlackAttachment, SlackAttachmentAction,
     SlackFile, SlackMessage, SlackUser, SlackUserStatus,
 };
+use crate::rich_message::MessageControlKey;
 
 mod rich_components;
 mod rich_model;
@@ -53,6 +54,8 @@ pub struct MessageHtmlContext {
     pub first_unread_ts: Option<String>,
     pub timeline_generation: Option<u64>,
     pub(crate) message_control_handles: HashMap<MessageRef, MessageControlHandle>,
+    pub(crate) message_control_action_handles:
+        HashMap<(MessageRef, MessageControlKey), MessageControlHandle>,
 }
 
 impl MessageHtmlContext {
@@ -63,6 +66,22 @@ impl MessageHtmlContext {
     ) -> Option<MessageControlHandle> {
         let target = MessageRef::new(channel_id?, message_ts).ok()?;
         self.message_control_handles.get(&target).cloned()
+    }
+
+    fn message_control_action_handles(
+        &self,
+        channel_id: Option<&str>,
+        message_ts: &str,
+    ) -> HashMap<MessageControlKey, MessageControlHandle> {
+        let Ok(target) = MessageRef::new(channel_id.unwrap_or_default(), message_ts) else {
+            return HashMap::new();
+        };
+        self.message_control_action_handles
+            .iter()
+            .filter_map(|((message, key), handle)| {
+                (message == &target).then_some((*key, handle.clone()))
+            })
+            .collect()
     }
 }
 
@@ -2508,6 +2527,7 @@ fn message_body_html(
                 &rich_plan::RichRenderPlan::new(
                     document,
                     context.message_control_handle(channel_id, &message.ts),
+                    context.message_control_action_handles(channel_id, &message.ts),
                 ),
                 context,
             )
@@ -2529,6 +2549,7 @@ fn message_body_html(
                 &rich_plan::RichRenderPlan::new(
                     document,
                     context.message_control_handle(channel_id, &message.ts),
+                    context.message_control_action_handles(channel_id, &message.ts),
                 ),
                 context,
             )
@@ -2953,6 +2974,7 @@ fn attachments_html(
             &rich_plan::RichRenderPlan::new(
                 document,
                 context.message_control_handle(channel_id, &message.ts),
+                context.message_control_action_handles(channel_id, &message.ts),
             ),
             context,
         )]
@@ -4246,6 +4268,47 @@ mod tests {
         (context, url.replace('&', "&amp;"))
     }
 
+    fn with_message_controls(
+        mut context: MessageHtmlContext,
+        channel_id: &str,
+        message: &SlackMessage,
+    ) -> (MessageHtmlContext, String, Vec<String>) {
+        let target = MessageRef::new(channel_id, message.ts.clone()).unwrap();
+        let mut registry = MessageControlRegistry::default();
+        registry
+            .replace_message_with_controls(
+                TimelineSurfaceId::Main,
+                target.clone(),
+                message.document.control_keys(),
+            )
+            .unwrap();
+        let fallback = registry
+            .active_handle(TimelineSurfaceId::Main, &target)
+            .unwrap();
+        context
+            .message_control_handles
+            .insert(target.clone(), fallback.clone());
+        let action_urls = message
+            .document
+            .control_keys()
+            .into_iter()
+            .filter_map(|key| {
+                let handle =
+                    registry.active_control_handle(TimelineSurfaceId::Main, &target, key)?;
+                let url = message_control_action_url(&handle).replace('&', "&amp;");
+                context
+                    .message_control_action_handles
+                    .insert((target.clone(), key), handle);
+                Some(url)
+            })
+            .collect();
+        (
+            context,
+            message_control_action_url(&fallback).replace('&', "&amp;"),
+            action_urls,
+        )
+    }
+
     fn contrast_ratio(foreground: &str, background: &str) -> f64 {
         fn luminance(color: &str) -> f64 {
             let channel = |offset| {
@@ -5085,6 +5148,7 @@ mod tests {
         message.blocks = Some(serde_json::json!([
             {
                 "type": "actions",
+                "block_id": "actions-block",
                 "elements": [
                     {
                         "type": "button",
@@ -5104,9 +5168,11 @@ mod tests {
                 ]
             }
         ]));
+        message.refresh_canonical_content();
 
-        let (context, control_url) =
-            with_message_control(MessageHtmlContext::default(), "C123", "1710000000.000100");
+        let (context, _, action_urls) =
+            with_message_controls(MessageHtmlContext::default(), "C123", &message);
+        let control_url = &action_urls[1];
         let html = conversation_document("C123", &[message], &context);
 
         assert!(html
@@ -5115,8 +5181,7 @@ mod tests {
         assert!(html.contains(&format!("href=\"{control_url}\"")));
         assert!(!control_url.contains("C123"));
         assert!(!control_url.contains("1710000000"));
-        assert!(html.contains("<span class=\"control-label\">Callback only</span>"));
-        assert!(html.contains("<span class=\"slack-handoff\">Open in Slack</span>"));
+        assert!(html.contains(">Callback only</a>"));
         assert!(html.contains(
             "<span class=\"block-action is-unavailable\" aria-disabled=\"true\">Unsafe</span>"
         ));
@@ -5164,7 +5229,8 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let (context, control_url) = with_message_control(context, "C123", "1710000000.000100");
+        let (context, _, action_urls) = with_message_controls(context, "C123", &message);
+        let control_url = &action_urls[0];
 
         let html = conversation_document("C123", &[message], &context);
 
@@ -5175,7 +5241,7 @@ mod tests {
         assert!(html.contains("Example Person"));
         assert!(html.contains("data:image/png;base64,request"));
         assert!(html.contains("Approve"));
-        assert!(html.contains(&control_url));
+        assert!(html.contains(control_url));
         assert!(!html.contains("private-callback"));
         assert!(!html.contains("private-approval-value"));
     }
@@ -5399,6 +5465,7 @@ mod tests {
             },
             {
                 "type": "actions",
+                "block_id": "issue-actions",
                 "elements": [
                     {
                         "type": "button",
@@ -5433,8 +5500,8 @@ mod tests {
         ]));
         message.refresh_canonical_content();
 
-        let (context, control_url) =
-            with_message_control(MessageHtmlContext::default(), "C123", "1710000000.000100");
+        let (context, control_url, action_urls) =
+            with_message_controls(MessageHtmlContext::default(), "C123", &message);
         let html = conversation_document("C123", &[message], &context);
 
         for content in [
@@ -5453,7 +5520,9 @@ mod tests {
         }
         assert!(html.contains("href=\"https://issues.example.test/ABC-1\""));
         assert_eq!(html.matches("conduit://message-control?").count(), 3);
-        assert_eq!(html.matches(&control_url).count(), 3);
+        assert_eq!(html.matches(&control_url).count(), 2);
+        assert!(html.contains(&action_urls[1]));
+        assert_ne!(control_url, action_urls[1]);
         for private in [
             "private-action",
             "private-value",
@@ -5515,15 +5584,15 @@ mod tests {
     fn rich_fixture_dom_exposes_color_handoff_and_image_accessory() {
         let mut bob = test_fixtures::bob_message();
         bob.refresh_canonical_content();
-        let (bob_context, _) =
-            with_message_control(MessageHtmlContext::default(), "C123", "1710000000.000100");
+        let (bob_context, _, bob_actions) =
+            with_message_controls(MessageHtmlContext::default(), "C123", &bob);
         let bob_html = conversation_document("C123", &[bob], &bob_context);
 
         assert!(bob_html.contains(
             "<section class=\"legacy-attachment\" style=\"--attachment-accent:#2eb67d\""
         ));
-        assert!(bob_html.contains("<span class=\"control-label\">Approve</span>"));
-        assert!(bob_html.contains("<span class=\"slack-handoff\">Open in Slack</span>"));
+        assert!(bob_html.contains(">Approve</a>"));
+        assert!(bob_html.contains(&bob_actions[0]));
         assert!(!bob_html.contains("private-callback"));
         assert!(!bob_html.contains("private-approval-value"));
 

@@ -61,7 +61,8 @@ use crate::huddles::state::{
 };
 use crate::message_handoff::{
     open_resolved_handoff, ExternalOpenError, ExternalOpener, HandoffProvenance,
-    MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
+    MessageControlHandle, MessageControlRegistry, MessageControlSelection, MessageControlTarget,
+    MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
 use crate::message_html::{
     self, MessageHtmlContext, TimelineAssetKind, TimelineDomPatch, TimelineInsertPosition,
@@ -72,7 +73,7 @@ use crate::models::{
     SlackConversation, SlackFile, SlackMessage, SlackUnreadState, SlackUser, SlackUserProfile,
     SlackUserStatus,
 };
-use crate::realtime::{RealtimePhase, RealtimeStatus};
+use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering;
 use crate::runtime::{
     image_asset_cache_key, AppRuntime, OperationContext, PreviewAsset, RequestId, RuntimeCommand,
@@ -88,6 +89,7 @@ use crate::sidebar::{
 #[cfg(test)]
 use crate::sidebar::{SidebarItemKey, SidebarRowModel};
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
+use crate::slack::SlackMessageActionRequest;
 use crate::slack_link::{
     resolve_slack_uri, slack_app_web_fallback, SlackFileAction, SlackUri, SlackUriResolution,
     SlackUriTarget,
@@ -4007,6 +4009,35 @@ fn browser_session_input(
     Ok((xoxc_token.to_string(), xoxd_token.to_string()))
 }
 
+fn message_action_control_keys(
+    message: &SlackMessage,
+    browser_session_available: bool,
+) -> Vec<crate::rich_message::MessageControlKey> {
+    if !browser_session_available || message.author.bot_id().is_none() {
+        return Vec::new();
+    }
+    message
+        .document
+        .control_keys()
+        .into_iter()
+        .filter(|key| {
+            message
+                .document
+                .control(*key)
+                .and_then(|control| control.action())
+                .is_some_and(|action| {
+                    !matches!(
+                        action,
+                        crate::rich_message::SlackControlAction::LegacyAttachment { .. }
+                    ) || message
+                        .user
+                        .as_deref()
+                        .is_some_and(|user| !user.trim().is_empty())
+                })
+        })
+        .collect()
+}
+
 impl ConduitWindow {
     pub fn new<P: IsA<gtk::Application>>(application: &P) -> Self {
         glib::Object::builder()
@@ -4016,6 +4047,10 @@ impl ConduitWindow {
 
     pub(crate) fn realtime_status(&self) -> RealtimeStatus {
         self.imp().realtime_status.get()
+    }
+
+    fn browser_message_actions_available(&self) -> bool {
+        self.realtime_status().transport == Some(RealtimeTransport::BrowserSession)
     }
 
     pub(crate) fn connect_realtime_status_changed(
@@ -4032,11 +4067,18 @@ impl ConduitWindow {
     }
 
     fn set_realtime_status(&self, status: RealtimeStatus) {
-        if self.imp().realtime_status.replace(status) == status {
+        let previous = self.imp().realtime_status.replace(status);
+        if previous == status {
             return;
         }
         self.render_workspace_lifecycle();
         self.emit_by_name::<()>("realtime-status-changed", &[]);
+        if (previous.transport == Some(RealtimeTransport::BrowserSession))
+            != (status.transport == Some(RealtimeTransport::BrowserSession))
+        {
+            self.rerender_current_main_messages();
+            self.rerender_current_thread();
+        }
     }
 
     fn setup_adaptive_layout(&self) {
@@ -7544,6 +7586,29 @@ impl ConduitWindow {
                     }
                 }
             }
+            RuntimeEventKind::MessageActionCompleted {
+                control_handle,
+                channel_id,
+                ts: _,
+                thread_ts,
+            } => {
+                self.imp()
+                    .message_control_registry
+                    .borrow_mut()
+                    .complete(&control_handle);
+                self.set_status("Action sent");
+                self.reload_after_message(&channel_id, thread_ts.as_deref());
+            }
+            RuntimeEventKind::MessageActionFailed {
+                control_handle,
+                failure,
+            } => {
+                self.imp()
+                    .message_control_registry
+                    .borrow_mut()
+                    .release(&control_handle);
+                self.set_status(&format!("Action failed: {}", failure.message));
+            }
             RuntimeEventKind::MessagePosted {
                 channel_id,
                 message,
@@ -7858,7 +7923,14 @@ impl ConduitWindow {
             let mut registry = self.imp().message_control_registry.borrow_mut();
             match request.kind {
                 RealtimeMessageKind::Posted | RealtimeMessageKind::Changed => {
-                    let _ = registry.replace_message(control_surface, target);
+                    let _ = registry.replace_message_with_controls(
+                        control_surface,
+                        target,
+                        message_action_control_keys(
+                            request.message,
+                            self.browser_message_actions_available(),
+                        ),
+                    );
                 }
                 RealtimeMessageKind::Deleted => {
                     registry.remove_message(control_surface, &target);
@@ -8611,27 +8683,16 @@ impl ConduitWindow {
                     self.set_status("Message action is no longer available");
                     return true;
                 };
-                let target = self
+                let claimed = self
                     .imp()
                     .message_control_registry
                     .borrow_mut()
-                    .activate_token(&handle);
-                let Ok(target) = target else {
+                    .claim_token(&handle);
+                let Ok((control_handle, target)) = claimed else {
                     self.set_status("Message action is no longer available");
                     return true;
                 };
-                if self
-                    .find_message(target.channel_id(), target.timestamp())
-                    .is_none()
-                {
-                    self.set_status("This message changed; try again");
-                    return true;
-                }
-                self.set_status("Opening message in Slack");
-                self.send_command(RuntimeCommand::ResolveMessagePermalink {
-                    channel_id: target.channel_id().to_string(),
-                    ts: target.timestamp().to_string(),
-                });
+                self.activate_message_control(control_handle, target);
                 true
             }
             Some("mark-read") => {
@@ -8856,6 +8917,138 @@ impl ConduitWindow {
             }
             _ => true,
         }
+    }
+
+    fn activate_message_control(
+        &self,
+        control_handle: MessageControlHandle,
+        target: MessageControlTarget,
+    ) {
+        let message_ref = target.message();
+        let Some(message) = self.find_message(message_ref.channel_id(), message_ref.timestamp())
+        else {
+            self.imp()
+                .message_control_registry
+                .borrow_mut()
+                .release(&control_handle);
+            self.set_status("This message changed; try again");
+            return;
+        };
+
+        let MessageControlSelection::Control(key) = target.selection() else {
+            self.imp()
+                .message_control_registry
+                .borrow_mut()
+                .complete(&control_handle);
+            self.set_status("Opening message in Slack");
+            self.send_command(RuntimeCommand::ResolveMessagePermalink {
+                channel_id: message_ref.channel_id().to_string(),
+                ts: message_ref.timestamp().to_string(),
+            });
+            return;
+        };
+        let Some(control) = message.document.control(key).cloned() else {
+            self.imp()
+                .message_control_registry
+                .borrow_mut()
+                .release(&control_handle);
+            self.set_status("This message changed; try again");
+            return;
+        };
+        let Some(action) = control.action().cloned() else {
+            self.imp()
+                .message_control_registry
+                .borrow_mut()
+                .release(&control_handle);
+            self.set_status("This action is not available yet");
+            return;
+        };
+        let Some(service_id) = message.author.bot_id().map(ToString::to_string) else {
+            self.imp()
+                .message_control_registry
+                .borrow_mut()
+                .release(&control_handle);
+            self.set_status("This action is not available yet");
+            return;
+        };
+        let reload_thread_ts = (target.surface() == TimelineSurfaceId::Thread).then(|| {
+            message
+                .thread_root_ts()
+                .unwrap_or(message.ts.as_str())
+                .to_string()
+        });
+        let request = SlackMessageActionRequest {
+            channel_id: message_ref.channel_id().to_string(),
+            message_ts: message.ts.clone(),
+            thread_ts: message.thread_ts.clone(),
+            service_id,
+            app_id: message.author.app_id().map(ToString::to_string),
+            bot_user_id: message.user.clone(),
+            action,
+        };
+
+        if let Some(confirmation) = control.confirmation.clone() {
+            let heading = confirmation
+                .title
+                .unwrap_or_else(|| gettext("Confirm action"));
+            let body = confirmation.text.unwrap_or_else(|| control.label.clone());
+            let confirm_label = confirmation
+                .confirm_label
+                .unwrap_or_else(|| gettext("Confirm"));
+            let deny_label = confirmation.deny_label.unwrap_or_else(|| gettext("Cancel"));
+            let dialog = adw::AlertDialog::builder()
+                .heading(heading)
+                .body(body)
+                .default_response("cancel")
+                .close_response("cancel")
+                .build();
+            dialog.add_response("cancel", &deny_label);
+            dialog.add_response("confirm", &confirm_label);
+            dialog.set_response_appearance(
+                "confirm",
+                if confirmation.destructive {
+                    adw::ResponseAppearance::Destructive
+                } else {
+                    adw::ResponseAppearance::Suggested
+                },
+            );
+            let weak_window = self.downgrade();
+            dialog.connect_response(None, move |_, response| {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                if response == "confirm" {
+                    window.dispatch_message_action(
+                        request.clone(),
+                        control_handle.clone(),
+                        reload_thread_ts.clone(),
+                    );
+                } else {
+                    window
+                        .imp()
+                        .message_control_registry
+                        .borrow_mut()
+                        .release(&control_handle);
+                }
+            });
+            dialog.present(Some(self));
+        } else {
+            self.dispatch_message_action(request, control_handle, reload_thread_ts);
+        }
+    }
+
+    fn dispatch_message_action(
+        &self,
+        request: SlackMessageActionRequest,
+        control_handle: MessageControlHandle,
+        reload_thread_ts: Option<String>,
+    ) {
+        self.set_status("Sending action");
+        self.send_command(RuntimeCommand::ExecuteMessageAction {
+            request,
+            control_handle,
+            reload_thread_ts,
+        });
     }
 
     fn open_external_link(&self, uri: &str) {
@@ -11373,8 +11566,10 @@ impl ConduitWindow {
         imp.message_title
             .set_title(&self.conversation_title(channel_id));
         let mut context = self.message_html_context(None);
-        context.message_control_handles =
-            self.replace_message_control_handles(TimelineSurfaceId::Main, channel_id, &messages);
+        (
+            context.message_control_handles,
+            context.message_control_action_handles,
+        ) = self.replace_message_control_handles(TimelineSurfaceId::Main, channel_id, &messages);
         if !imp.workspace.view.borrow().has_channel_context(channel_id) {
             context.load_more_url = self.channel_load_more_url(channel_id);
         }
@@ -11535,8 +11730,10 @@ impl ConduitWindow {
         let imp = self.imp();
         self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(Some(ts));
-        context.message_control_handles =
-            self.replace_message_control_handles(TimelineSurfaceId::Thread, channel_id, &messages);
+        (
+            context.message_control_handles,
+            context.message_control_action_handles,
+        ) = self.replace_message_control_handles(TimelineSurfaceId::Thread, channel_id, &messages);
         if !imp
             .workspace
             .view
@@ -13004,7 +13201,23 @@ impl ConduitWindow {
                     .borrow()
                     .active_handle(surface, &target)
                 {
-                    context.message_control_handles.insert(target, handle);
+                    context
+                        .message_control_handles
+                        .insert(target.clone(), handle);
+                }
+                for key in
+                    message_action_control_keys(message, self.browser_message_actions_available())
+                {
+                    if let Some(handle) = self
+                        .imp()
+                        .message_control_registry
+                        .borrow()
+                        .active_control_handle(surface, &target, key)
+                    {
+                        context
+                            .message_control_action_handles
+                            .insert((target.clone(), key), handle);
+                    }
                 }
             }
         }
@@ -13016,16 +13229,41 @@ impl ConduitWindow {
         surface: TimelineSurfaceId,
         channel_id: &str,
         messages: &[SlackMessage],
-    ) -> HashMap<MessageRef, crate::message_handoff::MessageControlHandle> {
+    ) -> (
+        HashMap<MessageRef, crate::message_handoff::MessageControlHandle>,
+        HashMap<
+            (MessageRef, crate::rich_message::MessageControlKey),
+            crate::message_handoff::MessageControlHandle,
+        >,
+    ) {
         let targets = messages
             .iter()
-            .filter_map(|message| MessageRef::new(channel_id, message.ts.clone()).ok())
+            .filter_map(|message| {
+                Some((
+                    MessageRef::new(channel_id, message.ts.clone()).ok()?,
+                    message_action_control_keys(message, self.browser_message_actions_available()),
+                ))
+            })
             .collect::<Vec<_>>();
-        self.imp()
+        let registered = self
+            .imp()
             .message_control_registry
             .borrow_mut()
-            .replace_surface(surface, targets)
-            .unwrap_or_default()
+            .replace_surface_with_controls(surface, targets)
+            .unwrap_or_default();
+        let mut fallback = HashMap::new();
+        let mut controls = HashMap::new();
+        for (target, handle) in registered {
+            match target.selection() {
+                crate::message_handoff::MessageControlSelection::MessageHandoff => {
+                    fallback.insert(target.message().clone(), handle);
+                }
+                crate::message_handoff::MessageControlSelection::Control(key) => {
+                    controls.insert((target.message().clone(), key), handle);
+                }
+            }
+        }
+        (fallback, controls)
     }
 
     fn message_html_context_with_image_keys(
@@ -13104,6 +13342,7 @@ impl ConduitWindow {
             read_marker_url: None,
             first_unread_ts: None,
             message_control_handles: HashMap::new(),
+            message_control_action_handles: HashMap::new(),
         }
     }
 
@@ -13392,6 +13631,41 @@ fn update_huddle_device_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_message_controls_require_fresh_callback_and_publisher_metadata() {
+        let mut message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000000.000100",
+            "user": "U_BOT",
+            "bot_id": "B_APP",
+            "app_id": "A_APP",
+            "blocks": [{
+                "type": "actions",
+                "block_id": "request-actions",
+                "elements": [{
+                    "type": "button",
+                    "action_id": "approve",
+                    "value": "opaque",
+                    "text": {"type": "plain_text", "text": "Approve"}
+                }]
+            }]
+        }))
+        .expect("synthetic app message should deserialize");
+        message.refresh_canonical_content();
+
+        assert_eq!(message_action_control_keys(&message, true).len(), 1);
+        assert!(message_action_control_keys(&message, false).is_empty());
+        let cached: SlackMessage = serde_json::from_str(
+            &serde_json::to_string(&message).expect("message should serialize"),
+        )
+        .expect("cached message should deserialize");
+        assert!(message_action_control_keys(&cached, true).is_empty());
+
+        message.author = crate::rich_message::MessageAuthor::Unknown {
+            display_name: "App".to_string(),
+        };
+        assert!(message_action_control_keys(&message, true).is_empty());
+    }
 
     #[test]
     fn composer_completion_description_announces_person_and_position() {

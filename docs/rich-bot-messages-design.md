@@ -13,7 +13,8 @@ This design covers:
 - bot and app identity;
 - lossless cache round-tripping for supported fields;
 - safe URL actions;
-- honest fallback for callback actions that Conduit cannot invoke through a public Slack API.
+- native callback buttons through Slack's verified browser-client protocol, with exact-message
+  handoff when the required callback or browser-session metadata is unavailable.
 
 It does not turn Conduit into a Block Kit authoring tool or a host for Slack apps.
 
@@ -39,7 +40,10 @@ Conduit should make every message understandable and every visible control hones
 - Content and identity are rendered natively.
 - Safe HTTP(S) URL actions execute natively by opening the URL.
 - Conduit-owned actions such as reactions continue through Conduit's runtime.
-- Callback actions owned by another Slack app open the exact message in Slack.
+- Button callbacks use Slack's private browser-client `blocks.actions` or `chat.attachmentAction`
+  method only when the current XOXC/XOXD session and complete fresh metadata are available.
+- Unsupported callbacks, selects, overflow menus, and cached controls without callback metadata
+  open the exact message in Slack.
 - A callback control must never look as if Conduit executed it when it only opened Slack.
 - Conduit must not fabricate an interaction payload or post directly to an app's Request URL.
 
@@ -79,6 +83,7 @@ MessageRenderPlan + ActionCapabilities
 semantic HTML / opaque control handles
           |
           +-> URL executor
+          +-> private Slack browser callback executor
           +-> exact-message Slack handoff
 ```
 
@@ -245,14 +250,15 @@ An `ActionCapabilityResolver` classifies each control for the current session:
   validation. It is not presented as proof that the publishing app received an interaction.
 - A URL control with Slack confirmation or callback-dependent semantics is `ExternalOnly`.
 - Conduit-owned controls are `Native`.
-- Slack app callback actions are `ExternalOnly`.
+- Complete button callbacks are `Native` only for an active browser session and the verified
+  private Slack methods. Missing or cached callback metadata makes them `ExternalOnly`.
 - Dynamic, external, user, conversation, and channel selects are `ExternalOnly`; their options and
   authorization belong to the publishing app and Slack.
 - malformed or unsafe controls are `Unavailable`.
 
-The resolver is a narrow port. A future interaction transport may implement callback actions only
-if a supported or explicitly approved, verified Slack client protocol exists. Merely having Socket
-Mode enabled is not sufficient: Conduit's connection belongs to Conduit's app, not Bob or Jira.
+The resolver is a narrow port. The approved private interaction transport talks to Slack itself,
+never to a publishing app's Request URL. Merely having Socket Mode enabled is not sufficient:
+Conduit's connection belongs to Conduit's app, not Bob or Jira.
 
 ## 4. Presentation and WebKit Boundary
 
@@ -302,8 +308,7 @@ The execution flow for controls that Conduit can actually execute is:
 
 1. Resolve the current message and control from `WorkspaceCoordinator`.
 2. Re-evaluate its capability.
-3. Show a native confirmation dialog when required by a Conduit-owned action. Slack-owned
-   confirmations remain part of the Slack handoff.
+3. Show Slack-provided confirmation copy in a native dialog before any callback dispatch.
 4. Mark the control busy using transient presentation state.
 5. Execute through `MessageActionService`.
 6. Feed any message result back as `WorkspaceMutation`; never patch the DOM as source of truth.
@@ -311,7 +316,7 @@ The execution flow for controls that Conduit can actually execute is:
    message/thread refresh.
 8. Clear busy state and announce success or a short actionable error.
 
-`MessageActionService` has only two initial executors:
+`MessageActionService` has three executors:
 
 ### URL executor
 
@@ -330,6 +335,17 @@ The execution flow for controls that Conduit can actually execute is:
   builder only as an offline fallback.
 - Opens that exact message externally, rather than routing the permalink back into Conduit.
 - Explains that the action must be completed in Slack.
+
+### Private Slack callback executor
+
+- Requires the current XOXC token, matching XOXD cookie, trusted workspace URL, and fresh
+  in-memory message metadata.
+- Sends Block Kit buttons to `blocks.actions` and legacy attachment buttons to
+  `chat.attachmentAction` using Slack web's multipart request shape.
+- Generates `client_token` at click time, submits once, and never retries an ambiguous failure.
+- Treats `ok: true` as dispatch acceptance, not business completion, then reloads the visible
+  message or thread. Realtime and refreshed Slack state remain authoritative.
+- Never stores callback metadata in SQLite and never logs the multipart payload.
 
 Do not optimistically change messages for callback actions. Realtime or refreshed Slack state is
 authoritative.
@@ -397,7 +413,9 @@ directly with credentials from generated HTML.
 |---|---|
 | Unsupported block | Safe fallback plus “Open in Slack” |
 | Unsafe action URL | Disabled control with a short explanation |
-| Callback action | Clearly marked exact-message Slack handoff |
+| Supported fresh button callback | Native dispatch, then Slack-authoritative refresh |
+| Missing callback/browser metadata | Clearly marked exact-message Slack handoff |
+| Callback dispatch failure | Full sanitized log, short status, same control can retry |
 | Stale control handle | “This message changed; try again” and refresh |
 | Missing workspace permalink | Disabled handoff and actionable status |
 | Malformed attachment | Render valid siblings and fallback |
@@ -421,11 +439,10 @@ This phase fixes blank Bob messages and bot identity without changing interactio
 - Normalize Block Kit and legacy buttons, static selects, and overflow menus.
 - Add capability resolution and a pure render plan.
 - Render URL controls natively.
-- Render callback controls with exact-message Slack handoff.
-- Add native confirmation for actions Conduit can actually execute.
+- Render unsupported callbacks with exact-message Slack handoff.
+- Add native confirmation for executable callbacks.
 
-This phase makes Jira-like messages complete and usable without pretending Conduit can dispatch
-another app's callback.
+This phase makes Jira-like messages complete while retaining a safe fallback.
 
 ### Phase 3: Pipeline integration
 
@@ -435,13 +452,12 @@ another app's callback.
 - Feed results and follow-up refreshes through the revisioned workspace pipeline.
 - Use one timeline delta per affected message.
 
-### Phase 4: Optional verified callback transport
+### Phase 4: Verified callback transport
 
-Only start this phase if Slack publishes a suitable client API or the project explicitly approves
-and verifies another protocol.
+Implemented after explicit project approval of the verified private Slack browser protocol.
 
-- Implement it behind `MessageActionService`.
-- Capability-gate by authentication mode and runtime verification.
+- Implement it behind the typed runtime action boundary.
+- Capability-gate by browser authentication mode and fresh callback metadata.
 - Add replay protection, rate limiting, response normalization, ephemeral-message handling, and
   modal fallback.
 - Automatically degrade to exact-message Slack handoff on protocol drift or missing capability.
@@ -453,7 +469,8 @@ and verifies another protocol.
 - Common Block Kit and legacy attachment content never produces a blank message.
 - Jira-style callback buttons, selects, and overflow menus are represented accurately.
 - URL buttons open only validated HTTP(S) destinations.
-- Callback controls never claim local completion and open the exact Slack message.
+- Supported callback buttons report only that the action was sent, then reload Slack state.
+- Unsupported or cached callback controls open the exact Slack message.
 - No action value or raw payload appears in generated HTML, custom URLs, logs, or test artifacts.
 - Stale or forged control handles cannot execute.
 - A fresh/realtime message replaces an old lossy cached row without duplicates.

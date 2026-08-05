@@ -4,9 +4,10 @@ use crate::models::{SlackAttachment, SlackFile};
 
 use crate::rich_message::{
     MessageAccessory as RichAccessory, MessageAttachment as RichAttachment,
-    MessageControl as RichControl, MessageDocument as RichDocument, MessageField as RichField,
-    MessageImage as RichImage, MessageLinkedText as RichLinkedText, MessageNode as RichNode,
-    RichInline, RichInlineStyle, RichTextNode,
+    MessageControl as RichControl, MessageControlConfirmation, MessageDocument as RichDocument,
+    MessageField as RichField, MessageImage as RichImage, MessageLinkedText as RichLinkedText,
+    MessageNode as RichNode, RichInline, RichInlineStyle, RichTextNode, SensitiveValue,
+    SlackControlAction,
 };
 
 pub(crate) fn normalize_blocks_with_files(
@@ -15,11 +16,35 @@ pub(crate) fn normalize_blocks_with_files(
     more_actions_label: &str,
     files: &[SlackFile],
 ) -> RichDocument {
+    normalize_blocks_with_callback_mode(
+        blocks,
+        choose_option_label,
+        more_actions_label,
+        files,
+        true,
+    )
+}
+
+fn normalize_blocks_with_callback_mode(
+    blocks: &Value,
+    choose_option_label: &str,
+    more_actions_label: &str,
+    files: &[SlackFile],
+    retain_callbacks: bool,
+) -> RichDocument {
     let nodes = blocks
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|block| normalize_block(block, choose_option_label, more_actions_label, files))
+        .filter_map(|block| {
+            normalize_block(
+                block,
+                choose_option_label,
+                more_actions_label,
+                files,
+                retain_callbacks,
+            )
+        })
         .collect();
     RichDocument::new(nodes, None)
 }
@@ -29,6 +54,7 @@ fn normalize_block(
     choose_option_label: &str,
     more_actions_label: &str,
     files: &[SlackFile],
+    retain_callbacks: bool,
 ) -> Option<RichNode> {
     match block.get("type")?.as_str()? {
         "header" => block_text(block).map(RichNode::Header),
@@ -42,7 +68,14 @@ fn normalize_block(
                 .filter_map(block_text)
                 .collect::<Vec<_>>();
             let accessory = block.get("accessory").and_then(|accessory| {
-                normalize_accessory(accessory, choose_option_label, more_actions_label, files)
+                normalize_accessory(
+                    accessory,
+                    block.get("block_id").and_then(Value::as_str),
+                    choose_option_label,
+                    more_actions_label,
+                    files,
+                    retain_callbacks,
+                )
             });
             (text.is_some() || !fields.is_empty() || accessory.is_some()).then_some(
                 RichNode::Section {
@@ -71,7 +104,13 @@ fn normalize_block(
                 .into_iter()
                 .flatten()
                 .filter_map(|element| {
-                    normalize_control(element, choose_option_label, more_actions_label)
+                    normalize_control(
+                        element,
+                        block.get("block_id").and_then(Value::as_str),
+                        choose_option_label,
+                        more_actions_label,
+                        retain_callbacks,
+                    )
                 })
                 .collect::<Vec<_>>();
             (!controls.is_empty()).then_some(RichNode::Actions(controls))
@@ -92,14 +131,23 @@ fn normalize_block(
 
 fn normalize_accessory(
     value: &Value,
+    block_id: Option<&str>,
     choose_option_label: &str,
     more_actions_label: &str,
     files: &[SlackFile],
+    retain_callbacks: bool,
 ) -> Option<RichAccessory> {
     if value.get("type").and_then(Value::as_str) == Some("image") {
         return normalize_image(value, files).map(RichAccessory::Image);
     }
-    normalize_control(value, choose_option_label, more_actions_label).map(RichAccessory::Control)
+    normalize_control(
+        value,
+        block_id,
+        choose_option_label,
+        more_actions_label,
+        retain_callbacks,
+    )
+    .map(RichAccessory::Control)
 }
 
 fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
@@ -137,10 +185,13 @@ fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
 
 fn normalize_control(
     value: &Value,
+    block_id: Option<&str>,
     choose_option_label: &str,
     more_actions_label: &str,
+    retain_callbacks: bool,
 ) -> Option<RichControl> {
-    let label = match value.get("type")?.as_str()? {
+    let kind = value.get("type")?.as_str()?;
+    let label = match kind {
         "button" => block_text(value)?,
         "static_select" | "multi_static_select" => value
             .get("placeholder")
@@ -149,6 +200,38 @@ fn normalize_control(
         "overflow" => more_actions_label.to_string(),
         _ => return None,
     };
+    if kind == "button"
+        && retain_callbacks
+        && value.get("url").and_then(Value::as_str).is_none()
+        && value
+            .get("action_id")
+            .and_then(Value::as_str)
+            .is_some_and(|action_id| !action_id.trim().is_empty())
+        && block_id.is_some_and(|block_id| !block_id.trim().is_empty())
+    {
+        let mut action = value.clone();
+        if let Some(action) = action.as_object_mut() {
+            action.retain(|key, value| {
+                matches!(
+                    key.as_str(),
+                    "type" | "action_id" | "text" | "value" | "style" | "third_party_auth"
+                ) && !value.is_null()
+            });
+            action.insert(
+                "block_id".to_string(),
+                Value::String(block_id.unwrap_or_default().to_string()),
+            );
+        }
+        if let Ok(action) = serde_json::to_string(&action) {
+            return Some(RichControl::callback(
+                label,
+                SlackControlAction::Block {
+                    action: SensitiveValue::new(action),
+                },
+                normalize_block_confirmation(value.get("confirm")),
+            ));
+        }
+    }
     Some(RichControl::presentation(
         label,
         value
@@ -157,6 +240,17 @@ fn normalize_control(
             .map(ToString::to_string),
         value.get("confirm").is_some(),
     ))
+}
+
+fn normalize_block_confirmation(value: Option<&Value>) -> Option<MessageControlConfirmation> {
+    let value = value?;
+    Some(MessageControlConfirmation {
+        title: value.get("title").and_then(block_text),
+        text: value.get("text").and_then(block_text),
+        confirm_label: value.get("confirm").and_then(block_text),
+        deny_label: value.get("deny").and_then(block_text),
+        destructive: value.get("style").and_then(Value::as_str) == Some("danger"),
+    })
 }
 
 fn normalize_rich_text_node(value: &Value) -> Option<RichTextNode> {
@@ -254,24 +348,32 @@ pub(crate) fn normalize_attachments(
     files: &[SlackFile],
 ) -> RichDocument {
     let mut nodes = Vec::new();
-    for attachment in attachments {
+    for (attachment_index, attachment) in attachments.iter().enumerate() {
         if let Some(blocks) = attachment.blocks.as_ref() {
-            let embedded =
-                normalize_blocks_with_files(blocks, "Choose an option", "More actions", files)
-                    .nodes;
+            let embedded = normalize_blocks_with_callback_mode(
+                blocks,
+                "Choose an option",
+                "More actions",
+                files,
+                false,
+            )
+            .nodes;
             if !embedded.is_empty() {
                 nodes.extend(embedded);
                 continue;
             }
         }
-        if let Some(attachment) = normalize_attachment(attachment) {
+        if let Some(attachment) = normalize_attachment(attachment, attachment_index) {
             nodes.push(RichNode::Attachment(Box::new(attachment)));
         }
     }
     RichDocument::new(nodes, None)
 }
 
-fn normalize_attachment(attachment: &SlackAttachment) -> Option<RichAttachment> {
+fn normalize_attachment(
+    attachment: &SlackAttachment,
+    attachment_index: usize,
+) -> Option<RichAttachment> {
     if !attachment.has_visible_content() {
         return None;
     }
@@ -315,8 +417,48 @@ fn normalize_attachment(attachment: &SlackAttachment) -> Option<RichAttachment> 
         .unwrap_or_default()
         .iter()
         .filter_map(|action| {
+            let label = action.label()?;
+            if action.url.is_none()
+                && action.kind.as_deref() == Some("button")
+                && attachment
+                    .callback_id
+                    .as_deref()
+                    .is_some_and(|callback_id| !callback_id.trim().is_empty())
+            {
+                let mut selected_action = serde_json::to_value(action).ok()?;
+                if let Some(selected_action) = selected_action.as_object_mut() {
+                    selected_action.retain(|key, value| {
+                        matches!(
+                            key.as_str(),
+                            "id" | "name" | "text" | "type" | "style" | "value"
+                        ) && !value.is_null()
+                    });
+                }
+                return Some(RichControl::callback(
+                    label,
+                    SlackControlAction::LegacyAttachment {
+                        attachment_id: attachment
+                            .id
+                            .unwrap_or_else(|| attachment_index.saturating_add(1) as u64),
+                        callback_id: SensitiveValue::new(
+                            attachment.callback_id.clone().unwrap_or_default(),
+                        ),
+                        action: SensitiveValue::new(serde_json::to_string(&selected_action).ok()?),
+                    },
+                    action
+                        .confirm
+                        .as_ref()
+                        .map(|confirmation| MessageControlConfirmation {
+                            title: confirmation.title.clone(),
+                            text: confirmation.text.clone(),
+                            confirm_label: confirmation.ok_text.clone(),
+                            deny_label: confirmation.dismiss_text.clone(),
+                            destructive: action.style.as_deref() == Some("danger"),
+                        }),
+                ));
+            }
             Some(RichControl::presentation(
-                action.label()?,
+                label,
                 action.url.clone(),
                 action.confirm.is_some(),
             ))
@@ -408,6 +550,76 @@ mod tests {
         assert!(debug.contains("Approve"));
         assert!(!debug.contains("private-callback"));
         assert!(!debug.contains("private-approval-value"));
+
+        let [RichNode::Attachment(attachment)] = document.nodes() else {
+            panic!("expected one attachment");
+        };
+        let [control] = attachment.actions.as_slice() else {
+            panic!("expected one attachment action");
+        };
+        let Some(SlackControlAction::LegacyAttachment {
+            attachment_id,
+            callback_id,
+            action,
+        }) = control.action()
+        else {
+            panic!("expected retained legacy callback");
+        };
+        assert_eq!(*attachment_id, 1);
+        assert_eq!(callback_id.expose(), "private-callback");
+        assert!(action.expose().contains("private-approval-value"));
+        let cached = serde_json::to_string(&document).expect("canonical document serializes");
+        assert!(!cached.contains("private-callback"));
+        assert!(!cached.contains("private-approval-value"));
+    }
+
+    #[test]
+    fn retains_block_button_callback_in_memory_only() {
+        let document = normalize_blocks_with_files(
+            &serde_json::json!([{
+                "type": "actions",
+                "block_id": "private-block",
+                "elements": [{
+                    "type": "button",
+                    "action_id": "private-action",
+                    "value": "private-value",
+                    "text": {"type": "plain_text", "text": "Approve"},
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Approve request?"},
+                        "text": {"type": "mrkdwn", "text": "This cannot be undone."},
+                        "confirm": {"type": "plain_text", "text": "Approve"},
+                        "deny": {"type": "plain_text", "text": "Cancel"}
+                    }
+                }]
+            }]),
+            "Choose",
+            "More actions",
+            &[],
+        );
+        let [RichNode::Actions(actions)] = document.nodes() else {
+            panic!("expected one actions block");
+        };
+        let [control] = actions.as_slice() else {
+            panic!("expected one button");
+        };
+        let Some(SlackControlAction::Block { action }) = control.action() else {
+            panic!("expected retained Block Kit callback");
+        };
+        assert!(action.expose().contains("private-action"));
+        assert!(!action.expose().contains("confirm"));
+        assert_eq!(
+            control
+                .confirmation
+                .as_ref()
+                .and_then(|value| value.title.as_deref()),
+            Some("Approve request?")
+        );
+        let debug = format!("{document:?}");
+        let cached = serde_json::to_string(&document).expect("canonical document serializes");
+        for sensitive in ["private-block", "private-action", "private-value"] {
+            assert!(!debug.contains(sensitive));
+            assert!(!cached.contains(sensitive));
+        }
     }
 
     #[test]

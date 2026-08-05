@@ -19,6 +19,7 @@ use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
     SlackUser, SlackUserGroup, SlackUserProfile, SlackUserStatus, StoredToken,
 };
+use crate::rich_message::SlackControlAction;
 use crate::search::{
     SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
 };
@@ -81,6 +82,33 @@ fn next_client_message_id() -> String {
         bytes[14],
         bytes[15]
     )
+}
+
+fn browser_action_client_token() -> String {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("web-{milliseconds}")
+}
+
+fn parse_private_action_json(value: &str) -> Result<Value> {
+    let action: Value = serde_json::from_str(value)
+        .map_err(|_| SlackError::validation("Slack message action metadata is invalid"))?;
+    let Some(action_object) = action.as_object() else {
+        return Err(SlackError::validation(
+            "Slack message action metadata is invalid",
+        ));
+    };
+    if action_object.get("type").and_then(Value::as_str) != Some("button")
+        || action_object.contains_key("confirm")
+        || action_object.contains_key("url")
+    {
+        return Err(SlackError::validation(
+            "Slack message action metadata is unsupported",
+        ));
+    }
+    Ok(action)
 }
 
 pub type Result<T> = std::result::Result<T, SlackError>;
@@ -329,6 +357,35 @@ pub struct SlackApi {
     user_agent: Option<String>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct SlackMessageActionRequest {
+    pub(crate) channel_id: String,
+    pub(crate) message_ts: String,
+    pub(crate) thread_ts: Option<String>,
+    pub(crate) service_id: String,
+    pub(crate) app_id: Option<String>,
+    pub(crate) bot_user_id: Option<String>,
+    pub(crate) action: SlackControlAction,
+}
+
+impl std::fmt::Debug for SlackMessageActionRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SlackMessageActionRequest")
+            .field("channel_id", &self.channel_id)
+            .field("message_ts", &self.message_ts)
+            .field("thread_ts", &self.thread_ts)
+            .field("service_id", &"[REDACTED]")
+            .field("app_id", &self.app_id.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "bot_user_id",
+                &self.bot_user_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("action", &self.action)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlackUnreadSnapshot {
     pub channels: Vec<SlackUnreadSnapshotRecord>,
@@ -432,6 +489,99 @@ impl SlackApi {
             .await?;
 
         normalize_browser_unread_snapshot(counts, &open_ims)
+    }
+
+    pub(crate) async fn execute_message_action(
+        &self,
+        workspace_url: &str,
+        team_id: &str,
+        request: &SlackMessageActionRequest,
+    ) -> Result<()> {
+        self.ensure_browser_session_credentials()?;
+        if team_id.trim().is_empty()
+            || request.channel_id.trim().is_empty()
+            || request.message_ts.trim().is_empty()
+            || request.service_id.trim().is_empty()
+        {
+            return Err(SlackError::validation(
+                "Slack message action metadata is incomplete",
+            ));
+        }
+        let api_base_url = self.browser_workspace_api_base_url(workspace_url)?;
+        let client_token = browser_action_client_token();
+        let common = [
+            ("_x_app_name", "client".to_string()),
+            ("_x_mode", "online".to_string()),
+            ("_x_sonic", "true".to_string()),
+        ];
+
+        match &request.action {
+            SlackControlAction::Block { action } => {
+                let action = parse_private_action_json(action.expose())?;
+                let mut container = json!({
+                    "type": "message",
+                    "message_ts": request.message_ts,
+                    "channel_id": request.channel_id,
+                    "is_ephemeral": false,
+                });
+                if let Some(thread_ts) = request.thread_ts.as_ref() {
+                    container["thread_ts"] = Value::String(thread_ts.clone());
+                }
+                let mut params = vec![
+                    ("service_id", request.service_id.clone()),
+                    ("service_team_id", team_id.to_string()),
+                    ("actions", Value::Array(vec![action]).to_string()),
+                    ("container", container.to_string()),
+                    ("client_token", client_token),
+                    ("_x_reason", "dispatch_action_to_developer".to_string()),
+                ];
+                if let Some(app_id) = request.app_id.as_ref() {
+                    params.push(("app_id", app_id.clone()));
+                }
+                params.extend(common);
+                let _: MessageActionResponse = self
+                    .post_browser_form(&api_base_url, "blocks.actions", &[], &params)
+                    .await?;
+            }
+            SlackControlAction::LegacyAttachment {
+                attachment_id,
+                callback_id,
+                action,
+            } => {
+                let action = parse_private_action_json(action.expose())?;
+                let mut payload = json!({
+                    "actions": [action],
+                    "attachment_id": attachment_id,
+                    "callback_id": callback_id.expose(),
+                    "channel_id": request.channel_id,
+                    "is_ephemeral": false,
+                    "message_ts": request.message_ts,
+                    "prompt_app_install": false,
+                    "team_id": team_id,
+                });
+                if let Some(thread_ts) = request.thread_ts.as_ref() {
+                    payload["thread_ts"] = Value::String(thread_ts.clone());
+                }
+                let bot_user_id = request.bot_user_id.as_ref().ok_or_else(|| {
+                    SlackError::validation("Slack message action metadata is incomplete")
+                })?;
+                let mut params = vec![
+                    ("payload", payload.to_string()),
+                    ("client_token", client_token),
+                    ("service_id", request.service_id.clone()),
+                    ("bot_user_id", bot_user_id.clone()),
+                    ("_x_reason", "user_attachment_action_dispatch".to_string()),
+                ];
+                if let Some(app_id) = request.app_id.as_ref() {
+                    params.push(("app_id", app_id.clone()));
+                }
+                params.extend(common);
+                let _: MessageActionResponse = self
+                    .post_browser_form(&api_base_url, "chat.attachmentAction", &[], &params)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn conversations(&self) -> Result<Vec<SlackConversation>> {
@@ -2147,6 +2297,13 @@ struct BrowserCountsResponse {
 impl_slack_response!(BrowserCountsResponse);
 
 #[derive(Debug, Deserialize)]
+struct MessageActionResponse {
+    ok: bool,
+    error: Option<String>,
+}
+impl_slack_response!(MessageActionResponse);
+
+#[derive(Debug, Deserialize)]
 struct BrowserCountRecord {
     id: String,
     last_read: Option<String>,
@@ -2433,6 +2590,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::rich_message::SensitiveValue;
     use tiny_http::{Header, Response, Server};
 
     fn browser_test_token(browser_cookie_d: Option<&str>) -> StoredToken {
@@ -2510,6 +2668,141 @@ mod tests {
             first.chars().filter(|character| *character == '-').count(),
             4
         );
+    }
+
+    #[test]
+    fn block_message_action_uses_private_browser_dispatch_shape() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(r#"{"ok":true}"#).with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, body)
+        });
+        let mut api = SlackApi::new(browser_test_token(Some("browser-cookie-value")));
+        api.api_base_url = format!("http://{address}/api");
+        let request = SlackMessageActionRequest {
+            channel_id: "C123".to_string(),
+            message_ts: "1710000000.000100".to_string(),
+            thread_ts: None,
+            service_id: "B123".to_string(),
+            app_id: Some("A123".to_string()),
+            bot_user_id: Some("U123".to_string()),
+            action: SlackControlAction::Block {
+                action: SensitiveValue::new(
+                    r#"{"type":"button","block_id":"block","action_id":"approve","value":"opaque","text":{"type":"plain_text","text":"Approve"}}"#,
+                ),
+            },
+        };
+
+        tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.execute_message_action("https://example.slack.com/", "T123", &request))
+            .expect("message action should dispatch");
+        let (path, body) = received.join().expect("mock Slack server should finish");
+
+        assert_eq!(path, "/api/blocks.actions");
+        assert_eq!(multipart_field_value(&body, "service_id"), Some("B123"));
+        assert_eq!(multipart_field_value(&body, "app_id"), Some("A123"));
+        assert_eq!(
+            multipart_field_value(&body, "service_team_id"),
+            Some("T123")
+        );
+        assert!(multipart_field_value(&body, "client_token")
+            .is_some_and(|value| value.starts_with("web-")));
+        assert_eq!(
+            multipart_field_value(&body, "_x_reason"),
+            Some("dispatch_action_to_developer")
+        );
+        let actions: Value = serde_json::from_str(
+            multipart_field_value(&body, "actions").expect("actions field should exist"),
+        )
+        .expect("actions should be JSON");
+        assert_eq!(actions[0]["action_id"], "approve");
+        let container: Value = serde_json::from_str(
+            multipart_field_value(&body, "container").expect("container field should exist"),
+        )
+        .expect("container should be JSON");
+        assert_eq!(container["type"], "message");
+        assert_eq!(container["channel_id"], "C123");
+        assert!(multipart_field_value(&body, "action_ts").is_none());
+    }
+
+    #[test]
+    fn legacy_message_action_uses_attachment_dispatch_shape() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(r#"{"ok":true,"replaced":true}"#).with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, body)
+        });
+        let mut api = SlackApi::new(browser_test_token(Some("browser-cookie-value")));
+        api.api_base_url = format!("http://{address}/api");
+        let request = SlackMessageActionRequest {
+            channel_id: "C123".to_string(),
+            message_ts: "1710000000.000100".to_string(),
+            thread_ts: Some("1710000000.000000".to_string()),
+            service_id: "B123".to_string(),
+            app_id: None,
+            bot_user_id: Some("U123".to_string()),
+            action: SlackControlAction::LegacyAttachment {
+                attachment_id: 2,
+                callback_id: SensitiveValue::new("callback"),
+                action: SensitiveValue::new(
+                    r#"{"type":"button","name":"response","text":"Yes","value":"yes"}"#,
+                ),
+            },
+        };
+
+        tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.execute_message_action("https://example.slack.com/", "T123", &request))
+            .expect("message action should dispatch");
+        let (path, body) = received.join().expect("mock Slack server should finish");
+
+        assert_eq!(path, "/api/chat.attachmentAction");
+        assert_eq!(multipart_field_value(&body, "service_id"), Some("B123"));
+        assert_eq!(multipart_field_value(&body, "bot_user_id"), Some("U123"));
+        assert_eq!(
+            multipart_field_value(&body, "_x_reason"),
+            Some("user_attachment_action_dispatch")
+        );
+        let payload: Value = serde_json::from_str(
+            multipart_field_value(&body, "payload").expect("payload field should exist"),
+        )
+        .expect("payload should be JSON");
+        assert_eq!(payload["attachment_id"], 2);
+        assert_eq!(payload["callback_id"], "callback");
+        assert_eq!(payload["actions"][0]["value"], "yes");
+        assert_eq!(payload["thread_ts"], "1710000000.000000");
+        assert_eq!(payload["prompt_app_install"], false);
     }
 
     #[test]

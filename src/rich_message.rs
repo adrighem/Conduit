@@ -12,6 +12,46 @@ impl SensitiveValue {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageControlKey(u32);
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum SlackControlAction {
+    Block {
+        action: SensitiveValue,
+    },
+    LegacyAttachment {
+        attachment_id: u64,
+        callback_id: SensitiveValue,
+        action: SensitiveValue,
+    },
+}
+
+impl fmt::Debug for SlackControlAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Block { .. } => formatter.write_str("SlackControlAction::Block([REDACTED])"),
+            Self::LegacyAttachment { .. } => {
+                formatter.write_str("SlackControlAction::LegacyAttachment([REDACTED])")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageControlConfirmation {
+    pub(crate) title: Option<String>,
+    pub(crate) text: Option<String>,
+    pub(crate) confirm_label: Option<String>,
+    pub(crate) deny_label: Option<String>,
+    pub(crate) destructive: bool,
 }
 
 impl fmt::Debug for SensitiveValue {
@@ -73,10 +113,26 @@ impl MessageAuthor {
             Self::User { .. } | Self::Unknown { .. } => None,
         }
     }
+
+    pub(crate) fn app_id(&self) -> Option<&str> {
+        match self {
+            Self::App { app_id, .. } => app_id.as_deref(),
+            Self::User { .. } | Self::Unknown { .. } => None,
+        }
+    }
+
+    pub(crate) fn bot_id(&self) -> Option<&str> {
+        match self {
+            Self::App { bot_id, .. } => bot_id.as_deref(),
+            Self::User { .. } | Self::Unknown { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageControl {
+    #[serde(default)]
+    pub(crate) key: Option<MessageControlKey>,
     pub(crate) label: String,
     #[serde(default)]
     pub(crate) url: Option<String>,
@@ -84,15 +140,22 @@ pub struct MessageControl {
     pub(crate) confirmation_required: bool,
     #[serde(default)]
     value: Option<SensitiveValue>,
+    #[serde(skip)]
+    action: Option<SlackControlAction>,
+    #[serde(default)]
+    pub(crate) confirmation: Option<MessageControlConfirmation>,
 }
 
 impl MessageControl {
     pub fn new(label: impl Into<String>, value: Option<SensitiveValue>) -> Self {
         Self {
+            key: None,
             label: label.into(),
             url: None,
             confirmation_required: false,
             value,
+            action: None,
+            confirmation: None,
         }
     }
 
@@ -102,15 +165,42 @@ impl MessageControl {
         confirmation_required: bool,
     ) -> Self {
         Self {
+            key: None,
             label: label.into(),
             url,
             confirmation_required,
             value: None,
+            action: None,
+            confirmation: None,
+        }
+    }
+
+    pub(crate) fn callback(
+        label: impl Into<String>,
+        action: SlackControlAction,
+        confirmation: Option<MessageControlConfirmation>,
+    ) -> Self {
+        Self {
+            key: None,
+            label: label.into(),
+            url: None,
+            confirmation_required: confirmation.is_some(),
+            value: None,
+            action: Some(action),
+            confirmation,
         }
     }
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    pub(crate) fn key(&self) -> Option<MessageControlKey> {
+        self.key
+    }
+
+    pub(crate) fn action(&self) -> Option<&SlackControlAction> {
+        self.action.as_ref()
     }
 }
 
@@ -220,7 +310,8 @@ pub struct MessageDocument {
 }
 
 impl MessageDocument {
-    pub fn new(nodes: Vec<MessageNode>, accessible_fallback: Option<String>) -> Self {
+    pub fn new(mut nodes: Vec<MessageNode>, accessible_fallback: Option<String>) -> Self {
+        assign_control_keys(&mut nodes);
         Self {
             nodes,
             accessible_fallback: accessible_fallback.filter(|text| !text.trim().is_empty()),
@@ -275,6 +366,71 @@ impl MessageDocument {
 
     pub fn mentioned_user_ids(&self) -> impl Iterator<Item = &str> {
         self.nodes.iter().flat_map(message_node_user_ids)
+    }
+
+    pub(crate) fn control_keys(&self) -> Vec<MessageControlKey> {
+        let mut keys = Vec::new();
+        for node in &self.nodes {
+            visit_node_controls(node, &mut |control| {
+                if let Some(key) = control.key() {
+                    keys.push(key);
+                }
+            });
+        }
+        keys
+    }
+
+    pub(crate) fn control(&self, key: MessageControlKey) -> Option<&MessageControl> {
+        for node in &self.nodes {
+            let mut found = None;
+            visit_node_controls(node, &mut |control| {
+                if found.is_none() && control.key() == Some(key) {
+                    found = Some(control);
+                }
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+}
+
+fn assign_control_keys(nodes: &mut [MessageNode]) {
+    let mut next = 1_u32;
+    for node in nodes {
+        visit_node_controls_mut(node, &mut |control| {
+            control.key = Some(MessageControlKey(next));
+            next = next
+                .checked_add(1)
+                .expect("message control key space exhausted");
+        });
+    }
+}
+
+fn visit_node_controls_mut(node: &mut MessageNode, visitor: &mut impl FnMut(&mut MessageControl)) {
+    match node {
+        MessageNode::Control(control) => visitor(control),
+        MessageNode::Section {
+            accessory: Some(MessageAccessory::Control(control)),
+            ..
+        } => visitor(control),
+        MessageNode::Actions(controls) => controls.iter_mut().for_each(visitor),
+        MessageNode::Attachment(attachment) => attachment.actions.iter_mut().for_each(visitor),
+        _ => {}
+    }
+}
+
+fn visit_node_controls<'a>(node: &'a MessageNode, visitor: &mut impl FnMut(&'a MessageControl)) {
+    match node {
+        MessageNode::Control(control) => visitor(control),
+        MessageNode::Section {
+            accessory: Some(MessageAccessory::Control(control)),
+            ..
+        } => visitor(control),
+        MessageNode::Actions(controls) => controls.iter().for_each(visitor),
+        MessageNode::Attachment(attachment) => attachment.actions.iter().for_each(visitor),
+        _ => {}
     }
 }
 
@@ -409,6 +565,54 @@ mod tests {
 
         assert!(!format!("{value:?}").contains("synthetic-private-marker"));
         assert!(!format!("{document:?}").contains("synthetic-private-marker"));
+    }
+
+    #[test]
+    fn document_assigns_stable_keys_across_control_locations() {
+        let document = MessageDocument::new(
+            vec![
+                MessageNode::Control(MessageControl::new("First", None)),
+                MessageNode::Section {
+                    text: None,
+                    fields: Vec::new(),
+                    accessory: Some(MessageAccessory::Control(MessageControl::new(
+                        "Second", None,
+                    ))),
+                },
+                MessageNode::Actions(vec![MessageControl::new("Third", None)]),
+            ],
+            None,
+        );
+        let keys = document.control_keys();
+
+        assert_eq!(keys.len(), 3);
+        assert_eq!(
+            keys.iter().map(|key| key.0).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            document.control(keys[1]).map(MessageControl::label),
+            Some("Second")
+        );
+    }
+
+    #[test]
+    fn callback_action_is_redacted_and_not_serialized() {
+        let document = MessageDocument::new(
+            vec![MessageNode::Control(MessageControl::callback(
+                "Approve",
+                SlackControlAction::Block {
+                    action: SensitiveValue::new("synthetic-private-action"),
+                },
+                None,
+            ))],
+            None,
+        );
+
+        assert!(!format!("{document:?}").contains("synthetic-private-action"));
+        assert!(!serde_json::to_string(&document)
+            .expect("document serializes")
+            .contains("synthetic-private-action"));
     }
 
     #[test]

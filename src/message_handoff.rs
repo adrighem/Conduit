@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
+use crate::rich_message::MessageControlKey;
+
 const MAX_HANDLE_TOKEN_ATTEMPTS: usize = 32;
 const MIN_HANDLE_TOKEN_BYTES: usize = 16;
 const MAX_HANDLE_TOKEN_BYTES: usize = 128;
@@ -61,7 +63,7 @@ impl fmt::Display for MessageRefError {
 impl std::error::Error for MessageRefError {}
 
 #[derive(Clone, Eq, Hash, PartialEq)]
-pub(crate) struct MessageControlHandle(String);
+pub struct MessageControlHandle(String);
 
 impl MessageControlHandle {
     fn parse(token: impl Into<String>) -> Result<Self, HandleResolutionError> {
@@ -79,6 +81,11 @@ impl MessageControlHandle {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic() -> Self {
+        Self("00000000000000000000000000000000".to_string())
     }
 }
 
@@ -108,6 +115,49 @@ pub(crate) enum TimelineSurfaceId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum MessageControlSelection {
+    MessageHandoff,
+    Control(MessageControlKey),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct MessageControlTarget {
+    surface: TimelineSurfaceId,
+    message: MessageRef,
+    selection: MessageControlSelection,
+}
+
+impl MessageControlTarget {
+    fn handoff(surface: TimelineSurfaceId, message: MessageRef) -> Self {
+        Self {
+            surface,
+            message,
+            selection: MessageControlSelection::MessageHandoff,
+        }
+    }
+
+    fn control(surface: TimelineSurfaceId, message: MessageRef, key: MessageControlKey) -> Self {
+        Self {
+            surface,
+            message,
+            selection: MessageControlSelection::Control(key),
+        }
+    }
+
+    pub(crate) fn surface(&self) -> TimelineSurfaceId {
+        self.surface
+    }
+
+    pub(crate) fn message(&self) -> &MessageRef {
+        &self.message
+    }
+
+    pub(crate) fn selection(&self) -> MessageControlSelection {
+        self.selection
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PresentationRevision(u64);
 
 impl PresentationRevision {
@@ -123,8 +173,7 @@ impl PresentationRevision {
 #[derive(Clone, Debug)]
 struct HandleEntry {
     session_epoch: u64,
-    surface: TimelineSurfaceId,
-    message: MessageRef,
+    target: MessageControlTarget,
     revision: PresentationRevision,
 }
 
@@ -132,7 +181,8 @@ pub(crate) struct MessageControlRegistry<T = RandomHandleTokenSource> {
     session_epoch: u64,
     revision: PresentationRevision,
     entries: HashMap<MessageControlHandle, HandleEntry>,
-    active: HashMap<(TimelineSurfaceId, MessageRef), (PresentationRevision, MessageControlHandle)>,
+    active: HashMap<MessageControlTarget, (PresentationRevision, MessageControlHandle)>,
+    claimed: HashSet<MessageControlHandle>,
     token_source: T,
 }
 
@@ -160,6 +210,7 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
             revision: PresentationRevision(0),
             entries: HashMap::new(),
             active: HashMap::new(),
+            claimed: HashSet::new(),
             token_source,
         }
     }
@@ -171,8 +222,10 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
             .expect("message-control session epoch exhausted");
         self.entries.clear();
         self.active.clear();
+        self.claimed.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_surface(
         &mut self,
         surface: TimelineSurfaceId,
@@ -181,14 +234,14 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         let revoked = self
             .active
             .iter()
-            .filter_map(|((entry_surface, _), (_, handle))| {
-                (*entry_surface == surface).then_some(handle.clone())
+            .filter_map(|(target, (_, handle))| {
+                (target.surface == surface).then_some(handle.clone())
             })
             .collect::<Vec<_>>();
-        self.active
-            .retain(|(entry_surface, _), _| *entry_surface != surface);
+        self.active.retain(|target, _| target.surface != surface);
         for handle in revoked {
             self.entries.remove(&handle);
+            self.claimed.remove(&handle);
         }
 
         self.revision = self.revision.next();
@@ -197,13 +250,15 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         let mut unique = HashSet::new();
         for message in messages {
             if unique.insert(message.clone()) {
-                let handle = self.register(surface, message.clone(), revision)?;
+                let target = MessageControlTarget::handoff(surface, message.clone());
+                let handle = self.register(target, revision)?;
                 registered.insert(message, handle);
             }
         }
         Ok(registered)
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_message(
         &mut self,
         surface: TimelineSurfaceId,
@@ -212,12 +267,81 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         self.remove_message(surface, &message);
         self.revision = self.revision.next();
         let revision = self.revision;
-        self.register(surface, message, revision)
+        self.register(MessageControlTarget::handoff(surface, message), revision)
+    }
+
+    pub(crate) fn replace_surface_with_controls(
+        &mut self,
+        surface: TimelineSurfaceId,
+        messages: impl IntoIterator<Item = (MessageRef, Vec<MessageControlKey>)>,
+    ) -> Result<HashMap<MessageControlTarget, MessageControlHandle>, HandleRegistrationError> {
+        let revoked = self
+            .active
+            .iter()
+            .filter_map(|(target, (_, handle))| {
+                (target.surface == surface).then_some(handle.clone())
+            })
+            .collect::<Vec<_>>();
+        self.active.retain(|target, _| target.surface != surface);
+        for handle in revoked {
+            self.entries.remove(&handle);
+            self.claimed.remove(&handle);
+        }
+
+        self.revision = self.revision.next();
+        let revision = self.revision;
+        let mut registered = HashMap::new();
+        let mut unique = HashSet::new();
+        for (message, control_keys) in messages {
+            if !unique.insert(message.clone()) {
+                continue;
+            }
+            let fallback = MessageControlTarget::handoff(surface, message.clone());
+            let handle = self.register(fallback.clone(), revision)?;
+            registered.insert(fallback, handle);
+            for key in control_keys {
+                let target = MessageControlTarget::control(surface, message.clone(), key);
+                let handle = self.register(target.clone(), revision)?;
+                registered.insert(target, handle);
+            }
+        }
+        Ok(registered)
+    }
+
+    pub(crate) fn replace_message_with_controls(
+        &mut self,
+        surface: TimelineSurfaceId,
+        message: MessageRef,
+        control_keys: Vec<MessageControlKey>,
+    ) -> Result<HashMap<MessageControlTarget, MessageControlHandle>, HandleRegistrationError> {
+        self.remove_message(surface, &message);
+        self.revision = self.revision.next();
+        let revision = self.revision;
+        let mut registered = HashMap::new();
+        let fallback = MessageControlTarget::handoff(surface, message.clone());
+        let handle = self.register(fallback.clone(), revision)?;
+        registered.insert(fallback, handle);
+        for key in control_keys {
+            let target = MessageControlTarget::control(surface, message.clone(), key);
+            let handle = self.register(target.clone(), revision)?;
+            registered.insert(target, handle);
+        }
+        Ok(registered)
     }
 
     pub(crate) fn remove_message(&mut self, surface: TimelineSurfaceId, message: &MessageRef) {
-        if let Some((_, handle)) = self.active.remove(&(surface, message.clone())) {
+        let revoked = self
+            .active
+            .iter()
+            .filter_map(|(target, (_, handle))| {
+                (target.surface == surface && &target.message == message).then_some(handle.clone())
+            })
+            .collect::<Vec<_>>();
+        self.active
+            .retain(|target, _| target.surface != surface || &target.message != message);
+        for handle in revoked {
             self.entries.remove(&handle);
+            self.claimed.remove(&handle);
         }
     }
 
@@ -227,7 +351,22 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         message: &MessageRef,
     ) -> Option<MessageControlHandle> {
         self.active
-            .get(&(surface, message.clone()))
+            .get(&MessageControlTarget::handoff(surface, message.clone()))
+            .map(|(_, handle)| handle.clone())
+    }
+
+    pub(crate) fn active_control_handle(
+        &self,
+        surface: TimelineSurfaceId,
+        message: &MessageRef,
+        key: MessageControlKey,
+    ) -> Option<MessageControlHandle> {
+        self.active
+            .get(&MessageControlTarget::control(
+                surface,
+                message.clone(),
+                key,
+            ))
             .map(|(_, handle)| handle.clone())
     }
 
@@ -244,14 +383,25 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         }
         let is_active = self
             .active
-            .get(&(entry.surface, entry.message.clone()))
+            .get(&entry.target)
             .is_some_and(|(revision, active_handle)| {
                 *revision == entry.revision && active_handle == handle
             });
         if !is_active {
             return Err(HandleResolutionError::Stale);
         }
-        Ok(entry.message.clone())
+        Ok(entry.target.message.clone())
+    }
+
+    pub(crate) fn resolve_target(
+        &self,
+        handle: &MessageControlHandle,
+    ) -> Result<MessageControlTarget, HandleResolutionError> {
+        self.resolve(handle)?;
+        self.entries
+            .get(handle)
+            .map(|entry| entry.target.clone())
+            .ok_or(HandleResolutionError::Unknown)
     }
 
     #[cfg(test)]
@@ -259,6 +409,7 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         self.resolve(&MessageControlHandle::parse(token)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn activate_token(
         &mut self,
         token: &str,
@@ -269,14 +420,37 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
             .entries
             .remove(&handle)
             .ok_or(HandleResolutionError::Unknown)?;
-        self.active.remove(&(entry.surface, entry.message));
+        self.active.remove(&entry.target);
+        self.claimed.remove(&handle);
         Ok(target)
+    }
+
+    pub(crate) fn claim_token(
+        &mut self,
+        token: &str,
+    ) -> Result<(MessageControlHandle, MessageControlTarget), HandleResolutionError> {
+        let handle = MessageControlHandle::parse(token)?;
+        let target = self.resolve_target(&handle)?;
+        if !self.claimed.insert(handle.clone()) {
+            return Err(HandleResolutionError::Claimed);
+        }
+        Ok((handle, target))
+    }
+
+    pub(crate) fn release(&mut self, handle: &MessageControlHandle) {
+        self.claimed.remove(handle);
+    }
+
+    pub(crate) fn complete(&mut self, handle: &MessageControlHandle) {
+        self.claimed.remove(handle);
+        if let Some(entry) = self.entries.remove(handle) {
+            self.active.remove(&entry.target);
+        }
     }
 
     fn register(
         &mut self,
-        surface: TimelineSurfaceId,
-        message: MessageRef,
+        target: MessageControlTarget,
         revision: PresentationRevision,
     ) -> Result<MessageControlHandle, HandleRegistrationError> {
         let handle = (0..MAX_HANDLE_TOKEN_ATTEMPTS)
@@ -288,13 +462,11 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
             .ok_or(HandleRegistrationError::TokenSourceExhausted)?;
         let entry = HandleEntry {
             session_epoch: self.session_epoch,
-            surface,
-            message: message.clone(),
+            target: target.clone(),
             revision,
         };
         self.entries.insert(handle.clone(), entry);
-        self.active
-            .insert((surface, message), (revision, handle.clone()));
+        self.active.insert(target, (revision, handle.clone()));
         Ok(handle)
     }
 }
@@ -317,6 +489,7 @@ pub(crate) enum HandleResolutionError {
     Malformed,
     Unknown,
     Stale,
+    Claimed,
 }
 
 impl fmt::Display for HandleResolutionError {
@@ -325,6 +498,7 @@ impl fmt::Display for HandleResolutionError {
             Self::Malformed => formatter.write_str("malformed message-control handle"),
             Self::Unknown => formatter.write_str("unknown message-control handle"),
             Self::Stale => formatter.write_str("stale message-control handle"),
+            Self::Claimed => formatter.write_str("message-control handle is already in use"),
         }
     }
 }
@@ -643,6 +817,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::rich_message::{MessageControl, MessageDocument, MessageNode};
 
     #[derive(Debug)]
     struct SequenceTokenSource {
@@ -748,6 +923,60 @@ mod tests {
             registry.activate_token(handle.as_str()),
             Err(HandleResolutionError::Unknown)
         );
+    }
+
+    #[test]
+    fn per_control_handles_claim_release_and_complete_independently() {
+        let mut registry = registry(&[
+            "00000000000000000000000000000000",
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222",
+        ]);
+        let message = target("C123", "1710000000.000100");
+        let document = MessageDocument::new(
+            vec![MessageNode::Actions(vec![
+                MessageControl::new("Approve", None),
+                MessageControl::new("Decline", None),
+            ])],
+            None,
+        );
+        let keys = document.control_keys();
+        let handles = registry
+            .replace_message_with_controls(TimelineSurfaceId::Main, message.clone(), keys.clone())
+            .unwrap();
+        let approve = handles
+            .get(&MessageControlTarget::control(
+                TimelineSurfaceId::Main,
+                message.clone(),
+                keys[0],
+            ))
+            .unwrap();
+        let decline = handles
+            .get(&MessageControlTarget::control(
+                TimelineSurfaceId::Main,
+                message,
+                keys[1],
+            ))
+            .unwrap();
+
+        assert_ne!(approve, decline);
+        let (claimed_handle, claimed_target) = registry.claim_token(approve.as_str()).unwrap();
+        assert_eq!(
+            claimed_target.selection(),
+            MessageControlSelection::Control(keys[0])
+        );
+        assert_eq!(
+            registry.claim_token(approve.as_str()),
+            Err(HandleResolutionError::Claimed)
+        );
+        registry.release(&claimed_handle);
+        let (claimed_handle, _) = registry.claim_token(approve.as_str()).unwrap();
+        registry.complete(&claimed_handle);
+        assert_eq!(
+            registry.claim_token(approve.as_str()),
+            Err(HandleResolutionError::Unknown)
+        );
+        assert!(registry.claim_token(decline.as_str()).is_ok());
     }
 
     #[test]

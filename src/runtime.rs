@@ -25,7 +25,8 @@ use crate::huddles::model::{ActiveHuddle, HuddlePresence};
 use crate::huddles::signaling::{production_native_join_capability, NativeJoinCapability};
 use crate::huddles::state::{HuddleCommand, HuddleEvent, HuddleFailure, HuddlePhase};
 use crate::message_handoff::{
-    MessageHandoffResolver, MessageRef, ProviderFailure, ResolvedMessageHandoff,
+    MessageControlHandle, MessageHandoffResolver, MessageRef, ProviderFailure,
+    ResolvedMessageHandoff,
 };
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
@@ -36,8 +37,8 @@ use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::{recent_history_preview, ConversationHistoryService};
 use crate::slack::{
     supported_preview_mime_type, DownloadedPreviewAsset, SlackApi, SlackError, SlackErrorCategory,
-    SlackMessagePage, SlackUnreadSnapshot, SlackUnreadSnapshotRecord, MAX_PREVIEW_IMAGE_BYTES,
-    MAX_PREVIEW_VIDEO_BYTES,
+    SlackMessageActionRequest, SlackMessagePage, SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
+    MAX_PREVIEW_IMAGE_BYTES, MAX_PREVIEW_VIDEO_BYTES,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
@@ -189,6 +190,11 @@ pub enum RuntimeCommand {
         channel_id: String,
         ts: String,
     },
+    ExecuteMessageAction {
+        request: SlackMessageActionRequest,
+        control_handle: MessageControlHandle,
+        reload_thread_ts: Option<String>,
+    },
     MarkConversationRead {
         channel_id: String,
         ts: String,
@@ -281,6 +287,7 @@ pub enum RuntimeOperation {
     Media,
     AttachmentDownload,
     MessagePermalink,
+    MessageAction,
     PostMessage,
     Reaction,
     Saved,
@@ -587,6 +594,16 @@ impl RuntimeCommand {
                     RuntimeTarget::ExactMessage {
                         channel_id: channel_id.clone(),
                         ts: ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Interactive,
+            ),
+            Self::ExecuteMessageAction { request, .. } => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::MessageAction,
+                    RuntimeTarget::ExactMessage {
+                        channel_id: request.channel_id.clone(),
+                        ts: request.message_ts.clone(),
                     },
                 ),
                 RuntimeTaskLane::Interactive,
@@ -955,6 +972,16 @@ pub enum RuntimeEventKind {
     MessagePermalinkResolved {
         handoff: ResolvedMessageHandoff,
     },
+    MessageActionCompleted {
+        control_handle: MessageControlHandle,
+        channel_id: String,
+        ts: String,
+        thread_ts: Option<String>,
+    },
+    MessageActionFailed {
+        control_handle: MessageControlHandle,
+        failure: RuntimeFailure,
+    },
     MessagePosted {
         channel_id: String,
         message: Box<SlackMessage>,
@@ -1122,6 +1149,13 @@ impl RuntimeEventKind {
                     ts: handoff.target.timestamp().to_string(),
                 },
             ),
+            Self::MessageActionCompleted { channel_id, ts, .. } => OperationContext::new(
+                RuntimeOperation::MessageAction,
+                RuntimeTarget::ExactMessage {
+                    channel_id: channel_id.clone(),
+                    ts: ts.clone(),
+                },
+            ),
             Self::RealtimeStatusChanged(_) | Self::SocketModeEvent { .. } => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
@@ -1141,6 +1175,7 @@ impl RuntimeEventKind {
             | Self::MessagePosted { .. }
             | Self::ReactionUpdated { .. }
             | Self::SavedUpdated { .. }
+            | Self::MessageActionFailed { .. }
             | Self::AttachmentDownloadProgress { .. }
             | Self::FileUploadProgress { .. }
             | Self::FileUploaded(_) => fallback.clone(),
@@ -4330,6 +4365,63 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context
                 .events
                 .send_event(RuntimeEventKind::MessagePermalinkResolved { handoff });
+        }
+        RuntimeCommand::ExecuteMessageAction {
+            request,
+            control_handle,
+            reload_thread_ts,
+        } => {
+            let Some((workspace_url, team_id, api)) = context
+                .workspace_url
+                .zip(context.team_id)
+                .zip(context.slack.as_ref())
+                .map(|((workspace_url, team_id), api)| (workspace_url, team_id, api))
+            else {
+                crate::debug::log(
+                    "runtime",
+                    "MessageActionFailed method=private-slack-callback category=Validation error=Slack action session metadata is unavailable",
+                );
+                context
+                    .events
+                    .send_event(RuntimeEventKind::MessageActionFailed {
+                        control_handle,
+                        failure: RuntimeFailure::validation(
+                            "Slack action session is unavailable. Sign in again.",
+                        ),
+                    });
+                return Ok(());
+            };
+            match api
+                .execute_message_action(workspace_url, team_id, &request)
+                .await
+            {
+                Ok(()) => {
+                    context
+                        .events
+                        .send_event(RuntimeEventKind::MessageActionCompleted {
+                            control_handle,
+                            channel_id: request.channel_id,
+                            ts: request.message_ts,
+                            thread_ts: reload_thread_ts,
+                        });
+                }
+                Err(error) => {
+                    let category = error.category();
+                    let full_error = anyhow::Error::new(error);
+                    crate::debug::log(
+                        "runtime",
+                        &format!(
+                            "MessageActionFailed method=private-slack-callback category={category:?} error={full_error:#}"
+                        ),
+                    );
+                    context
+                        .events
+                        .send_event(RuntimeEventKind::MessageActionFailed {
+                            control_handle,
+                            failure: RuntimeFailure::from_slack_category(category),
+                        });
+                }
+            }
         }
         RuntimeCommand::MarkConversationRead { channel_id, ts } => {
             let api = require_slack(context.slack)?;
@@ -14359,6 +14451,37 @@ mod tests {
         .descriptor();
         assert_eq!(permalink.lane, RuntimeTaskLane::Interactive);
         assert!(permalink.supersedes_previous);
+
+        let message_action = RuntimeCommand::ExecuteMessageAction {
+            request: SlackMessageActionRequest {
+                channel_id: "C123".to_string(),
+                message_ts: "1710000000.000100".to_string(),
+                thread_ts: None,
+                service_id: "B123".to_string(),
+                app_id: Some("A123".to_string()),
+                bot_user_id: Some("U123".to_string()),
+                action: crate::rich_message::SlackControlAction::Block {
+                    action: crate::rich_message::SensitiveValue::new(
+                        r#"{"type":"button","block_id":"block","action_id":"approve"}"#,
+                    ),
+                },
+            },
+            control_handle: MessageControlHandle::synthetic(),
+            reload_thread_ts: None,
+        }
+        .descriptor();
+        assert_eq!(message_action.lane, RuntimeTaskLane::Interactive);
+        assert!(!message_action.supersedes_previous);
+        assert_eq!(
+            message_action.context,
+            OperationContext::new(
+                RuntimeOperation::MessageAction,
+                RuntimeTarget::ExactMessage {
+                    channel_id: "C123".to_string(),
+                    ts: "1710000000.000100".to_string(),
+                },
+            )
+        );
 
         let leave = RuntimeCommand::LeaveConversation {
             channel_id: "C123".to_string(),

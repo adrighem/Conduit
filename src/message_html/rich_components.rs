@@ -100,6 +100,7 @@ fn render_control(
         &control.label,
         control.url.as_deref(),
         control.confirmation_required,
+        control.action().is_some(),
     ) {
         ControlPlan::Navigate { url, .. } => format!(
             "<a class=\"block-action\" href=\"{}\" rel=\"noreferrer noopener\">{label_html}</a>",
@@ -108,6 +109,35 @@ fn render_control(
         ControlPlan::Unavailable { .. } => format!(
             "<span class=\"block-action is-unavailable\" aria-disabled=\"true\">{label_html}</span>"
         ),
+        ControlPlan::ExecuteCallback { label } => {
+            let accessible = gettext("Use {label}").replace("{label}", &label);
+            match control
+                .key()
+                .and_then(|key| plan.control_action_handles.get(&key))
+            {
+                Some(handle) => format!(
+                    "<a class=\"block-action\" href=\"{}\" aria-label=\"{}\">{label_html}</a>",
+                    super::escape_html(&super::message_control_action_url(handle)),
+                    super::escape_html(&accessible),
+                ),
+                None => match plan.control_handle.as_ref() {
+                    Some(handle) => {
+                        let accessible = gettext("Open this message in Slack to use {label}")
+                            .replace("{label}", &label);
+                        format!(
+                            "<a class=\"block-action is-external\" href=\"{}\" aria-label=\"{}\"><span class=\"control-label\">{label_html}</span><span class=\"slack-handoff\">{}</span></a>",
+                            super::escape_html(&super::message_control_action_url(handle)),
+                            super::escape_html(&accessible),
+                            super::escape_html(&gettext("Open in Slack"))
+                        )
+                    }
+                    None => format!(
+                        "<span class=\"block-action is-unavailable\" aria-disabled=\"true\" title=\"{}\">{label_html}</span>",
+                        super::escape_html(&gettext("This action is not available yet"))
+                    ),
+                },
+            }
+        }
         ControlPlan::SlackHandoff { label } => {
             let accessible =
                 gettext("Open this message in Slack to use {label}").replace("{label}", &label);
