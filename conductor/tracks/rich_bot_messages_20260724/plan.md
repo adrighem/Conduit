@@ -57,3 +57,12 @@
 - [x] Task: Add failing coverage for image blocks nested inside legacy attachments 2e7a549
 - [x] Task: Preserve attachment-embedded image blocks through canonical normalization and rendering fbe931c
 - [x] Task: Conductor - User Manual Verification 'Animated GIF shares' (Protocol in workflow.md) 31e9f44
+
+## Phase 7: Native bot callback actions
+
+- [x] Task: Add canonical-model and request-shape tests for Bob and Outlook buttons
+- [x] Task: Preserve redacted per-control callback metadata and opaque per-control handles
+- [x] Task: Execute `blocks.actions` and `chat.attachmentAction` through XOXC/XOXD
+- [x] Task: Honor confirmations, reload after success, and surface sanitized failures
+- [~] Task: Run formatting, strict Clippy, Rust tests, Meson compilation, and Meson tests (all pass except Clippy is blocked by installed clippy 0.1.87 with rustc 1.95)
+- [ ] Task: Conductor - User Manual Verification 'Native bot callback actions' (Protocol in workflow.md)

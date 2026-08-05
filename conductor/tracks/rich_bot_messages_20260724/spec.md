@@ -17,8 +17,9 @@ cache, and presentation paths.
 4. Supported content and fallback policy never leaves a genuine message blank.
 5. Bot/app display names and avatars resolve before the generic Slack fallback without acquiring
    user presence or person-profile behavior.
-6. Safe URL controls remain navigation affordances. Slack callback controls are represented
-   honestly and open the exact originating message in Slack.
+6. Safe URL controls remain navigation affordances. Supported Slack callback buttons execute
+   through the authenticated browser-session transport; unsupported controls open the exact
+   originating message in Slack.
 7. Exact-message handoff prefers `chat.getPermalink` and uses a strictly validated constructed
    workspace permalink only when the API result is unavailable.
 8. Callback identifiers, action/option values, raw payloads, response URLs, and credentials never
@@ -26,6 +27,12 @@ cache, and presentation paths.
 9. Web API, realtime, coordinator, and store paths use the same retained message representation.
 10. Existing cached rows that already lost data recover through normal fresh history/realtime
     replacement without duplicate messages.
+11. Callback execution uses Slack's private `chat.attachmentAction` and `blocks.actions` methods
+    only when XOXC/XOXD browser-session credentials are available.
+12. Each callback button receives its own opaque, revision-bound handle. Sensitive callback and
+    action values remain outside HTML, custom URLs, debug output, and diagnostics.
+13. Slack confirmation metadata is honored before dispatch. Successful actions reload the visible
+    message context; failures log complete sanitized diagnostics and show a short status message.
 
 ## Acceptance Criteria
 
@@ -33,7 +40,13 @@ cache, and presentation paths.
   and thread metadata after serialization and deserialization.
 - Synthetic Jira-like messages render rich text, buttons, static selects, and overflow menus.
 - URL controls allow only safe HTTP(S) destinations.
-- Callback controls clearly state that Slack is required and activate an exact-message handoff.
+- Executable callback buttons activate the matching private Slack action exactly once; controls
+  without retained action metadata or browser-session authentication keep exact-message handoff.
+- Bob-style Block Kit buttons and Outlook-style legacy attachment buttons have synthetic request
+  shape coverage.
+- Explicit Slack confirmations are shown before dispatch.
+- Success reloads the visible conversation or thread. Failure permits retry without duplicate
+  in-flight dispatch and never logs action values.
 - Unknown or malformed nodes preserve valid siblings and accessible fallback.
 - Cache round-trip and fresh-over-old merge tests cover the formerly discarded fields.
 - Generated HTML and action URLs contain no callback/action values.
@@ -41,9 +54,8 @@ cache, and presentation paths.
 
 ## Out of Scope
 
-- Fabricating Slack interaction payloads or directly calling another app's Request URL.
-- Reverse-engineering private Slack click-submission endpoints.
-- Native execution of Bob/Jira callback actions without a documented supported Slack client API.
+- Calling another app's Request URL directly or fabricating Slack-signed app requests.
+- Interactive selects, overflow choices, modals, and external suggestion providers.
 - Block Kit authoring, workflow building, modal hosting, and external option-provider hosting.
 - Multiple connected Slack workspaces.
 
