@@ -1,0 +1,7 @@
+Task: Persist and restore the last selected conversation with restart coverage
+
+Summary: Stores workspace identity and last conversation atomically, restores only after catalog availability, gives explicit startup navigation precedence, and clears stale targets after authoritative sync.
+
+Files: data/eu.vanadrighem.conduit.gschema.xml, src/config.rs, src/window.rs, tests/test_window_state.py
+
+Rationale: Preserve the last useful conversation across clean restarts without reviving a conversation from another workspace or overriding a notification or Slack URI.
