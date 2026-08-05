@@ -1,0 +1,7 @@
+Task: Make composer toolbar controls square and recalculate overflow
+
+Summary: Size every primary formatting and ellipsis control to 34 by 34 pixels, remove theme padding that inflated natural width, and derive compact and expanded toolbar widths from control count and spacing.
+
+Modified files: src/window.rs, src/window.ui
+
+Rationale: Keep controls visually uniform and activate overflow exactly when the fixed-width control row no longer fits.
