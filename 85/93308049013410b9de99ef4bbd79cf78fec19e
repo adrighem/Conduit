@@ -1,0 +1,7 @@
+Task: Conductor - User Manual Verification 'Incremental GTK and WebKit presentation'
+
+Summary: User confirmed stable virtualized-sidebar selection, incremental timeline scroll behavior, and cached media rendering on 2026-08-06. Local Meson validation passed 17/17; Rust tests passed 947 with 3 ignored. Exact-head CI 31091791190 and CodeQL 31091790015 passed at c5c1d08.
+
+Modified files: None. This is a verification-only checkpoint commit.
+
+Rationale: Record explicit approval of Phase 5 before advancing the workspace pipeline rearchitecture.
