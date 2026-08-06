@@ -1,0 +1,7 @@
+Task: Remove whole-state storage, raw realtime UI events, broad invalidations, and routine reload adapters
+
+Summary: Routed routine history, thread, message, reaction, read, user, and thread-catalog updates through canonical WorkspaceMutation reductions, revisioned WorkspacePatch delivery, and atomic StoreBatch persistence. Removed raw workspace payload events, direct reload helpers, whole-state storage compatibility, and broad presentation invalidations.
+
+Modified: src/conversation_catalog.rs, src/message_handoff.rs, src/runtime.rs, src/store.rs, src/window.rs, src/workspace_pipeline.rs, src/workspace_state.rs
+
+Rationale: Preserve one authoritative mutation path from cache, Web API, local actions, and realtime input through persistence and presentation. Rust suite passes: 930 passed, 3 ignored.
