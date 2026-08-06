@@ -1,0 +1,9 @@
+Task: Add settled-idle counters and run full automated acceptance validation
+
+Summary: Added saturating redacted counters and 60-second debug samples for admitted jobs, outbound Slack requests, SQLite connections/transactions/changed/skipped rows, sidebar projection operations, document loads, and timeline deltas. Removed remaining production exposure of test-only compatibility helpers.
+
+Modified: src/application.rs, src/conversation_catalog.rs, src/debug.rs, src/models.rs, src/runtime.rs, src/services/conversation_history.rs, src/slack.rs, src/store.rs, src/sync_scheduler.rs, src/thread_pane.rs, src/window.rs, src/workspace_state.rs
+
+Verification: cargo fmt --all --check passed; cargo clippy --locked --all-targets -- -D warnings passed; cargo test --locked --all-targets passed with 932 passed and 3 ignored; Meson compilation passed; Meson tests passed 17/17; git diff --check passed. No coverage tool is configured. The optional all-features Clippy attempt stopped before project linting because local GStreamer WebRTC 1.24 development metadata is unavailable.
+
+Rationale: Make settled-idle activity measurable without workspace identifiers or private content, and prove the default production pipeline against the repository acceptance matrix.
