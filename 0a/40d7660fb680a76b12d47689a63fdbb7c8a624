@@ -1,0 +1,7 @@
+Task: Migrate remaining workspace surfaces onto coordinator intents and projections
+
+Summary: Unified user, thread catalog, channel and thread timeline, reaction, search, and saved-message presentation behind revisioned WorkspacePatch application; added canonical partial-user merges, reaction mutations, cached thread projections, and grouped TimelineDelta delivery.
+
+Modified: src/runtime.rs, src/window.rs, src/workspace_pipeline.rs, src/workspace_state.rs
+
+Rationale: Make the coordinator authoritative beyond conversations while preserving request-scoped completion metadata during the cleanup transition. Rust suite passes: 952 passed, 3 ignored.
