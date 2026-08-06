@@ -25,7 +25,8 @@ use gtk::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::models::SlackUser;
+use crate::models::{SlackMessage, SlackUser};
+use crate::rich_message::{MessageNode, RichInline, RichInlineStyle, RichTextNode};
 use crate::search::{
     SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
 };
@@ -65,6 +66,21 @@ pub struct MentionSpan {
     pub end: usize,
     pub user_id: String,
     pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerEntityKind {
+    Link { url: String },
+    Channel { channel_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerEntitySpan {
+    pub start: usize,
+    pub end: usize,
+    pub label: String,
+    pub kind: ComposerEntityKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +156,7 @@ pub struct ComposerAttachmentDraft {
 pub struct RichComposerDraft {
     pub text: String,
     pub mentions: Vec<MentionSpan>,
+    pub entities: Vec<ComposerEntitySpan>,
     pub styles: Vec<ComposerStyleSpan>,
     pub blocks: Vec<ComposerBlockSpan>,
     pub attachments: Vec<ComposerAttachmentDraft>,
@@ -169,10 +186,220 @@ impl RichComposerDraft {
             "elements": elements,
         })];
         Some(ComposerMessagePayload {
-            fallback_text: serialize_composer_mentions(&self.text, &self.mentions),
+            fallback_text: serialize_composer_semantics(&self.text, &self.mentions, &self.entities),
             blocks_json: serde_json::to_string(&blocks).ok()?,
         })
     }
+}
+
+#[derive(Default)]
+struct MessageDraftBuilder {
+    draft: RichComposerDraft,
+    position: usize,
+    has_line: bool,
+}
+
+impl MessageDraftBuilder {
+    fn start_line(&mut self) -> usize {
+        if self.has_line {
+            self.draft.text.push('\n');
+            self.position += 1;
+        }
+        self.has_line = true;
+        self.position
+    }
+
+    fn push_text(&mut self, text: &str, style: RichInlineStyle) {
+        let start = self.position;
+        self.draft.text.push_str(text);
+        self.position += text.chars().count();
+        let style = ComposerTextStyle {
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            strike: style.strike,
+            code: style.code,
+        };
+        if start < self.position && !style.is_empty() {
+            self.draft.styles.push(ComposerStyleSpan {
+                start,
+                end: self.position,
+                style,
+            });
+        }
+    }
+
+    fn push_inlines(&mut self, inlines: &[RichInline], user_names: &HashMap<String, String>) {
+        for inline in inlines {
+            match inline {
+                RichInline::Text { text, style } => self.push_text(text, *style),
+                RichInline::Link { url, label, style } => {
+                    let label = if label.is_empty() { url } else { label };
+                    let start = self.position;
+                    self.push_text(label, *style);
+                    self.draft.entities.push(ComposerEntitySpan {
+                        start,
+                        end: self.position,
+                        label: label.clone(),
+                        kind: ComposerEntityKind::Link { url: url.clone() },
+                    });
+                }
+                RichInline::User(user_id) => {
+                    let label = format!(
+                        "@{}",
+                        user_names
+                            .get(user_id)
+                            .map(String::as_str)
+                            .unwrap_or(user_id)
+                    );
+                    let start = self.position;
+                    self.draft.text.push_str(&label);
+                    self.position += label.chars().count();
+                    self.draft.mentions.push(MentionSpan {
+                        start,
+                        end: self.position,
+                        user_id: user_id.clone(),
+                        label,
+                    });
+                }
+                RichInline::Channel(channel_id) => {
+                    let label = format!("#{channel_id}");
+                    let start = self.position;
+                    self.push_text(&label, RichInlineStyle::default());
+                    self.draft.entities.push(ComposerEntitySpan {
+                        start,
+                        end: self.position,
+                        label,
+                        kind: ComposerEntityKind::Channel {
+                            channel_id: channel_id.clone(),
+                        },
+                    });
+                }
+                RichInline::Emoji(name) => {
+                    self.push_text(&emoji_shortcode(name), RichInlineStyle::default())
+                }
+            }
+        }
+    }
+
+    fn push_line(
+        &mut self,
+        inlines: &[RichInline],
+        kind: Option<ComposerBlockKind>,
+        user_names: &HashMap<String, String>,
+    ) {
+        let start = self.start_line();
+        self.push_inlines(inlines, user_names);
+        if let Some(kind) = kind.filter(|_| start < self.position) {
+            self.draft.blocks.push(ComposerBlockSpan {
+                start,
+                end: self.position,
+                kind,
+            });
+        }
+    }
+}
+
+fn blocks_match_editable_draft(message: &SlackMessage, draft: &RichComposerDraft) -> bool {
+    let Some(Value::Array(original_blocks)) = message.blocks.as_ref() else {
+        return false;
+    };
+    let Some(payload) = draft.slack_payload() else {
+        return false;
+    };
+    let Ok(Value::Array(generated_blocks)) = serde_json::from_str::<Value>(&payload.blocks_json)
+    else {
+        return false;
+    };
+    let normalized_original = original_blocks
+        .iter()
+        .cloned()
+        .map(|mut block| {
+            if let Some(block) = block.as_object_mut() {
+                block.remove("block_id");
+            }
+            block
+        })
+        .collect::<Vec<_>>();
+    normalized_original == generated_blocks
+}
+
+/// Converts a plain or wholly rich-text Slack message into an editable composer draft.
+/// Mixed Block Kit layouts are rejected so editing cannot silently discard content.
+pub fn composer_draft_from_message(
+    message: &SlackMessage,
+    user_names: &HashMap<String, String>,
+) -> Option<(RichComposerDraft, bool)> {
+    let blocks_are_editable = match message.blocks.as_ref() {
+        None => true,
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .all(|block| block.get("type").and_then(Value::as_str) == Some("rich_text")),
+        Some(_) => false,
+    };
+    if !blocks_are_editable {
+        return None;
+    }
+    let document_is_editable = message
+        .document
+        .nodes()
+        .iter()
+        .all(|node| matches!(node, MessageNode::RichText(_)));
+    if !document_is_editable {
+        return None;
+    }
+    let uses_rich_blocks = message
+        .document
+        .nodes()
+        .iter()
+        .any(|node| matches!(node, MessageNode::RichText(_)));
+
+    let mut builder = MessageDraftBuilder::default();
+    for node in message.document.nodes() {
+        let MessageNode::RichText(nodes) = node else {
+            continue;
+        };
+        for node in nodes {
+            match node {
+                RichTextNode::Paragraph(inlines) => builder.push_line(inlines, None, user_names),
+                RichTextNode::Preformatted(inlines) => {
+                    builder.push_line(inlines, Some(ComposerBlockKind::Preformatted), user_names)
+                }
+                RichTextNode::Quote(inlines) => {
+                    builder.push_line(inlines, Some(ComposerBlockKind::Quote), user_names)
+                }
+                RichTextNode::List { ordered, items } => {
+                    let kind = if *ordered {
+                        ComposerBlockKind::NumberedList
+                    } else {
+                        ComposerBlockKind::BulletedList
+                    };
+                    for item in items {
+                        builder.push_line(item, Some(kind), user_names);
+                    }
+                }
+            }
+        }
+    }
+    if !builder.draft.text.is_empty() {
+        if uses_rich_blocks && !blocks_match_editable_draft(message, &builder.draft) {
+            return None;
+        }
+        return Some((builder.draft, uses_rich_blocks));
+    }
+    if uses_rich_blocks {
+        return None;
+    }
+
+    let hydrated = hydrate_composer_mentions(&message.body_text(), user_names);
+    Some((
+        RichComposerDraft {
+            text: hydrated.text,
+            mentions: hydrated.mentions,
+            ..RichComposerDraft::default()
+        },
+        uses_rich_blocks,
+    ))
 }
 
 pub fn encode_rich_composer_draft(draft: &RichComposerDraft) -> String {
@@ -289,6 +516,14 @@ fn composer_inline_elements(draft: &RichComposerDraft, start: usize, end: usize)
     let start = start.min(characters.len());
     let end = end.min(characters.len()).max(start);
     let mentions = valid_composer_mentions(&draft.text, &draft.mentions);
+    let entities = valid_composer_entities(&draft.text, &draft.entities)
+        .into_iter()
+        .filter(|entity| {
+            !mentions
+                .iter()
+                .any(|mention| ranges_overlap(entity.start, entity.end, mention.start, mention.end))
+        })
+        .collect::<Vec<_>>();
     let styles = draft
         .styles
         .iter()
@@ -302,13 +537,28 @@ fn composer_inline_elements(draft: &RichComposerDraft, start: usize, end: usize)
         .collect::<Vec<_>>();
     let mut boundaries = vec![start, end];
     for span in &styles {
-        boundaries.push(span.start.max(start));
-        boundaries.push(span.end.min(end));
+        for boundary in [span.start.max(start), span.end.min(end)] {
+            let splits_semantic = mentions
+                .iter()
+                .any(|mention| mention.start < boundary && boundary < mention.end)
+                || entities
+                    .iter()
+                    .any(|entity| entity.start < boundary && boundary < entity.end);
+            if !splits_semantic {
+                boundaries.push(boundary);
+            }
+        }
     }
     for mention in &mentions {
         if mention.start < end && start < mention.end {
             boundaries.push(mention.start.max(start));
             boundaries.push(mention.end.min(end));
+        }
+    }
+    for entity in &entities {
+        if entity.start < end && start < entity.end {
+            boundaries.push(entity.start.max(start));
+            boundaries.push(entity.end.min(end));
         }
     }
     boundaries.sort_unstable();
@@ -335,6 +585,21 @@ fn composer_inline_elements(draft: &RichComposerDraft, start: usize, end: usize)
                 json!({"type": "user", "user_id": mention.user_id}),
                 style,
             ));
+            continue;
+        }
+        if let Some(entity) = entities
+            .iter()
+            .find(|entity| entity.start == segment_start && entity.end == segment_end)
+        {
+            let element = match &entity.kind {
+                ComposerEntityKind::Link { url } => {
+                    json!({"type": "link", "url": url, "text": entity.label})
+                }
+                ComposerEntityKind::Channel { channel_id } => {
+                    json!({"type": "channel", "channel_id": channel_id})
+                }
+            };
+            elements.push(styled_rich_element(element, style));
             continue;
         }
 
@@ -683,8 +948,37 @@ fn valid_mention_span(span: &MentionSpan, characters: &[char]) -> bool {
         && characters[span.start..span.end].iter().collect::<String>() == span.label
 }
 
-fn spans_overlap(left: &MentionSpan, right: &MentionSpan) -> bool {
-    left.start < right.end && right.start < left.end
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+pub fn expand_composer_semantic_selection(
+    mut start: usize,
+    mut end: usize,
+    mentions: &[MentionSpan],
+    entities: &[ComposerEntitySpan],
+) -> (usize, usize) {
+    loop {
+        let previous = (start, end);
+        for (span_start, span_end) in mentions
+            .iter()
+            .map(|span| (span.start, span.end))
+            .chain(entities.iter().map(|span| (span.start, span.end)))
+        {
+            if ranges_overlap(start, end, span_start, span_end) {
+                start = start.min(span_start);
+                end = end.max(span_end);
+            }
+        }
+        if (start, end) == previous {
+            return (start, end);
+        }
+    }
 }
 
 fn valid_composer_mentions<'a>(text: &str, spans: &'a [MentionSpan]) -> Vec<&'a MentionSpan> {
@@ -697,7 +991,40 @@ fn valid_composer_mentions<'a>(text: &str, spans: &'a [MentionSpan]) -> Vec<&'a 
             !spans.iter().enumerate().any(|(other_index, other)| {
                 *index != other_index
                     && valid_mention_span(other, &characters)
-                    && spans_overlap(span, other)
+                    && ranges_overlap(span.start, span.end, other.start, other.end)
+            })
+        })
+        .map(|(_, span)| span)
+        .collect::<Vec<_>>();
+    valid.sort_by_key(|span| (span.start, span.end));
+    valid
+}
+
+fn valid_entity_span(span: &ComposerEntitySpan, characters: &[char]) -> bool {
+    let identity_is_valid = match &span.kind {
+        ComposerEntityKind::Link { url } => !url.trim().is_empty(),
+        ComposerEntityKind::Channel { channel_id } => !channel_id.trim().is_empty(),
+    };
+    identity_is_valid
+        && span.start < span.end
+        && span.end <= characters.len()
+        && characters[span.start..span.end].iter().collect::<String>() == span.label
+}
+
+fn valid_composer_entities<'a>(
+    text: &str,
+    spans: &'a [ComposerEntitySpan],
+) -> Vec<&'a ComposerEntitySpan> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut valid = spans
+        .iter()
+        .enumerate()
+        .filter(|(_, span)| valid_entity_span(span, &characters))
+        .filter(|(index, span)| {
+            !spans.iter().enumerate().any(|(other_index, other)| {
+                *index != other_index
+                    && valid_entity_span(other, &characters)
+                    && ranges_overlap(span.start, span.end, other.start, other.end)
             })
         })
         .map(|(_, span)| span)
@@ -718,6 +1045,89 @@ pub fn serialize_composer_mentions(text: &str, spans: &[MentionSpan]) -> String 
         serialized.push_str(&span.user_id);
         serialized.push('>');
         cursor = span.end;
+    }
+    serialized.extend(characters[cursor..].iter());
+    serialized
+}
+
+pub fn serialize_composer_semantics(
+    text: &str,
+    mentions: &[MentionSpan],
+    entities: &[ComposerEntitySpan],
+) -> String {
+    if entities.is_empty() {
+        return serialize_composer_mentions(text, mentions);
+    }
+
+    enum SemanticSpan<'a> {
+        Mention(&'a MentionSpan),
+        Entity(&'a ComposerEntitySpan),
+    }
+
+    impl SemanticSpan<'_> {
+        fn start(&self) -> usize {
+            match self {
+                Self::Mention(span) => span.start,
+                Self::Entity(span) => span.start,
+            }
+        }
+
+        fn end(&self) -> usize {
+            match self {
+                Self::Mention(span) => span.end,
+                Self::Entity(span) => span.end,
+            }
+        }
+    }
+
+    let characters = text.chars().collect::<Vec<_>>();
+    let mentions = valid_composer_mentions(text, mentions);
+    let entities = valid_composer_entities(text, entities)
+        .into_iter()
+        .filter(|entity| {
+            !mentions
+                .iter()
+                .any(|mention| ranges_overlap(entity.start, entity.end, mention.start, mention.end))
+        })
+        .collect::<Vec<_>>();
+    let mut spans = mentions
+        .into_iter()
+        .map(SemanticSpan::Mention)
+        .chain(entities.into_iter().map(SemanticSpan::Entity))
+        .collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start(), span.end()));
+
+    let mut serialized = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for span in spans {
+        serialized.extend(characters[cursor..span.start()].iter());
+        match span {
+            SemanticSpan::Mention(span) => {
+                serialized.push_str("<@");
+                serialized.push_str(&span.user_id);
+                serialized.push('>');
+            }
+            SemanticSpan::Entity(span) => match &span.kind {
+                ComposerEntityKind::Link { url } if span.label == *url => {
+                    serialized.push('<');
+                    serialized.push_str(url);
+                    serialized.push('>');
+                }
+                ComposerEntityKind::Link { url } => {
+                    serialized.push('<');
+                    serialized.push_str(url);
+                    serialized.push('|');
+                    serialized.push_str(&span.label);
+                    serialized.push('>');
+                }
+                ComposerEntityKind::Channel { channel_id } => {
+                    serialized.push_str("<#");
+                    serialized.push_str(channel_id);
+                    serialized.push('>');
+                }
+            },
+        }
+        cursor = span.end();
     }
     serialized.extend(characters[cursor..].iter());
     serialized
@@ -798,6 +1208,41 @@ pub enum CompletionKeyAction {
     Ignore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageEditKeyAction {
+    Start,
+    Cancel,
+    Ignore,
+}
+
+pub fn message_edit_key_action(
+    key: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+    composer_empty: bool,
+    editing: bool,
+) -> MessageEditKeyAction {
+    let non_lock_modifiers = gtk::gdk::ModifierType::SHIFT_MASK
+        | gtk::gdk::ModifierType::CONTROL_MASK
+        | gtk::gdk::ModifierType::ALT_MASK
+        | gtk::gdk::ModifierType::SUPER_MASK
+        | gtk::gdk::ModifierType::META_MASK;
+    let has_only_control = state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        && !state.intersects(
+            gtk::gdk::ModifierType::SHIFT_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK
+                | gtk::gdk::ModifierType::META_MASK,
+        );
+
+    if key == gtk::gdk::Key::Escape && editing && !state.intersects(non_lock_modifiers) {
+        MessageEditKeyAction::Cancel
+    } else if key == gtk::gdk::Key::Up && has_only_control && composer_empty && !editing {
+        MessageEditKeyAction::Start
+    } else {
+        MessageEditKeyAction::Ignore
+    }
+}
+
 pub fn completion_key_action(
     key: gtk::gdk::Key,
     state: gtk::gdk::ModifierType,
@@ -854,6 +1299,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::models::SlackUserProfile;
+    use crate::rich_message::MessageDocument;
 
     use super::*;
 
@@ -906,6 +1352,325 @@ mod tests {
             text_view_enter_action(gtk::gdk::Key::space, gtk::gdk::ModifierType::empty()),
             TextViewEnterAction::Ignore
         );
+    }
+
+    #[test]
+    fn edit_shortcut_requires_an_empty_composer_and_control_up() {
+        assert_eq!(
+            message_edit_key_action(
+                gtk::gdk::Key::Up,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                true,
+                false,
+            ),
+            MessageEditKeyAction::Start
+        );
+        assert_eq!(
+            message_edit_key_action(
+                gtk::gdk::Key::Up,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                false,
+                false,
+            ),
+            MessageEditKeyAction::Ignore
+        );
+        assert_eq!(
+            message_edit_key_action(
+                gtk::gdk::Key::Up,
+                gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK,
+                true,
+                false,
+            ),
+            MessageEditKeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn escape_cancels_only_an_active_edit() {
+        assert_eq!(
+            message_edit_key_action(
+                gtk::gdk::Key::Escape,
+                gtk::gdk::ModifierType::empty(),
+                false,
+                true,
+            ),
+            MessageEditKeyAction::Cancel
+        );
+        assert_eq!(
+            message_edit_key_action(
+                gtk::gdk::Key::Escape,
+                gtk::gdk::ModifierType::empty(),
+                true,
+                false,
+            ),
+            MessageEditKeyAction::Ignore
+        );
+        assert_eq!(
+            message_edit_key_action(
+                gtk::gdk::Key::Up,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                false,
+                true,
+            ),
+            MessageEditKeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn formatting_selection_expands_to_complete_semantic_spans() {
+        let mentions = vec![MentionSpan {
+            start: 2,
+            end: 6,
+            user_id: "U1".into(),
+            label: "@Ada".into(),
+        }];
+        let entities = vec![ComposerEntitySpan {
+            start: 8,
+            end: 12,
+            label: "link".into(),
+            kind: ComposerEntityKind::Link {
+                url: "https://example.com".into(),
+            },
+        }];
+
+        assert_eq!(
+            expand_composer_semantic_selection(4, 10, &mentions, &entities),
+            (2, 12)
+        );
+        assert_eq!(
+            expand_composer_semantic_selection(13, 15, &mentions, &entities),
+            (13, 15)
+        );
+    }
+
+    #[test]
+    fn canonical_message_rich_text_becomes_an_editable_draft() {
+        let message = SlackMessage {
+            text: Some("fallback".into()),
+            blocks: Some(json!([{
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "text", "text": "Hello ", "style": {"bold": true}},
+                            {"type": "user", "user_id": "U1"}
+                        ]
+                    },
+                    {
+                        "type": "rich_text_quote",
+                        "elements": [{"type": "text", "text": "quoted"}]
+                    },
+                    {
+                        "type": "rich_text_list",
+                        "style": "ordered",
+                        "indent": 0,
+                        "elements": [
+                            {
+                                "type": "rich_text_section",
+                                "elements": [{"type": "text", "text": "first"}]
+                            },
+                            {
+                                "type": "rich_text_section",
+                                "elements": [{"type": "emoji", "name": "wave"}]
+                            }
+                        ]
+                    }
+                ]
+            }])),
+            document: MessageDocument::new(
+                vec![MessageNode::RichText(vec![
+                    RichTextNode::Paragraph(vec![
+                        RichInline::Text {
+                            text: "Hello ".into(),
+                            style: RichInlineStyle {
+                                bold: true,
+                                ..RichInlineStyle::default()
+                            },
+                        },
+                        RichInline::User("U1".into()),
+                    ]),
+                    RichTextNode::Quote(vec![RichInline::Text {
+                        text: "quoted".into(),
+                        style: RichInlineStyle::default(),
+                    }]),
+                    RichTextNode::List {
+                        ordered: true,
+                        items: vec![
+                            vec![RichInline::Text {
+                                text: "first".into(),
+                                style: RichInlineStyle::default(),
+                            }],
+                            vec![RichInline::Emoji("wave".into())],
+                        ],
+                    },
+                ])],
+                Some("fallback".into()),
+            ),
+            ..SlackMessage::default()
+        };
+        let (draft, uses_rich_blocks) = composer_draft_from_message(
+            &message,
+            &HashMap::from([("U1".to_string(), "Ada".to_string())]),
+        )
+        .expect("rich-text message should be editable");
+        assert!(uses_rich_blocks);
+
+        assert_eq!(draft.text, "Hello @Ada\nquoted\nfirst\n:wave:");
+        assert_eq!(
+            draft.mentions,
+            vec![MentionSpan {
+                start: 6,
+                end: 10,
+                user_id: "U1".into(),
+                label: "@Ada".into(),
+            }]
+        );
+        assert_eq!(
+            draft.styles,
+            vec![ComposerStyleSpan {
+                start: 0,
+                end: 6,
+                style: ComposerTextStyle {
+                    bold: true,
+                    ..ComposerTextStyle::default()
+                },
+            }]
+        );
+        assert_eq!(
+            draft.blocks,
+            vec![
+                ComposerBlockSpan {
+                    start: 11,
+                    end: 17,
+                    kind: ComposerBlockKind::Quote,
+                },
+                ComposerBlockSpan {
+                    start: 18,
+                    end: 23,
+                    kind: ComposerBlockKind::NumberedList,
+                },
+                ComposerBlockSpan {
+                    start: 24,
+                    end: 30,
+                    kind: ComposerBlockKind::NumberedList,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn edit_draft_round_trips_links_and_channel_mentions() {
+        let message = SlackMessage {
+            text: Some("Docs in channel".into()),
+            blocks: Some(json!([{
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [
+                        {
+                            "type": "link",
+                            "url": "https://example.com/docs",
+                            "text": "Docs"
+                        },
+                        {"type": "text", "text": " in "},
+                        {"type": "channel", "channel_id": "C123"}
+                    ]
+                }]
+            }])),
+            document: MessageDocument::new(
+                vec![MessageNode::RichText(vec![RichTextNode::Paragraph(vec![
+                    RichInline::Link {
+                        url: "https://example.com/docs".into(),
+                        label: "Docs".into(),
+                        style: RichInlineStyle::default(),
+                    },
+                    RichInline::Text {
+                        text: " in ".into(),
+                        style: RichInlineStyle::default(),
+                    },
+                    RichInline::Channel("C123".into()),
+                ])])],
+                Some("Docs in channel".into()),
+            ),
+            ..SlackMessage::default()
+        };
+        let (mut draft, uses_rich_blocks) = composer_draft_from_message(&message, &HashMap::new())
+            .expect("rich-text message should be editable");
+        assert!(uses_rich_blocks);
+        assert_eq!(draft.text, "Docs in #C123");
+        assert_eq!(draft.entities.len(), 2);
+        assert_eq!(
+            serialize_composer_semantics(&draft.text, &draft.mentions, &draft.entities),
+            "<https://example.com/docs|Docs> in <#C123>"
+        );
+
+        draft.styles.push(ComposerStyleSpan {
+            start: 1,
+            end: 3,
+            style: ComposerTextStyle {
+                bold: true,
+                ..ComposerTextStyle::default()
+            },
+        });
+        let payload = draft
+            .slack_payload()
+            .expect("semantic draft should serialize");
+        let blocks: Value = serde_json::from_str(&payload.blocks_json).unwrap();
+        let inlines = blocks[0]["elements"][0]["elements"].as_array().unwrap();
+        assert_eq!(inlines[0]["type"], "link");
+        assert_eq!(inlines[0]["url"], "https://example.com/docs");
+        assert!(inlines.iter().any(|inline| inline["type"] == "channel"));
+
+        let mut cached_without_wire_blocks = message;
+        cached_without_wire_blocks.blocks = None;
+        assert_eq!(
+            composer_draft_from_message(&cached_without_wire_blocks, &HashMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn edit_draft_rejects_mixed_block_layouts_but_accepts_plain_text() {
+        let mixed = SlackMessage {
+            text: Some("fallback".into()),
+            blocks: Some(json!([
+                {"type": "rich_text"},
+                {"type": "section", "text": {"type": "plain_text", "text": "extra"}}
+            ])),
+            ..SlackMessage::default()
+        };
+        assert_eq!(composer_draft_from_message(&mixed, &HashMap::new()), None);
+
+        let cached_mixed = SlackMessage {
+            text: Some("fallback".into()),
+            document: MessageDocument::new(
+                vec![MessageNode::Section {
+                    text: Some("presentation".into()),
+                    fields: Vec::new(),
+                    accessory: None,
+                }],
+                Some("fallback".into()),
+            ),
+            ..SlackMessage::default()
+        };
+        assert_eq!(
+            composer_draft_from_message(&cached_mixed, &HashMap::new()),
+            None
+        );
+
+        let plain = SlackMessage {
+            text: Some("Hello <@U1>".into()),
+            ..SlackMessage::default()
+        };
+        let (draft, uses_rich_blocks) = composer_draft_from_message(
+            &plain,
+            &HashMap::from([("U1".to_string(), "Ada".to_string())]),
+        )
+        .expect("plain text should be editable");
+        assert!(!uses_rich_blocks);
+        assert_eq!(draft.text, "Hello @Ada");
+        assert_eq!(draft.mentions[0].user_id, "U1");
     }
 
     #[test]
@@ -1329,6 +2094,7 @@ mod tests {
                 user_id: "UADA".to_string(),
                 label: "@Ada".to_string(),
             }],
+            entities: Vec::new(),
             styles: vec![ComposerStyleSpan {
                 start: 0,
                 end: 5,

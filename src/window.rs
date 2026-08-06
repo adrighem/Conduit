@@ -36,13 +36,14 @@ use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
 use crate::composer::{
-    completion_key_action, decode_rich_composer_draft, emoji_token_at_caret,
-    encode_rich_composer_draft, hydrate_composer_mentions, mention_candidates,
-    mention_token_at_caret, replace_emoji_token, replace_mention_token, search_mention_candidates,
-    serialize_composer_mentions, text_view_enter_action, text_view_text, CompletionKeyAction,
-    ComposerAttachmentDraft, ComposerBlockKind, ComposerBlockSpan, ComposerStyleSpan,
-    ComposerTextStyle, EmojiToken, MentionCandidate, MentionSpan, MentionToken, RichComposerDraft,
-    TextViewEnterAction,
+    completion_key_action, composer_draft_from_message, decode_rich_composer_draft,
+    emoji_token_at_caret, encode_rich_composer_draft, expand_composer_semantic_selection,
+    hydrate_composer_mentions, mention_candidates, mention_token_at_caret, message_edit_key_action,
+    replace_emoji_token, replace_mention_token, search_mention_candidates,
+    serialize_composer_semantics, text_view_enter_action, text_view_text, CompletionKeyAction,
+    ComposerAttachmentDraft, ComposerBlockKind, ComposerBlockSpan, ComposerEntityKind,
+    ComposerEntitySpan, ComposerStyleSpan, ComposerTextStyle, EmojiToken, MentionCandidate,
+    MentionSpan, MentionToken, MessageEditKeyAction, RichComposerDraft, TextViewEnterAction,
 };
 use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
@@ -197,6 +198,23 @@ struct ComposerMentionMark {
     end: gtk::TextMark,
     user_id: String,
     label: String,
+}
+
+#[derive(Debug)]
+struct ComposerEntityMark {
+    start: gtk::TextMark,
+    end: gtk::TextMark,
+    label: String,
+    kind: ComposerEntityKind,
+}
+
+#[derive(Debug, Clone)]
+struct MessageEditState {
+    channel_id: String,
+    original: SlackMessage,
+    original_draft: RichComposerDraft,
+    uses_rich_blocks: bool,
+    submitted: bool,
 }
 
 struct SystemExternalOpener;
@@ -419,8 +437,11 @@ mod imp {
         pub(super) composer_format_css_provider: RefCell<Option<gtk::CssProvider>>,
         pub(super) message_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) thread_mentions: RefCell<Vec<ComposerMentionMark>>,
+        pub(super) message_entities: RefCell<Vec<ComposerEntityMark>>,
+        pub(super) thread_entities: RefCell<Vec<ComposerEntityMark>>,
         pub(super) message_attachments: RefCell<Vec<ComposerAttachmentDraft>>,
         pub(super) thread_attachments: RefCell<Vec<ComposerAttachmentDraft>>,
+        pub(super) message_edit: RefCell<Option<MessageEditState>>,
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
         pub(super) main_timeline_presenter: RefCell<TimelinePresenter>,
         pub(super) thread_timeline_presenter: RefCell<TimelinePresenter>,
@@ -471,6 +492,7 @@ mod imp {
             if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
                 let huddle_test = std::env::var_os("CONDUIT_TEST_HUDDLE").is_some();
                 let status_test = std::env::var_os("CONDUIT_TEST_STATUS_DIALOG").is_some();
+                let message_edit_test = std::env::var_os("CONDUIT_TEST_MESSAGE_EDIT").is_some();
                 let initial_sync_test = std::env::var_os("CONDUIT_TEST_INITIAL_SYNC").is_some();
                 let empty_new_message_test =
                     std::env::var_os("CONDUIT_TEST_EMPTY_NEW_MESSAGE").is_some();
@@ -483,8 +505,10 @@ mod imp {
                 obj.show_workspace(AuthInfo {
                     team: Some("Test Workspace".to_string()),
                     team_id: huddle_test.then(|| "TTEST".to_string()),
-                    user: (huddle_test || status_test).then(|| "Test User".to_string()),
-                    user_id: (huddle_test || status_test).then(|| "UTEST".to_string()),
+                    user: (huddle_test || status_test || message_edit_test)
+                        .then(|| "Test User".to_string()),
+                    user_id: (huddle_test || status_test || message_edit_test)
+                        .then(|| "UTEST".to_string()),
                     ..AuthInfo::default()
                 });
                 if initial_sync_test || empty_new_message_test {
@@ -572,6 +596,47 @@ mod imp {
                     obj.select_conversation(&channel_id, &title);
                 } else if obj.selected_channel_id().is_none() {
                     obj.select_conversation(test_channel_id, "#general");
+                }
+                if message_edit_test {
+                    let mut messages = vec![
+                        SlackMessage {
+                            user: Some("UOTHER".to_string()),
+                            text: Some("Newer message from someone else".to_string()),
+                            ts: "3.0".to_string(),
+                            ..SlackMessage::default()
+                        },
+                        SlackMessage {
+                            user: Some("UTEST".to_string()),
+                            text: Some("Last sent message".to_string()),
+                            ts: "2.0".to_string(),
+                            ..SlackMessage::default()
+                        },
+                        SlackMessage {
+                            user: Some("UTEST".to_string()),
+                            text: Some("Older sent message".to_string()),
+                            ts: "1.0".to_string(),
+                            ..SlackMessage::default()
+                        },
+                    ];
+                    for message in &mut messages {
+                        message.refresh_canonical_content();
+                    }
+                    obj.imp().workspace.view.borrow_mut().apply_history(
+                        test_channel_id,
+                        messages,
+                        false,
+                        None,
+                        false,
+                        true,
+                    );
+                    let messages = obj
+                        .imp()
+                        .workspace
+                        .view
+                        .borrow()
+                        .snapshot()
+                        .channel_messages;
+                    obj.populate_history(test_channel_id, messages);
                 }
                 if huddle_test {
                     let huddle = crate::huddles::model::ActiveHuddle {
@@ -733,6 +798,10 @@ menubutton.composer-format-control > button {
   min-width: 0;
   min-height: 0;
   padding: 0;
+}
+button.message-edit-action {
+  background-color: @success_bg_color;
+  color: @success_fg_color;
 }
 "#;
 const MAX_COMPOSER_ATTACHMENTS: usize = 10;
@@ -2187,6 +2256,23 @@ fn submitted_draft_matches(
         .is_some_and(|text| text.trim() == submitted)
 }
 
+fn latest_editable_message(
+    messages: &[SlackMessage],
+    current_user_id: Option<&str>,
+) -> Option<SlackMessage> {
+    let current_user_id = current_user_id?;
+    messages
+        .iter()
+        .find(|message| {
+            message.author_user_id() == Some(current_user_id)
+                && !message.is_thread_reply()
+                && matches!(message.subtype.as_deref(), None | Some("me_message"))
+                && !message.ts.trim().is_empty()
+                && !message.body_text().trim().is_empty()
+        })
+        .cloned()
+}
+
 fn remove_submitted_attachments(
     current: &mut RichComposerDraft,
     submitted: &RichComposerDraft,
@@ -2326,6 +2412,10 @@ enum RuntimeFailureRecovery {
         channel_id: String,
         thread_ts: Option<String>,
     },
+    UpdateMessage {
+        channel_id: String,
+        message_ts: String,
+    },
     Reaction {
         channel_id: String,
         thread_ts: Option<String>,
@@ -2399,6 +2489,12 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
             channel_id: channel_id.clone(),
             thread_ts: thread_ts.clone(),
         },
+        (RuntimeOperation::UpdateMessage, RuntimeTarget::ExactMessage { channel_id, ts }) => {
+            RuntimeFailureRecovery::UpdateMessage {
+                channel_id: channel_id.clone(),
+                message_ts: ts.clone(),
+            }
+        }
         (
             RuntimeOperation::Reaction,
             RuntimeTarget::Message {
@@ -5064,7 +5160,28 @@ impl ConduitWindow {
 
         clear_stale_upload_staging(&self.imp().drafts.borrow());
         self.setup_window_actions();
+        let edit_cancel_controller = gtk::EventControllerKey::new();
+        edit_cancel_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak_window = self.downgrade();
+        edit_cancel_controller.connect_key_pressed(move |_, key, _, state| {
+            let Some(window) = weak_window.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if message_edit_key_action(key, state, false, window.message_edit_is_active())
+                == MessageEditKeyAction::Cancel
+            {
+                window.cancel_message_edit();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        self.add_controller(edit_cancel_controller);
         self.connect_close_request(|window| {
+            if window.message_edit_submission_pending() {
+                window.set_status(&gettext("Wait for the edited message to finish saving."));
+                return glib::Propagation::Stop;
+            }
             window.flush_persistent_state();
             glib::Propagation::Proceed
         });
@@ -5406,14 +5523,29 @@ impl ConduitWindow {
         });
     }
 
-    fn flush_current_drafts(&self) {
+    fn message_edit_submission_pending(&self) -> bool {
+        self.imp()
+            .message_edit
+            .borrow()
+            .as_ref()
+            .is_some_and(|edit| edit.submitted)
+    }
+
+    fn flush_current_drafts(&self) -> bool {
+        if self.message_edit_submission_pending() {
+            self.set_status(&gettext("Wait for the edited message to finish saving."));
+            record_test_message_edit_state(self, "navigation-blocked");
+            return false;
+        }
+        self.exit_message_edit(None, "abandoned");
         let generation = self.imp().draft_save_generation.get().saturating_add(1);
         self.imp().draft_save_generation.set(generation);
         self.save_current_drafts();
+        true
     }
 
     pub(crate) fn flush_persistent_state(&self) {
-        self.flush_current_drafts();
+        let _ = self.flush_current_drafts();
         self.save_selected_conversation();
         self.save_window_state();
     }
@@ -5435,7 +5567,11 @@ impl ConduitWindow {
         let thread_key = self
             .selected_thread_ts()
             .and_then(|thread_ts| self.draft_key(&channel_id, Some(&thread_ts)));
-        let message_text = self.composer_draft_storage(ComposerTarget::Message);
+        let message_text = if self.message_edit_is_active() {
+            String::new()
+        } else {
+            self.composer_draft_storage(ComposerTarget::Message)
+        };
         let thread_text = self.composer_draft_storage(ComposerTarget::Thread);
         {
             let mut drafts = self.imp().drafts.borrow_mut();
@@ -5809,6 +5945,155 @@ impl ConduitWindow {
             .set_sensitive(sensitive);
     }
 
+    fn message_edit_is_active(&self) -> bool {
+        self.imp().message_edit.borrow().is_some()
+    }
+
+    fn set_message_edit_submission_state(&self, submitted: bool) {
+        let imp = self.imp();
+        imp.send_button.set_sensitive(!submitted);
+        imp.upload_button.set_sensitive(false);
+        imp.message_attachment_previews.set_sensitive(false);
+        imp.message_entry.set_editable(!submitted);
+        let formatting_supported = imp
+            .message_edit
+            .borrow()
+            .as_ref()
+            .is_some_and(|edit| edit.uses_rich_blocks);
+        imp.message_format_toolbar
+            .set_sensitive(!submitted && formatting_supported);
+        imp.message_format_overflow
+            .set_sensitive(!submitted && formatting_supported);
+    }
+
+    fn sync_message_edit_presentation(&self, editing: bool) {
+        let imp = self.imp();
+        if editing {
+            imp.message_title.set_title(&gettext("Edit message"));
+            imp.message_title
+                .set_subtitle(&gettext("Press Escape to cancel"));
+            imp.message_title.set_tooltip_text(None);
+            imp.message_title
+                .update_property(&[gtk::accessible::Property::Description(&gettext(
+                    "Editing message. Press Escape to cancel.",
+                ))]);
+            imp.send_button.remove_css_class("suggested-action");
+            imp.send_button.add_css_class("message-edit-action");
+            imp.send_button.set_icon_name("document-save-symbolic");
+            imp.send_button
+                .set_tooltip_text(Some(&gettext("Save Edited Message")));
+            imp.send_button
+                .update_property(&[gtk::accessible::Property::Label(&gettext(
+                    "Save Edited Message",
+                ))]);
+        } else {
+            imp.send_button.remove_css_class("message-edit-action");
+            imp.send_button.add_css_class("suggested-action");
+            imp.send_button.set_icon_name("mail-send-symbolic");
+            imp.send_button
+                .set_tooltip_text(Some(&gettext("Send Message")));
+            imp.send_button
+                .update_property(&[gtk::accessible::Property::Label(&gettext("Send Message"))]);
+            self.refresh_current_conversation_title();
+        }
+    }
+
+    fn start_message_edit(&self) -> bool {
+        if self.current_main_view() != MainMessageView::Conversation
+            || self.message_edit_is_active()
+            || !self.imp().send_button.is_sensitive()
+        {
+            return false;
+        }
+        let current_draft = self.composer_rich_draft(ComposerTarget::Message);
+        if !current_draft.text.is_empty() || !current_draft.attachments.is_empty() {
+            return false;
+        }
+        let Some(channel_id) = self.visible_channel_id() else {
+            return false;
+        };
+        let current_user_id = self.imp().current_user_id.borrow().clone();
+        let original = {
+            let state = self.imp().workspace.view.borrow();
+            latest_editable_message(
+                state.channel_tail_messages(&channel_id),
+                current_user_id.as_deref(),
+            )
+        };
+        let Some(original) = original else {
+            self.set_status(&gettext("No sent message is available to edit."));
+            return false;
+        };
+        let Some((draft, uses_rich_blocks)) =
+            composer_draft_from_message(&original, &self.imp().user_names.borrow())
+        else {
+            self.set_status(&gettext("This message layout cannot be safely edited."));
+            return false;
+        };
+        if draft.text.trim().is_empty() {
+            return false;
+        }
+
+        *self.imp().message_edit.borrow_mut() = Some(MessageEditState {
+            channel_id,
+            original,
+            original_draft: draft.clone(),
+            uses_rich_blocks,
+            submitted: false,
+        });
+        self.set_composer_rich_draft(ComposerTarget::Message, &draft);
+        self.sync_message_edit_presentation(true);
+        self.set_message_edit_submission_state(false);
+        let text_view = self.composer_text_view(ComposerTarget::Message);
+        let buffer = text_view.buffer();
+        buffer.place_cursor(&buffer.end_iter());
+        text_view.grab_focus();
+        self.set_status(&gettext("Editing message. Press Escape to cancel."));
+        record_test_message_edit_state(self, "editing");
+        true
+    }
+
+    fn exit_message_edit(&self, status: Option<&str>, test_state: &str) -> bool {
+        if self.imp().message_edit.borrow_mut().take().is_none() {
+            return false;
+        }
+        self.set_composer_rich_draft(ComposerTarget::Message, &RichComposerDraft::default());
+        self.sync_message_edit_presentation(false);
+        self.imp().message_entry.set_editable(true);
+        self.imp().message_format_toolbar.set_sensitive(true);
+        self.imp().message_format_overflow.set_sensitive(true);
+        self.set_composer_submission_sensitive(ComposerTarget::Message, true);
+        if let Some(status) = status {
+            self.set_status(status);
+        }
+        record_test_message_edit_state(self, test_state);
+        true
+    }
+
+    fn cancel_message_edit(&self) -> bool {
+        let submitted = self
+            .imp()
+            .message_edit
+            .borrow()
+            .as_ref()
+            .is_some_and(|edit| edit.submitted);
+        if submitted {
+            self.set_status(&gettext("The edited message is being saved."));
+            return true;
+        }
+        self.exit_message_edit(Some(&gettext("Message edit canceled.")), "canceled")
+    }
+
+    fn finish_message_edit(&self, channel_id: &str, message_ts: &str) -> bool {
+        let matches = self
+            .imp()
+            .message_edit
+            .borrow()
+            .as_ref()
+            .is_some_and(|edit| edit.channel_id == channel_id && edit.original.ts == message_ts);
+        matches && self.exit_message_edit(None, "completed")
+    }
+
     fn reset_composer_upload_progress(&self, target: ComposerTarget) {
         let progress = self.composer_upload_progress(target);
         progress.set_visible(false);
@@ -5831,6 +6116,15 @@ impl ConduitWindow {
         path: PathBuf,
         remove_after_upload: bool,
     ) {
+        if target == ComposerTarget::Message && self.message_edit_is_active() {
+            if remove_after_upload {
+                let _ = std::fs::remove_file(path);
+            }
+            self.set_status(&gettext(
+                "Attachments cannot be added while editing a message.",
+            ));
+            return;
+        }
         if !path.is_file() {
             self.set_status(&gettext("The selected attachment is no longer available."));
             if remove_after_upload {
@@ -6318,6 +6612,14 @@ impl ConduitWindow {
                 buffer.apply_tag_by_name(tag, &start, &end);
             }
         } else if let Some((start, end)) = selection {
+            let (start_offset, end_offset) = expand_composer_semantic_selection(
+                start.offset().max(0) as usize,
+                end.offset().max(0) as usize,
+                &self.composer_mention_spans(target),
+                &self.composer_entity_spans(target),
+            );
+            let start = buffer.iter_at_offset(start_offset as i32);
+            let end = buffer.iter_at_offset(end_offset as i32);
             if active {
                 buffer.apply_tag_by_name(tag, &start, &end);
             } else {
@@ -6375,6 +6677,13 @@ impl ConduitWindow {
         }
     }
 
+    fn composer_entities(&self, target: ComposerTarget) -> &RefCell<Vec<ComposerEntityMark>> {
+        match target {
+            ComposerTarget::Message => &self.imp().message_entities,
+            ComposerTarget::Thread => &self.imp().thread_entities,
+        }
+    }
+
     fn ensure_composer_mention_tag(&self, target: ComposerTarget) {
         const TAG_NAME: &str = "composer-mention";
         let buffer = self.composer_text_view(target).buffer();
@@ -6397,6 +6706,18 @@ impl ConduitWindow {
         }
     }
 
+    fn clear_composer_entities(&self, target: ComposerTarget) {
+        let buffer = self.composer_text_view(target).buffer();
+        for entity in self.composer_entities(target).borrow_mut().drain(..) {
+            if !entity.start.is_deleted() {
+                buffer.delete_mark(&entity.start);
+            }
+            if !entity.end.is_deleted() {
+                buffer.delete_mark(&entity.end);
+            }
+        }
+    }
+
     fn add_composer_mention(&self, target: ComposerTarget, span: MentionSpan) {
         const TAG_NAME: &str = "composer-mention";
         self.ensure_composer_mention_tag(target);
@@ -6415,6 +6736,45 @@ impl ConduitWindow {
                 end: buffer.create_mark(None, &end, true),
                 user_id: span.user_id,
                 label: span.label,
+            });
+    }
+
+    fn add_composer_entity(&self, target: ComposerTarget, span: ComposerEntitySpan) {
+        const LINK_TAG_NAME: &str = "composer-link";
+        const CHANNEL_TAG_NAME: &str = "composer-channel";
+        let buffer = self.composer_text_view(target).buffer();
+        let table = buffer.tag_table();
+        for tag in [
+            gtk::TextTag::builder()
+                .name(LINK_TAG_NAME)
+                .underline(gtk::pango::Underline::Single)
+                .build(),
+            gtk::TextTag::builder()
+                .name(CHANNEL_TAG_NAME)
+                .weight(600)
+                .build(),
+        ] {
+            let Some(name) = tag.name() else {
+                continue;
+            };
+            if table.lookup(name.as_str()).is_none() {
+                table.add(&tag);
+            }
+        }
+        let start = buffer.iter_at_offset(span.start as i32);
+        let end = buffer.iter_at_offset(span.end as i32);
+        let tag_name = match &span.kind {
+            ComposerEntityKind::Link { .. } => LINK_TAG_NAME,
+            ComposerEntityKind::Channel { .. } => CHANNEL_TAG_NAME,
+        };
+        buffer.apply_tag_by_name(tag_name, &start, &end);
+        self.composer_entities(target)
+            .borrow_mut()
+            .push(ComposerEntityMark {
+                start: buffer.create_mark(None, &start, false),
+                end: buffer.create_mark(None, &end, true),
+                label: span.label,
+                kind: span.kind,
             });
     }
 
@@ -6452,6 +6812,56 @@ impl ConduitWindow {
                     buffer.remove_tag_by_name(TAG_NAME, &start_iter, &end_iter);
                     buffer.delete_mark(&mention.start);
                     buffer.delete_mark(&mention.end);
+                    false
+                }
+            });
+        spans
+    }
+
+    fn composer_entity_spans(&self, target: ComposerTarget) -> Vec<ComposerEntitySpan> {
+        const LINK_TAG_NAME: &str = "composer-link";
+        const CHANNEL_TAG_NAME: &str = "composer-channel";
+        let text_view = self.composer_text_view(target);
+        let buffer = text_view.buffer();
+        let text = text_view_text(&text_view);
+        let characters = text.chars().collect::<Vec<_>>();
+        let mut spans = Vec::new();
+        self.composer_entities(target)
+            .borrow_mut()
+            .retain_mut(|entity| {
+                if entity.start.is_deleted() || entity.end.is_deleted() {
+                    return false;
+                }
+                let start = buffer.iter_at_mark(&entity.start).offset().max(0) as usize;
+                let end = buffer.iter_at_mark(&entity.end).offset().max(0) as usize;
+                let current_label = (start < end && end <= characters.len())
+                    .then(|| characters[start..end].iter().collect::<String>());
+                let valid = match (&entity.kind, current_label.as_deref()) {
+                    (ComposerEntityKind::Link { .. }, Some(label)) => {
+                        entity.label = label.to_string();
+                        true
+                    }
+                    (ComposerEntityKind::Channel { .. }, Some(label)) => label == entity.label,
+                    (_, None) => false,
+                };
+                if valid {
+                    spans.push(ComposerEntitySpan {
+                        start,
+                        end,
+                        label: entity.label.clone(),
+                        kind: entity.kind.clone(),
+                    });
+                    true
+                } else {
+                    let tag_start = start.min(end).min(characters.len());
+                    let tag_end = start.max(end).min(characters.len());
+                    let start_iter = buffer.iter_at_offset(tag_start as i32);
+                    let end_iter = buffer.iter_at_offset(tag_end as i32);
+                    for tag_name in [LINK_TAG_NAME, CHANNEL_TAG_NAME] {
+                        buffer.remove_tag_by_name(tag_name, &start_iter, &end_iter);
+                    }
+                    buffer.delete_mark(&entity.start);
+                    buffer.delete_mark(&entity.end);
                     false
                 }
             });
@@ -6522,7 +6932,7 @@ impl ConduitWindow {
         }
     }
 
-    fn composer_range_intersects_mention(
+    fn composer_range_intersects_semantic(
         &self,
         target: ComposerTarget,
         start: usize,
@@ -6531,11 +6941,19 @@ impl ConduitWindow {
         self.composer_mention_spans(target)
             .iter()
             .any(|span| start < span.end && span.start < end)
+            || self
+                .composer_entity_spans(target)
+                .iter()
+                .any(|span| start < span.end && span.start < end)
     }
 
     fn composer_canonical_text(&self, target: ComposerTarget) -> String {
         let text = text_view_text(&self.composer_text_view(target));
-        serialize_composer_mentions(&text, &self.composer_mention_spans(target))
+        serialize_composer_semantics(
+            &text,
+            &self.composer_mention_spans(target),
+            &self.composer_entity_spans(target),
+        )
     }
 
     fn ensure_composer_format_tags(&self, target: ComposerTarget) {
@@ -6683,6 +7101,7 @@ impl ConduitWindow {
         RichComposerDraft {
             text: text_view_text(&self.composer_text_view(target)),
             mentions: self.composer_mention_spans(target),
+            entities: self.composer_entity_spans(target),
             styles: self.composer_style_spans(target),
             blocks: self.composer_block_spans(target),
             attachments: self.composer_attachments(target).borrow().clone(),
@@ -6704,6 +7123,7 @@ impl ConduitWindow {
             toolbar.updating.set(true);
         }
         self.clear_composer_mentions(target);
+        self.clear_composer_entities(target);
         let buffer = self.composer_text_view(target).buffer();
         buffer.set_text(&draft.text);
         let length = buffer.char_count().max(0) as usize;
@@ -6744,6 +7164,9 @@ impl ConduitWindow {
         for mention in &draft.mentions {
             self.add_composer_mention(target, mention.clone());
         }
+        for entity in &draft.entities {
+            self.add_composer_entity(target, entity.clone());
+        }
         if let Some(toolbar) = self.composer_toolbar(target).borrow().as_ref() {
             toolbar.updating.set(false);
         }
@@ -6767,6 +7190,7 @@ impl ConduitWindow {
             toolbar.updating.set(true);
         }
         self.clear_composer_mentions(target);
+        self.clear_composer_entities(target);
         self.composer_text_view(target)
             .buffer()
             .set_text(&hydrated.text);
@@ -6869,7 +7293,7 @@ impl ConduitWindow {
         let text = text_view_text(&text_view);
         let caret = buffer.cursor_position().max(0) as usize;
         let mention_token = mention_token_at_caret(&text, caret).filter(|token| {
-            !self.composer_range_intersects_mention(target, token.start, token.end)
+            !self.composer_range_intersects_semantic(target, token.start, token.end)
         });
         let (token, entries) = if let Some(token) = mention_token {
             let candidates = mention_candidates(&self.imp().discovered_users.borrow());
@@ -7064,6 +7488,20 @@ impl ConduitWindow {
         key: gtk::gdk::Key,
         state: gtk::gdk::ModifierType,
     ) -> glib::Propagation {
+        if target == ComposerTarget::Message {
+            let draft = self.composer_rich_draft(target);
+            let empty = draft.text.is_empty() && draft.attachments.is_empty();
+            match message_edit_key_action(key, state, empty, self.message_edit_is_active()) {
+                MessageEditKeyAction::Start if self.start_message_edit() => {
+                    return glib::Propagation::Stop;
+                }
+                MessageEditKeyAction::Cancel => {
+                    self.cancel_message_edit();
+                    return glib::Propagation::Stop;
+                }
+                MessageEditKeyAction::Start | MessageEditKeyAction::Ignore => {}
+            }
+        }
         let is_open = {
             let completion_ref = self.composer_completion(target).borrow();
             completion_ref
@@ -7641,6 +8079,33 @@ impl ConduitWindow {
                     self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
                 }
             }
+            RuntimeEventKind::MessageUpdated {
+                channel_id,
+                message,
+            } => {
+                let message = *message;
+                let edit_finished = self.finish_message_edit(&channel_id, &message.ts);
+                if edit_finished
+                    || self.visible_channel_id().as_deref() == Some(channel_id.as_str())
+                {
+                    self.set_status(&gettext("Message updated"));
+                }
+                let outcome = self.apply_timeline_message(
+                    &channel_id,
+                    &message,
+                    RealtimeMessageKind::Changed,
+                    false,
+                    None,
+                );
+                if outcome.refresh_unreads {
+                    self.populate_unreads(self.unread_items());
+                } else {
+                    self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+                }
+                if edit_finished {
+                    self.activate_pending_navigation_intents();
+                }
+            }
             RuntimeEventKind::ReactionUpdated {
                 channel_id,
                 ts,
@@ -8106,6 +8571,10 @@ impl ConduitWindow {
     }
 
     fn go_back(&self) {
+        if self.message_edit_submission_pending() {
+            self.set_status(&gettext("Wait for the edited message to finish saving."));
+            return;
+        }
         let imp = self.imp();
         if imp.profile_visible.replace(false) {
             imp.pending_profile_user_id.borrow_mut().take();
@@ -8126,6 +8595,9 @@ impl ConduitWindow {
             MainNavigationTarget::Unreads => self.show_unreads(),
             MainNavigationTarget::Threads => self.show_threads(),
             MainNavigationTarget::Search => {
+                if !self.flush_current_drafts() {
+                    return;
+                }
                 imp.workspace.view.borrow_mut().show_search();
                 self.render_closed_thread();
                 self.render_conversations();
@@ -8140,7 +8612,9 @@ impl ConduitWindow {
     }
 
     fn show_messages(&self) {
-        self.flush_current_drafts();
+        if !self.flush_current_drafts() {
+            return;
+        }
         if let Some(channel_id) = self.selected_channel_id() {
             let title = self.conversation_title(&channel_id);
             self.select_conversation(&channel_id, &title);
@@ -8156,8 +8630,10 @@ impl ConduitWindow {
     }
 
     fn show_unreads(&self) {
+        if !self.flush_current_drafts() {
+            return;
+        }
         self.record_navigation(&MainNavigationTarget::Unreads);
-        self.flush_current_drafts();
         self.imp().workspace.view.borrow_mut().show_unreads();
         self.render_closed_thread();
         let items = self.unread_items();
@@ -8166,8 +8642,10 @@ impl ConduitWindow {
     }
 
     fn show_threads(&self) {
+        if !self.flush_current_drafts() {
+            return;
+        }
         self.record_navigation(&MainNavigationTarget::Threads);
-        self.flush_current_drafts();
         self.imp().workspace.view.borrow_mut().show_threads();
         self.render_closed_thread();
         self.populate_threads();
@@ -8175,21 +8653,25 @@ impl ConduitWindow {
     }
 
     fn show_files(&self) {
-        self.start_files_surface(&gettext("Loading files"));
-        self.send_command(RuntimeCommand::LoadFiles);
+        if self.start_files_surface(&gettext("Loading files")) {
+            self.send_command(RuntimeCommand::LoadFiles);
+        }
     }
 
     fn show_slack_file(&self, file_id: &str, share_requested: bool) {
-        self.start_files_surface(&gettext("Loading file"));
-        self.send_command(RuntimeCommand::LoadFile {
-            file_id: file_id.to_string(),
-            share_requested,
-        });
+        if self.start_files_surface(&gettext("Loading file")) {
+            self.send_command(RuntimeCommand::LoadFile {
+                file_id: file_id.to_string(),
+                share_requested,
+            });
+        }
     }
 
-    fn start_files_surface(&self, loading_message: &str) {
+    fn start_files_surface(&self, loading_message: &str) -> bool {
+        if !self.flush_current_drafts() {
+            return false;
+        }
         self.record_navigation(&MainNavigationTarget::Files);
-        self.flush_current_drafts();
         let title = gettext("Files");
         self.imp().workspace.view.borrow_mut().start_files();
         self.render_closed_thread();
@@ -8197,11 +8679,14 @@ impl ConduitWindow {
         self.render_conversations();
         self.load_message_html(&message_html::placeholder_document(&title, loading_message));
         self.imp().workspace_split.set_show_content(true);
+        true
     }
 
     fn show_later(&self) {
+        if !self.flush_current_drafts() {
+            return;
+        }
         self.record_navigation(&MainNavigationTarget::Saved);
-        self.flush_current_drafts();
         let title = gettext("Later");
         self.imp().workspace.view.borrow_mut().start_saved();
         self.imp().message_title.set_title(&title);
@@ -8221,8 +8706,10 @@ impl ConduitWindow {
             self.set_status("Enter a message search query");
             return;
         }
+        if !self.flush_current_drafts() {
+            return;
+        }
         self.record_navigation(&MainNavigationTarget::Search);
-        self.flush_current_drafts();
         self.imp().workspace.view.borrow_mut().start_search();
         let title = gettext("Search results");
         self.render_closed_thread();
@@ -8277,7 +8764,73 @@ impl ConduitWindow {
         self.submit_composer(ComposerTarget::Thread);
     }
 
+    fn submit_message_edit(&self) {
+        let draft = self.composer_rich_draft(ComposerTarget::Message);
+        if !draft.attachments.is_empty() {
+            self.set_status(&gettext(
+                "Attachments cannot be added while editing a message.",
+            ));
+            return;
+        }
+        let Some(payload) = draft.slack_payload() else {
+            self.set_status(&gettext("An edited message cannot be empty."));
+            return;
+        };
+        let (channel_id, original, unchanged, already_submitted, uses_rich_blocks) = {
+            let edit = self.imp().message_edit.borrow();
+            let Some(edit) = edit.as_ref() else {
+                return;
+            };
+            let original_payload = edit.original_draft.slack_payload();
+            let uses_rich_blocks = edit.uses_rich_blocks;
+            let unchanged = original_payload.as_ref().is_some_and(|original_payload| {
+                if uses_rich_blocks {
+                    original_payload == &payload
+                } else {
+                    original_payload.fallback_text == payload.fallback_text
+                }
+            });
+            (
+                edit.channel_id.clone(),
+                edit.original.clone(),
+                unchanged,
+                edit.submitted,
+                uses_rich_blocks,
+            )
+        };
+        if already_submitted {
+            return;
+        }
+        if self.visible_channel_id().as_deref() != Some(channel_id.as_str()) {
+            self.exit_message_edit(None, "abandoned");
+            return;
+        }
+        if unchanged {
+            self.exit_message_edit(Some(&gettext("Message was unchanged.")), "unchanged");
+            return;
+        }
+        if let Some(edit) = self.imp().message_edit.borrow_mut().as_mut() {
+            edit.submitted = true;
+        }
+        self.set_message_edit_submission_state(true);
+        self.set_status(&gettext("Saving edited message"));
+        record_test_message_edit_state(self, "submitted");
+        if std::env::var_os("CONDUIT_TEST_MESSAGE_EDIT_NO_RUNTIME").is_some() {
+            return;
+        }
+        self.send_command(RuntimeCommand::UpdateMessage {
+            channel_id,
+            original: Box::new(original),
+            text: payload.fallback_text,
+            blocks_json: uses_rich_blocks.then_some(payload.blocks_json),
+        });
+    }
+
     fn submit_composer(&self, target: ComposerTarget) {
+        if target == ComposerTarget::Message && self.message_edit_is_active() {
+            self.submit_message_edit();
+            return;
+        }
         let Some(channel_id) = self.visible_channel_id() else {
             self.set_status("Select a conversation");
             return;
@@ -8333,7 +8886,9 @@ impl ConduitWindow {
             return;
         }
 
-        self.flush_current_drafts();
+        if !self.flush_current_drafts() {
+            return;
+        }
         if !record_upload_submission(
             &mut self.imp().pending_upload_drafts.borrow_mut(),
             key,
@@ -8517,13 +9072,17 @@ impl ConduitWindow {
     }
 
     fn close_thread(&self) {
-        self.flush_current_drafts();
+        if !self.flush_current_drafts() {
+            return;
+        }
         self.imp().workspace.view.borrow_mut().close_thread();
         self.render_closed_thread();
     }
 
     fn open_thread(&self, channel_id: &str, ts: &str) {
-        self.flush_current_drafts();
+        if !self.flush_current_drafts() {
+            return;
+        }
         if self.visible_channel_id().as_deref() != Some(channel_id) {
             let title = self.conversation_title(channel_id);
             self.select_conversation(channel_id, &title);
@@ -8571,7 +9130,9 @@ impl ConduitWindow {
         let channel_id = location.channel_id().to_string();
         let thread_ts = location.thread_ts().map(ToString::to_string);
         let title = self.conversation_title(&channel_id);
-        self.select_conversation_target(&channel_id, &title, Some(location.message_ts()));
+        if !self.select_conversation_target(&channel_id, &title, Some(location.message_ts())) {
+            return;
+        }
         if let Some(thread_ts) = thread_ts.as_deref() {
             self.open_thread(&channel_id, thread_ts);
         }
@@ -8620,6 +9181,9 @@ impl ConduitWindow {
     fn show_user_profile(&self, user_id: &str) {
         let user_id = user_id.trim();
         if user_id.is_empty() {
+            return;
+        }
+        if !self.flush_current_drafts() {
             return;
         }
         self.close_media_viewer();
@@ -9183,7 +9747,10 @@ impl ConduitWindow {
     }
 
     fn reset_workspace_state(&self) {
-        self.flush_current_drafts();
+        if !self.flush_current_drafts() {
+            self.exit_message_edit(None, "abandoned");
+            self.save_current_drafts();
+        }
         self.close_media_viewer();
         self.withdraw_huddle_notification();
         let imp = self.imp();
@@ -9492,6 +10059,30 @@ impl ConduitWindow {
                         ComposerTarget::Message
                     };
                     self.set_composer_submission_sensitive(target, true);
+                    self.set_status(error);
+                }
+            }
+            RuntimeFailureRecovery::UpdateMessage {
+                channel_id,
+                message_ts,
+            } => {
+                let edit_active = {
+                    let mut edit = self.imp().message_edit.borrow_mut();
+                    edit.as_mut().is_some_and(|edit| {
+                        let matches =
+                            edit.channel_id == channel_id && edit.original.ts == message_ts;
+                        if matches {
+                            edit.submitted = false;
+                        }
+                        matches
+                    })
+                };
+                if edit_active {
+                    self.sync_message_edit_presentation(true);
+                    self.set_message_edit_submission_state(false);
+                    self.set_status(error);
+                    record_test_message_edit_state(self, "failed");
+                } else if self.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
                     self.set_status(error);
                 }
             }
@@ -11305,6 +11896,10 @@ impl ConduitWindow {
     }
 
     fn refresh_current_conversation_title(&self) {
+        if self.message_edit_is_active() {
+            self.sync_message_edit_presentation(true);
+            return;
+        }
         let imp = self.imp();
         if self.current_main_view() == MainMessageView::Conversation {
             if let Some(channel_id) = self.visible_channel_id() {
@@ -11367,6 +11962,9 @@ impl ConduitWindow {
     }
 
     fn refresh_conversation_title_status(&self, channel_id: &str) {
+        if self.message_edit_is_active() {
+            return;
+        }
         let imp = self.imp();
         let status = imp
             .workspace
@@ -11436,7 +12034,7 @@ impl ConduitWindow {
     }
 
     fn select_conversation(&self, channel_id: &str, title: &str) {
-        self.select_conversation_target(channel_id, title, None);
+        let _ = self.select_conversation_target(channel_id, title, None);
     }
 
     fn select_conversation_target(
@@ -11444,9 +12042,11 @@ impl ConduitWindow {
         channel_id: &str,
         title: &str,
         explicit_message_ts: Option<&str>,
-    ) {
+    ) -> bool {
+        if !self.flush_current_drafts() {
+            return false;
+        }
         self.record_navigation(&MainNavigationTarget::Conversation(channel_id.to_string()));
-        self.flush_current_drafts();
         crate::debug::log(
             "ui",
             &format!("select_conversation channel_id={channel_id} title={title}"),
@@ -11530,6 +12130,7 @@ impl ConduitWindow {
         }
         self.imp().pending_last_conversation.borrow_mut().take();
         self.save_selected_conversation();
+        true
     }
 
     fn request_channel_history(&self, channel_id: &str) {
@@ -11563,8 +12164,12 @@ impl ConduitWindow {
         scroll_behavior: TimelineScrollBehavior,
     ) {
         let imp = self.imp();
-        imp.message_title
-            .set_title(&self.conversation_title(channel_id));
+        if self.message_edit_is_active() {
+            self.sync_message_edit_presentation(true);
+        } else {
+            imp.message_title
+                .set_title(&self.conversation_title(channel_id));
+        }
         let mut context = self.message_html_context(None);
         (
             context.message_control_handles,
@@ -12047,6 +12652,10 @@ impl ConduitWindow {
                     self.queue_ui_invalidations(UiInvalidations::THREAD);
                 }
             }
+        }
+
+        if outcome.refresh_derived_view {
+            self.rerender_current_main_messages();
         }
 
         self.request_user_names(std::slice::from_ref(message));
@@ -12764,6 +13373,11 @@ impl ConduitWindow {
     }
 
     fn activate_pending_slack_uris(&self) -> bool {
+        if self.message_edit_submission_pending() {
+            self.set_status(&gettext("Wait for the edited message to finish saving."));
+            record_test_message_edit_state(self, "navigation-blocked");
+            return false;
+        }
         let mut opened = false;
         loop {
             let Some(uri) = self.imp().pending_slack_uris.borrow().front().cloned() else {
@@ -12818,6 +13432,11 @@ impl ConduitWindow {
     }
 
     fn activate_pending_notification_target(&self) -> bool {
+        if self.message_edit_submission_pending() {
+            self.set_status(&gettext("Wait for the edited message to finish saving."));
+            record_test_message_edit_state(self, "navigation-blocked");
+            return false;
+        }
         let Some(target) = self.imp().pending_notification_target.borrow().clone() else {
             return false;
         };
@@ -13419,6 +14038,32 @@ fn record_test_web_view_lifecycle(window: &ConduitWindow) {
             "thread_open": window.thread_pane().is_open(),
             "thread_widget_children": thread_widget_children,
             "selected_channel": window.selected_channel_id(),
+        })
+        .to_string(),
+    );
+}
+
+fn record_test_message_edit_state(window: &ConduitWindow, state: &str) {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_MESSAGE_EDIT_FILE") else {
+        return;
+    };
+    let imp = window.imp();
+    let edit = imp.message_edit.borrow();
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({
+            "state": state,
+            "channel_id": edit.as_ref().map(|edit| edit.channel_id.as_str()),
+            "message_ts": edit.as_ref().map(|edit| edit.original.ts.as_str()),
+            "header_title": imp.message_title.title().to_string(),
+            "header_subtitle": imp.message_title.subtitle().to_string(),
+            "send_tooltip": imp.send_button.tooltip_text().map(|text| text.to_string()),
+            "edit_class": imp.send_button.has_css_class("message-edit-action"),
+            "suggested_class": imp.send_button.has_css_class("suggested-action"),
+            "send_sensitive": imp.send_button.is_sensitive(),
+            "upload_sensitive": imp.upload_button.is_sensitive(),
+            "entry_editable": imp.message_entry.is_editable(),
+            "format_sensitive": imp.message_format_toolbar.is_sensitive(),
         })
         .to_string(),
     );
@@ -14753,6 +15398,10 @@ mod tests {
             channel_id: "C123".to_string(),
             thread_ts: Some("1.0".to_string()),
         };
+        let exact_message = RuntimeTarget::ExactMessage {
+            channel_id: "C123".to_string(),
+            ts: "2.0".to_string(),
+        };
 
         let cases = [
             (
@@ -14855,6 +15504,14 @@ mod tests {
                 RuntimeFailureRecovery::PostMessage {
                     channel_id: "C123".to_string(),
                     thread_ts: Some("1.0".to_string()),
+                },
+            ),
+            (
+                RuntimeOperation::UpdateMessage,
+                exact_message,
+                RuntimeFailureRecovery::UpdateMessage {
+                    channel_id: "C123".to_string(),
+                    message_ts: "2.0".to_string(),
                 },
             ),
             (
@@ -15803,6 +16460,48 @@ mod tests {
             Some("https://workspace.slack.com".into())
         );
         assert_eq!(workspace_identity(&AuthInfo::default()), None);
+    }
+
+    #[test]
+    fn latest_editable_message_skips_newer_foreign_and_ineligible_messages() {
+        let messages = vec![
+            SlackMessage {
+                user: Some("UOTHER".into()),
+                text: Some("newer foreign".into()),
+                ts: "5.0".into(),
+                ..Default::default()
+            },
+            SlackMessage {
+                user: Some("USELF".into()),
+                text: Some("thread reply".into()),
+                ts: "4.0".into(),
+                thread_ts: Some("1.0".into()),
+                ..Default::default()
+            },
+            SlackMessage {
+                user: Some("USELF".into()),
+                text: Some("unsupported subtype".into()),
+                ts: "3.0".into(),
+                subtype: Some("channel_join".into()),
+                ..Default::default()
+            },
+            SlackMessage {
+                user: Some("USELF".into()),
+                text: Some("last editable".into()),
+                ts: "2.0".into(),
+                ..Default::default()
+            },
+            SlackMessage {
+                user: Some("USELF".into()),
+                text: Some("older".into()),
+                ts: "1.0".into(),
+                ..Default::default()
+            },
+        ];
+
+        let selected = latest_editable_message(&messages, Some("USELF")).unwrap();
+        assert_eq!(selected.ts, "2.0");
+        assert_eq!(latest_editable_message(&messages, None), None);
     }
 
     #[test]

@@ -180,6 +180,16 @@ def completion_state(path: Path, expected: dict) -> dict | None:
     return state if state == expected else None
 
 
+def message_edit_state(path: Path, expected_state: str) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return state if state.get("state") == expected_state else None
+
+
 def wait_for_completion_ready(
     path: Path,
     target: str,
@@ -330,6 +340,92 @@ def verify_hydrated_person_draft(window_id: str) -> None:
     assert composer_text(window_id) == "Draft @Grace Hopper"
 
 
+def verify_message_edit_shortcut(
+    window_id: str, state_path: Path, completion_path: Path
+) -> None:
+    press(window_id, "ctrl+m")
+    time.sleep(0.1)
+
+    replace_composer_text(window_id, "Existing draft")
+    press(window_id, "ctrl+Up")
+    time.sleep(0.1)
+    assert composer_text(window_id) == "Existing draft"
+    assert not state_path.exists()
+    replace_composer_text(window_id, "")
+
+    type_text(window_id, " ")
+    press(window_id, "ctrl+Up")
+    time.sleep(0.1)
+    assert composer_text(window_id) == " "
+    assert not state_path.exists()
+    replace_composer_text(window_id, "")
+
+    press(window_id, "ctrl+Up")
+    editing = wait_until(lambda: message_edit_state(state_path, "editing"))
+    assert editing["message_ts"] == "2.0"
+    assert editing["header_title"] == "Edit message"
+    assert editing["header_subtitle"] == "Press Escape to cancel"
+    assert editing["send_tooltip"] == "Save Edited Message"
+    assert editing["edit_class"] is True
+    assert editing["suggested_class"] is False
+    assert editing["send_sensitive"] is True
+    assert editing["upload_sensitive"] is False
+    assert editing["entry_editable"] is True
+    assert editing["format_sensitive"] is False
+    assert composer_text(window_id) == "Last sent message"
+
+    replace_composer_text(window_id, "@ada")
+    wait_for_completion_ready(completion_path, "message", "mention", "ada", "UADA")
+    press(window_id, "Escape")
+    canceled = wait_until(lambda: message_edit_state(state_path, "canceled"))
+    assert canceled["header_title"] == "#general"
+    assert canceled["header_subtitle"] == ""
+    assert canceled["send_tooltip"] == "Send Message"
+    assert canceled["edit_class"] is False
+    assert canceled["suggested_class"] is True
+    assert canceled["send_sensitive"] is True
+    assert canceled["upload_sensitive"] is True
+    assert canceled["entry_editable"] is True
+    assert canceled["format_sensitive"] is True
+    type_text(window_id, "x")
+    assert composer_text(window_id) == "x"
+    replace_composer_text(window_id, "")
+
+    press(window_id, "ctrl+Up")
+    wait_until(lambda: message_edit_state(state_path, "editing"))
+    press(window_id, "Return")
+    unchanged = wait_until(lambda: message_edit_state(state_path, "unchanged"))
+    assert unchanged["header_title"] == "#general"
+    type_text(window_id, "x")
+    assert composer_text(window_id) == "x"
+    replace_composer_text(window_id, "")
+
+    press(window_id, "ctrl+Up")
+    wait_until(lambda: message_edit_state(state_path, "editing"))
+    press(window_id, "End")
+    type_text(window_id, " updated")
+    press(window_id, "Return")
+    submitted = wait_until(lambda: message_edit_state(state_path, "submitted"))
+    assert submitted["channel_id"] == "C_TEST"
+    assert submitted["message_ts"] == "2.0"
+    assert submitted["header_title"] == "Edit message"
+    assert submitted["send_tooltip"] == "Save Edited Message"
+    assert submitted["edit_class"] is True
+    assert submitted["suggested_class"] is False
+    assert submitted["send_sensitive"] is False
+    assert submitted["upload_sensitive"] is False
+    assert submitted["entry_editable"] is False
+    assert submitted["format_sensitive"] is False
+    assert composer_text(window_id) == "Last sent message updated"
+    type_text(window_id, " ignored")
+    assert composer_text(window_id) == "Last sent message updated"
+    press(window_id, "ctrl+2")
+    blocked = wait_until(lambda: message_edit_state(state_path, "navigation-blocked"))
+    assert blocked["header_title"] == "Edit message"
+    assert blocked["channel_id"] == "C_TEST"
+    assert composer_text(window_id) == "Last sent message updated"
+
+
 def stop_process(process: subprocess.Popen[str]) -> None:
     process.terminate()
     try:
@@ -403,6 +499,34 @@ def main() -> None:
                 verify_person_completion(window_id, target, completion_path)
             finally:
                 stop_process(process)
+
+        message_edit_path = temporary_path / "message-edit.json"
+        message_edit_completion_path = temporary_path / "message-edit-completion.json"
+        edit_environment = environment.copy()
+        edit_environment.update(
+            {
+                "CONDUIT_TEST_MESSAGE_EDIT": "1",
+                "CONDUIT_TEST_MESSAGE_EDIT_FILE": str(message_edit_path),
+                "CONDUIT_TEST_MESSAGE_EDIT_NO_RUNTIME": "1",
+                "CONDUIT_TEST_COMPOSER_COMPLETION_FILE": str(
+                    message_edit_completion_path
+                ),
+                "CONDUIT_TEST_COMPOSER_HYDRATION": "1",
+            }
+        )
+        process = subprocess.Popen(
+            [str(binary)],
+            env=edit_environment,
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            window_id = wait_for_window(process)
+            verify_message_edit_shortcut(
+                window_id, message_edit_path, message_edit_completion_path
+            )
+        finally:
+            stop_process(process)
 
 
 if __name__ == "__main__":

@@ -210,6 +210,12 @@ pub enum RuntimeCommand {
         blocks_json: Option<String>,
         thread_ts: Option<String>,
     },
+    UpdateMessage {
+        channel_id: String,
+        original: Box<SlackMessage>,
+        text: String,
+        blocks_json: Option<String>,
+    },
     SetReaction {
         channel_id: String,
         ts: String,
@@ -289,6 +295,7 @@ pub enum RuntimeOperation {
     MessagePermalink,
     MessageAction,
     PostMessage,
+    UpdateMessage,
     Reaction,
     Saved,
     ConversationStar,
@@ -630,6 +637,20 @@ impl RuntimeCommand {
                     RuntimeTarget::Message {
                         channel_id: channel_id.clone(),
                         thread_ts: thread_ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Interactive,
+            ),
+            Self::UpdateMessage {
+                channel_id,
+                original,
+                ..
+            } => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::UpdateMessage,
+                    RuntimeTarget::ExactMessage {
+                        channel_id: channel_id.clone(),
+                        ts: original.ts.clone(),
                     },
                 ),
                 RuntimeTaskLane::Interactive,
@@ -986,6 +1007,10 @@ pub enum RuntimeEventKind {
         channel_id: String,
         message: Box<SlackMessage>,
     },
+    MessageUpdated {
+        channel_id: String,
+        message: Box<SlackMessage>,
+    },
     ReactionUpdated {
         channel_id: String,
         ts: String,
@@ -1173,6 +1198,7 @@ impl RuntimeEventKind {
             | Self::Error(_)
             | Self::AttentionMessagesObserved(_)
             | Self::MessagePosted { .. }
+            | Self::MessageUpdated { .. }
             | Self::ReactionUpdated { .. }
             | Self::SavedUpdated { .. }
             | Self::MessageActionFailed { .. }
@@ -1443,7 +1469,69 @@ impl WorkspaceReducerAdapter {
             .lock()
             .expect("workspace coordinator lock poisoned")
             .apply_from(origin, mutation);
-        if let Some(reduction) = reduction.as_ref() {
+        self.observe_reduction(origin, reduction.as_ref());
+        reduction
+    }
+
+    fn apply_updated_message(
+        &self,
+        channel_id: &str,
+        original: &SlackMessage,
+        updated: SlackMessage,
+    ) -> SlackMessage {
+        let (message, reduction) = self.reduce_updated_message(channel_id, original, updated);
+        self.observe_reduction(MutationOrigin::Local, reduction.as_ref());
+        message
+    }
+
+    fn apply_updated_message_and_enqueue(
+        &self,
+        store: Option<&WorkspaceStore>,
+        channel_id: &str,
+        original: &SlackMessage,
+        updated: SlackMessage,
+    ) -> SlackMessage {
+        let (message, reduction) = self.reduce_updated_message(channel_id, original, updated);
+        self.observe_reduction(MutationOrigin::Local, reduction.as_ref());
+        if let Some(reduction) = reduction {
+            self.enqueue_reduction(store, reduction);
+        }
+        message
+    }
+
+    fn reduce_updated_message(
+        &self,
+        channel_id: &str,
+        original: &SlackMessage,
+        updated: SlackMessage,
+    ) -> (SlackMessage, Option<WorkspaceReduction>) {
+        let (message, reduction) = {
+            let mut coordinator = self
+                .coordinator
+                .lock()
+                .expect("workspace coordinator lock poisoned");
+            let freshest = coordinator
+                .history(channel_id)
+                .into_iter()
+                .find(|message| message.ts == original.ts)
+                .unwrap_or_else(|| original.clone());
+            let message = merge_updated_content(freshest, updated);
+            let reduction = coordinator.apply_from(
+                MutationOrigin::Local,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: channel_id.to_string(),
+                    message: message.clone(),
+                    kind: MessageMutationKind::Changed,
+                    origin: MutationOrigin::Local,
+                },
+            );
+            (message, reduction)
+        };
+        (message, reduction)
+    }
+
+    fn observe_reduction(&self, origin: MutationOrigin, reduction: Option<&WorkspaceReduction>) {
+        if let Some(reduction) = reduction {
             let revision = reduction.patch().revision().value();
             for effect in reduction.effects() {
                 let WorkspaceEffect::MessageAttention(effect) = effect;
@@ -1467,7 +1555,6 @@ impl WorkspaceReducerAdapter {
                 ),
             );
         }
-        reduction
     }
 
     #[cfg(test)]
@@ -1511,6 +1598,11 @@ impl WorkspaceReducerAdapter {
         mutation: WorkspaceMutation,
     ) -> Option<WorkspaceReduction> {
         let reduction = self.apply(origin, mutation)?;
+        self.enqueue_reduction(store, reduction.clone());
+        Some(reduction)
+    }
+
+    fn enqueue_reduction(&self, store: Option<&WorkspaceStore>, reduction: WorkspaceReduction) {
         let batch = reduction.store_batch().cloned();
         let persisted = store.is_none() || batch.is_none();
         self.pending_writes
@@ -1522,7 +1614,6 @@ impl WorkspaceReducerAdapter {
                 persisted,
                 repair: false,
             });
-        Some(reduction)
     }
 
     /// Flushes and drains all admitted reductions in revision order. Socket
@@ -4521,6 +4612,100 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 });
             }
         }
+        RuntimeCommand::UpdateMessage {
+            channel_id,
+            original,
+            text,
+            blocks_json,
+        } => {
+            let api = require_slack(context.slack)?;
+            let updated = api
+                .update_message(&channel_id, &original, &text, blocks_json.as_deref())
+                .await?;
+            if let Some(store) = context.workspace_store.as_ref() {
+                let _admission = context.workspace.store_batch_admission.lock().await;
+                let cache_ready = match context
+                    .workspace
+                    .recover_persisted_admitted(Some(store))
+                    .await
+                {
+                    Ok(reductions) => {
+                        for reduction in reductions {
+                            context
+                                .events
+                                .send_workspace_patch(reduction.patch().clone());
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        crate::debug::log(
+                            "store",
+                            &format!(
+                                "LocalMessageUpdateRecoveryDeferred channel_id={channel_id} category={:?}",
+                                error.category()
+                            ),
+                        );
+                        false
+                    }
+                };
+                let message = context.workspace.apply_updated_message_and_enqueue(
+                    Some(store),
+                    &channel_id,
+                    &original,
+                    updated,
+                );
+                let message_for_catalog = message.clone();
+                context.events.send_event(RuntimeEventKind::MessageUpdated {
+                    channel_id: channel_id.clone(),
+                    message: Box::new(message),
+                });
+                if cache_ready {
+                    match context.workspace.persist_pending_writes(Some(store)).await {
+                        Ok(()) => {
+                            for reduction in context.workspace.drain_persisted_admitted() {
+                                context.events.send_workspace_patch(reduction.patch().clone());
+                            }
+                        }
+                        Err(error) => crate::debug::log(
+                            "store",
+                            &format!(
+                                "LocalMessageUpdateStoreDeferred channel_id={channel_id} category={:?}",
+                                error.category()
+                            ),
+                        ),
+                    }
+                }
+                if let Err(error) = store
+                    .observe_thread_realtime(
+                        &channel_id,
+                        &message_for_catalog,
+                        context.current_user_id,
+                    )
+                    .await
+                {
+                    crate::debug::log(
+                        "store",
+                        &format!(
+                            "LocalMessageUpdateThreadCatalogDeferred channel_id={channel_id} category={:?}",
+                            error.category()
+                        ),
+                    );
+                } else {
+                    let workspace_store = Some(store.clone());
+                    load_cached_thread_catalog(context.events, &workspace_store, context.workspace)
+                        .await;
+                }
+            } else {
+                let message =
+                    context
+                        .workspace
+                        .apply_updated_message(&channel_id, &original, updated);
+                context.events.send_event(RuntimeEventKind::MessageUpdated {
+                    channel_id,
+                    message: Box::new(message),
+                });
+            }
+        }
         RuntimeCommand::SetReaction {
             channel_id,
             ts,
@@ -5402,6 +5587,17 @@ async fn persist_realtime_events(
     }
 }
 
+fn merge_updated_content(mut freshest: SlackMessage, updated: SlackMessage) -> SlackMessage {
+    freshest.text = updated.text;
+    freshest.blocks = updated.blocks;
+    freshest.edited = updated.edited;
+    if updated.user.is_some() {
+        freshest.user = updated.user;
+    }
+    freshest.refresh_canonical_content();
+    freshest
+}
+
 /// Publish Slack's authoritative response before recoverable local cache work.
 ///
 /// A later sync can restore a cache write interrupted by shutdown, while delaying
@@ -5432,6 +5628,15 @@ async fn persist_local_post_message(
     if message_event.kind != SocketModeMessageKind::Posted {
         return;
     }
+    persist_local_message(store, current_user_id, events, message_event).await;
+}
+
+async fn persist_local_message(
+    store: &WorkspaceStore,
+    current_user_id: Option<&str>,
+    events: &RuntimeEventSender,
+    message_event: crate::socket_mode::SocketModeMessageEvent,
+) {
     let channel_id = &message_event.channel_id;
     let message = &message_event.message;
     if let Some(thread_ts) = message.thread_root_ts() {
@@ -10745,6 +10950,123 @@ mod tests {
         assert_eq!(fields.target, "message:C123:main");
         assert!(!format!("{fields:?}").contains("do not trace this message"));
         assert!(!format!("{fields:?}").contains("do not trace these blocks"));
+
+        let update = RuntimeCommand::UpdateMessage {
+            channel_id: "C123".to_string(),
+            original: Box::new(SlackMessage {
+                ts: "1.0".to_string(),
+                ..SlackMessage::default()
+            }),
+            text: "do not trace this edit".to_string(),
+            blocks_json: Some("do not trace edited blocks".to_string()),
+        };
+        let fields = RuntimeTraceFields::for_command(identity, &update);
+        assert_eq!(fields.operation, RuntimeOperation::UpdateMessage);
+        assert_eq!(fields.target, "exact-message:C123:1.0");
+        assert!(!format!("{fields:?}").contains("do not trace this edit"));
+        assert!(!format!("{fields:?}").contains("do not trace edited blocks"));
+    }
+
+    #[test]
+    fn updated_content_is_atomically_merged_with_current_workspace_metadata() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-local-message-update-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
+        let freshest = SlackMessage {
+            user: Some("U1".into()),
+            text: Some("old".into()),
+            ts: "1.0".into(),
+            reply_count: Some(4),
+            reactions: Some(vec![crate::models::SlackReaction {
+                name: Some("thumbsup".into()),
+                count: Some(2),
+                users: Some(vec!["U1".into(), "U2".into()]),
+            }]),
+            ..SlackMessage::default()
+        };
+        let mut updated = SlackMessage {
+            user: Some("U1".into()),
+            text: Some("edited".into()),
+            ts: "1.0".into(),
+            edited: Some(crate::models::SlackMessageEdit {
+                user: Some("U1".into()),
+                ts: None,
+            }),
+            ..SlackMessage::default()
+        };
+        updated.refresh_canonical_content();
+        let original = SlackMessage {
+            user: Some("U1".into()),
+            text: Some("old".into()),
+            ts: "1.0".into(),
+            ..SlackMessage::default()
+        };
+        let workspace = WorkspaceReducerAdapter::default();
+        workspace.apply(
+            MutationOrigin::Local,
+            WorkspaceMutation::MessageChanged {
+                channel_id: "C1".into(),
+                message: freshest.clone(),
+                kind: MessageMutationKind::Posted,
+                origin: MutationOrigin::Local,
+            },
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let merged = runtime.block_on(async {
+            store
+                .store_history("C1", std::slice::from_ref(&freshest))
+                .await
+                .unwrap();
+            store
+                .store_thread("C1", "1.0", std::slice::from_ref(&freshest))
+                .await
+                .unwrap();
+            store
+                .observe_thread_page("C1", "1.0", std::slice::from_ref(&freshest), true)
+                .await
+                .unwrap();
+            let _admission = workspace.store_batch_admission.lock().await;
+            let merged =
+                workspace.apply_updated_message_and_enqueue(Some(&store), "C1", &original, updated);
+            workspace
+                .persist_pending_writes(Some(&store))
+                .await
+                .unwrap();
+            workspace.drain_persisted_admitted();
+            store
+                .observe_thread_realtime("C1", &merged, Some("U1"))
+                .await
+                .unwrap();
+            merged
+        });
+
+        assert_eq!(merged.body_text(), "edited");
+        assert_eq!(merged.reactions, freshest.reactions);
+        assert_eq!(merged.reply_count, Some(4));
+        assert!(merged.edited.is_some());
+        assert_eq!(workspace.history("C1"), vec![merged]);
+        runtime.block_on(async {
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            let thread = store.load_thread("C1", "1.0").await.unwrap().unwrap();
+            let catalog = store.load_thread_catalog().await.unwrap();
+            for cached in [&history[0], &thread[0]] {
+                assert_eq!(cached.body_text(), "edited");
+                assert_eq!(cached.reactions, freshest.reactions);
+                assert_eq!(cached.reply_count, Some(4));
+            }
+            assert_eq!(catalog[0].root.as_ref().unwrap().body_text(), "edited");
+        });
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -393,6 +393,7 @@ pub(crate) struct RealtimeMessageOutcome {
     pub(crate) render_channel: bool,
     pub(crate) render_thread: bool,
     pub(crate) refresh_unreads: bool,
+    pub(crate) refresh_derived_view: bool,
     pub(crate) channel_scroll: Option<WorkspaceScrollBehavior>,
 }
 
@@ -759,6 +760,13 @@ impl WorkspaceViewState {
                     .as_deref()
                     .unwrap_or(&history.messages)
             })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn channel_tail_messages(&self, channel_id: &str) -> &[SlackMessage] {
+        self.channels
+            .get(channel_id)
+            .map(|history| history.messages.as_slice())
             .unwrap_or_default()
     }
 
@@ -1358,11 +1366,18 @@ impl WorkspaceViewState {
                 base_changed || context_changed
             });
 
+        let search_changed =
+            apply_realtime_message_to_search(&mut self.search_results, channel_id, &message, kind);
+        let saved_changed =
+            apply_realtime_message_to_saved(&mut self.saved_items, channel_id, &message, kind);
+
         RealtimeMessageOutcome {
             channel_changed,
             render_channel,
             render_thread,
             refresh_unreads: self.main_view == MainMessageView::Unreads,
+            refresh_derived_view: (self.main_view == MainMessageView::Search && search_changed)
+                || (self.main_view == MainMessageView::Saved && saved_changed),
             channel_scroll: render_channel.then_some(
                 if kind == RealtimeMessageKind::Posted && message.belongs_in_channel_timeline() {
                     WorkspaceScrollBehavior::StickToBottom
@@ -1483,6 +1498,71 @@ impl WorkspaceViewState {
             WorkspaceScrollBehavior::Bottom
         } else {
             WorkspaceScrollBehavior::StickToBottom
+        }
+    }
+}
+
+fn apply_realtime_message_to_search(
+    results: &mut Vec<SearchMatch>,
+    channel_id: &str,
+    message: &SlackMessage,
+    kind: RealtimeMessageKind,
+) -> bool {
+    let matches_message = |result: &SearchMatch| {
+        result
+            .channel
+            .as_ref()
+            .and_then(|channel| channel.id.as_deref())
+            == Some(channel_id)
+            && result.ts.as_deref() == Some(message.ts.as_str())
+    };
+    match kind {
+        RealtimeMessageKind::Posted => false,
+        RealtimeMessageKind::Changed => {
+            let text = Some(message.body_text());
+            let mut changed = false;
+            for result in results.iter_mut().filter(|result| matches_message(result)) {
+                if result.text != text {
+                    result.text.clone_from(&text);
+                    changed = true;
+                }
+            }
+            changed
+        }
+        RealtimeMessageKind::Deleted => {
+            let previous_len = results.len();
+            results.retain(|result| !matches_message(result));
+            results.len() != previous_len
+        }
+    }
+}
+
+fn apply_realtime_message_to_saved(
+    items: &mut Vec<SavedItem>,
+    channel_id: &str,
+    message: &SlackMessage,
+    kind: RealtimeMessageKind,
+) -> bool {
+    let matches_message = |item: &SavedItem| {
+        item.channel.as_deref() == Some(channel_id)
+            && item.message.as_ref().map(|message| message.ts.as_str()) == Some(message.ts.as_str())
+    };
+    match kind {
+        RealtimeMessageKind::Posted => false,
+        RealtimeMessageKind::Changed => {
+            let mut changed = false;
+            for item in items.iter_mut().filter(|item| matches_message(item)) {
+                if item.message.as_ref() != Some(message) {
+                    item.message = Some(message.clone());
+                    changed = true;
+                }
+            }
+            changed
+        }
+        RealtimeMessageKind::Deleted => {
+            let previous_len = items.len();
+            items.retain(|item| !matches_message(item));
+            items.len() != previous_len
         }
     }
 }
@@ -3034,6 +3114,68 @@ mod tests {
     }
 
     #[test]
+    fn realtime_edits_refresh_cached_search_and_saved_messages() {
+        let mut state = WorkspaceViewState::default();
+        state.apply_search_results(vec![SearchMatch {
+            channel: Some(crate::models::SlackSearchChannel {
+                id: Some("C1".into()),
+                name: Some("general".into()),
+            }),
+            text: Some("old search text".into()),
+            ts: Some("3".into()),
+            ..SearchMatch::default()
+        }]);
+        state.apply_saved(vec![SavedItem {
+            channel: Some("C1".into()),
+            message: Some(message("3", "old saved text")),
+            ..SavedItem::default()
+        }]);
+
+        state.show_search();
+        let search_outcome = state.apply_realtime_message(
+            "C1",
+            message("3", "edited once"),
+            RealtimeMessageKind::Changed,
+        );
+        assert!(search_outcome.refresh_derived_view);
+        assert_eq!(
+            state.search_results()[0].text.as_deref(),
+            Some("edited once")
+        );
+        assert_eq!(
+            state.saved_items()[0]
+                .message
+                .as_ref()
+                .map(SlackMessage::body_text),
+            Some("edited once".into())
+        );
+
+        state.show_saved();
+        let saved_outcome = state.apply_realtime_message(
+            "C1",
+            message("3", "edited twice"),
+            RealtimeMessageKind::Changed,
+        );
+        assert!(saved_outcome.refresh_derived_view);
+        assert_eq!(
+            state.saved_items()[0]
+                .message
+                .as_ref()
+                .map(SlackMessage::body_text),
+            Some("edited twice".into())
+        );
+
+        let deleted = state.apply_realtime_message(
+            "C1",
+            message("3", "deleted"),
+            RealtimeMessageKind::Deleted,
+        );
+        assert!(deleted.refresh_derived_view);
+        assert!(state.search_results().is_empty());
+        assert!(state.saved_items().is_empty());
+    }
+
+    #[test]
     fn realtime_posts_keep_channel_messages_in_descending_timestamp_order() {
         let mut state = WorkspaceViewState::default();
         state.select_conversation("C1");
@@ -3549,7 +3691,7 @@ mod tests {
         ));
         assert!(state.has_channel_context("C1"));
         assert_eq!(state.channel_messages("C1")[0].body_text(), "target");
-        assert_eq!(state.channels["C1"].messages[0].body_text(), "latest");
+        assert_eq!(state.channel_tail_messages("C1")[0].body_text(), "latest");
 
         let outcome = state.select_conversation("C1");
         assert_eq!(

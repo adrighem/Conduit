@@ -16,8 +16,8 @@ use tokio::io::AsyncWriteExt;
 use crate::auth::browser_session_cookie_header;
 use crate::http_client;
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUnreadState,
-    SlackUser, SlackUserGroup, SlackUserProfile, SlackUserStatus, StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackMessageEdit,
+    SlackUnreadState, SlackUser, SlackUserGroup, SlackUserProfile, SlackUserStatus, StoredToken,
 };
 use crate::rich_message::SlackControlAction;
 use crate::search::{
@@ -1276,6 +1276,18 @@ impl SlackApi {
         Ok(message)
     }
 
+    pub async fn update_message(
+        &self,
+        channel_id: &str,
+        original: &SlackMessage,
+        text: &str,
+        blocks_json: Option<&str>,
+    ) -> Result<SlackMessage> {
+        let params = update_message_params(channel_id, &original.ts, text, blocks_json);
+        let response: UpdateMessageResponse = self.post_form("chat.update", &params).await?;
+        Ok(merge_updated_message(original, text, blocks_json, response))
+    }
+
     pub async fn message_permalink(&self, channel_id: &str, message_ts: &str) -> Result<String> {
         let response: MessagePermalinkResponse = self
             .post_form(
@@ -1817,6 +1829,66 @@ fn post_message_params(
         params.push(("thread_ts", thread_ts.to_string()));
     }
     params
+}
+
+fn update_message_params(
+    channel_id: &str,
+    message_ts: &str,
+    text: &str,
+    blocks_json: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![
+        ("channel", channel_id.to_string()),
+        ("ts", message_ts.to_string()),
+        ("text", text.to_string()),
+    ];
+    if let Some(blocks_json) = blocks_json.filter(|blocks| !blocks.trim().is_empty()) {
+        params.push(("blocks", blocks_json.to_string()));
+    }
+    params
+}
+
+fn merge_updated_message(
+    original: &SlackMessage,
+    submitted_text: &str,
+    submitted_blocks: Option<&str>,
+    response: UpdateMessageResponse,
+) -> SlackMessage {
+    let response_message = response.message.as_ref().and_then(Value::as_object);
+    let response_string = |field: &str| {
+        response_message
+            .and_then(|message| message.get(field))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    let mut message = original.clone();
+    message.ts = response
+        .ts
+        .filter(|ts| !ts.trim().is_empty())
+        .unwrap_or_else(|| original.ts.clone());
+    message.text = response_string("text")
+        .or(response.text)
+        .or_else(|| Some(submitted_text.to_string()));
+    message.user = response_string("user").or_else(|| original.user.clone());
+    message.blocks = response_message
+        .and_then(|value| value.get("blocks"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .or_else(|| submitted_blocks.and_then(|blocks| serde_json::from_str(blocks).ok()));
+    message.edited = response_message
+        .and_then(|value| value.get("edited"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .or_else(|| original.edited.clone())
+        .or_else(|| {
+            Some(SlackMessageEdit {
+                user: message.user.clone(),
+                ts: None,
+            })
+        });
+    message.refresh_canonical_content();
+    message
 }
 
 fn complete_upload_params(
@@ -2544,6 +2616,18 @@ struct PostMessageResponse {
     message: SlackMessage,
 }
 impl_slack_response!(PostMessageResponse);
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct UpdateMessageResponse {
+    ok: bool,
+    error: Option<String>,
+    channel: Option<String>,
+    ts: Option<String>,
+    text: Option<String>,
+    message: Option<Value>,
+}
+impl_slack_response!(UpdateMessageResponse);
 
 #[derive(Debug, Deserialize)]
 struct MessagePermalinkResponse {
@@ -3590,6 +3674,86 @@ mod tests {
             .into_owned()
             .collect::<HashMap<_, _>>();
         assert_eq!(form.get("blocks").map(String::as_str), Some(blocks));
+    }
+
+    #[test]
+    fn rich_message_update_targets_existing_message_and_restores_omitted_blocks() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"channel":"C123","ts":"1710000000.000100","text":"Edited","message":{"text":"Edited","user":"U1"}}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, body)
+        });
+        let blocks = r#"[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"text","text":"Edited","style":{"italic":true}}]}]}]"#;
+        let original = SlackMessage {
+            user: Some("U1".into()),
+            text: Some("Original".into()),
+            ts: "1710000000.000100".into(),
+            reactions: Some(vec![]),
+            ..SlackMessage::default()
+        };
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+
+        let message = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.update_message("C123", &original, "Edited", Some(blocks)))
+            .expect("message should update");
+
+        assert_eq!(message.ts, original.ts);
+        assert_eq!(message.body_text(), "Edited");
+        assert_eq!(message.reactions, original.reactions);
+        assert!(message.edited.is_some());
+        assert!(matches!(
+            message.document.nodes(),
+            [crate::rich_message::MessageNode::RichText(_)]
+        ));
+        let (path, body) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/chat.update");
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(form.get("channel").map(String::as_str), Some("C123"));
+        assert_eq!(
+            form.get("ts").map(String::as_str),
+            Some("1710000000.000100")
+        );
+        assert_eq!(form.get("text").map(String::as_str), Some("Edited"));
+        assert_eq!(form.get("blocks").map(String::as_str), Some(blocks));
+        assert!(!form.contains_key("client_msg_id"));
+        assert!(!form.contains_key("thread_ts"));
+    }
+
+    #[test]
+    fn plain_message_update_omits_blocks_without_changing_the_target() {
+        let form = update_message_params("C123", "1710000000.000100", "Edited", None)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(form.get("channel").map(String::as_str), Some("C123"));
+        assert_eq!(
+            form.get("ts").map(String::as_str),
+            Some("1710000000.000100")
+        );
+        assert_eq!(form.get("text").map(String::as_str), Some("Edited"));
+        assert!(!form.contains_key("blocks"));
     }
 
     #[test]
