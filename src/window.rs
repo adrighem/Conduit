@@ -98,15 +98,15 @@ use crate::slack_link::{
 use crate::socket_mode::{
     SocketModeEvent, SocketModeMessageEvent, SocketModeMessageKind, SocketModeReactionEvent,
 };
-use crate::thread_catalog::ThreadCatalog;
 use crate::thread_pane::ThreadPane;
-use crate::workspace_pipeline::WorkspaceRevision;
+use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
     resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
     ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
     ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
-    RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome, WorkspaceLifecycle,
-    WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
+    RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome, TimelineProjectionApplication,
+    TimelineProjectionOperation, WorkspaceLifecycle, WorkspaceLifecycleEvent,
+    WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -7565,7 +7565,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::WorkspacePatch(patch) => {
-                self.apply_conversation_workspace_patch(&patch);
+                self.apply_workspace_patch(&patch);
             }
             RuntimeEventKind::ConversationsSynchronized => {
                 if !self.imp().connect_requested.get() {
@@ -7734,14 +7734,6 @@ impl ConduitWindow {
             RuntimeEventKind::AttentionMessagesObserved(observations) => {
                 self.apply_attention_observations(observations);
             }
-            RuntimeEventKind::ThreadCatalogLoaded(records) => {
-                *self.imp().workspace.threads.borrow_mut() = ThreadCatalog::from_records(records);
-                if self.current_main_view() == MainMessageView::Threads {
-                    self.populate_threads();
-                } else if self.current_main_view() == MainMessageView::Unreads {
-                    self.populate_unreads(self.unread_items());
-                }
-            }
             RuntimeEventKind::HistoryLoaded {
                 channel_id,
                 messages,
@@ -7759,7 +7751,7 @@ impl ConduitWindow {
                     cached,
                 );
                 if outcome.visible {
-                    if outcome.render {
+                    if outcome.render || append_older {
                         let rendered_messages = self
                             .imp()
                             .workspace
@@ -7799,7 +7791,7 @@ impl ConduitWindow {
                     append_older,
                 );
                 if let ThreadApplyOutcome::Applied { scroll, render } = outcome {
-                    if render {
+                    if render || append_older {
                         let rendered_messages = self
                             .imp()
                             .workspace
@@ -8284,6 +8276,20 @@ impl ConduitWindow {
         scroll: TimelineScrollBehavior,
         fallback: UiInvalidations,
     ) {
+        self.apply_timeline_patches_at_revision(surface, revision, vec![patch], scroll, fallback);
+    }
+
+    fn apply_timeline_patches_at_revision(
+        &self,
+        surface: TimelineSurface,
+        revision: WorkspaceRevision,
+        patches: Vec<TimelineDomPatch>,
+        scroll: TimelineScrollBehavior,
+        fallback: UiInvalidations,
+    ) {
+        if patches.is_empty() {
+            return;
+        }
         let action = {
             let mut presenter = self.timeline_presenter(surface).borrow_mut();
             let Some(document) = presenter.document().cloned() else {
@@ -8293,8 +8299,8 @@ impl ConduitWindow {
             };
             let base_revision = presenter.expected_revision();
             let revision = revision.max(base_revision);
-            let delta = TimelineDelta::new(document, base_revision, revision, vec![patch], scroll)
-                .expect("one timeline patch should form a delta");
+            let delta = TimelineDelta::new(document, base_revision, revision, patches, scroll)
+                .expect("timeline patches should form a delta");
             presenter.queue_delta(delta)
         };
         match action {
@@ -9109,6 +9115,26 @@ impl ConduitWindow {
                     messages,
                     TimelineScrollBehavior::StickToBottom,
                 );
+            }
+            ThreadOpenOutcome::RenderCachedAndRefresh => {
+                let messages = self
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow()
+                    .current_thread_messages()
+                    .to_vec();
+                self.populate_thread(
+                    channel_id,
+                    ts,
+                    messages,
+                    TimelineScrollBehavior::StickToBottom,
+                );
+                self.set_status(&gettext("Refreshing thread"));
+                self.send_command(RuntimeCommand::LoadThread {
+                    channel_id: channel_id.to_string(),
+                    ts: ts.to_string(),
+                });
             }
             ThreadOpenOutcome::RequestFresh => {
                 self.set_status(&gettext("Loading thread"));
@@ -10240,10 +10266,7 @@ impl ConduitWindow {
         self.set_sidebar_error(error);
     }
 
-    fn apply_conversation_workspace_patch(
-        &self,
-        patch: &crate::workspace_pipeline::WorkspacePatch,
-    ) {
+    fn apply_workspace_patch(&self, patch: &crate::workspace_pipeline::WorkspacePatch) {
         let selected_before = self.selected_channel_id();
         let pending_before = self.imp().pending_last_conversation.borrow().clone();
         let revision = patch.revision();
@@ -10251,7 +10274,7 @@ impl ConduitWindow {
             let local_reads = self.imp().local_read_ts_by_channel.borrow();
             self.imp()
                 .workspace
-                .apply_conversation_patch_with_local_reads(patch, &local_reads)
+                .apply_workspace_patch_with_local_reads(patch, &local_reads)
         };
         let Some(application) = application else {
             crate::debug::log(
@@ -10269,39 +10292,276 @@ impl ConduitWindow {
                 local_reads.remove(channel_id);
             }
         }
-        if !application.conversation_changed() {
-            return;
+        if application.users_reset() || !application.changed_user_ids().is_empty() {
+            self.sync_workspace_user_projection(
+                application.users_reset(),
+                application.changed_user_ids(),
+            );
+        }
+        if !application.timeline_changes().is_empty() {
+            self.apply_workspace_timeline_projection(revision, application.timeline_changes());
+        }
+        if application.conversation_changed() {
+            remove_patch_departures_from_discovery(
+                &mut self.imp().discovered_channels.borrow_mut(),
+                application.removals(),
+            );
+            for removal in application.removals() {
+                let channel_id = removal.channel_id();
+                if selected_before.as_deref() == Some(channel_id)
+                    || pending_before
+                        .as_ref()
+                        .is_some_and(|pending| pending.channel_id == channel_id)
+                {
+                    self.clear_last_conversation();
+                }
+                self.imp()
+                    .pending_opened_conversation_ids
+                    .borrow_mut()
+                    .remove(channel_id);
+                self.imp()
+                    .local_read_ts_by_channel
+                    .borrow_mut()
+                    .remove(channel_id);
+                if removal.was_visible() {
+                    let title = gettext("Select a conversation");
+                    self.imp().message_title.set_title(&title);
+                    self.show_message_placeholder(&title);
+                    self.render_closed_thread();
+                }
+            }
+            self.sync_conversations_from_catalog();
+        }
+        if application.thread_catalog_changed() {
+            match self.current_main_view() {
+                MainMessageView::Threads => self.populate_threads(),
+                MainMessageView::Unreads if !application.conversation_changed() => {
+                    self.populate_unreads(self.unread_items());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn sync_workspace_user_projection(&self, reset: bool, changed_user_ids: &[String]) {
+        let users = self.imp().workspace.users.borrow();
+        let selected = if reset {
+            users.values().cloned().collect::<Vec<_>>()
+        } else {
+            changed_user_ids
+                .iter()
+                .filter_map(|user_id| users.get(user_id).cloned())
+                .collect::<Vec<_>>()
+        };
+        drop(users);
+
+        let mut affected_user_ids = changed_user_ids.iter().cloned().collect::<HashSet<_>>();
+        if reset {
+            let imp = self.imp();
+            affected_user_ids.extend(imp.user_names.borrow().keys().cloned());
+            affected_user_ids.extend(imp.user_statuses.borrow().keys().cloned());
+            *imp.user_names.borrow_mut() = Arc::new(HashMap::new());
+            *imp.user_full_names.borrow_mut() = Arc::new(HashMap::new());
+            *imp.user_avatar_urls.borrow_mut() = Arc::new(HashMap::new());
+            *imp.user_search_aliases.borrow_mut() = HashMap::new();
+            *imp.user_statuses.borrow_mut() = Arc::new(HashMap::new());
         }
 
-        remove_patch_departures_from_discovery(
-            &mut self.imp().discovered_channels.borrow_mut(),
-            application.removals(),
-        );
-        for removal in application.removals() {
-            let channel_id = removal.channel_id();
-            if selected_before.as_deref() == Some(channel_id)
-                || pending_before
-                    .as_ref()
-                    .is_some_and(|pending| pending.channel_id == channel_id)
-            {
-                self.clear_last_conversation();
+        let mut names = HashMap::new();
+        let mut full_names = HashMap::new();
+        let mut avatar_urls = HashMap::new();
+        let mut aliases = HashMap::new();
+        let mut statuses = HashMap::new();
+        let mut cleared_statuses = Vec::new();
+        for user in selected {
+            let Some(user_id) = user.id.clone() else {
+                continue;
+            };
+            affected_user_ids.insert(user_id.clone());
+            if let Some(name) = user.display_name() {
+                names.insert(user_id.clone(), name);
             }
-            self.imp()
-                .pending_opened_conversation_ids
-                .borrow_mut()
-                .remove(channel_id);
-            self.imp()
-                .local_read_ts_by_channel
-                .borrow_mut()
-                .remove(channel_id);
-            if removal.was_visible() {
-                let title = gettext("Select a conversation");
-                self.imp().message_title.set_title(&title);
-                self.show_message_placeholder(&title);
-                self.render_closed_thread();
+            if let Some(full_name) = user.full_name() {
+                full_names.insert(user_id.clone(), full_name);
+            }
+            if let Some(avatar_url) = user.avatar_url() {
+                avatar_urls.insert(user_id.clone(), avatar_url);
+            }
+            let user_aliases = user.search_aliases();
+            if !user_aliases.is_empty() {
+                aliases.insert(user_id.clone(), user_aliases);
+            }
+            if let Some(status) = user.status() {
+                statuses.insert(user_id, status);
+            } else if user
+                .profile
+                .as_ref()
+                .is_some_and(|profile| profile.contains_status_fields())
+            {
+                cleared_statuses.push(user_id);
             }
         }
-        self.sync_conversations_from_catalog();
+
+        {
+            let imp = self.imp();
+            Arc::make_mut(&mut imp.user_names.borrow_mut()).extend(names);
+            Arc::make_mut(&mut imp.user_full_names.borrow_mut()).extend(full_names);
+            Arc::make_mut(&mut imp.user_avatar_urls.borrow_mut()).extend(avatar_urls);
+            imp.user_search_aliases.borrow_mut().extend(aliases);
+            let mut known_statuses = imp.user_statuses.borrow_mut();
+            let known_statuses = Arc::make_mut(&mut known_statuses);
+            known_statuses.extend(statuses);
+            for user_id in cleared_statuses {
+                known_statuses.remove(&user_id);
+            }
+            let mut pending = imp.pending_user_ids.borrow_mut();
+            for user_id in &affected_user_ids {
+                pending.remove(user_id);
+            }
+        }
+
+        for target in COMPOSER_TARGETS {
+            self.refresh_composer_mention_names(target);
+            self.refresh_composer_completion(target);
+        }
+        let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
+        affected_user_ids.sort();
+        for user_id in &affected_user_ids {
+            self.patch_user_on_timelines(user_id);
+        }
+        self.update_huddle_surface();
+        self.queue_ui_invalidations(
+            UiInvalidations::SIDEBAR | UiInvalidations::PICKER | UiInvalidations::TITLE,
+        );
+        self.flush_pending_message_notifications();
+    }
+
+    fn apply_workspace_timeline_projection(
+        &self,
+        revision: WorkspaceRevision,
+        changes: &[TimelineProjectionApplication],
+    ) {
+        let mut refresh_derived_view = false;
+        for change in changes {
+            refresh_derived_view |= change.derived_view_changed();
+            if !change.render() || change.operations().is_empty() {
+                continue;
+            }
+            let (surface, channel_id, thread_ts, has_context, fallback) = match change.target() {
+                TimelineTarget::Channel(channel_id) => (
+                    TimelineSurface::Main,
+                    channel_id.as_str(),
+                    None,
+                    self.imp()
+                        .workspace
+                        .view
+                        .borrow()
+                        .has_channel_context(channel_id),
+                    UiInvalidations::MAIN,
+                ),
+                TimelineTarget::Thread {
+                    channel_id,
+                    thread_ts,
+                } => (
+                    TimelineSurface::Thread,
+                    channel_id.as_str(),
+                    Some(thread_ts.as_str()),
+                    self.imp()
+                        .workspace
+                        .view
+                        .borrow()
+                        .has_thread_context(channel_id, thread_ts),
+                    UiInvalidations::THREAD,
+                ),
+            };
+            if has_context {
+                self.queue_ui_invalidations(fallback);
+                continue;
+            }
+
+            let mut operations = change.operations().to_vec();
+            if operations.iter().all(|operation| {
+                matches!(
+                    operation,
+                    TimelineProjectionOperation::Upsert { inserted: true, .. }
+                )
+            }) {
+                operations.sort_by(|left, right| {
+                    let TimelineProjectionOperation::Upsert { message: left, .. } = left else {
+                        unreachable!();
+                    };
+                    let TimelineProjectionOperation::Upsert { message: right, .. } = right else {
+                        unreachable!();
+                    };
+                    left.ts.cmp(&right.ts)
+                });
+            }
+            let mut patches = Vec::with_capacity(operations.len());
+            for operation in operations {
+                match operation {
+                    TimelineProjectionOperation::Upsert { message, inserted } => {
+                        self.request_user_names(std::slice::from_ref(message.as_ref()));
+                        self.request_image_assets(std::iter::once(message.as_ref()));
+                        if let Ok(target) = MessageRef::new(channel_id, message.ts.clone()) {
+                            let _ = self
+                                .imp()
+                                .message_control_registry
+                                .borrow_mut()
+                                .replace_message_with_controls(
+                                    match surface {
+                                        TimelineSurface::Main => TimelineSurfaceId::Main,
+                                        TimelineSurface::Thread => TimelineSurfaceId::Thread,
+                                    },
+                                    target,
+                                    message_action_control_keys(
+                                        &message,
+                                        self.browser_message_actions_available(),
+                                    ),
+                                );
+                        }
+                        let context = self.message_patch_context(thread_ts, &message);
+                        patches.push(if inserted {
+                            message_html::insert_message_patch(
+                                channel_id,
+                                &message,
+                                &context,
+                                TimelineInsertPosition::Append,
+                                None,
+                            )
+                        } else {
+                            message_html::replace_message_patch(
+                                channel_id, &message, &context, None,
+                            )
+                        });
+                    }
+                    TimelineProjectionOperation::Remove { message_ts } => {
+                        if let Ok(target) = MessageRef::new(channel_id, message_ts.clone()) {
+                            self.imp()
+                                .message_control_registry
+                                .borrow_mut()
+                                .remove_message(
+                                    match surface {
+                                        TimelineSurface::Main => TimelineSurfaceId::Main,
+                                        TimelineSurface::Thread => TimelineSurfaceId::Thread,
+                                    },
+                                    &target,
+                                );
+                        }
+                        patches.push(message_html::remove_message_patch(message_ts));
+                    }
+                }
+            }
+            self.apply_timeline_patches_at_revision(
+                surface,
+                revision,
+                patches,
+                TimelineScrollBehavior::Preserve,
+                fallback,
+            );
+        }
+        if refresh_derived_view {
+            self.rerender_current_main_messages();
+        }
     }
 
     fn set_sidebar_error(&self, error: &str) {
@@ -12264,7 +12524,7 @@ impl ConduitWindow {
                 .note_render_requested(generation)
         });
         if render_action != Some(ConversationOpenRenderAction::HoldReconciliation) {
-            let revision = imp.workspace.conversation_patch_revision();
+            let revision = imp.workspace.workspace_patch_revision();
             let document = TimelineDocument::Conversation(channel_id.to_string());
             let loaded = self.ensure_timeline_document(
                 TimelineSurface::Main,
@@ -12355,7 +12615,7 @@ impl ConduitWindow {
             .view
             .borrow_mut()
             .take_thread_focus_for_render(channel_id, ts, &messages);
-        let revision = imp.workspace.conversation_patch_revision();
+        let revision = imp.workspace.workspace_patch_revision();
         let document = TimelineDocument::Thread {
             channel_id: channel_id.to_string(),
             ts: ts.to_string(),
@@ -15178,7 +15438,7 @@ mod tests {
         let RuntimeEventKind::WorkspacePatch(patch) = recovered.kind else {
             unreachable!();
         };
-        state.apply_conversation_patch(&patch).unwrap();
+        state.apply_workspace_patch(&patch).unwrap();
         assert!(state.conversations.borrow().get("C1").is_some());
     }
 
@@ -15207,7 +15467,7 @@ mod tests {
             };
 
             assert!(state
-                .apply_conversation_patch(&patch)
+                .apply_workspace_patch(&patch)
                 .unwrap()
                 .conversation_changed());
             assert_eq!(
@@ -15241,7 +15501,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.apply_conversation_patch(&patch).unwrap();
+        state.apply_workspace_patch(&patch).unwrap();
         state.view.borrow_mut().select_conversation("C1");
         assert_eq!(
             state
@@ -15270,7 +15530,7 @@ mod tests {
         };
         let first_revision = crate::workspace_pipeline::WorkspaceRevision::INITIAL.successor();
         state
-            .apply_conversation_patch(
+            .apply_workspace_patch(
                 &crate::workspace_pipeline::WorkspacePatch::new(
                     first_revision,
                     vec![
@@ -15284,7 +15544,7 @@ mod tests {
             )
             .unwrap();
         let removal = state
-            .apply_conversation_patch(
+            .apply_workspace_patch(
                 &crate::workspace_pipeline::WorkspacePatch::new(
                     first_revision.successor(),
                     vec![

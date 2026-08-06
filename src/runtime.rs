@@ -50,7 +50,6 @@ use crate::sync_scheduler::{
     ReplacementClass, RetryPolicy, SchedulerConfig, SyncDurability, SyncJob, SyncJobId,
     SyncPriority, SyncScheduler, SyncTargetKey, SyncTargetKind,
 };
-use crate::thread_catalog::ThreadRecord;
 use crate::workspace_pipeline::{
     same_message_identity, ConversationMembershipSnapshot, ConversationRefresh,
     MessageAttentionEffect, MessageMutationKind, MutationOrigin, SnapshotEnvelope, StoreBatch,
@@ -918,7 +917,6 @@ pub enum RuntimeEventKind {
         decision: AttentionDecision,
     },
     AttentionMessagesObserved(Vec<AttentionObservation>),
-    ThreadCatalogLoaded(Vec<ThreadRecord>),
     HistoryLoaded {
         channel_id: String,
         messages: Vec<SlackMessage>,
@@ -1058,8 +1056,7 @@ impl RuntimeEventKind {
             | Self::ConversationsPatched { .. }
             | Self::ConversationsLoadFailed(_)
             | Self::ConversationUnreadUpdated { .. }
-            | Self::ConversationAttentionAcknowledged { .. }
-            | Self::ThreadCatalogLoaded(_) => {
+            | Self::ConversationAttentionAcknowledged { .. } => {
                 OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace)
             }
             Self::AttentionNotificationCandidate { .. } => {
@@ -1478,10 +1475,10 @@ impl WorkspaceReducerAdapter {
         channel_id: &str,
         original: &SlackMessage,
         updated: SlackMessage,
-    ) -> SlackMessage {
+    ) -> (SlackMessage, Option<WorkspaceReduction>) {
         let (message, reduction) = self.reduce_updated_message(channel_id, original, updated);
         self.observe_reduction(MutationOrigin::Local, reduction.as_ref());
-        message
+        (message, reduction)
     }
 
     fn apply_updated_message_and_enqueue(
@@ -3249,13 +3246,15 @@ async fn run_job_payload(
                 let status_base_revision = connection.user_status_sync.revision();
                 let users_base_revision = connection.workspace.revision();
                 let users = api.users().await?;
-                connection.workspace.apply(
+                if let Some(reduction) = connection.workspace.apply(
                     MutationOrigin::WebApi,
                     WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
                         users_base_revision,
                         users.clone(),
                     )),
-                );
+                ) {
+                    events.send_workspace_patch(reduction.patch().clone());
+                }
                 let aliases = users
                     .iter()
                     .filter_map(|user| Some((user.id.clone()?, user.search_aliases())))
@@ -3355,6 +3354,12 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             thread_catalog.len()
         ),
     );
+    let users = users_from_cached_projections(
+        &user_names,
+        &user_full_names,
+        &user_avatar_urls,
+        &user_statuses,
+    );
     if !user_names.is_empty() {
         connection
             .user_cache
@@ -3368,11 +3373,6 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     }
     if !user_avatar_urls.is_empty() {
         events.send_event(RuntimeEventKind::UserAvatarUrlsLoaded(user_avatar_urls));
-    }
-    if !user_search_aliases.is_empty() {
-        events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(
-            user_search_aliases,
-        ));
     }
     if !user_statuses.is_empty() {
         events.send_event(RuntimeEventKind::UserStatusesLoaded {
@@ -3389,6 +3389,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             MutationOrigin::Cache,
             WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
                 conversations: conversations.clone(),
+                users,
                 threads: thread_catalog.clone(),
                 ..Default::default()
             }),
@@ -3401,8 +3402,10 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             &format!("WorkspaceBootstrapPublishFailed error={error:#}"),
         );
     }
-    if !thread_catalog.is_empty() {
-        events.send_event(RuntimeEventKind::ThreadCatalogLoaded(thread_catalog));
+    if !user_search_aliases.is_empty() {
+        events.send_event(RuntimeEventKind::UserSearchAliasesLoaded(
+            user_search_aliases,
+        ));
     }
     if !custom_emojis.is_empty() {
         events.send_event(RuntimeEventKind::EmojiCatalogLoaded(custom_emojis));
@@ -3432,6 +3435,46 @@ fn user_avatar_urls(users: &[SlackUser]) -> HashMap<String, String> {
     users
         .iter()
         .filter_map(|user| Some((user.id.clone()?, user.avatar_url()?)))
+        .collect()
+}
+
+fn users_from_cached_projections(
+    names: &HashMap<String, String>,
+    full_names: &HashMap<String, String>,
+    avatar_urls: &HashMap<String, String>,
+    statuses: &HashMap<String, SlackUserStatus>,
+) -> Vec<SlackUser> {
+    let mut user_ids = names
+        .keys()
+        .chain(full_names.keys())
+        .chain(avatar_urls.keys())
+        .chain(statuses.keys())
+        .filter(|user_id| !user_id.trim().is_empty())
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    user_ids.sort();
+    user_ids
+        .into_iter()
+        .map(|user_id| {
+            let status = statuses.get(&user_id);
+            SlackUser {
+                id: Some(user_id.clone()),
+                name: names.get(&user_id).cloned(),
+                real_name: full_names.get(&user_id).cloned(),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: names.get(&user_id).cloned(),
+                    real_name: full_names.get(&user_id).cloned(),
+                    image_72: avatar_urls.get(&user_id).cloned(),
+                    status_text: status.map(|status| status.text.clone()),
+                    status_emoji: status.map(|status| status.emoji.clone()),
+                    status_expiration: status.map(|status| status.expiration),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        })
         .collect()
 }
 
@@ -3811,13 +3854,17 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let status_base_revision = context.user_status_sync.revision();
             let users_base_revision = context.workspace.revision();
             let users = api.users().await?;
-            context.workspace.apply(
+            if let Some(reduction) = context.workspace.apply(
                 MutationOrigin::WebApi,
                 WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
                     users_base_revision,
                     users.clone(),
                 )),
-            );
+            ) {
+                context
+                    .events
+                    .send_workspace_patch(reduction.patch().clone());
+            }
             let aliases = users
                 .iter()
                 .filter_map(|user| Some((user.id.clone()?, user.search_aliases())))
@@ -4129,7 +4176,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             )
             .await;
             store_thread(context.workspace_store, &channel_id, &ts, &page.messages).await;
-            let attention = snapshot_attention_effects(context.workspace.apply(
+            let reduction = context.workspace.apply(
                 MutationOrigin::WebApi,
                 WorkspaceMutation::ThreadSnapshot {
                     channel_id: channel_id.clone(),
@@ -4143,7 +4190,13 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                         },
                     ),
                 },
-            ));
+            );
+            if let Some(reduction) = reduction.as_ref() {
+                context
+                    .events
+                    .send_workspace_patch(reduction.patch().clone());
+            }
+            let attention = snapshot_attention_effects(reduction);
             persist_snapshot_attention(context.events, context.workspace_store, attention).await;
             send_thread_loaded(context.events, channel_id, ts, page, false);
         }
@@ -4183,7 +4236,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 !page.has_more && page.next_cursor.is_none(),
             )
             .await;
-            let attention = snapshot_attention_effects(context.workspace.apply(
+            let reduction = context.workspace.apply(
                 MutationOrigin::WebApi,
                 WorkspaceMutation::ThreadSnapshot {
                     channel_id: channel_id.clone(),
@@ -4197,7 +4250,13 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                         },
                     ),
                 },
-            ));
+            );
+            if let Some(reduction) = reduction.as_ref() {
+                context
+                    .events
+                    .send_workspace_patch(reduction.patch().clone());
+            }
+            let attention = snapshot_attention_effects(reduction);
             persist_snapshot_attention(context.events, context.workspace_store, attention).await;
             send_thread_loaded(context.events, channel_id, ts, page, true);
         }
@@ -4265,6 +4324,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 let status_base_revision = context.user_status_sync.user_revision(&user_id);
                 let api = require_slack(context.slack)?;
                 let user = api.user(&user_id).await?;
+                if let Some(reduction) = context.workspace.apply(
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::UserUpsert(user.clone()),
+                ) {
+                    context
+                        .events
+                        .send_workspace_patch(reduction.patch().clone());
+                }
                 let display_name = user.display_name().unwrap_or_else(|| user_id.clone());
                 let full_name = user.full_name();
                 let avatar_url = user.avatar_url();
@@ -4321,6 +4388,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     "runtime",
                     &format!("UserProfileFieldsUnavailable user_id={user_id} error={error:#}"),
                 ),
+            }
+            if let Some(reduction) = context.workspace.apply(
+                MutationOrigin::WebApi,
+                WorkspaceMutation::UserUpsert(user.clone()),
+            ) {
+                context
+                    .events
+                    .send_workspace_patch(reduction.patch().clone());
             }
             context
                 .events
@@ -4575,7 +4650,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             if message.user.is_none() {
                 message.user = context.current_user_id.map(str::to_string);
             }
-            context.workspace.apply(
+            if let Some(reduction) = context.workspace.apply(
                 MutationOrigin::Local,
                 WorkspaceMutation::MessageChanged {
                     channel_id: channel_id.clone(),
@@ -4583,7 +4658,11 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     kind: MessageMutationKind::Posted,
                     origin: MutationOrigin::Local,
                 },
-            );
+            ) {
+                context
+                    .events
+                    .send_workspace_patch(reduction.patch().clone());
+            }
             if let Some(store) = context.workspace_store.as_ref() {
                 let persistence_event = crate::socket_mode::SocketModeMessageEvent {
                     channel_id: channel_id.clone(),
@@ -4599,6 +4678,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                             store,
                             context.current_user_id,
                             context.events,
+                            context.workspace,
                             persistence_event,
                         )
                         .await;
@@ -4696,10 +4776,15 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                         .await;
                 }
             } else {
-                let message =
+                let (message, reduction) =
                     context
                         .workspace
                         .apply_updated_message(&channel_id, &original, updated);
+                if let Some(reduction) = reduction {
+                    context
+                        .events
+                        .send_workspace_patch(reduction.patch().clone());
+                }
                 context.events.send_event(RuntimeEventKind::MessageUpdated {
                     channel_id,
                     message: Box::new(message),
@@ -4715,15 +4800,45 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         } => {
             let api = require_slack(context.slack)?;
             api.set_reaction(&channel_id, &ts, &name, add).await?;
-            context
-                .events
-                .send_event(RuntimeEventKind::ReactionUpdated {
+            let completion = RuntimeEventKind::ReactionUpdated {
+                channel_id: channel_id.clone(),
+                ts: ts.clone(),
+                name: name.clone(),
+                added: add,
+                thread_ts,
+            };
+            if let Some(user_id) = context.current_user_id {
+                let mutation = WorkspaceMutation::ReactionChanged {
                     channel_id,
-                    ts,
+                    message_ts: ts,
                     name,
+                    user_id: user_id.to_string(),
                     added: add,
-                    thread_ts,
-                });
+                };
+                if context.workspace_store.is_some() {
+                    context
+                        .workspace
+                        .apply_persisted_and_publish_with_completion(
+                            context.workspace_store.as_ref(),
+                            context.events,
+                            MutationOrigin::Local,
+                            mutation,
+                            completion,
+                        )
+                        .await?;
+                } else {
+                    if let Some(reduction) =
+                        context.workspace.apply(MutationOrigin::Local, mutation)
+                    {
+                        context
+                            .events
+                            .send_workspace_patch(reduction.patch().clone());
+                    }
+                    context.events.send_event(completion);
+                }
+            } else {
+                context.events.send_event(completion);
+            }
         }
         RuntimeCommand::SetSaved {
             channel_id,
@@ -4763,6 +4878,18 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             let profile = api.set_current_user_status(&status).await?;
             let status = profile.status();
+            if let Some(reduction) = context.workspace.apply(
+                MutationOrigin::Local,
+                WorkspaceMutation::UserUpsert(SlackUser {
+                    id: Some(user_id.clone()),
+                    profile: Some(profile),
+                    ..Default::default()
+                }),
+            ) {
+                context
+                    .events
+                    .send_workspace_patch(reduction.patch().clone());
+            }
             let status_for_event = status.clone();
             let revision = context.user_status_sync.publish_change(&user_id, || {
                 context
@@ -4900,7 +5027,13 @@ async fn run_socket_mode(
                         SocketModeEvent::Message(_) | SocketModeEvent::Reaction(_)
                     );
                 let attention = (!defer_ordered_ui)
-                    .then(|| apply_realtime_workspace_event(&workspace_for_run, &event))
+                    .then(|| {
+                        apply_realtime_workspace_event_and_publish(
+                            &workspace_for_run,
+                            &events_for_run,
+                            &event,
+                        )
+                    })
                     .flatten();
                 let status_change_user_id = match &event {
                     SocketModeEvent::UserChanged(user)
@@ -5037,7 +5170,7 @@ fn apply_realtime_persistence_queue_fallback(
     event: SocketModeEvent,
 ) {
     let attention = matches!(&event, SocketModeEvent::Message(_))
-        .then(|| apply_realtime_workspace_event(workspace, &event))
+        .then(|| apply_realtime_workspace_event_and_publish(workspace, events, &event))
         .flatten()
         .map(|effect| effect.decision);
     events.send_event(RuntimeEventKind::SocketModeEvent { event, attention });
@@ -5047,14 +5180,47 @@ fn apply_realtime_workspace_event(
     workspace: &WorkspaceReducerAdapter,
     event: &SocketModeEvent,
 ) -> Option<MessageAttentionEffect> {
-    let mutation = match event {
+    let reduction = reduce_realtime_workspace_event(workspace, event)?;
+    reduction_message_attention(&reduction)
+}
+
+fn apply_realtime_workspace_event_and_publish(
+    workspace: &WorkspaceReducerAdapter,
+    events: &RuntimeEventSender,
+    event: &SocketModeEvent,
+) -> Option<MessageAttentionEffect> {
+    let reduction = reduce_realtime_workspace_event(workspace, event)?;
+    let attention = reduction_message_attention(&reduction);
+    events.send_workspace_patch(reduction.patch().clone());
+    attention
+}
+
+fn reduce_realtime_workspace_event(
+    workspace: &WorkspaceReducerAdapter,
+    event: &SocketModeEvent,
+) -> Option<WorkspaceReduction> {
+    workspace.apply(
+        MutationOrigin::Realtime,
+        realtime_workspace_mutation(event)?,
+    )
+}
+
+fn realtime_workspace_mutation(event: &SocketModeEvent) -> Option<WorkspaceMutation> {
+    match event {
         SocketModeEvent::Message(event) => Some(realtime_message_mutation(event, None)),
         SocketModeEvent::UserChanged(user) => Some(WorkspaceMutation::UserUpsert((**user).clone())),
-        SocketModeEvent::UserHuddleChanged(_)
-        | SocketModeEvent::Reaction(_)
-        | SocketModeEvent::RefreshConversations => None,
-    };
-    let reduction = workspace.apply(MutationOrigin::Realtime, mutation?)?;
+        SocketModeEvent::Reaction(reaction) => Some(WorkspaceMutation::ReactionChanged {
+            channel_id: reaction.channel_id.clone(),
+            message_ts: reaction.ts.clone(),
+            name: reaction.name.clone(),
+            user_id: reaction.user_id.clone(),
+            added: reaction.added,
+        }),
+        SocketModeEvent::UserHuddleChanged(_) | SocketModeEvent::RefreshConversations => None,
+    }
+}
+
+fn reduction_message_attention(reduction: &WorkspaceReduction) -> Option<MessageAttentionEffect> {
     reduction
         .effects()
         .iter()
@@ -5577,7 +5743,26 @@ async fn persist_realtime_events(
                 .await;
             }
             RealtimePersistenceEvent::OrderedEvent { event } => {
-                apply_realtime_workspace_event(&workspace, &event);
+                if let Some(mutation) = realtime_workspace_mutation(&event) {
+                    if let Err(error) = workspace
+                        .apply_persisted_and_publish_inner(
+                            Some(&store),
+                            &events,
+                            MutationOrigin::Realtime,
+                            mutation,
+                            None,
+                        )
+                        .await
+                    {
+                        crate::debug::log(
+                            "store",
+                            &format!(
+                                "RealtimeWorkspaceMutationDeferred category={:?}",
+                                error.category()
+                            ),
+                        );
+                    }
+                }
                 events.send_event(RuntimeEventKind::SocketModeEvent {
                     event,
                     attention: None,
@@ -5623,18 +5808,20 @@ async fn persist_local_post_message(
     store: &WorkspaceStore,
     current_user_id: Option<&str>,
     events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
     message_event: crate::socket_mode::SocketModeMessageEvent,
 ) {
     if message_event.kind != SocketModeMessageKind::Posted {
         return;
     }
-    persist_local_message(store, current_user_id, events, message_event).await;
+    persist_local_message(store, current_user_id, events, workspace, message_event).await;
 }
 
 async fn persist_local_message(
     store: &WorkspaceStore,
     current_user_id: Option<&str>,
     events: &RuntimeEventSender,
+    workspace: &WorkspaceReducerAdapter,
     message_event: crate::socket_mode::SocketModeMessageEvent,
 ) {
     let channel_id = &message_event.channel_id;
@@ -5674,15 +5861,8 @@ async fn persist_local_message(
             &format!("ThreadRealtimeStoreFailed channel_id={channel_id} error={error:#}"),
         );
     } else {
-        match store.load_thread_catalog().await {
-            Ok(records) if !records.is_empty() => {
-                events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records));
-            }
-            Ok(_) => {}
-            Err(error) => {
-                crate::debug::log("store", &format!("ThreadCatalogLoadFailed error={error:#}"))
-            }
-        }
+        let workspace_store = Some(store.clone());
+        load_cached_thread_catalog(events, &workspace_store, workspace).await;
     }
 }
 
@@ -7063,14 +7243,14 @@ async fn load_cached_thread_catalog(
         return;
     };
     match store.load_thread_catalog().await {
-        Ok(records) if !records.is_empty() => {
-            workspace.apply(
+        Ok(records) => {
+            if let Some(reduction) = workspace.apply(
                 MutationOrigin::Cache,
-                WorkspaceMutation::ThreadCatalogChanged(records.clone()),
-            );
-            events.send_event(RuntimeEventKind::ThreadCatalogLoaded(records));
+                WorkspaceMutation::ThreadCatalogChanged(records),
+            ) {
+                events.send_workspace_patch(reduction.patch().clone());
+            }
         }
-        Ok(_) => {}
         Err(error) => crate::debug::log(
             "runtime",
             &format!("CachedThreadCatalogLoadFailed error={error:#}"),
@@ -7196,7 +7376,7 @@ async fn load_cached_thread(
                     messages.len()
                 ),
             );
-            let attention = snapshot_attention_effects(workspace.apply(
+            let reduction = workspace.apply(
                 MutationOrigin::Cache,
                 WorkspaceMutation::ThreadSnapshot {
                     channel_id: channel_id.to_string(),
@@ -7210,7 +7390,11 @@ async fn load_cached_thread(
                         },
                     ),
                 },
-            ));
+            );
+            if let Some(reduction) = reduction.as_ref() {
+                events.send_workspace_patch(reduction.patch().clone());
+            }
+            let attention = snapshot_attention_effects(reduction);
             persist_snapshot_attention(events, workspace_store, attention).await;
             events.send_event(RuntimeEventKind::ThreadLoaded {
                 channel_id: channel_id.to_string(),
@@ -7772,12 +7956,11 @@ mod tests {
                     .map(|event| match &event.kind {
                         RuntimeEventKind::UserNamesLoaded(_) => "users",
                         RuntimeEventKind::WorkspacePatch(_) => "patch",
-                        RuntimeEventKind::ThreadCatalogLoaded(_) => "threads",
                         RuntimeEventKind::EmojiCatalogLoaded(_) => "emoji",
                         other => panic!("unexpected cache projection event {other:?}"),
                     })
                     .collect::<Vec<_>>(),
-                vec!["users", "patch", "threads", "emoji"]
+                vec!["users", "patch", "emoji"]
             );
             let patches = delivered
                 .iter()
@@ -7801,12 +7984,6 @@ mod tests {
                 matches!(
                     &event.kind,
                     RuntimeEventKind::UserNamesLoaded(names) if names == &user_names
-                )
-            }));
-            assert!(delivered.iter().any(|event| {
-                matches!(
-                    &event.kind,
-                    RuntimeEventKind::ThreadCatalogLoaded(records) if records == &thread_records
                 )
             }));
             assert!(delivered.iter().any(|event| {
@@ -7979,11 +8156,7 @@ mod tests {
                             _ => None,
                         })
                         .collect::<Vec<_>>(),
-                    if cache_has_conversation {
-                        vec![1, 2]
-                    } else {
-                        vec![1]
-                    }
+                    vec![1, 2]
                 );
                 assert!(!delivered
                     .iter()
@@ -8333,7 +8506,7 @@ mod tests {
             let RuntimeEventKind::WorkspacePatch(bootstrap) = bootstrap.kind else {
                 panic!("expected a typed bootstrap patch");
             };
-            view.apply_conversation_patch(&bootstrap).unwrap();
+            view.apply_workspace_patch(&bootstrap).unwrap();
 
             let refresh_base = workspace.revision();
             store
@@ -8430,13 +8603,13 @@ mod tests {
                     && snapshot.channel_id == "C1"
             ));
             let recovered_application = view
-                .apply_conversation_patch_with_local_reads(&patches[0], &local_reads)
+                .apply_workspace_patch_with_local_reads(&patches[0], &local_reads)
                 .unwrap();
             assert!(
                 recovered_application.conversation_changed(),
                 "ordinary refreshed metadata should still render"
             );
-            view.apply_conversation_patch_with_local_reads(&patches[1], &local_reads)
+            view.apply_workspace_patch_with_local_reads(&patches[1], &local_reads)
                 .unwrap();
             assert!(receiver.try_recv().is_err());
 
@@ -9498,7 +9671,7 @@ mod tests {
             let RuntimeEventKind::WorkspacePatch(bootstrap) = bootstrap.kind else {
                 panic!("expected a typed bootstrap patch");
             };
-            view.apply_conversation_patch(&bootstrap).unwrap();
+            view.apply_workspace_patch(&bootstrap).unwrap();
 
             store
                 .install_conversation_batch_failure_trigger_for("C1")
@@ -9663,7 +9836,7 @@ mod tests {
                 vec!["11.0", "12.0", "21.0"]
             );
             for patch in &patches {
-                view.apply_conversation_patch_with_local_reads(patch, &local_reads)
+                view.apply_workspace_patch_with_local_reads(patch, &local_reads)
                     .unwrap();
             }
 
@@ -10570,7 +10743,7 @@ mod tests {
             }),
         )
         .is_none());
-        assert_eq!(workspace.revision().value(), 2);
+        assert_eq!(workspace.revision().value(), 3);
     }
 
     #[test]
@@ -12932,7 +13105,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_thread_catalog_raw_patch_and_notification_order_is_explicit() {
+    fn socket_thread_catalog_patch_and_notification_order_is_explicit() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -13023,14 +13196,17 @@ mod tests {
             assert!(matches!(
                 delivered.as_slice(),
                 [
-                    RuntimeEventKind::ThreadCatalogLoaded(records),
+                    RuntimeEventKind::WorkspacePatch(catalog_patch),
                     RuntimeEventKind::SocketModeEvent {
                         event: SocketModeEvent::Message(message),
                         attention: Some(_),
                     },
                     RuntimeEventKind::WorkspacePatch(patch),
                     RuntimeEventKind::AttentionNotificationCandidate { message: notified, .. },
-                ] if !records.is_empty()
+                ] if catalog_patch.changes().iter().any(|change| matches!(
+                        change,
+                        WorkspaceChange::ThreadCatalogChanged(records) if !records.is_empty()
+                    ))
                     && message.message.ts == "2.0"
                     && notified.ts == "2.0"
                     && patch.changes().iter().any(|change| matches!(
@@ -13068,10 +13244,12 @@ mod tests {
                 },
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
             );
+            let workspace = WorkspaceReducerAdapter::default();
             persist_local_post_message(
                 &store,
                 Some("U_SELF"),
                 &events,
+                &workspace,
                 crate::socket_mode::SocketModeMessageEvent {
                     channel_id: "C1".into(),
                     message: SlackMessage {
@@ -13088,6 +13266,7 @@ mod tests {
                 &store,
                 Some("U_SELF"),
                 &events,
+                &workspace,
                 crate::socket_mode::SocketModeMessageEvent {
                     channel_id: "C1".into(),
                     message: SlackMessage {
@@ -13123,8 +13302,6 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["2.0"]
             );
-
-            let workspace = WorkspaceReducerAdapter::default();
             workspace.update_attention_context(WorkspaceAttentionContext {
                 current_user_id: Some("U_SELF".into()),
             });

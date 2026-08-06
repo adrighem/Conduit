@@ -16,10 +16,12 @@ use std::collections::HashMap;
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     slack_timestamp_is_after, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
-    SlackFile, SlackMessage, SlackReaction,
+    SlackFile, SlackMessage, SlackReaction, SlackUser,
 };
 use crate::thread_catalog::ThreadCatalog;
-use crate::workspace_pipeline::{WorkspaceChange, WorkspacePatch, WorkspaceRevision};
+use crate::workspace_pipeline::{
+    MessageChange, TimelineTarget, WorkspaceChange, WorkspacePatch, WorkspaceRevision,
+};
 
 /// Authoritative connection lifecycle for one workspace session.
 ///
@@ -88,13 +90,14 @@ impl WorkspaceLifecycle {
 pub(crate) struct WorkspaceSessionState {
     lifecycle: Cell<WorkspaceLifecycle>,
     pub(crate) conversations: RefCell<ConversationCatalog>,
+    pub(crate) users: RefCell<HashMap<String, SlackUser>>,
     pub(crate) view: RefCell<WorkspaceViewState>,
     pub(crate) threads: RefCell<ThreadCatalog>,
-    conversation_patches: RefCell<ConversationPatchConsumer>,
+    workspace_patches: RefCell<WorkspacePatchConsumer>,
 }
 
 #[derive(Debug, Default)]
-struct ConversationPatchConsumer {
+struct WorkspacePatchConsumer {
     revision: WorkspaceRevision,
 }
 
@@ -120,15 +123,72 @@ impl ConversationPatchRemoval {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ConversationPatchApplication {
+pub(crate) struct WorkspacePatchApplication {
     conversation_changed: bool,
+    thread_catalog_changed: bool,
+    users_reset: bool,
+    changed_user_ids: Vec<String>,
+    timeline_changes: Vec<TimelineProjectionApplication>,
     removals: Vec<ConversationPatchRemoval>,
     acknowledged_local_reads: Vec<String>,
 }
 
-impl ConversationPatchApplication {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TimelineProjectionApplication {
+    target: TimelineTarget,
+    render: bool,
+    derived_view_changed: bool,
+    operations: Vec<TimelineProjectionOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TimelineProjectionOperation {
+    Upsert {
+        message: Box<SlackMessage>,
+        inserted: bool,
+    },
+    Remove {
+        message_ts: String,
+    },
+}
+
+impl TimelineProjectionApplication {
+    pub(crate) fn target(&self) -> &TimelineTarget {
+        &self.target
+    }
+
+    pub(crate) fn render(&self) -> bool {
+        self.render
+    }
+
+    pub(crate) fn derived_view_changed(&self) -> bool {
+        self.derived_view_changed
+    }
+
+    pub(crate) fn operations(&self) -> &[TimelineProjectionOperation] {
+        &self.operations
+    }
+}
+
+impl WorkspacePatchApplication {
     pub(crate) fn conversation_changed(&self) -> bool {
         self.conversation_changed
+    }
+
+    pub(crate) fn thread_catalog_changed(&self) -> bool {
+        self.thread_catalog_changed
+    }
+
+    pub(crate) fn users_reset(&self) -> bool {
+        self.users_reset
+    }
+
+    pub(crate) fn changed_user_ids(&self) -> &[String] {
+        &self.changed_user_ids
+    }
+
+    pub(crate) fn timeline_changes(&self) -> &[TimelineProjectionApplication] {
+        &self.timeline_changes
     }
 
     pub(crate) fn removals(&self) -> &[ConversationPatchRemoval] {
@@ -156,45 +216,53 @@ impl WorkspaceSessionState {
 
     pub(crate) fn reset(&self) {
         *self.conversations.borrow_mut() = ConversationCatalog::default();
+        self.users.borrow_mut().clear();
         self.view.borrow_mut().reset();
         *self.threads.borrow_mut() = ThreadCatalog::default();
-        *self.conversation_patches.borrow_mut() = ConversationPatchConsumer::default();
+        *self.workspace_patches.borrow_mut() = WorkspacePatchConsumer::default();
     }
 
     #[allow(dead_code)]
-    pub(crate) fn conversation_patch_revision(&self) -> WorkspaceRevision {
-        self.conversation_patches.borrow().revision
+    pub(crate) fn workspace_patch_revision(&self) -> WorkspaceRevision {
+        self.workspace_patches.borrow().revision
     }
 
     #[cfg(test)]
-    pub(crate) fn apply_conversation_patch(
+    pub(crate) fn apply_workspace_patch(
         &self,
         patch: &WorkspacePatch,
-    ) -> Option<ConversationPatchApplication> {
-        self.apply_conversation_patch_with_local_reads(patch, &HashMap::new())
+    ) -> Option<WorkspacePatchApplication> {
+        self.apply_workspace_patch_with_local_reads(patch, &HashMap::new())
     }
 
-    pub(crate) fn apply_conversation_patch_with_local_reads(
+    pub(crate) fn apply_workspace_patch_with_local_reads(
         &self,
         patch: &WorkspacePatch,
         local_read_ts_by_channel: &HashMap<String, String>,
-    ) -> Option<ConversationPatchApplication> {
-        let mut consumer = self.conversation_patches.borrow_mut();
+    ) -> Option<WorkspacePatchApplication> {
+        let mut consumer = self.workspace_patches.borrow_mut();
         if patch.revision() <= consumer.revision {
             return None;
         }
 
         let mut catalog = self.conversations.borrow_mut();
+        let mut users = self.users.borrow_mut();
         let mut view = self.view.borrow_mut();
-        let mut application = ConversationPatchApplication::default();
+        let mut threads = self.threads.borrow_mut();
+        let mut application = WorkspacePatchApplication::default();
         for change in patch.changes() {
             match change {
-                WorkspaceChange::BootstrapReset(data) => replace_patch_conversations(
-                    &mut catalog,
-                    &mut view,
-                    &data.conversations,
-                    &mut application,
-                ),
+                WorkspaceChange::BootstrapReset(data) => {
+                    replace_patch_conversations(
+                        &mut catalog,
+                        &mut view,
+                        &data.conversations,
+                        &mut application,
+                    );
+                    *threads = ThreadCatalog::from_records(data.threads.clone());
+                    application.thread_catalog_changed = true;
+                    replace_patch_users(&mut users, &data.users, &mut application);
+                }
                 WorkspaceChange::ConversationsReset(conversations) => {
                     replace_patch_conversations(
                         &mut catalog,
@@ -270,10 +338,42 @@ impl WorkspaceSessionState {
                     }
                     application.conversation_changed |= catalog.apply_unread_snapshot(snapshot);
                 }
-                WorkspaceChange::UsersReset(_)
-                | WorkspaceChange::UserUpsert(_)
-                | WorkspaceChange::TimelineChanged { .. }
-                | WorkspaceChange::ThreadCatalogChanged(_) => {}
+                WorkspaceChange::ThreadCatalogChanged(records) => {
+                    *threads = ThreadCatalog::from_records(records.clone());
+                    application.thread_catalog_changed = true;
+                }
+                WorkspaceChange::UsersReset(updated) => {
+                    replace_patch_users(&mut users, updated, &mut application);
+                }
+                WorkspaceChange::UserUpsert(user) => {
+                    let Some(user_id) = user
+                        .id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|user_id| !user_id.is_empty())
+                    else {
+                        continue;
+                    };
+                    if users.get(user_id) != Some(user) {
+                        users.insert(user_id.to_string(), user.clone());
+                        application.changed_user_ids.push(user_id.to_string());
+                    }
+                }
+                WorkspaceChange::TimelineChanged { target, changes } => {
+                    if let Some(timeline_change) = view.apply_timeline_changes(target, changes) {
+                        if let Some(existing) = application
+                            .timeline_changes
+                            .iter_mut()
+                            .find(|existing| existing.target == timeline_change.target)
+                        {
+                            existing.render |= timeline_change.render;
+                            existing.derived_view_changed |= timeline_change.derived_view_changed;
+                            existing.operations.extend(timeline_change.operations);
+                        } else {
+                            application.timeline_changes.push(timeline_change);
+                        }
+                    }
+                }
             }
         }
         consumer.revision = patch.revision();
@@ -281,11 +381,33 @@ impl WorkspaceSessionState {
     }
 }
 
+fn replace_patch_users(
+    users: &mut HashMap<String, SlackUser>,
+    updated: &[SlackUser],
+    application: &mut WorkspacePatchApplication,
+) {
+    users.clear();
+    for user in updated {
+        let Some(user_id) = user
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|user_id| !user_id.is_empty())
+        else {
+            continue;
+        };
+        users.insert(user_id.to_string(), user.clone());
+    }
+    application.users_reset = true;
+    application.changed_user_ids = users.keys().cloned().collect();
+    application.changed_user_ids.sort();
+}
+
 fn replace_patch_conversations(
     catalog: &mut ConversationCatalog,
     view: &mut WorkspaceViewState,
     conversations: &[SlackConversation],
-    application: &mut ConversationPatchApplication,
+    application: &mut WorkspacePatchApplication,
 ) {
     let incoming_ids = conversations
         .iter()
@@ -367,6 +489,7 @@ pub(crate) struct WorkspaceFailureOutcome {
 pub(crate) enum ThreadOpenOutcome {
     Ignored,
     RenderCurrent,
+    RenderCachedAndRefresh,
     RequestFresh,
     AwaitFresh,
 }
@@ -723,6 +846,7 @@ pub(crate) struct WorkspaceViewState {
     main_view: MainMessageView,
     last_channel_id: Option<String>,
     channels: HashMap<String, ChannelHistoryState>,
+    thread_timelines: HashMap<(String, String), Vec<SlackMessage>>,
     thread: Option<ThreadViewState>,
     search_results: Vec<SearchMatch>,
     files: Vec<SlackFile>,
@@ -856,6 +980,8 @@ impl WorkspaceViewState {
 
     pub(crate) fn remove_conversation(&mut self, channel_id: &str) {
         self.channels.remove(channel_id);
+        self.thread_timelines
+            .retain(|(known_channel_id, _), _| known_channel_id != channel_id);
         if self.last_channel_id.as_deref() == Some(channel_id) {
             self.last_channel_id = None;
             if self.main_view == MainMessageView::Conversation {
@@ -1085,16 +1211,26 @@ impl WorkspaceViewState {
             }
         }
 
+        let messages = self
+            .thread_timelines
+            .get(&(channel_id.to_string(), ts.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        let has_cached_messages = !messages.is_empty();
         self.thread = Some(ThreadViewState {
             channel_id: channel_id.to_string(),
             ts: ts.to_string(),
-            messages: Vec::new(),
+            messages,
             context_messages: None,
             next_cursor: None,
             status: ThreadLoadStatus::Loading,
             focus_ts: None,
         });
-        ThreadOpenOutcome::RequestFresh
+        if has_cached_messages {
+            ThreadOpenOutcome::RenderCachedAndRefresh
+        } else {
+            ThreadOpenOutcome::RequestFresh
+        }
     }
 
     pub(crate) fn begin_thread_history_request(&mut self) -> bool {
@@ -1295,6 +1431,10 @@ impl WorkspaceViewState {
         thread.status = ThreadLoadStatus::Ready;
         thread.context_messages = None;
         thread.next_cursor = usable_cursor(has_more, next_cursor);
+        self.thread_timelines.insert(
+            (channel_id.to_string(), ts.to_string()),
+            thread.messages.clone(),
+        );
         ThreadApplyOutcome::Applied {
             scroll: if append_older {
                 WorkspaceScrollBehavior::PreservePrepend
@@ -1309,6 +1449,124 @@ impl WorkspaceViewState {
         self.thread
             .as_ref()
             .and_then(|thread| thread.next_cursor.as_deref())
+    }
+
+    fn apply_timeline_changes(
+        &mut self,
+        target: &TimelineTarget,
+        changes: &[MessageChange],
+    ) -> Option<TimelineProjectionApplication> {
+        if changes.is_empty() {
+            return None;
+        }
+        let channel_id = match target {
+            TimelineTarget::Channel(channel_id) => channel_id.as_str(),
+            TimelineTarget::Thread { channel_id, .. } => channel_id.as_str(),
+        };
+        let mut search_changed = false;
+        let mut saved_changed = false;
+        for change in changes {
+            match change {
+                MessageChange::Upsert(message) => {
+                    search_changed |= apply_realtime_message_to_search(
+                        &mut self.search_results,
+                        channel_id,
+                        message,
+                        RealtimeMessageKind::Changed,
+                    );
+                    saved_changed |= apply_realtime_message_to_saved(
+                        &mut self.saved_items,
+                        channel_id,
+                        message,
+                        RealtimeMessageKind::Changed,
+                    );
+                }
+                MessageChange::Remove { message_ts } => {
+                    let removed = SlackMessage {
+                        ts: message_ts.clone(),
+                        ..Default::default()
+                    };
+                    search_changed |= apply_realtime_message_to_search(
+                        &mut self.search_results,
+                        channel_id,
+                        &removed,
+                        RealtimeMessageKind::Deleted,
+                    );
+                    saved_changed |= apply_realtime_message_to_saved(
+                        &mut self.saved_items,
+                        channel_id,
+                        &removed,
+                        RealtimeMessageKind::Deleted,
+                    );
+                }
+            }
+        }
+
+        let (timeline_changed, render, operations) = match target {
+            TimelineTarget::Channel(channel_id) => {
+                let visible = self.visible_channel_id() == Some(channel_id.as_str());
+                let history = self.channels.entry(channel_id.clone()).or_default();
+                let operations = timeline_projection_operations(
+                    &history.messages,
+                    changes,
+                    SlackMessage::belongs_in_channel_timeline,
+                );
+                let base_changed = apply_projection_message_changes(
+                    &mut history.messages,
+                    changes,
+                    SlackMessage::belongs_in_channel_timeline,
+                );
+                let context_changed = history
+                    .context_messages
+                    .as_mut()
+                    .is_some_and(|messages| apply_context_message_changes(messages, changes));
+                if base_changed {
+                    history.loaded = true;
+                }
+                let changed = base_changed || context_changed;
+                (changed, visible && changed, operations)
+            }
+            TimelineTarget::Thread {
+                channel_id,
+                thread_ts,
+            } => {
+                let key = (channel_id.clone(), thread_ts.clone());
+                let (base_changed, projected_messages, operations) = {
+                    let messages = self.thread_timelines.entry(key).or_default();
+                    let operations = timeline_projection_operations(messages, changes, |message| {
+                        message.belongs_to_thread(thread_ts)
+                    });
+                    let changed = apply_projection_message_changes(messages, changes, |message| {
+                        message.belongs_to_thread(thread_ts)
+                    });
+                    (changed, changed.then(|| messages.clone()), operations)
+                };
+                let active_changed = self
+                    .thread
+                    .as_mut()
+                    .filter(|thread| thread.channel_id == *channel_id && thread.ts == *thread_ts)
+                    .is_some_and(|thread| {
+                        if let Some(messages) = projected_messages.as_ref() {
+                            thread.messages.clone_from(messages);
+                        }
+                        let context_changed = thread
+                            .context_messages
+                            .as_mut()
+                            .is_some_and(|context| apply_context_message_changes(context, changes));
+                        base_changed || context_changed
+                    });
+                (base_changed || active_changed, active_changed, operations)
+            }
+        };
+        let derived_view_changed = (self.main_view == MainMessageView::Search && search_changed)
+            || (self.main_view == MainMessageView::Saved && saved_changed);
+        let projection_changed = timeline_changed || search_changed || saved_changed;
+        projection_changed.then(|| TimelineProjectionApplication {
+            target: target.clone(),
+            render,
+            derived_view_changed,
+            operations,
+        })
     }
 
     pub(crate) fn apply_realtime_message(
@@ -1365,6 +1623,16 @@ impl WorkspaceViewState {
                     .is_some_and(|messages| apply_realtime_message_to(messages, &message, kind));
                 base_changed || context_changed
             });
+        if let Some(thread) = self
+            .thread
+            .as_ref()
+            .filter(|thread| thread.channel_id == channel_id)
+        {
+            self.thread_timelines.insert(
+                (thread.channel_id.clone(), thread.ts.clone()),
+                thread.messages.clone(),
+            );
+        }
 
         let search_changed =
             apply_realtime_message_to_search(&mut self.search_results, channel_id, &message, kind);
@@ -1571,6 +1839,102 @@ fn usable_cursor(has_more: bool, cursor: Option<String>) -> Option<String> {
     cursor.filter(|cursor| has_more && !cursor.trim().is_empty())
 }
 
+fn apply_projection_message_changes(
+    messages: &mut Vec<SlackMessage>,
+    changes: &[MessageChange],
+    accepts: impl Fn(&SlackMessage) -> bool,
+) -> bool {
+    let mut changed = false;
+    for change in changes {
+        match change {
+            MessageChange::Upsert(message) if accepts(message) => {
+                if let Some(existing) = messages.iter_mut().find(|known| known.ts == message.ts) {
+                    if existing != message.as_ref() {
+                        existing.clone_from(message);
+                        changed = true;
+                    }
+                } else {
+                    messages.push((**message).clone());
+                    changed = true;
+                }
+            }
+            MessageChange::Upsert(_) => {}
+            MessageChange::Remove { message_ts } => {
+                let previous_len = messages.len();
+                messages.retain(|message| message.ts != *message_ts);
+                changed |= messages.len() != previous_len;
+            }
+        }
+    }
+    if changed {
+        messages.sort_by(|left, right| right.ts.cmp(&left.ts));
+        messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
+    }
+    changed
+}
+
+fn timeline_projection_operations(
+    messages: &[SlackMessage],
+    changes: &[MessageChange],
+    accepts: impl Fn(&SlackMessage) -> bool,
+) -> Vec<TimelineProjectionOperation> {
+    let mut known = messages
+        .iter()
+        .map(|message| (message.ts.clone(), message.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut operations = Vec::new();
+    for change in changes {
+        match change {
+            MessageChange::Upsert(message) if accepts(message) => {
+                let inserted = !known.contains_key(&message.ts);
+                if known.get(&message.ts) != Some(message.as_ref()) {
+                    known.insert(message.ts.clone(), (**message).clone());
+                    operations.push(TimelineProjectionOperation::Upsert {
+                        message: message.clone(),
+                        inserted,
+                    });
+                }
+            }
+            MessageChange::Upsert(_) => {}
+            MessageChange::Remove { message_ts } => {
+                if known.remove(message_ts).is_some() {
+                    operations.push(TimelineProjectionOperation::Remove {
+                        message_ts: message_ts.clone(),
+                    });
+                }
+            }
+        }
+    }
+    operations
+}
+
+fn apply_context_message_changes(
+    messages: &mut Vec<SlackMessage>,
+    changes: &[MessageChange],
+) -> bool {
+    let mut changed = false;
+    for change in changes {
+        match change {
+            MessageChange::Upsert(message) => {
+                let Some(existing) = messages.iter_mut().find(|known| known.ts == message.ts)
+                else {
+                    continue;
+                };
+                if existing != message.as_ref() {
+                    existing.clone_from(message);
+                    changed = true;
+                }
+            }
+            MessageChange::Remove { message_ts } => {
+                let previous_len = messages.len();
+                messages.retain(|message| message.ts != *message_ts);
+                changed |= messages.len() != previous_len;
+            }
+        }
+    }
+    changed
+}
+
 fn normalize_messages(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
     messages.sort_by(|left, right| right.ts.cmp(&left.ts));
     messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
@@ -1731,8 +2095,8 @@ mod tests {
     use super::*;
     use crate::models::{SlackConversationUnreadSnapshot, SlackUnreadState};
     use crate::workspace_pipeline::{
-        ConversationAttentionObservation, WorkspaceBootstrapData, WorkspaceChange, WorkspacePatch,
-        WorkspaceRevision,
+        ConversationAttentionObservation, MessageChange, TimelineTarget, WorkspaceBootstrapData,
+        WorkspaceChange, WorkspacePatch, WorkspaceRevision,
     };
 
     fn message(ts: &str, text: &str) -> SlackMessage {
@@ -1787,7 +2151,7 @@ mod tests {
             }),
         );
         assert!(state
-            .apply_conversation_patch(&bootstrap)
+            .apply_workspace_patch(&bootstrap)
             .unwrap()
             .conversation_changed());
         state.view.borrow_mut().select_conversation("C1");
@@ -1797,10 +2161,10 @@ mod tests {
             WorkspaceChange::ConversationUpsert(conversation("C1", "new")),
         );
         assert!(state
-            .apply_conversation_patch(&newer)
+            .apply_workspace_patch(&newer)
             .unwrap()
             .conversation_changed());
-        assert_eq!(state.conversation_patch_revision(), revision_three);
+        assert_eq!(state.workspace_patch_revision(), revision_three);
 
         let duplicate = conversation_patch(
             revision_three,
@@ -1808,12 +2172,12 @@ mod tests {
                 channel_id: "C1".to_string(),
             },
         );
-        assert!(state.apply_conversation_patch(&duplicate).is_none());
+        assert!(state.apply_workspace_patch(&duplicate).is_none());
         let stale = conversation_patch(
             revision_two,
             WorkspaceChange::ConversationUpsert(conversation("C1", "rollback")),
         );
-        assert!(state.apply_conversation_patch(&stale).is_none());
+        assert!(state.apply_workspace_patch(&stale).is_none());
         assert_eq!(
             state
                 .conversations
@@ -1834,7 +2198,7 @@ mod tests {
                 channel_id: "C1".to_string(),
             },
         );
-        let application = state.apply_conversation_patch(&removal).unwrap();
+        let application = state.apply_workspace_patch(&removal).unwrap();
         assert_eq!(application.removals().len(), 1);
         assert_eq!(application.removals()[0].channel_id(), "C1");
         assert!(application.removals()[0].was_visible());
@@ -1860,7 +2224,7 @@ mod tests {
             is_open: None,
         });
         state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&conversation_patch(
                 revision_one,
                 WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
                     conversations: vec![initial],
@@ -1888,13 +2252,13 @@ mod tests {
             },
         );
         let delayed = state
-            .apply_conversation_patch_with_local_reads(&delayed_unread, &local_reads)
+            .apply_workspace_patch_with_local_reads(&delayed_unread, &local_reads)
             .unwrap();
         assert!(!delayed.conversation_changed());
         assert!(delayed.acknowledged_local_reads().is_empty());
-        assert_eq!(state.conversation_patch_revision(), revision_three);
+        assert_eq!(state.workspace_patch_revision(), revision_three);
         assert!(state
-            .apply_conversation_patch_with_local_reads(
+            .apply_workspace_patch_with_local_reads(
                 &conversation_patch(
                     revision_three,
                     WorkspaceChange::ConversationRemoved {
@@ -1905,7 +2269,7 @@ mod tests {
             )
             .is_none());
         assert!(state
-            .apply_conversation_patch_with_local_reads(
+            .apply_workspace_patch_with_local_reads(
                 &conversation_patch(
                     revision_two,
                     WorkspaceChange::UnreadChanged {
@@ -1933,7 +2297,7 @@ mod tests {
         }
 
         let cursorless = state
-            .apply_conversation_patch_with_local_reads(
+            .apply_workspace_patch_with_local_reads(
                 &conversation_patch(
                     revision_four,
                     WorkspaceChange::UnreadChanged {
@@ -1960,7 +2324,7 @@ mod tests {
         }
 
         let acknowledged = state
-            .apply_conversation_patch_with_local_reads(
+            .apply_workspace_patch_with_local_reads(
                 &conversation_patch(
                     revision_five,
                     WorkspaceChange::UnreadChanged {
@@ -1999,7 +2363,7 @@ mod tests {
             ("topic".to_string(), serde_json::json!("Keep me")),
         ]));
         state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&conversation_patch(
                 revision_one,
                 WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
                     conversations: vec![initial],
@@ -2013,7 +2377,7 @@ mod tests {
             record_unread: true,
         };
         let first = state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&conversation_patch(
                 revision_two,
                 WorkspaceChange::ConversationAttentionObserved {
                     channel_id: "C1".to_string(),
@@ -2023,7 +2387,7 @@ mod tests {
             .unwrap();
         assert!(first.conversation_changed());
         let duplicate = state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&conversation_patch(
                 revision_three,
                 WorkspaceChange::ConversationAttentionObserved {
                     channel_id: "C1".to_string(),
@@ -2051,7 +2415,7 @@ mod tests {
             .advance_read_cursor("C1", "20.0", 0);
         let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
         let stale = state
-            .apply_conversation_patch_with_local_reads(
+            .apply_workspace_patch_with_local_reads(
                 &conversation_patch(
                     revision_four,
                     WorkspaceChange::ConversationAttentionObserved {
@@ -2081,7 +2445,7 @@ mod tests {
         }
 
         let newer = state
-            .apply_conversation_patch_with_local_reads(
+            .apply_workspace_patch_with_local_reads(
                 &conversation_patch(
                     revision_five,
                     WorkspaceChange::ConversationAttentionObserved {
@@ -2109,7 +2473,7 @@ mod tests {
         embedded_marker.advance_read_cursor("30.0", 0);
         embedded_marker.set_local_read_ts("30.0");
         embedded_marker_state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&conversation_patch(
                 revision_one,
                 WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
                     conversations: vec![embedded_marker],
@@ -2118,7 +2482,7 @@ mod tests {
             ))
             .unwrap();
         let embedded_stale = embedded_marker_state
-            .apply_conversation_patch(&conversation_patch(
+            .apply_workspace_patch(&conversation_patch(
                 revision_two,
                 WorkspaceChange::ConversationAttentionObserved {
                     channel_id: "C2".to_string(),
@@ -2326,6 +2690,181 @@ mod tests {
             MainMessageView::Placeholder
         );
         assert!(session.threads.borrow().get("C1", "1").is_none());
+    }
+
+    #[test]
+    fn workspace_patch_alone_hydrates_and_replaces_the_thread_catalog() {
+        let session = WorkspaceSessionState::default();
+        let mut catalog = ThreadCatalog::default();
+        let mut root = message("1", "thread root");
+        root.reply_count = Some(1);
+        catalog.observe_history("C1", &[root]);
+        let records = catalog.into_records();
+        let revision_one = WorkspaceRevision::INITIAL.successor();
+
+        let hydrated = session
+            .apply_workspace_patch(&conversation_patch(
+                revision_one,
+                WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                    threads: records.clone(),
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+
+        assert!(hydrated.thread_catalog_changed());
+        assert_eq!(session.threads.borrow().clone().into_records(), records);
+
+        let replaced = session
+            .apply_workspace_patch(&conversation_patch(
+                revision_one.successor(),
+                WorkspaceChange::ThreadCatalogChanged(Vec::new()),
+            ))
+            .unwrap();
+
+        assert!(replaced.thread_catalog_changed());
+        assert!(session.threads.borrow().clone().into_records().is_empty());
+    }
+
+    #[test]
+    fn workspace_patch_alone_hydrates_updates_and_clears_users() {
+        let session = WorkspaceSessionState::default();
+        let revision_one = WorkspaceRevision::INITIAL.successor();
+        let user = SlackUser {
+            id: Some("U1".into()),
+            name: Some("old".into()),
+            ..Default::default()
+        };
+
+        let hydrated = session
+            .apply_workspace_patch(&conversation_patch(
+                revision_one,
+                WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                    users: vec![user],
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+        assert!(hydrated.users_reset());
+        assert_eq!(hydrated.changed_user_ids(), &["U1"]);
+
+        let updated = session
+            .apply_workspace_patch(&conversation_patch(
+                revision_one.successor(),
+                WorkspaceChange::UserUpsert(SlackUser {
+                    id: Some("U1".into()),
+                    name: Some("new".into()),
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+        assert!(!updated.users_reset());
+        assert_eq!(updated.changed_user_ids(), &["U1"]);
+        assert_eq!(
+            session
+                .users
+                .borrow()
+                .get("U1")
+                .and_then(|user| user.name.as_deref()),
+            Some("new")
+        );
+
+        let cleared = session
+            .apply_workspace_patch(&conversation_patch(
+                revision_one.successor().successor(),
+                WorkspaceChange::UsersReset(Vec::new()),
+            ))
+            .unwrap();
+        assert!(cleared.users_reset());
+        assert!(cleared.changed_user_ids().is_empty());
+        assert!(session.users.borrow().is_empty());
+    }
+
+    #[test]
+    fn workspace_patch_projects_timelines_and_keeps_derived_surfaces_fresh() {
+        let session = WorkspaceSessionState::default();
+        {
+            let mut view = session.view.borrow_mut();
+            view.select_conversation("C1");
+            view.apply_search_results(vec![SearchMatch {
+                channel: Some(crate::models::SlackSearchChannel {
+                    id: Some("C1".into()),
+                    ..Default::default()
+                }),
+                ts: Some("1".into()),
+                text: Some("old".into()),
+                ..Default::default()
+            }]);
+            view.apply_saved(vec![SavedItem {
+                channel: Some("C1".into()),
+                message: Some(message("1", "old")),
+                ..Default::default()
+            }]);
+        }
+        let revision_one = WorkspaceRevision::INITIAL.successor();
+        let changed = session
+            .apply_workspace_patch(&conversation_patch(
+                revision_one,
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(message("1", "new")))],
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(changed.timeline_changes().len(), 1);
+        assert_eq!(
+            changed.timeline_changes()[0].target(),
+            &TimelineTarget::Channel("C1".into())
+        );
+        assert!(changed.timeline_changes()[0].render());
+        let view = session.view.borrow();
+        assert_eq!(view.channel_messages("C1")[0].body_text(), "new");
+        assert_eq!(view.search_results()[0].text.as_deref(), Some("new"));
+        assert_eq!(
+            view.saved_items()[0].message.as_ref().unwrap().body_text(),
+            "new"
+        );
+        drop(view);
+
+        let thread_changed = session
+            .apply_workspace_patch(&conversation_patch(
+                revision_one.successor(),
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Thread {
+                        channel_id: "C1".into(),
+                        thread_ts: "1".into(),
+                    },
+                    changes: vec![MessageChange::Upsert(Box::new(thread_message(
+                        "2", "1", "reply",
+                    )))],
+                },
+            ))
+            .unwrap();
+        assert!(!thread_changed.timeline_changes()[0].render());
+        let mut view = session.view.borrow_mut();
+        assert_eq!(
+            view.open_thread("C1", "1"),
+            ThreadOpenOutcome::RenderCachedAndRefresh
+        );
+        assert_eq!(view.current_thread_messages()[0].body_text(), "reply");
+        drop(view);
+
+        session
+            .apply_workspace_patch(&conversation_patch(
+                revision_one.successor().successor(),
+                WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Remove {
+                        message_ts: "1".into(),
+                    }],
+                },
+            ))
+            .unwrap();
+        let view = session.view.borrow();
+        assert!(view.channel_messages("C1").is_empty());
+        assert!(view.search_results().is_empty());
+        assert!(view.saved_items().is_empty());
     }
 
     #[test]

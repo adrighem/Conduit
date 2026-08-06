@@ -217,6 +217,13 @@ pub(crate) enum WorkspaceMutation {
         origin: MutationOrigin,
         delivery: DeliveryState,
     },
+    ReactionChanged {
+        channel_id: String,
+        message_ts: String,
+        name: String,
+        user_id: String,
+        added: bool,
+    },
     ThreadCatalogChanged(Vec<ThreadRecord>),
 }
 
@@ -605,6 +612,13 @@ impl WorkspaceCoordinator {
                 origin,
                 delivery,
             } => self.apply_message(&channel_id, message, kind, origin, Some(delivery)),
+            WorkspaceMutation::ReactionChanged {
+                channel_id,
+                message_ts,
+                name,
+                user_id,
+                added,
+            } => self.apply_reaction(&channel_id, &message_ts, &name, &user_id, added, origin),
             WorkspaceMutation::ThreadCatalogChanged(records) => self.apply_thread_catalog(records),
         }
     }
@@ -1141,6 +1155,7 @@ impl WorkspaceCoordinator {
             .map(str::trim)
             .filter(|user_id| !user_id.is_empty())?
             .to_string();
+        let user = merge_user_update(self.users.get(&user_id).map(|entry| &entry.value), user);
         if self
             .users
             .get(&user_id)
@@ -1161,6 +1176,48 @@ impl WorkspaceCoordinator {
             vec![WorkspaceChange::UserUpsert(user.clone())],
             vec![StoreChange::UserUpsert(user)],
         )
+    }
+
+    fn apply_reaction(
+        &mut self,
+        channel_id: &str,
+        message_ts: &str,
+        name: &str,
+        user_id: &str,
+        added: bool,
+        origin: MutationOrigin,
+    ) -> Option<WorkspaceReduction> {
+        if channel_id.trim().is_empty()
+            || message_ts.trim().is_empty()
+            || name.trim().is_empty()
+            || user_id.trim().is_empty()
+        {
+            return None;
+        }
+        let mut message = self
+            .histories
+            .get(channel_id)
+            .and_then(|timeline| timeline.messages.get(message_ts))
+            .map(|entry| entry.value.clone())
+            .or_else(|| {
+                self.threads
+                    .iter()
+                    .filter(|((known_channel_id, _), _)| known_channel_id == channel_id)
+                    .find_map(|(_, timeline)| timeline.messages.get(message_ts))
+                    .map(|entry| entry.value.clone())
+            })?;
+        if !apply_reaction_to_message(&mut message, name, user_id, added) {
+            return None;
+        }
+        let mut reduction = self.apply_message(
+            channel_id,
+            message,
+            MessageMutationKind::Changed,
+            origin,
+            None,
+        )?;
+        reduction.effects.clear();
+        Some(reduction)
     }
 
     fn message_projection_is_superseded(
@@ -2118,6 +2175,120 @@ impl WorkspaceCoordinator {
     }
 }
 
+fn merge_user_update(existing: Option<&SlackUser>, mut update: SlackUser) -> SlackUser {
+    let Some(existing) = existing else {
+        return update;
+    };
+    let mut merged = existing.clone();
+
+    macro_rules! merge_user_fields {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                if update.$field.is_some() {
+                    merged.$field = update.$field.take();
+                }
+            )+
+        };
+    }
+    merge_user_fields!(id, name, real_name, deleted, is_bot, tz, tz_label, tz_offset,);
+
+    let Some(mut profile_update) = update.profile.take() else {
+        return merged;
+    };
+    let Some(profile) = merged.profile.as_mut() else {
+        merged.profile = Some(profile_update);
+        return merged;
+    };
+
+    macro_rules! merge_profile_fields {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                if profile_update.$field.is_some() {
+                    profile.$field = profile_update.$field.take();
+                }
+            )+
+        };
+    }
+    merge_profile_fields!(
+        display_name,
+        display_name_normalized,
+        real_name,
+        real_name_normalized,
+        status_text,
+        status_emoji,
+        status_expiration,
+        title,
+        phone,
+        email,
+        skype,
+        pronouns,
+        about,
+        location,
+        image_72,
+        image_192,
+        image_512,
+        image_original,
+        huddle_state_call_id,
+        huddle_state_channel_id,
+        huddle_state_expiration_ts,
+    );
+    if profile_update.huddle_state != Default::default() {
+        profile.huddle_state = profile_update.huddle_state;
+    }
+    if !profile_update.fields.is_empty() {
+        profile.fields.extend(profile_update.fields);
+    }
+    merged
+}
+
+fn apply_reaction_to_message(
+    message: &mut SlackMessage,
+    name: &str,
+    user_id: &str,
+    added: bool,
+) -> bool {
+    let reactions = message.reactions.get_or_insert_with(Vec::new);
+    let position = reactions
+        .iter()
+        .position(|reaction| reaction.name.as_deref() == Some(name));
+    if added {
+        if let Some(position) = position {
+            let reaction = &mut reactions[position];
+            let users = reaction.users.get_or_insert_with(Vec::new);
+            if users.iter().any(|known| known == user_id) {
+                return false;
+            }
+            users.push(user_id.to_string());
+            reaction.count = Some(reaction.count.unwrap_or_default().saturating_add(1));
+        } else {
+            reactions.push(crate::models::SlackReaction {
+                name: Some(name.to_string()),
+                count: Some(1),
+                users: Some(vec![user_id.to_string()]),
+            });
+        }
+        return true;
+    }
+
+    let Some(position) = position else {
+        return false;
+    };
+    let reaction = &mut reactions[position];
+    if let Some(users) = reaction.users.as_mut() {
+        let previous_len = users.len();
+        users.retain(|known| known != user_id);
+        if users.len() == previous_len {
+            return false;
+        }
+    }
+    let count = reaction.count.unwrap_or_default().saturating_sub(1);
+    reaction.count = Some(count);
+    if count == 0 {
+        reactions.remove(position);
+    }
+    true
+}
+
 fn newest_message_ts(
     messages: &[SlackMessage],
     count: usize,
@@ -2702,6 +2873,114 @@ mod tests {
             coordinator.conversation("C1").unwrap().latest_message_ts(),
             Some("30.0")
         );
+    }
+
+    #[test]
+    fn partial_user_upsert_preserves_known_identity_and_profile_fields() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator
+            .apply(WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U1".into()),
+                name: Some("person".into()),
+                real_name: Some("Person One".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    display_name: Some("Person".into()),
+                    image_72: Some("https://example.invalid/avatar.png".into()),
+                    status_text: Some("Busy".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::UserUpsert(SlackUser {
+                id: Some("U1".into()),
+                profile: Some(crate::models::SlackUserProfile {
+                    status_text: Some(String::new()),
+                    status_emoji: Some(":white_check_mark:".into()),
+                    status_expiration: Some(42),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+
+        let [WorkspaceChange::UserUpsert(user)] = reduction.patch().changes() else {
+            panic!("expected one merged user upsert");
+        };
+        assert_eq!(user.name.as_deref(), Some("person"));
+        assert_eq!(user.real_name.as_deref(), Some("Person One"));
+        let profile = user.profile.as_ref().unwrap();
+        assert_eq!(profile.display_name.as_deref(), Some("Person"));
+        assert_eq!(
+            profile.image_72.as_deref(),
+            Some("https://example.invalid/avatar.png")
+        );
+        assert_eq!(profile.status_text.as_deref(), Some(""));
+        assert_eq!(profile.status_emoji.as_deref(), Some(":white_check_mark:"));
+        assert_eq!(profile.status_expiration, Some(42));
+    }
+
+    #[test]
+    fn reaction_mutation_updates_the_canonical_message_once() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        coordinator
+            .apply(WorkspaceMutation::HistorySnapshot {
+                channel_id: "C1".into(),
+                snapshot: SnapshotEnvelope::new(
+                    WorkspaceRevision::INITIAL,
+                    MessagePage {
+                        messages: vec![message("1", "hello")],
+                        complete: true,
+                        ..Default::default()
+                    },
+                ),
+            })
+            .unwrap();
+
+        let added = coordinator
+            .apply(WorkspaceMutation::ReactionChanged {
+                channel_id: "C1".into(),
+                message_ts: "1".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            added.patch().changes(),
+            [WorkspaceChange::TimelineChanged { changes, .. }]
+                if matches!(changes.as_slice(), [MessageChange::Upsert(message)]
+                    if message.reactions.as_ref().is_some_and(|reactions| {
+                        reactions.iter().any(|reaction| reaction.name.as_deref() == Some("wave")
+                            && reaction.count == Some(1)
+                            && reaction.users.as_ref().is_some_and(|users| users == &["U1"]))
+                    }))
+        ));
+        assert!(coordinator
+            .apply(WorkspaceMutation::ReactionChanged {
+                channel_id: "C1".into(),
+                message_ts: "1".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: true,
+            })
+            .is_none());
+
+        coordinator
+            .apply(WorkspaceMutation::ReactionChanged {
+                channel_id: "C1".into(),
+                message_ts: "1".into(),
+                name: "wave".into(),
+                user_id: "U1".into(),
+                added: false,
+            })
+            .unwrap();
+        assert!(coordinator.history("C1")[0]
+            .reactions
+            .as_ref()
+            .is_some_and(Vec::is_empty));
     }
 
     #[test]
