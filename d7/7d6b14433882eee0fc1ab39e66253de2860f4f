@@ -1,0 +1,7 @@
+Task: Synchronize final architecture documentation
+
+Summary: Updated the canonical Conductor tech stack to describe sole coordinator ownership, patch and store-batch guarantees, stale-snapshot protection, bounded scheduling, startup limits, patch-driven presentation, incremental WebKit delivery, and 60-second redacted pipeline counter samples.
+
+Modified: conductor/tech-stack.md
+
+Rationale: Remove transitional compatibility wording and make the maintained architecture source match the completed Phase 6 implementation and acceptance gate.
