@@ -1,5 +1,7 @@
 use crate::models::SlackMessage;
-use crate::slack::{SlackApi, SlackError, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
+#[cfg(test)]
+use crate::slack::CHANNEL_HISTORY_PAGE_LIMIT;
+use crate::slack::{SlackApi, SlackError, SlackMessagePage};
 use crate::store::{StoreError, WorkspaceStore};
 
 pub(crate) trait ConversationHistorySlack {
@@ -55,6 +57,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn recent_history_preview(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
     messages.sort_by(|left, right| right.ts.cmp(&left.ts));
     messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);

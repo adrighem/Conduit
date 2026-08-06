@@ -45,6 +45,7 @@ const ABOUT_ICON_NAME: &str = config::APPLICATION_ID;
 const ABOUT_LOGO_SIZE: i32 = 192;
 const NOTIFICATION_LIFETIME: Duration = Duration::from_secs(10);
 const MAX_EXTERNAL_SLACK_URIS: usize = 16;
+const PIPELINE_COUNTER_SAMPLE_INTERVAL_SECONDS: u32 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RealtimePreferencePresentation {
@@ -618,6 +619,7 @@ mod imp {
     pub struct ConduitApplication {
         search_provider_registration: RefCell<Option<gio::RegistrationId>>,
         debug_enabled: Cell<bool>,
+        pipeline_counter_sampler: RefCell<Option<glib::SourceId>>,
         notification_generations: RefCell<HashMap<String, u64>>,
         next_notification_generation: Cell<u64>,
     }
@@ -625,6 +627,34 @@ mod imp {
     impl ConduitApplication {
         pub(super) fn set_debug_enabled(&self, enabled: bool) {
             self.debug_enabled.set(enabled);
+            if enabled {
+                if self.pipeline_counter_sampler.borrow().is_some() {
+                    return;
+                }
+                let weak_application = self.obj().downgrade();
+                let mut baseline = crate::debug::pipeline_counter_snapshot();
+                let source = glib::timeout_add_seconds_local(
+                    PIPELINE_COUNTER_SAMPLE_INTERVAL_SECONDS,
+                    move || {
+                        let Some(application) = weak_application.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        let imp = application.imp();
+                        if !imp.debug_enabled() {
+                            imp.pipeline_counter_sampler.borrow_mut().take();
+                            return glib::ControlFlow::Break;
+                        }
+                        baseline = crate::debug::trace_pipeline_counter_sample(
+                            baseline,
+                            u64::from(PIPELINE_COUNTER_SAMPLE_INTERVAL_SECONDS),
+                        );
+                        glib::ControlFlow::Continue
+                    },
+                );
+                self.pipeline_counter_sampler.replace(Some(source));
+            } else if let Some(source) = self.pipeline_counter_sampler.borrow_mut().take() {
+                source.remove();
+            }
         }
 
         pub(super) fn debug_enabled(&self) -> bool {
@@ -708,8 +738,8 @@ mod imp {
             let connect = options.contains("connect");
             let debug = options.contains("debug");
             let debug_auth = debug || options.contains("debug-auth");
-            self.set_debug_enabled(debug);
             crate::debug::set_enabled(debug);
+            self.set_debug_enabled(debug);
             crate::debug::log("app", "debug logging enabled");
             application.present_slack_uris(
                 connect,
@@ -726,6 +756,7 @@ mod imp {
         }
 
         fn shutdown(&self) {
+            self.set_debug_enabled(false);
             self.obj().flush_active_window_state();
             self.parent_shutdown();
         }

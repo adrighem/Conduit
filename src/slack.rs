@@ -357,6 +357,13 @@ pub struct SlackApi {
     user_agent: Option<String>,
 }
 
+async fn send_tracked_slack_request(
+    request: reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    crate::debug::pipeline_counters().record_api_request();
+    request.send().await
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct SlackMessageActionRequest {
     pub(crate) channel_id: String,
@@ -1030,8 +1037,7 @@ impl SlackApi {
         } else {
             self.http.get(url)
         };
-        let response = request
-            .send()
+        let response = send_tracked_slack_request(request)
             .await
             .context("failed to download Slack preview asset")?
             .error_for_status()
@@ -1089,9 +1095,7 @@ impl SlackApi {
     /// after a successful download and never contains a partial response.
     pub async fn download_media(&self, url: &str, destination: &Path) -> Result<DownloadedMedia> {
         ensure_trusted_slack_download_url(url)?;
-        let response = self
-            .authenticated_request(Method::GET, url)
-            .send()
+        let response = send_tracked_slack_request(self.authenticated_request(Method::GET, url))
             .await
             .context("failed to download Slack media")?
             .error_for_status()
@@ -1182,9 +1186,7 @@ impl SlackApi {
         }
 
         progress(DownloadProgressUpdate::new(0.05, "Starting download"));
-        let response = self
-            .authenticated_request(Method::GET, url)
-            .send()
+        let response = send_tracked_slack_request(self.authenticated_request(Method::GET, url))
             .await
             .context("failed to download Slack attachment")?
             .error_for_status()
@@ -1434,10 +1436,7 @@ impl SlackApi {
                 base + span * 0.60,
                 &format!("Uploading {filename}"),
             ));
-            self.http
-                .post(&upload.upload_url)
-                .body(bytes)
-                .send()
+            send_tracked_slack_request(self.http.post(&upload.upload_url).body(bytes))
                 .await
                 .context("failed to upload file bytes to Slack upload URL")?
                 .error_for_status()
@@ -1474,13 +1473,13 @@ impl SlackApi {
         let mut retries = 0;
 
         loop {
-            let response = self
-                .authenticated_request(Method::POST, &url)
-                .timeout(API_REQUEST_TIMEOUT)
-                .form(&form)
-                .send()
-                .await
-                .with_context(|| format!("failed to call Slack method {method}"))?;
+            let response = send_tracked_slack_request(
+                self.authenticated_request(Method::POST, &url)
+                    .timeout(API_REQUEST_TIMEOUT)
+                    .form(&form),
+            )
+            .await
+            .with_context(|| format!("failed to call Slack method {method}"))?;
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = retry_after_delay(&response);
@@ -1567,8 +1566,7 @@ impl SlackApi {
         if let Some(user_agent) = user_agent {
             request = request.header(USER_AGENT, user_agent);
         }
-        let response = request
-            .send()
+        let response = send_tracked_slack_request(request)
             .await
             .with_context(|| format!("failed to call Slack method {method}"))?;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {

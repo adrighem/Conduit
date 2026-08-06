@@ -703,6 +703,7 @@ impl SyncScheduler {
             ready_at_ms: now_ms,
         });
         self.counters.admitted = self.counters.admitted.saturating_add(1);
+        crate::debug::pipeline_counters().record_jobs(1);
         self.counters.coalesced = self
             .counters
             .coalesced

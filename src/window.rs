@@ -1622,6 +1622,7 @@ fn apply_sidebar_store_operations(
     items: &[KeyedSidebarItem],
     operations: &[SidebarProjectionOperation],
 ) {
+    crate::debug::pipeline_counters().record_sidebar_operations(operations.len());
     for operation in operations {
         match *operation {
             SidebarProjectionOperation::Reset => {
@@ -2631,6 +2632,7 @@ fn user_status_presentation(
     })
 }
 
+#[cfg(test)]
 fn apply_user_status_snapshot(
     current: &mut HashMap<String, SlackUserStatus>,
     statuses: HashMap<String, SlackUserStatus>,
@@ -8122,6 +8124,7 @@ impl ConduitWindow {
             return;
         };
         let script = message_html::timeline_dom_delta_call(delta.patches());
+        crate::debug::pipeline_counters().record_timeline_delta();
         let weak_window = self.downgrade();
         web_view.evaluate_javascript(
             &script,
@@ -13268,6 +13271,7 @@ impl ConduitWindow {
         if let Some(web_view) = self.imp().message_view.borrow().as_ref() {
             let started = Instant::now();
             crate::debug::log("ui", &format!("load_message_html bytes={}", html.len()));
+            crate::debug::pipeline_counters().record_document_load();
             web_view.load_html(html, Some(message_html::base_uri()));
             log_performance(started, |elapsed_ms| {
                 format!(
@@ -13300,6 +13304,7 @@ impl ConduitWindow {
         match surface {
             TimelineSurface::Main => {
                 if let Some(web_view) = self.imp().message_view.borrow().as_ref() {
+                    crate::debug::pipeline_counters().record_document_load();
                     web_view.load_html(&html, Some(message_html::base_uri()));
                 }
             }

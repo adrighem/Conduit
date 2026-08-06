@@ -99,6 +99,7 @@ impl ThreadPane {
         };
         let started = Instant::now();
         crate::debug::log("ui", &format!("load_thread_html bytes={}", html.len()));
+        crate::debug::pipeline_counters().record_document_load();
         web_view.load_html(html, Some(message_html::base_uri()));
         log_performance(started, "html_load_submit", html.len());
     }

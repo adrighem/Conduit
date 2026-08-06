@@ -1,6 +1,7 @@
+#[cfg(test)]
+use crate::models::SlackUnreadState;
 use crate::models::{
     conversation_metadata_key_is_unread_owned, SlackConversation, SlackConversationUnreadSnapshot,
-    SlackUnreadState,
 };
 use std::collections::HashMap;
 
@@ -187,6 +188,7 @@ impl ConversationCatalog {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_realtime_unread(&mut self, id: &str, state: SlackUnreadState) {
         self.apply_unread(id, state);
     }
@@ -195,6 +197,7 @@ impl ConversationCatalog {
     /// overwriting the raw unread counters received from Slack.
     ///
     /// Returns whether the conversation metadata was already present.
+    #[cfg(test)]
     pub(crate) fn observe_attention_message(
         &mut self,
         id: &str,
@@ -275,6 +278,7 @@ impl ConversationCatalog {
         before.as_ref() != Some(&entry.conversation)
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_read_cursor(&mut self, id: &str, ts: &str, remaining_unread: u64) {
         self.apply_unread(
             id,
@@ -308,6 +312,7 @@ impl ConversationCatalog {
         }
     }
 
+    #[cfg(test)]
     fn apply_unread(&mut self, id: &str, state: SlackUnreadState) {
         if !state.known {
             return;

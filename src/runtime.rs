@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
-use crate::attention::{AttentionDecision, AttentionPreferences, AttentionReason, DeliveryState};
+#[cfg(test)]
+use crate::attention::AttentionReason;
+use crate::attention::{AttentionDecision, AttentionPreferences, DeliveryState};
 use crate::attention_metrics::{AttentionMetrics, AttentionPersistenceOutcome};
 use crate::auth::{
     browser_session_token_from_env, browser_session_token_from_values, configured_app_token,
@@ -8503,16 +8505,19 @@ mod tests {
             else {
                 panic!("fresh history must complete after its canonical patch");
             };
-            let view = ui_session.view.borrow();
+            let projected_messages = ui_session
+                .view
+                .borrow()
+                .channel_messages("C1")
+                .iter()
+                .map(|message| (message.ts.clone(), message.body_text()))
+                .collect::<Vec<_>>();
             assert_eq!(
-                view.channel_messages("C1")
-                    .iter()
-                    .map(|message| (message.ts.as_str(), message.body_text()))
-                    .collect::<Vec<_>>(),
+                projected_messages,
                 vec![
-                    ("5.0", "fresh page item".into()),
-                    ("4.0", "concurrent post".into()),
-                    ("1.0", "authoritative edit".into()),
+                    ("5.0".into(), "fresh page item".into()),
+                    ("4.0".into(), "concurrent post".into()),
+                    ("1.0".into(), "authoritative edit".into()),
                 ]
             );
             assert_eq!(

@@ -1740,6 +1740,7 @@ pub struct SlackUserGroup {
 }
 
 impl SlackUserGroup {
+    #[cfg(test)]
     pub fn mention_label(&self) -> String {
         self.handle
             .as_deref()

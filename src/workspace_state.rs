@@ -1139,6 +1139,7 @@ impl WorkspaceViewState {
         ConversationSelectionOutcome { decision, scroll }
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_history_request(&mut self, channel_id: &str) -> bool {
         let history = self.channels.entry(channel_id.to_string()).or_default();
         if history.loading {
@@ -1451,6 +1452,7 @@ impl WorkspaceViewState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn apply_thread(
         &mut self,
         channel_id: &str,
@@ -1708,7 +1710,7 @@ impl WorkspaceViewState {
 }
 
 fn update_search_message(
-    results: &mut Vec<SearchMatch>,
+    results: &mut [SearchMatch],
     channel_id: &str,
     message: &SlackMessage,
 ) -> bool {
@@ -1748,11 +1750,7 @@ fn remove_search_message(
     results.len() != previous_len
 }
 
-fn update_saved_message(
-    items: &mut Vec<SavedItem>,
-    channel_id: &str,
-    message: &SlackMessage,
-) -> bool {
+fn update_saved_message(items: &mut [SavedItem], channel_id: &str, message: &SlackMessage) -> bool {
     let matches_message = |item: &SavedItem| {
         item.channel.as_deref() == Some(channel_id)
             && item.message.as_ref().map(|message| message.ts.as_str()) == Some(message.ts.as_str())
@@ -1902,12 +1900,14 @@ fn normalize_channel_messages(messages: Vec<SlackMessage>) -> Vec<SlackMessage> 
     )
 }
 
+#[cfg(test)]
 fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
     let mut messages = existing.to_vec();
     messages.extend(page.iter().cloned());
     normalize_messages(messages)
 }
 
+#[cfg(test)]
 fn merge_message_refresh(
     existing: &[SlackMessage],
     snapshot: &[SlackMessage],

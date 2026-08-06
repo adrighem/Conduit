@@ -487,6 +487,7 @@ fn run_maintenance_batch(
     if changed == 0 {
         let _ = transaction.rollback();
         metrics.skipped_rows.fetch_add(batch_len, Ordering::Relaxed);
+        crate::debug::pipeline_counters().record_sqlite_work(0, 0, batch_len);
         for (response, value) in completed {
             let _ = response.send(Ok(value));
         }
@@ -550,6 +551,7 @@ fn record_store_work(metrics: &StoreMetrics, transactions: u64, changed: u64, sk
         .fetch_add(transactions, Ordering::Relaxed);
     metrics.changed_rows.fetch_add(changed, Ordering::Relaxed);
     metrics.skipped_rows.fetch_add(skipped, Ordering::Relaxed);
+    crate::debug::pipeline_counters().record_sqlite_work(transactions, changed, skipped);
     tracing::trace!(
         target: "conduit::store",
         event = "store_batch",
@@ -650,6 +652,7 @@ pub(crate) struct SyncFreshness {
     pub(crate) retry_after_ms: Option<i64>,
 }
 
+#[cfg(test)]
 enum ConversationRowMutation<R> {
     Unchanged(R),
     Upsert(SlackConversation, R),
@@ -1189,6 +1192,7 @@ impl WorkspaceStore {
 
     /// Advances one cached conversation's read cursor without assuming that
     /// messages newer than the supplied cursor have been read.
+    #[cfg(test)]
     pub async fn advance_conversation_read_cursor(
         &self,
         channel_id: &str,
@@ -1219,6 +1223,7 @@ impl WorkspaceStore {
         .await
     }
 
+    #[cfg(test)]
     pub async fn clear_conversation_unread_state(
         &self,
         channel_id: &str,
@@ -1238,7 +1243,7 @@ impl WorkspaceStore {
             .await
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub async fn observe_conversation_attention_from_event(
         &self,
         channel_id: &str,
@@ -1271,6 +1276,7 @@ impl WorkspaceStore {
         .await
     }
 
+    #[cfg(test)]
     pub async fn observe_conversation_attention_batch(
         &self,
         channel_id: &str,
@@ -1459,7 +1465,7 @@ impl WorkspaceStore {
     }
 
     /// Removes one cached conversation without disturbing other catalog data.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn remove_conversation(&self, channel_id: &str) -> Result<bool> {
         if channel_id.trim().is_empty() {
             return Ok(false);
@@ -1480,12 +1486,14 @@ impl WorkspaceStore {
         self.load_kind_map("user_name").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_name(&self, user_id: &str, display_name: &str) -> Result<()> {
         let mut names = HashMap::new();
         names.insert(user_id.to_string(), display_name.to_string());
         self.store_user_names(&names).await
     }
 
+    #[cfg(test)]
     pub async fn store_user_names(&self, user_names: &HashMap<String, String>) -> Result<()> {
         let values = user_names
             .iter()
@@ -1502,6 +1510,7 @@ impl WorkspaceStore {
         self.load_kind_map("user_full_name").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_full_names(
         &self,
         user_full_names: &HashMap<String, String>,
@@ -1521,6 +1530,7 @@ impl WorkspaceStore {
         self.load_kind_map("user_avatar_url").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_avatar_urls(
         &self,
         avatar_urls: &HashMap<String, String>,
@@ -1538,6 +1548,7 @@ impl WorkspaceStore {
         self.load_kind_map("user_aliases").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_search_aliases(
         &self,
         aliases: &HashMap<String, Vec<String>>,
@@ -1557,6 +1568,7 @@ impl WorkspaceStore {
         self.load_kind_map("user_status").await
     }
 
+    #[cfg(test)]
     pub async fn store_user_status(
         &self,
         user_id: &str,
@@ -1631,6 +1643,7 @@ impl WorkspaceStore {
         self.store_merged_history(channel_id, messages).await
     }
 
+    #[cfg(test)]
     pub async fn store_merged_history(
         &self,
         channel_id: &str,
@@ -1694,6 +1707,7 @@ impl WorkspaceStore {
             .filter(|messages| !messages.is_empty()))
     }
 
+    #[cfg(test)]
     pub async fn store_thread(
         &self,
         channel_id: &str,
@@ -1705,6 +1719,7 @@ impl WorkspaceStore {
             .map(|_| ())
     }
 
+    #[cfg(test)]
     pub async fn store_merged_thread(
         &self,
         channel_id: &str,
@@ -1764,6 +1779,7 @@ impl WorkspaceStore {
         .map(|_| ())
     }
 
+    #[cfg(test)]
     pub async fn mark_thread_read(
         &self,
         channel_id: &str,
@@ -1817,6 +1833,7 @@ impl WorkspaceStore {
             .await
     }
 
+    #[cfg(test)]
     async fn update_conversation(
         &self,
         channel_id: &str,
@@ -1832,6 +1849,7 @@ impl WorkspaceStore {
         .await
     }
 
+    #[cfg(test)]
     async fn mutate_conversation_row<R, F>(&self, channel_id: &str, update: F) -> Result<R>
     where
         R: Send + 'static,
@@ -2148,6 +2166,7 @@ fn open_database_once(directory: &Path) -> Result<Connection> {
             directory.display()
         )
     })?;
+    crate::debug::pipeline_counters().record_sqlite_connections(1);
     connection.busy_timeout(Duration::from_secs(2))?;
     let schema_version =
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
@@ -2204,6 +2223,7 @@ fn open_query_database(directory: &Path) -> Result<Connection> {
         database_path(directory),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    crate::debug::pipeline_counters().record_sqlite_connections(1);
     connection.busy_timeout(Duration::from_secs(2))?;
     connection.pragma_update(None, "query_only", true)?;
     Ok(connection)
@@ -3823,6 +3843,7 @@ fn thread_key(channel_id: &str, thread_ts: &str) -> String {
     format!("{channel_id}:{thread_ts}")
 }
 
+#[cfg(test)]
 fn merge_history_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
     // Incoming API/realtime data wins for duplicate timestamps while cached
     // messages missing from a bounded or in-flight page remain available.
@@ -3831,6 +3852,7 @@ fn merge_history_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<
     pruned_history(messages)
 }
 
+#[cfg(test)]
 fn merge_channel_history_pages(
     existing: &[SlackMessage],
     page: &[SlackMessage],
