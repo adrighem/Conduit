@@ -144,10 +144,6 @@ impl MessageControlTarget {
         }
     }
 
-    pub(crate) fn surface(&self) -> TimelineSurfaceId {
-        self.surface
-    }
-
     pub(crate) fn message(&self) -> &MessageRef {
         &self.message
     }

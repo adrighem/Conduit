@@ -26,7 +26,7 @@ use crate::models::{
     conversation_metadata_key_is_unread_owned, slack_timestamp_is_after, SlackConversation,
     SlackConversationUnreadSnapshot, SlackMessage, SlackUser,
 };
-use crate::thread_catalog::{ThreadRecord, ThreadUnreadState};
+use crate::thread_catalog::{ThreadCatalog, ThreadRecord, ThreadUnreadState};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct WorkspaceRevision(u64);
@@ -217,12 +217,22 @@ pub(crate) enum WorkspaceMutation {
         origin: MutationOrigin,
         delivery: DeliveryState,
     },
+    MessageUpdated {
+        channel_id: String,
+        original: Box<SlackMessage>,
+        updated: SlackMessage,
+    },
     ReactionChanged {
         channel_id: String,
         message_ts: String,
         name: String,
         user_id: String,
         added: bool,
+    },
+    ThreadRead {
+        channel_id: String,
+        thread_ts: String,
+        last_read: String,
     },
     ThreadCatalogChanged(Vec<ThreadRecord>),
 }
@@ -511,6 +521,20 @@ impl WorkspaceCoordinator {
             .unwrap_or_default()
     }
 
+    pub(crate) fn message(&self, channel_id: &str, message_ts: &str) -> Option<SlackMessage> {
+        self.histories
+            .get(channel_id)
+            .and_then(|timeline| timeline.messages.get(message_ts))
+            .map(|entry| entry.value.clone())
+            .or_else(|| {
+                self.threads
+                    .iter()
+                    .filter(|((known_channel_id, _), _)| known_channel_id == channel_id)
+                    .find_map(|(_, timeline)| timeline.messages.get(message_ts))
+                    .map(|entry| entry.value.clone())
+            })
+    }
+
     pub(crate) fn apply(&mut self, mutation: WorkspaceMutation) -> Option<WorkspaceReduction> {
         self.apply_from(MutationOrigin::Cache, mutation)
     }
@@ -612,6 +636,11 @@ impl WorkspaceCoordinator {
                 origin,
                 delivery,
             } => self.apply_message(&channel_id, message, kind, origin, Some(delivery)),
+            WorkspaceMutation::MessageUpdated {
+                channel_id,
+                original,
+                updated,
+            } => self.apply_message_update(&channel_id, &original, updated),
             WorkspaceMutation::ReactionChanged {
                 channel_id,
                 message_ts,
@@ -619,6 +648,11 @@ impl WorkspaceCoordinator {
                 user_id,
                 added,
             } => self.apply_reaction(&channel_id, &message_ts, &name, &user_id, added, origin),
+            WorkspaceMutation::ThreadRead {
+                channel_id,
+                thread_ts,
+                last_read,
+            } => self.apply_thread_read(&channel_id, &thread_ts, &last_read),
             WorkspaceMutation::ThreadCatalogChanged(records) => self.apply_thread_catalog(records),
         }
     }
@@ -1064,17 +1098,10 @@ impl WorkspaceCoordinator {
             return None;
         }
         entry.unread_revision = revision;
-        let state = entry.value.unread_state();
         let conversation = entry.value.clone();
-        let snapshot = SlackConversationUnreadSnapshot {
-            channel_id: channel_id.to_string(),
-            unread_state: state,
-            last_read: Some(ts.to_string()),
-            ..Default::default()
-        };
         self.commit(
             revision,
-            vec![WorkspaceChange::UnreadChanged { snapshot }],
+            vec![WorkspaceChange::ConversationUpsert(conversation.clone())],
             vec![StoreChange::ConversationUpsert(conversation)],
         )
     }
@@ -1292,6 +1319,7 @@ impl WorkspaceCoordinator {
     ) -> Option<WorkspaceReduction> {
         let base_revision = snapshot.base_revision();
         let page = snapshot.into_data();
+        let page_complete = page.complete;
         let revision = self.next_revision();
         let incoming = page
             .messages
@@ -1308,6 +1336,7 @@ impl WorkspaceCoordinator {
         let timeline = self.timeline_mut(&target);
         let mut changes = Vec::new();
         let mut accepted_messages = Vec::new();
+        let mut catalog_messages = Vec::new();
         for (message_ts, message) in &incoming {
             if timeline
                 .tombstones
@@ -1320,6 +1349,7 @@ impl WorkspaceCoordinator {
             {
                 continue;
             }
+            catalog_messages.push(message.clone());
             if timeline
                 .messages
                 .get(message_ts)
@@ -1337,7 +1367,7 @@ impl WorkspaceCoordinator {
                 accepted_messages.push(message.clone());
             }
         }
-        if page.complete {
+        if page_complete {
             let removed = timeline
                 .messages
                 .iter()
@@ -1352,13 +1382,25 @@ impl WorkspaceCoordinator {
                 changes.push(MessageChange::Remove { message_ts });
             }
         }
-        if changes.is_empty() {
-            return None;
-        }
+        let timeline_changed = !changes.is_empty();
         accepted_messages.sort_by(|left, right| left.ts.cmp(&right.ts));
         let messages = timeline.messages();
-        let store_change = (origin != MutationOrigin::Cache)
+        let store_change = (timeline_changed && origin != MutationOrigin::Cache)
             .then(|| store_timeline_replacement(&target, messages));
+        let catalog_records = match &target {
+            TimelineTarget::Channel(channel_id) => self.update_thread_catalog(|catalog| {
+                catalog.observe_history(channel_id, &catalog_messages);
+            }),
+            TimelineTarget::Thread {
+                channel_id,
+                thread_ts,
+            } => self.update_thread_catalog(|catalog| {
+                catalog.observe_thread(channel_id, thread_ts, &catalog_messages, page_complete);
+            }),
+        };
+        if !timeline_changed && catalog_records.is_none() {
+            return None;
+        }
         let reconciled_message_ts =
             self.reconciled_unread_message_ts(&target, &accepted_messages, origin);
         let attention_effects = accepted_messages
@@ -1413,8 +1455,17 @@ impl WorkspaceCoordinator {
                 entry.unread_revision = revision;
             }
         }
-        let mut patch_changes = vec![WorkspaceChange::TimelineChanged { target, changes }];
+        let mut patch_changes = timeline_changed
+            .then(|| WorkspaceChange::TimelineChanged { target, changes })
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut store_changes = store_change.into_iter().collect::<Vec<_>>();
+        if let Some(records) = catalog_records {
+            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(records.clone()));
+            if origin != MutationOrigin::Cache {
+                store_changes.push(StoreChange::ThreadCatalogReplaced(records));
+            }
+        }
         if !attention_observations.is_empty() {
             patch_changes.push(WorkspaceChange::ConversationAttentionObserved {
                 channel_id: attention_channel_id.clone(),
@@ -1448,6 +1499,28 @@ impl WorkspaceCoordinator {
             kind,
             origin,
             self.message_delivery_state(channel_id, message, origin),
+        )
+    }
+
+    fn apply_message_update(
+        &mut self,
+        channel_id: &str,
+        original: &SlackMessage,
+        updated: SlackMessage,
+    ) -> Option<WorkspaceReduction> {
+        let freshest = self
+            .histories
+            .get(channel_id)
+            .and_then(|timeline| timeline.messages.get(&original.ts))
+            .map(|entry| entry.value.clone())
+            .unwrap_or_else(|| original.clone());
+        let message = merge_updated_message_content(freshest, updated);
+        self.apply_message(
+            channel_id,
+            message,
+            MessageMutationKind::Changed,
+            MutationOrigin::Local,
+            None,
         )
     }
 
@@ -1694,9 +1767,6 @@ impl WorkspaceCoordinator {
             }
         }
 
-        if patch_changes.is_empty() {
-            return None;
-        }
         if matches!(
             kind,
             MessageMutationKind::Changed | MessageMutationKind::Deleted
@@ -1758,6 +1828,23 @@ impl WorkspaceCoordinator {
                     }
                 }
             }
+        }
+        let current_user_id = self.attention_context.current_user_id.clone();
+        let catalog_records = match kind {
+            MessageMutationKind::Posted => self.update_thread_catalog(|catalog| {
+                catalog.observe_realtime(channel_id, &message, current_user_id.as_deref());
+            }),
+            MessageMutationKind::Changed => self.update_thread_catalog(|catalog| {
+                catalog.observe_history(channel_id, std::slice::from_ref(&message));
+            }),
+            MessageMutationKind::Deleted => None,
+        };
+        if let Some(records) = catalog_records {
+            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(records.clone()));
+            store_changes.push(StoreChange::ThreadCatalogReplaced(records));
+        }
+        if patch_changes.is_empty() {
+            return None;
         }
         let effects = attention_effect
             .map(WorkspaceEffect::MessageAttention)
@@ -2149,6 +2236,66 @@ impl WorkspaceCoordinator {
         )
     }
 
+    fn update_thread_catalog(
+        &mut self,
+        update: impl FnOnce(&mut ThreadCatalog),
+    ) -> Option<Vec<ThreadRecord>> {
+        let mut catalog = ThreadCatalog::from_records(self.thread_catalog.clone());
+        update(&mut catalog);
+        let records = catalog.into_records();
+        if records == self.thread_catalog {
+            return None;
+        }
+        self.thread_catalog.clone_from(&records);
+        Some(records)
+    }
+
+    fn apply_thread_read(
+        &mut self,
+        channel_id: &str,
+        thread_ts: &str,
+        last_read: &str,
+    ) -> Option<WorkspaceReduction> {
+        if channel_id.trim().is_empty()
+            || thread_ts.trim().is_empty()
+            || last_read.trim().is_empty()
+        {
+            return None;
+        }
+        let mut catalog = ThreadCatalog::from_records(self.thread_catalog.clone());
+        let cleared_reply_ts = catalog.mark_read(channel_id, thread_ts, last_read);
+        let records = catalog.into_records();
+        let catalog_changed = records != self.thread_catalog;
+        let attention_changed = self.conversations.get(channel_id).is_some_and(|entry| {
+            cleared_reply_ts
+                .iter()
+                .any(|message_ts| entry.value.has_observed_attention_message(message_ts))
+        });
+        if !catalog_changed && !attention_changed {
+            return None;
+        }
+
+        let revision = self.next_revision();
+        let mut patch_changes = Vec::new();
+        let mut store_changes = Vec::new();
+        if catalog_changed {
+            self.thread_catalog.clone_from(&records);
+            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(records.clone()));
+            store_changes.push(StoreChange::ThreadCatalogReplaced(records));
+        }
+        if attention_changed {
+            let entry = self.conversations.get_mut(channel_id).unwrap();
+            entry
+                .value
+                .acknowledge_attention_messages(&cleared_reply_ts);
+            entry.unread_revision = revision;
+            let conversation = entry.value.clone();
+            patch_changes.push(WorkspaceChange::ConversationUpsert(conversation.clone()));
+            store_changes.push(StoreChange::ConversationUpsert(conversation));
+        }
+        self.commit(revision, patch_changes, store_changes)
+    }
+
     fn timeline_mut(&mut self, target: &TimelineTarget) -> &mut TimelineState {
         match target {
             TimelineTarget::Channel(channel_id) => {
@@ -2476,6 +2623,20 @@ impl WorkspaceReduction {
     pub(crate) fn effects(&self) -> &[WorkspaceEffect] {
         &self.effects
     }
+}
+
+fn merge_updated_message_content(
+    mut freshest: SlackMessage,
+    updated: SlackMessage,
+) -> SlackMessage {
+    freshest.text = updated.text;
+    freshest.blocks = updated.blocks;
+    freshest.edited = updated.edited;
+    if updated.user.is_some() {
+        freshest.user = updated.user;
+    }
+    freshest.refresh_canonical_content();
+    freshest
 }
 
 impl Default for WorkspaceCoordinator {
@@ -4307,7 +4468,10 @@ mod tests {
 
         assert!(matches!(
             reduction.patch().changes(),
-            [WorkspaceChange::TimelineChanged { .. }]
+            [
+                WorkspaceChange::TimelineChanged { .. },
+                WorkspaceChange::ThreadCatalogChanged(_),
+            ]
         ));
         assert!(
             reduction.store_batch().is_none(),
@@ -4629,16 +4793,20 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(matches!(
-            thread.store_batch().unwrap().changes(),
-            [StoreChange::ThreadReplaced {
+        let store_changes = thread.store_batch().unwrap().changes();
+        assert!(store_changes.iter().any(|change| matches!(
+            change,
+            StoreChange::ThreadReplaced {
                 channel_id,
                 thread_ts,
                 messages,
-            }] if channel_id == "C1"
+            } if channel_id == "C1"
                 && thread_ts == "10.0"
                 && matches!(messages.as_slice(), [message] if message.ts == "11.0")
-        ));
+        )));
+        assert!(store_changes
+            .iter()
+            .any(|change| matches!(change, StoreChange::ThreadCatalogReplaced(_))));
     }
 
     #[test]
@@ -4670,16 +4838,28 @@ mod tests {
                 origin: MutationOrigin::Realtime,
             })
             .unwrap();
+        assert!(reduction
+            .store_batch()
+            .unwrap()
+            .changes()
+            .iter()
+            .any(|change| matches!(
+                change,
+                StoreChange::MessageDelta {
+                    channel_id,
+                    message,
+                    kind: MessageMutationKind::Posted,
+                } if channel_id == "C1" && message.ts == "11.0"
+            )));
+        assert!(reduction
+            .store_batch()
+            .unwrap()
+            .changes()
+            .iter()
+            .any(|change| matches!(change, StoreChange::ThreadCatalogReplaced(_))));
+        let patch_changes = reduction.patch().changes();
         assert!(matches!(
-            reduction.store_batch().unwrap().changes(),
-            [StoreChange::MessageDelta {
-                channel_id,
-                message,
-                kind: MessageMutationKind::Posted,
-            }] if channel_id == "C1" && message.ts == "11.0"
-        ));
-        assert!(matches!(
-            reduction.patch().changes(),
+            &patch_changes[..2],
             [
                 WorkspaceChange::TimelineChanged {
                     target: TimelineTarget::Thread { thread_ts, .. },
@@ -4700,6 +4880,10 @@ mod tests {
                         if root.ts == "10.0" && root.reply_count == Some(1)
                 )
         ));
+        assert!(matches!(
+            patch_changes.last(),
+            Some(WorkspaceChange::ThreadCatalogChanged(_))
+        ));
 
         let mut coordinator = new_coordinator();
         let mut broadcast = message("12.0", "broadcast");
@@ -4713,16 +4897,22 @@ mod tests {
                 origin: MutationOrigin::Realtime,
             })
             .unwrap();
+        assert!(reduction
+            .store_batch()
+            .unwrap()
+            .changes()
+            .iter()
+            .any(|change| matches!(
+                change,
+                StoreChange::MessageDelta {
+                    channel_id,
+                    message,
+                    kind: MessageMutationKind::Posted,
+                } if channel_id == "C1" && message.ts == "12.0"
+            )));
+        let patch_changes = reduction.patch().changes();
         assert!(matches!(
-            reduction.store_batch().unwrap().changes(),
-            [StoreChange::MessageDelta {
-                channel_id,
-                message,
-                kind: MessageMutationKind::Posted,
-            }] if channel_id == "C1" && message.ts == "12.0"
-        ));
-        assert!(matches!(
-            reduction.patch().changes(),
+            &patch_changes[..3],
             [
                 WorkspaceChange::TimelineChanged {
                     target: TimelineTarget::Channel(_),
@@ -4750,6 +4940,10 @@ mod tests {
                     [MessageChange::Upsert(root)]
                         if root.ts == "10.0" && root.reply_count == Some(1)
                 )
+        ));
+        assert!(matches!(
+            patch_changes.last(),
+            Some(WorkspaceChange::ThreadCatalogChanged(_))
         ));
     }
 
@@ -4855,16 +5049,21 @@ mod tests {
                 origin: MutationOrigin::Realtime,
             })
             .unwrap();
-        assert!(matches!(
-            moved.store_batch().unwrap().changes(),
-            [StoreChange::MessageDelta {
-                channel_id,
-                message,
-                kind: MessageMutationKind::Changed,
-            }] if channel_id == "C1"
-                && message.ts == "11.0"
-                && message.thread_ts.as_deref() == Some("20.0")
-        ));
+        assert!(moved
+            .store_batch()
+            .unwrap()
+            .changes()
+            .iter()
+            .any(|change| matches!(
+                change,
+                StoreChange::MessageDelta {
+                    channel_id,
+                    message,
+                    kind: MessageMutationKind::Changed,
+                } if channel_id == "C1"
+                    && message.ts == "11.0"
+                    && message.thread_ts.as_deref() == Some("20.0")
+            )));
         assert!(coordinator
             .threads
             .get(&("C1".to_string(), "10.0".to_string()))
@@ -5042,8 +5241,9 @@ mod tests {
         assert_eq!(channel_root.reply_count, Some(3));
         assert_eq!(channel_root.latest_reply.as_deref(), Some("20.0"));
         assert_eq!(thread_root, channel_root);
+        let patch_changes = reduction.patch().changes();
         assert!(matches!(
-            reduction.patch().changes(),
+            &patch_changes[..3],
             [
                 WorkspaceChange::TimelineChanged {
                     target: TimelineTarget::Thread { .. },
@@ -5069,6 +5269,10 @@ mod tests {
                     thread_root_changes.as_slice(),
                     [MessageChange::Upsert(message)] if message.reply_count == Some(3)
                 )
+        ));
+        assert!(matches!(
+            patch_changes.last(),
+            Some(WorkspaceChange::ThreadCatalogChanged(_))
         ));
     }
 
@@ -5133,17 +5337,17 @@ mod tests {
         assert_eq!(channel_root.reply_count, thread_root.reply_count);
         assert_eq!(channel_root.latest_reply, thread_root.latest_reply);
         assert_eq!(channel_root.reply_users, thread_root.reply_users);
-        assert!(matches!(
-            reduction.patch().changes().last(),
-            Some(WorkspaceChange::TimelineChanged {
+        assert!(reduction.patch().changes().iter().any(|change| matches!(
+            change,
+            WorkspaceChange::TimelineChanged {
                 target: TimelineTarget::Thread { .. },
                 changes,
-            }) if matches!(
+            } if matches!(
                 changes.as_slice(),
                 [MessageChange::Upsert(root)]
                     if root.text.as_deref() == Some("newer thread snapshot")
             )
-        ));
+        )));
     }
 
     #[test]
@@ -5255,14 +5459,19 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(matches!(
-            reduction.store_batch().unwrap().changes(),
-            [StoreChange::ThreadReplaced { messages, .. }]
-                if messages.iter().any(|message| {
-                    message.ts == "10.0"
-                        && message.text.as_deref() == Some("current root")
-                })
-        ));
+        assert!(reduction
+            .store_batch()
+            .unwrap()
+            .changes()
+            .iter()
+            .any(|change| matches!(
+                change,
+                StoreChange::ThreadReplaced { messages, .. }
+                    if messages.iter().any(|message| {
+                        message.ts == "10.0"
+                            && message.text.as_deref() == Some("current root")
+                    })
+            )));
     }
 
     #[test]
@@ -5390,8 +5599,9 @@ mod tests {
                 Some(&["U1".to_string(), "U2".to_string()][..])
             );
         }
+        let patch_changes = reduction.patch().changes();
         assert!(matches!(
-            reduction.patch().changes(),
+            &patch_changes[..2],
             [
                 WorkspaceChange::TimelineChanged {
                     target: TimelineTarget::Channel(_),
@@ -5402,6 +5612,10 @@ mod tests {
                     ..
                 },
             ] if thread_ts == "10.0"
+        ));
+        assert!(matches!(
+            patch_changes.last(),
+            Some(WorkspaceChange::ThreadCatalogChanged(_))
         ));
     }
 

@@ -877,7 +877,22 @@ impl WorkspaceStore {
     }
 
     pub(crate) async fn load_bootstrap(&self) -> Result<Option<WorkspaceBootstrap>> {
-        Ok(self.load_state().await?.map(WorkspaceBootstrap::from))
+        let workspace_key = self.workspace_key.clone();
+        let result = self
+            .query_or_reset(None, move |connection| {
+                load_sqlite_bootstrap(connection, &workspace_key)
+            })
+            .await;
+        if let Err(error) = &result {
+            crate::debug::log(
+                "store",
+                &format!(
+                    "WorkspaceBootstrapReadFailed category={:?}",
+                    error.category()
+                ),
+            );
+        }
+        result
     }
 
     #[allow(dead_code)]
@@ -1542,14 +1557,6 @@ impl WorkspaceStore {
         self.load_kind_map("user_status").await
     }
 
-    pub async fn store_user_statuses(
-        &self,
-        statuses: &HashMap<String, SlackUserStatus>,
-    ) -> Result<()> {
-        self.store_kind_map("user_status", statuses.clone(), true)
-            .await
-    }
-
     pub async fn store_user_status(
         &self,
         user_id: &str,
@@ -1757,53 +1764,6 @@ impl WorkspaceStore {
         .map(|_| ())
     }
 
-    pub async fn observe_thread_history(
-        &self,
-        channel_id: &str,
-        messages: &[SlackMessage],
-    ) -> Result<()> {
-        let channel_id = channel_id.to_string();
-        let messages = messages.to_vec();
-        self.update_thread_catalog(move |catalog| {
-            catalog.observe_history(&channel_id, &messages);
-        })
-        .await
-        .map(|_| ())
-    }
-
-    pub async fn observe_thread_page(
-        &self,
-        channel_id: &str,
-        root_ts: &str,
-        messages: &[SlackMessage],
-        complete: bool,
-    ) -> Result<()> {
-        let channel_id = channel_id.to_string();
-        let root_ts = root_ts.to_string();
-        let messages = messages.to_vec();
-        self.update_thread_catalog(move |catalog| {
-            catalog.observe_thread(&channel_id, &root_ts, &messages, complete);
-        })
-        .await
-        .map(|_| ())
-    }
-
-    pub async fn observe_thread_realtime(
-        &self,
-        channel_id: &str,
-        message: &SlackMessage,
-        current_user_id: Option<&str>,
-    ) -> Result<()> {
-        let channel_id = channel_id.to_string();
-        let message = message.clone();
-        let current_user_id = current_user_id.map(str::to_string);
-        self.update_thread_catalog(move |catalog| {
-            catalog.observe_realtime(&channel_id, &message, current_user_id.as_deref());
-        })
-        .await
-        .map(|_| ())
-    }
-
     pub async fn mark_thread_read(
         &self,
         channel_id: &str,
@@ -1855,15 +1815,6 @@ impl WorkspaceStore {
                 Ok(cleared_reply_ts)
             })
             .await
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn update_state(&self, update: impl FnOnce(&mut CachedWorkspaceState)) -> Result<()> {
-        let _guard = self.update_lock.lock().await;
-        let mut state = self.load_state_for_update().await?;
-        state.workspace_id = self.workspace_id.clone();
-        update(&mut state);
-        self.store_state(&state).await
     }
 
     async fn update_conversation(
@@ -1923,53 +1874,6 @@ impl WorkspaceStore {
                         Ok(result)
                     }
                 }
-            })
-            .await
-    }
-
-    async fn load_state(&self) -> Result<Option<CachedWorkspaceState>> {
-        let workspace_key = self.workspace_key.clone();
-        let result = self
-            .query_or_reset(None, move |connection| {
-                load_sqlite_state(connection, &workspace_key)
-            })
-            .await;
-        if let Err(error) = &result {
-            crate::debug::log(
-                "store",
-                &format!("WorkspaceCacheReadFailed category={:?}", error.category()),
-            );
-        }
-        result
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn load_state_for_update(&self) -> Result<CachedWorkspaceState> {
-        let mut state = self
-            .load_state()
-            .await?
-            .unwrap_or_else(CachedWorkspaceState::new);
-        state.workspace_id = self.workspace_id.clone();
-        Ok(state)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn store_state(&self, state: &CachedWorkspaceState) -> Result<()> {
-        self.store_state_with_activation(state, false).await
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn store_state_with_activation(
-        &self,
-        state: &CachedWorkspaceState,
-        activate: bool,
-    ) -> Result<()> {
-        let workspace_key = self.workspace_key.clone();
-        let state = state.clone();
-        self.hub()
-            .await?
-            .write(move |connection| {
-                store_sqlite_state(connection, &workspace_key, &state, activate)
             })
             .await
     }
@@ -2139,7 +2043,7 @@ fn normalized_pending_unread_queue(channel_ids: impl IntoIterator<Item = String>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedWorkspaceState {
+struct LegacyWorkspaceState {
     version: u32,
     #[serde(default)]
     workspace_id: String,
@@ -2167,43 +2071,6 @@ struct CachedWorkspaceState {
     custom_emojis: HashMap<String, String>,
     #[serde(default)]
     attention_deliveries: Vec<String>,
-}
-
-impl CachedWorkspaceState {
-    fn new() -> Self {
-        Self {
-            version: CACHE_VERSION,
-            workspace_id: String::new(),
-            conversations: Vec::new(),
-            user_names: HashMap::new(),
-            user_full_names: HashMap::new(),
-            user_avatar_urls: HashMap::new(),
-            user_search_aliases: HashMap::new(),
-            user_statuses: HashMap::new(),
-            channel_histories: HashMap::new(),
-            thread_replies: HashMap::new(),
-            thread_catalog: Vec::new(),
-            pending_unread_refresh: Vec::new(),
-            custom_emojis: HashMap::new(),
-            attention_deliveries: Vec::new(),
-        }
-    }
-}
-
-impl From<CachedWorkspaceState> for WorkspaceBootstrap {
-    fn from(state: CachedWorkspaceState) -> Self {
-        Self {
-            workspace_id: state.workspace_id,
-            conversations: state.conversations,
-            user_names: state.user_names,
-            user_full_names: state.user_full_names,
-            user_avatar_urls: state.user_avatar_urls,
-            user_search_aliases: state.user_search_aliases,
-            user_statuses: state.user_statuses,
-            thread_catalog: state.thread_catalog,
-            custom_emojis: state.custom_emojis,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -2385,10 +2252,10 @@ fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn load_sqlite_state(
+fn load_sqlite_bootstrap(
     connection: &Connection,
     workspace_key: &str,
-) -> Result<Option<CachedWorkspaceState>> {
+) -> Result<Option<WorkspaceBootstrap>> {
     let workspace_id = connection
         .query_row(
             "SELECT workspace_id FROM workspaces WHERE workspace_key = ?1",
@@ -2400,98 +2267,17 @@ fn load_sqlite_state(
         return Ok(None);
     };
 
-    let mut state = CachedWorkspaceState::new();
-    state.workspace_id = workspace_id;
-    let mut statement = connection.prepare(
-        "SELECT kind, item_key, payload_json
-         FROM workspace_items WHERE workspace_key = ?1 ORDER BY kind, item_key",
-    )?;
-    let rows = statement.query_map([workspace_key], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (kind, item_key, payload) = row?;
-        match kind.as_str() {
-            "conversation" => state
-                .conversations
-                .push(serde_json::from_str(&payload).context("invalid cached conversation")?),
-            "user_name" => {
-                state.user_names.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached user name")?,
-                );
-            }
-            "user_full_name" => {
-                state.user_full_names.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached user full name")?,
-                );
-            }
-            "user_avatar_url" => {
-                state.user_avatar_urls.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached user avatar URL")?,
-                );
-            }
-            "user_aliases" => {
-                state.user_search_aliases.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached user aliases")?,
-                );
-            }
-            "user_status" => {
-                state.user_statuses.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached user status")?,
-                );
-            }
-            "channel_history" => {
-                state.channel_histories.insert(
-                    item_key,
-                    normalize_cached_messages(
-                        serde_json::from_str(&payload).context("invalid cached channel history")?,
-                    ),
-                );
-            }
-            "thread_replies" => {
-                state.thread_replies.insert(
-                    item_key,
-                    normalize_cached_messages(
-                        serde_json::from_str(&payload).context("invalid cached thread replies")?,
-                    ),
-                );
-            }
-            "thread_record" => state
-                .thread_catalog
-                .push(serde_json::from_str(&payload).context("invalid cached thread record")?),
-            "pending_unread" if item_key == PENDING_UNREAD_QUEUE_KEY => {
-                state.pending_unread_refresh.extend(
-                    serde_json::from_str::<Vec<String>>(&payload)
-                        .context("invalid cached pending unread queue")?,
-                );
-            }
-            "pending_unread" => state.pending_unread_refresh.push(item_key),
-            "custom_emoji" => {
-                state.custom_emojis.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached custom emoji")?,
-                );
-            }
-            ATTENTION_DELIVERY_KIND if item_key == ATTENTION_DELIVERY_LEDGER_KEY => {
-                state.attention_deliveries.extend(
-                    serde_json::from_str::<Vec<String>>(&payload)
-                        .context("invalid cached attention delivery ledger")?,
-                );
-            }
-            _ => {}
-        }
-    }
-    state.pending_unread_refresh = normalized_pending_unread_queue(state.pending_unread_refresh);
-    Ok(Some(state))
+    Ok(Some(WorkspaceBootstrap {
+        workspace_id,
+        conversations: load_sqlite_kind_values(connection, workspace_key, "conversation")?,
+        user_names: load_sqlite_kind_map(connection, workspace_key, "user_name")?,
+        user_full_names: load_sqlite_kind_map(connection, workspace_key, "user_full_name")?,
+        user_avatar_urls: load_sqlite_kind_map(connection, workspace_key, "user_avatar_url")?,
+        user_search_aliases: load_sqlite_kind_map(connection, workspace_key, "user_aliases")?,
+        user_statuses: load_sqlite_kind_map(connection, workspace_key, "user_status")?,
+        thread_catalog: load_sqlite_kind_values(connection, workspace_key, "thread_record")?,
+        custom_emojis: load_sqlite_kind_map(connection, workspace_key, "custom_emoji")?,
+    }))
 }
 
 fn load_sqlite_kind_map<T: DeserializeOwned>(
@@ -2667,13 +2453,13 @@ fn load_sqlite_search_state(
     Ok(Some(state))
 }
 
-fn store_sqlite_state(
+fn import_legacy_state(
     connection: &mut Connection,
     workspace_key: &str,
-    state: &CachedWorkspaceState,
+    state: &LegacyWorkspaceState,
     activate: bool,
 ) -> Result<()> {
-    let desired = state_items(state)?;
+    let desired = legacy_state_items(state)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     ensure_sqlite_workspace(&transaction, workspace_key, &state.workspace_id, activate)?;
     sync_state_items(&transaction, workspace_key, desired)?;
@@ -3786,7 +3572,7 @@ fn sync_sqlite_kind<T: Serialize>(
     Ok(changed)
 }
 
-fn state_items(state: &CachedWorkspaceState) -> Result<HashMap<(String, String), String>> {
+fn legacy_state_items(state: &LegacyWorkspaceState) -> Result<HashMap<(String, String), String>> {
     let mut items = HashMap::new();
     for conversation in &state.conversations {
         let conversation = conversation_for_cache(conversation);
@@ -3926,7 +3712,7 @@ fn migrate_legacy_workspace(
         return Ok(());
     };
     state.workspace_id = workspace_id.to_string();
-    store_sqlite_state(connection, workspace_key, &state, false)?;
+    import_legacy_state(connection, workspace_key, &state, false)?;
     remove_legacy_workspace_files(directory, workspace_key);
     Ok(())
 }
@@ -3962,7 +3748,7 @@ fn migrate_legacy_active_workspace(connection: &mut Connection, directory: &Path
         (candidates.len() == 1).then(|| candidates.remove(0))
     };
     if let Some((workspace_key, state)) = candidate {
-        store_sqlite_state(connection, &workspace_key, &state, true)?;
+        import_legacy_state(connection, &workspace_key, &state, true)?;
         remove_legacy_workspace_files(directory, &workspace_key);
         let _ = std::fs::remove_file(directory.join("active-workspace"));
     }
@@ -3974,7 +3760,7 @@ fn remove_legacy_workspace_files(directory: &Path, workspace_key: &str) {
     let _ = std::fs::remove_file(directory.join(format!("{workspace_key}.search.json")));
 }
 
-fn legacy_states(directory: &Path) -> Result<Vec<(String, CachedWorkspaceState)>> {
+fn legacy_states(directory: &Path) -> Result<Vec<(String, LegacyWorkspaceState)>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -4003,14 +3789,14 @@ fn legacy_states(directory: &Path) -> Result<Vec<(String, CachedWorkspaceState)>
 fn read_legacy_state(
     directory: &Path,
     workspace_key: &str,
-) -> Result<Option<CachedWorkspaceState>> {
+) -> Result<Option<LegacyWorkspaceState>> {
     let path = directory.join(format!("{workspace_key}.json"));
     let data = match std::fs::read_to_string(&path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let state = match serde_json::from_str::<CachedWorkspaceState>(&data) {
+    let state = match serde_json::from_str::<LegacyWorkspaceState>(&data) {
         Ok(state) if state.version == CACHE_VERSION => state,
         Ok(_) | Err(_) => return Ok(None),
     };
@@ -6088,10 +5874,10 @@ mod tests {
                 .expect("conversation store failed");
             assert_eq!(
                 store
-                    .load_state()
+                    .load_bootstrap()
                     .await
-                    .expect("workspace state load failed")
-                    .expect("missing cached workspace state")
+                    .expect("workspace bootstrap load failed")
+                    .expect("missing cached workspace bootstrap")
                     .workspace_id,
                 "T123:U123"
             );
@@ -6518,6 +6304,42 @@ mod tests {
             assert!(bootstrap.user_avatar_urls["U1"].ends_with("u1.png"));
             assert_eq!(bootstrap.user_search_aliases["U1"][0], "ada");
             assert!(bootstrap.custom_emojis.contains_key("party"));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_bootstrap_does_not_read_unrelated_timeline_rows() {
+        let directory = temp_cache_dir("workspace-bootstrap-focused");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            store
+                .store_conversations(&[SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            let workspace_key = store.workspace_key.clone();
+            store
+                .hub()
+                .await
+                .unwrap()
+                .write(move |connection| {
+                    connection.execute(
+                        "INSERT OR REPLACE INTO workspace_items(
+                            workspace_key, kind, item_key, payload_json
+                         ) VALUES (?1, 'channel_history', 'C_BAD', 'not-json')",
+                        [workspace_key],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+
+            let bootstrap = store.load_bootstrap().await.unwrap().unwrap();
+            assert_eq!(bootstrap.conversations[0].id, "C1");
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -6960,9 +6782,9 @@ mod tests {
             .expect("workspace identity upgrade failed");
 
         let state = runtime()
-            .block_on(store.load_state())
+            .block_on(store.load_bootstrap())
             .unwrap()
-            .expect("missing upgraded state");
+            .expect("missing upgraded bootstrap");
         assert_eq!(state.workspace_id, "T123:U123");
         assert_eq!(state.conversations[0].id, "D1");
         assert!(!store.path().exists());
@@ -7059,8 +6881,11 @@ mod tests {
         });
 
         assert!(load_active_search_state(&directory).unwrap().is_none());
-        let cached = runtime().block_on(store.load_state()).unwrap().unwrap();
-        assert_eq!(cached.conversations[0].id, "C1");
+        let conversations = runtime()
+            .block_on(store.load_conversations())
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversations[0].id, "C1");
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -7917,15 +7742,6 @@ mod tests {
             store.store_pending_unread_refresh(&pending).await.unwrap();
 
             assert_eq!(store.load_pending_unread_refresh().await.unwrap(), pending);
-            assert_eq!(
-                store
-                    .load_state()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .pending_unread_refresh,
-                pending
-            );
         });
 
         let connection = Connection::open(store.database_path()).unwrap();
@@ -7980,15 +7796,6 @@ mod tests {
         ];
         runtime.block_on(async {
             assert_eq!(store.load_pending_unread_refresh().await.unwrap(), expected);
-            assert_eq!(
-                store
-                    .load_state()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .pending_unread_refresh,
-                expected
-            );
             store.store_pending_unread_refresh(&expected).await.unwrap();
         });
 
@@ -8462,11 +8269,11 @@ mod tests {
 
             // Loading also sanitizes caches written by older Conduit versions.
             store
-                .update_state(|state| {
-                    state
-                        .channel_histories
-                        .insert("C2".into(), vec![root, reply, broadcast]);
-                })
+                .store_kind_map(
+                    "channel_history",
+                    HashMap::from([("C2".into(), vec![root, reply, broadcast])]),
+                    false,
+                )
                 .await
                 .unwrap();
             assert_eq!(

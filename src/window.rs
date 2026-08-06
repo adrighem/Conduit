@@ -67,12 +67,11 @@ use crate::message_handoff::{
 };
 use crate::message_html::{
     self, MessageHtmlContext, TimelineAssetKind, TimelineDomPatch, TimelineInsertPosition,
-    TimelineMessageArrival, TimelineMessageRegion, TimelineScrollBehavior,
+    TimelineMessageArrival, TimelineScrollBehavior,
 };
 use crate::models::{
-    slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
-    SlackConversation, SlackFile, SlackMessage, SlackUnreadState, SlackUser, SlackUserProfile,
-    SlackUserStatus,
+    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
+    SlackMessage, SlackUser, SlackUserStatus,
 };
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering;
@@ -95,18 +94,14 @@ use crate::slack_link::{
     resolve_slack_uri, slack_app_web_fallback, SlackFileAction, SlackUri, SlackUriResolution,
     SlackUriTarget,
 };
-use crate::socket_mode::{
-    SocketModeEvent, SocketModeMessageEvent, SocketModeMessageKind, SocketModeReactionEvent,
-};
 use crate::thread_pane::ThreadPane;
 use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
     resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
     ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
-    ConversationSelectionDecision, MainMessageView, ReactionUpdate, RealtimeMessageKind,
-    RealtimeMessageOutcome, ThreadApplyOutcome, ThreadOpenOutcome, TimelineProjectionApplication,
-    TimelineProjectionOperation, WorkspaceLifecycle, WorkspaceLifecycleEvent,
-    WorkspaceScrollBehavior, WorkspaceSessionState, WorkspaceSnapshot,
+    ConversationSelectionDecision, MainMessageView, ThreadApplyOutcome, ThreadOpenOutcome,
+    TimelineProjectionApplication, TimelineProjectionOperation, TimelineProjectionPosition,
+    WorkspaceLifecycle, WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
 };
 
 #[derive(Debug, Clone)]
@@ -634,8 +629,8 @@ mod imp {
                         .workspace
                         .view
                         .borrow()
-                        .snapshot()
-                        .channel_messages;
+                        .channel_messages(test_channel_id)
+                        .to_vec();
                     obj.populate_history(test_channel_id, messages);
                 }
                 if huddle_test {
@@ -1090,17 +1085,6 @@ fn merge_timeline_delta_scroll(
     }
 }
 
-struct RealtimeMessagePatch<'a> {
-    surface: TimelineSurface,
-    channel_id: &'a str,
-    message: &'a SlackMessage,
-    kind: RealtimeMessageKind,
-    arrival: Option<TimelineMessageArrival>,
-    unread_start: bool,
-    thread_ts: Option<&'a str>,
-    fallback: UiInvalidations,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct UiInvalidations(u8);
 
@@ -1113,6 +1097,10 @@ impl UiInvalidations {
 
     fn contains(self, invalidation: Self) -> bool {
         self.0 & invalidation.0 != 0
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
     }
 
     fn insert(&mut self, invalidations: Self) -> bool {
@@ -2085,22 +2073,6 @@ fn message_notification_conversation(
     ))
 }
 
-fn local_reaction_update(
-    channel_id: &str,
-    ts: &str,
-    name: &str,
-    added: bool,
-    current_user_id: Option<&str>,
-) -> Option<ReactionUpdate> {
-    Some(ReactionUpdate {
-        channel_id: channel_id.to_string(),
-        ts: ts.to_string(),
-        name: name.to_string(),
-        user_id: current_user_id?.to_string(),
-        added,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NotificationTarget {
     workspace_id: String,
@@ -2286,20 +2258,6 @@ fn remove_submitted_attachments(
 
 fn draft_persist_required(drafts_changed: bool, persist_pending: bool) -> bool {
     drafts_changed || persist_pending
-}
-
-fn posted_message_thread_ts(
-    context: &OperationContext,
-    channel_id: &str,
-    message: &SlackMessage,
-) -> Option<String> {
-    match &context.target {
-        RuntimeTarget::Message {
-            channel_id: target_channel_id,
-            thread_ts,
-        } if target_channel_id == channel_id => thread_ts.clone(),
-        _ => message.thread_ts.clone(),
-    }
 }
 
 fn record_draft_submission(
@@ -2671,24 +2629,6 @@ fn user_status_presentation(
         subtitle,
         accessible_text: status.accessible_text(),
     })
-}
-
-fn apply_user_status_profile_update(
-    statuses: &mut HashMap<String, SlackUserStatus>,
-    user_id: &str,
-    profile: &SlackUserProfile,
-) -> bool {
-    if !profile.contains_status_fields() {
-        return false;
-    }
-    match profile.status() {
-        Some(status) if statuses.get(user_id) == Some(&status) => false,
-        Some(status) => {
-            statuses.insert(user_id.to_string(), status);
-            true
-        }
-        None => statuses.remove(user_id).is_some(),
-    }
 }
 
 fn apply_user_status_snapshot(
@@ -3715,16 +3655,44 @@ fn localized_replies_error(error: &str) -> String {
     gettext("Could not load replies. Try again. {error}").replace("{error}", error)
 }
 
-fn sidebar_user_name_update_needs_render(
+fn user_projection_invalidations(
     conversations: &[SlackConversation],
-    user_id: &str,
-) -> bool {
-    conversations.iter().any(|conversation| {
+    affected_user_ids: &[String],
+    current_user_id: Option<&str>,
+    visible_channel_id: Option<&str>,
+    picker_open: bool,
+) -> UiInvalidations {
+    let affected = affected_user_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let conversation_uses_affected_user = |conversation: &SlackConversation| {
         conversation
             .display_user_ids()
             .iter()
-            .any(|display_user_id| display_user_id == user_id)
-    })
+            .any(|user_id| affected.contains(user_id.as_str()))
+    };
+    let sidebar = conversations.iter().any(conversation_uses_affected_user);
+    let title = current_user_id.is_some_and(|user_id| affected.contains(user_id))
+        || visible_channel_id
+            .and_then(|channel_id| {
+                conversations
+                    .iter()
+                    .find(|conversation| conversation.id == channel_id)
+            })
+            .is_some_and(conversation_uses_affected_user);
+
+    let mut invalidations = UiInvalidations::default();
+    if sidebar {
+        invalidations.insert(UiInvalidations::SIDEBAR);
+    }
+    if picker_open && !affected.is_empty() {
+        invalidations.insert(UiInvalidations::PICKER);
+    }
+    if title {
+        invalidations.insert(UiInvalidations::TITLE);
+    }
+    invalidations
 }
 
 fn message_navigation_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
@@ -3905,38 +3873,6 @@ fn messages_use_user_in_reactions(messages: &[SlackMessage], user_id: &str) -> b
     })
 }
 
-fn realtime_dom_patch_kind(
-    kind: RealtimeMessageKind,
-    current_messages: &[SlackMessage],
-    message: &SlackMessage,
-) -> Option<RealtimeMessageKind> {
-    if kind != RealtimeMessageKind::Posted {
-        return Some(kind);
-    }
-
-    if current_messages
-        .iter()
-        .any(|current| current.ts == message.ts)
-    {
-        // Socket Mode may redeliver an event, or the same message may already have
-        // arrived through a history refresh. Replace it instead of duplicating it.
-        return Some(RealtimeMessageKind::Changed);
-    }
-
-    current_messages
-        .first()
-        .is_none_or(|newest| message.ts > newest.ts)
-        .then_some(RealtimeMessageKind::Posted)
-}
-
-fn timeline_patch_needed(
-    state_changed: bool,
-    arrival: Option<TimelineMessageArrival>,
-    surface_contains_message: bool,
-) -> bool {
-    state_changed || (arrival.is_some() && surface_contains_message)
-}
-
 fn create_cache_directory(path: &Path) {
     if let Err(error) = std::fs::create_dir_all(path) {
         crate::debug::log(
@@ -4045,16 +3981,8 @@ fn first_unread_message_ts(
     resolve_first_unread_message_ts(messages, last_read, unread_count)
 }
 
-fn mutation_completion_reloads_visible_channel(
-    visible_channel: Option<&str>,
-    completed_channel: &str,
-) -> bool {
-    visible_channel == Some(completed_channel)
-}
-
 fn timeline_scroll_behavior(behavior: WorkspaceScrollBehavior) -> TimelineScrollBehavior {
     match behavior {
-        WorkspaceScrollBehavior::Preserve => TimelineScrollBehavior::Preserve,
         WorkspaceScrollBehavior::PreservePrepend => TimelineScrollBehavior::PreservePrepend,
         WorkspaceScrollBehavior::StickToBottom => TimelineScrollBehavior::StickToBottom,
         WorkspaceScrollBehavior::Bottom => TimelineScrollBehavior::Bottom,
@@ -4649,8 +4577,13 @@ impl ConduitWindow {
     }
 
     fn open_media_viewer(&self, item: MediaGalleryItem) {
-        let snapshot = self.current_message_snapshot();
-        let mut gallery = media_gallery_items(&snapshot.channel_messages);
+        let messages = {
+            let view = self.imp().workspace.view.borrow();
+            view.last_channel_id()
+                .map(|channel_id| view.channel_messages(channel_id).to_vec())
+                .unwrap_or_default()
+        };
+        let mut gallery = media_gallery_items(&messages);
         if !gallery.iter().any(|candidate| candidate.url == item.url) {
             gallery.push(item.clone());
         }
@@ -7569,6 +7502,10 @@ impl ConduitWindow {
             }
             RuntimeEventKind::ConversationsSynchronized => {
                 if !self.imp().connect_requested.get() {
+                    self.imp()
+                        .pending_opened_conversation_ids
+                        .borrow_mut()
+                        .clear();
                     if conversation_sync_completion_needs_catalog_sync(
                         self.imp().workspace_ready.get(),
                     ) {
@@ -7576,15 +7513,6 @@ impl ConduitWindow {
                     }
                     let explicit_intent_opened = self.activate_pending_navigation_intents();
                     self.restore_last_conversation(true, explicit_intent_opened);
-                    self.restore_workspace_status();
-                }
-            }
-            RuntimeEventKind::ConversationsLoaded(_conversations) => {
-                if !self.imp().connect_requested.get() {
-                    self.imp()
-                        .pending_opened_conversation_ids
-                        .borrow_mut()
-                        .clear();
                     self.restore_workspace_status();
                 }
             }
@@ -7598,16 +7526,6 @@ impl ConduitWindow {
                 self.refresh_open_conversation_picker();
             }
             RuntimeEventKind::ConversationPeopleDiscovered(users) => {
-                let names = users
-                    .iter()
-                    .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
-                    .collect::<HashMap<_, _>>();
-                let avatar_urls = users
-                    .iter()
-                    .filter_map(|user| Some((user.id.clone()?, user.avatar_url()?)))
-                    .collect::<HashMap<_, _>>();
-                self.populate_user_names(names);
-                self.populate_user_avatar_urls(avatar_urls);
                 *self.imp().discovered_users.borrow_mut() = users;
                 self.refresh_open_conversation_picker();
                 self.refresh_open_people_picker(true);
@@ -7615,38 +7533,31 @@ impl ConduitWindow {
                     self.refresh_composer_completion(target);
                 }
             }
-            RuntimeEventKind::ConversationOpened(conversation) => {
-                let channel_id = conversation.id.clone();
-                let imp = self.imp();
-                let title = conversation.display_name_with_users(
-                    &imp.user_names.borrow(),
-                    imp.current_user_id.borrow().as_deref(),
-                );
+            RuntimeEventKind::ConversationOpenCompleted { channel_id } => {
+                let title = self.conversation_title(&channel_id);
                 self.select_conversation(&channel_id, &title);
             }
-            RuntimeEventKind::ConversationUpdated(_conversation) => {
-                self.refresh_current_conversation_title();
+            RuntimeEventKind::ConversationUpdateCompleted { channel_id } => {
+                if self.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
+                    self.refresh_current_conversation_title();
+                }
                 self.set_status(&gettext("People added"));
             }
-            RuntimeEventKind::ConversationStarUpdated(conversation) => {
-                let starred = conversation.is_starred();
+            RuntimeEventKind::ConversationStarUpdateCompleted {
+                channel_id: _,
+                starred,
+            } => {
                 self.set_status(&gettext(if starred {
                     "Conversation starred"
                 } else {
                     "Conversation unstarred"
                 }));
             }
-            RuntimeEventKind::CurrentUserStatusUpdated { user_id, status } => {
+            RuntimeEventKind::CurrentUserStatusUpdateCompleted {
+                user_id: _,
+                cleared,
+            } => {
                 self.imp().pending_status_update.borrow_mut().take();
-                let cleared = status.is_none();
-                let mut statuses = self.imp().user_statuses.borrow_mut();
-                if let Some(status) = status {
-                    Arc::make_mut(&mut statuses).insert(user_id.clone(), status);
-                } else {
-                    Arc::make_mut(&mut statuses).remove(&user_id);
-                }
-                drop(statuses);
-                self.user_statuses_changed(vec![user_id]);
                 self.set_status(&gettext(if cleared {
                     "Status cleared"
                 } else {
@@ -7656,109 +7567,39 @@ impl ConduitWindow {
             RuntimeEventKind::ConversationLeft { channel_id: _ } => {
                 self.set_status(&gettext("Left channel"));
             }
-            RuntimeEventKind::ConversationsPatched {
-                conversations,
-                unread_snapshots,
-            } => {
-                let mut catalog = self.imp().workspace.conversations.borrow_mut();
-                for conversation in conversations {
-                    catalog.upsert_metadata(conversation);
-                }
-                let mut acknowledged_local_reads = Vec::new();
-                for snapshot in unread_snapshots {
-                    let newer_local_read = self
-                        .imp()
-                        .local_read_ts_by_channel
-                        .borrow()
-                        .get(&snapshot.channel_id)
-                        .is_some_and(|local| {
-                            snapshot.last_read.as_deref().is_none_or(|server| {
-                                slack_timestamp_is_after(local.as_str(), server)
-                            })
-                        });
-                    if !newer_local_read {
-                        if snapshot.last_read.is_some()
-                            && self
-                                .imp()
-                                .local_read_ts_by_channel
-                                .borrow()
-                                .contains_key(&snapshot.channel_id)
-                        {
-                            acknowledged_local_reads.push(snapshot.channel_id.clone());
-                        }
-                        catalog.apply_unread_snapshot(&snapshot);
-                    }
-                }
-                drop(catalog);
-                let mut local_reads = self.imp().local_read_ts_by_channel.borrow_mut();
-                for channel_id in acknowledged_local_reads {
-                    local_reads.remove(&channel_id);
-                }
-                drop(local_reads);
-                self.sync_conversations_from_catalog();
-            }
-            RuntimeEventKind::ConversationUnreadUpdated {
-                channel_id,
-                unread_state,
-            } => self.apply_conversation_unread_state(&channel_id, unread_state),
-            RuntimeEventKind::ConversationMarkedRead { channel_id, ts } => {
-                self.imp()
-                    .local_read_ts_by_channel
-                    .borrow_mut()
-                    .insert(channel_id.clone(), ts.clone());
-                self.advance_conversation_read_cursor(&channel_id, &ts);
-                self.render_conversations();
-                if self.current_main_view() == MainMessageView::Unreads {
-                    self.populate_unreads(self.unread_items());
-                }
-            }
-            RuntimeEventKind::ConversationAttentionAcknowledged {
-                channel_id,
-                message_ts,
-            } => {
-                self.imp()
-                    .workspace
-                    .conversations
-                    .borrow_mut()
-                    .acknowledge_attention_messages(&channel_id, &message_ts);
-                self.render_conversations();
-                if self.current_main_view() == MainMessageView::Unreads {
-                    self.populate_unreads(self.unread_items());
-                }
-            }
             RuntimeEventKind::AttentionNotificationCandidate {
                 channel_id,
                 message,
                 decision,
             } => self.handle_attention_notification_candidate(&channel_id, &message, &decision),
-            RuntimeEventKind::AttentionMessagesObserved(observations) => {
-                self.apply_attention_observations(observations);
-            }
-            RuntimeEventKind::HistoryLoaded {
+            RuntimeEventKind::HistoryLoadCompleted {
                 channel_id,
-                messages,
                 has_more,
                 next_cursor,
                 append_older,
                 cached,
             } => {
-                let outcome = self.imp().workspace.view.borrow_mut().apply_history(
-                    &channel_id,
-                    messages,
-                    has_more,
-                    next_cursor,
-                    append_older,
-                    cached,
-                );
+                let outcome = self
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow_mut()
+                    .complete_history_load(
+                        &channel_id,
+                        has_more,
+                        next_cursor,
+                        append_older,
+                        cached,
+                    );
                 if outcome.visible {
-                    if outcome.render || append_older {
+                    if outcome.render {
                         let rendered_messages = self
                             .imp()
                             .workspace
                             .view
                             .borrow()
-                            .snapshot()
-                            .channel_messages;
+                            .channel_messages(&channel_id)
+                            .to_vec();
                         self.populate_history_with_scroll(
                             &channel_id,
                             rendered_messages,
@@ -7774,35 +7615,33 @@ impl ConduitWindow {
                     }
                 }
             }
-            RuntimeEventKind::ThreadLoaded {
+            RuntimeEventKind::ThreadLoadCompleted {
                 channel_id,
-                ts,
-                messages,
+                thread_ts,
                 has_more,
                 next_cursor,
                 append_older,
             } => {
-                let outcome = self.imp().workspace.view.borrow_mut().apply_thread(
+                let outcome = self.imp().workspace.view.borrow_mut().complete_thread_load(
                     &channel_id,
-                    &ts,
-                    messages,
+                    &thread_ts,
                     has_more,
                     next_cursor,
                     append_older,
                 );
                 if let ThreadApplyOutcome::Applied { scroll, render } = outcome {
-                    if render || append_older {
+                    if render {
                         let rendered_messages = self
                             .imp()
                             .workspace
                             .view
                             .borrow()
-                            .snapshot()
-                            .thread_messages;
+                            .current_thread_messages()
+                            .to_vec();
                         self.request_user_names(&rendered_messages);
                         self.populate_thread(
                             &channel_id,
-                            &ts,
+                            &thread_ts,
                             rendered_messages,
                             timeline_scroll_behavior(scroll),
                         );
@@ -7810,7 +7649,24 @@ impl ConduitWindow {
                     self.restore_workspace_status();
                 }
             }
-            RuntimeEventKind::MessageContextLoaded { location, messages } => {
+            RuntimeEventKind::MessageContextLoadCompleted {
+                location,
+                message_timestamps,
+            } => {
+                let message_timestamps = message_timestamps.into_iter().collect::<HashSet<_>>();
+                let messages = {
+                    let view = self.imp().workspace.view.borrow();
+                    let canonical = if location.thread_ts().is_some() {
+                        view.current_thread_messages()
+                    } else {
+                        view.channel_tail_messages(location.channel_id())
+                    };
+                    canonical
+                        .iter()
+                        .filter(|message| message_timestamps.contains(&message.ts))
+                        .cloned()
+                        .collect()
+                };
                 let visible = self
                     .imp()
                     .workspace
@@ -7894,56 +7750,22 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::RealtimeStatusChanged(status) => self.set_realtime_status(status),
-            RuntimeEventKind::SocketModeEvent { event, attention } => {
-                self.handle_socket_mode_event(event, attention)
-            }
+            RuntimeEventKind::WorkspaceRefreshRequested => self.refresh_conversations(),
             RuntimeEventKind::Huddle(event) => self.handle_huddle_event(event),
-            RuntimeEventKind::UserLoaded {
-                user_id,
-                display_name,
-                full_name,
-                avatar_url,
-                status,
-            } => {
-                self.populate_user_names(HashMap::from([(user_id.clone(), display_name)]));
-                if let Some(full_name) = full_name {
-                    self.populate_user_full_names(HashMap::from([(user_id.clone(), full_name)]));
-                }
-                if let Some(avatar_url) = avatar_url {
-                    self.populate_user_avatar_urls(HashMap::from([(user_id.clone(), avatar_url)]));
-                }
-                if let Some(status) = status {
-                    self.populate_user_statuses(HashMap::from([(user_id, status)]));
-                }
-            }
-            RuntimeEventKind::UserProfileLoaded(user) => {
-                let user_id = user.id.clone().unwrap_or_default();
+            RuntimeEventKind::UserProfileLoadCompleted { user_id } => {
                 let expected = self.imp().pending_profile_user_id.borrow().clone();
                 if expected.as_deref() == Some(user_id.as_str()) {
                     self.imp().pending_profile_user_id.borrow_mut().take();
-                    self.imp()
-                        .message_title
-                        .set_title(&user.display_name().unwrap_or_else(|| gettext("Profile")));
-                    let context = self.message_html_context(None);
-                    self.load_message_html(&message_html::user_profile_document(&user, &context));
+                    if let Some(user) = self.imp().workspace.users.borrow().get(&user_id).cloned() {
+                        self.imp()
+                            .message_title
+                            .set_title(&user.display_name().unwrap_or_else(|| gettext("Profile")));
+                        let context = self.message_html_context(None);
+                        self.load_message_html(&message_html::user_profile_document(
+                            &user, &context,
+                        ));
+                    }
                 }
-            }
-            RuntimeEventKind::UserNamesLoaded(user_names) => self.populate_user_names(user_names),
-            RuntimeEventKind::UserFullNamesLoaded(names) => self.populate_user_full_names(names),
-            RuntimeEventKind::UserAvatarUrlsLoaded(urls) => self.populate_user_avatar_urls(urls),
-            RuntimeEventKind::UserSearchAliasesLoaded(aliases) => {
-                *self.imp().user_search_aliases.borrow_mut() = aliases;
-                self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::PICKER);
-            }
-            RuntimeEventKind::UserStatusesLoaded {
-                statuses,
-                replace_existing,
-                preserve_user_ids,
-            } => {
-                self.apply_user_statuses_snapshot(statuses, replace_existing, &preserve_user_ids);
-            }
-            RuntimeEventKind::UserGroupsLoaded { names, members } => {
-                self.populate_user_groups(names, members);
             }
             RuntimeEventKind::EmojiCatalogLoaded(emojis) => self.replace_custom_emojis(emojis),
             RuntimeEventKind::ImageAssetLoaded { key, asset } => {
@@ -8016,18 +7838,12 @@ impl ConduitWindow {
                     }
                 }
             }
-            RuntimeEventKind::MessageActionCompleted {
-                control_handle,
-                channel_id,
-                ts: _,
-                thread_ts,
-            } => {
+            RuntimeEventKind::MessageActionCompleted { control_handle } => {
                 self.imp()
                     .message_control_registry
                     .borrow_mut()
                     .complete(&control_handle);
                 self.set_status("Action sent");
-                self.reload_after_message(&channel_id, thread_ts.as_deref());
             }
             RuntimeEventKind::MessageActionFailed {
                 control_handle,
@@ -8039,15 +7855,11 @@ impl ConduitWindow {
                     .release(&control_handle);
                 self.set_status(&format!("Action failed: {}", failure.message));
             }
-            RuntimeEventKind::MessagePosted {
+            RuntimeEventKind::MessagePostCompleted {
                 channel_id,
-                message,
+                message_ts,
+                thread_ts,
             } => {
-                let thread_ts = posted_message_thread_ts(&meta.context, &channel_id, &message);
-                let mut message = *message;
-                if let Some(thread_ts) = thread_ts.as_deref() {
-                    message.thread_ts = Some(thread_ts.to_string());
-                }
                 self.complete_submitted_draft(&channel_id, thread_ts.as_deref());
                 if self.mutation_target_is_active(&channel_id, thread_ts.as_deref()) {
                     let target = if thread_ts.is_some() {
@@ -8058,81 +7870,55 @@ impl ConduitWindow {
                     self.set_composer_submission_sensitive(target, true);
                     self.set_status("Message sent");
                 }
-                let outcome = self.apply_timeline_message(
+                self.animate_sent_message_completion(
                     &channel_id,
-                    &message,
-                    RealtimeMessageKind::Posted,
-                    false,
-                    Some(TimelineMessageArrival::Sent),
+                    &message_ts,
+                    thread_ts.as_deref(),
                 );
-                if outcome.refresh_unreads {
-                    self.populate_unreads(self.unread_items());
-                } else {
-                    self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-                }
             }
-            RuntimeEventKind::MessageUpdated {
+            RuntimeEventKind::MessageUpdateCompleted {
                 channel_id,
-                message,
+                message_ts,
             } => {
-                let message = *message;
-                let edit_finished = self.finish_message_edit(&channel_id, &message.ts);
+                let edit_finished = self.finish_message_edit(&channel_id, &message_ts);
                 if edit_finished
                     || self.visible_channel_id().as_deref() == Some(channel_id.as_str())
                 {
                     self.set_status(&gettext("Message updated"));
                 }
-                let outcome = self.apply_timeline_message(
-                    &channel_id,
-                    &message,
-                    RealtimeMessageKind::Changed,
-                    false,
-                    None,
-                );
-                if outcome.refresh_unreads {
-                    self.populate_unreads(self.unread_items());
-                } else {
-                    self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-                }
                 if edit_finished {
                     self.activate_pending_navigation_intents();
                 }
             }
-            RuntimeEventKind::ReactionUpdated {
-                channel_id,
-                ts,
-                name,
-                added,
-                thread_ts,
-            } => {
+            RuntimeEventKind::ReactionUpdateCompleted { projected, .. } => {
                 self.set_status("Reaction updated");
-                let current_user_id = self.imp().current_user_id.borrow().clone();
-                if let Some(update) = local_reaction_update(
-                    &channel_id,
-                    &ts,
-                    &name,
-                    added,
-                    current_user_id.as_deref(),
-                ) {
-                    self.apply_reaction_update(update);
-                } else {
-                    self.reload_after_message(&channel_id, thread_ts.as_deref());
+                if !projected {
+                    crate::debug::log(
+                        "ui",
+                        "ReactionProjectionSkipped reason=current_user_unavailable",
+                    );
                 }
             }
             RuntimeEventKind::SavedUpdated {
                 channel_id,
+                message_ts,
                 saved,
-                thread_ts,
+                thread_ts: _,
             } => {
                 self.set_status(if saved {
                     "Saved for later"
                 } else {
                     "Removed from saved items"
                 });
-                if self.current_main_view() == MainMessageView::Saved {
-                    self.send_command(RuntimeCommand::LoadSavedItems);
-                } else {
-                    self.reload_after_message(&channel_id, thread_ts.as_deref());
+                let message = self.find_message(&channel_id, &message_ts);
+                if self.imp().workspace.view.borrow_mut().apply_saved_update(
+                    &channel_id,
+                    &message_ts,
+                    saved,
+                    message,
+                ) {
+                    let items = self.imp().workspace.view.borrow().saved_items().to_vec();
+                    self.populate_saved_items(items);
                 }
             }
             RuntimeEventKind::FileUploadProgress { fraction, label } => {
@@ -8185,7 +7971,6 @@ impl ConduitWindow {
                             .flatten()
                     });
                     self.complete_upload_draft(channel_id, thread_ts, submitted.as_deref());
-                    self.reload_after_message(channel_id, thread_ts);
                 }
             }
         }
@@ -8383,61 +8168,6 @@ impl ConduitWindow {
             TimelineSurface::Main => &self.imp().main_timeline_presenter,
             TimelineSurface::Thread => &self.imp().thread_timeline_presenter,
         }
-    }
-
-    fn apply_realtime_message_patch(&self, request: RealtimeMessagePatch<'_>) {
-        let control_surface = match request.surface {
-            TimelineSurface::Main => TimelineSurfaceId::Main,
-            TimelineSurface::Thread => TimelineSurfaceId::Thread,
-        };
-        if let Ok(target) = MessageRef::new(request.channel_id, request.message.ts.clone()) {
-            let mut registry = self.imp().message_control_registry.borrow_mut();
-            match request.kind {
-                RealtimeMessageKind::Posted | RealtimeMessageKind::Changed => {
-                    let _ = registry.replace_message_with_controls(
-                        control_surface,
-                        target,
-                        message_action_control_keys(
-                            request.message,
-                            self.browser_message_actions_available(),
-                        ),
-                    );
-                }
-                RealtimeMessageKind::Deleted => {
-                    registry.remove_message(control_surface, &target);
-                }
-            }
-        }
-        let patch = match request.kind {
-            RealtimeMessageKind::Posted => {
-                let mut context = self.message_patch_context(request.thread_ts, request.message);
-                if request.unread_start {
-                    context.first_unread_ts = Some(request.message.ts.clone());
-                }
-                message_html::insert_message_patch(
-                    request.channel_id,
-                    request.message,
-                    &context,
-                    TimelineInsertPosition::Append,
-                    request.arrival,
-                )
-            }
-            RealtimeMessageKind::Changed => message_html::replace_message_patch(
-                request.channel_id,
-                request.message,
-                &self.message_patch_context(request.thread_ts, request.message),
-                request.arrival,
-            ),
-            // Slack retains a tombstone for deleted messages. Replacing the existing
-            // article keeps the incremental path consistent with a complete render.
-            RealtimeMessageKind::Deleted => message_html::replace_message_patch(
-                request.channel_id,
-                request.message,
-                &self.message_patch_context(request.thread_ts, request.message),
-                None,
-            ),
-        };
-        self.apply_timeline_patch(request.surface, patch, request.fallback);
     }
 
     fn configure_auth_ui(&self) {
@@ -9561,12 +9291,6 @@ impl ConduitWindow {
             self.set_status("This action is not available yet");
             return;
         };
-        let reload_thread_ts = (target.surface() == TimelineSurfaceId::Thread).then(|| {
-            message
-                .thread_root_ts()
-                .unwrap_or(message.ts.as_str())
-                .to_string()
-        });
         let request = SlackMessageActionRequest {
             channel_id: message_ref.channel_id().to_string(),
             message_ts: message.ts.clone(),
@@ -9608,11 +9332,7 @@ impl ConduitWindow {
                     return;
                 };
                 if response == "confirm" {
-                    window.dispatch_message_action(
-                        request.clone(),
-                        control_handle.clone(),
-                        reload_thread_ts.clone(),
-                    );
+                    window.dispatch_message_action(request.clone(), control_handle.clone());
                 } else {
                     window
                         .imp()
@@ -9623,7 +9343,7 @@ impl ConduitWindow {
             });
             dialog.present(Some(self));
         } else {
-            self.dispatch_message_action(request, control_handle, reload_thread_ts);
+            self.dispatch_message_action(request, control_handle);
         }
     }
 
@@ -9631,13 +9351,11 @@ impl ConduitWindow {
         &self,
         request: SlackMessageActionRequest,
         control_handle: MessageControlHandle,
-        reload_thread_ts: Option<String>,
     ) {
         self.set_status("Sending action");
         self.send_command(RuntimeCommand::ExecuteMessageAction {
             request,
             control_handle,
-            reload_thread_ts,
         });
     }
 
@@ -9718,25 +9436,43 @@ impl ConduitWindow {
             .find_message(channel_id, ts)
     }
 
-    fn reload_after_message(&self, channel_id: &str, thread_ts: Option<&str>) {
-        if let Some(thread_ts) = thread_ts {
-            let should_load = {
-                let mut state = self.imp().workspace.view.borrow_mut();
-                state.visible_channel_id() == Some(channel_id)
-                    && state.selected_thread_ts() == Some(thread_ts)
-                    && state.begin_thread_history_request()
-            };
-            if should_load {
-                self.send_command(RuntimeCommand::LoadThread {
-                    channel_id: channel_id.to_string(),
-                    ts: thread_ts.to_string(),
-                });
-            }
-        } else {
-            let visible_channel = self.visible_channel_id();
-            if mutation_completion_reloads_visible_channel(visible_channel.as_deref(), channel_id) {
-                self.request_channel_history(channel_id);
-            }
+    fn animate_sent_message_completion(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+        thread_ts: Option<&str>,
+    ) {
+        let Some(message) = self.find_message(channel_id, message_ts) else {
+            return;
+        };
+        if self.visible_channel_id().as_deref() == Some(channel_id)
+            && message.belongs_in_channel_timeline()
+        {
+            self.apply_timeline_patch(
+                TimelineSurface::Main,
+                message_html::replace_message_patch(
+                    channel_id,
+                    &message,
+                    &self.message_patch_context(None, &message),
+                    Some(TimelineMessageArrival::Sent),
+                ),
+                UiInvalidations::MAIN,
+            );
+        }
+        if let Some(thread_ts) = thread_ts.filter(|thread_ts| {
+            self.selected_thread_ts().as_deref() == Some(*thread_ts)
+                && message.belongs_to_thread(thread_ts)
+        }) {
+            self.apply_timeline_patch(
+                TimelineSurface::Thread,
+                message_html::replace_message_patch(
+                    channel_id,
+                    &message,
+                    &self.message_patch_context(Some(thread_ts), &message),
+                    Some(TimelineMessageArrival::Sent),
+                ),
+                UiInvalidations::THREAD,
+            );
         }
     }
 
@@ -9985,13 +9721,6 @@ impl ConduitWindow {
                     .refresh_catalog(&self.imp().custom_emojis.borrow());
             }
         }
-        self.queue_ui_invalidations(
-            UiInvalidations::SIDEBAR
-                | UiInvalidations::PICKER
-                | UiInvalidations::TITLE
-                | UiInvalidations::MAIN
-                | UiInvalidations::THREAD,
-        );
         for target in COMPOSER_TARGETS {
             self.refresh_composer_completion(target);
         }
@@ -10206,26 +9935,37 @@ impl ConduitWindow {
     }
 
     fn patch_image_asset(&self, key: &str, source: Option<String>) {
-        if self
+        let avatar_user_ids = self
             .imp()
             .user_avatar_urls
             .borrow()
-            .values()
-            .any(|url| url == key)
+            .iter()
+            .filter_map(|(user_id, url)| (url == key).then_some(user_id.clone()))
+            .collect::<Vec<_>>();
+        if avatar_user_ids
+            .iter()
+            .any(|user_id| self.main_view_uses_user(user_id))
         {
-            self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
+            self.queue_ui_invalidations(UiInvalidations::MAIN);
         }
-        let (main_view, main_uses_asset, thread_uses_asset) = {
+        let thread_uses_avatar = {
             let state = self.imp().workspace.view.borrow();
-            let main = state.visible_channel_id().is_some_and(|channel_id| {
-                messages_use_image_asset(state.channel_messages(channel_id), key)
-            });
+            avatar_user_ids
+                .iter()
+                .any(|user_id| messages_use_user(state.current_thread_messages(), user_id))
+        };
+        if thread_uses_avatar {
+            self.queue_ui_invalidations(UiInvalidations::THREAD);
+        }
+        let main_uses_asset = self.main_view_uses_image_asset(key);
+        let (main_view, thread_uses_asset) = {
+            let state = self.imp().workspace.view.borrow();
             let thread = state.selected_thread_ts().is_some()
                 && messages_use_image_asset(state.current_thread_messages(), key);
-            (state.main_view(), main, thread)
+            (state.main_view(), thread)
         };
 
-        if main_uses_asset {
+        if main_view == MainMessageView::Conversation && main_uses_asset {
             self.apply_timeline_patch(
                 TimelineSurface::Main,
                 message_html::update_image_patch(
@@ -10239,10 +9979,7 @@ impl ConduitWindow {
                 ),
                 UiInvalidations::MAIN,
             );
-        } else if !matches!(
-            main_view,
-            MainMessageView::Conversation | MainMessageView::Placeholder
-        ) {
+        } else if main_uses_asset {
             self.queue_ui_invalidations(UiInvalidations::MAIN);
         }
         if thread_uses_asset {
@@ -10299,7 +10036,11 @@ impl ConduitWindow {
             );
         }
         if !application.timeline_changes().is_empty() {
-            self.apply_workspace_timeline_projection(revision, application.timeline_changes());
+            self.apply_workspace_timeline_projection(
+                revision,
+                application.timeline_changes(),
+                &application,
+            );
         }
         if application.conversation_changed() {
             remove_patch_departures_from_discovery(
@@ -10359,6 +10100,9 @@ impl ConduitWindow {
         if reset {
             let imp = self.imp();
             affected_user_ids.extend(imp.user_names.borrow().keys().cloned());
+            affected_user_ids.extend(imp.user_full_names.borrow().keys().cloned());
+            affected_user_ids.extend(imp.user_avatar_urls.borrow().keys().cloned());
+            affected_user_ids.extend(imp.user_search_aliases.borrow().keys().cloned());
             affected_user_ids.extend(imp.user_statuses.borrow().keys().cloned());
             *imp.user_names.borrow_mut() = Arc::new(HashMap::new());
             *imp.user_full_names.borrow_mut() = Arc::new(HashMap::new());
@@ -10418,6 +10162,7 @@ impl ConduitWindow {
             for user_id in &affected_user_ids {
                 pending.remove(user_id);
             }
+            self.schedule_status_expiry();
         }
 
         for target in COMPOSER_TARGETS {
@@ -10430,16 +10175,34 @@ impl ConduitWindow {
             self.patch_user_on_timelines(user_id);
         }
         self.update_huddle_surface();
-        self.queue_ui_invalidations(
-            UiInvalidations::SIDEBAR | UiInvalidations::PICKER | UiInvalidations::TITLE,
-        );
+        self.queue_user_projection_invalidations(&affected_user_ids);
         self.flush_pending_message_notifications();
+    }
+
+    fn queue_user_projection_invalidations(&self, affected_user_ids: &[String]) {
+        let invalidations = {
+            let imp = self.imp();
+            let conversations = imp.workspace.conversations.borrow().conversations();
+            let current_user_id = imp.current_user_id.borrow();
+            let visible_channel_id = self.visible_channel_id();
+            user_projection_invalidations(
+                &conversations,
+                affected_user_ids,
+                current_user_id.as_deref(),
+                visible_channel_id.as_deref(),
+                imp.conversation_picker_view.borrow().is_some(),
+            )
+        };
+        if !invalidations.is_empty() {
+            self.queue_ui_invalidations(invalidations);
+        }
     }
 
     fn apply_workspace_timeline_projection(
         &self,
         revision: WorkspaceRevision,
         changes: &[TimelineProjectionApplication],
+        application: &crate::workspace_state::WorkspacePatchApplication,
     ) {
         let mut refresh_derived_view = false;
         for change in changes {
@@ -10486,6 +10249,15 @@ impl ConduitWindow {
                     TimelineProjectionOperation::Upsert { inserted: true, .. }
                 )
             }) {
+                let prepend = operations.iter().all(|operation| {
+                    matches!(
+                        operation,
+                        TimelineProjectionOperation::Upsert {
+                            position: TimelineProjectionPosition::Prepend,
+                            ..
+                        }
+                    )
+                });
                 operations.sort_by(|left, right| {
                     let TimelineProjectionOperation::Upsert { message: left, .. } = left else {
                         unreachable!();
@@ -10493,13 +10265,31 @@ impl ConduitWindow {
                     let TimelineProjectionOperation::Upsert { message: right, .. } = right else {
                         unreachable!();
                     };
-                    left.ts.cmp(&right.ts)
+                    if prepend {
+                        right.ts.cmp(&left.ts)
+                    } else {
+                        left.ts.cmp(&right.ts)
+                    }
                 });
             }
+            let preserves_prepend = operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    TimelineProjectionOperation::Upsert {
+                        inserted: true,
+                        position: TimelineProjectionPosition::Prepend,
+                        ..
+                    }
+                )
+            });
             let mut patches = Vec::with_capacity(operations.len());
             for operation in operations {
                 match operation {
-                    TimelineProjectionOperation::Upsert { message, inserted } => {
+                    TimelineProjectionOperation::Upsert {
+                        message,
+                        inserted,
+                        position,
+                    } => {
                         self.request_user_names(std::slice::from_ref(message.as_ref()));
                         self.request_image_assets(std::iter::once(message.as_ref()));
                         if let Ok(target) = MessageRef::new(channel_id, message.ts.clone()) {
@@ -10519,13 +10309,25 @@ impl ConduitWindow {
                                     ),
                                 );
                         }
-                        let context = self.message_patch_context(thread_ts, &message);
+                        let mut context = self.message_patch_context(thread_ts, &message);
+                        if thread_ts.is_none()
+                            && application.unread_start(channel_id) == Some(message.ts.as_str())
+                        {
+                            context.first_unread_ts = Some(message.ts.clone());
+                        }
                         patches.push(if inserted {
                             message_html::insert_message_patch(
                                 channel_id,
                                 &message,
                                 &context,
-                                TimelineInsertPosition::Append,
+                                match position {
+                                    TimelineProjectionPosition::Append => {
+                                        TimelineInsertPosition::Append
+                                    }
+                                    TimelineProjectionPosition::Prepend => {
+                                        TimelineInsertPosition::Prepend
+                                    }
+                                },
                                 None,
                             )
                         } else {
@@ -10555,7 +10357,11 @@ impl ConduitWindow {
                 surface,
                 revision,
                 patches,
-                TimelineScrollBehavior::Preserve,
+                if preserves_prepend {
+                    TimelineScrollBehavior::PreservePrepend
+                } else {
+                    TimelineScrollBehavior::Preserve
+                },
                 fallback,
             );
         }
@@ -10662,107 +10468,15 @@ impl ConduitWindow {
         for target in COMPOSER_TARGETS {
             self.refresh_composer_mention_names(target);
         }
-        let should_render_sidebar = {
-            let imp = self.imp();
-            let conversations = imp.workspace.conversations.borrow().conversations();
-            changed_user_ids
-                .iter()
-                .any(|user_id| sidebar_user_name_update_needs_render(&conversations, user_id))
-        };
-        if should_render_sidebar {
-            self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-        }
         for user_id in &changed_user_ids {
             self.patch_user_on_timelines(user_id);
         }
         self.update_huddle_surface();
-        self.queue_ui_invalidations(UiInvalidations::PICKER | UiInvalidations::TITLE);
+        self.queue_user_projection_invalidations(&changed_user_ids);
         self.flush_pending_message_notifications();
     }
 
-    fn populate_user_full_names(&self, names: HashMap<String, String>) {
-        if names.is_empty() {
-            return;
-        }
-        let changed = {
-            let mut known = self.imp().user_full_names.borrow_mut();
-            let known = Arc::make_mut(&mut known);
-            let mut changed = false;
-            for (user_id, full_name) in names {
-                changed |= known.get(&user_id) != Some(&full_name);
-                known.insert(user_id, full_name);
-            }
-            changed
-        };
-        if changed {
-            self.queue_ui_invalidations(
-                UiInvalidations::MAIN | UiInvalidations::SIDEBAR | UiInvalidations::PICKER,
-            );
-            self.flush_pending_message_notifications();
-        }
-    }
-
-    fn populate_user_avatar_urls(&self, urls: HashMap<String, String>) {
-        if urls.is_empty() {
-            return;
-        }
-        let changed = {
-            let mut known = self.imp().user_avatar_urls.borrow_mut();
-            let known = Arc::make_mut(&mut known);
-            urls.into_iter()
-                .filter(|(user_id, url)| !user_id.trim().is_empty() && !url.trim().is_empty())
-                .fold(false, |changed, (user_id, url)| {
-                    (known.insert(user_id, url.clone()).as_ref() != Some(&url)) || changed
-                })
-        };
-        if changed {
-            self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
-        }
-    }
-
-    fn populate_user_statuses(&self, statuses: HashMap<String, SlackUserStatus>) {
-        if statuses.is_empty() {
-            return;
-        }
-        let changed = {
-            let mut known = self.imp().user_statuses.borrow_mut();
-            let known = Arc::make_mut(&mut known);
-            statuses
-                .into_iter()
-                .filter_map(|(user_id, status)| {
-                    (known.insert(user_id.clone(), status.clone()).as_ref() != Some(&status))
-                        .then_some(user_id)
-                })
-                .collect::<Vec<_>>()
-        };
-        self.user_statuses_changed(changed);
-    }
-
-    fn apply_user_statuses_snapshot(
-        &self,
-        statuses: HashMap<String, SlackUserStatus>,
-        replace_existing: bool,
-        preserve_user_ids: &HashSet<String>,
-    ) {
-        let mut known = self.imp().user_statuses.borrow_mut();
-        let changed = apply_user_status_snapshot(
-            Arc::make_mut(&mut known),
-            statuses,
-            replace_existing,
-            preserve_user_ids,
-        );
-        drop(known);
-        self.user_statuses_changed(changed);
-    }
-
-    fn user_statuses_changed(&self, changed_user_ids: Vec<String>) {
-        for user_id in &changed_user_ids {
-            self.patch_user_on_timelines(user_id);
-        }
-        self.queue_ui_invalidations(
-            UiInvalidations::SIDEBAR | UiInvalidations::PICKER | UiInvalidations::TITLE,
-        );
-
+    fn schedule_status_expiry(&self) {
         let imp = self.imp();
         let generation = imp.status_expiry_generation.get().saturating_add(1);
         imp.status_expiry_generation.set(generation);
@@ -10783,14 +10497,104 @@ impl ConduitWindow {
                     .borrow()
                     .keys()
                     .cloned()
-                    .collect();
-                window.user_statuses_changed(user_ids);
+                    .collect::<Vec<_>>();
+                for user_id in &user_ids {
+                    window.patch_user_on_timelines(user_id);
+                }
+                window.queue_user_projection_invalidations(&user_ids);
+                window.schedule_status_expiry();
             }
         });
     }
 
+    fn main_view_uses_user(&self, user_id: &str) -> bool {
+        let state = self.imp().workspace.view.borrow();
+        match state.main_view() {
+            MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
+                messages_use_user(state.channel_messages(channel_id), user_id)
+            }),
+            MainMessageView::Unreads => self
+                .imp()
+                .workspace
+                .conversations
+                .borrow()
+                .conversations()
+                .iter()
+                .filter(|conversation| conversation.has_unread_activity())
+                .any(|conversation| {
+                    conversation
+                        .display_user_ids()
+                        .iter()
+                        .any(|candidate| candidate == user_id)
+                }),
+            MainMessageView::Threads => {
+                let observed = state.observed_threads();
+                observed.iter().any(|(_, message)| {
+                    messages_use_user(std::slice::from_ref(message), user_id)
+                        || messages_use_user_in_reactions(std::slice::from_ref(message), user_id)
+                }) || {
+                    let conversations = self.imp().workspace.conversations.borrow().conversations();
+                    observed.iter().any(|(channel_id, _)| {
+                        conversations
+                            .iter()
+                            .find(|conversation| conversation.id == *channel_id)
+                            .is_some_and(|conversation| {
+                                conversation
+                                    .display_user_ids()
+                                    .iter()
+                                    .any(|candidate| candidate == user_id)
+                            })
+                    })
+                }
+            }
+            MainMessageView::Search => state.search_results().iter().any(|result| {
+                result.user.as_deref() == Some(user_id)
+                    || result
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.contains(&format!("<@{user_id}>")))
+            }),
+            MainMessageView::Saved => state.saved_items().iter().any(|item| {
+                item.message.as_ref().is_some_and(|message| {
+                    messages_use_user(std::slice::from_ref(message), user_id)
+                        || messages_use_user_in_reactions(std::slice::from_ref(message), user_id)
+                })
+            }),
+            MainMessageView::Files | MainMessageView::Placeholder => false,
+        }
+    }
+
+    fn main_view_uses_image_asset(&self, key: &str) -> bool {
+        let state = self.imp().workspace.view.borrow();
+        match state.main_view() {
+            MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
+                messages_use_image_asset(state.channel_messages(channel_id), key)
+            }),
+            MainMessageView::Threads => state
+                .observed_threads()
+                .iter()
+                .any(|(_, message)| messages_use_image_asset(std::slice::from_ref(message), key)),
+            MainMessageView::Saved => state.saved_items().iter().any(|item| {
+                item.message.as_ref().is_some_and(|message| {
+                    messages_use_image_asset(std::slice::from_ref(message), key)
+                })
+            }),
+            MainMessageView::Unreads
+            | MainMessageView::Search
+            | MainMessageView::Files
+            | MainMessageView::Placeholder => false,
+        }
+    }
+
     fn patch_user_on_timelines(&self, user_id: &str) {
-        let (main_view, main_uses_user, main_reaction_user, thread_uses_user, thread_reaction_user) = {
+        let main_view_uses_user = self.main_view_uses_user(user_id);
+        let (
+            main_view,
+            main_conversation_uses_user,
+            main_reaction_user,
+            thread_uses_user,
+            thread_reaction_user,
+        ) = {
             let state = self.imp().workspace.view.borrow();
             let main_messages = state
                 .visible_channel_id()
@@ -10822,16 +10626,13 @@ impl ConduitWindow {
             // Reaction tooltips contain resolved participant names but do not yet
             // expose individual participant nodes for a targeted DOM update.
             self.queue_ui_invalidations(UiInvalidations::MAIN);
-        } else if main_uses_user {
+        } else if main_conversation_uses_user {
             self.apply_timeline_patch(
                 TimelineSurface::Main,
                 message_html::update_user_patch(user_id, &name, status.as_ref(), &custom_emojis),
                 UiInvalidations::MAIN,
             );
-        } else if !matches!(
-            main_view,
-            MainMessageView::Conversation | MainMessageView::Placeholder
-        ) {
+        } else if main_view != MainMessageView::Conversation && main_view_uses_user {
             self.queue_ui_invalidations(UiInvalidations::MAIN);
         }
         if thread_reaction_user {
@@ -10842,113 +10643,6 @@ impl ConduitWindow {
                 message_html::update_user_patch(user_id, &name, status.as_ref(), &custom_emojis),
                 UiInvalidations::THREAD,
             );
-        }
-    }
-
-    fn populate_user_groups(
-        &self,
-        names: HashMap<String, String>,
-        members: HashMap<String, Vec<String>>,
-    ) {
-        if names.is_empty() && members.is_empty() {
-            return;
-        }
-
-        let changed = {
-            let imp = self.imp();
-            let mut known_names = imp.user_group_names.borrow_mut();
-            let mut known_members = imp.user_group_members.borrow_mut();
-            let known_names = Arc::make_mut(&mut known_names);
-            let known_members = Arc::make_mut(&mut known_members);
-            let mut changed = false;
-
-            for (group_id, name) in names {
-                if group_id.trim().is_empty() || name.trim().is_empty() {
-                    continue;
-                }
-                if known_names.get(&group_id) != Some(&name) {
-                    known_names.insert(group_id, name);
-                    changed = true;
-                }
-            }
-
-            for (group_id, member_names) in members {
-                if group_id.trim().is_empty() {
-                    continue;
-                }
-                if known_members.get(&group_id) != Some(&member_names) {
-                    known_members.insert(group_id, member_names);
-                    changed = true;
-                }
-            }
-
-            changed
-        };
-
-        if changed {
-            self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
-        }
-    }
-
-    fn advance_conversation_read_cursor(&self, channel_id: &str, ts: &str) {
-        let current_user_id = self.imp().current_user_id.borrow().clone();
-        let remaining_unread = self
-            .imp()
-            .workspace
-            .view
-            .borrow()
-            .channel_messages(channel_id)
-            .iter()
-            .filter(|message| message.ts.as_str() > ts)
-            .filter(|message| message.user.as_deref() != current_user_id.as_deref())
-            .count() as u64;
-        self.imp()
-            .workspace
-            .conversations
-            .borrow_mut()
-            .advance_read_cursor(channel_id, ts, remaining_unread);
-    }
-
-    fn apply_conversation_unread_state(&self, channel_id: &str, unread_state: SlackUnreadState) {
-        if !unread_state.known {
-            return;
-        }
-        let previous = self
-            .imp()
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    conversation.unread_activity_count(),
-                )
-            });
-        self.imp()
-            .workspace
-            .conversations
-            .borrow_mut()
-            .apply_realtime_unread(channel_id, unread_state);
-        let current = self
-            .imp()
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    conversation.unread_activity_count(),
-                )
-            });
-        let changed = previous != current;
-
-        if changed {
-            self.render_conversations();
-            if self.current_main_view() == MainMessageView::Unreads {
-                self.populate_unreads(self.unread_items());
-            }
         }
     }
 
@@ -12344,7 +12038,12 @@ impl ConduitWindow {
             .view
             .borrow_mut()
             .select_conversation(channel_id);
-        let current_messages = imp.workspace.view.borrow().snapshot().channel_messages;
+        let current_messages = imp
+            .workspace
+            .view
+            .borrow()
+            .channel_messages(channel_id)
+            .to_vec();
         imp.message_title.set_title(title);
         self.refresh_conversation_title_status(channel_id);
         self.restore_channel_draft(channel_id);
@@ -12391,22 +12090,6 @@ impl ConduitWindow {
         self.imp().pending_last_conversation.borrow_mut().take();
         self.save_selected_conversation();
         true
-    }
-
-    fn request_channel_history(&self, channel_id: &str) {
-        if !self
-            .imp()
-            .workspace
-            .view
-            .borrow_mut()
-            .begin_history_request(channel_id)
-        {
-            return;
-        }
-
-        self.send_command(RuntimeCommand::LoadHistory {
-            channel_id: channel_id.to_string(),
-        });
     }
 
     fn populate_history(&self, channel_id: &str, messages: Vec<SlackMessage>) {
@@ -12552,31 +12235,40 @@ impl ConduitWindow {
                 );
             }
         }
-        self.queue_history_render_followups(channel_id, messages);
+        self.queue_history_asset_followups(channel_id, messages);
     }
 
     fn reconcile_current_conversation_snapshot(&self) {
-        let snapshot = self.current_message_snapshot();
-        let Some(channel_id) = snapshot.channel_id else {
+        let projection = {
+            let view = self.imp().workspace.view.borrow();
+            if view.main_view() != MainMessageView::Conversation {
+                None
+            } else {
+                view.last_channel_id().map(|channel_id| {
+                    (
+                        channel_id.to_string(),
+                        view.channel_messages(channel_id).to_vec(),
+                    )
+                })
+            }
+        };
+        let Some((channel_id, messages)) = projection else {
             return;
         };
-        if snapshot.main_view == MainMessageView::Conversation
-            && !snapshot.channel_messages.is_empty()
-        {
+        if !messages.is_empty() {
             self.populate_history_with_scroll(
                 &channel_id,
-                snapshot.channel_messages,
+                messages,
                 TimelineScrollBehavior::Preserve,
             );
         }
     }
 
-    fn queue_history_render_followups(&self, channel_id: &str, messages: Vec<SlackMessage>) {
+    fn queue_history_asset_followups(&self, channel_id: &str, messages: Vec<SlackMessage>) {
         let weak_window = self.downgrade();
         let channel_id = channel_id.to_string();
         glib::idle_add_local_once(move || {
             if let Some(window) = weak_window.upgrade() {
-                window.queue_ui_invalidations(UiInvalidations::SIDEBAR);
                 if window.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
                     window.request_user_names(&messages);
                     window.request_image_assets(messages.iter());
@@ -12716,262 +12408,6 @@ impl ConduitWindow {
         self.request_image_assets(saved_messages);
         let context = self.message_html_context(None);
         self.load_message_html(&message_html::saved_items_document(&items, &context));
-    }
-
-    fn handle_socket_mode_event(
-        &self,
-        event: SocketModeEvent,
-        attention: Option<AttentionDecision>,
-    ) {
-        match event {
-            SocketModeEvent::Message(event) => self.apply_socket_message(*event, attention),
-            SocketModeEvent::Reaction(event) => self.apply_socket_reaction(event),
-            SocketModeEvent::UserChanged(user) | SocketModeEvent::UserHuddleChanged(user) => {
-                let Some(user_id) = user.id.clone() else {
-                    return;
-                };
-                if let Some(display_name) = user.display_name() {
-                    self.populate_user_names(HashMap::from([(user_id.clone(), display_name)]));
-                }
-                if let Some(full_name) = user.full_name() {
-                    self.populate_user_full_names(HashMap::from([(user_id.clone(), full_name)]));
-                }
-                if let Some(avatar_url) = user.avatar_url() {
-                    self.populate_user_avatar_urls(HashMap::from([(user_id.clone(), avatar_url)]));
-                }
-                if let Some(profile) = user.profile.as_ref() {
-                    let mut statuses = self.imp().user_statuses.borrow_mut();
-                    let changed = apply_user_status_profile_update(
-                        Arc::make_mut(&mut statuses),
-                        &user_id,
-                        profile,
-                    );
-                    drop(statuses);
-                    if changed {
-                        self.user_statuses_changed(vec![user_id]);
-                    }
-                }
-            }
-            SocketModeEvent::RefreshConversations => self.refresh_conversations(),
-        }
-    }
-
-    fn apply_socket_message(
-        &self,
-        event: SocketModeMessageEvent,
-        attention: Option<AttentionDecision>,
-    ) {
-        let channel_id = event.channel_id.clone();
-        let message = event.message.clone();
-        let current_user_id = self.imp().current_user_id.borrow().clone();
-        let was_unread = self
-            .imp()
-            .workspace
-            .conversations
-            .borrow()
-            .get(&channel_id)
-            .is_some_and(SlackConversation::has_unread_activity);
-        let external_post = event.kind == SocketModeMessageKind::Posted
-            && message.user.as_deref() != current_user_id.as_deref();
-        if let Some(decision) = attention.as_ref().filter(|_| external_post) {
-            let known = self
-                .imp()
-                .workspace
-                .conversations
-                .borrow_mut()
-                .observe_attention_message(&channel_id, &message.ts, decision.record_unread);
-            if !known {
-                self.refresh_conversations();
-            }
-        }
-        let became_unread = attention
-            .as_ref()
-            .is_some_and(|decision| external_post && decision.record_unread && !was_unread);
-
-        let kind = match event.kind {
-            SocketModeMessageKind::Posted => RealtimeMessageKind::Posted,
-            SocketModeMessageKind::Changed => RealtimeMessageKind::Changed,
-            SocketModeMessageKind::Deleted => RealtimeMessageKind::Deleted,
-        };
-        let outcome = self.apply_timeline_message(&channel_id, &message, kind, became_unread, None);
-
-        if outcome.refresh_unreads {
-            self.populate_unreads(self.unread_items());
-        } else {
-            self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-        }
-    }
-
-    fn apply_attention_observations(
-        &self,
-        observations: Vec<crate::runtime::AttentionObservation>,
-    ) {
-        if observations.is_empty() {
-            return;
-        }
-        let mut refresh_metadata = false;
-        {
-            let mut conversations = self.imp().workspace.conversations.borrow_mut();
-            for observation in observations {
-                refresh_metadata |= !conversations.observe_attention_message(
-                    &observation.channel_id,
-                    &observation.message_ts,
-                    observation.record_unread,
-                );
-            }
-        }
-        self.sync_conversations_from_catalog();
-        if self.current_main_view() == MainMessageView::Unreads {
-            self.populate_unreads(self.unread_items());
-        }
-        if refresh_metadata {
-            self.refresh_conversations();
-        }
-    }
-
-    fn apply_timeline_message(
-        &self,
-        channel_id: &str,
-        message: &SlackMessage,
-        kind: RealtimeMessageKind,
-        unread_start: bool,
-        arrival: Option<TimelineMessageArrival>,
-    ) -> RealtimeMessageOutcome {
-        let (channel_dom_kind, thread_dom_kind, channel_contains_message, thread_contains_message) = {
-            let state = self.imp().workspace.view.borrow();
-            let selected_thread_ts = state.selected_thread_ts();
-            let channel_kind =
-                realtime_dom_patch_kind(kind, state.channel_messages(channel_id), message);
-            let thread_kind = selected_thread_ts
-                .filter(|thread_ts| message.belongs_to_thread(thread_ts))
-                .map(|_| realtime_dom_patch_kind(kind, state.current_thread_messages(), message))
-                .unwrap_or(Some(kind));
-            (
-                channel_kind,
-                thread_kind,
-                state.visible_channel_id() == Some(channel_id)
-                    && message.belongs_in_channel_timeline(),
-                selected_thread_ts.is_some_and(|thread_ts| message.belongs_to_thread(thread_ts)),
-            )
-        };
-
-        let outcome = self
-            .imp()
-            .workspace
-            .view
-            .borrow_mut()
-            .apply_realtime_message(channel_id, message.clone(), kind);
-
-        if timeline_patch_needed(outcome.render_channel, arrival, channel_contains_message) {
-            if self
-                .imp()
-                .workspace
-                .view
-                .borrow()
-                .has_channel_context(channel_id)
-            {
-                self.queue_ui_invalidations(UiInvalidations::MAIN);
-            } else if let Some(dom_kind) = channel_dom_kind {
-                self.apply_realtime_message_patch(RealtimeMessagePatch {
-                    surface: TimelineSurface::Main,
-                    channel_id,
-                    message,
-                    kind: dom_kind,
-                    arrival,
-                    unread_start,
-                    thread_ts: None,
-                    fallback: UiInvalidations::MAIN,
-                });
-            } else {
-                self.queue_ui_invalidations(UiInvalidations::MAIN);
-            }
-        }
-
-        if timeline_patch_needed(outcome.render_thread, arrival, thread_contains_message) {
-            if let Some(thread_ts) = self.selected_thread_ts() {
-                if self
-                    .imp()
-                    .workspace
-                    .view
-                    .borrow()
-                    .has_thread_context(channel_id, &thread_ts)
-                {
-                    self.queue_ui_invalidations(UiInvalidations::THREAD);
-                } else if let Some(dom_kind) = thread_dom_kind {
-                    self.apply_realtime_message_patch(RealtimeMessagePatch {
-                        surface: TimelineSurface::Thread,
-                        channel_id,
-                        message,
-                        kind: dom_kind,
-                        arrival,
-                        unread_start: false,
-                        thread_ts: Some(&thread_ts),
-                        fallback: UiInvalidations::THREAD,
-                    });
-                } else {
-                    self.queue_ui_invalidations(UiInvalidations::THREAD);
-                }
-            }
-        }
-
-        if outcome.refresh_derived_view {
-            self.rerender_current_main_messages();
-        }
-
-        self.request_user_names(std::slice::from_ref(message));
-        self.request_image_assets(std::iter::once(message));
-        outcome
-    }
-
-    fn apply_socket_reaction(&self, event: SocketModeReactionEvent) {
-        self.apply_reaction_update(ReactionUpdate {
-            channel_id: event.channel_id,
-            ts: event.ts,
-            name: event.name,
-            user_id: event.user_id,
-            added: event.added,
-        });
-    }
-
-    fn apply_reaction_update(&self, update: ReactionUpdate) {
-        let outcome = self
-            .imp()
-            .workspace
-            .view
-            .borrow_mut()
-            .apply_reaction(&update);
-
-        if outcome.changed {
-            let updated_message = self
-                .imp()
-                .workspace
-                .view
-                .borrow()
-                .find_message(&update.channel_id, &update.ts);
-            let Some(updated_message) = updated_message else {
-                self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
-                return;
-            };
-            if outcome.render_channel {
-                let patch = message_html::message_region_patch(
-                    &update.channel_id,
-                    &updated_message,
-                    &self.message_patch_context(None, &updated_message),
-                    TimelineMessageRegion::Responses,
-                );
-                self.apply_timeline_patch(TimelineSurface::Main, patch, UiInvalidations::MAIN);
-            }
-            if outcome.render_thread {
-                let thread_ts = self.selected_thread_ts();
-                let patch = message_html::message_region_patch(
-                    &update.channel_id,
-                    &updated_message,
-                    &self.message_patch_context(thread_ts.as_deref(), &updated_message),
-                    TimelineMessageRegion::Responses,
-                );
-                self.apply_timeline_patch(TimelineSurface::Thread, patch, UiInvalidations::THREAD);
-            }
-        }
     }
 
     fn handle_huddle_event(&self, event: HuddleEvent) {
@@ -14020,34 +13456,59 @@ impl ConduitWindow {
     }
 
     fn rerender_current_main_messages(&self) {
-        let snapshot = self.current_message_snapshot();
-
-        match snapshot.main_view {
+        let main_view = self.imp().workspace.view.borrow().main_view();
+        match main_view {
             MainMessageView::Conversation => {
-                if let Some(channel_id) = snapshot.channel_id.as_deref() {
-                    self.populate_history(channel_id, snapshot.channel_messages);
+                let projection = {
+                    let view = self.imp().workspace.view.borrow();
+                    view.last_channel_id().map(|channel_id| {
+                        (
+                            channel_id.to_string(),
+                            view.channel_messages(channel_id).to_vec(),
+                        )
+                    })
+                };
+                if let Some((channel_id, messages)) = projection {
+                    self.populate_history(&channel_id, messages);
                 }
             }
             MainMessageView::Unreads => self.populate_unreads(self.unread_items()),
             MainMessageView::Threads => self.populate_threads(),
-            MainMessageView::Search => self.populate_search_results(snapshot.search_results),
-            MainMessageView::Files => self.populate_files(snapshot.files),
-            MainMessageView::Saved => self.populate_saved_items(snapshot.saved_items),
+            MainMessageView::Search => {
+                let results = self.imp().workspace.view.borrow().search_results().to_vec();
+                self.populate_search_results(results);
+            }
+            MainMessageView::Files => {
+                let files = self.imp().workspace.view.borrow().files().to_vec();
+                self.populate_files(files);
+            }
+            MainMessageView::Saved => {
+                let items = self.imp().workspace.view.borrow().saved_items().to_vec();
+                self.populate_saved_items(items);
+            }
             MainMessageView::Placeholder => {}
         }
     }
 
     fn rerender_current_thread(&self) {
-        let snapshot = self.current_message_snapshot();
-        if let Some(channel_id) = snapshot.channel_id {
-            if let Some(thread_ts) = snapshot.thread_ts {
-                self.populate_thread(
-                    &channel_id,
-                    &thread_ts,
-                    snapshot.thread_messages,
-                    TimelineScrollBehavior::Preserve,
-                );
-            }
+        let projection = {
+            let view = self.imp().workspace.view.borrow();
+            view.selected_thread_target()
+                .map(|(channel_id, thread_ts)| {
+                    (
+                        channel_id.to_string(),
+                        thread_ts.to_string(),
+                        view.current_thread_messages().to_vec(),
+                    )
+                })
+        };
+        if let Some((channel_id, thread_ts, messages)) = projection {
+            self.populate_thread(
+                &channel_id,
+                &thread_ts,
+                messages,
+                TimelineScrollBehavior::Preserve,
+            );
         }
     }
 
@@ -14234,10 +13695,6 @@ impl ConduitWindow {
         let names = promoted_recent_reactions(stored.iter().map(|value| value.as_str()), name);
         let values = names.iter().map(String::as_str).collect::<Vec<_>>();
         let _ = settings.set_strv(config::RECENT_REACTIONS_KEY, values);
-    }
-
-    fn current_message_snapshot(&self) -> WorkspaceSnapshot {
-        self.imp().workspace.view.borrow().snapshot()
     }
 
     fn selected_channel_id(&self) -> Option<String> {
@@ -16245,43 +15702,6 @@ mod tests {
     }
 
     #[test]
-    fn sparse_profile_updates_preserve_status_while_explicit_blanks_clear_it() {
-        let mut statuses = HashMap::from([(
-            "U123".to_string(),
-            SlackUserStatus {
-                text: "Focus time".to_string(),
-                emoji: ":headphones:".to_string(),
-                expiration: 0,
-            },
-        )]);
-
-        assert!(!apply_user_status_profile_update(
-            &mut statuses,
-            "U123",
-            &SlackUserProfile {
-                huddle_state_call_id: Some("R123".to_string()),
-                ..Default::default()
-            },
-        ));
-        assert_eq!(
-            statuses.get("U123").map(|status| status.text.as_str()),
-            Some("Focus time")
-        );
-
-        assert!(apply_user_status_profile_update(
-            &mut statuses,
-            "U123",
-            &SlackUserProfile {
-                status_text: Some(String::new()),
-                status_emoji: Some(String::new()),
-                status_expiration: Some(0),
-                ..Default::default()
-            },
-        ));
-        assert!(!statuses.contains_key("U123"));
-    }
-
-    #[test]
     fn status_snapshots_replace_stale_values_without_overwriting_newer_users() {
         let current_status = SlackUserStatus {
             text: "Current".to_string(),
@@ -16395,7 +15815,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_user_name_updates_render_for_idle_dm_and_group_dm_rows() {
+    fn user_projection_invalidations_target_only_affected_surfaces() {
         let dm = SlackConversation {
             id: "D123".to_string(),
             user: Some("U123".to_string()),
@@ -16416,19 +15836,39 @@ mod tests {
         };
         let conversations = vec![dm, group_dm, channel];
 
-        assert!(sidebar_user_name_update_needs_render(
+        let dm_flags = user_projection_invalidations(
             &conversations,
-            "U123"
-        ));
-        assert!(sidebar_user_name_update_needs_render(
+            &["U123".to_string()],
+            Some("U999"),
+            Some("D123"),
+            false,
+        );
+        assert!(dm_flags.contains(UiInvalidations::SIDEBAR));
+        assert!(dm_flags.contains(UiInvalidations::TITLE));
+        assert!(!dm_flags.contains(UiInvalidations::PICKER));
+
+        let group_flags = user_projection_invalidations(
             &conversations,
-            "U456"
-        ));
-        assert!(!sidebar_user_name_update_needs_render(
+            &["U456".to_string()],
+            None,
+            Some("C123"),
+            false,
+        );
+        assert!(group_flags.contains(UiInvalidations::SIDEBAR));
+        assert!(!group_flags.contains(UiInvalidations::TITLE));
+
+        let current_user_flags = user_projection_invalidations(
             &conversations,
-            "U999"
-        ));
-        assert!(!sidebar_user_name_update_needs_render(&[], "U123"));
+            &["U999".to_string()],
+            Some("U999"),
+            Some("C123"),
+            false,
+        );
+        assert_eq!(current_user_flags, UiInvalidations::TITLE);
+
+        let picker_flags =
+            user_projection_invalidations(&conversations, &["U000".to_string()], None, None, true);
+        assert_eq!(picker_flags, UiInvalidations::PICKER);
     }
 
     #[test]
@@ -16634,24 +16074,6 @@ mod tests {
     }
 
     #[test]
-    fn local_reaction_completion_keeps_the_incremental_update_payload() {
-        assert_eq!(
-            local_reaction_update("C123", "1710000200.000000", "eyes", true, Some("U123")),
-            Some(ReactionUpdate {
-                channel_id: "C123".into(),
-                ts: "1710000200.000000".into(),
-                name: "eyes".into(),
-                user_id: "U123".into(),
-                added: true,
-            })
-        );
-        assert_eq!(
-            local_reaction_update("C123", "1710000200.000000", "eyes", true, None),
-            None
-        );
-    }
-
-    #[test]
     fn notification_targets_wait_for_the_workspace_and_conversations() {
         let target = NotificationTarget {
             workspace_id: "T123".into(),
@@ -16778,18 +16200,6 @@ mod tests {
             "hello"
         ));
         assert!(!submitted_draft_matches(None, None, "hello"));
-
-        let context = OperationContext::new(
-            RuntimeOperation::PostMessage,
-            RuntimeTarget::Message {
-                channel_id: "C123".into(),
-                thread_ts: Some("parent".into()),
-            },
-        );
-        assert_eq!(
-            posted_message_thread_ts(&context, "C123", &SlackMessage::default()).as_deref(),
-            Some("parent")
-        );
     }
 
     #[test]
@@ -17461,80 +16871,6 @@ mod tests {
     }
 
     #[test]
-    fn realtime_dom_posts_append_only_when_they_are_newest() {
-        let existing = [
-            SlackMessage {
-                ts: "3".to_string(),
-                ..Default::default()
-            },
-            SlackMessage {
-                ts: "1".to_string(),
-                ..Default::default()
-            },
-        ];
-
-        assert_eq!(
-            realtime_dom_patch_kind(
-                RealtimeMessageKind::Posted,
-                &existing,
-                &SlackMessage {
-                    ts: "4".to_string(),
-                    ..Default::default()
-                }
-            ),
-            Some(RealtimeMessageKind::Posted)
-        );
-        assert_eq!(
-            realtime_dom_patch_kind(
-                RealtimeMessageKind::Posted,
-                &existing,
-                &SlackMessage {
-                    ts: "2".to_string(),
-                    ..Default::default()
-                }
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn realtime_dom_redeliveries_replace_instead_of_duplicate() {
-        let existing = [SlackMessage {
-            ts: "3".to_string(),
-            ..Default::default()
-        }];
-        let redelivery = SlackMessage {
-            ts: "3".to_string(),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            realtime_dom_patch_kind(RealtimeMessageKind::Posted, &existing, &redelivery),
-            Some(RealtimeMessageKind::Changed)
-        );
-        assert_eq!(
-            realtime_dom_patch_kind(RealtimeMessageKind::Deleted, &existing, &redelivery),
-            Some(RealtimeMessageKind::Deleted)
-        );
-    }
-
-    #[test]
-    fn local_arrival_repatches_a_socket_first_duplicate_on_the_visible_surface() {
-        assert!(timeline_patch_needed(
-            false,
-            Some(TimelineMessageArrival::Sent),
-            true
-        ));
-        assert!(!timeline_patch_needed(
-            false,
-            Some(TimelineMessageArrival::Sent),
-            false
-        ));
-        assert!(!timeline_patch_needed(false, None, true));
-        assert!(timeline_patch_needed(true, None, false));
-    }
-
-    #[test]
     fn unread_focus_starts_after_last_read_or_uses_unread_count() {
         let messages = [
             SlackMessage {
@@ -17560,19 +16896,6 @@ mod tests {
             Some("2")
         );
         assert_eq!(first_unread_message_ts(&messages, None, 0), None);
-    }
-
-    #[test]
-    fn mutation_completion_reloads_only_the_visible_channel() {
-        assert!(mutation_completion_reloads_visible_channel(
-            Some("C123"),
-            "C123"
-        ));
-        assert!(!mutation_completion_reloads_visible_channel(
-            Some("C456"),
-            "C123"
-        ));
-        assert!(!mutation_completion_reloads_visible_channel(None, "C123"));
     }
 
     #[test]
