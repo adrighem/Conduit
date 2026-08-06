@@ -47,7 +47,7 @@
 ## Phase 6: Expansion and cleanup
 
 - [x] Task: Migrate remaining workspace surfaces onto coordinator intents and projections 0a40d76
-- [~] Task: Remove whole-state storage, raw realtime UI events, broad invalidations, and routine reload adapters
-- [ ] Task: Add settled-idle counters and run full automated acceptance validation
+- [x] Task: Remove whole-state storage, raw realtime UI events, broad invalidations, and routine reload adapters d81fce4
+- [~] Task: Add settled-idle counters and run full automated acceptance validation
 - [ ] Task: Synchronize final architecture documentation
 - [ ] Task: Conductor - User Manual Verification 'Expansion and cleanup' (Protocol in workflow.md)
