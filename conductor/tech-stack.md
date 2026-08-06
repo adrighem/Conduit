@@ -57,10 +57,10 @@
 - Safe URL controls navigate directly. Slack-owned callback controls use one-shot opaque,
   session/revision-scoped handles and a typed, validated exact-message external handoff with
   explicit authoritative or constructed-fallback provenance.
-- A keyed `SidebarModelDiff` reconciles stable rows in the current `GtkListBox`; migration to a virtualized `GtkListView` remains planned.
+- A keyed `SidebarProjection` applies splice, update, and reset operations to a `gio::ListStore` backing a virtualized `GtkListView`, preserving stable selection without whole-catalog rebuilds.
 - Conversation navigation creates a generation-scoped opening session with an immutable semantic target. One WebKit viewport controller owns initial geometry, reveals the timeline only after positioning, cancels on user interaction, and arms read observation after commit.
-- Message timelines load generated HTML documents for navigation, then reconcile cached-to-fresh snapshots and asynchronous metadata through anchor-preserving typed DOM patches. Realtime messages, response regions, user details, and loaded media use the same patch runtime; broader revision-aware batching remains planned.
-- Cached message media is size- and MIME-checked before it is rendered through bounded data URLs. A dedicated cache-key URI scheme remains planned.
+- Each message WebView owns a revision-aware timeline presenter. Navigation loads a generated document, while cached-to-fresh snapshots, realtime messages, response regions, user details, and loaded media are coalesced into one anchor-preserving typed DOM delta per GTK frame; full reloads are reserved for navigation and recovery.
+- Cached message media uses an exact raster/video MIME allowlist and 8/16 MiB payload bounds, then resolves only registered SHA-256 keys through a private `conduit-asset` WebKit scheme backed by shared immutable bytes.
 - Desktop notifications use stable workspace/user/channel IDs and typed application actions so activation can survive a cold start.
 
 ## External Slack URI Integration

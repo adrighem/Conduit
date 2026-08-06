@@ -35,14 +35,14 @@
 - [x] Task: Conductor - User Manual Verification 'Bounded synchronization and backpressure' (Protocol in workflow.md) 6590ad0
 - [x] Task: Fix startup scheduler follow-up admission regression 91303bb
 
-## Phase 5: Incremental GTK and WebKit presentation
+## Phase 5: Incremental GTK and WebKit presentation [checkpoint: 8593308]
 
 - [x] Task: Define SidebarProjection keyed splice/update/reset behavior with 1,430-row regression tests 5cb5167
 - [x] Task: Migrate the sidebar to GtkListView, gio::ListStore, and stable single selection fdc127c
 - [x] Task: Define TimelinePresenter document/revision/loading/delta behavior with scroll regression tests 9a37fad
 - [x] Task: Route one batched TimelineDelta per frame and restrict full document loads b1f136a
 - [x] Task: Add the MIME-checked conduit-asset cache-key scheme and remove nested root resize observers 44f1c0f
-- [ ] Task: Conductor - User Manual Verification 'Incremental GTK and WebKit presentation' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Incremental GTK and WebKit presentation' (Protocol in workflow.md) 8593308
 
 ## Phase 6: Expansion and cleanup
 
