@@ -49,5 +49,5 @@
 - [x] Task: Migrate remaining workspace surfaces onto coordinator intents and projections 0a40d76
 - [x] Task: Remove whole-state storage, raw realtime UI events, broad invalidations, and routine reload adapters d81fce4
 - [x] Task: Add settled-idle counters and run full automated acceptance validation 0e3939f
-- [~] Task: Synchronize final architecture documentation
-- [ ] Task: Conductor - User Manual Verification 'Expansion and cleanup' (Protocol in workflow.md)
+- [x] Task: Synchronize final architecture documentation d77d6b1
+- [~] Task: Conductor - User Manual Verification 'Expansion and cleanup' (Protocol in workflow.md)
