@@ -12,11 +12,12 @@
 - `anyhow` remains available at executable and orchestration boundaries for contextual aggregation when no typed recovery decision is needed.
 - A small workspace lifecycle model describes connection and synchronization state independently from navigation-oriented `WorkspaceViewState`.
 - Application services are extracted incrementally behind narrow ports only when a concrete use case and headless test require the seam.
-- `services::conversation_history` owns cached-preview and fresh-history orchestration behind focused Slack and store ports; the runtime adapts its progress into GTK-facing events.
+- `services::conversation_history` owns cached and fresh history retrieval behind focused Slack and store ports. Runtime results enter the workspace coordinator; state-free completion events carry only request metadata such as pagination cursors.
 
 ## Observability
 - `tracing` provides structured asynchronous spans for runtime sessions, requests, operations, and non-sensitive targets.
 - `tracing-subscriber` initializes human-readable diagnostics at the executable boundary and respects environment filtering.
+- Debug mode samples saturating, process-wide pipeline counters every 60 seconds. Samples report deltas and totals for admitted jobs, outbound Slack requests, SQLite connections/transactions/changed/skipped rows, sidebar operations, document loads, and timeline deltas.
 - Credentials, OAuth values, browser-session data, and message bodies are excluded from fields and events.
 
 ## Slack Integration
@@ -28,7 +29,7 @@
 ## Build and Test
 - Cargo for Rust dependency management and unit tests.
 - Meson/Ninja for GNOME build integration and resources.
-- `cargo test` and `meson test -C _build` are supported validation commands.
+- `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --all-targets`, `meson compile -C _build`, and `meson test -C _build` form the default acceptance gate.
 
 ## Releases and Distribution
 - Release Please v4 maintains conventional-commit release pull requests, the changelog, synchronized Cargo/Meson/AppStream versions, `v<semver>` tags, and GitHub Releases.
@@ -38,15 +39,17 @@
 
 ## Local State
 - XDG cache paths under the application ID for WebKit data, image assets, and Slack state caches.
-- A workspace-scoped `StoreHub` owns one persistent SQLite writer and two query-only readers behind bounded channels; revisioned batches, commit barriers, and clean shutdown replace per-operation connections.
+- A workspace-scoped `StoreHub` owns one persistent SQLite writer and two query-only readers behind bounded channels. Revisioned atomic `StoreBatch` writes, unchanged suppression, commit barriers, and clean shutdown replace routine per-operation write connections.
 - Schema-v2 freshness and retry metadata augment keyed derived-cache payloads. Cache migration/corruption recovery may recreate derived Slack data without touching keyring credentials or GSettings drafts.
 - GSettings stores workspace/user/conversation/thread-scoped composer drafts.
 
 ## Workspace Pipeline
-- A headless `WorkspaceCoordinator` maintains a revisioned canonical view for the inputs migrated so far, alongside the existing runtime, persistence, and UI compatibility paths.
-- Cached hydration, Web API responses, local actions, and realtime transports normalize into pure `WorkspaceMutation` values. Each changed logical mutation emits one revisioned `WorkspacePatch` and, when persistence changes, one ordered `StoreBatch`; compatibility paths still deliver the current UI events and store writes.
-- Snapshot envelopes carry the revision at which network work began so reducer merges cannot roll back newer realtime or local overlays.
-- Runtime work is bounded by separate semaphores for navigation, interactive, background, image, and upload lanes. Typed `SyncJob` coalescing and cancellation remain part of the active workspace-pipeline track.
+- A headless `WorkspaceCoordinator` is the sole canonical owner of conversations, users, channel and thread timelines, thread records, read/attention overlays, message identities, and monotonically increasing workspace revisions for the one connected workspace.
+- Cached hydration, Web API responses, local actions, and both realtime transports normalize into typed `WorkspaceMutation` values. One accepted logical mutation emits at most one `WorkspacePatch` and one ordered atomic `StoreBatch`; identical input emits neither.
+- Persistence is attempted before its matching patch is published; persistence failure does not suppress the current canonical projection and is handled by ordered recovery. GTK receives coordinator-owned workspace state only through revisioned patches, while companion completion events for those paths carry request or operation metadata rather than parallel state payloads.
+- Snapshot envelopes carry the revision at which network work began. Coordinator merges preserve newer local/realtime values, read cursors, tombstones, and message identity decisions when stale results arrive.
+- A bounded `SyncScheduler` coalesces typed jobs across interactive, foreground, and yielding maintenance priorities, reserves capacity before spawning, applies freshness and retry policy, and supports generation-scoped cancellation and clean shutdown. Image and upload work retain specialized bounded execution paths.
+- Startup hydrates one cached projection, starts realtime promptly, conditionally refreshes membership, enriches at most 30 priority conversations, and prefetches at most 12 histories. User-directory refresh remains lazy after a warm cache.
 
 ## Presentation
 - libadwaita split views and breakpoints adapt the workspace and thread shell to narrow windows.
@@ -59,7 +62,8 @@
   explicit authoritative or constructed-fallback provenance.
 - A keyed `SidebarProjection` applies splice, update, and reset operations to a `gio::ListStore` backing a virtualized `GtkListView`, preserving stable selection without whole-catalog rebuilds.
 - Conversation navigation creates a generation-scoped opening session with an immutable semantic target. One WebKit viewport controller owns initial geometry, reveals the timeline only after positioning, cancels on user interaction, and arms read observation after commit.
-- Each message WebView owns a revision-aware timeline presenter. Navigation loads a generated document, while cached-to-fresh snapshots, realtime messages, response regions, user details, and loaded media are coalesced into one anchor-preserving typed DOM delta per GTK frame; full reloads are reserved for navigation and recovery.
+- `WorkspaceViewState` consumes workspace patches to update cached projections and derives the narrow sidebar, title, picker, main-view, and thread presentation changes needed for each patch.
+- Each message WebView owns a revision-aware timeline presenter. Navigation loads a generated document, while cached-to-fresh snapshots, realtime messages, response regions, user details, and loaded media are coalesced into one anchor-preserving typed DOM delta per GTK frame; full reloads are reserved for initial navigation, revision mismatch, and unrecoverable presentation recovery.
 - Cached message media uses an exact raster/video MIME allowlist and 8/16 MiB payload bounds, then resolves only registered SHA-256 keys through a private `conduit-asset` WebKit scheme backed by shared immutable bytes.
 - Desktop notifications use stable workspace/user/channel IDs and typed application actions so activation can survive a cold start.
 
