@@ -46,7 +46,7 @@
 
 ## Phase 6: Expansion and cleanup
 
-- [ ] Task: Migrate remaining workspace surfaces onto coordinator intents and projections
+- [~] Task: Migrate remaining workspace surfaces onto coordinator intents and projections
 - [ ] Task: Remove whole-state storage, raw realtime UI events, broad invalidations, and routine reload adapters
 - [ ] Task: Add settled-idle counters and run full automated acceptance validation
 - [ ] Task: Synchronize final architecture documentation
