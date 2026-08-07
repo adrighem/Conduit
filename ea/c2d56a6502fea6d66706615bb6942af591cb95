@@ -1,0 +1,9 @@
+Task: Stabilize headless keyboard window activation
+
+Summary: Resolve the WM-active X11 client and validate its exact title and process before retaining a window ID for the main window or conversation switcher.
+
+Modified files: tests/test_keyboard_shortcuts.py
+
+Verification: Original focused test passed 5/5, demonstrating the intermittent shape; patched focused test passed 10/10; cargo fmt and strict Clippy passed; cargo test passed with 932 passed and 3 ignored; Meson compilation passed; Meson tests passed 17/17.
+
+Rationale: CI run 31173808491 retained a transient xfwm frame ID that became unactivatable between composer focus and clipboard read. Selecting the managed GTK client prevents recurrence without retrying or suppressing test failures.
