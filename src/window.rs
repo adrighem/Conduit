@@ -491,6 +491,8 @@ mod imp {
                 let initial_sync_test = std::env::var_os("CONDUIT_TEST_INITIAL_SYNC").is_some();
                 let empty_new_message_test =
                     std::env::var_os("CONDUIT_TEST_EMPTY_NEW_MESSAGE").is_some();
+                let conversation_restore_test =
+                    std::env::var_os("CONDUIT_TEST_CONVERSATION_RESTORE").is_some();
                 if status_test && std::env::var_os("CONDUIT_TEST_STATUS_NARROW").is_some() {
                     obj.set_default_size(360, 720);
                 }
@@ -527,7 +529,7 @@ mod imp {
                     is_channel: Some(true),
                     ..SlackConversation::default()
                 }];
-                if std::env::var_os("CONDUIT_TEST_CONVERSATION_RESTORE").is_some() {
+                if conversation_restore_test {
                     test_conversations.push(SlackConversation {
                         id: "C_RESTORED".to_string(),
                         name: Some("restored".to_string()),
@@ -535,7 +537,6 @@ mod imp {
                         ..SlackConversation::default()
                     });
                 }
-                obj.populate_conversations(test_conversations);
                 let test_users = vec![
                     SlackUser {
                         id: Some("UADA".to_string()),
@@ -560,12 +561,28 @@ mod imp {
                         ..Default::default()
                     },
                 ];
-                obj.populate_user_names(
-                    test_users
-                        .iter()
-                        .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
-                        .collect(),
-                );
+                if conversation_restore_test {
+                    let bootstrap_patch = crate::workspace_pipeline::WorkspacePatch::new(
+                        WorkspaceRevision::INITIAL.successor(),
+                        vec![crate::workspace_pipeline::WorkspaceChange::BootstrapReset(
+                            crate::workspace_pipeline::WorkspaceBootstrapData {
+                                conversations: test_conversations,
+                                users: test_users.clone(),
+                                ..Default::default()
+                            },
+                        )],
+                    )
+                    .expect("test bootstrap patch should contain workspace data");
+                    obj.apply_workspace_patch(&bootstrap_patch);
+                } else {
+                    obj.populate_conversations(test_conversations);
+                    obj.populate_user_names(
+                        test_users
+                            .iter()
+                            .filter_map(|user| Some((user.id.clone()?, user.display_name()?)))
+                            .collect(),
+                    );
+                }
                 *self.discovered_users.borrow_mut() = test_users;
                 if status_test && std::env::var_os("CONDUIT_TEST_STATUS_PRESET").is_some() {
                     let emoji = if std::env::var_os("CONDUIT_TEST_STATUS_CUSTOM_PRESET").is_some() {
@@ -10165,8 +10182,9 @@ impl ConduitWindow {
             for user_id in &affected_user_ids {
                 pending.remove(user_id);
             }
-            self.schedule_status_expiry();
         }
+        // Expiry scheduling reads the status map, so all projection borrows must be released first.
+        self.schedule_status_expiry();
 
         for target in COMPOSER_TARGETS {
             self.refresh_composer_mention_names(target);
