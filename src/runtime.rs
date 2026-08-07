@@ -1,15 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
@@ -38,9 +39,8 @@ use crate::models::{
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::ConversationHistoryService;
 use crate::slack::{
-    supported_preview_mime_type, DownloadedPreviewAsset, SlackApi, SlackError, SlackErrorCategory,
+    DownloadedPreviewAsset, PreviewAssetMime, SlackApi, SlackError, SlackErrorCategory,
     SlackMessageActionRequest, SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
-    MAX_PREVIEW_IMAGE_BYTES, MAX_PREVIEW_VIDEO_BYTES,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
@@ -75,29 +75,10 @@ const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const ATTACHMENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const ATTACHMENT_BASENAME_MAX_BYTES: usize = 180;
-const MAX_CACHED_PREVIEW_DATA_URI_BYTES: u64 =
-    (MAX_PREVIEW_VIDEO_BYTES as u64).div_ceil(3) * 4 + 128;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreviewAsset {
-    pub(crate) mime_type: String,
-    pub(crate) bytes: Arc<[u8]>,
-}
-
-impl PreviewAsset {
-    pub(crate) fn new(mime_type: String, bytes: Vec<u8>) -> Option<Self> {
-        let max_bytes = preview_asset_max_bytes(&mime_type)?;
-        (!bytes.is_empty() && bytes.len() <= max_bytes).then_some(Self {
-            mime_type,
-            bytes: bytes.into(),
-        })
-    }
-
-    pub(crate) fn is_valid(&self) -> bool {
-        preview_asset_max_bytes(&self.mime_type)
-            .is_some_and(|max_bytes| !self.bytes.is_empty() && self.bytes.len() <= max_bytes)
-    }
-}
+const PREVIEW_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const PREVIEW_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const PREVIEW_CACHE_MAX_ENTRIES: usize = 16_384;
+const PREVIEW_VALIDATION_PREFIX_BYTES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UploadAttachment {
@@ -946,7 +927,7 @@ pub enum RuntimeEventKind {
     EmojiCatalogLoaded(HashMap<String, String>),
     ImageAssetLoaded {
         key: String,
-        asset: PreviewAsset,
+        asset: CachedAssetDescriptor,
     },
     ImageAssetFailed {
         key: String,
@@ -1244,6 +1225,7 @@ struct RuntimeConnection {
     slack: SlackApi,
     workspace_url: Option<String>,
     workspace_store: Option<WorkspaceStore>,
+    image_cache_scope: String,
     workspace: WorkspaceReducerAdapter,
     current_user_id: Option<String>,
     user_cache: Arc<Mutex<HashMap<String, String>>>,
@@ -2005,55 +1987,408 @@ pub struct AppRuntime {
     commands: mpsc::UnboundedSender<RuntimeRequest>,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct CachedAssetDescriptor {
+    workspace_key: String,
+    cache_key: String,
+    mime_type: PreviewAssetMime,
+    size: u64,
+}
+
+impl CachedAssetDescriptor {
+    pub(crate) fn new(
+        workspace_key: String,
+        cache_key: String,
+        mime_type: PreviewAssetMime,
+        size: u64,
+    ) -> Option<Self> {
+        let size = usize::try_from(size).ok()?;
+        (valid_image_asset_cache_key(&workspace_key)
+            && valid_image_asset_cache_key(&cache_key)
+            && mime_type.validate_size(size))
+        .then_some(Self {
+            workspace_key,
+            cache_key,
+            mime_type,
+            size: size as u64,
+        })
+    }
+
+    pub(crate) fn workspace_key(&self) -> &str {
+        &self.workspace_key
+    }
+
+    pub(crate) fn cache_key(&self) -> &str {
+        &self.cache_key
+    }
+
+    pub(crate) fn content_type(&self) -> &'static str {
+        self.mime_type.as_str()
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn is_video(&self) -> bool {
+        self.mime_type.is_video()
+    }
+
+    pub(crate) fn uri(&self) -> String {
+        format!("conduit-asset://{}", self.cache_key)
+    }
+
+    pub(crate) fn matches_source(&self, key: &str) -> bool {
+        self.cache_key == preview_asset_cache_key(&self.workspace_key, key)
+    }
+
+    pub(crate) fn path_in(&self, root: &Path) -> PathBuf {
+        root.join(&self.workspace_key).join(format!(
+            "{}.{}",
+            self.cache_key,
+            self.mime_type.extension()
+        ))
+    }
+
+    pub(crate) fn validates_opened_content(&self, size: u64, prefix: &[u8]) -> bool {
+        size == self.size && self.mime_type.validate_cached_content(size, prefix)
+    }
+}
+
+impl std::fmt::Debug for CachedAssetDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CachedAssetDescriptor")
+            .field("workspace_key", &self.workspace_key)
+            .field("cache_key", &self.cache_key)
+            .field("mime_type", &self.mime_type)
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ImageAssetCache {
     directory: PathBuf,
+    operations: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ImageAssetCache {
     fn new(directory: PathBuf) -> Self {
-        Self { directory }
+        Self {
+            directory,
+            operations: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
-    async fn load(&self, key: &str) -> Result<Option<PreviewAsset>> {
-        let path = self.path_for_key(key);
-        match tokio::fs::metadata(&path).await {
-            Ok(metadata) if metadata.len() > MAX_CACHED_PREVIEW_DATA_URI_BYTES => return Ok(None),
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect cached image {}", path.display()));
+    async fn load(
+        &self,
+        workspace_scope: &str,
+        key: &str,
+    ) -> Result<Option<CachedAssetDescriptor>> {
+        let _operation = self.operations.lock().await;
+        let workspace_key = preview_workspace_cache_key(workspace_scope);
+        let cache_key = preview_asset_cache_key(&workspace_key, key);
+        let mut loaded = None;
+
+        for mime_type in PreviewAssetMime::ALL {
+            let descriptor =
+                CachedAssetDescriptor::new(workspace_key.clone(), cache_key.clone(), mime_type, 1)
+                    .expect("validated preview MIME accepts one byte");
+            let path = descriptor.path_in(&self.directory);
+            let path_metadata = match tokio::fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect cached preview asset {}", path.display())
+                    });
+                }
+            };
+            if !path_metadata.file_type().is_file() {
+                return Err(anyhow!("cached preview asset is not a regular file"));
+            }
+
+            let mut file = tokio::fs::File::open(&path).await.with_context(|| {
+                format!("failed to open cached preview asset {}", path.display())
+            })?;
+            let opened_metadata = file.metadata().await.with_context(|| {
+                format!("failed to inspect cached preview asset {}", path.display())
+            })?;
+            if !opened_metadata.is_file()
+                || !same_cache_file_identity(&path_metadata, &opened_metadata)
+            {
+                return Err(anyhow!("cached preview asset changed while opening"));
+            }
+
+            let mut prefix = [0_u8; PREVIEW_VALIDATION_PREFIX_BYTES];
+            let prefix_length = file.read(&mut prefix).await.with_context(|| {
+                format!("failed to validate cached preview asset {}", path.display())
+            })?;
+            let current_metadata = tokio::fs::symlink_metadata(&path).await.with_context(|| {
+                format!(
+                    "failed to revalidate cached preview asset {}",
+                    path.display()
+                )
+            })?;
+            if !current_metadata.file_type().is_file()
+                || !same_cache_file_identity(&opened_metadata, &current_metadata)
+                || !mime_type
+                    .validate_cached_content(opened_metadata.len(), &prefix[..prefix_length])
+            {
+                return Err(anyhow!(
+                    "cached preview asset has invalid MIME content or size"
+                ));
+            }
+            let descriptor = CachedAssetDescriptor::new(
+                workspace_key.clone(),
+                cache_key.clone(),
+                mime_type,
+                opened_metadata.len(),
+            )
+            .ok_or_else(|| anyhow!("cached preview asset descriptor is invalid"))?;
+            if loaded.replace((descriptor, file)).is_some() {
+                return Err(anyhow!(
+                    "cached preview asset has multiple MIME representations"
+                ));
             }
         }
-        match tokio::fs::read_to_string(&path).await {
-            Ok(data_uri) => Ok(preview_asset_from_data_uri(&data_uri)),
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to read cached image {}", path.display())),
-        }
+
+        let Some((descriptor, file)) = loaded else {
+            return Ok(None);
+        };
+        let file = file.into_std().await;
+        let now = SystemTime::now();
+        let _ = file.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(now)
+                .set_modified(now),
+        );
+        Ok(Some(descriptor))
     }
 
-    async fn store(&self, key: &str, asset: &PreviewAsset) -> Result<()> {
-        let data_uri = preview_asset_data_uri(asset);
+    async fn store(
+        &self,
+        workspace_scope: &str,
+        key: &str,
+        asset: DownloadedPreviewAsset,
+    ) -> Result<CachedAssetDescriptor> {
+        self.store_with_policy(workspace_scope, key, asset, PreviewCachePolicy::default())
+            .await
+    }
+
+    async fn store_with_policy(
+        &self,
+        workspace_scope: &str,
+        key: &str,
+        asset: DownloadedPreviewAsset,
+        policy: PreviewCachePolicy,
+    ) -> Result<CachedAssetDescriptor> {
+        if !asset.mime_type.is_valid_payload(&asset.bytes) {
+            return Err(anyhow!(
+                "downloaded preview asset has invalid MIME content or size"
+            ));
+        }
+        let _operation = self.operations.lock().await;
         tokio::fs::create_dir_all(&self.directory)
             .await
             .with_context(|| {
                 format!(
-                    "failed to create image cache directory {}",
+                    "failed to create preview cache directory {}",
                     self.directory.display()
                 )
             })?;
 
-        let path = self.path_for_key(key);
-        tokio::fs::write(&path, &data_uri)
-            .await
-            .with_context(|| format!("failed to write cached image {}", path.display()))
+        let workspace_key = preview_workspace_cache_key(workspace_scope);
+        let cache_key = preview_asset_cache_key(&workspace_key, key);
+        let workspace_directory = self.directory.join(&workspace_key);
+        ensure_preview_workspace_directory(&workspace_directory).await?;
+
+        for other_mime_type in PreviewAssetMime::ALL {
+            if other_mime_type == asset.mime_type {
+                continue;
+            }
+            let other_path =
+                workspace_directory.join(format!("{}.{}", cache_key, other_mime_type.extension()));
+            match tokio::fs::symlink_metadata(&other_path).await {
+                Ok(metadata)
+                    if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
+                {
+                    tokio::fs::remove_file(&other_path).await.with_context(|| {
+                        format!(
+                            "failed to remove stale cached preview asset {}",
+                            other_path.display()
+                        )
+                    })?;
+                }
+                Ok(_) => return Err(anyhow!("cached preview asset path is not a file")),
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect stale cached preview asset {}",
+                            other_path.display()
+                        )
+                    })
+                }
+            }
+        }
+
+        let descriptor = CachedAssetDescriptor::new(
+            workspace_key,
+            cache_key,
+            asset.mime_type,
+            asset.bytes.len() as u64,
+        )
+        .ok_or_else(|| anyhow!("downloaded preview asset descriptor is invalid"))?;
+        let destination = descriptor.path_in(&self.directory);
+        let temporary = workspace_directory.join(format!(
+            ".{}-{:016x}.part",
+            descriptor.cache_key,
+            rand::random::<u64>()
+        ));
+        write_preview_asset_atomically(&destination, &temporary, &asset.bytes).await?;
+
+        let directory = self.directory.clone();
+        let protected = destination.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            prune_preview_cache(&directory, Some(&protected), policy, SystemTime::now())
+        })
+        .await;
+        let cleanup_error = match cleanup {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(anyhow!(error).context("preview cache cleanup failed")),
+            Err(error) => Some(anyhow!("preview cache cleanup task failed: {error}")),
+        };
+        if let Some(cleanup_error) = cleanup_error {
+            match tokio::fs::remove_file(&destination).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(rollback_error) => {
+                    return Err(anyhow!(
+                        "{cleanup_error:#}; failed to roll back cached preview asset: {rollback_error}"
+                    ));
+                }
+            }
+            return Err(cleanup_error);
+        }
+
+        Ok(descriptor)
     }
 
-    fn path_for_key(&self, key: &str) -> PathBuf {
-        self.directory
-            .join(format!("{}.data-uri", image_asset_cache_key(key)))
+    async fn maintain(&self) {
+        let _operation = self.operations.lock().await;
+        let directory = self.directory.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            prune_preview_cache(
+                &directory,
+                None,
+                PreviewCachePolicy::default(),
+                SystemTime::now(),
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => crate::debug::log(
+                "runtime",
+                &format!("PreviewCacheCleanupFailed error={error}"),
+            ),
+            Err(error) => crate::debug::log(
+                "runtime",
+                &format!("PreviewCacheCleanupTaskFailed error={error}"),
+            ),
+        }
     }
+
+    #[cfg(test)]
+    fn path_for_key(
+        &self,
+        workspace_scope: &str,
+        key: &str,
+        mime_type: PreviewAssetMime,
+    ) -> PathBuf {
+        let workspace_key = preview_workspace_cache_key(workspace_scope);
+        let cache_key = preview_asset_cache_key(&workspace_key, key);
+        self.directory
+            .join(workspace_key)
+            .join(format!("{cache_key}.{}", mime_type.extension()))
+    }
+}
+
+async fn ensure_preview_workspace_directory(directory: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(directory).await {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(anyhow!("preview cache workspace path is not a directory")),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            tokio::fs::create_dir(directory).await.with_context(|| {
+                format!(
+                    "failed to create preview workspace cache {}",
+                    directory.display()
+                )
+            })
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect preview workspace cache {}",
+                directory.display()
+            )
+        }),
+    }
+}
+
+async fn write_preview_asset_atomically(
+    destination: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut owns_temporary = false;
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(temporary)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create temporary preview asset {}",
+                    temporary.display()
+                )
+            })?;
+        owns_temporary = true;
+        file.write_all(bytes).await.with_context(|| {
+            format!(
+                "failed to write temporary preview asset {}",
+                temporary.display()
+            )
+        })?;
+        file.flush().await.with_context(|| {
+            format!(
+                "failed to flush temporary preview asset {}",
+                temporary.display()
+            )
+        })?;
+        drop(file);
+        tokio::fs::rename(temporary, destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to finalize cached preview asset {}",
+                    destination.display()
+                )
+            })?;
+        owns_temporary = false;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if owns_temporary {
+        let _ = tokio::fs::remove_file(temporary).await;
+    }
+    result
+}
+
+fn same_cache_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 pub(crate) fn image_asset_cache_key(key: &str) -> String {
@@ -2063,6 +2398,259 @@ pub(crate) fn image_asset_cache_key(key: &str) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+pub(crate) fn preview_workspace_cache_key(workspace_scope: &str) -> String {
+    image_asset_cache_key(workspace_scope)
+}
+
+fn preview_asset_cache_key(workspace_key: &str, key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(workspace_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn valid_image_asset_cache_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone, Copy)]
+struct PreviewCachePolicy {
+    max_age: Duration,
+    max_bytes: u64,
+    max_entries: usize,
+}
+
+impl Default for PreviewCachePolicy {
+    fn default() -> Self {
+        Self {
+            max_age: PREVIEW_CACHE_MAX_AGE,
+            max_bytes: PREVIEW_CACHE_MAX_BYTES,
+            max_entries: PREVIEW_CACHE_MAX_ENTRIES,
+        }
+    }
+}
+
+struct PreviewCacheEntry {
+    path: PathBuf,
+    workspace_key: String,
+    cache_key: String,
+    size: u64,
+    last_used: SystemTime,
+}
+
+type PreviewCacheOrderKey = (SystemTime, String, String, PathBuf);
+
+fn prune_preview_cache(
+    directory: &Path,
+    protected: Option<&Path>,
+    policy: PreviewCachePolicy,
+    now: SystemTime,
+) -> std::io::Result<()> {
+    let root_entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut retained = BTreeMap::new();
+    let mut identities = HashMap::new();
+    let mut total = 0_u64;
+    let mut eviction_cutoff = None;
+
+    for root_entry in root_entries {
+        let root_entry = root_entry?;
+        let workspace_path = root_entry.path();
+        let metadata = match std::fs::symlink_metadata(&workspace_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            remove_preview_cache_file(&workspace_path)?;
+            continue;
+        }
+        if !metadata.is_dir() {
+            remove_preview_cache_file(&workspace_path)?;
+            continue;
+        }
+        let Some(workspace_key) = workspace_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| valid_image_asset_cache_key(name))
+            .map(ToString::to_string)
+        else {
+            remove_preview_cache_directory(&workspace_path)?;
+            continue;
+        };
+
+        let workspace_entries = std::fs::read_dir(&workspace_path)?;
+        for entry in workspace_entries {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                let Some((cache_key, mime_type)) = preview_cache_file_identity(&path) else {
+                    remove_preview_cache_file(&path)?;
+                    continue;
+                };
+                if metadata.file_type().is_symlink()
+                    || !mime_type
+                        .validate_size(usize::try_from(metadata.len()).unwrap_or(usize::MAX))
+                {
+                    remove_preview_cache_file(&path)?;
+                    continue;
+                }
+                let last_used = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let expired = now
+                    .duration_since(last_used)
+                    .is_ok_and(|age| age > policy.max_age);
+                let is_protected = protected.is_some_and(|protected| protected == path);
+                if expired && !is_protected {
+                    remove_preview_cache_file(&path)?;
+                    continue;
+                }
+                retain_preview_cache_entry(
+                    &mut retained,
+                    &mut identities,
+                    &mut total,
+                    &mut eviction_cutoff,
+                    PreviewCacheEntry {
+                        path,
+                        workspace_key: workspace_key.clone(),
+                        cache_key,
+                        size: metadata.len(),
+                        last_used,
+                    },
+                    protected,
+                    policy,
+                )?;
+                continue;
+            }
+            if metadata.is_dir() {
+                remove_preview_cache_directory(&path)?;
+            } else {
+                remove_preview_cache_file(&path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn retain_preview_cache_entry(
+    retained: &mut BTreeMap<PreviewCacheOrderKey, PreviewCacheEntry>,
+    identities: &mut HashMap<(String, String), PreviewCacheOrderKey>,
+    total: &mut u64,
+    eviction_cutoff: &mut Option<PreviewCacheOrderKey>,
+    entry: PreviewCacheEntry,
+    protected: Option<&Path>,
+    policy: PreviewCachePolicy,
+) -> std::io::Result<()> {
+    let identity = (entry.workspace_key.clone(), entry.cache_key.clone());
+    let order = (
+        entry.last_used,
+        entry.workspace_key.clone(),
+        entry.cache_key.clone(),
+        entry.path.clone(),
+    );
+    let entry_is_protected = protected.is_some_and(|protected| protected == entry.path);
+    if !entry_is_protected
+        && eviction_cutoff
+            .as_ref()
+            .is_some_and(|cutoff| order <= *cutoff)
+    {
+        remove_preview_cache_file(&entry.path)?;
+        return Ok(());
+    }
+
+    if let Some(existing_order) = identities.remove(&identity) {
+        let existing = retained
+            .remove(&existing_order)
+            .expect("preview cache identity index must match retained entries");
+        *total = total.saturating_sub(existing.size);
+        let existing_is_protected = protected.is_some_and(|protected| protected == existing.path);
+        if existing_is_protected || (!entry_is_protected && existing_order >= order) {
+            remove_preview_cache_file(&entry.path)?;
+            *total = total.saturating_add(existing.size);
+            identities.insert(identity, existing_order.clone());
+            retained.insert(existing_order, existing);
+            return Ok(());
+        }
+        remove_preview_cache_file(&existing.path)?;
+    }
+
+    *total = total.saturating_add(entry.size);
+    identities.insert(identity, order.clone());
+    retained.insert(order, entry);
+
+    while *total > policy.max_bytes || retained.len() > policy.max_entries {
+        let Some(oldest_order) = retained
+            .iter()
+            .find(|(_, entry)| protected.is_none_or(|protected| protected != entry.path))
+            .map(|(order, _)| order.clone())
+        else {
+            return Err(std::io::Error::other(
+                "preview cache bounds could not be enforced",
+            ));
+        };
+        let oldest = retained
+            .remove(&oldest_order)
+            .expect("selected preview cache entry must exist");
+        remove_preview_cache_file(&oldest.path)?;
+        *total = total.saturating_sub(oldest.size);
+        identities.remove(&(oldest.workspace_key, oldest.cache_key));
+        if eviction_cutoff
+            .as_ref()
+            .is_none_or(|cutoff| oldest_order > *cutoff)
+        {
+            *eviction_cutoff = Some(oldest_order);
+        }
+    }
+    Ok(())
+}
+
+fn remove_preview_cache_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_preview_cache_directory(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn preview_cache_file_identity(path: &Path) -> Option<(String, PreviewAssetMime)> {
+    let file_name = path.file_name()?.to_str()?;
+    for mime_type in PreviewAssetMime::ALL {
+        let suffix = format!(".{}", mime_type.extension());
+        let Some(cache_key) = file_name.strip_suffix(&suffix) else {
+            continue;
+        };
+        if valid_image_asset_cache_key(cache_key) {
+            return Some((cache_key.to_string(), mime_type));
+        }
+    }
+    None
 }
 
 fn media_cache_path(url: &str, name: &str) -> PathBuf {
@@ -2255,35 +2843,6 @@ fn remove_completed_upload_files(attachments: &[UploadAttachment]) {
     }
 }
 
-fn preview_asset_data_uri(asset: &PreviewAsset) -> String {
-    format!(
-        "data:{};base64,{}",
-        asset.mime_type,
-        BASE64.encode(&asset.bytes)
-    )
-}
-
-fn preview_asset_from_data_uri(data_uri: &str) -> Option<PreviewAsset> {
-    if data_uri.len() as u64 > MAX_CACHED_PREVIEW_DATA_URI_BYTES {
-        return None;
-    }
-    let (mime_type, encoded) = data_uri.strip_prefix("data:")?.split_once(";base64,")?;
-    let max_bytes = preview_asset_max_bytes(mime_type)?;
-    if encoded.len() > max_bytes.div_ceil(3) * 4 {
-        return None;
-    }
-    let bytes = BASE64.decode(encoded).ok()?;
-    PreviewAsset::new(mime_type.to_string(), bytes)
-}
-
-fn preview_asset_max_bytes(mime_type: &str) -> Option<usize> {
-    supported_preview_mime_type(mime_type).then_some(if mime_type.starts_with("video/") {
-        MAX_PREVIEW_VIDEO_BYTES
-    } else {
-        MAX_PREVIEW_IMAGE_BYTES
-    })
-}
-
 impl AppRuntime {
     pub fn start() -> (Self, mpsc::UnboundedReceiver<RuntimeEvent>) {
         let (commands, receiver) = mpsc::unbounded_channel::<RuntimeRequest>();
@@ -2339,6 +2898,7 @@ async fn run_runtime(
     let state = Arc::new(Mutex::new(RuntimeState::new(SessionId::default())));
     let oauth = SlackOAuthClient::new();
     let image_cache = ImageAssetCache::new(config::image_asset_cache_dir());
+    image_cache.maintain().await;
     let limits = RuntimeTaskLimits::new(
         NAVIGATION_TASK_CONCURRENCY,
         INTERACTIVE_TASK_CONCURRENCY,
@@ -2627,13 +3187,16 @@ fn spawn_authentication_task<F>(
                         workspace.update_attention_preferences(
                             runtime_state.attention_preferences.clone(),
                         );
+                        let workspace_store_scope = workspace_store_id(&auth);
+                        let image_cache_scope = preview_workspace_scope(&auth);
                         let connection = RuntimeConnection {
                             slack: api,
                             workspace_url: auth.url.clone(),
                             workspace_store: Some(WorkspaceStore::new(
                                 config::state_cache_dir(),
-                                &workspace_store_id(&auth),
+                                &workspace_store_scope,
                             )),
+                            image_cache_scope,
                             workspace,
                             current_user_id: auth.user_id.clone(),
                             user_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -3311,6 +3874,7 @@ async fn handle_connected_command(
     let mut context = RuntimeContext {
         events,
         image_cache,
+        image_cache_scope: &connection.image_cache_scope,
         slack: &mut slack,
         workspace_store: &mut workspace_store,
         workspace: &connection.workspace,
@@ -3347,6 +3911,7 @@ async fn handle_connected_command(
 struct RuntimeContext<'a> {
     events: &'a RuntimeEventSender,
     image_cache: &'a ImageAssetCache,
+    image_cache_scope: &'a str,
     slack: &'a mut Option<SlackApi>,
     workspace_store: &'a mut Option<WorkspaceStore>,
     workspace: &'a WorkspaceReducerAdapter,
@@ -4148,7 +4713,11 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 "runtime",
                 &format!("LoadImageAsset key={}", crate::debug::url_for_log(&key)),
             );
-            match context.image_cache.load(&key).await {
+            match context
+                .image_cache
+                .load(context.image_cache_scope, &key)
+                .await
+            {
                 Ok(Some(asset)) => {
                     crate::debug::log(
                         "runtime",
@@ -4171,30 +4740,36 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
 
             match api.download_preview_asset(&url).await {
                 Ok(downloaded) => {
-                    let DownloadedPreviewAsset { mime_type, bytes } = downloaded;
-                    let asset = PreviewAsset::new(mime_type, bytes)
-                        .ok_or_else(|| anyhow!("downloaded preview asset failed validation"))?;
                     crate::debug::log(
                         "runtime",
                         &format!(
                             "ImageAssetLoaded key={} mime_type={} bytes={}",
                             crate::debug::url_for_log(&key),
-                            asset.mime_type,
-                            asset.bytes.len()
+                            downloaded.mime_type.as_str(),
+                            downloaded.bytes.len()
                         ),
                     );
-                    if let Err(error) = context.image_cache.store(&key, &asset).await {
-                        crate::debug::log(
-                            "runtime",
-                            &format!(
-                                "ImageAssetCacheWriteFailed key={} error={error:#}",
-                                crate::debug::url_for_log(&key)
-                            ),
-                        );
+                    match context
+                        .image_cache
+                        .store(context.image_cache_scope, &key, downloaded)
+                        .await
+                    {
+                        Ok(asset) => context
+                            .events
+                            .send_event(RuntimeEventKind::ImageAssetLoaded { key, asset }),
+                        Err(error) => {
+                            crate::debug::log(
+                                "runtime",
+                                &format!(
+                                    "ImageAssetCacheWriteFailed key={} error={error:#}",
+                                    crate::debug::url_for_log(&key)
+                                ),
+                            );
+                            context
+                                .events
+                                .send_event(RuntimeEventKind::ImageAssetFailed { key });
+                        }
                     }
-                    context
-                        .events
-                        .send_event(RuntimeEventKind::ImageAssetLoaded { key, asset });
                 }
                 Err(error) => {
                     crate::debug::log(
@@ -6392,6 +6967,26 @@ fn workspace_store_id(auth: &AuthInfo) -> String {
     format!("{team}:{user}")
 }
 
+pub(crate) fn preview_workspace_scope(auth: &AuthInfo) -> String {
+    let workspace = [
+        auth.team_id.as_deref(),
+        auth.url.as_deref(),
+        auth.team.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .unwrap_or("unknown-team");
+    let user = [auth.user_id.as_deref(), auth.user.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("unknown-user");
+    format!("{workspace}:{user}")
+}
+
 async fn publish_cached_thread(
     events: &RuntimeEventSender,
     workspace_store: &Option<WorkspaceStore>,
@@ -6970,6 +7565,7 @@ mod tests {
                 }),
                 workspace_url: None,
                 workspace_store: Some(store.clone()),
+                image_cache_scope: "test-workspace".to_string(),
                 workspace: workspace.clone(),
                 current_user_id: None,
                 user_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -7106,6 +7702,7 @@ mod tests {
                     }),
                     workspace_url: None,
                     workspace_store: Some(store.clone()),
+                    image_cache_scope: "test-workspace".to_string(),
                     workspace: workspace.clone(),
                     current_user_id: None,
                     user_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -13400,6 +13997,7 @@ mod tests {
             }),
             workspace_url: None,
             workspace_store: None,
+            image_cache_scope: "test-workspace".to_string(),
             workspace: workspace.clone(),
             current_user_id: Some("U_SELF".into()),
             user_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -13591,6 +14189,27 @@ mod tests {
         };
 
         assert_eq!(workspace_store_id(&auth), "T123:U123");
+        assert_eq!(preview_workspace_scope(&auth), "T123:U123");
+    }
+
+    #[test]
+    fn preview_workspace_scope_uses_stable_trimmed_fallbacks() {
+        let auth = AuthInfo {
+            team: Some(" Ignored team ".to_string()),
+            team_id: Some("   ".to_string()),
+            url: Some(" https://example.slack.com ".to_string()),
+            user: Some(" Ada ".to_string()),
+            user_id: Some("  ".to_string()),
+        };
+
+        assert_eq!(
+            preview_workspace_scope(&auth),
+            "https://example.slack.com:Ada"
+        );
+        assert_eq!(
+            preview_workspace_scope(&AuthInfo::default()),
+            "unknown-team:unknown-user"
+        );
     }
 
     #[test]
@@ -15094,7 +15713,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_asset_cache_round_trips_image_and_video_data_uris() {
+    fn preview_asset_cache_round_trips_raw_workspace_scoped_assets() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time before Unix epoch")
@@ -15104,6 +15723,7 @@ mod tests {
             std::process::id()
         ));
         let cache = ImageAssetCache::new(directory.clone());
+        let workspace = "T123:U123";
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -15112,74 +15732,388 @@ mod tests {
         runtime.block_on(async {
             assert_eq!(
                 cache
-                    .load("https://files.example/image.png")
+                    .load(workspace, "https://files.example/image.png")
                     .await
                     .expect("cache load failed"),
                 None
             );
 
-            let image = PreviewAsset::new("image/png".to_string(), b"image".to_vec()).unwrap();
-            cache
-                .store("https://files.example/image.png", &image)
+            let image_bytes = b"\x89PNG\r\n\x1a\nraw-image".to_vec();
+            let image = cache
+                .store(
+                    workspace,
+                    "https://files.example/image.png",
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Png,
+                        bytes: image_bytes.clone(),
+                    },
+                )
                 .await
                 .expect("cache store failed");
 
+            let image_path = cache.path_for_key(
+                workspace,
+                "https://files.example/image.png",
+                PreviewAssetMime::Png,
+            );
+            let cached = tokio::fs::read(&image_path).await.unwrap();
+            assert!(!cached.starts_with(b"data:"));
+            assert_eq!(cached, image_bytes);
+            assert_eq!(image.path_in(&directory), image_path);
+            assert_eq!(image.content_type(), "image/png");
+            assert!(!image.is_video());
+
             assert_eq!(
                 cache
-                    .load("https://files.example/image.png")
+                    .load(workspace, "https://files.example/image.png")
                     .await
                     .expect("cache load failed"),
-                Some(image)
+                Some(image.clone())
+            );
+            assert_eq!(
+                cache
+                    .load("T999:U999", "https://files.example/image.png")
+                    .await
+                    .expect("cross-workspace cache load failed"),
+                None
+            );
+            assert_ne!(
+                image_path,
+                cache.path_for_key(
+                    "T999:U999",
+                    "https://files.example/image.png",
+                    PreviewAssetMime::Png,
+                )
             );
 
-            let gif =
-                PreviewAsset::new("image/gif".to_string(), b"GIF89a-animated-frames".to_vec())
-                    .unwrap();
-            cache
-                .store("https://files.example/animated.gif", &gif)
+            let gif = cache
+                .store(
+                    workspace,
+                    "https://files.example/animated.gif",
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Gif,
+                        bytes: b"GIF89a-animated-frames".to_vec(),
+                    },
+                )
                 .await
                 .expect("cache store failed");
             assert_eq!(
                 cache
-                    .load("https://files.example/animated.gif")
+                    .load(workspace, "https://files.example/animated.gif")
                     .await
                     .expect("cache load failed"),
                 Some(gif)
             );
 
-            let video = PreviewAsset::new("video/mp4".to_string(), b"video".to_vec()).unwrap();
-            cache
-                .store("https://files.example/video.mp4", &video)
+            let video = cache
+                .store(
+                    workspace,
+                    "https://files.example/video.mp4",
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Mp4,
+                        bytes: b"\0\0\0\x18ftypisomvideo".to_vec(),
+                    },
+                )
                 .await
                 .expect("cache store failed");
+            assert!(video.is_video());
             assert_eq!(
                 cache
-                    .load("https://files.example/video.mp4")
+                    .load(workspace, "https://files.example/video.mp4")
                     .await
                     .expect("cache load failed"),
                 Some(video)
             );
 
-            tokio::fs::create_dir_all(&directory).await.unwrap();
-            let oversized_path = cache.path_for_key("oversized");
+            let oversized_path = cache.path_for_key(workspace, "oversized", PreviewAssetMime::Png);
             let oversized_file = std::fs::File::create(&oversized_path).unwrap();
             oversized_file
-                .set_len(MAX_CACHED_PREVIEW_DATA_URI_BYTES + 1)
+                .set_len(PreviewAssetMime::Png.max_bytes() as u64 + 1)
                 .unwrap();
-            assert_eq!(cache.load("oversized").await.unwrap(), None);
+            assert!(cache.load(workspace, "oversized").await.is_err());
         });
 
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn preview_asset_data_rejects_unsafe_mime_and_oversized_payloads() {
-        assert!(preview_asset_from_data_uri("data:image/svg+xml;base64,PHN2Zz4=").is_none());
-        assert!(preview_asset_from_data_uri("data:text/html;base64,PGgxPk5vPC9oMT4=").is_none());
-        assert!(preview_asset_from_data_uri("data:image/png,not-base64").is_none());
+    fn preview_asset_store_rolls_back_when_bounds_cannot_be_enforced() {
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-image-cache-rollback-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let cache = ImageAssetCache::new(directory.clone());
+        let workspace = "T123:U123";
+        let key = "https://files.example/image.png";
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
 
-        let oversized = vec![0_u8; MAX_PREVIEW_IMAGE_BYTES + 1];
-        let data_uri = format!("data:image/png;base64,{}", BASE64.encode(oversized));
-        assert!(preview_asset_from_data_uri(&data_uri).is_none());
+        runtime.block_on(async {
+            assert!(cache
+                .store_with_policy(
+                    workspace,
+                    key,
+                    DownloadedPreviewAsset {
+                        mime_type: PreviewAssetMime::Png,
+                        bytes: b"\x89PNG\r\n\x1a\nraw-image".to_vec(),
+                    },
+                    PreviewCachePolicy {
+                        max_age: Duration::MAX,
+                        max_bytes: u64::MAX,
+                        max_entries: 0,
+                    },
+                )
+                .await
+                .is_err());
+        });
+
+        assert!(!cache
+            .path_for_key(workspace, key, PreviewAssetMime::Png)
+            .exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cached_asset_descriptor_rejects_invalid_keys_and_sizes() {
+        let workspace_key = "a".repeat(64);
+        let cache_key = "b".repeat(64);
+        assert!(CachedAssetDescriptor::new(
+            workspace_key.clone(),
+            cache_key.clone(),
+            PreviewAssetMime::Png,
+            8,
+        )
+        .is_some());
+        assert!(CachedAssetDescriptor::new(
+            "../workspace".to_string(),
+            cache_key.clone(),
+            PreviewAssetMime::Png,
+            8,
+        )
+        .is_none());
+        assert!(CachedAssetDescriptor::new(
+            workspace_key,
+            "A".repeat(64),
+            PreviewAssetMime::Png,
+            8,
+        )
+        .is_none());
+        assert!(CachedAssetDescriptor::new(
+            "a".repeat(64),
+            cache_key,
+            PreviewAssetMime::Png,
+            PreviewAssetMime::Png.max_bytes() as u64 + 1,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn preview_cache_prunes_legacy_files_and_evicts_to_a_byte_cap() {
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-preview-prune-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let workspace = directory.join("a".repeat(64));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let first = workspace.join(format!("{}.png", "1".repeat(64)));
+        let second = workspace.join(format!("{}.png", "2".repeat(64)));
+        let protected = workspace.join(format!("{}.png", "3".repeat(64)));
+        let legacy = directory.join(format!("{}.data-uri", "4".repeat(64)));
+        std::fs::write(&first, b"\x89PNG\r\n\x1a\n1").unwrap();
+        std::fs::write(&second, b"\x89PNG\r\n\x1a\n2").unwrap();
+        std::fs::write(&protected, b"\x89PNG\r\n\x1a\n3").unwrap();
+        std::fs::write(&legacy, b"data:image/png;base64,legacy").unwrap();
+
+        prune_preview_cache(
+            &directory,
+            Some(&protected),
+            PreviewCachePolicy {
+                max_age: Duration::MAX,
+                max_bytes: 17,
+                max_entries: 2,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        let retained_size = std::fs::read_dir(&workspace)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum::<u64>();
+        assert!(!legacy.exists());
+        assert!(protected.exists());
+        assert!(retained_size <= 17);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn preview_cache_evicts_to_an_entry_cap() {
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-preview-entry-prune-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let workspace = directory.join("a".repeat(64));
+        std::fs::create_dir_all(&workspace).unwrap();
+        for marker in ['1', '2', '3'] {
+            std::fs::write(
+                workspace.join(format!("{}.jpg", marker.to_string().repeat(64))),
+                b"\xff\xd8\xff",
+            )
+            .unwrap();
+        }
+
+        prune_preview_cache(
+            &directory,
+            None,
+            PreviewCachePolicy {
+                max_age: Duration::MAX,
+                max_bytes: u64::MAX,
+                max_entries: 2,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_dir(&workspace).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn preview_cache_reports_an_unenforceable_protected_bound() {
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-preview-protected-prune-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let workspace = directory.join("a".repeat(64));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let protected = workspace.join(format!("{}.jpg", "1".repeat(64)));
+        std::fs::write(&protected, b"\xff\xd8\xff").unwrap();
+
+        assert!(prune_preview_cache(
+            &directory,
+            Some(&protected),
+            PreviewCachePolicy {
+                max_age: Duration::MAX,
+                max_bytes: u64::MAX,
+                max_entries: 0,
+            },
+            SystemTime::now(),
+        )
+        .is_err());
+        assert!(protected.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn streaming_preview_eviction_is_independent_of_scan_order() {
+        for (case, scan_order) in [[2, 1, 0], [0, 1, 2]].into_iter().enumerate() {
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-preview-order-test-{}-{}-{case}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let sizes = [4_u64, 6, 6];
+            let paths = sizes
+                .iter()
+                .enumerate()
+                .map(|(index, size)| {
+                    let path = directory.join(format!("asset-{index}.jpg"));
+                    std::fs::write(&path, vec![0_u8; *size as usize]).unwrap();
+                    path
+                })
+                .collect::<Vec<_>>();
+            let mut retained = BTreeMap::new();
+            let mut identities = HashMap::new();
+            let mut total = 0;
+            let mut eviction_cutoff = None;
+            for index in scan_order {
+                retain_preview_cache_entry(
+                    &mut retained,
+                    &mut identities,
+                    &mut total,
+                    &mut eviction_cutoff,
+                    PreviewCacheEntry {
+                        path: paths[index].clone(),
+                        workspace_key: "workspace".to_string(),
+                        cache_key: format!("key-{index}"),
+                        size: sizes[index],
+                        last_used: UNIX_EPOCH + Duration::from_secs(index as u64 + 1),
+                    },
+                    None,
+                    PreviewCachePolicy {
+                        max_age: Duration::MAX,
+                        max_bytes: 10,
+                        max_entries: 10,
+                    },
+                )
+                .unwrap();
+            }
+
+            assert_eq!(
+                retained
+                    .values()
+                    .map(|entry| entry.cache_key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["key-2"]
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn streaming_preview_duplicates_keep_the_same_newest_winner() {
+        for (case, scan_order) in [[0, 1, 2], [2, 0, 1], [1, 2, 0]].into_iter().enumerate() {
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-preview-duplicate-test-{}-{}-{case}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let paths = ["png", "jpg", "gif"].map(|extension| {
+                let path = directory.join(format!("asset.{extension}"));
+                std::fs::write(&path, b"data").unwrap();
+                path
+            });
+            let mut retained = BTreeMap::new();
+            let mut identities = HashMap::new();
+            let mut total = 0;
+            let mut eviction_cutoff = None;
+            for index in scan_order {
+                retain_preview_cache_entry(
+                    &mut retained,
+                    &mut identities,
+                    &mut total,
+                    &mut eviction_cutoff,
+                    PreviewCacheEntry {
+                        path: paths[index].clone(),
+                        workspace_key: "workspace".to_string(),
+                        cache_key: "same-key".to_string(),
+                        size: 4,
+                        last_used: UNIX_EPOCH + Duration::from_secs(index as u64 + 1),
+                    },
+                    None,
+                    PreviewCachePolicy {
+                        max_age: Duration::MAX,
+                        max_bytes: 100,
+                        max_entries: 10,
+                    },
+                )
+                .unwrap();
+            }
+
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained.values().next().unwrap().path, paths[2]);
+            assert!(paths[2].exists());
+            assert!(!paths[0].exists());
+            assert!(!paths[1].exists());
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 }

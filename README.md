@@ -272,6 +272,12 @@ for the full policy.
 - Workspace metadata, names, statuses, emoji, and message and thread history are
   stored in `state/state.sqlite3` below Conduit's XDG cache directory. WebKit,
   downloaded image, media, and attachment data use sibling cache directories.
+- Inline image and video previews are stored as MIME-checked raw files in
+  workspace-scoped cache directories. Each preview is limited to 8 MiB for images
+  or 16 MiB for videos; the preview cache is limited to 512 MiB and 16,384 files,
+  and entries older than 30 days are removed. The active preview registry is
+  limited to 64 MiB of addressable content and 2,048 entries, with bounded request
+  state and no second in-memory payload copy.
 - Clipboard images are temporarily encoded as PNG files in the cache's
   `upload-staging` directory. They are normally removed when the upload task ends;
   leftovers from a crash are cleared at the next startup.

@@ -15,6 +15,17 @@
     });
   }
 
+  function cachedAssetSource(value) {
+    if (!value || typeof value !== "object") return null;
+    if (value.kind !== "image" && value.kind !== "video") return null;
+    if (typeof value.uri !== "string") return null;
+    const prefix = "conduit-asset://";
+    if (!value.uri.startsWith(prefix)) return null;
+    const key = value.uri.slice(prefix.length);
+    if (!/^[0-9a-f]{64}$/.test(key)) return null;
+    return value;
+  }
+
   function authorElements(userId) {
     return Array.from(document.querySelectorAll("[data-author-user-id]")).filter(function (element) {
       return element.dataset.authorUserId === userId;
@@ -591,17 +602,18 @@
       if (patch.type === "update-image") {
         const targets = imageElements(patch.asset_key);
         if (targets.length === 0) return false;
+        const source = cachedAssetSource(patch.source);
         targets.forEach(function (target) {
-          if (typeof patch.source === "string") {
-            const isVideo = patch.media_kind === "video";
+          if (source) {
+            const isVideo = source.kind === "video";
             if ((isVideo && target.matches("video")) || (!isVideo && target.matches("img"))) {
-              target.src = patch.source;
+              target.src = source.uri;
             } else if (isVideo) {
               const video = document.createElement("video");
               video.preload = "metadata";
               video.muted = true;
               video.playsInline = true;
-              video.src = patch.source;
+              video.src = source.uri;
               video.setAttribute("aria-label", target.dataset.imageAlt || "");
               video.dataset.imageKey = patch.asset_key;
               video.dataset.imageAlt = target.dataset.imageAlt || "";
@@ -611,7 +623,7 @@
               const image = document.createElement("img");
               image.loading = "lazy";
               image.decoding = "async";
-              image.src = patch.source;
+              image.src = source.uri;
               image.alt = target.dataset.imageAlt || "";
               image.dataset.imageKey = patch.asset_key;
               image.dataset.imageAlt = image.alt;

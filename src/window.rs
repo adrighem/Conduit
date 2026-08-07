@@ -20,6 +20,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, Metadata};
+use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
@@ -66,8 +70,8 @@ use crate::message_handoff::{
     MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
 use crate::message_html::{
-    self, MessageHtmlContext, TimelineAssetKind, TimelineDomPatch, TimelineInsertPosition,
-    TimelineMessageArrival, TimelineScrollBehavior,
+    self, CachedAssetKind, CachedAssetSource, MessageHtmlContext, TimelineDomPatch,
+    TimelineInsertPosition, TimelineMessageArrival, TimelineScrollBehavior,
 };
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
@@ -76,9 +80,10 @@ use crate::models::{
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering;
 use crate::runtime::{
-    image_asset_cache_key, AppRuntime, OperationContext, PreviewAsset, RequestId, RuntimeCommand,
-    RuntimeEvent, RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory,
-    RuntimeIdentity, RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
+    preview_workspace_cache_key, preview_workspace_scope, AppRuntime, CachedAssetDescriptor,
+    OperationContext, RequestId, RuntimeCommand, RuntimeEvent, RuntimeEventKind, RuntimeEventMeta,
+    RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity, RuntimeOperation, RuntimeTarget,
+    SessionId, UploadAttachment,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
@@ -417,11 +422,11 @@ mod imp {
         pub message_font_settings_handler: RefCell<Option<(gtk::Settings, glib::SignalHandlerId)>>,
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub(super) thread_pane_controller: RefCell<Option<ThreadPane>>,
-        pub image_assets: RefCell<HashMap<String, String>>,
-        pub video_asset_keys: RefCell<HashSet<String>>,
-        pub(super) conduit_assets: Rc<RefCell<HashMap<String, PreviewAsset>>>,
-        pub pending_image_assets: RefCell<HashSet<String>>,
-        pub failed_image_assets: RefCell<HashSet<String>>,
+        pub image_assets: RefCell<HashMap<String, CachedAssetSource>>,
+        pub(super) conduit_assets: Rc<RefCell<BoundedConduitAssets>>,
+        pub(super) pending_image_assets: RefCell<BoundedImageAssetKeys>,
+        pub(super) failed_image_assets: RefCell<BoundedImageAssetKeys>,
+        pub(super) recovering_image_assets: RefCell<BoundedImageAssetKeys>,
         pub custom_emojis: RefCell<Arc<HashMap<String, String>>>,
         pub reaction_emoji_picker_model: RefCell<Option<Arc<EmojiPickerModel>>>,
         pub realtime_status: Cell<RealtimeStatus>,
@@ -1146,32 +1151,532 @@ fn timeline_surface_invalidation(surface: TimelineSurface) -> UiInvalidations {
     }
 }
 
+const CONDUIT_ASSET_REGISTRY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const CONDUIT_ASSET_REGISTRY_MAX_ENTRIES: usize = 2_048;
+const CONDUIT_ASSET_VALIDATION_PREFIX_BYTES: u64 = 64;
+const IMAGE_ASSET_SOURCE_MAX_BYTES: usize = 8 * 1024;
+const IMAGE_ASSET_KEY_SET_MAX_BYTES: usize = 8 * 1024 * 1024;
+const IMAGE_ASSET_KEY_SET_MAX_ENTRIES: usize = 2_048;
+
+#[derive(Debug, Default)]
+pub(super) struct BoundedImageAssetKeys {
+    entries: HashMap<String, u64>,
+    total_bytes: usize,
+    clock: u64,
+}
+
+impl BoundedImageAssetKeys {
+    fn try_insert(&mut self, key: String) -> bool {
+        if self.entries.contains_key(&key)
+            || key.is_empty()
+            || key.len() > IMAGE_ASSET_SOURCE_MAX_BYTES
+            || self.entries.len() >= IMAGE_ASSET_KEY_SET_MAX_ENTRIES
+            || self.total_bytes.saturating_add(key.len()) > IMAGE_ASSET_KEY_SET_MAX_BYTES
+        {
+            return false;
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(key.len());
+        self.entries.insert(key, self.clock);
+        true
+    }
+
+    fn insert_evicting(&mut self, key: String) -> bool {
+        if self.entries.contains_key(&key)
+            || key.is_empty()
+            || key.len() > IMAGE_ASSET_SOURCE_MAX_BYTES
+            || key.len() > IMAGE_ASSET_KEY_SET_MAX_BYTES
+        {
+            return false;
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(key.len());
+        self.entries.insert(key.clone(), self.clock);
+        while self.entries.len() > IMAGE_ASSET_KEY_SET_MAX_ENTRIES
+            || self.total_bytes > IMAGE_ASSET_KEY_SET_MAX_BYTES
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by(|(left_key, left_clock), (right_key, right_clock)| {
+                    left_clock
+                        .cmp(right_clock)
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+        self.entries.contains_key(&key)
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn remove(&mut self, key: &str) -> bool {
+        let Some((key, _)) = self.entries.remove_entry(key) else {
+            return false;
+        };
+        self.total_bytes = self.total_bytes.saturating_sub(key.len());
+        true
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+        self.clock = 0;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.entries.keys()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageAssetRecoveryAction {
+    Retry,
+    AlreadyPending,
+    Fail,
+}
+
+fn image_asset_recovery_action(
+    recovering: &mut BoundedImageAssetKeys,
+    pending: &mut BoundedImageAssetKeys,
+    key: &str,
+) -> ImageAssetRecoveryAction {
+    if !recovering.try_insert(key.to_string()) {
+        return ImageAssetRecoveryAction::Fail;
+    }
+    if pending.try_insert(key.to_string()) {
+        ImageAssetRecoveryAction::Retry
+    } else if pending.contains(key) {
+        ImageAssetRecoveryAction::AlreadyPending
+    } else {
+        ImageAssetRecoveryAction::Fail
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConduitAssetEntry {
+    descriptor: CachedAssetDescriptor,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct BoundedConduitAssets {
+    workspace_key: Option<String>,
+    entries: HashMap<String, ConduitAssetEntry>,
+    total_bytes: u64,
+    max_bytes: u64,
+    max_entries: usize,
+    clock: u64,
+}
+
+impl Default for BoundedConduitAssets {
+    fn default() -> Self {
+        Self::new(
+            CONDUIT_ASSET_REGISTRY_MAX_BYTES,
+            CONDUIT_ASSET_REGISTRY_MAX_ENTRIES,
+        )
+    }
+}
+
+impl BoundedConduitAssets {
+    fn new(max_bytes: u64, max_entries: usize) -> Self {
+        Self {
+            workspace_key: None,
+            entries: HashMap::new(),
+            total_bytes: 0,
+            max_bytes,
+            max_entries,
+            clock: 0,
+        }
+    }
+
+    fn set_workspace(&mut self, workspace_key: Option<String>) {
+        if self.workspace_key != workspace_key {
+            self.clear();
+            self.workspace_key = workspace_key;
+        }
+    }
+
+    fn insert(&mut self, descriptor: CachedAssetDescriptor) -> Option<Vec<String>> {
+        let workspace_key = self.workspace_key.as_deref()?;
+        let cache_key = descriptor.cache_key().to_string();
+        let uri = descriptor.uri();
+        if descriptor.workspace_key() != workspace_key
+            || descriptor.size() == 0
+            || descriptor.size() > self.max_bytes
+            || conduit_asset_request_key(&uri).as_deref() != Some(cache_key.as_str())
+        {
+            return None;
+        }
+
+        self.clock = self.clock.saturating_add(1);
+        if let Some(replaced) = self.entries.remove(&cache_key) {
+            self.total_bytes = self.total_bytes.saturating_sub(replaced.descriptor.size());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(descriptor.size());
+        self.entries.insert(
+            cache_key,
+            ConduitAssetEntry {
+                descriptor,
+                last_used: self.clock,
+            },
+        );
+
+        let mut evicted = Vec::new();
+        while self.total_bytes > self.max_bytes || self.entries.len() > self.max_entries {
+            let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.last_used
+                        .cmp(&right.last_used)
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest_key) {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.descriptor.size());
+                evicted.push(oldest_key);
+            }
+        }
+        Some(evicted)
+    }
+
+    fn get(&mut self, cache_key: &str) -> Option<CachedAssetDescriptor> {
+        let workspace_key = self.workspace_key.as_deref()?;
+        let entry = self.entries.get_mut(cache_key)?;
+        if entry.descriptor.workspace_key() != workspace_key {
+            return None;
+        }
+        self.clock = self.clock.saturating_add(1);
+        entry.last_used = self.clock;
+        Some(entry.descriptor.clone())
+    }
+
+    fn remove(&mut self, cache_key: &str) -> Option<CachedAssetDescriptor> {
+        let entry = self.entries.remove(cache_key)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.descriptor.size());
+        Some(entry.descriptor)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+        self.clock = 0;
+    }
+
+    fn contains_key(&self, cache_key: &str) -> bool {
+        self.entries.contains_key(cache_key)
+    }
+
+    #[cfg(test)]
+    fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 fn conduit_asset_request_key(uri: &str) -> Option<String> {
     let parsed = url::Url::parse(uri).ok()?;
     if parsed.scheme() != "conduit-asset"
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.port().is_some()
-        || !matches!(parsed.path(), "" | "/")
+        || !parsed.path().is_empty()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
         return None;
     }
     let key = parsed.host_str()?;
-    (key.len() == 64
+    let valid_key = key.len() == 64
         && key
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-    .then(|| key.to_string())
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    (valid_key && uri == format!("conduit-asset://{key}")).then(|| key.to_string())
 }
 
 fn conduit_asset_for_request(
     uri: &str,
-    assets: &HashMap<String, PreviewAsset>,
-) -> Option<PreviewAsset> {
+    assets: &mut BoundedConduitAssets,
+) -> Option<CachedAssetDescriptor> {
     let key = conduit_asset_request_key(uri)?;
-    assets.get(&key).filter(|asset| asset.is_valid()).cloned()
+    assets.get(&key)
+}
+
+fn cached_asset_source_is_registered(
+    source: &CachedAssetSource,
+    assets: &BoundedConduitAssets,
+) -> bool {
+    conduit_asset_request_key(source.uri()).is_some_and(|key| assets.contains_key(&key))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConduitAssetResponsePlan {
+    Full,
+    Partial { start: u64, end: u64 },
+    NotSatisfiable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConduitAssetServeOutcome {
+    Rejected,
+    Served(String),
+    Invalidated(String),
+}
+
+fn conduit_asset_request_method(method: Option<&str>) -> Option<&str> {
+    match method {
+        Some(method @ ("GET" | "HEAD")) => Some(method),
+        _ => None,
+    }
+}
+
+fn conduit_asset_response_plan(range: Option<&str>, size: u64) -> ConduitAssetResponsePlan {
+    let Some(range) = range else {
+        return ConduitAssetResponsePlan::Full;
+    };
+    let Some(specification) = range.trim().strip_prefix("bytes=") else {
+        return ConduitAssetResponsePlan::NotSatisfiable;
+    };
+    if specification.contains(',') || size == 0 {
+        return ConduitAssetResponsePlan::NotSatisfiable;
+    }
+    let Some((start, end)) = specification.split_once('-') else {
+        return ConduitAssetResponsePlan::NotSatisfiable;
+    };
+    let start = start.trim();
+    let end = end.trim();
+    if start.is_empty() {
+        let Ok(suffix_length) = end.parse::<u64>() else {
+            return ConduitAssetResponsePlan::NotSatisfiable;
+        };
+        if suffix_length == 0 {
+            return ConduitAssetResponsePlan::NotSatisfiable;
+        }
+        let suffix_length = suffix_length.min(size);
+        return ConduitAssetResponsePlan::Partial {
+            start: size - suffix_length,
+            end: size - 1,
+        };
+    }
+
+    let Ok(start) = start.parse::<u64>() else {
+        return ConduitAssetResponsePlan::NotSatisfiable;
+    };
+    if start >= size {
+        return ConduitAssetResponsePlan::NotSatisfiable;
+    }
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        let Ok(end) = end.parse::<u64>() else {
+            return ConduitAssetResponsePlan::NotSatisfiable;
+        };
+        if end < start {
+            return ConduitAssetResponsePlan::NotSatisfiable;
+        }
+        end.min(size - 1)
+    };
+    ConduitAssetResponsePlan::Partial { start, end }
+}
+
+#[cfg(unix)]
+fn same_opened_file(left: &Metadata, right: &Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_opened_file(left: &Metadata, right: &Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok().is_some()
+        && left.modified().ok() == right.modified().ok()
+}
+
+fn open_conduit_asset(descriptor: &CachedAssetDescriptor) -> io::Result<File> {
+    open_conduit_asset_at(descriptor, &config::image_asset_cache_dir())
+}
+
+fn open_conduit_asset_at(
+    descriptor: &CachedAssetDescriptor,
+    cache_root: &Path,
+) -> io::Result<File> {
+    let path = descriptor.path_in(cache_root);
+    let before = std::fs::symlink_metadata(&path)?;
+    if !before.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid cached asset",
+        ));
+    }
+    #[cfg(unix)]
+    if before.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid cached asset",
+        ));
+    }
+
+    let mut file = File::open(&path)?;
+    let opened = file.metadata()?;
+    let after = std::fs::symlink_metadata(&path)?;
+    if !opened.is_file()
+        || !after.file_type().is_file()
+        || !same_opened_file(&before, &opened)
+        || !same_opened_file(&opened, &after)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid cached asset",
+        ));
+    }
+
+    let mut prefix =
+        Vec::with_capacity(opened.len().min(CONDUIT_ASSET_VALIDATION_PREFIX_BYTES) as usize);
+    file.by_ref()
+        .take(CONDUIT_ASSET_VALIDATION_PREFIX_BYTES)
+        .read_to_end(&mut prefix)?;
+    let validated = file.metadata()?;
+    if !same_opened_file(&opened, &validated)
+        || !descriptor.validates_opened_content(validated.len(), &prefix)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid cached asset",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
+fn finish_conduit_asset_error(request: &webkit6::URISchemeRequest) {
+    let mut error = glib::Error::new(
+        gio::IOErrorEnum::NotFound,
+        "unknown or invalid Conduit asset",
+    );
+    request.finish_error(&mut error);
+}
+
+fn finish_conduit_asset_response(
+    request: &webkit6::URISchemeRequest,
+    descriptor: &CachedAssetDescriptor,
+    mut file: File,
+    method: &str,
+    plan: ConduitAssetResponsePlan,
+) -> io::Result<()> {
+    let total_length = descriptor.size();
+    let (status, reason, start, end, content_length) = match plan {
+        ConduitAssetResponsePlan::Full => {
+            (200, "OK", 0, total_length.saturating_sub(1), total_length)
+        }
+        ConduitAssetResponsePlan::Partial { start, end } => {
+            (206, "Partial Content", start, end, end - start + 1)
+        }
+        ConduitAssetResponsePlan::NotSatisfiable => {
+            let stream = gio::MemoryInputStream::new();
+            let response = webkit6::URISchemeResponse::new(&stream, 0);
+            response.set_status(416, Some("Range Not Satisfiable"));
+            response.set_content_type(descriptor.content_type());
+            let headers =
+                webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
+            headers.replace("Accept-Ranges", "bytes");
+            headers.replace("Cache-Control", "no-store");
+            headers.replace("Content-Length", "0");
+            headers.replace("Content-Range", &format!("bytes */{total_length}"));
+            headers.replace("X-Content-Type-Options", "nosniff");
+            response.set_http_headers(headers);
+            request.finish_with_response(&response);
+            return Ok(());
+        }
+    };
+
+    let stream: gio::InputStream = if method == "HEAD" {
+        gio::MemoryInputStream::new().upcast()
+    } else {
+        file.seek(SeekFrom::Start(start))?;
+        gio::ReadInputStream::new(file.take(content_length)).upcast()
+    };
+    let stream_length = if method == "HEAD" {
+        0
+    } else {
+        content_length as i64
+    };
+    let response = webkit6::URISchemeResponse::new(&stream, stream_length);
+    response.set_status(status, Some(reason));
+    response.set_content_type(descriptor.content_type());
+    let headers = webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
+    headers.replace("Accept-Ranges", "bytes");
+    headers.replace("Cache-Control", "no-store");
+    headers.replace("Content-Length", &content_length.to_string());
+    headers.replace("X-Content-Type-Options", "nosniff");
+    if status == 206 {
+        headers.replace(
+            "Content-Range",
+            &format!("bytes {start}-{end}/{total_length}"),
+        );
+    }
+    response.set_http_headers(headers);
+    request.finish_with_response(&response);
+    Ok(())
+}
+
+fn serve_conduit_asset_request(
+    request: &webkit6::URISchemeRequest,
+    assets: &Rc<RefCell<BoundedConduitAssets>>,
+) -> ConduitAssetServeOutcome {
+    let Some(uri) = request.uri() else {
+        finish_conduit_asset_error(request);
+        return ConduitAssetServeOutcome::Rejected;
+    };
+    let Some(cache_key) = conduit_asset_request_key(uri.as_str()) else {
+        finish_conduit_asset_error(request);
+        return ConduitAssetServeOutcome::Rejected;
+    };
+    let Some(descriptor) = conduit_asset_for_request(uri.as_str(), &mut assets.borrow_mut()) else {
+        finish_conduit_asset_error(request);
+        return ConduitAssetServeOutcome::Rejected;
+    };
+    let method = request.http_method();
+    let Some(method) = conduit_asset_request_method(method.as_deref()) else {
+        finish_conduit_asset_error(request);
+        return ConduitAssetServeOutcome::Rejected;
+    };
+    let range = request
+        .http_headers()
+        .and_then(|headers| headers.one("Range"))
+        .map(|range| range.to_string());
+    let plan = conduit_asset_response_plan(range.as_deref(), descriptor.size());
+    let Ok(file) = open_conduit_asset(&descriptor) else {
+        assets.borrow_mut().remove(&cache_key);
+        finish_conduit_asset_error(request);
+        return ConduitAssetServeOutcome::Invalidated(cache_key);
+    };
+    if finish_conduit_asset_response(request, &descriptor, file, method, plan).is_err() {
+        assets.borrow_mut().remove(&cache_key);
+        finish_conduit_asset_error(request);
+        return ConduitAssetServeOutcome::Invalidated(cache_key);
+    }
+    ConduitAssetServeOutcome::Served(cache_key)
 }
 
 fn generate_html(label: &str, render: impl FnOnce() -> String) -> String {
@@ -3781,7 +4286,7 @@ fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
     } else {
         file.preview_url()?
     };
-    Some((url.to_string(), url.to_string()))
+    bounded_image_asset_request(url)
 }
 
 fn attachment_image_asset_request(
@@ -3798,37 +4303,60 @@ fn native_preview_asset_request(url: &str) -> Option<(String, String)> {
     if !crate::slack::supports_native_preview_asset_url(url) {
         return None;
     }
+    bounded_image_asset_request(url)
+}
+
+fn bounded_image_asset_request(url: &str) -> Option<(String, String)> {
+    if url.is_empty() || url.len() > IMAGE_ASSET_SOURCE_MAX_BYTES {
+        return None;
+    }
     Some((url.to_string(), url.to_string()))
+}
+
+fn retain_image_asset_request(
+    requests: &mut HashMap<String, String>,
+    request: Option<(String, String)>,
+) {
+    let Some((key, url)) = request else {
+        return;
+    };
+    if requests.contains_key(&key) || requests.len() >= CONDUIT_ASSET_REGISTRY_MAX_ENTRIES {
+        return;
+    }
+    requests.insert(key, url);
 }
 
 fn message_image_asset_requests<'a>(
     messages: impl IntoIterator<Item = &'a SlackMessage>,
     avatar_urls: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
-    let mut requests = Vec::new();
+    let mut requests = HashMap::new();
     for message in messages {
-        requests.extend(
-            message
-                .files
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .filter_map(image_asset_request),
-        );
-        requests.extend(
-            message
-                .attachments
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .filter_map(attachment_image_asset_request),
-        );
-        requests.extend(
-            message
-                .document
-                .image_urls()
-                .filter_map(native_preview_asset_request),
-        );
+        for request in message
+            .files
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter_map(image_asset_request)
+        {
+            retain_image_asset_request(&mut requests, Some(request));
+        }
+        for request in message
+            .attachments
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter_map(attachment_image_asset_request)
+        {
+            retain_image_asset_request(&mut requests, Some(request));
+        }
+        for request in message
+            .document
+            .image_urls()
+            .filter_map(native_preview_asset_request)
+        {
+            retain_image_asset_request(&mut requests, Some(request));
+        }
         if let Some(url) = message
             .user
             .as_ref()
@@ -3836,11 +4364,11 @@ fn message_image_asset_requests<'a>(
             .map(String::as_str)
             .or_else(|| message.avatar_url())
         {
-            requests.push((url.to_string(), url.to_string()));
+            retain_image_asset_request(&mut requests, bounded_image_asset_request(url));
         }
     }
+    let mut requests = requests.into_iter().collect::<Vec<_>>();
     requests.sort_by(|left, right| left.0.cmp(&right.0));
-    requests.dedup_by(|left, right| left.0 == right.0);
     requests
 }
 
@@ -4918,23 +5446,26 @@ impl ConduitWindow {
     fn create_message_web_context(&self) -> webkit6::WebContext {
         let context = webkit6::WebContext::new();
         let assets = Rc::clone(&self.imp().conduit_assets);
+        let weak_window = self.downgrade();
         context.register_uri_scheme("conduit-asset", move |request| {
-            let asset = request
-                .uri()
-                .as_deref()
-                .and_then(|uri| conduit_asset_for_request(uri, &assets.borrow()));
-            let Some(asset) = asset else {
-                let mut error = glib::Error::new(
-                    gio::IOErrorEnum::NotFound,
-                    "unknown or invalid Conduit asset",
-                );
-                request.finish_error(&mut error);
+            let outcome = serve_conduit_asset_request(request, &assets);
+            let Some(window) = weak_window.upgrade() else {
                 return;
             };
-            let length = asset.bytes.len() as i64;
-            let bytes = glib::Bytes::from_owned(asset.bytes);
-            let stream = gio::MemoryInputStream::from_bytes(&bytes);
-            request.finish(&stream, length, Some(&asset.mime_type));
+            match outcome {
+                ConduitAssetServeOutcome::Rejected => {}
+                ConduitAssetServeOutcome::Served(cache_key) => {
+                    window.mark_conduit_asset_served(&cache_key);
+                }
+                ConduitAssetServeOutcome::Invalidated(cache_key) => {
+                    let weak_window = window.downgrade();
+                    glib::idle_add_local_once(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.recover_invalid_conduit_asset(&cache_key);
+                        }
+                    });
+                }
+            }
         });
         if let Some(security_manager) = context.security_manager() {
             security_manager.register_uri_scheme_as_secure("conduit-asset");
@@ -7841,14 +8372,43 @@ impl ConduitWindow {
                 let imp = self.imp();
                 imp.pending_image_assets.borrow_mut().remove(&key);
                 imp.failed_image_assets.borrow_mut().remove(&key);
-                let cache_key = image_asset_cache_key(&key);
-                let source = format!("conduit-asset://{cache_key}");
-                if asset.mime_type.starts_with("video/") {
-                    imp.video_asset_keys.borrow_mut().insert(key.clone());
-                } else {
-                    imp.video_asset_keys.borrow_mut().remove(&key);
+                if key.is_empty()
+                    || key.len() > IMAGE_ASSET_SOURCE_MAX_BYTES
+                    || !asset.matches_source(&key)
+                {
+                    self.mark_image_asset_failed(&key);
+                    return;
                 }
-                imp.conduit_assets.borrow_mut().insert(cache_key, asset);
+                let kind = if asset.is_video() {
+                    CachedAssetKind::Video
+                } else {
+                    CachedAssetKind::Image
+                };
+                let Some(source) = CachedAssetSource::new(asset.uri(), kind) else {
+                    self.mark_image_asset_failed(&key);
+                    return;
+                };
+                let Some(evicted) = imp.conduit_assets.borrow_mut().insert(asset) else {
+                    self.mark_image_asset_failed(&key);
+                    return;
+                };
+                if !evicted.is_empty() {
+                    let evicted = evicted.into_iter().collect::<HashSet<_>>();
+                    let evicted_sources = imp
+                        .image_assets
+                        .borrow()
+                        .iter()
+                        .filter(|(_, source)| {
+                            conduit_asset_request_key(source.uri())
+                                .is_some_and(|cache_key| evicted.contains(&cache_key))
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>();
+                    for evicted_source in evicted_sources {
+                        imp.image_assets.borrow_mut().remove(&evicted_source);
+                        self.patch_image_asset(&evicted_source, None);
+                    }
+                }
                 imp.image_assets
                     .borrow_mut()
                     .insert(key.clone(), source.clone());
@@ -9627,10 +10187,10 @@ impl ConduitWindow {
         *imp.workspace_url.borrow_mut() = None;
         *imp.sidebar_error.borrow_mut() = None;
         imp.image_assets.borrow_mut().clear();
-        imp.video_asset_keys.borrow_mut().clear();
-        imp.conduit_assets.borrow_mut().clear();
+        imp.conduit_assets.borrow_mut().set_workspace(None);
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
+        imp.recovering_image_assets.borrow_mut().clear();
         *imp.custom_emojis.borrow_mut() = Arc::default();
         self.set_composer_canonical_text(ComposerTarget::Message, "");
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
@@ -9656,7 +10216,13 @@ impl ConduitWindow {
     }
 
     fn show_workspace(&self, auth: AuthInfo) {
-        *self.imp().workspace_id.borrow_mut() = workspace_identity(&auth);
+        let preview_scope = preview_workspace_scope(&auth);
+        let workspace_id = workspace_identity(&auth);
+        self.imp()
+            .conduit_assets
+            .borrow_mut()
+            .set_workspace(Some(preview_workspace_cache_key(&preview_scope)));
+        *self.imp().workspace_id.borrow_mut() = workspace_id;
         self.validate_last_conversation_workspace();
         self.imp().workspace_ready.set(false);
         self.imp().initial_sync_complete.set(false);
@@ -9987,20 +10553,69 @@ impl ConduitWindow {
         self.show_thread_placeholder(&message);
     }
 
+    fn image_asset_keys_for_cache_key(&self, cache_key: &str) -> Vec<String> {
+        self.imp()
+            .image_assets
+            .borrow()
+            .iter()
+            .filter(|(_, source)| {
+                conduit_asset_request_key(source.uri()).as_deref() == Some(cache_key)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    fn mark_conduit_asset_served(&self, cache_key: &str) {
+        if self.imp().recovering_image_assets.borrow().is_empty() {
+            return;
+        }
+        let keys = self.image_asset_keys_for_cache_key(cache_key);
+        let mut recovering = self.imp().recovering_image_assets.borrow_mut();
+        for key in keys {
+            recovering.remove(&key);
+        }
+    }
+
+    fn recover_invalid_conduit_asset(&self, cache_key: &str) {
+        let keys = self.image_asset_keys_for_cache_key(cache_key);
+        for key in keys {
+            self.imp().image_assets.borrow_mut().remove(&key);
+            self.patch_image_asset(&key, None);
+
+            let action = {
+                let mut recovering = self.imp().recovering_image_assets.borrow_mut();
+                let mut pending = self.imp().pending_image_assets.borrow_mut();
+                image_asset_recovery_action(&mut recovering, &mut pending, &key)
+            };
+            match action {
+                ImageAssetRecoveryAction::Retry => {
+                    self.send_command(RuntimeCommand::LoadImageAsset {
+                        key: key.clone(),
+                        url: key,
+                    });
+                }
+                ImageAssetRecoveryAction::AlreadyPending => {}
+                ImageAssetRecoveryAction::Fail => self.mark_image_asset_failed(&key),
+            }
+        }
+    }
+
     fn mark_image_asset_failed(&self, key: &str) {
         let imp = self.imp();
         imp.pending_image_assets.borrow_mut().remove(key);
-        imp.failed_image_assets.borrow_mut().insert(key.to_string());
-        imp.video_asset_keys.borrow_mut().remove(key);
+        imp.recovering_image_assets.borrow_mut().remove(key);
+        imp.failed_image_assets
+            .borrow_mut()
+            .insert_evicting(key.to_string());
         if let Some(source) = imp.image_assets.borrow_mut().remove(key) {
-            if let Some(cache_key) = conduit_asset_request_key(&source) {
+            if let Some(cache_key) = conduit_asset_request_key(source.uri()) {
                 imp.conduit_assets.borrow_mut().remove(&cache_key);
             }
         }
         self.patch_image_asset(key, None);
     }
 
-    fn patch_image_asset(&self, key: &str, source: Option<String>) {
+    fn patch_image_asset(&self, key: &str, source: Option<CachedAssetSource>) {
         let avatar_user_ids = self
             .imp()
             .user_avatar_urls
@@ -10034,15 +10649,7 @@ impl ConduitWindow {
         if main_view == MainMessageView::Conversation && main_uses_asset {
             self.apply_timeline_patch(
                 TimelineSurface::Main,
-                message_html::update_image_patch(
-                    key,
-                    source.clone(),
-                    if self.imp().video_asset_keys.borrow().contains(key) {
-                        TimelineAssetKind::Video
-                    } else {
-                        TimelineAssetKind::Image
-                    },
-                ),
+                message_html::update_image_patch(key, source.clone()),
                 UiInvalidations::MAIN,
             );
         } else if main_uses_asset {
@@ -10051,15 +10658,7 @@ impl ConduitWindow {
         if thread_uses_asset {
             self.apply_timeline_patch(
                 TimelineSurface::Thread,
-                message_html::update_image_patch(
-                    key,
-                    source,
-                    if self.imp().video_asset_keys.borrow().contains(key) {
-                        TimelineAssetKind::Video
-                    } else {
-                        TimelineAssetKind::Image
-                    },
-                ),
+                message_html::update_image_patch(key, source),
                 UiInvalidations::THREAD,
             );
         }
@@ -13571,18 +14170,21 @@ impl ConduitWindow {
         }
 
         let known_assets = self.imp().image_assets.borrow();
+        let registered_assets = self.imp().conduit_assets.borrow();
         let failed_assets = self.imp().failed_image_assets.borrow();
         let mut pending_assets = self.imp().pending_image_assets.borrow_mut();
         let missing_requests = requests
             .into_iter()
             .filter(|(key, _)| {
-                !known_assets.contains_key(key)
-                    && !failed_assets.contains(key)
-                    && pending_assets.insert(key.clone())
+                !known_assets.get(key).is_some_and(|source| {
+                    cached_asset_source_is_registered(source, &registered_assets)
+                }) && !failed_assets.contains(key)
+                    && pending_assets.try_insert(key.clone())
             })
             .collect::<Vec<_>>();
         drop(pending_assets);
         drop(failed_assets);
+        drop(registered_assets);
         drop(known_assets);
 
         crate::debug::log(
@@ -13790,6 +14392,17 @@ impl ConduitWindow {
             .map(|settings| settings.strv(config::RECENT_REACTIONS_KEY))
             .map(|names| names.iter().map(ToString::to_string).collect())
             .unwrap_or_default();
+        let registered_assets = imp.conduit_assets.borrow();
+        let image_assets = imp
+            .image_assets
+            .borrow()
+            .iter()
+            .filter(|(key, source)| {
+                image_keys.is_none_or(|keys| keys.contains(*key))
+                    && cached_asset_source_is_registered(source, &registered_assets)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         MessageHtmlContext {
             user_names,
             user_full_names: imp.user_full_names.borrow().clone(),
@@ -13803,20 +14416,7 @@ impl ConduitWindow {
             load_more_url: None,
             timeline_scroll: TimelineScrollBehavior::Preserve,
             timeline_generation: None,
-            image_assets: imp
-                .image_assets
-                .borrow()
-                .iter()
-                .filter(|(key, _)| image_keys.is_none_or(|keys| keys.contains(*key)))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-            video_asset_keys: imp
-                .video_asset_keys
-                .borrow()
-                .iter()
-                .filter(|key| image_keys.is_none_or(|keys| keys.contains(*key)))
-                .cloned()
-                .collect(),
+            image_assets,
             failed_image_urls: imp
                 .failed_image_assets
                 .borrow()
@@ -14140,6 +14740,7 @@ fn update_huddle_device_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slack::PreviewAssetMime;
 
     #[test]
     fn executable_message_controls_require_fresh_callback_and_publisher_metadata() {
@@ -14513,6 +15114,7 @@ mod tests {
     #[test]
     fn conduit_asset_requests_require_an_exact_known_cache_key() {
         let key = "a".repeat(64);
+        let workspace_key = "f".repeat(64);
         assert_eq!(
             conduit_asset_request_key(&format!("conduit-asset://{key}")),
             Some(key.clone())
@@ -14521,25 +15123,250 @@ mod tests {
             "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "conduit-asset://unknown",
             "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/path",
+            "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
             "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?query=1",
+            "conduit-asset://AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "conduit-asset://user@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             assert_eq!(conduit_asset_request_key(uri), None, "{uri}");
         }
 
-        let asset = PreviewAsset::new("image/png".to_string(), b"png".to_vec()).unwrap();
-        let assets = HashMap::from([(key.clone(), asset.clone())]);
+        let asset = CachedAssetDescriptor::new(
+            workspace_key.clone(),
+            key.clone(),
+            PreviewAssetMime::Png,
+            8,
+        )
+        .unwrap();
+        let mut assets = BoundedConduitAssets::new(16, 4);
+        assets.set_workspace(Some(workspace_key));
+        assert_eq!(assets.insert(asset.clone()), Some(Vec::new()));
         assert_eq!(
-            conduit_asset_for_request(&format!("conduit-asset://{key}"), &assets),
+            conduit_asset_for_request(&format!("conduit-asset://{key}"), &mut assets),
             Some(asset)
         );
         assert_eq!(
             conduit_asset_for_request(
                 "conduit-asset://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                &assets,
+                &mut assets,
             ),
             None
         );
+    }
+
+    #[test]
+    fn conduit_asset_registry_evicts_least_recently_used_bytes() {
+        let first_key = "a".repeat(64);
+        let second_key = "b".repeat(64);
+        let third_key = "c".repeat(64);
+        let workspace_key = "f".repeat(64);
+        let descriptor = |cache_key: String| {
+            CachedAssetDescriptor::new(workspace_key.clone(), cache_key, PreviewAssetMime::Png, 4)
+                .unwrap()
+        };
+        let first = descriptor(first_key.clone());
+        let second = descriptor(second_key.clone());
+        let third = descriptor(third_key.clone());
+        let mut assets = BoundedConduitAssets::new(8, 4);
+        assets.set_workspace(Some(workspace_key));
+        let second_source =
+            CachedAssetSource::from_cache_key(&second_key, CachedAssetKind::Image).unwrap();
+
+        assert_eq!(assets.insert(first.clone()), Some(Vec::new()));
+        assert_eq!(assets.insert(second), Some(Vec::new()));
+        assert!(cached_asset_source_is_registered(&second_source, &assets));
+        assert_eq!(assets.get(&first_key), Some(first));
+        assert_eq!(assets.insert(third), Some(vec![second_key.clone()]));
+
+        assert!(assets.contains_key(&first_key));
+        assert!(!assets.contains_key(&second_key));
+        assert!(!cached_asset_source_is_registered(&second_source, &assets));
+        assert!(assets.contains_key(&third_key));
+        assert_eq!(assets.total_bytes(), 8);
+    }
+
+    #[test]
+    fn conduit_asset_registry_caps_signature_only_entries() {
+        let workspace_key = "f".repeat(64);
+        let mut assets = BoundedConduitAssets::new(64, 2);
+        assets.set_workspace(Some(workspace_key.clone()));
+        for marker in ['a', 'b', 'c'] {
+            let descriptor = CachedAssetDescriptor::new(
+                workspace_key.clone(),
+                marker.to_string().repeat(64),
+                PreviewAssetMime::Jpeg,
+                3,
+            )
+            .unwrap();
+            assets.insert(descriptor).unwrap();
+        }
+
+        assert_eq!(assets.len(), 2);
+        assert!(!assets.contains_key(&"a".repeat(64)));
+        assert!(assets.contains_key(&"b".repeat(64)));
+        assert!(assets.contains_key(&"c".repeat(64)));
+    }
+
+    #[test]
+    fn image_asset_key_sets_bound_count_and_bytes() {
+        let mut keys = BoundedImageAssetKeys::default();
+        for index in 0..=IMAGE_ASSET_KEY_SET_MAX_ENTRIES {
+            assert_eq!(
+                keys.try_insert(format!("asset-{index}")),
+                index < IMAGE_ASSET_KEY_SET_MAX_ENTRIES
+            );
+        }
+        assert_eq!(keys.len(), IMAGE_ASSET_KEY_SET_MAX_ENTRIES);
+
+        let mut oversized = BoundedImageAssetKeys::default();
+        assert!(!oversized.try_insert("x".repeat(IMAGE_ASSET_SOURCE_MAX_BYTES + 1)));
+
+        let mut evicting = BoundedImageAssetKeys::default();
+        for index in 0..=IMAGE_ASSET_KEY_SET_MAX_ENTRIES {
+            assert!(evicting.insert_evicting(format!("asset-{index}")));
+        }
+        assert_eq!(evicting.len(), IMAGE_ASSET_KEY_SET_MAX_ENTRIES);
+        assert!(!evicting.contains("asset-0"));
+        assert!(evicting.contains(&format!("asset-{}", IMAGE_ASSET_KEY_SET_MAX_ENTRIES)));
+
+        let mut byte_bounded = BoundedImageAssetKeys::default();
+        let entries_by_bytes = IMAGE_ASSET_KEY_SET_MAX_BYTES / IMAGE_ASSET_SOURCE_MAX_BYTES;
+        for index in 0..=entries_by_bytes {
+            let key = format!(
+                "{}{:020}",
+                "x".repeat(IMAGE_ASSET_SOURCE_MAX_BYTES - 20),
+                index
+            );
+            assert!(byte_bounded.insert_evicting(key));
+        }
+        assert_eq!(byte_bounded.len(), entries_by_bytes);
+    }
+
+    #[test]
+    fn invalid_conduit_asset_retries_once_until_a_success_clears_recovery() {
+        let key = "https://files.example/image.png";
+        let mut recovering = BoundedImageAssetKeys::default();
+        let mut pending = BoundedImageAssetKeys::default();
+
+        assert_eq!(
+            image_asset_recovery_action(&mut recovering, &mut pending, key),
+            ImageAssetRecoveryAction::Retry
+        );
+        pending.remove(key);
+        assert_eq!(
+            image_asset_recovery_action(&mut recovering, &mut pending, key),
+            ImageAssetRecoveryAction::Fail
+        );
+
+        recovering.remove(key);
+        assert_eq!(
+            image_asset_recovery_action(&mut recovering, &mut pending, key),
+            ImageAssetRecoveryAction::Retry
+        );
+
+        let mut already_recovering = BoundedImageAssetKeys::default();
+        let mut already_pending = BoundedImageAssetKeys::default();
+        already_pending.try_insert(key.to_string());
+        assert_eq!(
+            image_asset_recovery_action(&mut already_recovering, &mut already_pending, key),
+            ImageAssetRecoveryAction::AlreadyPending
+        );
+    }
+
+    #[test]
+    fn conduit_asset_registry_rejects_cross_workspace_descriptors() {
+        let current_workspace = "a".repeat(64);
+        let descriptor =
+            CachedAssetDescriptor::new("b".repeat(64), "c".repeat(64), PreviewAssetMime::Png, 8)
+                .unwrap();
+        let mut assets = BoundedConduitAssets::new(16, 4);
+        assets.set_workspace(Some(current_workspace));
+
+        assert_eq!(assets.insert(descriptor), None);
+        assert_eq!(assets.total_bytes(), 0);
+    }
+
+    #[test]
+    fn conduit_asset_ranges_are_single_and_bounded() {
+        assert_eq!(conduit_asset_request_method(Some("GET")), Some("GET"));
+        assert_eq!(conduit_asset_request_method(Some("HEAD")), Some("HEAD"));
+        assert_eq!(conduit_asset_request_method(None), None);
+        assert_eq!(conduit_asset_request_method(Some("get")), None);
+        assert_eq!(conduit_asset_request_method(Some("POST")), None);
+        assert_eq!(
+            conduit_asset_response_plan(None, 10),
+            ConduitAssetResponsePlan::Full
+        );
+        assert_eq!(
+            conduit_asset_response_plan(Some("bytes=2-5"), 10),
+            ConduitAssetResponsePlan::Partial { start: 2, end: 5 }
+        );
+        assert_eq!(
+            conduit_asset_response_plan(Some("bytes=7-"), 10),
+            ConduitAssetResponsePlan::Partial { start: 7, end: 9 }
+        );
+        assert_eq!(
+            conduit_asset_response_plan(Some("bytes=-4"), 10),
+            ConduitAssetResponsePlan::Partial { start: 6, end: 9 }
+        );
+        assert_eq!(
+            conduit_asset_response_plan(Some("bytes=8-99"), 10),
+            ConduitAssetResponsePlan::Partial { start: 8, end: 9 }
+        );
+        for range in [
+            "items=0-1",
+            "bytes=",
+            "bytes=5-4",
+            "bytes=10-",
+            "bytes=-0",
+            "bytes=0-1,3-4",
+        ] {
+            assert_eq!(
+                conduit_asset_response_plan(Some(range), 10),
+                ConduitAssetResponsePlan::NotSatisfiable,
+                "{range}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_asset_file_requires_regular_stable_matching_content() {
+        let workspace_key = "a".repeat(64);
+        let cache_key = "b".repeat(64);
+        let valid_bytes = b"\x89PNG\r\n\x1a\nvalid";
+        let descriptor = CachedAssetDescriptor::new(
+            workspace_key,
+            cache_key,
+            PreviewAssetMime::Png,
+            valid_bytes.len() as u64,
+        )
+        .unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-window-asset-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = descriptor.path_in(&directory);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, valid_bytes).unwrap();
+
+        assert!(open_conduit_asset_at(&descriptor, &directory).is_ok());
+        std::fs::write(&path, b"not-a-png!!!!").unwrap();
+        assert!(open_conduit_asset_at(&descriptor, &directory).is_err());
+
+        #[cfg(unix)]
+        {
+            let alternate = directory.join("alternate.png");
+            std::fs::write(&alternate, valid_bytes).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&alternate, &path).unwrap();
+            assert!(open_conduit_asset_at(&descriptor, &directory).is_err());
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn timeline_delta(
@@ -14783,8 +15610,7 @@ mod tests {
             1,
             TimelineDomPatch::UpdateImage {
                 asset_key: "asset".to_string(),
-                source: Some("conduit-asset://asset".to_string()),
-                media_kind: TimelineAssetKind::Image,
+                source: CachedAssetSource::from_cache_key(&"a".repeat(64), CachedAssetKind::Image),
             },
             TimelineScrollBehavior::StickToBottom,
         ));
@@ -17130,6 +17956,36 @@ mod tests {
         );
 
         assert_eq!(requests, vec![(avatar_url.clone(), avatar_url)]);
+    }
+
+    #[test]
+    fn message_image_requests_reject_oversized_source_keys() {
+        let messages = [SlackMessage {
+            user: Some("U123".to_string()),
+            ..Default::default()
+        }];
+        let oversized_url = format!(
+            "https://avatars.slack-edge.com/{}",
+            "x".repeat(IMAGE_ASSET_SOURCE_MAX_BYTES)
+        );
+
+        assert!(message_image_asset_requests(
+            &messages,
+            &HashMap::from([("U123".to_string(), oversized_url)]),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn image_asset_request_collection_is_entry_bounded() {
+        let mut requests = HashMap::new();
+        for index in 0..=CONDUIT_ASSET_REGISTRY_MAX_ENTRIES {
+            let key = format!("asset-{index}");
+            retain_image_asset_request(&mut requests, Some((key.clone(), key)));
+        }
+
+        assert_eq!(requests.len(), CONDUIT_ASSET_REGISTRY_MAX_ENTRIES);
+        assert!(!requests.contains_key(&format!("asset-{}", CONDUIT_ASSET_REGISTRY_MAX_ENTRIES)));
     }
 
     #[test]

@@ -185,8 +185,10 @@ START_PROBE = r"""
     const gifApplied = window.conduitApplyTimelinePatch({
       type: "update-image",
       asset_key: "animated-gif",
-      source: window.animatedGifSource,
-      media_kind: "image"
+      source: {
+        uri: "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        kind: "image"
+      }
     });
     const animatedGif = document.querySelector('img[data-image-key="animated-gif"]');
     animatedGif.loading = "eager";
