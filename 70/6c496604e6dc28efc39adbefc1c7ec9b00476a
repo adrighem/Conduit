@@ -1,0 +1,9 @@
+Task: Fix cached-bootstrap lifecycle panic
+
+Summary: Released mutable user-status and pending-user projection borrows before scheduling status expiry, preventing the GLib runtime-event consumer from panicking during cached BootstrapReset projection. Updated the existing window-state fixture to restore a workspace through the canonical bootstrap patch.
+
+Modified: src/window.rs
+
+Verification: Regression reproduced before the fix; cargo fmt --all --check, strict Clippy, and cargo test --locked --all-targets passed with 932 passed and 3 ignored; Meson compilation passed; Meson tests passed 17/17. No coverage tool is configured.
+
+Rationale: Cached conversations must dismiss the initial syncing surface even when cached user projections are applied at startup.
