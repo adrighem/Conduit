@@ -1,0 +1,7 @@
+Task: Close and archive Workspace Pipeline Rearchitecture
+
+Summary: Marked the fully verified track completed, removed it from the active track index, and moved its artifacts into the Conductor archive.
+
+Modified files: conductor/tracks.md; conductor/archive/workspace_pipeline_rearchitecture_20260720/{metadata.json,plan.md,spec.md}
+
+Rationale: All six phases and manual checkpoints are complete, so the track no longer belongs in the active queue.
