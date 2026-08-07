@@ -86,8 +86,3 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [~] Track: Lazy WebView and on-demand emoji materialization
 *Link: [./conductor/tracks/lazy_webview_emoji_20260729/](./conductor/tracks/lazy_webview_emoji_20260729/)*
-
----
-
-## [~] Track: Bounded synchronization scheduler
-*Link: [./conductor/tracks/bounded_sync_scheduler_20260729/](./conductor/tracks/bounded_sync_scheduler_20260729/)*
