@@ -77,7 +77,7 @@ START_PROBE = r"""
       position: "append",
       message_ts: "22",
       arrival: "sent",
-      html: '<li><article class="message" data-message-ts="22">Sent message</article></li>'
+      html: '<li class="message-list-item"><article class="message" data-message-ts="22">Sent message</article></li>'
     });
     const sentMessage = document.querySelector('[data-message-ts="22"]');
     const sentArrivalClass = sentMessage.classList.contains("sent-message-arrival");
@@ -103,7 +103,7 @@ START_PROBE = r"""
       type: "insert-message",
       position: "append",
       message_ts: "23",
-      html: '<li><article class="message" data-message-ts="23">Incoming message</article></li>'
+      html: '<li class="message-list-item"><article class="message" data-message-ts="23">Incoming message</article></li>'
     });
     const incomingMessage = document.querySelector('[data-message-ts="23"]');
     const incomingArrivalClass =
@@ -116,7 +116,7 @@ START_PROBE = r"""
       position: "append",
       message_ts: "24",
       arrival: "sent",
-      html: '<li><article class="message" data-message-ts="24">Reduced motion</article></li>'
+      html: '<li class="message-list-item"><article class="message" data-message-ts="24">Reduced motion</article></li>'
     });
     const reducedMotionArrivalClass = document
       .querySelector('[data-message-ts="24"]')
@@ -138,7 +138,7 @@ START_PROBE = r"""
       position: "append",
       message_ts: "25",
       arrival: "sent",
-      html: '<li><article class="message" data-message-ts="25">Sent while reading</article></li>'
+      html: '<li class="message-list-item"><article class="message" data-message-ts="25">Sent while reading</article></li>'
     });
     await wait(100);
     const sentAwayMessage = document.querySelector('[data-message-ts="25"]');
@@ -163,7 +163,7 @@ START_PROBE = r"""
     const snapshotAnchorTop = replacement.getBoundingClientRect().top;
     const snapshotHtml = Array.from({ length: 24 }, (_, offset) => {
       const index = offset;
-      return '<li><article class="message" data-message-ts="' + index +
+      return '<li class="message-list-item"><article class="message" data-message-ts="' + index +
         '" style="min-height:' + (80 + index % 3 * 20) + 'px">Snapshot ' + index +
         ' with changed wrapping and dimensions.</article></li>';
     }).join("");
@@ -180,6 +180,7 @@ START_PROBE = r"""
     await wait(100);
     const snapshotAnchor = document.querySelector('[data-message-ts="10"]');
     const snapshotAnchorDelta = snapshotAnchor.getBoundingClientRect().top - snapshotAnchorTop;
+    const snapshotLoadMore = document.querySelector(".timeline-action").textContent;
 
     const gifApplied = window.conduitApplyTimelinePatch({
       type: "update-image",
@@ -194,6 +195,80 @@ START_PROBE = r"""
     for (let attempt = 0; attempt < 40 && !animatedGif.complete; attempt += 1) {
       await wait(25);
     }
+
+    const readSnapshotHtml = Array.from({ length: 12 }, (_, offset) => {
+      const timestamp = String(1710000001 + offset) + ".000001";
+      return '<li class="message-list-item"><article class="message" data-message-ts="' +
+        timestamp + '">Read marker ' + timestamp + '</article></li>';
+    }).join("");
+    const readSnapshotApplied = window.conduitApplyTimelinePatch({
+      type: "replace-snapshot",
+      list_html: readSnapshotHtml,
+      load_more_html: ""
+    });
+    await nextFrame();
+    await nextFrame();
+    await nextFrame();
+    const readTarget = document.querySelector('[data-message-ts="1710000006.000001"]');
+    if (!readTarget) throw new Error("read target missing after snapshot");
+    const unreadSeparator = document.createElement("li");
+    unreadSeparator.className = "unread-separator";
+    unreadSeparator.textContent = "New";
+    readTarget.closest(".message-list-item").before(unreadSeparator);
+    const readConfigured = window.conduitApplyTimelinePatch({
+      type: "configure-read-state",
+      read_marker_url: "conduit://mark-read?channel=C1&ts=0&probe=early",
+      first_unread_ts: "1710000006.000001"
+    });
+    readTarget.scrollIntoView({ block: "center" });
+    await wait(250);
+    document.querySelector('[data-message-ts="1710000001.000001"]')
+      .scrollIntoView({ block: "center" });
+    await wait(350);
+    const stableReadConfigured = window.conduitApplyTimelinePatch({
+      type: "configure-read-state",
+      read_marker_url: "conduit://mark-read?channel=C1&ts=0&probe=stable",
+      first_unread_ts: "1710000006.000001"
+    });
+    await nextFrame();
+    await nextFrame();
+    await nextFrame();
+    readTarget.scrollIntoView({ block: "center" });
+    await wait(600);
+    const separatorAfterRead = document.querySelector(".unread-separator");
+    const separatorParent = separatorAfterRead ? separatorAfterRead.parentElement.tagName : "";
+    const appendedReadApplied = window.conduitApplyTimelinePatch({
+      type: "insert-message",
+      position: "append",
+      message_ts: "1710000013.000001",
+      html: '<li class="message-list-item"><article class="message" data-message-ts="1710000013.000001">Later unread</article></li>'
+    });
+    await nextFrame();
+    await nextFrame();
+    await nextFrame();
+    const appendedRead = document.querySelector('[data-message-ts="1710000013.000001"]');
+    if (!appendedRead) throw new Error("appended read target missing");
+    appendedRead.scrollIntoView({ block: "center" });
+    await wait(600);
+    await wait(600);
+    const readDisabled = window.conduitApplyTimelinePatch({
+      type: "configure-read-state",
+      read_marker_url: null,
+      first_unread_ts: null
+    });
+    const disabledAppendApplied = window.conduitApplyTimelinePatch({
+      type: "insert-message",
+      position: "append",
+      message_ts: "1710000014.000001",
+      html: '<li class="message-list-item"><article class="message" data-message-ts="1710000014.000001">Disabled unread</article></li>'
+    });
+    await nextFrame();
+    await nextFrame();
+    await nextFrame();
+    const disabledRead = document.querySelector('[data-message-ts="1710000014.000001"]');
+    if (!disabledRead) throw new Error("disabled read target missing");
+    disabledRead.scrollIntoView({ block: "center" });
+    await wait(600);
     window.timelineScrollResult = {
       initialFocusDelta,
       initialPending,
@@ -220,14 +295,22 @@ START_PROBE = r"""
       snapshotApplied,
       snapshotText: snapshotAnchor.textContent,
       snapshotAnchorDelta,
-      snapshotLoadMore: document.querySelector(".timeline-action").textContent,
+      snapshotLoadMore,
       gifApplied,
       gifElement: animatedGif.tagName,
       gifNaturalWidth: animatedGif.naturalWidth,
-      gifSourceIsGif: animatedGif.currentSrc.startsWith("data:image/gif;base64,")
+      gifSourceIsGif: animatedGif.currentSrc.startsWith("data:image/gif;base64,"),
+      readSnapshotApplied,
+      readConfigured,
+      stableReadConfigured,
+      separatorParent,
+      appendedReadApplied,
+      readDisabled,
+      disabledAppendApplied
     };
   })().catch((error) => {
-    window.timelineScrollError = String(error && error.stack ? error.stack : error);
+    window.timelineScrollError = String(error) + "\n" +
+      String(error && error.stack ? error.stack : "");
   });
   return true;
 })()
@@ -245,7 +328,7 @@ def main() -> None:
     timeline_script = Path(sys.argv[1]).read_text(encoding="utf-8")
     assert "</script" not in timeline_script.lower()
     messages = "".join(
-        f'<li><article class="message" data-message-ts="{index}">'
+        f'<li class="message-list-item"><article class="message" data-message-ts="{index}">'
         f'Message {index} with enough wrapping text to exercise a narrower timeline. '
         f'This content deliberately spans several words and lines.</article></li>'
         for index in range(1, 22)
@@ -279,6 +362,7 @@ html, body {{ margin: 0; padding: 0; }}
     window.set_child(web_view)
     window.present()
     outcome: dict[str, object] = {}
+    read_mark_uris: list[str] = []
 
     def fail(error: BaseException) -> None:
         outcome["error"] = error
@@ -318,10 +402,26 @@ html, body {{ margin: 0; padding: 0; }}
                 START_PROBE, -1, None, None, None, on_started, None
             )
 
+    def on_decide_policy(
+        _view: WebKit.WebView, decision, decision_type: WebKit.PolicyDecisionType
+    ) -> bool:
+        if decision_type not in (
+            WebKit.PolicyDecisionType.NAVIGATION_ACTION,
+            WebKit.PolicyDecisionType.NEW_WINDOW_ACTION,
+        ):
+            return False
+        uri = decision.get_navigation_action().get_request().get_uri()
+        if uri.startswith("conduit://mark-read?"):
+            read_mark_uris.append(uri)
+            decision.ignore()
+            return True
+        return False
+
     def on_timeout() -> bool:
         fail(TimeoutError("WebKit timeline scroll test timed out"))
         return GLib.SOURCE_REMOVE
 
+    web_view.connect("decide-policy", on_decide_policy)
     web_view.connect("load-changed", on_load_changed)
     GLib.timeout_add_seconds(15, on_timeout)
     web_view.load_html(html, "app://conduit/")
@@ -362,6 +462,17 @@ html, body {{ margin: 0; padding: 0; }}
     assert payload["gifElement"] == "IMG", payload
     assert payload["gifNaturalWidth"] == 2, payload
     assert payload["gifSourceIsGif"] is True, payload
+    assert payload["readSnapshotApplied"] is True, payload
+    assert payload["readConfigured"] is True, payload
+    assert payload["stableReadConfigured"] is True, payload
+    assert payload["separatorParent"] == "OL", payload
+    assert payload["appendedReadApplied"] is True, payload
+    assert payload["readDisabled"] is True, payload
+    assert payload["disabledAppendApplied"] is True, payload
+    assert len(read_mark_uris) == 2, read_mark_uris
+    assert all("probe=early" not in uri for uri in read_mark_uris), read_mark_uris
+    assert all("probe=stable" in uri for uri in read_mark_uris), read_mark_uris
+    assert "ts=1710000013.000001" in read_mark_uris[-1], read_mark_uris
 
 
 if __name__ == "__main__":

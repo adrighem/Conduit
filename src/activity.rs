@@ -1,10 +1,10 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gettextrs::{gettext, ngettext};
 
 use crate::models::SlackConversation;
-use crate::thread_catalog::{ThreadRecord, ThreadUnreadState};
+use crate::thread_catalog::{ThreadCatalog, ThreadRecord, ThreadUnreadState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -65,6 +65,7 @@ impl ActivityItem {
     }
 }
 
+#[cfg(test)]
 pub fn build_activity_items(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
@@ -90,12 +91,113 @@ pub fn build_activity_items(
     items
 }
 
+pub(crate) fn build_unread_activity_items(
+    conversations: &[SlackConversation],
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    thread_catalog: &ThreadCatalog,
+    visible_message_ts: &HashSet<(String, String)>,
+) -> Vec<ActivityItem> {
+    let conversation_titles = conversations
+        .iter()
+        .map(|conversation| {
+            (
+                conversation.id.clone(),
+                conversation.display_name_with_users(user_names, current_user_id),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let records = thread_catalog.clone().into_records();
+    let mut thread_items = build_thread_activity_items(records, &conversation_titles)
+        .into_iter()
+        .filter_map(|item| {
+            let thread_ts = item.thread_ts.clone()?;
+            Some(((item.channel_id.clone(), thread_ts), item))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut items = Vec::new();
+
+    for conversation in conversations {
+        if !conversation.has_unread_activity() {
+            continue;
+        }
+        let total_count = conversation.unread_activity_count();
+        let Some(tracked) = conversation.tracked_unread_message_timestamps() else {
+            items.push(conversation_activity_item(
+                conversation,
+                user_names,
+                current_user_id,
+                total_count,
+            ));
+            continue;
+        };
+
+        let tracked_count = u64::try_from(tracked.len()).unwrap_or(u64::MAX);
+        let mut visible_count = total_count.saturating_sub(tracked_count);
+        let mut exact_thread_counts = HashMap::<(String, String), u64>::new();
+        for message_ts in tracked {
+            if visible_message_ts.contains(&(conversation.id.clone(), message_ts.to_string())) {
+                visible_count = visible_count.saturating_add(1);
+            } else if let Some(key) =
+                thread_catalog.thread_key_for_reply(&conversation.id, message_ts)
+            {
+                *exact_thread_counts
+                    .entry((key.channel_id.clone(), key.root_ts.clone()))
+                    .or_default() += 1;
+            } else {
+                visible_count = visible_count.saturating_add(1);
+            }
+        }
+
+        if visible_count > 0 || (total_count == 0 && conversation.has_unread_activity()) {
+            items.push(conversation_activity_item(
+                conversation,
+                user_names,
+                current_user_id,
+                visible_count,
+            ));
+        }
+        for ((channel_id, thread_ts), count) in exact_thread_counts {
+            let Some(record) = thread_catalog.get(&channel_id, &thread_ts) else {
+                continue;
+            };
+            let item = thread_activity_item(record, &conversation_titles, count);
+            thread_items
+                .entry((channel_id, thread_ts))
+                .and_modify(|known| known.unread_count = known.unread_count.max(count))
+                .or_insert(item);
+        }
+    }
+
+    items.extend(thread_items.into_values());
+    sort_activity_items(&mut items);
+    items
+}
+
+fn conversation_activity_item(
+    conversation: &SlackConversation,
+    user_names: &HashMap<String, String>,
+    current_user_id: Option<&str>,
+    unread_count: u64,
+) -> ActivityItem {
+    ActivityItem {
+        channel_id: conversation.id.clone(),
+        thread_ts: None,
+        title: conversation.display_name_with_users(user_names, current_user_id),
+        kind: activity_kind(conversation),
+        unread: true,
+        unread_count,
+    }
+}
+
 pub fn sort_activity_items(items: &mut [ActivityItem]) {
     items.sort_by_key(|item| {
         (
             item.kind.sort_rank(),
             Reverse(item.unread_count),
             item.title.to_lowercase(),
+            item.channel_id.clone(),
+            item.thread_ts.clone(),
         )
     });
 }
@@ -116,29 +218,37 @@ pub fn build_thread_activity_items(
             if count == 0 {
                 return None;
             }
-            let channel_title = conversation_titles
-                .get(&record.key.channel_id)
-                .cloned()
-                .unwrap_or_else(|| record.key.channel_id.clone());
-            let root_text = record
-                .root
-                .as_ref()
-                .and_then(|root| root.text.as_deref())
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .unwrap_or("Thread");
-            Some(ActivityItem {
-                channel_id: record.key.channel_id,
-                thread_ts: Some(record.key.root_ts),
-                title: format!("{channel_title}: {root_text}"),
-                kind: ActivityKind::Thread,
-                unread: true,
-                unread_count: count,
-            })
+            Some(thread_activity_item(&record, conversation_titles, count))
         })
         .collect::<Vec<_>>();
     sort_activity_items(&mut items);
     items
+}
+
+fn thread_activity_item(
+    record: &ThreadRecord,
+    conversation_titles: &HashMap<String, String>,
+    unread_count: u64,
+) -> ActivityItem {
+    let channel_title = conversation_titles
+        .get(&record.key.channel_id)
+        .cloned()
+        .unwrap_or_else(|| record.key.channel_id.clone());
+    let root_text = record
+        .root
+        .as_ref()
+        .and_then(|root| root.text.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("Thread");
+    ActivityItem {
+        channel_id: record.key.channel_id.clone(),
+        thread_ts: Some(record.key.root_ts.clone()),
+        title: format!("{channel_title}: {root_text}"),
+        kind: ActivityKind::Thread,
+        unread: true,
+        unread_count,
+    }
 }
 
 fn activity_kind(conversation: &SlackConversation) -> ActivityKind {
@@ -278,5 +388,163 @@ mod tests {
         assert_eq!(items[0].title, "#general: Deployment status");
         assert_eq!(items[0].unread_count, 2);
         assert_eq!(items[0].kind, ActivityKind::Thread);
+    }
+
+    #[test]
+    fn hidden_unsubscribed_reply_becomes_thread_only_activity() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("2.0", true);
+        let mut root = SlackMessage {
+            ts: "1.0".to_string(),
+            text: Some("Deployment status".to_string()),
+            subscribed: Some(false),
+            unread_count: Some(0),
+            ..Default::default()
+        };
+        root.reply_count = Some(1);
+        let reply = SlackMessage {
+            ts: "2.0".to_string(),
+            thread_ts: Some("1.0".to_string()),
+            ..Default::default()
+        };
+        let mut catalog = ThreadCatalog::default();
+        catalog.observe_thread("C1", "1.0", &[root, reply], true);
+
+        let items = build_unread_activity_items(
+            &[conversation],
+            &HashMap::new(),
+            None,
+            &catalog,
+            &HashSet::new(),
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread_ts.as_deref(), Some("1.0"));
+        assert_eq!(items[0].unread_count, 1);
+    }
+
+    #[test]
+    fn mixed_visible_and_hidden_identities_partition_by_owner() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        for message_ts in ["2.0", "3.0", "4.0"] {
+            conversation.observe_attention_message_at(message_ts, true);
+        }
+        let mut catalog = ThreadCatalog::default();
+        for (root_ts, reply_ts) in [("1.0", "2.0"), ("1.5", "3.0")] {
+            catalog.observe_thread(
+                "C1",
+                root_ts,
+                &[
+                    SlackMessage {
+                        ts: root_ts.to_string(),
+                        text: Some(format!("Thread {root_ts}")),
+                        subscribed: Some(false),
+                        ..Default::default()
+                    },
+                    SlackMessage {
+                        ts: reply_ts.to_string(),
+                        thread_ts: Some(root_ts.to_string()),
+                        ..Default::default()
+                    },
+                ],
+                true,
+            );
+        }
+        let visible = HashSet::from([("C1".to_string(), "4.0".to_string())]);
+
+        let items =
+            build_unread_activity_items(&[conversation], &HashMap::new(), None, &catalog, &visible);
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.thread_ts.is_none())
+                .map(|item| item.unread_count),
+            Some(1)
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.thread_ts.is_some())
+                .map(|item| item.unread_count)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+    }
+
+    #[test]
+    fn subscribed_thread_attention_merges_by_maximum_count() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("2.0", true);
+        let mut catalog = ThreadCatalog::default();
+        catalog.observe_thread(
+            "C1",
+            "1.0",
+            &[
+                SlackMessage {
+                    ts: "1.0".to_string(),
+                    subscribed: Some(true),
+                    unread_count: Some(2),
+                    ..Default::default()
+                },
+                SlackMessage {
+                    ts: "2.0".to_string(),
+                    thread_ts: Some("1.0".to_string()),
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+
+        let items = build_unread_activity_items(
+            &[conversation],
+            &HashMap::new(),
+            None,
+            &catalog,
+            &HashSet::new(),
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread_ts.as_deref(), Some("1.0"));
+        assert_eq!(items[0].unread_count, 2);
+    }
+
+    #[test]
+    fn unknown_exact_identity_keeps_channel_fallback() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("2.0", true);
+
+        let items = build_unread_activity_items(
+            &[conversation],
+            &HashMap::new(),
+            None,
+            &ThreadCatalog::default(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(items.len(), 1);
+        assert!(items[0].thread_ts.is_none());
+        assert_eq!(items[0].unread_count, 1);
     }
 }

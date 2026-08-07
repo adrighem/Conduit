@@ -31,9 +31,9 @@ use crate::message_handoff::{
     ResolvedMessageHandoff,
 };
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
-    SlackConversationUnreadSnapshot, SlackFile, SlackMessage, SlackUnreadState, SlackUser,
-    SlackUserStatus, StoredToken,
+    slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
+    SlackConversation, SlackConversationUnreadSnapshot, SlackFile, SlackMessage, SlackUnreadState,
+    SlackUser, SlackUserStatus, StoredToken,
 };
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::ConversationHistoryService;
@@ -196,6 +196,10 @@ pub enum RuntimeCommand {
         control_handle: MessageControlHandle,
     },
     MarkConversationRead {
+        channel_id: String,
+        ts: String,
+    },
+    MarkConversationReadAll {
         channel_id: String,
         ts: String,
     },
@@ -616,6 +620,10 @@ impl RuntimeCommand {
                 RuntimeTaskLane::Interactive,
             ),
             Self::MarkConversationRead { channel_id, .. } => RuntimeCommandDescriptor::request(
+                channel(RuntimeOperation::ReadMarker, channel_id),
+                RuntimeTaskLane::Interactive,
+            ),
+            Self::MarkConversationReadAll { channel_id, .. } => RuntimeCommandDescriptor::mutation(
                 channel(RuntimeOperation::ReadMarker, channel_id),
                 RuntimeTaskLane::Interactive,
             ),
@@ -4324,8 +4332,27 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 context.read_marks,
                 context.workspace_store,
                 context.workspace,
-                &channel_id,
-                &ts,
+                ConversationReadRequest {
+                    channel_id: &channel_id,
+                    latest_ts: &ts,
+                    mode: ConversationReadMode::ThroughVisible,
+                },
+            )
+            .await;
+        }
+        RuntimeCommand::MarkConversationReadAll { channel_id, ts } => {
+            let api = require_slack(context.slack)?;
+            mark_conversation_read_best_effort(
+                api,
+                context.events,
+                context.read_marks,
+                context.workspace_store,
+                context.workspace,
+                ConversationReadRequest {
+                    channel_id: &channel_id,
+                    latest_ts: &ts,
+                    mode: ConversationReadMode::All,
+                },
             )
             .await;
         }
@@ -5408,9 +5435,10 @@ async fn persist_socket_attention(
     let channel_id = &message_event.channel_id;
     let message = &message_event.message;
     match store
-        .accept_attention_delivery(
+        .accept_attention_delivery_for_message(
             channel_id,
             &message.ts,
+            message.thread_root_ts(),
             decision.record_unread,
             decision.send_notification,
         )
@@ -6240,24 +6268,48 @@ async fn publish_history_snapshot_with_completion(
     Ok(reductions)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConversationReadMode {
+    ThroughVisible,
+    All,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConversationReadRequest<'a> {
+    channel_id: &'a str,
+    latest_ts: &'a str,
+    mode: ConversationReadMode,
+}
+
 async fn mark_conversation_read_best_effort(
     api: &SlackApi,
     events: &RuntimeEventSender,
     read_marks: &mut HashMap<String, String>,
     workspace_store: &Option<WorkspaceStore>,
     workspace: &WorkspaceReducerAdapter,
-    channel_id: &str,
-    latest_ts: &str,
+    request: ConversationReadRequest<'_>,
 ) {
+    let ConversationReadRequest {
+        channel_id,
+        latest_ts,
+        mode,
+    } = request;
     if channel_id.trim().is_empty() || latest_ts.trim().is_empty() {
         return;
     }
 
-    if read_marks
-        .get(channel_id)
-        .is_some_and(|marked_ts| marked_ts.as_str() >= latest_ts)
-    {
-        publish_local_read_marker(events, workspace_store, workspace, channel_id, latest_ts).await;
+    if read_marks.get(channel_id).is_some_and(|marked_ts| {
+        marked_ts == latest_ts || slack_timestamp_is_after(marked_ts, latest_ts)
+    }) {
+        publish_local_read_marker(
+            events,
+            workspace_store,
+            workspace,
+            channel_id,
+            latest_ts,
+            mode,
+        )
+        .await;
         return;
     }
 
@@ -6280,7 +6332,15 @@ async fn mark_conversation_read_best_effort(
     }
 
     read_marks.insert(channel_id.to_string(), latest_ts.to_string());
-    publish_local_read_marker(events, workspace_store, workspace, channel_id, latest_ts).await;
+    publish_local_read_marker(
+        events,
+        workspace_store,
+        workspace,
+        channel_id,
+        latest_ts,
+        mode,
+    )
+    .await;
 }
 
 async fn publish_local_read_marker(
@@ -6289,17 +6349,25 @@ async fn publish_local_read_marker(
     workspace: &WorkspaceReducerAdapter,
     channel_id: &str,
     latest_ts: &str,
+    mode: ConversationReadMode,
 ) {
+    let mutation = match mode {
+        ConversationReadMode::ThroughVisible => WorkspaceMutation::ReadAdvanced {
+            channel_id: channel_id.to_string(),
+            ts: latest_ts.to_string(),
+            remaining_unread: 0,
+        },
+        ConversationReadMode::All => WorkspaceMutation::ConversationReadAll {
+            channel_id: channel_id.to_string(),
+            ts: latest_ts.to_string(),
+        },
+    };
     if let Err(error) = workspace
         .apply_persisted_and_publish(
             workspace_store.as_ref(),
             events,
             MutationOrigin::Local,
-            WorkspaceMutation::ReadAdvanced {
-                channel_id: channel_id.to_string(),
-                ts: latest_ts.to_string(),
-                remaining_unread: 0,
-            },
+            mutation,
         )
         .await
     {
@@ -7520,7 +7588,15 @@ mod tests {
                 .await
                 .unwrap();
             let workspace_store = Some(store.clone());
-            publish_local_read_marker(&events, &workspace_store, &workspace, "C1", "20.0").await;
+            publish_local_read_marker(
+                &events,
+                &workspace_store,
+                &workspace,
+                "C1",
+                "20.0",
+                ConversationReadMode::All,
+            )
+            .await;
             view.conversations
                 .borrow_mut()
                 .advance_read_cursor("C1", "20.0", 0);
@@ -8879,8 +8955,14 @@ mod tests {
 
             let admission = workspace.store_batch_admission.lock().await;
             let workspace_store = Some(store.clone());
-            let local_read =
-                publish_local_read_marker(&events, &workspace_store, &workspace, "C1", "20.0");
+            let local_read = publish_local_read_marker(
+                &events,
+                &workspace_store,
+                &workspace,
+                "C1",
+                "20.0",
+                ConversationReadMode::All,
+            );
             tokio::pin!(local_read);
             assert!(matches!(
                 futures_util::poll!(&mut local_read),
@@ -13678,6 +13760,14 @@ mod tests {
         .descriptor();
         assert_eq!(interactive.lane, RuntimeTaskLane::Interactive);
         assert!(interactive.supersedes_previous);
+
+        let explicit_mark_all = RuntimeCommand::MarkConversationReadAll {
+            channel_id: "C123".to_string(),
+            ts: "1710000000.000100".to_string(),
+        }
+        .descriptor();
+        assert_eq!(explicit_mark_all.lane, RuntimeTaskLane::Interactive);
+        assert!(!explicit_mark_all.supersedes_previous);
 
         let permalink = RuntimeCommand::ResolveMessagePermalink {
             channel_id: "C123".to_string(),

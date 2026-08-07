@@ -103,6 +103,7 @@
   let automaticPositioning = false;
   let userInteracted = false;
   let readMarkerArmed = false;
+  let updateReadMarker = null;
 
   function notifyHost(action) {
     if (generation !== null) {
@@ -186,71 +187,162 @@
     return left.localeCompare(right) > 0;
   }
 
+  function configureReadMarker(readMarkerUrl, firstUnreadTs) {
+    if (!timeline) return;
+    const url = typeof readMarkerUrl === "string" ? readMarkerUrl : "";
+    const firstUnread = typeof firstUnreadTs === "string" ? firstUnreadTs : "";
+    if (url) timeline.dataset.readMarkerUrl = url;
+    else delete timeline.dataset.readMarkerUrl;
+    if (firstUnread) timeline.dataset.firstUnreadTs = firstUnread;
+    else delete timeline.dataset.firstUnreadTs;
+    if (updateReadMarker) updateReadMarker(url, firstUnread);
+  }
+
   function armReadMarker() {
-    if (readMarkerArmed || !timeline || !timeline.dataset.readMarkerUrl) return;
+    if (readMarkerArmed || !timeline) return;
     readMarkerArmed = true;
     if (!("IntersectionObserver" in window)) return;
-    const readMarkerUrl = timeline.dataset.readMarkerUrl;
-    const sentinel = document.getElementById("timeline-read-sentinel");
-    if (sentinel) {
-      const sentinelObserver = new IntersectionObserver(function (entries) {
-        if (!entries.some(function (entry) { return entry.isIntersecting; })) return;
-        sentinelObserver.disconnect();
-        window.location.href = readMarkerUrl;
-      }, { threshold: 1.0 });
-      sentinelObserver.observe(sentinel);
-      return;
-    }
-
+    let readMarkerUrl = "";
+    let readMarkerIdentity = "";
+    let firstUnreadTs = "";
+    let isThreadRead = false;
+    let readEnabled = false;
+    let configurationLastSent = "";
     let lastSent = "";
+    let pending = "";
     let timer = 0;
     const visible = new Set();
+    const observed = new Set();
+
+    function readMarkerDescriptor(url) {
+      if (!url) return { identity: "", thread: false };
+      try {
+        const target = new URL(url);
+        const thread = target.searchParams.has("thread_ts");
+        target.searchParams.delete("ts");
+        return { identity: target.toString(), thread: thread };
+      } catch (_) {
+        return { identity: "", thread: false };
+      }
+    }
+
+    function newestVisibleTimestamp() {
+      if (!readEnabled) return "";
+      const timestamps = [];
+      visible.forEach(function (message) {
+        if (!message.isConnected) {
+          visible.delete(message);
+          return;
+        }
+        const ts = message.dataset.messageTs;
+        if (!ts) return;
+        if (!isThreadRead && timestampAfter(firstUnreadTs, ts)) return;
+        if (configurationLastSent && !timestampAfter(ts, configurationLastSent)) return;
+        timestamps.push(ts);
+      });
+      return timestamps.sort().pop() || "";
+    }
+
+    function advanceUnreadSeparator(newest) {
+      const message = Array.from(document.querySelectorAll("[data-message-ts]")).find(function (item) {
+        return item.dataset.messageTs === newest;
+      });
+      const currentItem = message ? message.closest(".message-list-item") : null;
+      let nextItem = currentItem ? currentItem.nextElementSibling : null;
+      while (nextItem && !nextItem.classList.contains("message-list-item")) {
+        nextItem = nextItem.nextElementSibling;
+      }
+      const separator = document.querySelector(".unread-separator");
+      if (separator && nextItem) nextItem.before(separator);
+      else if (separator) separator.remove();
+    }
+
     function schedule() {
+      const newest = newestVisibleTimestamp();
+      if (!newest) {
+        pending = "";
+        window.clearTimeout(timer);
+        timer = 0;
+        return;
+      }
+      if (timer && pending === newest) return;
+      pending = newest;
       window.clearTimeout(timer);
       timer = window.setTimeout(function () {
-        const newest = Array.from(visible).sort().pop();
-        if (!newest || !timestampAfter(newest, lastSent)) return;
-        lastSent = newest;
-        const ordered = Array.from(document.querySelectorAll("[data-message-ts]"));
-        const currentIndex = ordered.findIndex(function (message) {
-          return message.dataset.messageTs === newest;
-        });
-        const next = currentIndex >= 0 ? ordered[currentIndex + 1] : null;
-        const separator = document.querySelector(".unread-separator");
-        if (separator && next) next.before(separator);
-        else if (separator) separator.remove();
+        timer = 0;
+        const candidate = pending;
+        pending = "";
+        if (
+          newestVisibleTimestamp() !== candidate ||
+          (configurationLastSent && !timestampAfter(candidate, configurationLastSent))
+        ) {
+          schedule();
+          return;
+        }
+        configurationLastSent = candidate;
+        if (!lastSent || timestampAfter(candidate, lastSent)) lastSent = candidate;
+        advanceUnreadSeparator(candidate);
         const target = new URL(readMarkerUrl);
-        target.searchParams.set("ts", newest);
+        target.searchParams.set("ts", candidate);
         window.location.href = target.toString();
       }, 500);
     }
+
     const observer = new IntersectionObserver(function (entries) {
       entries.forEach(function (entry) {
         const ts = entry.target.dataset.messageTs;
         if (!ts) return;
-        if (entry.isIntersecting) visible.add(ts); else visible.delete(ts);
+        if (entry.intersectionRatio >= 0.90) visible.add(entry.target);
+        else visible.delete(entry.target);
       });
       schedule();
     }, { threshold: 0.90 });
-    function observeUnreadMessages() {
-      const boundary = document.querySelector(".unread-separator");
-      if (!boundary) return;
-      let afterBoundary = false;
-      document.querySelectorAll(".unread-separator, [data-message-ts]").forEach(function (node) {
-        if (node.classList.contains("unread-separator")) {
-          afterBoundary = true;
-          return;
-        }
-        if (afterBoundary && !node.dataset.readObserved) {
-          node.dataset.readObserved = "true";
-          observer.observe(node);
-        }
-      });
+
+    function applyReadMarkerConfiguration(url, unreadTs) {
+      const descriptor = readMarkerDescriptor(url);
+      const enabled = Boolean(descriptor.identity) && (descriptor.thread || Boolean(unreadTs));
+      const changed =
+        descriptor.identity !== readMarkerIdentity ||
+        unreadTs !== firstUnreadTs ||
+        enabled !== readEnabled;
+      readMarkerUrl = url;
+      readMarkerIdentity = descriptor.identity;
+      firstUnreadTs = unreadTs;
+      isThreadRead = descriptor.thread;
+      readEnabled = enabled;
+      if (changed) {
+        configurationLastSent = "";
+        pending = "";
+        window.clearTimeout(timer);
+        timer = 0;
+      }
+      schedule();
     }
-    observeUnreadMessages();
+
+    function observeMessages() {
+      observed.forEach(function (message) {
+        if (message.isConnected) return;
+        observer.unobserve(message);
+        observed.delete(message);
+        visible.delete(message);
+      });
+      document.querySelectorAll("[data-message-ts]").forEach(function (message) {
+        if (observed.has(message)) return;
+        observed.add(message);
+        observer.observe(message);
+      });
+      schedule();
+    }
+
+    updateReadMarker = applyReadMarkerConfiguration;
+    applyReadMarkerConfiguration(
+      timeline.dataset.readMarkerUrl || "",
+      timeline.dataset.firstUnreadTs || ""
+    );
+    observeMessages();
     const list = document.querySelector(".message-list");
     if (list) {
-      new MutationObserver(observeUnreadMessages).observe(list, {
+      new MutationObserver(observeMessages).observe(list, {
         childList: true,
         subtree: true
       });
@@ -429,6 +521,11 @@
 
   function applyTimelinePatch(patch, arrivalVisible) {
     if (!patch || typeof patch.type !== "string") return false;
+    if (patch.type === "configure-read-state") {
+      configureReadMarker(patch.read_marker_url, patch.first_unread_ts);
+      return true;
+    }
+
     if (patch.type === "replace-snapshot") {
         const list = document.querySelector(".message-list");
         if (

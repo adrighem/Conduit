@@ -156,8 +156,14 @@ impl SlackConversation {
     }
 
     pub(crate) fn set_local_read_ts(&mut self, ts: &str) {
-        self.extra
-            .insert(LOCAL_READ_TS_KEY.to_string(), Value::String(ts.to_string()));
+        if !ts.trim().is_empty()
+            && self
+                .local_read_ts()
+                .is_none_or(|current| slack_timestamp_is_after(ts, current))
+        {
+            self.extra
+                .insert(LOCAL_READ_TS_KEY.to_string(), Value::String(ts.to_string()));
+        }
     }
 
     pub(crate) fn clear_local_read_ts(&mut self) {
@@ -192,16 +198,29 @@ impl SlackConversation {
     }
 
     pub fn advance_read_cursor(&mut self, ts: &str, remaining_unread: u64) {
-        self.extra
-            .insert("last_read".to_string(), Value::String(ts.to_string()));
-        self.apply_unread_state(SlackUnreadState::from_parts(
+        self.advance_raw_read_cursor(ts, remaining_unread);
+        self.acknowledge_attention_through(ts);
+        if remaining_unread == 0 && self.attention.is_none() {
+            self.clear_attention_activity();
+        }
+    }
+
+    pub(crate) fn advance_raw_read_cursor(&mut self, ts: &str, remaining_unread: u64) {
+        self.advance_read_cursor_position(ts);
+        self.apply_unread_state_preserving_attention(SlackUnreadState::from_parts(
             true,
             remaining_unread > 0,
             remaining_unread,
         ));
-        self.acknowledge_attention_through(ts);
-        if remaining_unread == 0 && self.attention.is_none() {
-            self.clear_attention_activity();
+    }
+
+    pub(crate) fn advance_read_cursor_position(&mut self, ts: &str) {
+        if self
+            .last_read_ts()
+            .is_none_or(|current| slack_timestamp_is_after(ts, current))
+        {
+            self.extra
+                .insert("last_read".to_string(), Value::String(ts.to_string()));
         }
     }
 
@@ -317,6 +336,16 @@ impl SlackConversation {
             })
     }
 
+    pub(crate) fn tracked_unread_message_timestamps(&self) -> Option<Vec<&str>> {
+        self.attention.as_ref().and_then(|state| {
+            if state.unread_count > 0 && state.unread_message_ts.is_empty() {
+                None
+            } else {
+                Some(state.unread_message_ts.iter().map(String::as_str).collect())
+            }
+        })
+    }
+
     pub(crate) fn observe_attention_message_at(
         &mut self,
         message_ts: &str,
@@ -410,6 +439,14 @@ impl SlackConversation {
     }
 
     pub fn apply_unread_state(&mut self, state: SlackUnreadState) {
+        self.apply_unread_state_preserving_attention(state);
+        if !state.known {
+            return;
+        }
+        self.reconcile_attention_with_raw(state);
+    }
+
+    fn apply_unread_state_preserving_attention(&mut self, state: SlackUnreadState) {
         if !state.known {
             return;
         }
@@ -423,7 +460,10 @@ impl SlackConversation {
             "has_unreads".to_string(),
             serde_json::json!(state.has_unread),
         );
-        self.reconcile_attention_with_raw(state);
+        if let Some(attention) = self.attention.as_mut() {
+            attention.raw_unread_count = state.display_count;
+            attention.raw_has_unread = state.has_unread;
+        }
     }
 
     fn reconcile_attention_with_raw(&mut self, raw: SlackUnreadState) {
@@ -433,6 +473,7 @@ impl SlackConversation {
         if !raw.has_unread {
             attention.unread_count = 0;
             attention.has_unread = false;
+            attention.unread_message_ts.clear();
         }
         attention.raw_unread_count = raw.display_count;
         attention.raw_has_unread = raw.has_unread;
@@ -474,6 +515,36 @@ impl SlackConversation {
             self.extra
                 .insert("is_open".to_string(), serde_json::json!(is_open));
         }
+    }
+
+    pub(crate) fn apply_unread_snapshot_preserving_attention_messages(
+        &mut self,
+        snapshot: &SlackConversationUnreadSnapshot,
+        preserved_message_ts: &[String],
+    ) {
+        let preserved = self
+            .attention
+            .as_ref()
+            .map(|attention| {
+                attention
+                    .unread_message_ts
+                    .iter()
+                    .filter(|message_ts| preserved_message_ts.contains(message_ts))
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        self.apply_unread_snapshot(snapshot);
+        if snapshot.unread_state.has_unread || preserved.is_empty() {
+            return;
+        }
+        let Some(attention) = self.attention.as_mut() else {
+            return;
+        };
+        attention.unread_message_ts = preserved;
+        attention.unread_count =
+            u64::try_from(attention.unread_message_ts.len()).unwrap_or(u64::MAX);
+        attention.has_unread = attention.unread_count > 0;
     }
 
     pub fn is_muted_conversation(&self) -> bool {
@@ -2436,6 +2507,26 @@ mod tests {
     }
 
     #[test]
+    fn raw_zero_preserves_exact_tracked_attention_identities() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            unread_count: Some(2),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("1.0", true);
+        conversation.observe_attention_message_at("2.0", true);
+
+        conversation.advance_raw_read_cursor("3.0", 0);
+
+        assert_eq!(conversation.raw_unread_activity_count(), 0);
+        assert_eq!(conversation.unread_activity_count(), 2);
+        assert_eq!(
+            conversation.tracked_unread_message_timestamps(),
+            Some(vec!["1.0", "2.0"])
+        );
+    }
+
+    #[test]
     fn acknowledging_attention_messages_preserves_other_unreads_and_raw_state() {
         let mut conversation = SlackConversation {
             id: "C1".to_string(),
@@ -2472,6 +2563,7 @@ mod tests {
         );
         assert_eq!(conversation.unread_activity_count(), 2);
         assert!(conversation.has_unread_activity());
+        assert_eq!(conversation.tracked_unread_message_timestamps(), None);
     }
 
     #[test]

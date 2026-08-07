@@ -1208,16 +1208,11 @@ impl WorkspaceStore {
                 .latest_message_ts()
                 .is_none_or(|latest| latest <= last_read.as_str());
             if reached_latest {
-                conversation.clear_raw_unread_activity();
-                if conversation.attention.is_none() {
-                    conversation.clear_attention_activity();
-                }
+                conversation.advance_raw_read_cursor(&last_read, 0);
+            } else {
+                conversation.advance_read_cursor_position(&last_read);
             }
             conversation.acknowledge_attention_through(&last_read);
-            conversation.extra.insert(
-                "last_read".to_string(),
-                serde_json::Value::String(last_read.clone()),
-            );
             conversation.set_local_read_ts(&last_read);
         })
         .await
@@ -1329,10 +1324,29 @@ impl WorkspaceStore {
     /// Atomically records a classified message and, when requested, claims its
     /// native-notification identity. This keeps a restart between the two
     /// writes from turning one realtime delivery into divergent state.
+    #[cfg(test)]
     pub async fn accept_attention_delivery(
         &self,
         channel_id: &str,
         message_ts: &str,
+        record_unread: bool,
+        claim_notification: bool,
+    ) -> Result<AttentionDeliveryOutcome> {
+        self.accept_attention_delivery_for_message(
+            channel_id,
+            message_ts,
+            None,
+            record_unread,
+            claim_notification,
+        )
+        .await
+    }
+
+    pub async fn accept_attention_delivery_for_message(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+        thread_root_ts: Option<&str>,
         record_unread: bool,
         claim_notification: bool,
     ) -> Result<AttentionDeliveryOutcome> {
@@ -1348,6 +1362,9 @@ impl WorkspaceStore {
         let workspace_id = self.workspace_id.clone();
         let channel_id = channel_id.to_string();
         let message_ts = message_ts.to_string();
+        let thread_root_ts = thread_root_ts
+            .filter(|root_ts| !root_ts.trim().is_empty() && *root_ts != message_ts)
+            .map(ToString::to_string);
         self.hub()
             .await?
             .write(move |connection| {
@@ -1359,9 +1376,20 @@ impl WorkspaceStore {
                             id: channel_id.clone(),
                             ..Default::default()
                         });
-                if conversation.local_read_ts().is_some_and(|last_read| {
-                    !slack_timestamp_is_after(message_ts.as_str(), last_read)
-                }) {
+                let at_or_before_read_cursor = if let Some(root_ts) = thread_root_ts.as_deref() {
+                    let records =
+                        load_sqlite_kind_values(&transaction, &workspace_key, "thread_record")?;
+                    ThreadCatalog::from_records(records).reply_is_acknowledged(
+                        &channel_id,
+                        root_ts,
+                        &message_ts,
+                    )
+                } else {
+                    conversation.local_read_ts().is_some_and(|last_read| {
+                        !slack_timestamp_is_after(message_ts.as_str(), last_read)
+                    })
+                };
+                if at_or_before_read_cursor {
                     transaction.rollback()?;
                     return Ok(AttentionDeliveryOutcome {
                         observation: AttentionObservationStatus::AtOrBeforeReadCursor,
@@ -7635,6 +7663,79 @@ mod tests {
                 .unwrap());
             let conversations = store.load_conversations().await.unwrap().unwrap();
             assert_eq!(conversations[0].unread_activity_count(), 1);
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn realtime_reply_uses_thread_cursor_instead_of_newer_channel_cursor() {
+        let directory = temp_cache_dir("workspace-store-thread-read-ordering");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_conversations(&[SlackConversation {
+                    id: "C1".to_string(),
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            store
+                .clear_conversation_unread_state("C1", "20.0")
+                .await
+                .unwrap();
+            let mut catalog = ThreadCatalog::default();
+            catalog.observe_thread(
+                "C1",
+                "1.0",
+                &[SlackMessage {
+                    ts: "1.0".to_string(),
+                    last_read: Some("5.0".to_string()),
+                    unread_count: Some(0),
+                    ..Default::default()
+                }],
+                false,
+            );
+            store
+                .store_thread_catalog(&catalog.clone().into_records())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .accept_attention_delivery_for_message("C1", "10.0", Some("1.0"), true, true,)
+                    .await
+                    .unwrap(),
+                AttentionDeliveryOutcome {
+                    observation: AttentionObservationStatus::Accepted,
+                    notification_claimed: true,
+                }
+            );
+
+            let mut read_through_reply = SlackMessage {
+                ts: "1.0".to_string(),
+                last_read: Some("15.0".to_string()),
+                unread_count: Some(0),
+                ..Default::default()
+            };
+            read_through_reply.latest_reply = Some("15.0".to_string());
+            catalog.observe_thread("C1", "1.0", &[read_through_reply], false);
+            store
+                .store_thread_catalog(&catalog.into_records())
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .accept_attention_delivery_for_message("C1", "12.0", Some("1.0"), true, true,)
+                    .await
+                    .unwrap(),
+                AttentionDeliveryOutcome {
+                    observation: AttentionObservationStatus::AtOrBeforeReadCursor,
+                    notification_claimed: false,
+                }
+            );
         });
 
         let _ = std::fs::remove_dir_all(directory);

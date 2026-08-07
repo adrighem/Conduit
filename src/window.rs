@@ -4000,6 +4000,52 @@ fn first_unread_message_ts(
     resolve_first_unread_message_ts(messages, last_read, unread_count)
 }
 
+/// `None` means the identity ledger is incomplete and aggregate fallback is required.
+/// `Some(None)` means all classified unread identities are hidden from this channel timeline.
+fn exact_first_visible_unread_message_ts(
+    conversation: &SlackConversation,
+    messages: &[SlackMessage],
+) -> Option<Option<String>> {
+    let tracked = conversation.tracked_unread_message_timestamps()?;
+    let unread_count = conversation.unread_activity_count();
+    if unread_count == 0 {
+        return (!conversation.has_unread_activity()).then_some(None);
+    }
+    if u64::try_from(tracked.len()).unwrap_or(u64::MAX) != unread_count {
+        return None;
+    }
+    let tracked = tracked.into_iter().collect::<HashSet<_>>();
+    Some(
+        messages
+            .iter()
+            .map(|message| message.ts.as_str())
+            .filter(|message_ts| tracked.contains(message_ts))
+            .min()
+            .map(ToString::to_string),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConversationReadPresentationSignature {
+    has_unread: bool,
+    unread_count: u64,
+    last_read: Option<String>,
+    tracked_message_ts: Option<Vec<String>>,
+}
+
+impl ConversationReadPresentationSignature {
+    fn from_conversation(conversation: &SlackConversation) -> Self {
+        Self {
+            has_unread: conversation.has_unread_activity(),
+            unread_count: conversation.unread_activity_count(),
+            last_read: conversation.last_read_ts().map(ToString::to_string),
+            tracked_message_ts: conversation
+                .tracked_unread_message_timestamps()
+                .map(|values| values.into_iter().map(ToString::to_string).collect()),
+        }
+    }
+}
+
 fn timeline_scroll_behavior(behavior: WorkspaceScrollBehavior) -> TimelineScrollBehavior {
     match behavior {
         WorkspaceScrollBehavior::PreservePrepend => TimelineScrollBehavior::PreservePrepend,
@@ -10025,6 +10071,14 @@ impl ConduitWindow {
 
     fn apply_workspace_patch(&self, patch: &crate::workspace_pipeline::WorkspacePatch) {
         let selected_before = self.selected_channel_id();
+        let selected_read_before = selected_before.as_deref().and_then(|channel_id| {
+            self.imp()
+                .workspace
+                .conversations
+                .borrow()
+                .get(channel_id)
+                .map(ConversationReadPresentationSignature::from_conversation)
+        });
         let pending_before = self.imp().pending_last_conversation.borrow().clone();
         let revision = patch.revision();
         let application = {
@@ -10049,6 +10103,18 @@ impl ConduitWindow {
                 local_reads.remove(channel_id);
             }
         }
+        let selected_after = self.selected_channel_id();
+        let selected_read_after = selected_after.as_deref().and_then(|channel_id| {
+            self.imp()
+                .workspace
+                .conversations
+                .borrow()
+                .get(channel_id)
+                .map(ConversationReadPresentationSignature::from_conversation)
+        });
+        let visible_read_state_changed = selected_before == selected_after
+            && selected_read_before != selected_read_after
+            && self.current_main_view() == MainMessageView::Conversation;
         if application.users_reset() || !application.changed_user_ids().is_empty() {
             self.sync_workspace_user_projection(
                 application.users_reset(),
@@ -10102,6 +10168,41 @@ impl ConduitWindow {
                 _ => {}
             }
         }
+        if visible_read_state_changed {
+            if application.timeline_changes().is_empty() {
+                self.reconcile_current_conversation_snapshot();
+            } else {
+                self.configure_current_conversation_read_state(revision);
+            }
+        }
+    }
+
+    fn configure_current_conversation_read_state(&self, revision: WorkspaceRevision) {
+        let projection = {
+            let view = self.imp().workspace.view.borrow();
+            if view.main_view() != MainMessageView::Conversation {
+                None
+            } else {
+                view.last_channel_id().map(|channel_id| {
+                    (
+                        channel_id.to_string(),
+                        view.channel_messages(channel_id).to_vec(),
+                    )
+                })
+            }
+        };
+        let Some((channel_id, messages)) = projection else {
+            return;
+        };
+        let mut context = self.message_html_context(None);
+        self.configure_conversation_read_context(&channel_id, &messages, &mut context);
+        self.apply_timeline_patch_at_revision(
+            TimelineSurface::Main,
+            revision,
+            message_html::configure_read_state_patch(&context),
+            TimelineScrollBehavior::Preserve,
+            UiInvalidations::MAIN,
+        );
     }
 
     fn sync_workspace_user_projection(&self, reset: bool, changed_user_ids: &[String]) {
@@ -10986,7 +11087,7 @@ impl ConduitWindow {
                 .map(ToString::to_string)
         });
         if let Some(ts) = latest {
-            self.send_command(RuntimeCommand::MarkConversationRead {
+            self.send_command(RuntimeCommand::MarkConversationReadAll {
                 channel_id: channel_id.to_string(),
                 ts,
             });
@@ -12028,7 +12129,13 @@ impl ConduitWindow {
         );
         let imp = self.imp();
         self.withdraw_conversation_notification(channel_id);
-        let (has_unread, last_read, unread_count) = imp
+        let current_messages = imp
+            .workspace
+            .view
+            .borrow()
+            .channel_messages(channel_id)
+            .to_vec();
+        let (has_unread, last_read, unread_count, exact_first_unread) = imp
             .workspace
             .conversations
             .borrow()
@@ -12042,29 +12149,33 @@ impl ConduitWindow {
                         .cloned()
                         .or_else(|| conversation.last_read_ts().map(ToString::to_string)),
                     conversation.unread_activity_count(),
+                    exact_first_visible_unread_message_ts(conversation, &current_messages),
                 )
             })
             .unwrap_or_default();
-        imp.conversation_opening.borrow_mut().begin(
-            channel_id,
+        let open_intent = if explicit_message_ts.is_some() {
             ConversationOpenIntent::choose(
                 explicit_message_ts,
                 has_unread,
                 last_read.as_deref(),
                 unread_count,
-            ),
-        );
+            )
+        } else if let Some(first_unread) = exact_first_unread {
+            first_unread.map_or(
+                ConversationOpenIntent::Latest,
+                ConversationOpenIntent::Message,
+            )
+        } else {
+            ConversationOpenIntent::choose(None, has_unread, last_read.as_deref(), unread_count)
+        };
+        imp.conversation_opening
+            .borrow_mut()
+            .begin(channel_id, open_intent);
         let outcome = imp
             .workspace
             .view
             .borrow_mut()
             .select_conversation(channel_id);
-        let current_messages = imp
-            .workspace
-            .view
-            .borrow()
-            .channel_messages(channel_id)
-            .to_vec();
         imp.message_title.set_title(title);
         self.refresh_conversation_title_status(channel_id);
         self.restore_channel_draft(channel_id);
@@ -12142,32 +12253,7 @@ impl ConduitWindow {
         if !imp.workspace.view.borrow().has_channel_context(channel_id) {
             context.load_more_url = self.channel_load_more_url(channel_id);
         }
-        let (has_unread, last_read, unread_count) = imp
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    imp.local_read_ts_by_channel
-                        .borrow()
-                        .get(channel_id)
-                        .cloned()
-                        .or_else(|| conversation.last_read_ts().map(ToString::to_string)),
-                    conversation.unread_activity_count(),
-                )
-            })
-            .unwrap_or_default();
-        let first_unread_ts = has_unread
-            .then(|| first_unread_message_ts(&messages, last_read.as_deref(), unread_count))
-            .flatten();
-        if context.thread_ts.is_none() {
-            context.read_marker_url = Some(message_html::mark_read_action_url(channel_id, "0"));
-        }
-        if first_unread_ts.is_some() {
-            context.first_unread_ts = first_unread_ts.clone();
-        }
+        self.configure_conversation_read_context(channel_id, &messages, &mut context);
         context.timeline_scroll = scroll_behavior;
         let active_open_generation = imp
             .conversation_opening
@@ -12247,16 +12333,52 @@ impl ConduitWindow {
                 },
             );
             if !loaded {
-                self.apply_timeline_patch_at_revision(
+                self.apply_timeline_patches_at_revision(
                     TimelineSurface::Main,
                     revision,
-                    message_html::conversation_snapshot_patch(channel_id, &messages, &context),
+                    vec![
+                        message_html::conversation_snapshot_patch(channel_id, &messages, &context),
+                        message_html::configure_read_state_patch(&context),
+                    ],
                     context.timeline_scroll,
                     UiInvalidations::MAIN,
                 );
             }
         }
         self.queue_history_asset_followups(channel_id, messages);
+    }
+
+    fn configure_conversation_read_context(
+        &self,
+        channel_id: &str,
+        messages: &[SlackMessage],
+        context: &mut MessageHtmlContext,
+    ) {
+        let imp = self.imp();
+        let (has_unread, last_read, unread_count, exact_first_unread) = imp
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .map(|conversation| {
+                (
+                    conversation.has_unread_activity(),
+                    imp.local_read_ts_by_channel
+                        .borrow()
+                        .get(channel_id)
+                        .cloned()
+                        .or_else(|| conversation.last_read_ts().map(ToString::to_string)),
+                    conversation.unread_activity_count(),
+                    exact_first_visible_unread_message_ts(conversation, messages),
+                )
+            })
+            .unwrap_or_default();
+        context.read_marker_url = Some(message_html::mark_read_action_url(channel_id, "0"));
+        context.first_unread_ts = exact_first_unread.unwrap_or_else(|| {
+            has_unread
+                .then(|| first_unread_message_ts(messages, last_read.as_deref(), unread_count))
+                .flatten()
+        });
     }
 
     fn reconcile_current_conversation_snapshot(&self) {
@@ -13231,23 +13353,25 @@ impl ConduitWindow {
         let conversations = imp.workspace.conversations.borrow().conversations();
         let user_names = imp.user_names.borrow();
         let current_user_id = imp.current_user_id.borrow();
-        let mut items =
-            activity::build_activity_items(&conversations, &user_names, current_user_id.as_deref());
-        let conversation_titles = conversations
+        let visible_message_ts = conversations
             .iter()
-            .map(|conversation| {
-                (
-                    conversation.id.clone(),
-                    conversation.display_name_with_users(&user_names, current_user_id.as_deref()),
-                )
+            .flat_map(|conversation| {
+                imp.workspace
+                    .view
+                    .borrow()
+                    .channel_messages(&conversation.id)
+                    .iter()
+                    .map(|message| (conversation.id.clone(), message.ts.clone()))
+                    .collect::<Vec<_>>()
             })
-            .collect::<HashMap<_, _>>();
-        items.extend(activity::build_thread_activity_items(
-            imp.workspace.threads.borrow().clone().into_records(),
-            &conversation_titles,
-        ));
-        activity::sort_activity_items(&mut items);
-        items
+            .collect::<HashSet<_>>();
+        activity::build_unread_activity_items(
+            &conversations,
+            &user_names,
+            current_user_id.as_deref(),
+            &imp.workspace.threads.borrow(),
+            &visible_message_ts,
+        )
     }
 
     fn clear_list(&self, list: &gtk::ListBox) {
@@ -16919,6 +17043,58 @@ mod tests {
             Some("2")
         );
         assert_eq!(first_unread_message_ts(&messages, None, 0), None);
+    }
+
+    #[test]
+    fn exact_hidden_attention_does_not_substitute_a_visible_root() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("2", true);
+        let messages = [SlackMessage {
+            ts: "3".to_string(),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            exact_first_visible_unread_message_ts(&conversation, &messages),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn exact_mixed_attention_focuses_the_visible_identity() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("2", true);
+        conversation.observe_attention_message_at("3", true);
+        let messages = [SlackMessage {
+            ts: "3".to_string(),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            exact_first_visible_unread_message_ts(&conversation, &messages),
+            Some(Some("3".to_string()))
+        );
+    }
+
+    #[test]
+    fn incomplete_attention_ledger_keeps_aggregate_fallback() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            ..Default::default()
+        };
+        conversation.observe_attention_message_at("2", true);
+        conversation.observe_attention_message(true);
+
+        assert_eq!(
+            exact_first_visible_unread_message_ts(&conversation, &[]),
+            None
+        );
     }
 
     #[test]

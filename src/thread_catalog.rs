@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::SlackMessage;
+use crate::models::{slack_timestamp_is_after, SlackMessage};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ThreadKey {
@@ -73,6 +73,26 @@ impl ThreadRecord {
     pub(crate) fn is_known_subscribed(&self) -> bool {
         self.subscribed == Some(true)
     }
+
+    fn read_cursor(&self) -> Option<&str> {
+        let catalog_cursor = match &self.unread {
+            ThreadUnreadState::Known { last_read, .. } => last_read.as_deref(),
+            ThreadUnreadState::Unknown => None,
+        };
+        let root_cursor = self
+            .root
+            .as_ref()
+            .and_then(|root| root.last_read.as_deref());
+        match (catalog_cursor, root_cursor) {
+            (Some(catalog), Some(root)) if slack_timestamp_is_after(root, catalog) => Some(root),
+            (Some(catalog), _) => Some(catalog),
+            (None, root) => root,
+        }
+    }
+
+    pub(crate) fn has_seen_reply(&self, reply_ts: &str) -> bool {
+        self.seen_reply_ts.contains(reply_ts)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -104,6 +124,49 @@ impl ThreadCatalog {
 
     pub(crate) fn get(&self, channel_id: &str, root_ts: &str) -> Option<&ThreadRecord> {
         ThreadKey::new(channel_id, root_ts).and_then(|key| self.records.get(&key))
+    }
+
+    /// Resolves an exact observed reply identity to its owning thread.
+    pub(crate) fn thread_key_for_reply(
+        &self,
+        channel_id: &str,
+        reply_ts: &str,
+    ) -> Option<&ThreadKey> {
+        self.records
+            .values()
+            .find(|record| record.key.channel_id == channel_id && record.has_seen_reply(reply_ts))
+            .map(|record| &record.key)
+    }
+
+    pub(crate) fn reply_is_acknowledged(
+        &self,
+        channel_id: &str,
+        root_ts: &str,
+        reply_ts: &str,
+    ) -> bool {
+        self.get(channel_id, root_ts)
+            .and_then(ThreadRecord::read_cursor)
+            .is_some_and(|last_read| !slack_timestamp_is_after(reply_ts, last_read))
+    }
+
+    /// Exact reply identities proven read by persisted thread cursors.
+    pub(crate) fn acknowledged_reply_timestamps(&self, channel_id: &str) -> Vec<String> {
+        let mut reply_ts = self
+            .records
+            .values()
+            .filter(|record| record.key.channel_id == channel_id)
+            .filter_map(|record| record.read_cursor().map(|cursor| (record, cursor)))
+            .flat_map(|(record, last_read)| {
+                record
+                    .seen_reply_ts
+                    .iter()
+                    .filter(move |reply_ts| !slack_timestamp_is_after(reply_ts, last_read))
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        reply_ts.sort();
+        reply_ts.dedup();
+        reply_ts
     }
 
     /// Build the thread-inbox projection from locally observed roots and persisted Slack
@@ -265,48 +328,57 @@ impl ThreadCatalog {
         root_ts: &str,
         last_read: &str,
     ) -> Vec<String> {
+        if last_read.trim().is_empty() {
+            return Vec::new();
+        }
         let Some(key) = ThreadKey::new(channel_id, root_ts) else {
             return Vec::new();
         };
         if let Some(record) = self.records.get_mut(&key) {
-            if record
-                .latest_reply
-                .as_deref()
-                .is_some_and(|latest| last_read < latest)
-            {
-                return Vec::new();
-            }
+            let effective_last_read = record
+                .read_cursor()
+                .filter(|known| slack_timestamp_is_after(known, last_read))
+                .unwrap_or(last_read)
+                .to_string();
             let mut cleared_reply_ts = record
-                .unread_reply_ts
+                .seen_reply_ts
                 .iter()
-                .filter(|reply_ts| reply_ts.as_str() <= last_read)
+                .filter(|reply_ts| !slack_timestamp_is_after(reply_ts, &effective_last_read))
                 .cloned()
                 .collect::<Vec<_>>();
-            if let ThreadUnreadState::Known {
-                last_read: Some(previous_last_read),
-                ..
-            } = &record.unread
-            {
-                cleared_reply_ts.extend(
-                    record
-                        .seen_reply_ts
-                        .iter()
-                        .filter(|reply_ts| {
-                            reply_ts.as_str() > previous_last_read.as_str()
-                                && reply_ts.as_str() <= last_read
-                        })
-                        .cloned(),
-                );
-            }
             cleared_reply_ts.sort();
             cleared_reply_ts.dedup();
+
+            let tracked_before = record.unread_reply_ts.len();
             record
                 .unread_reply_ts
-                .retain(|reply_ts| reply_ts.as_str() > last_read);
-            record.unread = ThreadUnreadState::Known {
-                count: 0,
-                last_read: (!last_read.trim().is_empty()).then(|| last_read.to_string()),
+                .retain(|reply_ts| slack_timestamp_is_after(reply_ts, &effective_last_read));
+            let tracked_acknowledged = tracked_before.saturating_sub(record.unread_reply_ts.len());
+            let read_through_latest = record
+                .latest_reply
+                .as_deref()
+                .is_none_or(|latest| !slack_timestamp_is_after(latest, &effective_last_read));
+            record.unread = match &record.unread {
+                ThreadUnreadState::Known { count, .. } => ThreadUnreadState::Known {
+                    count: if read_through_latest {
+                        0
+                    } else {
+                        count.saturating_sub(tracked_acknowledged as u64)
+                    },
+                    last_read: Some(effective_last_read.clone()),
+                },
+                ThreadUnreadState::Unknown if read_through_latest => ThreadUnreadState::Known {
+                    count: 0,
+                    last_read: Some(effective_last_read.clone()),
+                },
+                ThreadUnreadState::Unknown => ThreadUnreadState::Unknown,
             };
+            if let Some(root) = record.root.as_mut() {
+                root.last_read = Some(effective_last_read);
+                if let ThreadUnreadState::Known { count, .. } = &record.unread {
+                    root.unread_count = Some(*count);
+                }
+            }
             return cleared_reply_ts;
         }
         Vec::new()
@@ -379,9 +451,11 @@ fn merge_root_metadata(record: &mut ThreadRecord, root: &SlackMessage) {
         let preserves_newer_local_read = matches!(
             &record.unread,
             ThreadUnreadState::Known {
-                count: 0,
                 last_read: Some(known_last_read),
-            } if root.last_read.as_deref().is_none_or(|incoming| known_last_read.as_str() >= incoming)
+                ..
+            } if root.last_read.as_deref().is_none_or(|incoming| {
+                !slack_timestamp_is_after(incoming, known_last_read)
+            })
         );
         if !preserves_newer_local_read {
             record.unread = ThreadUnreadState::Known {
@@ -404,7 +478,12 @@ fn merge_root_metadata(record: &mut ThreadRecord, root: &SlackMessage) {
             last_read: known, ..
         } = &mut record.unread
         {
-            *known = Some(last_read.clone());
+            if known
+                .as_deref()
+                .is_none_or(|current| slack_timestamp_is_after(last_read, current))
+            {
+                *known = Some(last_read.clone());
+            }
         }
     }
     let mut merged_root = root.clone();
@@ -529,6 +608,37 @@ mod tests {
     }
 
     #[test]
+    fn partial_local_thread_read_preserves_cursor_and_newer_unread_over_stale_metadata() {
+        let mut catalog = ThreadCatalog::default();
+        let mut initial = root("1.0", 0);
+        initial.subscribed = Some(true);
+        initial.unread_count = Some(0);
+        catalog.observe_thread("C1", "1.0", &[initial], false);
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"));
+        catalog.mark_read("C1", "1.0", "2.0");
+
+        let mut stale = root("1.0", 2);
+        stale.unread_count = Some(2);
+        stale.last_read = Some("1.0".into());
+        stale.latest_reply = Some("3.0".into());
+        catalog.observe_thread("C1", "1.0", &[stale], false);
+
+        let record = catalog.get("C1", "1.0").unwrap();
+        assert_eq!(
+            record.unread,
+            ThreadUnreadState::Known {
+                count: 1,
+                last_read: Some("2.0".into())
+            }
+        );
+        assert_eq!(
+            record.root.as_ref().and_then(|root| root.unread_count),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn realtime_replies_increment_known_subscribed_threads_once() {
         let mut catalog = ThreadCatalog::default();
         let mut root = root("1.0", 1);
@@ -561,6 +671,50 @@ mod tests {
         assert_eq!(
             catalog.mark_read("C1", "1.0", "3.0"),
             vec!["2.0".to_string(), "3.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn mark_read_returns_seen_replies_for_an_unsubscribed_thread_without_a_prior_marker() {
+        let mut catalog = ThreadCatalog::default();
+        let mut root = root("1.0", 2);
+        root.subscribed = Some(false);
+        catalog.observe_thread(
+            "C1",
+            "1.0",
+            &[root, reply("2.0", "1.0", "U2"), reply("3.0", "1.0", "U3")],
+            true,
+        );
+
+        assert_eq!(
+            catalog.mark_read("C1", "1.0", "3.0"),
+            vec!["2.0".to_string(), "3.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn repeated_same_cursor_read_returns_seen_replies_for_attention_repair() {
+        let mut catalog = ThreadCatalog::default();
+        let mut root = root("1.0", 0);
+        root.subscribed = Some(true);
+        root.unread_count = Some(0);
+        catalog.observe_thread("C1", "1.0", &[root], false);
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
+
+        assert_eq!(
+            catalog.mark_read("C1", "1.0", "2.0"),
+            vec!["2.0".to_string()]
+        );
+        assert_eq!(
+            catalog.mark_read("C1", "1.0", "2.0"),
+            vec!["2.0".to_string()]
+        );
+        assert_eq!(
+            catalog.get("C1", "1.0").unwrap().unread,
+            ThreadUnreadState::Known {
+                count: 0,
+                last_read: Some("2.0".into())
+            }
         );
     }
 
@@ -601,21 +755,43 @@ mod tests {
     }
 
     #[test]
-    fn mark_read_does_not_clear_a_reply_newer_than_the_marker() {
+    fn mark_read_clears_seen_replies_through_cursor_and_retains_newer_replies() {
         let mut catalog = ThreadCatalog::default();
-        let mut root = root("1.0", 1);
+        let mut root = root("1.0", 0);
         root.subscribed = Some(true);
-        root.unread_count = Some(1);
-        root.latest_reply = Some("3.0".into());
+        root.unread_count = Some(0);
         catalog.observe_thread("C1", "1.0", &[root], false);
-        catalog.mark_read("C1", "1.0", "2.0");
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"));
+
+        assert_eq!(
+            catalog.mark_read("C1", "1.0", "2.0"),
+            vec!["2.0".to_string()]
+        );
         assert_eq!(
             catalog.get("C1", "1.0").unwrap().unread,
             ThreadUnreadState::Known {
                 count: 1,
-                last_read: None
+                last_read: Some("2.0".into())
             }
         );
+    }
+
+    #[test]
+    fn exact_reply_identity_resolves_to_its_thread() {
+        let mut catalog = ThreadCatalog::default();
+        catalog.observe_thread(
+            "C1",
+            "1.0",
+            &[root("1.0", 1), reply("2.0", "1.0", "U2")],
+            true,
+        );
+
+        assert_eq!(
+            catalog.thread_key_for_reply("C1", "2.0"),
+            ThreadKey::new("C1", "1.0").as_ref()
+        );
+        assert!(catalog.thread_key_for_reply("C2", "2.0").is_none());
     }
 
     #[test]

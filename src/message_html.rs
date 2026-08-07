@@ -102,6 +102,10 @@ pub enum TimelineScrollBehavior {
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[allow(dead_code)]
 pub enum TimelineDomPatch {
+    ConfigureReadState {
+        read_marker_url: Option<String>,
+        first_unread_ts: Option<String>,
+    },
     ReplaceSnapshot {
         list_html: String,
         load_more_html: String,
@@ -207,6 +211,18 @@ pub fn conversation_snapshot_patch(
             .as_deref()
             .map(|url| load_more_action_html(url, &gettext("Load older messages")))
             .unwrap_or_default(),
+    }
+}
+
+#[allow(dead_code)]
+pub fn configure_read_state_patch(context: &MessageHtmlContext) -> TimelineDomPatch {
+    let read_marker_url = active_read_marker_url(context).map(ToString::to_string);
+    let first_unread_ts = read_marker_url
+        .as_ref()
+        .and(context.first_unread_ts.clone());
+    TimelineDomPatch::ConfigureReadState {
+        read_marker_url,
+        first_unread_ts,
     }
 }
 
@@ -754,16 +770,18 @@ pub fn conversation_document_with_focus(
         .timeline_generation
         .map(|generation| format!(" data-timeline-generation=\"{generation}\""))
         .unwrap_or_default();
-    let read_marker_attribute = context
-        .read_marker_url
-        .as_deref()
+    let read_marker_attribute = active_read_marker_url(context)
         .map(|url| format!(" data-read-marker-url=\"{}\"", escape_html(url)))
+        .unwrap_or_default();
+    let first_unread_attribute = active_read_marker_url(context)
+        .and(context.first_unread_ts.as_deref())
+        .map(|ts| format!(" data-first-unread-ts=\"{}\"", escape_html(ts)))
         .unwrap_or_default();
     let mut body = format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\" \
          data-timeline-positioning=\"pending\" data-timeline-mode=\"{}\" \
          data-timeline-sticky-key=\"{}\" data-timeline-anchor-key=\"{}\"\
-         {generation_attribute}{focus_attribute}{read_marker_attribute}>{}",
+         {generation_attribute}{focus_attribute}{read_marker_attribute}{first_unread_attribute}>{}",
         context.timeline_scroll.js_mode(),
         escape_html(&sticky_key),
         escape_html(&anchor_key),
@@ -785,12 +803,6 @@ pub fn conversation_document_with_focus(
     ));
     body.push_str(&conversation_list_items_html(channel_id, messages, context));
     body.push_str("</ol>");
-    if context.read_marker_url.is_some()
-        && context.first_unread_ts.is_none()
-        && context.thread_ts.is_some()
-    {
-        body.push_str("<div id=\"timeline-read-sentinel\" aria-hidden=\"true\"></div>");
-    }
     if context.thread_ts.is_some() {
         if let Some(url) = context.load_more_url.as_deref() {
             body.push_str(&load_more_action_html(url, &gettext("Load more replies")));
@@ -1966,6 +1978,13 @@ fn timeline_scroll_identity(channel_id: &str, thread_ts: Option<&str>) -> String
         Some(thread_ts) => format!("thread:{channel_id}:{thread_ts}"),
         None => format!("channel:{channel_id}"),
     }
+}
+
+fn active_read_marker_url(context: &MessageHtmlContext) -> Option<&str> {
+    context
+        .read_marker_url
+        .as_deref()
+        .filter(|_| context.thread_ts.is_some() || context.first_unread_ts.is_some())
 }
 
 fn timeline_dom_runtime_script() -> &'static str {
@@ -5893,6 +5912,7 @@ mod tests {
         let html = conversation_document("C123", &[message("unread")], &context);
 
         assert!(html.contains("class=\"unread-separator\""));
+        assert!(html.contains("data-first-unread-ts=\"1710000000.000100\""));
         assert!(html.contains("data-timeline-generation=\"42\""));
         assert!(html.contains("data-timeline-positioning=\"pending\""));
         assert!(html.contains("\"conduit://timeline-\" + action"));
@@ -5901,8 +5921,10 @@ mod tests {
         assert!(html.contains("new IntersectionObserver"));
         assert!(html.contains("function armReadMarker"));
         assert!(html.contains("commitInitialPosition"));
-        assert!(html.contains("target.searchParams.set(\"ts\", newest)"));
-        assert!(html.contains("if (separator && next) next.before(separator)"));
+        assert!(html.contains("entry.intersectionRatio >= 0.90"));
+        assert!(html.contains("timeline.dataset.firstUnreadTs || \"\""));
+        assert!(html.contains("target.searchParams.set(\"ts\", candidate)"));
+        assert!(html.contains("timestampAfter(candidate, lastSent)"));
         assert!(!html.contains("function focusTarget()"));
         assert!(!html.contains("function applyScroll()"));
     }
@@ -5917,7 +5939,21 @@ mod tests {
     }
 
     #[test]
-    fn thread_read_marker_and_scroll_state_are_scoped_to_the_thread() {
+    fn read_channel_without_visible_unread_does_not_arm_a_marker_url() {
+        let context = MessageHtmlContext {
+            read_marker_url: Some(mark_read_action_url("C123", "0")),
+            ..Default::default()
+        };
+
+        let html = conversation_document("C123", &[message("read")], &context);
+
+        assert!(!html.contains("conduit://mark-read?channel=C123"));
+        assert!(!html.contains("data-first-unread-ts="));
+        assert!(html.contains("function configureReadMarker"));
+    }
+
+    #[test]
+    fn thread_read_marker_uses_continuous_message_observation() {
         let context = MessageHtmlContext {
             thread_ts: Some("1710000000.000100".into()),
             read_marker_url: Some(mark_thread_read_action_url(
@@ -5931,9 +5967,32 @@ mod tests {
 
         let html = conversation_document("C123", &[message("reply")], &context);
 
-        assert!(html.contains("id=\"timeline-read-sentinel\""));
+        assert!(!html.contains("timeline-read-sentinel"));
         assert!(html.contains("thread_ts=1710000000.000100"));
         assert!(html.contains("conduit:timeline-at-bottom:thread:C123:1710000000.000100"));
+        assert!(html.contains("observer.observe(message)"));
+        assert!(html.contains("new MutationObserver(observeMessages)"));
+        assert!(!html.contains("observer.disconnect()"));
+    }
+
+    #[test]
+    fn read_observer_requires_stable_visibility_and_tracks_new_messages() {
+        let script = timeline_dom_runtime_script();
+
+        assert!(script.contains("entry.intersectionRatio >= 0.90"));
+        assert!(script.contains("if (timer && pending === newest) return"));
+        assert!(script.contains("newestVisibleTimestamp() !== candidate"));
+        assert!(script.contains("}, 500);"));
+        assert!(script.contains("new MutationObserver(observeMessages)"));
+        assert!(script.contains("observer.observe(message)"));
+        assert!(script.contains("observer.unobserve(message)"));
+        assert!(script.contains("message.closest(\".message-list-item\")"));
+        assert!(script.contains("nextItem.before(separator)"));
+        assert!(script.contains("patch.type === \"configure-read-state\""));
+        assert!(script.contains("configurationLastSent = \"\""));
+        assert!(script.contains("if (!lastSent || timestampAfter(candidate, lastSent))"));
+        assert!(!script.contains("observeUnreadMessages"));
+        assert!(!script.contains("timeline-read-sentinel"));
     }
 
     #[test]
@@ -6645,6 +6704,55 @@ mod tests {
             load_more_html,
         });
         assert!(script.contains("\"type\":\"replace-snapshot\""));
+    }
+
+    #[test]
+    fn configure_read_state_patch_serializes_visible_channel_boundary() {
+        let context = MessageHtmlContext {
+            read_marker_url: Some(mark_read_action_url("C123", "0")),
+            first_unread_ts: Some("1710000001.000100".into()),
+            ..Default::default()
+        };
+
+        let script = timeline_dom_patch_call(&configure_read_state_patch(&context));
+
+        assert!(script.contains("\"type\":\"configure-read-state\""));
+        assert!(
+            script.contains("\"read_marker_url\":\"conduit://mark-read?channel=C123\\u0026ts=0\"")
+        );
+        assert!(script.contains("\"first_unread_ts\":\"1710000001.000100\""));
+    }
+
+    #[test]
+    fn configure_read_state_patch_disables_channel_without_visible_unread() {
+        let context = MessageHtmlContext {
+            read_marker_url: Some(mark_read_action_url("C123", "0")),
+            ..Default::default()
+        };
+
+        let script = timeline_dom_patch_call(&configure_read_state_patch(&context));
+
+        assert!(script.contains("\"read_marker_url\":null"));
+        assert!(script.contains("\"first_unread_ts\":null"));
+    }
+
+    #[test]
+    fn configure_read_state_patch_keeps_thread_observation_without_boundary() {
+        let context = MessageHtmlContext {
+            thread_ts: Some("1710000000.000100".into()),
+            read_marker_url: Some(mark_thread_read_action_url(
+                "C123",
+                "1710000000.000100",
+                "1710000001.000100",
+            )),
+            ..Default::default()
+        };
+
+        let script = timeline_dom_patch_call(&configure_read_state_patch(&context));
+
+        assert!(script.contains("\"type\":\"configure-read-state\""));
+        assert!(script.contains("thread_ts=1710000000.000100"));
+        assert!(script.contains("\"first_unread_ts\":null"));
     }
 
     #[test]
