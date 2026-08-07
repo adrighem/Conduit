@@ -50,4 +50,5 @@
 - [x] Task: Remove whole-state storage, raw realtime UI events, broad invalidations, and routine reload adapters d81fce4
 - [x] Task: Add settled-idle counters and run full automated acceptance validation 0e3939f
 - [x] Task: Synchronize final architecture documentation d77d6b1
+- [x] Task: Fix cached-bootstrap lifecycle panic 706c496
 - [~] Task: Conductor - User Manual Verification 'Expansion and cleanup' (Protocol in workflow.md)
