@@ -325,22 +325,126 @@ pub struct OperationContext {
     pub target: RuntimeTarget,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeAdmissionKind {
+    Control,
+    DurableAction,
+    ReadMarker,
+    Coalescible,
+    Supersedable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ConversationDiscoveryScope {
+    Full,
+    Channels,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum UserLoadScope {
+    Basic,
+    Profile,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct OpaqueAdmissionTarget([u8; 32]);
+
+impl OpaqueAdmissionTarget {
+    fn digest(parts: &[&str]) -> Self {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            let length = u64::try_from(part.len()).expect("runtime admission target is too large");
+            hasher.update(length.to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        Self(hasher.finalize().into())
+    }
+}
+
+impl std::fmt::Debug for OpaqueAdmissionTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OpaqueAdmissionTarget")
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum RuntimeAdmissionKey {
+    Authentication,
+    Navigation(NavigationSlot),
+    WorkspaceRefresh,
+    ConversationDiscovery(ConversationDiscoveryScope),
+    User {
+        scope: UserLoadScope,
+        target: OpaqueAdmissionTarget,
+    },
+    ImageAsset(OpaqueAdmissionTarget),
+    Media(OpaqueAdmissionTarget),
+    MessagePermalink(OpaqueAdmissionTarget),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeAdmissionPolicy {
+    kind: RuntimeAdmissionKind,
+    replacement_key: Option<RuntimeAdmissionKey>,
+}
+
+impl RuntimeAdmissionPolicy {
+    fn control() -> Self {
+        Self {
+            kind: RuntimeAdmissionKind::Control,
+            replacement_key: None,
+        }
+    }
+
+    fn durable_action() -> Self {
+        Self {
+            kind: RuntimeAdmissionKind::DurableAction,
+            replacement_key: None,
+        }
+    }
+
+    fn read_marker() -> Self {
+        Self {
+            kind: RuntimeAdmissionKind::ReadMarker,
+            replacement_key: None,
+        }
+    }
+
+    fn coalescible(replacement_key: RuntimeAdmissionKey) -> Self {
+        Self {
+            kind: RuntimeAdmissionKind::Coalescible,
+            replacement_key: Some(replacement_key),
+        }
+    }
+
+    fn supersedable(replacement_key: RuntimeAdmissionKey) -> Self {
+        Self {
+            kind: RuntimeAdmissionKind::Supersedable,
+            replacement_key: Some(replacement_key),
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct RuntimeTraceFields {
     session: SessionId,
     request: RequestId,
     operation: RuntimeOperation,
     target: String,
+    admission: RuntimeAdmissionKind,
+    replacement_key: Option<RuntimeAdmissionKey>,
 }
 
 impl RuntimeTraceFields {
     fn for_command(identity: RuntimeIdentity, command: &RuntimeCommand) -> Self {
-        let context = command.operation_context();
+        let descriptor = command.descriptor();
         Self {
             session: identity.session,
             request: identity.request,
-            operation: context.operation,
-            target: runtime_target_for_trace(&context.target),
+            operation: descriptor.context.operation,
+            target: runtime_target_for_trace(&descriptor.context.target),
+            admission: descriptor.admission.kind,
+            replacement_key: descriptor.admission.replacement_key,
         }
     }
 
@@ -352,6 +456,8 @@ impl RuntimeTraceFields {
             request = ?self.request,
             operation = ?self.operation,
             target = %self.target,
+            admission = ?self.admission,
+            replacement_key = ?self.replacement_key,
         )
     }
 }
@@ -392,27 +498,64 @@ fn runtime_target_for_trace(target: &RuntimeTarget) -> String {
     }
 }
 
+fn runtime_target_kind(target: &RuntimeTarget) -> &'static str {
+    match target {
+        RuntimeTarget::Workspace => "workspace",
+        RuntimeTarget::Channel(_) => "channel",
+        RuntimeTarget::Thread { .. } => "thread",
+        RuntimeTarget::User(_) => "user",
+        RuntimeTarget::File(_) => "file",
+        RuntimeTarget::Image(_) => "image",
+        RuntimeTarget::Media(_) => "media",
+        RuntimeTarget::Attachment(_) => "attachment",
+        RuntimeTarget::ExactMessage { .. } => "exact-message",
+        RuntimeTarget::Message { .. } => "message",
+        RuntimeTarget::Upload { .. } => "upload",
+        RuntimeTarget::Huddle(_) => "huddle",
+    }
+}
+
 impl OperationContext {
     pub fn new(operation: RuntimeOperation, target: RuntimeTarget) -> Self {
         Self { operation, target }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct RuntimeCommandDescriptor {
     context: OperationContext,
     supersedes_previous: bool,
     navigation_slot: Option<NavigationSlot>,
     lane: RuntimeTaskLane,
+    admission: RuntimeAdmissionPolicy,
+}
+
+impl std::fmt::Debug for RuntimeCommandDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeCommandDescriptor")
+            .field("operation", &self.context.operation)
+            .field("target", &runtime_target_kind(&self.context.target))
+            .field("supersedes_previous", &self.supersedes_previous)
+            .field("navigation_slot", &self.navigation_slot)
+            .field("lane", &self.lane)
+            .field("admission", &self.admission)
+            .finish()
+    }
 }
 
 impl RuntimeCommandDescriptor {
-    fn request(context: OperationContext, lane: RuntimeTaskLane) -> Self {
+    fn request(
+        context: OperationContext,
+        lane: RuntimeTaskLane,
+        admission: RuntimeAdmissionPolicy,
+    ) -> Self {
         Self {
             context,
             supersedes_previous: true,
             navigation_slot: None,
             lane,
+            admission,
         }
     }
 
@@ -422,16 +565,36 @@ impl RuntimeCommandDescriptor {
             supersedes_previous: true,
             navigation_slot: Some(slot),
             lane: RuntimeTaskLane::Navigation,
+            admission: RuntimeAdmissionPolicy::supersedable(RuntimeAdmissionKey::Navigation(slot)),
         }
     }
 
-    fn mutation(context: OperationContext, lane: RuntimeTaskLane) -> Self {
+    fn mutation(
+        context: OperationContext,
+        lane: RuntimeTaskLane,
+        admission: RuntimeAdmissionPolicy,
+    ) -> Self {
         Self {
             context,
             supersedes_previous: false,
             navigation_slot: None,
             lane,
+            admission,
         }
+    }
+}
+
+fn huddle_admission_policy(command: &HuddleCommand) -> RuntimeAdmissionPolicy {
+    match command {
+        HuddleCommand::OpenPreflight { .. }
+        | HuddleCommand::Join { .. }
+        | HuddleCommand::OpenExternally { .. }
+        | HuddleCommand::Leave
+        | HuddleCommand::Dismiss
+        | HuddleCommand::SetMuted(_)
+        | HuddleCommand::SetCameraEnabled(_)
+        | HuddleCommand::SetScreenShareEnabled(_)
+        | HuddleCommand::SelectDevice { .. } => RuntimeAdmissionPolicy::durable_action(),
     }
 }
 
@@ -455,44 +618,58 @@ impl RuntimeCommand {
             Self::LoadStoredToken => RuntimeCommandDescriptor::request(
                 workspace(RuntimeOperation::Startup),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::supersedable(RuntimeAdmissionKey::Authentication),
             ),
             Self::StartOAuth { .. } | Self::StartBrowserSession { .. } => {
                 RuntimeCommandDescriptor::request(
                     workspace(RuntimeOperation::Authenticate),
                     RuntimeTaskLane::Interactive,
+                    RuntimeAdmissionPolicy::supersedable(RuntimeAdmissionKey::Authentication),
                 )
             }
             Self::SignOut => RuntimeCommandDescriptor::mutation(
                 workspace(RuntimeOperation::SignOut),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::control(),
             ),
             Self::Disconnect => RuntimeCommandDescriptor::mutation(
                 workspace(RuntimeOperation::Disconnect),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::control(),
             ),
             Self::RefreshConversations => RuntimeCommandDescriptor::request(
                 workspace(RuntimeOperation::Conversations),
                 RuntimeTaskLane::Background,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::WorkspaceRefresh),
             ),
             Self::UpdateAttentionPreferences(_) => RuntimeCommandDescriptor::mutation(
                 workspace(RuntimeOperation::SocketMode),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::DiscoverConversations => RuntimeCommandDescriptor::request(
                 workspace(RuntimeOperation::ConversationDiscovery),
                 RuntimeTaskLane::Background,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::ConversationDiscovery(
+                    ConversationDiscoveryScope::Full,
+                )),
             ),
             Self::DiscoverChannels => RuntimeCommandDescriptor::request(
                 workspace(RuntimeOperation::ConversationDiscovery),
                 RuntimeTaskLane::Background,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::ConversationDiscovery(
+                    ConversationDiscoveryScope::Channels,
+                )),
             ),
             Self::JoinConversation { channel_id } => RuntimeCommandDescriptor::request(
                 channel(RuntimeOperation::OpenConversation, channel_id),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::LeaveConversation { channel_id } => RuntimeCommandDescriptor::mutation(
                 channel(RuntimeOperation::LeaveConversation, channel_id),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::OpenDirectMessage { user_id } => RuntimeCommandDescriptor::request(
                 OperationContext::new(
@@ -500,16 +677,19 @@ impl RuntimeCommand {
                     RuntimeTarget::User(user_id.clone()),
                 ),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::OpenGroupDirectMessage { .. } | Self::CreateChannel { .. } => {
                 RuntimeCommandDescriptor::mutation(
                     workspace(RuntimeOperation::OpenConversation),
                     RuntimeTaskLane::Interactive,
+                    RuntimeAdmissionPolicy::durable_action(),
                 )
             }
             Self::InviteToChannel { channel_id, .. } => RuntimeCommandDescriptor::mutation(
                 channel(RuntimeOperation::OpenConversation, channel_id),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::LoadHistory { channel_id } => RuntimeCommandDescriptor::navigation(
                 channel(RuntimeOperation::History, channel_id),
@@ -554,25 +734,38 @@ impl RuntimeCommand {
                 workspace(RuntimeOperation::SavedItems),
                 NavigationSlot::Main,
             ),
-            Self::LoadUser { user_id } | Self::LoadUserProfile { user_id } => {
-                RuntimeCommandDescriptor::request(
-                    OperationContext::new(
-                        RuntimeOperation::User,
-                        RuntimeTarget::User(user_id.clone()),
-                    ),
-                    RuntimeTaskLane::Background,
-                )
-            }
+            Self::LoadUser { user_id } => RuntimeCommandDescriptor::request(
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone())),
+                RuntimeTaskLane::Background,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::User {
+                    scope: UserLoadScope::Basic,
+                    target: OpaqueAdmissionTarget::digest(&[user_id]),
+                }),
+            ),
+            Self::LoadUserProfile { user_id } => RuntimeCommandDescriptor::request(
+                OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone())),
+                RuntimeTaskLane::Background,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::User {
+                    scope: UserLoadScope::Profile,
+                    target: OpaqueAdmissionTarget::digest(&[user_id]),
+                }),
+            ),
             Self::LoadImageAsset { key, .. } => RuntimeCommandDescriptor::request(
                 OperationContext::new(
                     RuntimeOperation::ImageAsset,
                     RuntimeTarget::Image(key.clone()),
                 ),
                 RuntimeTaskLane::Image,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::ImageAsset(
+                    OpaqueAdmissionTarget::digest(&[key]),
+                )),
             ),
             Self::LoadMedia { url, .. } => RuntimeCommandDescriptor::request(
                 OperationContext::new(RuntimeOperation::Media, RuntimeTarget::Media(url.clone())),
                 RuntimeTaskLane::Image,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::Media(
+                    OpaqueAdmissionTarget::digest(&[url]),
+                )),
             ),
             Self::DownloadAttachment { url, .. } => RuntimeCommandDescriptor::request(
                 OperationContext::new(
@@ -580,6 +773,7 @@ impl RuntimeCommand {
                     RuntimeTarget::Attachment(url.clone()),
                 ),
                 RuntimeTaskLane::Image,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::ResolveMessagePermalink { channel_id, ts } => RuntimeCommandDescriptor::request(
                 OperationContext::new(
@@ -590,6 +784,9 @@ impl RuntimeCommand {
                     },
                 ),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::MessagePermalink(
+                    OpaqueAdmissionTarget::digest(&[channel_id, ts]),
+                )),
             ),
             Self::ExecuteMessageAction { request, .. } => RuntimeCommandDescriptor::mutation(
                 OperationContext::new(
@@ -600,14 +797,17 @@ impl RuntimeCommand {
                     },
                 ),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::MarkConversationRead { channel_id, .. } => RuntimeCommandDescriptor::request(
                 channel(RuntimeOperation::ReadMarker, channel_id),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::read_marker(),
             ),
             Self::MarkConversationReadAll { channel_id, .. } => RuntimeCommandDescriptor::mutation(
                 channel(RuntimeOperation::ReadMarker, channel_id),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::read_marker(),
             ),
             Self::MarkThreadRead {
                 channel_id,
@@ -616,6 +816,7 @@ impl RuntimeCommand {
             } => RuntimeCommandDescriptor::mutation(
                 thread(RuntimeOperation::ReadMarker, channel_id, thread_ts),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::read_marker(),
             ),
             Self::PostMessage {
                 channel_id,
@@ -630,6 +831,7 @@ impl RuntimeCommand {
                     },
                 ),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::UpdateMessage {
                 channel_id,
@@ -644,6 +846,7 @@ impl RuntimeCommand {
                     },
                 ),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::SetReaction {
                 channel_id,
@@ -658,6 +861,7 @@ impl RuntimeCommand {
                     },
                 ),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::SetSaved {
                 channel_id,
@@ -672,14 +876,17 @@ impl RuntimeCommand {
                     },
                 ),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::SetConversationStarred { channel_id, .. } => RuntimeCommandDescriptor::mutation(
                 channel(RuntimeOperation::ConversationStar, channel_id),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::SetCurrentUserStatus { .. } => RuntimeCommandDescriptor::mutation(
                 workspace(RuntimeOperation::UserStatus),
                 RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::UploadFiles {
                 channel_id,
@@ -694,6 +901,7 @@ impl RuntimeCommand {
                     },
                 ),
                 RuntimeTaskLane::Upload,
+                RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::Huddle(command) => RuntimeCommandDescriptor::mutation(
                 OperationContext::new(
@@ -701,6 +909,7 @@ impl RuntimeCommand {
                     RuntimeTarget::Huddle(command.call_id().unwrap_or("active").to_string()),
                 ),
                 RuntimeTaskLane::Interactive,
+                huddle_admission_policy(command),
             ),
         }
     }
@@ -10662,6 +10871,8 @@ mod tests {
         assert!(output.contains("RequestId(42)"));
         assert!(output.contains("operation=Media"));
         assert!(output.contains("media:https://files.slack.com/file"));
+        assert!(output.contains("admission=Coalescible"));
+        assert!(output.contains("replacement_key=Some(Media(OpaqueAdmissionTarget))"));
         for secret in [
             "viewer",
             "password",
@@ -14461,6 +14672,541 @@ mod tests {
             thread_context.navigation_slot(),
             Some(NavigationSlot::Thread)
         );
+    }
+
+    fn expected_runtime_admission(command: &RuntimeCommand) -> RuntimeAdmissionPolicy {
+        match command {
+            RuntimeCommand::LoadStoredToken
+            | RuntimeCommand::StartOAuth { .. }
+            | RuntimeCommand::StartBrowserSession { .. } => {
+                RuntimeAdmissionPolicy::supersedable(RuntimeAdmissionKey::Authentication)
+            }
+            RuntimeCommand::SignOut | RuntimeCommand::Disconnect => {
+                RuntimeAdmissionPolicy::control()
+            }
+            RuntimeCommand::RefreshConversations => {
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::WorkspaceRefresh)
+            }
+            RuntimeCommand::DiscoverConversations => RuntimeAdmissionPolicy::coalescible(
+                RuntimeAdmissionKey::ConversationDiscovery(ConversationDiscoveryScope::Full),
+            ),
+            RuntimeCommand::DiscoverChannels => RuntimeAdmissionPolicy::coalescible(
+                RuntimeAdmissionKey::ConversationDiscovery(ConversationDiscoveryScope::Channels),
+            ),
+            RuntimeCommand::LoadHistory { .. }
+            | RuntimeCommand::LoadOlderHistory { .. }
+            | RuntimeCommand::SearchMessages { .. }
+            | RuntimeCommand::LoadFiles
+            | RuntimeCommand::LoadFile { .. }
+            | RuntimeCommand::LoadSavedItems => RuntimeAdmissionPolicy::supersedable(
+                RuntimeAdmissionKey::Navigation(NavigationSlot::Main),
+            ),
+            RuntimeCommand::LoadThread { .. } | RuntimeCommand::LoadOlderThread { .. } => {
+                RuntimeAdmissionPolicy::supersedable(RuntimeAdmissionKey::Navigation(
+                    NavigationSlot::Thread,
+                ))
+            }
+            RuntimeCommand::LoadMessageContext(location) => RuntimeAdmissionPolicy::supersedable(
+                RuntimeAdmissionKey::Navigation(if location.thread_ts().is_some() {
+                    NavigationSlot::Thread
+                } else {
+                    NavigationSlot::Main
+                }),
+            ),
+            RuntimeCommand::LoadUser { user_id } => {
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::User {
+                    scope: UserLoadScope::Basic,
+                    target: OpaqueAdmissionTarget::digest(&[user_id]),
+                })
+            }
+            RuntimeCommand::LoadUserProfile { user_id } => {
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::User {
+                    scope: UserLoadScope::Profile,
+                    target: OpaqueAdmissionTarget::digest(&[user_id]),
+                })
+            }
+            RuntimeCommand::LoadImageAsset { key, .. } => RuntimeAdmissionPolicy::coalescible(
+                RuntimeAdmissionKey::ImageAsset(OpaqueAdmissionTarget::digest(&[key])),
+            ),
+            RuntimeCommand::LoadMedia { url, .. } => RuntimeAdmissionPolicy::coalescible(
+                RuntimeAdmissionKey::Media(OpaqueAdmissionTarget::digest(&[url])),
+            ),
+            RuntimeCommand::ResolveMessagePermalink { channel_id, ts } => {
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::MessagePermalink(
+                    OpaqueAdmissionTarget::digest(&[channel_id, ts]),
+                ))
+            }
+            RuntimeCommand::MarkConversationRead { .. }
+            | RuntimeCommand::MarkConversationReadAll { .. }
+            | RuntimeCommand::MarkThreadRead { .. } => RuntimeAdmissionPolicy::read_marker(),
+            RuntimeCommand::UpdateAttentionPreferences(_)
+            | RuntimeCommand::JoinConversation { .. }
+            | RuntimeCommand::LeaveConversation { .. }
+            | RuntimeCommand::OpenDirectMessage { .. }
+            | RuntimeCommand::OpenGroupDirectMessage { .. }
+            | RuntimeCommand::CreateChannel { .. }
+            | RuntimeCommand::InviteToChannel { .. }
+            | RuntimeCommand::DownloadAttachment { .. }
+            | RuntimeCommand::ExecuteMessageAction { .. }
+            | RuntimeCommand::PostMessage { .. }
+            | RuntimeCommand::UpdateMessage { .. }
+            | RuntimeCommand::SetReaction { .. }
+            | RuntimeCommand::SetSaved { .. }
+            | RuntimeCommand::SetConversationStarred { .. }
+            | RuntimeCommand::SetCurrentUserStatus { .. }
+            | RuntimeCommand::UploadFiles { .. }
+            | RuntimeCommand::Huddle(_) => RuntimeAdmissionPolicy::durable_action(),
+        }
+    }
+
+    fn expected_legacy_scheduling(
+        command: &RuntimeCommand,
+    ) -> (bool, Option<NavigationSlot>, RuntimeTaskLane) {
+        match command {
+            RuntimeCommand::LoadHistory { .. }
+            | RuntimeCommand::LoadOlderHistory { .. }
+            | RuntimeCommand::SearchMessages { .. }
+            | RuntimeCommand::LoadFiles
+            | RuntimeCommand::LoadFile { .. }
+            | RuntimeCommand::LoadSavedItems => (
+                true,
+                Some(NavigationSlot::Main),
+                RuntimeTaskLane::Navigation,
+            ),
+            RuntimeCommand::LoadThread { .. } | RuntimeCommand::LoadOlderThread { .. } => (
+                true,
+                Some(NavigationSlot::Thread),
+                RuntimeTaskLane::Navigation,
+            ),
+            RuntimeCommand::LoadMessageContext(location) => (
+                true,
+                Some(if location.thread_ts().is_some() {
+                    NavigationSlot::Thread
+                } else {
+                    NavigationSlot::Main
+                }),
+                RuntimeTaskLane::Navigation,
+            ),
+            RuntimeCommand::LoadStoredToken
+            | RuntimeCommand::StartOAuth { .. }
+            | RuntimeCommand::StartBrowserSession { .. }
+            | RuntimeCommand::JoinConversation { .. }
+            | RuntimeCommand::OpenDirectMessage { .. }
+            | RuntimeCommand::ResolveMessagePermalink { .. }
+            | RuntimeCommand::MarkConversationRead { .. } => {
+                (true, None, RuntimeTaskLane::Interactive)
+            }
+            RuntimeCommand::RefreshConversations
+            | RuntimeCommand::DiscoverChannels
+            | RuntimeCommand::DiscoverConversations
+            | RuntimeCommand::LoadUser { .. }
+            | RuntimeCommand::LoadUserProfile { .. } => (true, None, RuntimeTaskLane::Background),
+            RuntimeCommand::LoadImageAsset { .. }
+            | RuntimeCommand::LoadMedia { .. }
+            | RuntimeCommand::DownloadAttachment { .. } => (true, None, RuntimeTaskLane::Image),
+            RuntimeCommand::UploadFiles { .. } => (false, None, RuntimeTaskLane::Upload),
+            RuntimeCommand::SignOut
+            | RuntimeCommand::Disconnect
+            | RuntimeCommand::UpdateAttentionPreferences(_)
+            | RuntimeCommand::LeaveConversation { .. }
+            | RuntimeCommand::OpenGroupDirectMessage { .. }
+            | RuntimeCommand::CreateChannel { .. }
+            | RuntimeCommand::InviteToChannel { .. }
+            | RuntimeCommand::ExecuteMessageAction { .. }
+            | RuntimeCommand::MarkConversationReadAll { .. }
+            | RuntimeCommand::MarkThreadRead { .. }
+            | RuntimeCommand::PostMessage { .. }
+            | RuntimeCommand::UpdateMessage { .. }
+            | RuntimeCommand::SetReaction { .. }
+            | RuntimeCommand::SetSaved { .. }
+            | RuntimeCommand::SetConversationStarred { .. }
+            | RuntimeCommand::SetCurrentUserStatus { .. }
+            | RuntimeCommand::Huddle(_) => (false, None, RuntimeTaskLane::Interactive),
+        }
+    }
+
+    fn runtime_command_fixtures() -> Vec<RuntimeCommand> {
+        vec![
+            RuntimeCommand::LoadStoredToken,
+            RuntimeCommand::StartOAuth {
+                client_id: "client".to_string(),
+                debug_auth: false,
+            },
+            RuntimeCommand::StartBrowserSession {
+                xoxc_token: "browser-token-canary".to_string(),
+                xoxd_token: "cookie-token-canary".to_string(),
+                user_agent: Some("agent-canary".to_string()),
+            },
+            RuntimeCommand::SignOut,
+            RuntimeCommand::Disconnect,
+            RuntimeCommand::RefreshConversations,
+            RuntimeCommand::UpdateAttentionPreferences(AttentionPreferences::default()),
+            RuntimeCommand::DiscoverChannels,
+            RuntimeCommand::DiscoverConversations,
+            RuntimeCommand::JoinConversation {
+                channel_id: "C1".to_string(),
+            },
+            RuntimeCommand::LeaveConversation {
+                channel_id: "C1".to_string(),
+            },
+            RuntimeCommand::OpenDirectMessage {
+                user_id: "U1".to_string(),
+            },
+            RuntimeCommand::OpenGroupDirectMessage {
+                user_ids: vec!["U1".to_string(), "U2".to_string()],
+            },
+            RuntimeCommand::CreateChannel {
+                name: "channel".to_string(),
+                is_private: false,
+            },
+            RuntimeCommand::InviteToChannel {
+                channel_id: "C1".to_string(),
+                user_ids: vec!["U1".to_string()],
+            },
+            RuntimeCommand::LoadHistory {
+                channel_id: "C1".to_string(),
+            },
+            RuntimeCommand::LoadOlderHistory {
+                channel_id: "C1".to_string(),
+                cursor: "cursor".to_string(),
+            },
+            RuntimeCommand::LoadThread {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+            },
+            RuntimeCommand::LoadOlderThread {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+                cursor: "cursor".to_string(),
+            },
+            RuntimeCommand::LoadMessageContext(
+                SearchMessageLocation::new("C1", "1.0", None).unwrap(),
+            ),
+            RuntimeCommand::SearchMessages {
+                query: "query-canary".to_string(),
+            },
+            RuntimeCommand::LoadFiles,
+            RuntimeCommand::LoadFile {
+                file_id: "F1".to_string(),
+                share_requested: false,
+            },
+            RuntimeCommand::LoadSavedItems,
+            RuntimeCommand::LoadUser {
+                user_id: "U1".to_string(),
+            },
+            RuntimeCommand::LoadUserProfile {
+                user_id: "U1".to_string(),
+            },
+            RuntimeCommand::LoadImageAsset {
+                key: "image-key-canary".to_string(),
+                url: "https://files.slack.com/image?token=image-url-canary".to_string(),
+            },
+            RuntimeCommand::LoadMedia {
+                url: "https://files.slack.com/media?token=media-url-canary".to_string(),
+                name: "media-name-canary".to_string(),
+            },
+            RuntimeCommand::DownloadAttachment {
+                url: "https://files.slack.com/download?token=download-url-canary".to_string(),
+                name: "download-name-canary".to_string(),
+            },
+            RuntimeCommand::ResolveMessagePermalink {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+            },
+            RuntimeCommand::ExecuteMessageAction {
+                request: SlackMessageActionRequest {
+                    channel_id: "C1".to_string(),
+                    message_ts: "1.0".to_string(),
+                    thread_ts: None,
+                    service_id: "B1".to_string(),
+                    app_id: None,
+                    bot_user_id: None,
+                    action: crate::rich_message::SlackControlAction::Block {
+                        action: crate::rich_message::SensitiveValue::new("action-canary"),
+                    },
+                },
+                control_handle: MessageControlHandle::synthetic(),
+            },
+            RuntimeCommand::MarkConversationRead {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+            },
+            RuntimeCommand::MarkConversationReadAll {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+            },
+            RuntimeCommand::MarkThreadRead {
+                channel_id: "C1".to_string(),
+                thread_ts: "1.0".to_string(),
+                ts: "2.0".to_string(),
+            },
+            RuntimeCommand::PostMessage {
+                channel_id: "C1".to_string(),
+                text: "message-text-canary".to_string(),
+                blocks_json: Some("blocks-canary".to_string()),
+                thread_ts: None,
+            },
+            RuntimeCommand::UpdateMessage {
+                channel_id: "C1".to_string(),
+                original: Box::new(SlackMessage {
+                    ts: "1.0".to_string(),
+                    ..SlackMessage::default()
+                }),
+                text: "edit-text-canary".to_string(),
+                blocks_json: Some("edit-blocks-canary".to_string()),
+            },
+            RuntimeCommand::SetReaction {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+                name: "reaction-canary".to_string(),
+                add: true,
+                thread_ts: None,
+            },
+            RuntimeCommand::SetSaved {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+                add: true,
+                thread_ts: None,
+            },
+            RuntimeCommand::SetConversationStarred {
+                channel_id: "C1".to_string(),
+                starred: true,
+            },
+            RuntimeCommand::SetCurrentUserStatus {
+                status: SlackUserStatus::default(),
+            },
+            RuntimeCommand::UploadFiles {
+                channel_id: "C1".to_string(),
+                thread_ts: None,
+                attachments: vec![UploadAttachment {
+                    path: PathBuf::from("upload-path-canary"),
+                    remove_after_upload: false,
+                }],
+                blocks_json: Some("upload-blocks-canary".to_string()),
+            },
+            RuntimeCommand::Huddle(HuddleCommand::SetMuted(true)),
+        ]
+    }
+
+    #[test]
+    fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
+        let commands = runtime_command_fixtures();
+        assert_eq!(commands.len(), 42);
+
+        for command in commands {
+            let descriptor = command.descriptor();
+            assert_eq!(descriptor.admission, expected_runtime_admission(&command));
+
+            let (supersedes_previous, navigation_slot, lane) = expected_legacy_scheduling(&command);
+            assert_eq!(descriptor.supersedes_previous, supersedes_previous);
+            assert_eq!(descriptor.navigation_slot, navigation_slot);
+            assert_eq!(descriptor.lane, lane);
+
+            assert_eq!(
+                descriptor.admission.replacement_key.is_some(),
+                matches!(
+                    descriptor.admission.kind,
+                    RuntimeAdmissionKind::Coalescible | RuntimeAdmissionKind::Supersedable
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn every_huddle_command_is_a_durable_action() {
+        let commands = [
+            HuddleCommand::OpenPreflight {
+                call_id: "R1".to_string(),
+            },
+            HuddleCommand::Join {
+                call_id: "R1".to_string(),
+            },
+            HuddleCommand::OpenExternally {
+                call_id: "R1".to_string(),
+            },
+            HuddleCommand::Leave,
+            HuddleCommand::Dismiss,
+            HuddleCommand::SetMuted(true),
+            HuddleCommand::SetCameraEnabled(true),
+            HuddleCommand::SetScreenShareEnabled(true),
+            HuddleCommand::SelectDevice {
+                kind: crate::huddles::state::HuddleDeviceKind::Microphone,
+                id: "device-canary".to_string(),
+            },
+        ];
+
+        for command in commands {
+            assert_eq!(
+                huddle_admission_policy(&command),
+                RuntimeAdmissionPolicy::durable_action()
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_admission_keys_partition_replaceable_work() {
+        let key = |command: RuntimeCommand| {
+            command
+                .descriptor()
+                .admission
+                .replacement_key
+                .expect("replaceable command should have a key")
+        };
+
+        let main_navigation = key(RuntimeCommand::LoadHistory {
+            channel_id: "C1".to_string(),
+        });
+        assert_eq!(
+            main_navigation,
+            key(RuntimeCommand::SearchMessages {
+                query: "different query".to_string(),
+            })
+        );
+        let thread_navigation = key(RuntimeCommand::LoadThread {
+            channel_id: "C1".to_string(),
+            ts: "1.0".to_string(),
+        });
+        assert_eq!(
+            thread_navigation,
+            key(RuntimeCommand::LoadMessageContext(
+                SearchMessageLocation::new("C1", "2.0", Some("1.0")).unwrap(),
+            ))
+        );
+        assert_ne!(main_navigation, thread_navigation);
+
+        assert_eq!(
+            key(RuntimeCommand::LoadStoredToken),
+            key(RuntimeCommand::StartBrowserSession {
+                xoxc_token: "token-a".to_string(),
+                xoxd_token: "token-b".to_string(),
+                user_agent: None,
+            })
+        );
+        assert_ne!(
+            key(RuntimeCommand::DiscoverConversations),
+            key(RuntimeCommand::DiscoverChannels)
+        );
+        assert_ne!(
+            key(RuntimeCommand::LoadUser {
+                user_id: "U1".to_string(),
+            }),
+            key(RuntimeCommand::LoadUserProfile {
+                user_id: "U1".to_string(),
+            })
+        );
+        assert_ne!(
+            key(RuntimeCommand::LoadUser {
+                user_id: "U1".to_string(),
+            }),
+            key(RuntimeCommand::LoadUser {
+                user_id: "U2".to_string(),
+            })
+        );
+        assert_ne!(
+            key(RuntimeCommand::LoadImageAsset {
+                key: "asset-a".to_string(),
+                url: "https://files.slack.com/a".to_string(),
+            }),
+            key(RuntimeCommand::LoadImageAsset {
+                key: "asset-b".to_string(),
+                url: "https://files.slack.com/a".to_string(),
+            })
+        );
+        // The viewer matches completion by URL, so one completion serves duplicate names.
+        assert_eq!(
+            key(RuntimeCommand::LoadMedia {
+                url: "https://files.slack.com/media-a".to_string(),
+                name: "first-name.mp4".to_string(),
+            }),
+            key(RuntimeCommand::LoadMedia {
+                url: "https://files.slack.com/media-a".to_string(),
+                name: "second-name.mp4".to_string(),
+            })
+        );
+        assert_ne!(
+            key(RuntimeCommand::LoadMedia {
+                url: "https://files.slack.com/media-a".to_string(),
+                name: "media.mp4".to_string(),
+            }),
+            key(RuntimeCommand::LoadMedia {
+                url: "https://files.slack.com/media-b".to_string(),
+                name: "media.mp4".to_string(),
+            })
+        );
+        assert_ne!(
+            key(RuntimeCommand::ResolveMessagePermalink {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+            }),
+            key(RuntimeCommand::ResolveMessagePermalink {
+                channel_id: "C1".to_string(),
+                ts: "2.0".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_admission_regressions_preserve_durable_intent() {
+        let policy = |command: RuntimeCommand| command.descriptor().admission;
+
+        assert_eq!(
+            policy(RuntimeCommand::JoinConversation {
+                channel_id: "C1".to_string(),
+            })
+            .kind,
+            RuntimeAdmissionKind::DurableAction
+        );
+        assert_eq!(
+            policy(RuntimeCommand::OpenDirectMessage {
+                user_id: "U1".to_string(),
+            })
+            .kind,
+            RuntimeAdmissionKind::DurableAction
+        );
+        assert_eq!(
+            policy(RuntimeCommand::MarkConversationRead {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+            })
+            .kind,
+            RuntimeAdmissionKind::ReadMarker
+        );
+        assert_eq!(
+            policy(RuntimeCommand::RefreshConversations).kind,
+            RuntimeAdmissionKind::Coalescible
+        );
+    }
+
+    #[test]
+    fn runtime_admission_debug_output_excludes_command_payloads() {
+        let debug = runtime_command_fixtures()
+            .iter()
+            .map(|command| format!("{:?}", command.descriptor()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for private in [
+            "browser-token-canary",
+            "cookie-token-canary",
+            "agent-canary",
+            "query-canary",
+            "image-key-canary",
+            "image-url-canary",
+            "media-url-canary",
+            "media-name-canary",
+            "download-url-canary",
+            "download-name-canary",
+            "action-canary",
+            "message-text-canary",
+            "blocks-canary",
+            "edit-text-canary",
+            "edit-blocks-canary",
+            "reaction-canary",
+            "upload-path-canary",
+            "upload-blocks-canary",
+        ] {
+            assert!(!debug.contains(private), "descriptor leaked {private}");
+        }
     }
 
     #[test]
