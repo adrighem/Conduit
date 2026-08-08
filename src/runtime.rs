@@ -84,6 +84,10 @@ const RUNTIME_UPLOAD_TASK_CAPACITY: usize = 8;
 const RUNTIME_CONTROL_DISPATCH_BURST: usize = 4;
 const RUNTIME_EVENT_QUEUE_CAPACITY: usize = 256;
 const RUNTIME_EVENT_PROGRESS_CAPACITY: usize = 32;
+const HUDDLE_ACTOR_QUEUE_CAPACITY: usize = 64;
+const HUDDLE_ACTOR_RESERVED_CAPACITY: usize = 8;
+const HUDDLE_ACTOR_OBSERVATION_CAPACITY: usize =
+    HUDDLE_ACTOR_QUEUE_CAPACITY - HUDDLE_ACTOR_RESERVED_CAPACITY;
 const REALTIME_PERSISTENCE_QUEUE_CAPACITY: usize = 256;
 const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -1807,9 +1811,17 @@ impl RuntimeRequest {
                     .expect("coalescible command requires a replacement key"),
             }),
             RuntimeAdmissionKind::DurableAction | RuntimeAdmissionKind::ReadMarker => {
+                let context = if matches!(&command, RuntimeCommand::Huddle(_)) {
+                    OperationContext::new(
+                        RuntimeOperation::Huddle,
+                        RuntimeTarget::Huddle("active".to_string()),
+                    )
+                } else {
+                    descriptor.context.clone()
+                };
                 Some(RuntimeInFlightKey::Ordered {
                     session: identity.session,
-                    context: descriptor.context.clone(),
+                    context,
                 })
             }
             RuntimeAdmissionKind::Control | RuntimeAdmissionKind::Supersedable => None,
@@ -3026,41 +3038,327 @@ impl WorkspaceReducerAdapter {
     }
 }
 
-#[derive(Clone, Debug)]
-struct HuddleActorHandle {
-    sender: mpsc::UnboundedSender<HuddleActorMessage>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HuddleObservationKind {
+    Discovered,
+    Ended,
+    Presence,
 }
 
-#[derive(Debug)]
+fn huddle_observation_kind(input: &CoordinatorInput) -> Option<HuddleObservationKind> {
+    match input {
+        CoordinatorInput::HuddleDiscovered(_) => Some(HuddleObservationKind::Discovered),
+        CoordinatorInput::HuddleEnded { .. } => Some(HuddleObservationKind::Ended),
+        CoordinatorInput::PresenceChanged { .. } => Some(HuddleObservationKind::Presence),
+        CoordinatorInput::OpenPreflight { .. }
+        | CoordinatorInput::JoinRequested { .. }
+        | CoordinatorInput::OpenExternally { .. }
+        | CoordinatorInput::LeaveRequested
+        | CoordinatorInput::Dismissed
+        | CoordinatorInput::MutedChanged(_)
+        | CoordinatorInput::CameraChanged(_)
+        | CoordinatorInput::ScreenShareChanged(_)
+        | CoordinatorInput::ScreenShareStarted
+        | CoordinatorInput::ScreenShareStopped
+        | CoordinatorInput::ScreenShareFailed(_)
+        | CoordinatorInput::DeviceSelected { .. }
+        | CoordinatorInput::MediaConnected
+        | CoordinatorInput::ConnectionLost
+        | CoordinatorInput::MediaReconnected
+        | CoordinatorInput::MediaStopped
+        | CoordinatorInput::StatisticsUpdated(_)
+        | CoordinatorInput::JoinCapabilityChanged(_)
+        | CoordinatorInput::Failed(_)
+        | CoordinatorInput::Reset => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HuddleActorMessageKind {
+    Command,
+    Observation(HuddleObservationKind),
+}
+
 enum HuddleActorMessage {
-    Command(HuddleCommand),
-    Input(CoordinatorInput),
+    Command {
+        command: HuddleCommand,
+        completion: oneshot::Sender<Result<()>>,
+    },
+    Observation {
+        input: CoordinatorInput,
+        kind: HuddleObservationKind,
+        observation_slot: OwnedSemaphorePermit,
+    },
+}
+
+impl HuddleActorMessage {
+    fn kind(&self) -> HuddleActorMessageKind {
+        match self {
+            Self::Command { .. } => HuddleActorMessageKind::Command,
+            Self::Observation { kind, .. } => HuddleActorMessageKind::Observation(*kind),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HuddleActorAdmissionSnapshot {
+    admitted: u64,
+    admitted_commands: u64,
+    admitted_observations: u64,
+    dequeued: u64,
+    blocked: u64,
+    closed: u64,
+    depth: usize,
+    observation_depth: usize,
+    peak_depth: usize,
+    peak_observation_depth: usize,
+}
+
+#[derive(Default)]
+struct HuddleActorAdmissionMetrics {
+    snapshot: HuddleActorAdmissionSnapshot,
+}
+
+impl HuddleActorAdmissionMetrics {
+    fn record_admitted(&mut self, kind: HuddleActorMessageKind) {
+        self.snapshot.admitted = self.snapshot.admitted.saturating_add(1);
+        self.snapshot.depth = self.snapshot.depth.saturating_add(1);
+        match kind {
+            HuddleActorMessageKind::Command => {
+                self.snapshot.admitted_commands = self.snapshot.admitted_commands.saturating_add(1);
+            }
+            HuddleActorMessageKind::Observation(_) => {
+                self.snapshot.admitted_observations =
+                    self.snapshot.admitted_observations.saturating_add(1);
+                self.snapshot.observation_depth = self.snapshot.observation_depth.saturating_add(1);
+            }
+        }
+        self.snapshot.peak_depth = self.snapshot.peak_depth.max(self.snapshot.depth);
+        self.snapshot.peak_observation_depth = self
+            .snapshot
+            .peak_observation_depth
+            .max(self.snapshot.observation_depth);
+    }
+
+    fn record_dequeued(&mut self, kind: HuddleActorMessageKind) {
+        self.snapshot.dequeued = self.snapshot.dequeued.saturating_add(1);
+        self.snapshot.depth = self.snapshot.depth.saturating_sub(1);
+        if matches!(kind, HuddleActorMessageKind::Observation(_)) {
+            self.snapshot.observation_depth = self.snapshot.observation_depth.saturating_sub(1);
+        }
+    }
+
+    fn record_closed(&mut self) {
+        self.snapshot.closed = self.snapshot.closed.saturating_add(1);
+    }
+
+    fn record_blocked(&mut self) {
+        self.snapshot.blocked = self.snapshot.blocked.saturating_add(1);
+    }
+}
+
+struct HuddleActorAdmission {
+    observation_slots: Arc<Semaphore>,
+    metrics: Mutex<HuddleActorAdmissionMetrics>,
+}
+
+impl HuddleActorAdmission {
+    fn snapshot(&self) -> HuddleActorAdmissionSnapshot {
+        self.metrics
+            .lock()
+            .expect("huddle actor admission metrics lock poisoned")
+            .snapshot
+    }
+
+    fn record_closed(&self) {
+        self.metrics
+            .lock()
+            .expect("huddle actor admission metrics lock poisoned")
+            .record_closed();
+    }
+
+    fn record_blocked(&self) {
+        self.metrics
+            .lock()
+            .expect("huddle actor admission metrics lock poisoned")
+            .record_blocked();
+    }
+}
+
+#[derive(Clone)]
+struct HuddleActorHandle {
+    sender: mpsc::Sender<HuddleActorMessage>,
+    admission: Arc<HuddleActorAdmission>,
+}
+
+impl std::fmt::Debug for HuddleActorHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HuddleActorHandle").finish()
+    }
 }
 
 impl HuddleActorHandle {
-    fn command(&self, command: HuddleCommand) -> Result<()> {
-        self.sender
-            .send(HuddleActorMessage::Command(command))
-            .map_err(|_| anyhow!("huddle coordinator is not available"))
+    async fn admit(&self, message: HuddleActorMessage, blocked: bool) -> Result<()> {
+        let kind = message.kind();
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if !blocked {
+                    self.admission.record_blocked();
+                }
+                match self.sender.reserve().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        self.admission.record_closed();
+                        return Err(anyhow!("huddle coordinator is not available"));
+                    }
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.admission.record_closed();
+                return Err(anyhow!("huddle coordinator is not available"));
+            }
+        };
+        let mut metrics = self
+            .admission
+            .metrics
+            .lock()
+            .expect("huddle actor admission metrics lock poisoned");
+        permit.send(message);
+        metrics.record_admitted(kind);
+        Ok(())
     }
 
-    fn input(&self, input: CoordinatorInput) -> Result<()> {
-        self.sender
-            .send(HuddleActorMessage::Input(input))
-            .map_err(|_| anyhow!("huddle coordinator is not available"))
+    async fn command(&self, command: HuddleCommand) -> Result<()> {
+        let completed = self.admit_command(command).await?;
+        completed
+            .await
+            .map_err(|_| anyhow!("huddle coordinator stopped before completing command"))?
     }
 
-    fn observe_huddle(&self, huddle: ActiveHuddle) -> Result<()> {
-        self.input(CoordinatorInput::HuddleDiscovered(huddle))
+    async fn admit_command(&self, command: HuddleCommand) -> Result<oneshot::Receiver<Result<()>>> {
+        let (completion, completed) = oneshot::channel();
+        self.admit(
+            HuddleActorMessage::Command {
+                command,
+                completion,
+            },
+            false,
+        )
+        .await?;
+        Ok(completed)
+    }
+
+    async fn observe(&self, input: CoordinatorInput) -> Result<()> {
+        let Some(kind) = huddle_observation_kind(&input) else {
+            return Err(anyhow!("huddle actor input is not an observation"));
+        };
+        let observation_slots = Arc::clone(&self.admission.observation_slots);
+        let (observation_slot, blocked) = match Arc::clone(&observation_slots).try_acquire_owned() {
+            Ok(slot) => (slot, false),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                self.admission.record_blocked();
+                match observation_slots.acquire_owned().await {
+                    Ok(slot) => (slot, true),
+                    Err(_) => {
+                        self.admission.record_closed();
+                        return Err(anyhow!("huddle coordinator is not available"));
+                    }
+                }
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                self.admission.record_closed();
+                return Err(anyhow!("huddle coordinator is not available"));
+            }
+        };
+        self.admit(
+            HuddleActorMessage::Observation {
+                input,
+                kind,
+                observation_slot,
+            },
+            blocked,
+        )
+        .await
+    }
+
+    async fn observe_huddle(&self, huddle: ActiveHuddle) -> Result<()> {
+        self.observe(CoordinatorInput::HuddleDiscovered(huddle))
+            .await
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> HuddleActorAdmissionSnapshot {
+        self.admission.snapshot()
     }
 }
 
-fn huddle_actor_channel() -> (
-    HuddleActorHandle,
-    mpsc::UnboundedReceiver<HuddleActorMessage>,
-) {
-    let (sender, receiver) = mpsc::unbounded_channel();
-    (HuddleActorHandle { sender }, receiver)
+struct HuddleActorReceiver {
+    receiver: mpsc::Receiver<HuddleActorMessage>,
+    admission: Arc<HuddleActorAdmission>,
+}
+
+impl HuddleActorReceiver {
+    async fn recv(&mut self) -> Option<HuddleActorMessage> {
+        std::future::poll_fn(|context| {
+            let mut metrics = self
+                .admission
+                .metrics
+                .lock()
+                .expect("huddle actor admission metrics lock poisoned");
+            match std::pin::Pin::new(&mut self.receiver).poll_recv(context) {
+                std::task::Poll::Ready(Some(message)) => {
+                    metrics.record_dequeued(message.kind());
+                    std::task::Poll::Ready(Some(message))
+                }
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    fn close(&mut self) {
+        self.admission.observation_slots.close();
+        self.receiver.close();
+    }
+
+    fn snapshot(&self) -> HuddleActorAdmissionSnapshot {
+        self.admission.snapshot()
+    }
+}
+
+fn huddle_actor_channel() -> (HuddleActorHandle, HuddleActorReceiver) {
+    huddle_actor_channel_with_capacity(
+        HUDDLE_ACTOR_QUEUE_CAPACITY,
+        HUDDLE_ACTOR_OBSERVATION_CAPACITY,
+    )
+}
+
+fn huddle_actor_channel_with_capacity(
+    capacity: usize,
+    observation_capacity: usize,
+) -> (HuddleActorHandle, HuddleActorReceiver) {
+    assert!(capacity > 0, "huddle actor capacity must be positive");
+    assert!(
+        observation_capacity <= capacity,
+        "huddle observation capacity exceeds total capacity"
+    );
+    let (sender, receiver) = mpsc::channel(capacity);
+    let admission = Arc::new(HuddleActorAdmission {
+        observation_slots: Arc::new(Semaphore::new(observation_capacity)),
+        metrics: Mutex::new(HuddleActorAdmissionMetrics::default()),
+    });
+    (
+        HuddleActorHandle {
+            sender,
+            admission: Arc::clone(&admission),
+        },
+        HuddleActorReceiver {
+            receiver,
+            admission,
+        },
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3170,10 +3468,92 @@ impl RealtimeSessionSupervisor {
     }
 }
 
+struct HuddleSessionSupervisor {
+    session: SessionId,
+    start: Option<oneshot::Sender<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+    admission: Arc<HuddleActorAdmission>,
+}
+
+impl HuddleSessionSupervisor {
+    fn spawn(
+        session: SessionId,
+        receiver: HuddleActorReceiver,
+        events: RuntimeEventSender,
+        join_capability: NativeJoinCapability,
+    ) -> Self {
+        let admission = Arc::clone(&receiver.admission);
+        let (start, start_receiver) = oneshot::channel();
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            if start_receiver.await.is_err() {
+                reject_unstarted_huddle_actor(receiver).await;
+                return;
+            }
+            run_huddle_actor(receiver, events, join_capability, shutdown_receiver).await;
+        });
+        Self {
+            session,
+            start: Some(start),
+            shutdown: Some(shutdown),
+            task,
+            admission,
+        }
+    }
+
+    fn start(&mut self) -> bool {
+        self.start
+            .take()
+            .is_some_and(|start| start.send(()).is_ok())
+    }
+
+    async fn shutdown(mut self) {
+        self.admission.observation_slots.close();
+        drop(self.start.take());
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Err(error) = self.task.await {
+            crate::debug::log(
+                "huddle",
+                &format!(
+                    "HuddleSupervisorFailed session={:?} error={error}",
+                    self.session
+                ),
+            );
+        }
+        let snapshot = self.admission.snapshot();
+        crate::debug::log(
+            "huddle",
+            &format!(
+                "HuddleActorAdmissionSummary admitted={} commands={} observations={} dequeued={} blocked={} closed={} depth={} observation_depth={} peak={} observation_peak={}",
+                snapshot.admitted,
+                snapshot.admitted_commands,
+                snapshot.admitted_observations,
+                snapshot.dequeued,
+                snapshot.blocked,
+                snapshot.closed,
+                snapshot.depth,
+                snapshot.observation_depth,
+                snapshot.peak_depth,
+                snapshot.peak_observation_depth,
+            ),
+        );
+    }
+}
+
+#[derive(Default)]
+struct RuntimeSessionSupervisors {
+    realtime: Option<RealtimeSessionSupervisor>,
+    huddle: Option<HuddleSessionSupervisor>,
+}
+
 struct RuntimeState {
     active_session: SessionId,
     connection: Option<RuntimeConnection>,
     realtime: Option<RealtimeSessionSupervisor>,
+    huddle: Option<HuddleSessionSupervisor>,
     attention_preferences: AttentionPreferences,
     tasks: HashMap<u64, tokio::task::AbortHandle>,
     task_requests: HashMap<u64, TrackedRequest>,
@@ -3190,6 +3570,7 @@ impl RuntimeState {
             active_session,
             connection: None,
             realtime: None,
+            huddle: None,
             attention_preferences: AttentionPreferences::default(),
             tasks: HashMap::new(),
             task_requests: HashMap::new(),
@@ -3201,10 +3582,7 @@ impl RuntimeState {
         }
     }
 
-    fn begin_session_replacement(
-        &mut self,
-        session: SessionId,
-    ) -> Option<RealtimeSessionSupervisor> {
+    fn begin_session_replacement(&mut self, session: SessionId) -> RuntimeSessionSupervisors {
         self.active_session = session;
         for (_, task) in self.tasks.drain() {
             task.abort();
@@ -3215,7 +3593,10 @@ impl RuntimeState {
         self.active_navigation.clear();
         self.latest_navigation.clear();
         self.connection = None;
-        self.realtime.take()
+        RuntimeSessionSupervisors {
+            realtime: self.realtime.take(),
+            huddle: self.huddle.take(),
+        }
     }
 
     fn install_realtime_supervisor(
@@ -3229,6 +3610,20 @@ impl RuntimeState {
             return Err(supervisor);
         }
         self.realtime = Some(supervisor);
+        Ok(())
+    }
+
+    fn install_huddle_supervisor(
+        &mut self,
+        mut supervisor: HuddleSessionSupervisor,
+    ) -> std::result::Result<(), HuddleSessionSupervisor> {
+        if self.active_session != supervisor.session || self.huddle.is_some() {
+            return Err(supervisor);
+        }
+        if !supervisor.start() {
+            return Err(supervisor);
+        }
+        self.huddle = Some(supervisor);
         Ok(())
     }
 
@@ -3376,12 +3771,15 @@ impl RuntimeState {
 }
 
 async fn replace_session_and_drain(state: &Arc<Mutex<RuntimeState>>, session: SessionId) {
-    let realtime = state
+    let supervisors = state
         .lock()
         .expect("runtime state lock poisoned")
         .begin_session_replacement(session);
-    if let Some(realtime) = realtime {
+    if let Some(realtime) = supervisors.realtime {
         realtime.shutdown().await;
+    }
+    if let Some(huddle) = supervisors.huddle {
+        huddle.shutdown().await;
     }
 }
 
@@ -4954,21 +5352,27 @@ async fn spawn_workspace_tasks(
     events: RuntimeEventSender,
     connection: RuntimeConnection,
     limits: RuntimeTaskLimits,
-    huddle_receiver: mpsc::UnboundedReceiver<HuddleActorMessage>,
+    huddle_receiver: HuddleActorReceiver,
 ) {
     let huddle_events = events.unsolicited(OperationContext::new(
         RuntimeOperation::Huddle,
         RuntimeTarget::Huddle("active".to_string()),
     ));
-    spawn_session_task(
-        state,
+    let huddle_supervisor = HuddleSessionSupervisor::spawn(
         identity.session,
-        run_huddle_actor(
-            huddle_receiver,
-            huddle_events,
-            production_native_join_capability(connection.slack.browser_cookie_d().is_some()),
-        ),
+        huddle_receiver,
+        huddle_events,
+        production_native_join_capability(connection.slack.browser_cookie_d().is_some()),
     );
+    let rejected_huddle = state
+        .lock()
+        .expect("runtime state lock poisoned")
+        .install_huddle_supervisor(huddle_supervisor)
+        .err();
+    if let Some(rejected_huddle) = rejected_huddle {
+        rejected_huddle.shutdown().await;
+        return;
+    }
 
     let (hydration_ready_sender, hydration_ready_receiver) = oneshot::channel();
     let state_after_hydration = Arc::clone(state);
@@ -5352,12 +5756,19 @@ async fn run_job_payload(
             let service = ConversationHistoryService::new(api, connection.workspace_store.as_ref());
             if let Some(messages) = service.load_cached(&channel_id).await? {
                 if !messages.is_empty() {
-                    observe_huddle_messages(
+                    if let Err(error) = observe_huddle_messages(
                         &connection.huddles,
                         connection.team_id.as_deref(),
                         &channel_id,
                         &messages,
-                    );
+                    )
+                    .await
+                    {
+                        crate::debug::log(
+                            "huddle",
+                            &format!("HuddleScheduledHistoryObservationFailed error={error}"),
+                        );
+                    }
                     publish_history_snapshot_with_completion(
                         events,
                         &connection.workspace_store,
@@ -5578,7 +5989,7 @@ async fn handle_connected_command(
     image_cache: &ImageAssetCache,
 ) -> Result<()> {
     let command = match command {
-        RuntimeCommand::Huddle(command) => return connection.huddles.command(command),
+        RuntimeCommand::Huddle(command) => return connection.huddles.command(command).await,
         command => command,
     };
     let mut slack = Some(connection.slack.clone());
@@ -6093,12 +6504,19 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let service = ConversationHistoryService::new(api, context.workspace_store.as_ref());
             match service.load_cached(&channel_id).await {
                 Ok(Some(messages)) if !messages.is_empty() => {
-                    observe_huddle_messages(
+                    if let Err(error) = observe_huddle_messages(
                         context.huddles,
                         context.team_id,
                         &channel_id,
                         &messages,
-                    );
+                    )
+                    .await
+                    {
+                        crate::debug::log(
+                            "huddle",
+                            &format!("HuddleCachedHistoryObservationFailed error={error}"),
+                        );
+                    }
                     if let Err(error) = publish_history_snapshot_with_completion(
                         context.events,
                         context.workspace_store,
@@ -6136,12 +6554,19 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context.events.send_status("Loading conversation");
             let base_revision = context.workspace.revision();
             let page = service.fetch(&channel_id).await?;
-            observe_huddle_messages(
+            if let Err(error) = observe_huddle_messages(
                 context.huddles,
                 context.team_id,
                 &channel_id,
                 &page.messages,
-            );
+            )
+            .await
+            {
+                crate::debug::log(
+                    "huddle",
+                    &format!("HuddleHistoryObservationFailed error={error}"),
+                );
+            }
             crate::debug::log(
                 "runtime",
                 &format!(
@@ -6177,12 +6602,19 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context.events.send_status("Loading older messages");
             let base_revision = context.workspace.revision();
             let page = api.history_page(&channel_id, Some(&cursor)).await?;
-            observe_huddle_messages(
+            if let Err(error) = observe_huddle_messages(
                 context.huddles,
                 context.team_id,
                 &channel_id,
                 &page.messages,
-            );
+            )
+            .await
+            {
+                crate::debug::log(
+                    "huddle",
+                    &format!("HuddleOlderHistoryObservationFailed error={error}"),
+                );
+            }
             publish_history_snapshot_with_completion(
                 context.events,
                 context.workspace_store,
@@ -6966,7 +7398,8 @@ async fn run_socket_mode(
                             &huddles_for_event,
                             team_id_for_event.as_deref(),
                             &event,
-                        );
+                        )
+                        .await?;
                         let defer_workspace_mutation = persistence_for_event.is_some()
                             && matches!(
                                 &event,
@@ -7259,35 +7692,40 @@ const fn message_mutation_kind(kind: SocketModeMessageKind) -> MessageMutationKi
     }
 }
 
-fn observe_huddle_socket_event(
+async fn observe_huddle_socket_event(
     huddles: &HuddleActorHandle,
     team_id: Option<&str>,
     event: &SocketModeEvent,
-) {
-    let result = match event {
+) -> Result<()> {
+    match event {
         SocketModeEvent::Message(event) => {
             let Some(room) = event.message.room.as_ref() else {
-                return;
+                return Ok(());
             };
             if room.has_ended() {
-                room.id
+                let Some(call_id) = room
+                    .id
                     .as_deref()
                     .map(str::trim)
                     .filter(|call_id| !call_id.is_empty())
-                    .map(|call_id| {
-                        huddles.input(CoordinatorInput::HuddleEnded {
-                            call_id: call_id.to_string(),
-                        })
+                else {
+                    return Ok(());
+                };
+                huddles
+                    .observe(CoordinatorInput::HuddleEnded {
+                        call_id: call_id.to_string(),
                     })
-                    .unwrap_or(Ok(()))
+                    .await
             } else {
-                team_id
-                    .and_then(|team_id| room.active_huddle(team_id, &event.channel_id))
-                    .map(|huddle| huddles.observe_huddle(huddle))
-                    .unwrap_or(Ok(()))
+                let Some(huddle) =
+                    team_id.and_then(|team_id| room.active_huddle(team_id, &event.channel_id))
+                else {
+                    return Ok(());
+                };
+                huddles.observe_huddle(huddle).await
             }
         }
-        SocketModeEvent::UserHuddleChanged(user) => observe_huddle_user(huddles, user),
+        SocketModeEvent::UserHuddleChanged(user) => observe_huddle_user(huddles, user).await,
         SocketModeEvent::UserChanged(user)
             if user.profile.as_ref().is_some_and(|profile| {
                 profile.huddle_state_call_id.is_some()
@@ -7296,30 +7734,26 @@ fn observe_huddle_socket_event(
                     || profile.huddle_state != crate::huddles::model::SlackHuddleState::DefaultUnset
             }) =>
         {
-            observe_huddle_user(huddles, user)
+            observe_huddle_user(huddles, user).await
         }
         SocketModeEvent::UserChanged(_)
         | SocketModeEvent::Reaction(_)
         | SocketModeEvent::RefreshConversations => Ok(()),
-    };
-
-    if result.is_err() {
-        crate::debug::log("huddle", "HuddleRealtimeObservationDropped");
     }
 }
 
-fn observe_huddle_messages(
+async fn observe_huddle_messages(
     huddles: &HuddleActorHandle,
     team_id: Option<&str>,
     channel_id: &str,
     messages: &[SlackMessage],
-) {
+) -> Result<()> {
     let Some(team_id) = team_id.map(str::trim).filter(|team_id| !team_id.is_empty()) else {
-        return;
+        return Ok(());
     };
     let channel_id = channel_id.trim();
     if channel_id.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut room_messages = messages
@@ -7338,30 +7772,30 @@ fn observe_huddle_messages(
         {
             continue;
         }
-        let result = if room.has_ended() {
-            room.id
+        if room.has_ended() {
+            let Some(call_id) = room
+                .id
                 .as_deref()
                 .map(str::trim)
                 .filter(|call_id| !call_id.is_empty())
-                .map(|call_id| {
-                    huddles.input(CoordinatorInput::HuddleEnded {
-                        call_id: call_id.to_string(),
-                    })
+            else {
+                continue;
+            };
+            huddles
+                .observe(CoordinatorInput::HuddleEnded {
+                    call_id: call_id.to_string(),
                 })
-                .unwrap_or(Ok(()))
+                .await?;
         } else {
-            room.active_huddle(team_id, channel_id)
-                .map(|huddle| huddles.observe_huddle(huddle))
-                .unwrap_or(Ok(()))
-        };
-        if result.is_err() {
-            crate::debug::log("huddle", "HuddleHistoryObservationDropped");
-            return;
+            if let Some(huddle) = room.active_huddle(team_id, channel_id) {
+                huddles.observe_huddle(huddle).await?;
+            }
         }
     }
+    Ok(())
 }
 
-fn observe_huddle_user(huddles: &HuddleActorHandle, user: &SlackUser) -> Result<()> {
+async fn observe_huddle_user(huddles: &HuddleActorHandle, user: &SlackUser) -> Result<()> {
     let Some(user_id) = user
         .id
         .as_deref()
@@ -7376,37 +7810,203 @@ fn observe_huddle_user(huddles: &HuddleActorHandle, user: &SlackUser) -> Result<
         .unwrap_or_default();
     let presence =
         HuddlePresence::from_user(user).filter(|presence| presence.is_active_at(unix_seconds));
-    huddles.input(CoordinatorInput::PresenceChanged {
-        user_id: user_id.to_string(),
-        presence,
+    huddles
+        .observe(CoordinatorInput::PresenceChanged {
+            user_id: user_id.to_string(),
+            presence,
+        })
+        .await
+}
+
+async fn reject_unstarted_huddle_actor(mut receiver: HuddleActorReceiver) {
+    receiver.close();
+    while let Some(message) = receiver.recv().await {
+        match message {
+            HuddleActorMessage::Command { completion, .. } => {
+                let _ = completion.send(Err(anyhow!("huddle coordinator session did not start")));
+            }
+            HuddleActorMessage::Observation {
+                observation_slot, ..
+            } => drop(observation_slot),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HuddleEffectApplication {
+    Transition,
+    Reset,
+}
+
+#[derive(Default)]
+struct HuddleEffectRuntime {
+    native_session_active: bool,
+}
+
+enum HuddleActorReceive {
+    Message(HuddleActorMessage),
+    Closed,
+    Shutdown,
+}
+
+async fn receive_huddle_or_shutdown(
+    receiver: &mut HuddleActorReceiver,
+    shutdown: &mut oneshot::Receiver<()>,
+) -> HuddleActorReceive {
+    let mut receive = std::pin::pin!(receiver.recv());
+    std::future::poll_fn(|context| {
+        if std::pin::Pin::new(&mut *shutdown).poll(context).is_ready() {
+            return std::task::Poll::Ready(HuddleActorReceive::Shutdown);
+        }
+        match receive.as_mut().poll(context) {
+            std::task::Poll::Ready(Some(message)) => {
+                std::task::Poll::Ready(HuddleActorReceive::Message(message))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(HuddleActorReceive::Closed),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     })
+    .await
 }
 
 async fn run_huddle_actor(
-    mut receiver: mpsc::UnboundedReceiver<HuddleActorMessage>,
+    mut receiver: HuddleActorReceiver,
     events: RuntimeEventSender,
     join_capability: NativeJoinCapability,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut coordinator = HuddleCoordinator::default();
-    let _ = coordinator.apply(CoordinatorInput::JoinCapabilityChanged(
+    let mut effect_runtime = HuddleEffectRuntime::default();
+    match coordinator.apply(CoordinatorInput::JoinCapabilityChanged(
         join_capability.is_available(),
-    ));
-    while let Some(message) = receiver.recv().await {
-        let input = match message {
-            HuddleActorMessage::Command(command) => huddle_input_from_command(command),
-            HuddleActorMessage::Input(input) => input,
-        };
-        match coordinator.apply(input) {
-            Ok(effects) => {
-                apply_huddle_effects(&mut coordinator, effects, &events, join_capability)
+    )) {
+        Ok(effects) => {
+            if let Err(error) = apply_huddle_effects(
+                &mut coordinator,
+                effects,
+                &events,
+                join_capability,
+                &mut effect_runtime,
+                HuddleEffectApplication::Transition,
+            ) {
+                crate::debug::log(
+                    "huddle",
+                    &format!("HuddleCapabilityEffectsFailed error={error}"),
+                );
             }
-            Err(error) => {
-                crate::debug::log("huddle", &format!("HuddleTransitionRejected error={error}"))
+        }
+        Err(error) => crate::debug::log(
+            "huddle",
+            &format!("HuddleCapabilityTransitionRejected error={error}"),
+        ),
+    }
+
+    loop {
+        match receive_huddle_or_shutdown(&mut receiver, &mut shutdown).await {
+            HuddleActorReceive::Shutdown => {
+                receiver.close();
+                break;
+            }
+            HuddleActorReceive::Closed => break,
+            HuddleActorReceive::Message(message) => {
+                process_huddle_actor_message(
+                    message,
+                    &mut coordinator,
+                    &events,
+                    join_capability,
+                    &mut effect_runtime,
+                );
             }
         }
     }
+    while let Some(message) = receiver.recv().await {
+        process_huddle_actor_message(
+            message,
+            &mut coordinator,
+            &events,
+            join_capability,
+            &mut effect_runtime,
+        );
+    }
 
-    let _ = coordinator.apply(CoordinatorInput::Reset);
+    match coordinator.apply(CoordinatorInput::Reset) {
+        Ok(effects) => {
+            if let Err(error) = apply_huddle_effects(
+                &mut coordinator,
+                effects,
+                &events,
+                join_capability,
+                &mut effect_runtime,
+                HuddleEffectApplication::Reset,
+            ) {
+                crate::debug::log("huddle", &format!("HuddleResetEffectsFailed error={error}"));
+            }
+        }
+        Err(error) => crate::debug::log(
+            "huddle",
+            &format!("HuddleResetTransitionRejected error={error}"),
+        ),
+    }
+
+    let snapshot = receiver.snapshot();
+    crate::debug::log(
+        "huddle",
+        &format!(
+            "HuddleActorDrained admitted={} commands={} observations={} dequeued={} blocked={} depth={} observation_depth={} peak={} observation_peak={}",
+            snapshot.admitted,
+            snapshot.admitted_commands,
+            snapshot.admitted_observations,
+            snapshot.dequeued,
+            snapshot.blocked,
+            snapshot.depth,
+            snapshot.observation_depth,
+            snapshot.peak_depth,
+            snapshot.peak_observation_depth,
+        ),
+    );
+}
+
+fn process_huddle_actor_message(
+    message: HuddleActorMessage,
+    coordinator: &mut HuddleCoordinator,
+    events: &RuntimeEventSender,
+    join_capability: NativeJoinCapability,
+    effect_runtime: &mut HuddleEffectRuntime,
+) {
+    let (input, completion) = match message {
+        HuddleActorMessage::Command {
+            command,
+            completion,
+        } => (huddle_input_from_command(command), Some(completion)),
+        HuddleActorMessage::Observation {
+            input,
+            kind,
+            observation_slot,
+        } => {
+            debug_assert_eq!(huddle_observation_kind(&input), Some(kind));
+            drop(observation_slot);
+            (input, None)
+        }
+    };
+    let result = coordinator
+        .apply(input)
+        .map_err(anyhow::Error::new)
+        .and_then(|effects| {
+            apply_huddle_effects(
+                coordinator,
+                effects,
+                events,
+                join_capability,
+                effect_runtime,
+                HuddleEffectApplication::Transition,
+            )
+        });
+    if let Err(error) = result.as_ref() {
+        crate::debug::log("huddle", &format!("HuddleTransitionRejected error={error}"));
+    }
+    if let Some(completion) = completion {
+        let _ = completion.send(result);
+    }
 }
 
 fn huddle_input_from_command(command: HuddleCommand) -> CoordinatorInput {
@@ -7430,7 +8030,9 @@ fn apply_huddle_effects(
     effects: Vec<HuddleEffect>,
     events: &RuntimeEventSender,
     join_capability: NativeJoinCapability,
-) {
+    effect_runtime: &mut HuddleEffectRuntime,
+    application: HuddleEffectApplication,
+) -> Result<()> {
     let mut pending = std::collections::VecDeque::from(effects);
     while let Some(effect) = pending.pop_front() {
         match effect {
@@ -7444,13 +8046,30 @@ fn apply_huddle_effects(
                     NativeJoinCapability::Unavailable(reason) => reason.failure(),
                     NativeJoinCapability::Available { .. } => HuddleFailure::protocol_changed(),
                 };
-                if let Ok(effects) = coordinator.apply(CoordinatorInput::Failed(failure)) {
-                    pending.extend(effects);
-                }
+                pending.extend(
+                    coordinator
+                        .apply(CoordinatorInput::Failed(failure))
+                        .map_err(anyhow::Error::new)?,
+                );
             }
-            HuddleEffect::StopSession if coordinator.snapshot().phase == HuddlePhase::Leaving => {
-                if let Ok(effects) = coordinator.apply(CoordinatorInput::MediaStopped) {
-                    pending.extend(effects);
+            HuddleEffect::StopSession => {
+                let had_native_session = effect_runtime.native_session_active;
+                effect_runtime.native_session_active = false;
+                crate::debug::log(
+                    "huddle",
+                    &format!(
+                        "HuddleStopSessionHandled reset={} native_session_active={had_native_session}",
+                        application == HuddleEffectApplication::Reset,
+                    ),
+                );
+                if application == HuddleEffectApplication::Transition
+                    && coordinator.snapshot().phase == HuddlePhase::Leaving
+                {
+                    pending.extend(
+                        coordinator
+                            .apply(CoordinatorInput::MediaStopped)
+                            .map_err(anyhow::Error::new)?,
+                    );
                 }
             }
             HuddleEffect::OpenExternal(huddle) => events.send_event(RuntimeEventKind::Huddle(
@@ -7459,10 +8078,10 @@ fn apply_huddle_effects(
             HuddleEffect::ApplyControls(_)
             | HuddleEffect::ApplyDeviceSelection(_)
             | HuddleEffect::StartScreenShare
-            | HuddleEffect::StopScreenShare
-            | HuddleEffect::StopSession => {}
+            | HuddleEffect::StopScreenShare => {}
         }
     }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -8462,7 +9081,14 @@ async fn prefetch_channel_histories_best_effort(
                         ),
                     );
                 }
-                observe_huddle_messages(huddles, team_id, &channel_id, &page.messages);
+                if let Err(error) =
+                    observe_huddle_messages(huddles, team_id, &channel_id, &page.messages).await
+                {
+                    crate::debug::log(
+                        "huddle",
+                        &format!("HuddlePrefetchObservationFailed error={error}"),
+                    );
+                }
                 let unread_snapshot = SlackConversationUnreadSnapshot {
                     channel_id: channel_id.clone(),
                     unread_state: page.unread_state,
@@ -9694,6 +10320,62 @@ mod tests {
             .expect("second reaction stayed blocked after completion")
             .expect("admission receiver closed early");
             assert_eq!(second.request.identity.request, RequestId::new(2));
+        });
+    }
+
+    #[test]
+    fn runtime_command_admission_serializes_all_huddle_commands() {
+        admission_test_runtime().block_on(async {
+            let (sender, receiver) =
+                RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+            assert_eq!(
+                sender.send(admission_request(
+                    1,
+                    1,
+                    RuntimeCommand::Huddle(HuddleCommand::OpenPreflight {
+                        call_id: "R1".into(),
+                    }),
+                )),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+            assert_eq!(
+                sender.send(admission_request(
+                    1,
+                    2,
+                    RuntimeCommand::Huddle(HuddleCommand::SetMuted(true)),
+                )),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+
+            let first = receiver
+                .recv_lane(RuntimeTaskLane::Interactive)
+                .await
+                .expect("first huddle command should reserve shared actor target");
+            assert_eq!(first.request.identity.request, RequestId::new(1));
+            assert_eq!(
+                first.request.descriptor.context.target,
+                RuntimeTarget::Huddle("R1".into())
+            );
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                receiver.recv_lane(RuntimeTaskLane::Interactive),
+            )
+            .await
+            .is_err());
+
+            drop(first);
+            let second = tokio::time::timeout(
+                Duration::from_secs(1),
+                receiver.recv_lane(RuntimeTaskLane::Interactive),
+            )
+            .await
+            .expect("second huddle command stayed blocked after completion")
+            .expect("huddle admission receiver closed early");
+            assert_eq!(second.request.identity.request, RequestId::new(2));
+            assert_eq!(
+                second.request.descriptor.context.target,
+                RuntimeTarget::Huddle("active".into())
+            );
         });
     }
 
@@ -17219,6 +17901,19 @@ mod tests {
             let first_session = SessionId::default().next();
             let second_session = first_session.next();
             let state = Arc::new(Mutex::new(RuntimeState::new(first_session)));
+            let (huddle_events, mut huddle_event_receiver) = huddle_test_event_channel();
+            let (huddle_handle, huddle_receiver) = huddle_actor_channel();
+            let huddle_supervisor = HuddleSessionSupervisor::spawn(
+                first_session,
+                huddle_receiver,
+                huddle_events,
+                production_native_join_capability(false),
+            );
+            assert!(state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .install_huddle_supervisor(huddle_supervisor)
+                .is_ok());
             let (started, mut started_receiver) = oneshot::channel();
             let (drain_started, drain_started_receiver) = oneshot::channel();
             let (release_drain, release_drain_receiver) = oneshot::channel();
@@ -17266,6 +17961,19 @@ mod tests {
                 !replacement.is_finished(),
                 "session replacement completed before realtime drain"
             );
+            huddle_handle
+                .observe_huddle(test_huddle("R_DRAIN"))
+                .await
+                .expect("huddle actor closed before realtime drained");
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), huddle_event_receiver.recv())
+                    .await
+                    .expect("huddle actor did not process during realtime drain")
+                    .unwrap()
+                    .kind,
+                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot))
+                    if snapshot.phase == HuddlePhase::Discovered
+            ));
 
             let (old_task_started, old_task_started_receiver) = oneshot::channel();
             spawn_session_task(&state, first_session, async move {
@@ -17281,10 +17989,24 @@ mod tests {
             drained_receiver
                 .await
                 .expect("realtime drain did not finish");
+            assert!(huddle_handle
+                .observe_huddle(test_huddle("R_CLOSED"))
+                .await
+                .is_err());
+            assert!(matches!(
+                huddle_event_receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot))
+                    if snapshot.phase == HuddlePhase::Idle
+            ));
             assert!(state
                 .lock()
                 .expect("runtime state lock poisoned")
                 .realtime
+                .is_none());
+            assert!(state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .huddle
                 .is_none());
         });
     }
@@ -17345,7 +18067,9 @@ mod tests {
         state.set_attention_preferences(latest.clone());
         assert_eq!(state.attention_preferences, latest);
 
-        assert!(state.begin_session_replacement(second_session).is_none());
+        let supervisors = state.begin_session_replacement(second_session);
+        assert!(supervisors.realtime.is_none());
+        assert!(supervisors.huddle.is_none());
         let seeded = state.attention_context(Some("U_NEXT".to_string()));
         assert_eq!(seeded.current_user_id.as_deref(), Some("U_NEXT"));
         assert_eq!(state.attention_preferences, latest);
@@ -18604,15 +19328,22 @@ mod tests {
         });
     }
 
-    #[test]
-    fn huddle_actor_serializes_observation_and_user_commands() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let (event_sender, mut event_receiver) = runtime_event_channel();
-            let events = RuntimeEventSender {
+    fn test_huddle(call_id: &str) -> ActiveHuddle {
+        ActiveHuddle {
+            team_id: "T123".to_string(),
+            channel_id: "C123".to_string(),
+            call_id: call_id.to_string(),
+            name: None,
+            participant_ids: Vec::new(),
+            started_at: None,
+            huddle_link: None,
+        }
+    }
+
+    fn huddle_test_event_channel() -> (RuntimeEventSender, RuntimeEventReceiver) {
+        let (event_sender, event_receiver) = runtime_event_channel();
+        (
+            RuntimeEventSender {
                 sender: event_sender,
                 session: SessionId::default().next(),
                 request: None,
@@ -18621,24 +19352,420 @@ mod tests {
                     RuntimeTarget::Huddle("active".to_string()),
                 ),
                 workspace_patch_send_gate: None,
-            };
+            },
+            event_receiver,
+        )
+    }
+
+    fn available_huddle_join_capability() -> NativeJoinCapability {
+        NativeJoinCapability::Available {
+            slack_contract_revision: "test-slack",
+            chime_bridge_revision: "test-chime",
+        }
+    }
+
+    #[test]
+    fn huddle_actor_admission_bounds_observations_and_preserves_command_reserve_fifo() {
+        admission_test_runtime().block_on(async {
+            assert_eq!(HUDDLE_ACTOR_QUEUE_CAPACITY, 64);
+            assert_eq!(HUDDLE_ACTOR_RESERVED_CAPACITY, 8);
+            assert_eq!(HUDDLE_ACTOR_OBSERVATION_CAPACITY, 56);
+            let (handle, mut receiver) = huddle_actor_channel();
+            let observation_half = HUDDLE_ACTOR_OBSERVATION_CAPACITY / 2;
+            let command_half = HUDDLE_ACTOR_RESERVED_CAPACITY / 2;
+            let mut completions = Vec::new();
+
+            for index in 0..observation_half {
+                handle
+                    .observe(CoordinatorInput::PresenceChanged {
+                        user_id: format!("U{index}"),
+                        presence: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..command_half {
+                completions.push(handle.admit_command(HuddleCommand::Dismiss).await.unwrap());
+            }
+            for index in observation_half..HUDDLE_ACTOR_OBSERVATION_CAPACITY {
+                handle
+                    .observe(CoordinatorInput::PresenceChanged {
+                        user_id: format!("U{index}"),
+                        presence: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let blocked_observation_handle = handle.clone();
+            let blocked_observation = tokio::spawn(async move {
+                blocked_observation_handle
+                    .observe(CoordinatorInput::PresenceChanged {
+                        user_id: "U_BLOCKED".into(),
+                        presence: None,
+                    })
+                    .await
+            });
+
+            for _ in command_half..HUDDLE_ACTOR_RESERVED_CAPACITY {
+                completions.push(handle.admit_command(HuddleCommand::Dismiss).await.unwrap());
+            }
+            let blocked_command_handle = handle.clone();
+            let blocked_command = tokio::spawn(async move {
+                blocked_command_handle
+                    .admit_command(HuddleCommand::Dismiss)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while handle.snapshot().blocked < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("huddle producers did not enter admission backpressure");
+            assert!(!blocked_observation.is_finished());
+            assert!(!blocked_command.is_finished());
+            assert_eq!(
+                handle.snapshot(),
+                HuddleActorAdmissionSnapshot {
+                    admitted: 64,
+                    admitted_commands: 8,
+                    admitted_observations: 56,
+                    blocked: 2,
+                    depth: 64,
+                    observation_depth: 56,
+                    peak_depth: 64,
+                    peak_observation_depth: 56,
+                    ..HuddleActorAdmissionSnapshot::default()
+                }
+            );
+
+            blocked_observation.abort();
+            blocked_command.abort();
+            assert!(blocked_observation.await.unwrap_err().is_cancelled());
+            assert!(blocked_command.await.unwrap_err().is_cancelled());
+
+            for index in 0..HUDDLE_ACTOR_QUEUE_CAPACITY {
+                let message = receiver.recv().await.unwrap();
+                if index < observation_half
+                    || (observation_half + command_half
+                        ..HUDDLE_ACTOR_OBSERVATION_CAPACITY + command_half)
+                        .contains(&index)
+                {
+                    assert!(matches!(
+                        message.kind(),
+                        HuddleActorMessageKind::Observation(HuddleObservationKind::Presence)
+                    ));
+                } else {
+                    assert_eq!(message.kind(), HuddleActorMessageKind::Command);
+                }
+                drop(message);
+            }
+            drop(completions);
+            let snapshot = receiver.snapshot();
+            assert_eq!(snapshot.dequeued, 64);
+            assert_eq!(snapshot.depth, 0);
+            assert_eq!(snapshot.observation_depth, 0);
+        });
+    }
+
+    #[test]
+    fn huddle_actor_close_wakes_waiters_and_drains_accepted_fifo() {
+        admission_test_runtime().block_on(async {
+            let (handle, mut receiver) = huddle_actor_channel_with_capacity(1, 1);
+            handle
+                .observe(CoordinatorInput::PresenceChanged {
+                    user_id: "U1".into(),
+                    presence: None,
+                })
+                .await
+                .unwrap();
+            let waiting_handle = handle.clone();
+            let waiting = tokio::spawn(async move {
+                waiting_handle
+                    .observe(CoordinatorInput::PresenceChanged {
+                        user_id: "U2".into(),
+                        presence: None,
+                    })
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while handle.snapshot().blocked < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("huddle observation did not enter admission backpressure");
+            assert!(!waiting.is_finished());
+
+            receiver.close();
+            assert!(tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("closed observation admission did not wake")
+                .unwrap()
+                .is_err());
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind(),
+                HuddleActorMessageKind::Observation(HuddleObservationKind::Presence)
+            ));
+            assert!(receiver.recv().await.is_none());
+            assert!(handle.admit_command(HuddleCommand::Dismiss).await.is_err());
+        });
+    }
+
+    #[test]
+    fn huddle_actor_metrics_never_exceed_physical_queue_capacity() {
+        admission_test_runtime().block_on(async {
+            const MESSAGE_COUNT: usize = 1_000;
+            let (handle, mut receiver) = huddle_actor_channel_with_capacity(1, 1);
+            let producer_handle = handle.clone();
+            let producer = tokio::spawn(async move {
+                for _ in 0..MESSAGE_COUNT {
+                    let completion = producer_handle
+                        .admit_command(HuddleCommand::Dismiss)
+                        .await
+                        .unwrap();
+                    drop(completion);
+                }
+            });
+            for _ in 0..MESSAGE_COUNT {
+                assert_eq!(
+                    receiver.recv().await.unwrap().kind(),
+                    HuddleActorMessageKind::Command
+                );
+            }
+            producer.await.unwrap();
+
+            let snapshot = receiver.snapshot();
+            assert_eq!(snapshot.admitted, MESSAGE_COUNT as u64);
+            assert_eq!(snapshot.dequeued, MESSAGE_COUNT as u64);
+            assert_eq!(snapshot.depth, 0);
+            assert_eq!(snapshot.peak_depth, 1);
+        });
+    }
+
+    #[test]
+    fn cancelled_huddle_observation_restores_reserved_observation_slot() {
+        admission_test_runtime().block_on(async {
+            let (handle, mut receiver) = huddle_actor_channel_with_capacity(1, 1);
+            let command_completion = handle.admit_command(HuddleCommand::Dismiss).await.unwrap();
+            let waiting_handle = handle.clone();
+            let waiting = tokio::spawn(async move {
+                waiting_handle
+                    .observe(CoordinatorInput::PresenceChanged {
+                        user_id: "U_CANCELLED".into(),
+                        presence: None,
+                    })
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while handle.snapshot().blocked < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("observation did not wait behind full actor channel");
+            assert_eq!(handle.admission.observation_slots.available_permits(), 0);
+
+            waiting.abort();
+            assert!(waiting.await.unwrap_err().is_cancelled());
+            assert_eq!(handle.admission.observation_slots.available_permits(), 1);
+
+            assert_eq!(
+                receiver.recv().await.unwrap().kind(),
+                HuddleActorMessageKind::Command
+            );
+            assert!(command_completion.await.is_err());
+            handle
+                .observe(CoordinatorInput::PresenceChanged {
+                    user_id: "U_LATER".into(),
+                    presence: None,
+                })
+                .await
+                .expect("cancelled observation leaked reserved capacity");
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind(),
+                HuddleActorMessageKind::Observation(HuddleObservationKind::Presence)
+            ));
+        });
+    }
+
+    #[test]
+    fn huddle_supervisor_drains_commands_applies_reset_and_closes_retained_handle() {
+        admission_test_runtime().block_on(async {
+            let (events, mut event_receiver) = huddle_test_event_channel();
             let (handle, receiver) = huddle_actor_channel();
+            handle.observe_huddle(test_huddle("R123")).await.unwrap();
+            let completion = handle
+                .admit_command(HuddleCommand::OpenPreflight {
+                    call_id: "R123".into(),
+                })
+                .await
+                .unwrap();
+            let mut supervisor = HuddleSessionSupervisor::spawn(
+                SessionId::default().next(),
+                receiver,
+                events,
+                available_huddle_join_capability(),
+            );
+            assert!(supervisor.start());
+            supervisor.shutdown().await;
+
+            completion.await.unwrap().unwrap();
+            let phases = std::iter::from_fn(|| event_receiver.try_recv().ok())
+                .filter_map(|event| match event.kind {
+                    RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot)) => {
+                        Some((snapshot.phase, snapshot.native_join_available))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                phases,
+                vec![
+                    (HuddlePhase::Discovered, true),
+                    (HuddlePhase::Preflight, true),
+                    (HuddlePhase::Idle, true),
+                ]
+            );
+            assert!(handle.observe_huddle(test_huddle("R999")).await.is_err());
+            let snapshot = handle.snapshot();
+            assert_eq!(snapshot.admitted, 2);
+            assert_eq!(snapshot.dequeued, 2);
+            assert_eq!(snapshot.depth, 0);
+        });
+    }
+
+    #[test]
+    fn unstarted_huddle_supervisor_rejects_admitted_commands() {
+        admission_test_runtime().block_on(async {
+            let (events, mut event_receiver) = huddle_test_event_channel();
+            let (handle, receiver) = huddle_actor_channel();
+            let completion = handle.admit_command(HuddleCommand::Dismiss).await.unwrap();
+            let supervisor = HuddleSessionSupervisor::spawn(
+                SessionId::default().next(),
+                receiver,
+                events,
+                production_native_join_capability(false),
+            );
+            supervisor.shutdown().await;
+
+            assert!(completion.await.unwrap().is_err());
+            assert!(event_receiver.try_recv().is_err());
+            assert!(handle.admit_command(HuddleCommand::Dismiss).await.is_err());
+        });
+    }
+
+    #[test]
+    fn cancelled_huddle_command_waiter_does_not_cancel_admitted_command() {
+        admission_test_runtime().block_on(async {
+            let (events, mut event_receiver) = huddle_test_event_channel();
+            let (handle, receiver) = huddle_actor_channel();
+            handle.observe_huddle(test_huddle("R123")).await.unwrap();
+            let command_handle = handle.clone();
+            let command = tokio::spawn(async move {
+                command_handle
+                    .command(HuddleCommand::OpenPreflight {
+                        call_id: "R123".into(),
+                    })
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while handle.snapshot().admitted < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            command.abort();
+            assert!(command.await.unwrap_err().is_cancelled());
+
+            let (_shutdown, shutdown_receiver) = oneshot::channel();
             let actor = tokio::spawn(run_huddle_actor(
                 receiver,
                 events,
                 production_native_join_capability(false),
+                shutdown_receiver,
             ));
-            let huddle = crate::huddles::model::ActiveHuddle {
-                team_id: "T123".to_string(),
-                channel_id: "C123".to_string(),
-                call_id: "R123".to_string(),
-                name: None,
-                participant_ids: Vec::new(),
-                started_at: None,
-                huddle_link: None,
-            };
+            assert!(matches!(
+                event_receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot))
+                    if snapshot.phase == HuddlePhase::Discovered
+            ));
+            assert!(matches!(
+                event_receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::Huddle(HuddleEvent::Snapshot(snapshot))
+                    if snapshot.phase == HuddlePhase::Preflight
+            ));
+            drop(handle);
+            actor.await.unwrap();
+        });
+    }
 
-            handle.observe_huddle(huddle).unwrap();
+    #[test]
+    fn huddle_command_reports_invalid_transition_after_actor_processing() {
+        admission_test_runtime().block_on(async {
+            let (events, _event_receiver) = huddle_test_event_channel();
+            let (handle, receiver) = huddle_actor_channel();
+            let (_shutdown, shutdown_receiver) = oneshot::channel();
+            let actor = tokio::spawn(run_huddle_actor(
+                receiver,
+                events,
+                production_native_join_capability(false),
+                shutdown_receiver,
+            ));
+
+            assert!(handle.command(HuddleCommand::Dismiss).await.is_err());
+            drop(handle);
+            actor.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn closed_huddle_actor_propagates_socket_observation_failure() {
+        admission_test_runtime().block_on(async {
+            let (handle, mut receiver) = huddle_actor_channel();
+            receiver.close();
+            let message = serde_json::from_value::<SlackMessage>(serde_json::json!({
+                "ts": "1.0",
+                "room": {
+                    "id": "R123",
+                    "date_start": 1,
+                    "channels": ["C123"]
+                }
+            }))
+            .unwrap();
+            let event =
+                SocketModeEvent::Message(Box::new(crate::socket_mode::SocketModeMessageEvent {
+                    channel_id: "C123".into(),
+                    message,
+                    kind: SocketModeMessageKind::Posted,
+                }));
+
+            assert!(observe_huddle_socket_event(&handle, Some("T123"), &event)
+                .await
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn huddle_actor_serializes_observation_and_user_commands() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (events, mut event_receiver) = huddle_test_event_channel();
+            let (handle, receiver) = huddle_actor_channel();
+            let (_shutdown, shutdown_receiver) = oneshot::channel();
+            let actor = tokio::spawn(run_huddle_actor(
+                receiver,
+                events,
+                production_native_join_capability(false),
+                shutdown_receiver,
+            ));
+            let huddle = test_huddle("R123");
+
+            handle.observe_huddle(huddle).await.unwrap();
             let discovered = event_receiver.recv().await.unwrap();
             assert!(matches!(
                 discovered.kind,
@@ -18650,6 +19777,7 @@ mod tests {
                 .command(crate::huddles::state::HuddleCommand::OpenPreflight {
                     call_id: "R123".to_string(),
                 })
+                .await
                 .unwrap();
             let preflight = event_receiver.recv().await.unwrap();
             assert!(matches!(
@@ -18682,10 +19810,12 @@ mod tests {
                 workspace_patch_send_gate: None,
             };
             let (handle, receiver) = huddle_actor_channel();
+            let (_shutdown, shutdown_receiver) = oneshot::channel();
             let actor = tokio::spawn(run_huddle_actor(
                 receiver,
                 events,
                 production_native_join_capability(false),
+                shutdown_receiver,
             ));
             let messages = serde_json::from_value::<Vec<SlackMessage>>(serde_json::json!([
                 {
@@ -18708,7 +19838,9 @@ mod tests {
             ]))
             .unwrap();
 
-            observe_huddle_messages(&handle, Some("T123"), "C123", &messages);
+            observe_huddle_messages(&handle, Some("T123"), "C123", &messages)
+                .await
+                .unwrap();
 
             let discovered = event_receiver.recv().await.unwrap();
             assert!(matches!(

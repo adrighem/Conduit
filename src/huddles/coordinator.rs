@@ -183,7 +183,7 @@ impl HuddleCoordinator {
                 HuddleEffect::StopSession,
             ])
         } else {
-            self.snapshot = HuddleSnapshot::default();
+            self.reset_session_state();
             Ok(self.publish())
         }
     }
@@ -302,7 +302,7 @@ impl HuddleCoordinator {
             ],
             "dismiss",
         )?;
-        self.snapshot = HuddleSnapshot::default();
+        self.reset_session_state();
         Ok(self.publish())
     }
 
@@ -453,7 +453,7 @@ impl HuddleCoordinator {
 
     fn media_stopped(&mut self) -> Result<Vec<HuddleEffect>, HuddleTransitionError> {
         self.require_phase(&[HuddlePhase::Leaving], "finish leave")?;
-        self.snapshot = HuddleSnapshot::default();
+        self.reset_session_state();
         Ok(self.publish())
     }
 
@@ -499,12 +499,21 @@ impl HuddleCoordinator {
 
     fn reset(&mut self) -> Result<Vec<HuddleEffect>, HuddleTransitionError> {
         let stop_session = self.snapshot.phase != HuddlePhase::Idle;
-        self.snapshot = HuddleSnapshot::default();
-        let mut effects = self.publish();
+        self.reset_session_state();
+        let mut effects = Vec::with_capacity(usize::from(stop_session) + 1);
         if stop_session {
             effects.push(HuddleEffect::StopSession);
         }
+        effects.extend(self.publish());
         Ok(effects)
+    }
+
+    fn reset_session_state(&mut self) {
+        let native_join_available = self.snapshot.native_join_available;
+        self.snapshot = HuddleSnapshot {
+            native_join_available,
+            ..Default::default()
+        };
     }
 
     fn control_effects(&self) -> Vec<HuddleEffect> {
@@ -629,6 +638,13 @@ mod tests {
         }
     }
 
+    fn idle_snapshot_with_native_join() -> HuddleSnapshot {
+        HuddleSnapshot {
+            native_join_available: true,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn runs_discovery_preflight_join_connected_and_leave_lifecycle() {
         let mut coordinator = HuddleCoordinator::default();
@@ -668,6 +684,103 @@ mod tests {
         coordinator.apply(CoordinatorInput::MediaStopped).unwrap();
         assert_eq!(coordinator.snapshot().phase, HuddlePhase::Idle);
         assert!(coordinator.snapshot().huddle.is_none());
+    }
+
+    #[test]
+    fn reset_from_active_stops_session_before_publishing_authoritative_idle_state() {
+        let mut coordinator = connected_coordinator();
+        coordinator
+            .apply(CoordinatorInput::JoinCapabilityChanged(true))
+            .unwrap();
+        coordinator
+            .apply(CoordinatorInput::MutedChanged(true))
+            .unwrap();
+        coordinator
+            .apply(CoordinatorInput::CameraChanged(true))
+            .unwrap();
+        coordinator
+            .apply(CoordinatorInput::DeviceSelected {
+                kind: HuddleDeviceKind::Microphone,
+                id: "mic-1".to_string(),
+            })
+            .unwrap();
+
+        let expected = idle_snapshot_with_native_join();
+        let effects = coordinator.apply(CoordinatorInput::Reset).unwrap();
+
+        assert_eq!(coordinator.snapshot(), &expected);
+        assert_eq!(
+            effects,
+            vec![HuddleEffect::StopSession, HuddleEffect::Publish(expected),]
+        );
+    }
+
+    #[test]
+    fn reset_from_idle_publishes_authoritative_idle_without_session_cleanup() {
+        let mut coordinator = HuddleCoordinator::default();
+        assert!(coordinator
+            .apply(CoordinatorInput::JoinCapabilityChanged(true))
+            .unwrap()
+            .is_empty());
+
+        let expected = idle_snapshot_with_native_join();
+        let effects = coordinator.apply(CoordinatorInput::Reset).unwrap();
+
+        assert_eq!(coordinator.snapshot(), &expected);
+        assert_eq!(effects, vec![HuddleEffect::Publish(expected)]);
+    }
+
+    #[test]
+    fn ending_an_inactive_huddle_preserves_join_capability() {
+        let mut coordinator = HuddleCoordinator::default();
+        coordinator
+            .apply(CoordinatorInput::JoinCapabilityChanged(true))
+            .unwrap();
+        coordinator
+            .apply(CoordinatorInput::HuddleDiscovered(huddle()))
+            .unwrap();
+
+        let expected = idle_snapshot_with_native_join();
+        let effects = coordinator
+            .apply(CoordinatorInput::HuddleEnded {
+                call_id: "R123".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(coordinator.snapshot(), &expected);
+        assert_eq!(effects, vec![HuddleEffect::Publish(expected)]);
+    }
+
+    #[test]
+    fn dismissing_a_huddle_preserves_join_capability() {
+        let mut coordinator = HuddleCoordinator::default();
+        coordinator
+            .apply(CoordinatorInput::JoinCapabilityChanged(true))
+            .unwrap();
+        coordinator
+            .apply(CoordinatorInput::HuddleDiscovered(huddle()))
+            .unwrap();
+
+        let expected = idle_snapshot_with_native_join();
+        let effects = coordinator.apply(CoordinatorInput::Dismissed).unwrap();
+
+        assert_eq!(coordinator.snapshot(), &expected);
+        assert_eq!(effects, vec![HuddleEffect::Publish(expected)]);
+    }
+
+    #[test]
+    fn completing_media_stop_preserves_join_capability() {
+        let mut coordinator = connected_coordinator();
+        coordinator
+            .apply(CoordinatorInput::JoinCapabilityChanged(true))
+            .unwrap();
+        coordinator.apply(CoordinatorInput::LeaveRequested).unwrap();
+
+        let expected = idle_snapshot_with_native_join();
+        let effects = coordinator.apply(CoordinatorInput::MediaStopped).unwrap();
+
+        assert_eq!(coordinator.snapshot(), &expected);
+        assert_eq!(effects, vec![HuddleEffect::Publish(expected)]);
     }
 
     #[test]

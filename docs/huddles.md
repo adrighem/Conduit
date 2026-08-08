@@ -15,6 +15,28 @@ The optional GStreamer engine and synthetic harness are native media infrastruct
 
 Debian, RPM, and Flatpak release packages deliberately leave `native_media` and `screen_share` disabled until the production adapters above are available. This keeps unexercised media dependencies and capture permissions out of general packages without changing discovery, preflight, notifications, or **Open in Slack**. CI still builds and tests the opt-in stack.
 
+## Runtime admission and ordering
+
+Each authenticated session owns one bounded huddle actor. Realtime observations and user commands
+share a channel with a total capacity of 64. Accepted items run in FIFO channel admission order.
+Observations can occupy at most 56 queue positions, leaving eight positions available for commands.
+An observation waiting for that budget is not yet admitted, so a later command can use reserved
+capacity before it; out-of-band lifecycle supervision can also proceed. Neither case reorders
+accepted channel items.
+
+Observation producers wait for capacity instead of dropping huddle state. In Socket Mode, the wait
+shares the three-second envelope admission and acknowledgment deadline; if admission times out or
+the actor is closed, Conduit does not acknowledge that envelope, allowing Slack to retry it. A user
+command reports completion only after the state transition and all resulting effects complete.
+
+During session replacement or shutdown, supervision first stops and drains realtime ingestion. It
+then drains and resets the huddle actor and waits for the actor task to finish. Actor metrics contain
+queue and lifecycle metadata only, not participant names, call identifiers, room links, or payloads.
+
+This boundary covers huddle state coordination only. Bounded admission and teardown for native
+transport and media resources remain the next implementation slice; the actor boundary does not
+make production native Slack joining available.
+
 ## Build options
 
 The default build includes discovery, huddle UI state, and the external fallback without compiling the media stack. Meson exposes two opt-in features:

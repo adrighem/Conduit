@@ -25,6 +25,21 @@ reconnects so Slack can retry it. Browser RTM applies socket backpressure while 
 actor drains before a normal reconnect or supervised session shutdown. Live trace events report
 queue high-water marks at depth 1 and each new power-of-two peak.
 
+Huddle observations and user commands use a separate session-owned actor. Its channel holds at most
+64 pending items and processes accepted items in FIFO admission order. Observations may occupy no
+more than 56 positions, reserving eight positions for commands. An observation waiting for that
+budget is not yet admitted, so a later command can use reserved capacity before it; out-of-band
+lifecycle supervision can also proceed. Neither case reorders accepted channel items. Observation
+producers wait for admission rather than dropping state. For Socket Mode, that wait shares the
+transport's three-second admission and acknowledgment deadline, so a timeout or closed huddle actor
+leaves the Slack envelope unacknowledged for retry. A huddle command completes only after its
+coordinator transition and resulting effects have finished.
+
+Session replacement and shutdown stop and drain the realtime actor first, then drain and reset the
+huddle actor and wait for its task to finish. Huddle actor metrics contain queue and lifecycle
+metadata only, never huddle payload content or Slack identifiers. This slice bounds huddle state
+coordination; native transport and media-resource admission and teardown remain the next slice.
+
 GTK-to-runtime commands use a separate bounded admission layer before task creation. A reserved FIFO
 serves session and control work, while navigation, interactive, upload, background, and image lanes
 have independent queue and task caps. Durable actions and read markers stay FIFO and serialize per
