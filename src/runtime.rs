@@ -70,6 +70,7 @@ const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
 const BACKGROUND_TASK_CONCURRENCY: usize = 3;
 const IMAGE_TASK_CONCURRENCY: usize = 4;
 const UPLOAD_TASK_CONCURRENCY: usize = 2;
+const REALTIME_PERSISTENCE_QUEUE_CAPACITY: usize = 256;
 const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const ATTACHMENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -5203,9 +5204,6 @@ async fn run_socket_mode(
         let connected_events = events.clone();
         let mut persistence_tasks = tokio::task::JoinSet::new();
         let persistence_sender = workspace_store.clone().map(|store| {
-            // The socket callback is synchronous, so awaiting bounded capacity
-            // would deadlock the transport. One session-scoped ordered actor is
-            // drained before reconnect instead of dropping classified messages.
             let (sender, receiver) =
                 realtime_persistence_channel(workspace.attention_metrics_handle());
             persistence_tasks.spawn(persist_realtime_events(
@@ -5231,94 +5229,114 @@ async fn run_socket_mode(
                 ));
             },
             move |event| {
-                observe_huddle_socket_event(&huddles_for_run, team_id_for_run.as_deref(), &event);
-                let defer_workspace_mutation = persistence_for_run.is_some()
-                    && matches!(
+                let persistence_for_event = persistence_for_run.clone();
+                let workspace_for_event = workspace_for_run.clone();
+                let events_for_event = events_for_run.clone();
+                let huddles_for_event = huddles_for_run.clone();
+                let team_id_for_event = team_id_for_run.clone();
+                let user_status_sync_for_event = user_status_sync_for_run.clone();
+                async move {
+                    observe_huddle_socket_event(
+                        &huddles_for_event,
+                        team_id_for_event.as_deref(),
                         &event,
-                        SocketModeEvent::Message(_)
-                            | SocketModeEvent::Reaction(_)
-                            | SocketModeEvent::UserChanged(_)
-                            | SocketModeEvent::UserHuddleChanged(_)
                     );
-                let attention = (!defer_workspace_mutation)
-                    .then(|| {
-                        apply_realtime_workspace_event_and_publish(
-                            &workspace_for_run,
-                            &events_for_run,
+                    let defer_workspace_mutation = persistence_for_event.is_some()
+                        && matches!(
                             &event,
-                        )
-                    })
-                    .flatten();
-                if matches!(&event, SocketModeEvent::RefreshConversations) {
-                    events_for_run.send_event(RuntimeEventKind::WorkspaceRefreshRequested);
-                }
-                let status_change_user_id = match &event {
-                    SocketModeEvent::UserChanged(user)
-                    | SocketModeEvent::UserHuddleChanged(user)
-                        if user
-                            .profile
-                            .as_ref()
-                            .is_some_and(|profile| profile.contains_status_fields()) =>
-                    {
-                        user.id.clone()
-                    }
-                    _ => None,
-                };
-                let status_revision = status_change_user_id
-                    .as_deref()
-                    .map(|user_id| user_status_sync_for_run.publish_change(user_id, || {}));
-                let persistence_event = match &event {
-                    SocketModeEvent::UserChanged(user)
-                    | SocketModeEvent::UserHuddleChanged(user) => {
-                        Some(RealtimePersistenceEvent::UserChanged {
-                            user: user.clone(),
-                            status_revision,
-                        })
-                    }
-                    SocketModeEvent::Message(message) => Some(RealtimePersistenceEvent::Message {
-                        event: message.clone(),
-                    }),
-                    SocketModeEvent::Reaction(_) => Some(RealtimePersistenceEvent::OrderedEvent {
-                        event: event.clone(),
-                    }),
-                    SocketModeEvent::RefreshConversations => None,
-                };
-                let notification_without_store = persistence_for_run.is_none().then(|| {
-                    attention
-                        .as_ref()
-                        .filter(|effect| effect.decision.send_notification)
-                        .map(|effect| {
-                            (
-                                effect.channel_id.clone(),
-                                effect.message.clone(),
-                                effect.decision.clone(),
+                            SocketModeEvent::Message(_)
+                                | SocketModeEvent::Reaction(_)
+                                | SocketModeEvent::UserChanged(_)
+                                | SocketModeEvent::UserHuddleChanged(_)
+                        );
+                    let attention = (!defer_workspace_mutation)
+                        .then(|| {
+                            apply_realtime_workspace_event_and_publish(
+                                &workspace_for_event,
+                                &events_for_event,
+                                &event,
                             )
                         })
-                });
-                if let Some(sender) = persistence_for_run.as_ref() {
-                    if let Some(persistence_event) = persistence_event {
-                        if sender.send(persistence_event).is_err() {
-                            crate::debug::log(
-                                "store",
-                                "RealtimePersistenceQueueRejected reason=worker_closed",
-                            );
-                            if defer_workspace_mutation {
-                                apply_realtime_persistence_queue_fallback(
-                                    &workspace_for_run,
-                                    &events_for_run,
-                                    event,
+                        .flatten();
+                    if matches!(&event, SocketModeEvent::RefreshConversations) {
+                        events_for_event.send_event(RuntimeEventKind::WorkspaceRefreshRequested);
+                    }
+                    let status_change_user_id = match &event {
+                        SocketModeEvent::UserChanged(user)
+                        | SocketModeEvent::UserHuddleChanged(user)
+                            if user
+                                .profile
+                                .as_ref()
+                                .is_some_and(|profile| profile.contains_status_fields()) =>
+                        {
+                            user.id.clone()
+                        }
+                        _ => None,
+                    };
+                    let status_revision = status_change_user_id
+                        .as_deref()
+                        .map(|user_id| user_status_sync_for_event.publish_change(user_id, || {}));
+                    let persistence_event = match &event {
+                        SocketModeEvent::UserChanged(user)
+                        | SocketModeEvent::UserHuddleChanged(user) => {
+                            Some(RealtimePersistenceEvent::UserChanged {
+                                user: user.clone(),
+                                status_revision,
+                            })
+                        }
+                        SocketModeEvent::Message(message) => {
+                            Some(RealtimePersistenceEvent::Message {
+                                event: message.clone(),
+                            })
+                        }
+                        SocketModeEvent::Reaction(_) => {
+                            Some(RealtimePersistenceEvent::OrderedEvent {
+                                event: event.clone(),
+                            })
+                        }
+                        SocketModeEvent::RefreshConversations => None,
+                    };
+                    let notification_without_store = persistence_for_event.is_none().then(|| {
+                        attention
+                            .as_ref()
+                            .filter(|effect| effect.decision.send_notification)
+                            .map(|effect| {
+                                (
+                                    effect.channel_id.clone(),
+                                    effect.message.clone(),
+                                    effect.decision.clone(),
+                                )
+                            })
+                    });
+                    if let Some(sender) = persistence_for_event.as_ref() {
+                        if let Some(persistence_event) = persistence_event {
+                            if sender.send(persistence_event).await.is_err() {
+                                crate::debug::log(
+                                    "store",
+                                    "RealtimePersistenceQueueRejected reason=worker_closed",
                                 );
+                                if defer_workspace_mutation {
+                                    apply_realtime_persistence_queue_fallback(
+                                        &workspace_for_event,
+                                        &events_for_event,
+                                        event,
+                                    );
+                                }
+                                return Err(anyhow!("realtime persistence worker closed"));
                             }
                         }
+                    } else if let Some(Some((channel_id, message, decision))) =
+                        notification_without_store
+                    {
+                        events_for_event.send_event(
+                            RuntimeEventKind::AttentionNotificationCandidate {
+                                channel_id,
+                                message: Box::new(message),
+                                decision,
+                            },
+                        );
                     }
-                } else if let Some(Some((channel_id, message, decision))) =
-                    notification_without_store
-                {
-                    events_for_run.send_event(RuntimeEventKind::AttentionNotificationCandidate {
-                        channel_id,
-                        message: Box::new(message),
-                        decision,
-                    });
+                    Ok(())
                 }
             },
         )
@@ -5705,41 +5723,79 @@ enum RealtimePersistenceEvent {
 
 #[derive(Clone, Debug)]
 struct RealtimePersistenceSender {
-    sender: mpsc::UnboundedSender<RealtimePersistenceEvent>,
+    sender: mpsc::Sender<QueuedRealtimePersistenceEvent>,
+    admission: Arc<Semaphore>,
     metrics: Arc<AttentionMetrics>,
 }
 
 impl RealtimePersistenceSender {
-    fn send(
+    async fn send(
         &self,
         event: RealtimePersistenceEvent,
     ) -> Result<(), mpsc::error::SendError<RealtimePersistenceEvent>> {
-        self.metrics.record_queue_send(|| self.sender.send(event))
+        let slot = match Arc::clone(&self.admission).acquire_owned().await {
+            Ok(slot) => slot,
+            Err(_) => {
+                return self
+                    .metrics
+                    .record_queue_send(|| Err(mpsc::error::SendError(event)));
+            }
+        };
+        match self.sender.reserve().await {
+            Ok(permit) => {
+                self.metrics
+                    .record_queue_send(|| {
+                        permit.send(QueuedRealtimePersistenceEvent { event, slot });
+                        Ok::<(), std::convert::Infallible>(())
+                    })
+                    .expect("infallible bounded realtime persistence send");
+                Ok(())
+            }
+            Err(_) => {
+                drop(slot);
+                self.metrics
+                    .record_queue_send(|| Err(mpsc::error::SendError(event)))
+            }
+        }
     }
 }
 
+struct QueuedRealtimePersistenceEvent {
+    event: RealtimePersistenceEvent,
+    slot: OwnedSemaphorePermit,
+}
+
 struct RealtimePersistenceReceiver {
-    receiver: mpsc::UnboundedReceiver<RealtimePersistenceEvent>,
+    receiver: mpsc::Receiver<QueuedRealtimePersistenceEvent>,
     metrics: Arc<AttentionMetrics>,
 }
 
 impl RealtimePersistenceReceiver {
     async fn recv(&mut self) -> Option<RealtimePersistenceEvent> {
-        let event = self.receiver.recv().await;
-        if event.is_some() {
-            self.metrics.dequeue_queue_slot();
-        }
-        event
+        let queued = self.receiver.recv().await?;
+        self.metrics.dequeue_queue_slot();
+        let QueuedRealtimePersistenceEvent { event, slot } = queued;
+        drop(slot);
+        Some(event)
     }
 }
 
 fn realtime_persistence_channel(
     metrics: Arc<AttentionMetrics>,
 ) -> (RealtimePersistenceSender, RealtimePersistenceReceiver) {
-    let (sender, receiver) = mpsc::unbounded_channel();
+    realtime_persistence_channel_with_capacity(metrics, REALTIME_PERSISTENCE_QUEUE_CAPACITY)
+}
+
+fn realtime_persistence_channel_with_capacity(
+    metrics: Arc<AttentionMetrics>,
+    capacity: usize,
+) -> (RealtimePersistenceSender, RealtimePersistenceReceiver) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    let admission = Arc::new(Semaphore::new(capacity));
     (
         RealtimePersistenceSender {
             sender,
+            admission,
             metrics: Arc::clone(&metrics),
         },
         RealtimePersistenceReceiver { receiver, metrics },
@@ -11720,6 +11776,70 @@ mod tests {
     }
 
     #[test]
+    fn realtime_persistence_channel_backpressures_at_capacity_and_preserves_fifo() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let metrics = Arc::new(AttentionMetrics::default());
+            let (sender, mut receiver) =
+                realtime_persistence_channel_with_capacity(Arc::clone(&metrics), 2);
+            let event = |ts: &str| RealtimePersistenceEvent::Message {
+                event: Box::new(crate::socket_mode::SocketModeMessageEvent {
+                    channel_id: "C1".into(),
+                    message: SlackMessage {
+                        ts: ts.into(),
+                        ..Default::default()
+                    },
+                    kind: SocketModeMessageKind::Posted,
+                }),
+            };
+            let event_ts = |event: RealtimePersistenceEvent| match event {
+                RealtimePersistenceEvent::Message { event } => event.message.ts,
+                other => panic!("expected message event, got {other:?}"),
+            };
+
+            sender.send(event("1.0")).await.unwrap();
+            sender.send(event("2.0")).await.unwrap();
+            let third_sender = sender.clone();
+            let (attempted_sender, attempted_receiver) = oneshot::channel();
+            let mut third_send = tokio::spawn(async move {
+                let _ = attempted_sender.send(());
+                third_sender.send(event("3.0")).await.unwrap();
+            });
+            attempted_receiver.await.unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut third_send)
+                    .await
+                    .is_err(),
+                "send unexpectedly completed while the queue was full"
+            );
+            let saturated = metrics.snapshot();
+            assert_eq!(saturated.queue_enqueued, 2);
+            assert_eq!(saturated.queue_depth, 2);
+            assert_eq!(saturated.queue_peak_depth, 2);
+            assert_eq!(event_ts(receiver.recv().await.unwrap()), "1.0");
+
+            third_send.await.unwrap();
+            drop(sender);
+            assert_eq!(event_ts(receiver.recv().await.unwrap()), "2.0");
+            assert_eq!(event_ts(receiver.recv().await.unwrap()), "3.0");
+            assert!(receiver.recv().await.is_none());
+
+            let drained = metrics.snapshot();
+            assert_eq!(drained.queue_enqueued, 3);
+            assert_eq!(drained.queue_dequeued, 3);
+            assert_eq!(drained.queue_depth, 0);
+            assert_eq!(drained.queue_peak_depth, 2);
+            assert_eq!(drained.queue_rejected, 0);
+        });
+    }
+
+    #[test]
     fn realtime_status_persistence_skips_superseded_user_updates() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11776,12 +11896,14 @@ mod tests {
                     user: status_user("Current"),
                     status_revision: Some(current_revision),
                 })
+                .await
                 .unwrap();
             sender
                 .send(RealtimePersistenceEvent::UserChanged {
                     user: status_user("Stale"),
                     status_revision: Some(old_revision),
                 })
+                .await
                 .unwrap();
             drop(sender);
             worker.await.unwrap();
@@ -11868,6 +11990,7 @@ mod tests {
                     "original",
                     SocketModeMessageKind::Posted,
                 ))
+                .await
                 .unwrap();
             sender
                 .send(socket_message(
@@ -11875,6 +11998,7 @@ mod tests {
                     "edited",
                     SocketModeMessageKind::Changed,
                 ))
+                .await
                 .unwrap();
             sender
                 .send(socket_message(
@@ -11882,6 +12006,7 @@ mod tests {
                     "deleted",
                     SocketModeMessageKind::Deleted,
                 ))
+                .await
                 .unwrap();
             sender
                 .send(socket_message(
@@ -11889,6 +12014,7 @@ mod tests {
                     "survives",
                     SocketModeMessageKind::Posted,
                 ))
+                .await
                 .unwrap();
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), runtime_receiver.recv())
@@ -12030,6 +12156,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             drop(sender);
             worker.await.unwrap();
@@ -12179,6 +12306,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             let first = tokio::time::timeout(Duration::from_secs(1), runtime_receiver.recv())
                 .await
@@ -12224,6 +12352,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             let second = tokio::time::timeout(Duration::from_secs(1), runtime_receiver.recv())
                 .await
@@ -12267,6 +12396,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             drop(sender);
             worker.await.unwrap();
@@ -12453,7 +12583,7 @@ mod tests {
                     kind: SocketModeMessageKind::Posted,
                 }),
             };
-            sender.send(self_post("1.0", "first")).unwrap();
+            sender.send(self_post("1.0", "first")).await.unwrap();
 
             let visible = tokio::time::timeout(Duration::from_secs(1), runtime_receiver.recv())
                 .await
@@ -12476,7 +12606,7 @@ mod tests {
             );
 
             store.clear_history_batch_failure_trigger().await.unwrap();
-            sender.send(self_post("2.0", "second")).unwrap();
+            sender.send(self_post("2.0", "second")).await.unwrap();
             drop(sender);
             worker.await.unwrap();
 
@@ -12607,6 +12737,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             drop(sender);
             worker.await.unwrap();
@@ -12806,6 +12937,7 @@ mod tests {
                 .send(RealtimePersistenceEvent::Message {
                     event: Box::new(event),
                 })
+                .await
                 .unwrap();
         }
         drop(sender);
@@ -13090,6 +13222,7 @@ mod tests {
                             kind: SocketModeMessageKind::Posted,
                         }),
                     })
+                    .await
                     .unwrap();
             }
             sender
@@ -13106,6 +13239,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             drop(sender);
             worker.await.unwrap();
@@ -13181,6 +13315,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             sender
                 .send(RealtimePersistenceEvent::OrderedEvent {
@@ -13192,6 +13327,7 @@ mod tests {
                         added: true,
                     }),
                 })
+                .await
                 .unwrap();
             sender
                 .send(RealtimePersistenceEvent::Message {
@@ -13206,6 +13342,7 @@ mod tests {
                         kind: SocketModeMessageKind::Deleted,
                     }),
                 })
+                .await
                 .unwrap();
             drop(sender);
             worker.await.unwrap();
@@ -13298,6 +13435,7 @@ mod tests {
                     .send(RealtimePersistenceEvent::Message {
                         event: Box::new(event.clone()),
                     })
+                    .await
                     .unwrap();
             }
             drop(sender);
@@ -13401,6 +13539,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             drop(sender);
             worker.await.unwrap();
@@ -13515,6 +13654,7 @@ mod tests {
                 ts: "0.000001".into(),
                 user: Some("U_OTHER".into()),
                 text: Some("thread root".into()),
+                reply_count: Some(1),
                 reply_users: Some(vec!["U_SELF".into()]),
                 ..Default::default()
             };
@@ -13559,6 +13699,7 @@ mod tests {
             let mut direct_messages = Vec::with_capacity(200);
             let mut thread_messages = Vec::with_capacity(100);
             let mut duplicate_direct_messages = Vec::with_capacity(200);
+            let mut persistence_events = Vec::with_capacity(1_200);
             {
                 let mut enqueue = |channel_id: &str,
                                    index: usize,
@@ -13588,11 +13729,7 @@ mod tests {
                     if channel_id == "D1" {
                         duplicate_direct_messages.push(event.clone());
                     }
-                    sender
-                        .send(RealtimePersistenceEvent::Message {
-                            event: Box::new(event),
-                        })
-                        .unwrap();
+                    persistence_events.push(event);
                 };
 
                 for index in 1..=400 {
@@ -13620,11 +13757,13 @@ mod tests {
                     enqueue("C1", index, "membership update", Some("channel_join"), None);
                 }
             }
-            for event in duplicate_direct_messages {
+            persistence_events.extend(duplicate_direct_messages);
+            for event in persistence_events {
                 sender
                     .send(RealtimePersistenceEvent::Message {
                         event: Box::new(event),
                     })
+                    .await
                     .unwrap();
             }
             drop(sender);
@@ -13661,7 +13800,7 @@ mod tests {
             assert_eq!(metrics.queue_dequeued, 1_200);
             assert_eq!(metrics.queue_depth, 0);
             let queue_peak = metrics.queue_peak_depth;
-            assert!((1..=1_200).contains(&queue_peak));
+            assert!((1..=REALTIME_PERSISTENCE_QUEUE_CAPACITY as u64).contains(&queue_peak));
             assert_eq!(metrics.queue_rejected, 0);
 
             let mut notification_events = 0;
@@ -13680,7 +13819,7 @@ mod tests {
                 }
             }
             assert_eq!(notification_events, 500);
-            assert_eq!(message_patches, 1_200);
+            assert_eq!(message_patches, 1_000);
 
             let before_reconciliation = workspace
                 .coordinator
@@ -13868,6 +14007,7 @@ mod tests {
                         kind: SocketModeMessageKind::Posted,
                     }),
                 })
+                .await
                 .unwrap();
             drop(sender);
             worker.await.unwrap();

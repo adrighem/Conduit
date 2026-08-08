@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -154,11 +155,15 @@ fn build_websocket_request(
     Ok(request)
 }
 
-pub async fn run_once(
+pub async fn run_once<F, Fut>(
     credentials: &SocketModeCredentials,
     on_connected: impl FnOnce(),
-    mut handle_event: impl FnMut(SocketModeEvent),
-) -> Result<SocketModeDisconnect> {
+    mut handle_event: F,
+) -> Result<SocketModeDisconnect>
+where
+    F: FnMut(SocketModeEvent) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
     let protocol = RealtimeProtocol::from_credentials(credentials);
     let api = SocketModeApi::new(credentials.clone());
     let url = api.open_connection().await?;
@@ -179,24 +184,28 @@ pub async fn run_once(
         };
         match message.context("failed to read Slack Socket Mode WebSocket message")? {
             Message::Text(text) => {
-                if let Some(disconnect) = tokio::time::timeout(
+                if let Some(disconnect) = handle_text_message_with_deadline(
+                    text.as_str(),
+                    protocol,
+                    &mut socket,
+                    &mut handle_event,
                     WEBSOCKET_WRITE_TIMEOUT,
-                    handle_text_message(text.as_str(), protocol, &mut socket, &mut handle_event),
                 )
-                .await
-                .context("timed out acknowledging Slack Socket Mode message")??
+                .await?
                 {
                     return Ok(disconnect);
                 }
             }
             Message::Binary(bytes) => {
                 if let Ok(text) = std::str::from_utf8(&bytes) {
-                    if let Some(disconnect) = tokio::time::timeout(
+                    if let Some(disconnect) = handle_text_message_with_deadline(
+                        text,
+                        protocol,
+                        &mut socket,
+                        &mut handle_event,
                         WEBSOCKET_WRITE_TIMEOUT,
-                        handle_text_message(text, protocol, &mut socket, &mut handle_event),
                     )
-                    .await
-                    .context("timed out acknowledging Slack Socket Mode message")??
+                    .await?
                     {
                         return Ok(disconnect);
                     }
@@ -216,15 +225,43 @@ pub async fn run_once(
     Ok(SocketModeDisconnect::ConnectionClosed)
 }
 
-async fn handle_text_message<S>(
+async fn handle_text_message_with_deadline<S, F, Fut>(
     text: &str,
     protocol: RealtimeProtocol,
     socket: &mut S,
-    handle_event: &mut impl FnMut(SocketModeEvent),
+    handle_event: &mut F,
+    deadline: Duration,
 ) -> Result<Option<SocketModeDisconnect>>
 where
     S: Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut(SocketModeEvent) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let handling = handle_text_message(text, protocol, socket, handle_event);
+    if protocol == RealtimeProtocol::SocketMode {
+        // Slack requires a prompt ACK. Time out admission and the ACK write as
+        // one operation; cancellation leaves the envelope unacknowledged so it
+        // can be retried instead of silently dropping a durable event.
+        tokio::time::timeout(deadline, handling)
+            .await
+            .context("timed out admitting or acknowledging Slack Socket Mode message")?
+    } else {
+        handling.await
+    }
+}
+
+async fn handle_text_message<S, F, Fut>(
+    text: &str,
+    protocol: RealtimeProtocol,
+    socket: &mut S,
+    handle_event: &mut F,
+) -> Result<Option<SocketModeDisconnect>>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    F: FnMut(SocketModeEvent) -> Fut,
+    Fut: Future<Output = Result<()>>,
 {
     if protocol == RealtimeProtocol::BrowserRtm {
         let event: Value =
@@ -233,7 +270,7 @@ where
             return Ok(Some(SocketModeDisconnect::ConnectionClosed));
         }
         if let Some(event) = socket_event_from_rtm(&event) {
-            handle_event(event);
+            handle_event(event).await?;
         }
         return Ok(None);
     }
@@ -241,15 +278,7 @@ where
     let envelope: SocketModeEnvelope =
         serde_json::from_str(text).context("failed to parse Slack Socket Mode envelope")?;
 
-    if let Some(envelope_id) = envelope.envelope_id.as_deref() {
-        let ack = serde_json::json!({ "envelope_id": envelope_id }).to_string();
-        socket
-            .send(Message::Text(ack.into()))
-            .await
-            .context("failed to acknowledge Slack Socket Mode envelope")?;
-    }
-
-    match envelope.kind.as_str() {
+    let disconnect = match envelope.kind.as_str() {
         "hello" => {
             let approximate_connection_time = envelope
                 .debug_info
@@ -266,24 +295,37 @@ where
                         .unwrap_or_else(|| "<unknown>".to_string())
                 ),
             );
-            Ok(None)
+            None
         }
-        "disconnect" => Ok(Some(SocketModeDisconnect::from_reason(
+        "disconnect" => Some(SocketModeDisconnect::from_reason(
             envelope.reason.as_deref(),
-        ))),
+        )),
         "events_api" => {
             if let Some(payload) = envelope.payload.as_ref() {
                 if let Some(event) = socket_event_from_payload(payload) {
-                    handle_event(event);
+                    // Do not acknowledge a durable event until downstream has
+                    // admitted it. A full bounded queue therefore backpressures
+                    // socket reads instead of losing an acknowledged event.
+                    handle_event(event).await?;
                 }
             }
-            Ok(None)
+            None
         }
         kind => {
             crate::debug::log("socket", &format!("SocketModeIgnoredEnvelope type={kind}"));
-            Ok(None)
+            None
         }
+    };
+
+    if let Some(envelope_id) = envelope.envelope_id.as_deref() {
+        let ack = serde_json::json!({ "envelope_id": envelope_id }).to_string();
+        socket
+            .send(Message::Text(ack.into()))
+            .await
+            .context("failed to acknowledge Slack Socket Mode envelope")?;
     }
+
+    Ok(disconnect)
 }
 
 pub fn socket_event_from_payload(payload: &Value) -> Option<SocketModeEvent> {
@@ -559,10 +601,212 @@ struct ClientGetWebSocketUrlResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context as TaskContext, Poll};
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        messages: Arc<Mutex<Vec<Message>>>,
+    }
+
+    impl Sink<Message> for RecordingSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+            self.messages
+                .lock()
+                .expect("recording socket lock poisoned")
+                .push(message);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn payload(event: Value) -> Value {
         serde_json::json!({ "event": event })
+    }
+
+    #[test]
+    fn socket_mode_ack_waits_for_async_event_admission() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let mut socket = RecordingSink::default();
+            let recorded = Arc::clone(&socket.messages);
+            let release = Arc::new(tokio::sync::Notify::new());
+            let release_for_callback = Arc::clone(&release);
+            let mut handle_event = move |_event| {
+                let release = Arc::clone(&release_for_callback);
+                async move {
+                    release.notified().await;
+                    Ok(())
+                }
+            };
+            let envelope = serde_json::json!({
+                "type": "events_api",
+                "envelope_id": "E1",
+                "payload": {
+                    "event": {
+                        "type": "message",
+                        "channel": "C1",
+                        "ts": "1.0"
+                    }
+                }
+            })
+            .to_string();
+            let handling = handle_text_message(
+                &envelope,
+                RealtimeProtocol::SocketMode,
+                &mut socket,
+                &mut handle_event,
+            );
+            tokio::pin!(handling);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut handling)
+                    .await
+                    .is_err(),
+                "handler completed before admission"
+            );
+            assert!(
+                recorded
+                    .lock()
+                    .expect("recording socket lock poisoned")
+                    .is_empty(),
+                "Socket Mode ACK must wait for durable event admission"
+            );
+
+            release.notify_one();
+            assert_eq!(handling.await.unwrap(), None);
+            let messages = recorded.lock().expect("recording socket lock poisoned");
+            let [Message::Text(ack)] = messages.as_slice() else {
+                panic!("expected one text ACK, got {messages:?}");
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(ack.as_str()).unwrap(),
+                serde_json::json!({ "envelope_id": "E1" })
+            );
+        });
+    }
+
+    #[test]
+    fn socket_mode_admission_timeout_withholds_ack() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let mut socket = RecordingSink::default();
+            let recorded = Arc::clone(&socket.messages);
+            let mut handle_event = |_event| async move {
+                std::future::pending::<()>().await;
+                Ok(())
+            };
+            let envelope = serde_json::json!({
+                "type": "events_api",
+                "envelope_id": "E2",
+                "payload": {
+                    "event": {
+                        "type": "message",
+                        "channel": "C1",
+                        "ts": "2.0"
+                    }
+                }
+            })
+            .to_string();
+
+            let error = handle_text_message_with_deadline(
+                &envelope,
+                RealtimeProtocol::SocketMode,
+                &mut socket,
+                &mut handle_event,
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("timed out admitting or acknowledging"));
+            assert!(
+                recorded
+                    .lock()
+                    .expect("recording socket lock poisoned")
+                    .is_empty(),
+                "timed-out admission must remain unacknowledged for retry"
+            );
+        });
+    }
+
+    #[test]
+    fn socket_mode_callback_rejection_withholds_ack() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let mut socket = RecordingSink::default();
+            let recorded = Arc::clone(&socket.messages);
+            let mut handle_event = |_event| async move { Err(anyhow!("admission rejected")) };
+            let envelope = serde_json::json!({
+                "type": "events_api",
+                "envelope_id": "E3",
+                "payload": {
+                    "event": {
+                        "type": "message",
+                        "channel": "C1",
+                        "ts": "3.0"
+                    }
+                }
+            })
+            .to_string();
+
+            let error = handle_text_message(
+                &envelope,
+                RealtimeProtocol::SocketMode,
+                &mut socket,
+                &mut handle_event,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.to_string().contains("admission rejected"));
+            assert!(
+                recorded
+                    .lock()
+                    .expect("recording socket lock poisoned")
+                    .is_empty(),
+                "rejected admission must remain unacknowledged for retry"
+            );
+        });
     }
 
     #[test]
