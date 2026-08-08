@@ -2638,18 +2638,19 @@ fn notification_target_resolution(
     }
 }
 
-fn conversation_target_action(
+fn conversation_target_action<'a>(
     channel_or_user_id: &str,
-    conversations: &[SlackConversation],
+    conversations: impl IntoIterator<Item = &'a SlackConversation>,
 ) -> ConversationTargetAction {
     if channel_or_user_id.starts_with('U') || channel_or_user_id.starts_with('W') {
         if let Some(channel_id) = conversations
-            .iter()
-            .find(|conversation| {
+            .into_iter()
+            .filter(|conversation| {
                 conversation.is_im.unwrap_or(false)
                     && conversation.user.as_deref() == Some(channel_or_user_id)
             })
             .map(|conversation| conversation.id.clone())
+            .min()
         {
             return ConversationTargetAction::SelectConversation(channel_id);
         }
@@ -2711,13 +2712,13 @@ enum LastConversationRestoreDecision {
     Superseded,
 }
 
-fn last_conversation_restore_decision(
+fn last_conversation_restore_decision<'a>(
     pending: &LastConversation,
     workspace_id: Option<&str>,
     selected_channel_id: Option<&str>,
     authoritative: bool,
     explicit_intent_opened: bool,
-    conversations: &[SlackConversation],
+    conversations: impl IntoIterator<Item = &'a SlackConversation>,
 ) -> LastConversationRestoreDecision {
     if explicit_intent_opened || selected_channel_id.is_some() {
         return LastConversationRestoreDecision::Superseded;
@@ -2729,7 +2730,7 @@ fn last_conversation_restore_decision(
         return LastConversationRestoreDecision::Discard;
     }
     if conversations
-        .iter()
+        .into_iter()
         .any(|conversation| conversation.id == pending.channel_id)
     {
         return LastConversationRestoreDecision::Select(pending.channel_id.clone());
@@ -4179,13 +4180,18 @@ fn localized_replies_error(error: &str) -> String {
     gettext("Could not load replies. Try again. {error}").replace("{error}", error)
 }
 
-fn user_projection_invalidations(
-    conversations: &[SlackConversation],
+fn user_projection_invalidations<'a, I>(
+    conversations: I,
     affected_user_ids: &[String],
     current_user_id: Option<&str>,
     visible_channel_id: Option<&str>,
     picker_open: bool,
-) -> UiInvalidations {
+) -> UiInvalidations
+where
+    I: IntoIterator<Item = &'a SlackConversation>,
+    I::IntoIter: Clone,
+{
+    let conversations = conversations.into_iter();
     let affected = affected_user_ids
         .iter()
         .map(String::as_str)
@@ -4196,12 +4202,12 @@ fn user_projection_invalidations(
             .iter()
             .any(|user_id| affected.contains(user_id.as_str()))
     };
-    let sidebar = conversations.iter().any(conversation_uses_affected_user);
+    let sidebar = conversations.clone().any(conversation_uses_affected_user);
     let title = current_user_id.is_some_and(|user_id| affected.contains(user_id))
         || visible_channel_id
             .and_then(|channel_id| {
                 conversations
-                    .iter()
+                    .clone()
                     .find(|conversation| conversation.id == channel_id)
             })
             .is_some_and(conversation_uses_affected_user);
@@ -5969,15 +5975,18 @@ impl ConduitWindow {
         };
         let workspace_id = self.imp().workspace_id.borrow().clone();
         let selected_channel_id = self.selected_channel_id();
-        let conversations = self.imp().workspace.conversations.borrow().conversations();
-        match last_conversation_restore_decision(
-            &pending,
-            workspace_id.as_deref(),
-            selected_channel_id.as_deref(),
-            authoritative,
-            explicit_intent_opened,
-            &conversations,
-        ) {
+        let decision = {
+            let conversations = self.imp().workspace.conversations.borrow();
+            last_conversation_restore_decision(
+                &pending,
+                workspace_id.as_deref(),
+                selected_channel_id.as_deref(),
+                authoritative,
+                explicit_intent_opened,
+                conversations.iter(),
+            )
+        };
+        match decision {
             LastConversationRestoreDecision::Wait => {}
             LastConversationRestoreDecision::Select(channel_id) => {
                 self.imp().pending_last_conversation.borrow_mut().take();
@@ -10756,7 +10765,11 @@ impl ConduitWindow {
                     self.render_closed_thread();
                 }
             }
-            self.sync_conversations_from_catalog();
+            if application.conversation_reset() {
+                self.sync_conversations_from_catalog();
+            } else {
+                self.sync_changed_conversations(application.changed_conversation_ids());
+            }
         }
         if application.thread_catalog_changed() {
             match self.current_main_view() {
@@ -10903,11 +10916,11 @@ impl ConduitWindow {
     fn queue_user_projection_invalidations(&self, affected_user_ids: &[String]) {
         let invalidations = {
             let imp = self.imp();
-            let conversations = imp.workspace.conversations.borrow().conversations();
+            let conversations = imp.workspace.conversations.borrow();
             let current_user_id = imp.current_user_id.borrow();
             let visible_channel_id = self.visible_channel_id();
             user_projection_invalidations(
-                &conversations,
+                conversations.iter(),
                 affected_user_ids,
                 current_user_id.as_deref(),
                 visible_channel_id.as_deref(),
@@ -11143,6 +11156,26 @@ impl ConduitWindow {
         } else {
             self.refresh_current_conversation_title();
         }
+        self.finish_conversation_catalog_sync();
+    }
+
+    fn sync_changed_conversations(&self, changed_channel_ids: &[String]) {
+        *self.imp().sidebar_error.borrow_mut() = None;
+        self.request_changed_conversation_user_names(changed_channel_ids);
+        self.render_conversations();
+        if self.current_main_view() == MainMessageView::Unreads {
+            self.populate_unreads(self.unread_items());
+        } else if self.selected_channel_id().as_ref().is_some_and(|selected| {
+            changed_channel_ids
+                .iter()
+                .any(|channel_id| channel_id == selected)
+        }) {
+            self.refresh_current_conversation_title();
+        }
+        self.finish_conversation_catalog_sync();
+    }
+
+    fn finish_conversation_catalog_sync(&self) {
         self.imp().workspace_ready.set(true);
         let explicit_intent_opened = self.activate_pending_navigation_intents();
         self.restore_last_conversation(false, explicit_intent_opened);
@@ -11239,7 +11272,6 @@ impl ConduitWindow {
                 .workspace
                 .conversations
                 .borrow()
-                .conversations()
                 .iter()
                 .filter(|conversation| conversation.has_unread_activity())
                 .any(|conversation| {
@@ -11254,17 +11286,14 @@ impl ConduitWindow {
                     messages_use_user(std::slice::from_ref(message), user_id)
                         || messages_use_user_in_reactions(std::slice::from_ref(message), user_id)
                 }) || {
-                    let conversations = self.imp().workspace.conversations.borrow().conversations();
+                    let conversations = self.imp().workspace.conversations.borrow();
                     observed.iter().any(|(channel_id, _)| {
-                        conversations
-                            .iter()
-                            .find(|conversation| conversation.id == *channel_id)
-                            .is_some_and(|conversation| {
-                                conversation
-                                    .display_user_ids()
-                                    .iter()
-                                    .any(|candidate| candidate == user_id)
-                            })
+                        conversations.get(channel_id).is_some_and(|conversation| {
+                            conversation
+                                .display_user_ids()
+                                .iter()
+                                .any(|candidate| candidate == user_id)
+                        })
                     })
                 }
             }
@@ -11388,44 +11417,48 @@ impl ConduitWindow {
     fn render_conversations(&self) {
         let started = Instant::now();
         self.sync_workspace_chrome();
-        let imp = self.imp();
-        let conversations = imp.workspace.conversations.borrow().conversations();
-        let user_names = imp.user_names.borrow().clone();
-        let user_search_aliases = imp.user_search_aliases.borrow();
-        let selected_channel = self.visible_channel_id();
-        let active_huddle_channel_id = imp
-            .huddle_snapshot
-            .borrow()
-            .huddle
-            .as_ref()
-            .map(|huddle| huddle.channel_id.clone());
-        let model = sidebar::build_sidebar_list(
-            &conversations,
-            &user_names,
-            sidebar::SidebarBuildOptions {
-                selected_channel: selected_channel.as_deref(),
-                active_huddle_channel_id: active_huddle_channel_id.as_deref(),
-                current_user_id: imp.current_user_id.borrow().as_deref(),
-                query: imp.sidebar_filter_entry.text().as_str(),
-                unread_only: imp.sidebar_unread_filter_button.is_active(),
-                show_unreads_section: self.show_unreads_section(),
-                show_all: imp.sidebar_all_filter_button.is_active(),
-                loading: false,
-                has_error: imp.sidebar_error.borrow().is_some(),
-                user_search_aliases: Some(&user_search_aliases),
-                user_full_names: Some(&imp.user_full_names.borrow()),
-                user_statuses: Some(&imp.user_statuses.borrow()),
-            },
-        );
+        let (model, conversation_count) = {
+            let imp = self.imp();
+            let conversations = imp.workspace.conversations.borrow();
+            let user_names = imp.user_names.borrow();
+            let user_search_aliases = imp.user_search_aliases.borrow();
+            let selected_channel = self.visible_channel_id();
+            let active_huddle_channel_id = imp
+                .huddle_snapshot
+                .borrow()
+                .huddle
+                .as_ref()
+                .map(|huddle| huddle.channel_id.clone());
+            let model = sidebar::build_sidebar_list(
+                conversations.iter(),
+                &user_names,
+                sidebar::SidebarBuildOptions {
+                    selected_channel: selected_channel.as_deref(),
+                    active_huddle_channel_id: active_huddle_channel_id.as_deref(),
+                    current_user_id: imp.current_user_id.borrow().as_deref(),
+                    query: imp.sidebar_filter_entry.text().as_str(),
+                    unread_only: imp.sidebar_unread_filter_button.is_active(),
+                    show_unreads_section: self.show_unreads_section(),
+                    show_all: imp.sidebar_all_filter_button.is_active(),
+                    loading: false,
+                    has_error: imp.sidebar_error.borrow().is_some(),
+                    user_search_aliases: Some(&user_search_aliases),
+                    user_full_names: Some(&imp.user_full_names.borrow()),
+                    user_statuses: Some(&imp.user_statuses.borrow()),
+                },
+            );
+            (model, conversations.len())
+        };
 
         self.reconcile_sidebar(
-            model.keyed_items_with_collapsed_sections(&imp.collapsed_sidebar_sections.borrow()),
+            model.keyed_items_with_collapsed_sections(
+                &self.imp().collapsed_sidebar_sections.borrow(),
+            ),
         );
         log_performance(started, |elapsed_ms| {
             format!(
                 "sidebar_render conversations={} elapsed_ms={:.2}",
-                conversations.len(),
-                elapsed_ms
+                conversation_count, elapsed_ms
             )
         });
     }
@@ -13894,8 +13927,11 @@ impl ConduitWindow {
             }
             NotificationTargetResolution::Open => {
                 self.imp().pending_notification_target.borrow_mut().take();
-                let conversations = self.imp().workspace.conversations.borrow().conversations();
-                let opened = match conversation_target_action(&target.channel_id, &conversations) {
+                let action = {
+                    let conversations = self.imp().workspace.conversations.borrow();
+                    conversation_target_action(&target.channel_id, conversations.iter())
+                };
+                let opened = match action {
                     ConversationTargetAction::SelectConversation(channel_id) => {
                         let title = self.conversation_title(&channel_id);
                         self.select_conversation(&channel_id, &title);
@@ -13949,23 +13985,21 @@ impl ConduitWindow {
 
     fn unread_items(&self) -> Vec<ActivityItem> {
         let imp = self.imp();
-        let conversations = imp.workspace.conversations.borrow().conversations();
+        let conversations = imp.workspace.conversations.borrow();
+        let view = imp.workspace.view.borrow();
         let user_names = imp.user_names.borrow();
         let current_user_id = imp.current_user_id.borrow();
         let visible_message_ts = conversations
             .iter()
             .flat_map(|conversation| {
-                imp.workspace
-                    .view
-                    .borrow()
-                    .channel_messages(&conversation.id)
+                view.channel_messages(&conversation.id)
                     .iter()
                     .map(|message| (conversation.id.clone(), message.ts.clone()))
                     .collect::<Vec<_>>()
             })
             .collect::<HashSet<_>>();
         activity::build_unread_activity_items(
-            &conversations,
+            conversations.iter(),
             &user_names,
             current_user_id.as_deref(),
             &imp.workspace.threads.borrow(),
@@ -14134,10 +14168,23 @@ impl ConduitWindow {
             .workspace
             .conversations
             .borrow()
-            .conversations()
             .iter()
             .flat_map(SlackConversation::display_user_ids)
             .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+
+        self.request_user_ids(ids);
+    }
+
+    fn request_changed_conversation_user_names(&self, changed_channel_ids: &[String]) {
+        let conversations = self.imp().workspace.conversations.borrow();
+        let mut ids = changed_channel_ids
+            .iter()
+            .filter_map(|channel_id| conversations.get(channel_id))
+            .flat_map(SlackConversation::display_user_ids)
+            .collect::<Vec<_>>();
+        drop(conversations);
         ids.sort();
         ids.dedup();
 
@@ -14373,18 +14420,13 @@ impl ConduitWindow {
                 (conversation.id.clone(), title)
             })
             .collect::<HashMap<_, _>>();
-        conversation_titles.extend(
-            imp.workspace
-                .conversations
-                .borrow()
-                .conversations()
-                .into_iter()
-                .map(|conversation| {
-                    let title = conversation
-                        .display_name_with_users(&user_names, current_user_id.as_deref());
-                    (conversation.id, title)
-                }),
-        );
+        conversation_titles.extend(imp.workspace.conversations.borrow().iter().map(
+            |conversation| {
+                let title =
+                    conversation.display_name_with_users(&user_names, current_user_id.as_deref());
+                (conversation.id.clone(), title)
+            },
+        ));
         let recent_reactions = imp
             .settings
             .borrow()
@@ -17074,12 +17116,20 @@ mod tests {
 
     #[test]
     fn conversation_targets_select_known_channels_and_open_prospective_dms() {
-        let conversations = vec![SlackConversation {
-            id: "D123".into(),
-            user: Some("U123".into()),
-            is_im: Some(true),
-            ..Default::default()
-        }];
+        let conversations = [
+            SlackConversation {
+                id: "D999".into(),
+                user: Some("U123".into()),
+                is_im: Some(true),
+                ..Default::default()
+            },
+            SlackConversation {
+                id: "D123".into(),
+                user: Some("U123".into()),
+                is_im: Some(true),
+                ..Default::default()
+            },
+        ];
 
         assert_eq!(
             conversation_target_action("C123", &conversations),

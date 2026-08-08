@@ -91,15 +91,20 @@ pub fn build_activity_items(
     items
 }
 
-pub(crate) fn build_unread_activity_items(
-    conversations: &[SlackConversation],
+pub(crate) fn build_unread_activity_items<'a, I>(
+    conversations: I,
     user_names: &HashMap<String, String>,
     current_user_id: Option<&str>,
     thread_catalog: &ThreadCatalog,
     visible_message_ts: &HashSet<(String, String)>,
-) -> Vec<ActivityItem> {
+) -> Vec<ActivityItem>
+where
+    I: IntoIterator<Item = &'a SlackConversation>,
+    I::IntoIter: Clone,
+{
+    let conversations = conversations.into_iter();
     let conversation_titles = conversations
-        .iter()
+        .clone()
         .map(|conversation| {
             (
                 conversation.id.clone(),
@@ -340,6 +345,44 @@ mod tests {
         assert!(items[0].unread);
         assert_eq!(items[0].unread_count, 0);
         assert_eq!(items[0].unread_label(), "Unread conversation");
+    }
+
+    #[test]
+    fn borrowed_unread_iteration_is_independent_of_catalog_order() {
+        let conversations = [
+            SlackConversation {
+                id: "C2".to_string(),
+                name: Some("zebra".to_string()),
+                is_channel: Some(true),
+                unread_count: Some(2),
+                ..Default::default()
+            },
+            SlackConversation {
+                id: "C1".to_string(),
+                name: Some("alpha".to_string()),
+                is_channel: Some(true),
+                unread_count: Some(1),
+                ..Default::default()
+            },
+        ];
+        let catalog = ThreadCatalog::default();
+
+        let forward = build_unread_activity_items(
+            conversations.iter(),
+            &HashMap::new(),
+            None,
+            &catalog,
+            &HashSet::new(),
+        );
+        let reverse = build_unread_activity_items(
+            conversations.iter().rev(),
+            &HashMap::new(),
+            None,
+            &catalog,
+            &HashSet::new(),
+        );
+
+        assert_eq!(forward, reverse);
     }
 
     #[test]

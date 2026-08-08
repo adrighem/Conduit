@@ -531,20 +531,26 @@ fn active_user_status(statuses: Option<&UserStatuses>, user_id: &str) -> Option<
         .cloned()
 }
 
-pub fn build_sidebar_list(
-    conversations: &[SlackConversation],
+pub fn build_sidebar_list<'a, I>(
+    conversations: I,
     user_names: &HashMap<String, String>,
     options: SidebarBuildOptions<'_>,
-) -> SidebarListModel {
-    if options.loading && conversations.is_empty() {
+) -> SidebarListModel
+where
+    I: IntoIterator<Item = &'a SlackConversation>,
+    I::IntoIter: Clone,
+{
+    let conversations = conversations.into_iter();
+    let is_empty = conversations.clone().next().is_none();
+    if options.loading && is_empty {
         return SidebarListModel::Placeholder(SidebarPlaceholder::Loading);
     }
 
-    if options.has_error && conversations.is_empty() {
+    if options.has_error && is_empty {
         return SidebarListModel::Placeholder(SidebarPlaceholder::LoadFailed);
     }
 
-    if conversations.is_empty() {
+    if is_empty {
         return SidebarListModel::Placeholder(SidebarPlaceholder::Empty);
     }
 
@@ -552,10 +558,10 @@ pub fn build_sidebar_list(
     let recent_history_direct_messages = if options.show_all {
         HashSet::new()
     } else {
-        recent_history_direct_message_ids(conversations, options.selected_channel)
+        recent_history_direct_message_ids(conversations.clone(), options.selected_channel)
     };
     let mut rows = conversations
-        .iter()
+        .clone()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .filter(|conversation| {
             options.show_all
@@ -1110,12 +1116,12 @@ struct RecentHistoryDirectMessageCandidate {
     title: String,
 }
 
-fn recent_history_direct_message_ids(
-    conversations: &[SlackConversation],
+fn recent_history_direct_message_ids<'a>(
+    conversations: impl IntoIterator<Item = &'a SlackConversation>,
     selected_channel: Option<&str>,
 ) -> HashSet<String> {
     let mut candidates = conversations
-        .iter()
+        .into_iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .filter(|conversation| {
             matches!(
@@ -1456,6 +1462,17 @@ mod tests {
             search_aliases: Vec::new(),
             status: None,
         }
+    }
+
+    #[test]
+    fn borrowed_sidebar_iteration_is_independent_of_catalog_order() {
+        let conversations = [channel("C2", "zebra"), channel("C1", "alpha")];
+        let options = SidebarBuildOptions::default();
+
+        let forward = build_sidebar_list(conversations.iter(), &HashMap::new(), options);
+        let reverse = build_sidebar_list(conversations.iter().rev(), &HashMap::new(), options);
+
+        assert_eq!(forward.keyed_items(), reverse.keyed_items());
     }
 
     #[test]

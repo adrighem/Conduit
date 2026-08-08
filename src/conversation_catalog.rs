@@ -48,17 +48,18 @@ impl ConversationCatalog {
         self.entries.is_empty()
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Iterates borrowed conversations without constructing an owned presentation snapshot.
+    pub(crate) fn iter(&self) -> impl Clone + Iterator<Item = &SlackConversation> {
+        self.entries.values().map(|entry| &entry.conversation)
+    }
+
+    /// Creates a stable owned snapshot for persistence and explicit handoffs.
     pub(crate) fn conversations(&self) -> Vec<SlackConversation> {
-        let mut conversations = self
-            .entries
-            .values()
-            .map(|entry| entry.conversation.clone())
-            .collect::<Vec<_>>();
+        let mut conversations = self.iter().cloned().collect::<Vec<_>>();
         conversations.sort_by(|left, right| left.id.cmp(&right.id));
         conversations
     }
@@ -489,6 +490,22 @@ mod tests {
         assert!(!catalog.commit_membership_snapshot(stale_snapshot));
         assert!(catalog.get("C1").is_none());
         assert!(catalog.remove("missing").is_none());
+    }
+
+    #[test]
+    fn borrowed_iteration_reflects_catalog_updates_without_an_owned_snapshot() {
+        let mut catalog =
+            ConversationCatalog::from_cached([conversation("C1"), conversation("C2")]);
+        catalog.remove("C1");
+        catalog.upsert_authoritative(conversation("C3"));
+
+        let mut ids = catalog
+            .iter()
+            .map(|conversation| conversation.id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+
+        assert_eq!(ids, vec!["C2", "C3"]);
     }
 
     #[test]
