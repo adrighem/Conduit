@@ -14,7 +14,7 @@ Conduit implements optional live ingestion through either official Socket Mode o
 
 OAuth workspaces use Socket Mode when an app-level token is stored or provided through `CONDUIT_SLACK_APP_TOKEN` or `SLACK_APP_TOKEN`. Imported XOXC/XOXD workspaces instead use the browser-session WebSocket automatically and do not need an app token. The app continues to work with manual refresh and direct Web API calls when no realtime transport is configured.
 
-The runtime starts one realtime connection after workspace authentication and aborts it on sign-out or reconnect. Socket Mode calls `apps.connections.open` and acknowledges admitted envelopes with their `envelope_id`; browser sessions call `client.getWebSocketURL` and consume browser RTM events. Both transports reconnect with capped backoff after disconnects. If Slack reports `link_disabled`, Conduit keeps retrying so the running client reconnects once the link is enabled again.
+The runtime starts one supervisor-owned realtime connection after workspace authentication. On sign-out, session replacement, or runtime shutdown, the supervisor stops transport admission and waits for accepted persistence work before the old session completes. Socket Mode calls `apps.connections.open` and acknowledges admitted envelopes with their `envelope_id`; browser sessions call `client.getWebSocketURL` and consume browser RTM events. Both transports reconnect with capped backoff after disconnects. If Slack reports `link_disabled`, Conduit keeps retrying so the running client reconnects once the link is enabled again.
 
 One session-owned actor queue carries messages, user/profile changes, and reactions. Message and
 reaction effects remain ordered behind it before UI fan-out; user changes also use it for cache
@@ -22,7 +22,7 @@ persistence. The actor admits at most 256 pending events. Its asynchronous trans
 for capacity instead of dropping or reordering an event. Socket Mode admission and acknowledgment
 share a three-second deadline; a timeout or closed actor leaves the envelope unacknowledged and
 reconnects so Slack can retry it. Browser RTM applies socket backpressure while admission waits. The
-actor drains before a normal reconnect. Live trace events report queue high-water marks at depth 1
+actor drains before a normal reconnect or supervised session shutdown. Live trace events report queue high-water marks at depth 1
 and each new power-of-two peak.
 
 The workspace coordinator classifies every normalized message with the canonical attention policy.

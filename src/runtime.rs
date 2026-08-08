@@ -1955,9 +1955,84 @@ struct ActiveRequest {
     task_id: u64,
 }
 
+async fn wait_for_realtime_or_shutdown<F>(
+    shutdown: &mut oneshot::Receiver<()>,
+    future: F,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|context| {
+        if std::pin::Pin::new(&mut *shutdown).poll(context).is_ready() {
+            std::task::Poll::Ready(None)
+        } else {
+            future.as_mut().poll(context).map(Some)
+        }
+    })
+    .await
+}
+
+struct RealtimeSessionSupervisor {
+    session: SessionId,
+    start: Option<oneshot::Sender<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RealtimeSessionSupervisor {
+    fn spawn<F, Fut>(session: SessionId, run: F) -> Self
+    where
+        F: FnOnce(oneshot::Receiver<()>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (start, start_receiver) = oneshot::channel();
+        let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let Some(started) =
+                wait_for_realtime_or_shutdown(&mut shutdown_receiver, start_receiver).await
+            else {
+                return;
+            };
+            if started.is_err() {
+                return;
+            }
+            run(shutdown_receiver).await;
+        });
+        Self {
+            session,
+            start: Some(start),
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+
+    fn start(&mut self) -> bool {
+        self.start
+            .take()
+            .is_some_and(|start| start.send(()).is_ok())
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Err(error) = self.task.await {
+            crate::debug::log(
+                "socket",
+                &format!(
+                    "RealtimeSupervisorFailed session={:?} error={error}",
+                    self.session
+                ),
+            );
+        }
+    }
+}
+
 struct RuntimeState {
     active_session: SessionId,
     connection: Option<RuntimeConnection>,
+    realtime: Option<RealtimeSessionSupervisor>,
     attention_preferences: AttentionPreferences,
     tasks: HashMap<u64, tokio::task::AbortHandle>,
     task_requests: HashMap<u64, TrackedRequest>,
@@ -1973,6 +2048,7 @@ impl RuntimeState {
         Self {
             active_session,
             connection: None,
+            realtime: None,
             attention_preferences: AttentionPreferences::default(),
             tasks: HashMap::new(),
             task_requests: HashMap::new(),
@@ -1984,7 +2060,11 @@ impl RuntimeState {
         }
     }
 
-    fn replace_session(&mut self, session: SessionId) {
+    fn begin_session_replacement(
+        &mut self,
+        session: SessionId,
+    ) -> Option<RealtimeSessionSupervisor> {
+        self.active_session = session;
         for (_, task) in self.tasks.drain() {
             task.abort();
         }
@@ -1993,8 +2073,22 @@ impl RuntimeState {
         self.task_requests.clear();
         self.active_navigation.clear();
         self.latest_navigation.clear();
-        self.active_session = session;
         self.connection = None;
+        self.realtime.take()
+    }
+
+    fn install_realtime_supervisor(
+        &mut self,
+        mut supervisor: RealtimeSessionSupervisor,
+    ) -> std::result::Result<(), RealtimeSessionSupervisor> {
+        if self.active_session != supervisor.session || self.realtime.is_some() {
+            return Err(supervisor);
+        }
+        if !supervisor.start() {
+            return Err(supervisor);
+        }
+        self.realtime = Some(supervisor);
+        Ok(())
     }
 
     fn set_attention_preferences(&mut self, preferences: AttentionPreferences) {
@@ -2137,6 +2231,16 @@ impl RuntimeState {
                 }
             }
         }
+    }
+}
+
+async fn replace_session_and_drain(state: &Arc<Mutex<RuntimeState>>, session: SessionId) {
+    let realtime = state
+        .lock()
+        .expect("runtime state lock poisoned")
+        .begin_session_replacement(session);
+    if let Some(realtime) = realtime {
+        realtime.shutdown().await;
     }
 }
 
@@ -3122,14 +3226,15 @@ async fn run_runtime(
         let trace_fields = RuntimeTraceFields::for_command(identity, &command);
         let span = trace_fields.span();
         let _entered = span.enter();
-        {
-            let mut runtime_state = state.lock().expect("runtime state lock poisoned");
-            if identity.session < runtime_state.active_session {
-                continue;
-            }
-            if identity.session > runtime_state.active_session {
-                runtime_state.replace_session(identity.session);
-            }
+        let active_session = state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .active_session;
+        if identity.session < active_session {
+            continue;
+        }
+        if identity.session > active_session {
+            replace_session_and_drain(&state, identity.session).await;
         }
 
         let event_sender =
@@ -3145,10 +3250,7 @@ async fn run_runtime(
         );
     }
 
-    state
-        .lock()
-        .expect("runtime state lock poisoned")
-        .replace_session(SessionId::default());
+    replace_session_and_drain(&state, SessionId::default()).await;
 }
 
 fn dispatch_command(
@@ -3441,7 +3543,8 @@ fn spawn_authentication_task<F>(
                         connection,
                         limits,
                         huddle_receiver,
-                    );
+                    )
+                    .await;
                 }
                 Err(error) => {
                     let failure = authentication_failure(failure_context, &error);
@@ -3452,7 +3555,7 @@ fn spawn_authentication_task<F>(
     );
 }
 
-fn spawn_workspace_tasks(
+async fn spawn_workspace_tasks(
     state: &Arc<Mutex<RuntimeState>>,
     identity: RuntimeIdentity,
     events: RuntimeEventSender,
@@ -3535,10 +3638,26 @@ fn spawn_workspace_tasks(
             socket_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
                 RealtimeStatus::connecting(credentials.transport()),
             ));
-            spawn_session_task(state, identity.session, async move {
-                let _ = hydration_ready_receiver.await;
-                run_socket_mode(credentials, socket_events, connection).await;
-            });
+            let supervisor = RealtimeSessionSupervisor::spawn(
+                identity.session,
+                move |mut shutdown| async move {
+                    if wait_for_realtime_or_shutdown(&mut shutdown, hydration_ready_receiver)
+                        .await
+                        .is_none()
+                    {
+                        return;
+                    }
+                    run_socket_mode(credentials, socket_events, connection, shutdown).await;
+                },
+            );
+            let rejected = state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .install_realtime_supervisor(supervisor)
+                .err();
+            if let Some(rejected) = rejected {
+                rejected.shutdown().await;
+            }
         }
         Ok(None) => socket_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
             RealtimeStatus::default(),
@@ -5395,6 +5514,7 @@ async fn run_socket_mode(
     credentials: socket_mode::SocketModeCredentials,
     events: RuntimeEventSender,
     connection: RuntimeConnection,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let RuntimeConnection {
         workspace_store,
@@ -5409,6 +5529,9 @@ async fn run_socket_mode(
     let transport = credentials.transport();
 
     loop {
+        if realtime_shutdown_requested(&mut shutdown) {
+            return;
+        }
         let events_for_run = events.clone();
         let connected_events = events.clone();
         let mut persistence_tasks = tokio::task::JoinSet::new();
@@ -5430,139 +5553,143 @@ async fn run_socket_mode(
         let huddles_for_run = huddles.clone();
         let team_id_for_run = team_id.clone();
         let user_status_sync_for_run = user_status_sync.clone();
-        let result = socket_mode::run_once(
-            &credentials,
-            move || {
-                connected_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
-                    RealtimeStatus::online(transport),
-                ));
-            },
-            move |event| {
-                let persistence_for_event = persistence_for_run.clone();
-                let workspace_for_event = workspace_for_run.clone();
-                let events_for_event = events_for_run.clone();
-                let huddles_for_event = huddles_for_run.clone();
-                let team_id_for_event = team_id_for_run.clone();
-                let user_status_sync_for_event = user_status_sync_for_run.clone();
-                async move {
-                    observe_huddle_socket_event(
-                        &huddles_for_event,
-                        team_id_for_event.as_deref(),
-                        &event,
-                    );
-                    let defer_workspace_mutation = persistence_for_event.is_some()
-                        && matches!(
+        let result = {
+            let run_once = socket_mode::run_once(
+                &credentials,
+                move || {
+                    connected_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
+                        RealtimeStatus::online(transport),
+                    ));
+                },
+                move |event| {
+                    let persistence_for_event = persistence_for_run.clone();
+                    let workspace_for_event = workspace_for_run.clone();
+                    let events_for_event = events_for_run.clone();
+                    let huddles_for_event = huddles_for_run.clone();
+                    let team_id_for_event = team_id_for_run.clone();
+                    let user_status_sync_for_event = user_status_sync_for_run.clone();
+                    async move {
+                        observe_huddle_socket_event(
+                            &huddles_for_event,
+                            team_id_for_event.as_deref(),
                             &event,
-                            SocketModeEvent::Message(_)
-                                | SocketModeEvent::Reaction(_)
-                                | SocketModeEvent::UserChanged(_)
-                                | SocketModeEvent::UserHuddleChanged(_)
                         );
-                    let attention = (!defer_workspace_mutation)
-                        .then(|| {
-                            apply_realtime_workspace_event_and_publish(
-                                &workspace_for_event,
-                                &events_for_event,
+                        let defer_workspace_mutation = persistence_for_event.is_some()
+                            && matches!(
                                 &event,
-                            )
-                        })
-                        .flatten();
-                    if matches!(&event, SocketModeEvent::RefreshConversations) {
-                        events_for_event.send_event(RuntimeEventKind::WorkspaceRefreshRequested);
-                    }
-                    let status_change_user_id = match &event {
-                        SocketModeEvent::UserChanged(user)
-                        | SocketModeEvent::UserHuddleChanged(user)
-                            if user
-                                .profile
-                                .as_ref()
-                                .is_some_and(|profile| profile.contains_status_fields()) =>
-                        {
-                            user.id.clone()
-                        }
-                        _ => None,
-                    };
-                    let status_revision = status_change_user_id
-                        .as_deref()
-                        .map(|user_id| user_status_sync_for_event.publish_change(user_id, || {}));
-                    let persistence_event = match &event {
-                        SocketModeEvent::UserChanged(user)
-                        | SocketModeEvent::UserHuddleChanged(user) => {
-                            Some(RealtimePersistenceEvent::UserChanged {
-                                user: user.clone(),
-                                status_revision,
-                            })
-                        }
-                        SocketModeEvent::Message(message) => {
-                            Some(RealtimePersistenceEvent::Message {
-                                event: message.clone(),
-                            })
-                        }
-                        SocketModeEvent::Reaction(_) => {
-                            Some(RealtimePersistenceEvent::OrderedEvent {
-                                event: event.clone(),
-                            })
-                        }
-                        SocketModeEvent::RefreshConversations => None,
-                    };
-                    let notification_without_store = persistence_for_event.is_none().then(|| {
-                        attention
-                            .as_ref()
-                            .filter(|effect| effect.decision.send_notification)
-                            .map(|effect| {
-                                (
-                                    effect.channel_id.clone(),
-                                    effect.message.clone(),
-                                    effect.decision.clone(),
+                                SocketModeEvent::Message(_)
+                                    | SocketModeEvent::Reaction(_)
+                                    | SocketModeEvent::UserChanged(_)
+                                    | SocketModeEvent::UserHuddleChanged(_)
+                            );
+                        let attention = (!defer_workspace_mutation)
+                            .then(|| {
+                                apply_realtime_workspace_event_and_publish(
+                                    &workspace_for_event,
+                                    &events_for_event,
+                                    &event,
                                 )
                             })
-                    });
-                    if let Some(sender) = persistence_for_event.as_ref() {
-                        if let Some(persistence_event) = persistence_event {
-                            if sender.send(persistence_event).await.is_err() {
-                                crate::debug::log(
-                                    "store",
-                                    "RealtimePersistenceQueueRejected reason=worker_closed",
-                                );
-                                if defer_workspace_mutation {
-                                    apply_realtime_persistence_queue_fallback(
-                                        &workspace_for_event,
-                                        &events_for_event,
-                                        event,
-                                    );
-                                }
-                                return Err(anyhow!("realtime persistence worker closed"));
-                            }
+                            .flatten();
+                        if matches!(&event, SocketModeEvent::RefreshConversations) {
+                            events_for_event
+                                .send_event(RuntimeEventKind::WorkspaceRefreshRequested);
                         }
-                    } else if let Some(Some((channel_id, message, decision))) =
-                        notification_without_store
-                    {
-                        events_for_event.send_event(
-                            RuntimeEventKind::AttentionNotificationCandidate {
-                                channel_id,
-                                message: Box::new(message),
-                                decision,
-                            },
-                        );
+                        let status_change_user_id = match &event {
+                            SocketModeEvent::UserChanged(user)
+                            | SocketModeEvent::UserHuddleChanged(user)
+                                if user
+                                    .profile
+                                    .as_ref()
+                                    .is_some_and(|profile| profile.contains_status_fields()) =>
+                            {
+                                user.id.clone()
+                            }
+                            _ => None,
+                        };
+                        let status_revision = status_change_user_id.as_deref().map(|user_id| {
+                            user_status_sync_for_event.publish_change(user_id, || {})
+                        });
+                        let persistence_event = match &event {
+                            SocketModeEvent::UserChanged(user)
+                            | SocketModeEvent::UserHuddleChanged(user) => {
+                                Some(RealtimePersistenceEvent::UserChanged {
+                                    user: user.clone(),
+                                    status_revision,
+                                })
+                            }
+                            SocketModeEvent::Message(message) => {
+                                Some(RealtimePersistenceEvent::Message {
+                                    event: message.clone(),
+                                })
+                            }
+                            SocketModeEvent::Reaction(_) => {
+                                Some(RealtimePersistenceEvent::OrderedEvent {
+                                    event: event.clone(),
+                                })
+                            }
+                            SocketModeEvent::RefreshConversations => None,
+                        };
+                        let notification_without_store =
+                            persistence_for_event.is_none().then(|| {
+                                attention
+                                    .as_ref()
+                                    .filter(|effect| effect.decision.send_notification)
+                                    .map(|effect| {
+                                        (
+                                            effect.channel_id.clone(),
+                                            effect.message.clone(),
+                                            effect.decision.clone(),
+                                        )
+                                    })
+                            });
+                        if let Some(sender) = persistence_for_event.as_ref() {
+                            if let Some(persistence_event) = persistence_event {
+                                if sender.send(persistence_event).await.is_err() {
+                                    crate::debug::log(
+                                        "store",
+                                        "RealtimePersistenceQueueRejected reason=worker_closed",
+                                    );
+                                    if defer_workspace_mutation {
+                                        apply_realtime_persistence_queue_fallback(
+                                            &workspace_for_event,
+                                            &events_for_event,
+                                            event,
+                                        );
+                                    }
+                                    return Err(anyhow!("realtime persistence worker closed"));
+                                }
+                            }
+                        } else if let Some(Some((channel_id, message, decision))) =
+                            notification_without_store
+                        {
+                            events_for_event.send_event(
+                                RuntimeEventKind::AttentionNotificationCandidate {
+                                    channel_id,
+                                    message: Box::new(message),
+                                    decision,
+                                },
+                            );
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
-            },
-        )
-        .await;
-        events.send_event(RuntimeEventKind::RealtimeStatusChanged(
-            RealtimeStatus::reconnecting(transport),
-        ));
-        drop(persistence_sender);
-        while let Some(join_result) = persistence_tasks.join_next().await {
-            if let Err(error) = join_result {
-                crate::debug::log(
-                    "store",
-                    &format!("RealtimePersistenceWorkerFailed error={error}"),
-                );
-            }
+                },
+            );
+            wait_for_realtime_or_shutdown(&mut shutdown, run_once).await
+        };
+        if result.is_some() && !realtime_shutdown_requested(&mut shutdown) {
+            events.send_event(RuntimeEventKind::RealtimeStatusChanged(
+                RealtimeStatus::reconnecting(transport),
+            ));
         }
-        workspace.trace_attention_metrics_snapshot();
+        drain_realtime_persistence(persistence_sender, &mut persistence_tasks, &workspace).await;
+
+        let Some(result) = result else {
+            return;
+        };
+        if realtime_shutdown_requested(&mut shutdown) {
+            return;
+        }
 
         let timing = match result {
             Ok(SocketModeDisconnect::LinkDisabled) => {
@@ -5589,7 +5716,36 @@ async fn run_socket_mode(
         };
 
         reconnect_delay = timing.next_backoff;
-        tokio::time::sleep(timing.sleep).await;
+        if wait_for_realtime_or_shutdown(&mut shutdown, tokio::time::sleep(timing.sleep))
+            .await
+            .is_none()
+        {
+            return;
+        }
+    }
+}
+
+async fn drain_realtime_persistence(
+    persistence_sender: Option<RealtimePersistenceSender>,
+    persistence_tasks: &mut tokio::task::JoinSet<()>,
+    workspace: &WorkspaceReducerAdapter,
+) {
+    drop(persistence_sender);
+    while let Some(join_result) = persistence_tasks.join_next().await {
+        if let Err(error) = join_result {
+            crate::debug::log(
+                "store",
+                &format!("RealtimePersistenceWorkerFailed error={error}"),
+            );
+        }
+    }
+    workspace.trace_attention_metrics_snapshot();
+}
+
+fn realtime_shutdown_requested(shutdown: &mut oneshot::Receiver<()>) -> bool {
+    match shutdown.try_recv() {
+        Ok(()) | Err(oneshot::error::TryRecvError::Closed) => true,
+        Err(oneshot::error::TryRecvError::Empty) => false,
     }
 }
 
@@ -12051,6 +12207,67 @@ mod tests {
     }
 
     #[test]
+    fn realtime_persistence_drain_waits_for_fifo_and_reconciles_depth() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let workspace = WorkspaceReducerAdapter::default();
+            let metrics = workspace.attention_metrics_handle();
+            let (sender, mut receiver) =
+                realtime_persistence_channel_with_capacity(Arc::clone(&metrics), 3);
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let observed_by_worker = Arc::clone(&observed);
+            let (release_worker, worker_gate) = oneshot::channel();
+            let mut persistence_tasks = tokio::task::JoinSet::new();
+            persistence_tasks.spawn(async move {
+                let _ = worker_gate.await;
+                while let Some(event) = receiver.recv().await {
+                    let RealtimePersistenceEvent::Message { event } = event else {
+                        panic!("expected message event");
+                    };
+                    observed_by_worker
+                        .lock()
+                        .expect("observed event lock poisoned")
+                        .push(event.message.ts);
+                }
+            });
+            let event = |ts: &str| RealtimePersistenceEvent::Message {
+                event: Box::new(crate::socket_mode::SocketModeMessageEvent {
+                    channel_id: "C1".into(),
+                    message: SlackMessage {
+                        ts: ts.into(),
+                        ..Default::default()
+                    },
+                    kind: SocketModeMessageKind::Posted,
+                }),
+            };
+
+            sender.send(event("1.0")).await.unwrap();
+            sender.send(event("2.0")).await.unwrap();
+            sender.send(event("3.0")).await.unwrap();
+            assert_eq!(metrics.snapshot().queue_depth, 3);
+
+            release_worker.send(()).unwrap();
+            drain_realtime_persistence(Some(sender), &mut persistence_tasks, &workspace).await;
+
+            assert_eq!(
+                *observed.lock().expect("observed event lock poisoned"),
+                ["1.0", "2.0", "3.0"]
+            );
+            let drained = metrics.snapshot();
+            assert_eq!(drained.queue_enqueued, 3);
+            assert_eq!(drained.queue_dequeued, 3);
+            assert_eq!(drained.queue_depth, 0);
+            assert_eq!(drained.queue_peak_depth, 3);
+            assert_eq!(drained.queue_rejected, 0);
+        });
+    }
+
+    #[test]
     fn realtime_status_persistence_skips_superseded_user_updates() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -14267,10 +14484,7 @@ mod tests {
             });
             started_rx.await.expect("session task did not start");
 
-            state
-                .lock()
-                .expect("runtime state lock poisoned")
-                .replace_session(second_session);
+            replace_session_and_drain(&state, second_session).await;
 
             tokio::time::timeout(Duration::from_millis(100), cancelled_rx)
                 .await
@@ -14283,6 +14497,141 @@ mod tests {
                     .active_session,
                 second_session
             );
+        });
+    }
+
+    #[test]
+    fn realtime_wait_prioritizes_shutdown_over_ready_work() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let (shutdown, mut shutdown_receiver) = oneshot::channel();
+            shutdown.send(()).unwrap();
+
+            assert_eq!(
+                wait_for_realtime_or_shutdown(&mut shutdown_receiver, future::ready(42)).await,
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn session_replacement_marks_new_session_before_realtime_drain_completes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let first_session = SessionId::default().next();
+            let second_session = first_session.next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(first_session)));
+            let (started, mut started_receiver) = oneshot::channel();
+            let (drain_started, drain_started_receiver) = oneshot::channel();
+            let (release_drain, release_drain_receiver) = oneshot::channel();
+            let (drained, drained_receiver) = oneshot::channel();
+            let supervisor =
+                RealtimeSessionSupervisor::spawn(first_session, move |shutdown| async move {
+                    let _ = started.send(());
+                    let _ = shutdown.await;
+                    let _ = drain_started.send(());
+                    let _ = release_drain_receiver.await;
+                    let _ = drained.send(());
+                });
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut started_receiver)
+                    .await
+                    .is_err(),
+                "realtime supervisor started before installation"
+            );
+            assert!(state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .install_realtime_supervisor(supervisor)
+                .is_ok());
+            started_receiver
+                .await
+                .expect("installed realtime supervisor did not start");
+
+            let state_for_replacement = Arc::clone(&state);
+            let replacement = tokio::spawn(async move {
+                replace_session_and_drain(&state_for_replacement, second_session).await;
+            });
+            drain_started_receiver
+                .await
+                .expect("realtime drain did not start");
+
+            assert_eq!(
+                state
+                    .lock()
+                    .expect("runtime state lock poisoned")
+                    .active_session,
+                second_session
+            );
+            assert!(
+                !replacement.is_finished(),
+                "session replacement completed before realtime drain"
+            );
+
+            let (old_task_started, old_task_started_receiver) = oneshot::channel();
+            spawn_session_task(&state, first_session, async move {
+                let _ = old_task_started.send(());
+            });
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_millis(100), old_task_started_receiver).await,
+                Ok(Err(_))
+            ));
+
+            release_drain.send(()).unwrap();
+            replacement.await.unwrap();
+            drained_receiver
+                .await
+                .expect("realtime drain did not finish");
+            assert!(state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .realtime
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn stale_realtime_supervisor_is_rejected_before_start() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+
+        runtime.block_on(async {
+            let first_session = SessionId::default().next();
+            let second_session = first_session.next();
+            let state = Arc::new(Mutex::new(RuntimeState::new(second_session)));
+            let (started, started_receiver) = oneshot::channel();
+            let supervisor =
+                RealtimeSessionSupervisor::spawn(first_session, move |_shutdown| async move {
+                    let _ = started.send(());
+                });
+
+            let rejected = {
+                let mut state = state.lock().expect("runtime state lock poisoned");
+                match state.install_realtime_supervisor(supervisor) {
+                    Ok(()) => panic!("stale realtime supervisor was installed"),
+                    Err(rejected) => rejected,
+                }
+            };
+            rejected.shutdown().await;
+
+            assert!(started_receiver.await.is_err());
+            assert!(state
+                .lock()
+                .expect("runtime state lock poisoned")
+                .realtime
+                .is_none());
         });
     }
 
@@ -14307,7 +14656,7 @@ mod tests {
         state.set_attention_preferences(latest.clone());
         assert_eq!(state.attention_preferences, latest);
 
-        state.replace_session(second_session);
+        assert!(state.begin_session_replacement(second_session).is_none());
         let seeded = state.attention_context(Some("U_NEXT".to_string()));
         assert_eq!(seeded.current_user_id.as_deref(), Some("U_NEXT"));
         assert_eq!(state.attention_preferences, latest);
