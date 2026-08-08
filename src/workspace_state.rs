@@ -126,6 +126,7 @@ impl ConversationPatchRemoval {
 pub(crate) struct WorkspacePatchApplication {
     conversation_changed: bool,
     conversation_reset: bool,
+    conversation_structure_changed: bool,
     changed_conversation_ids: Vec<String>,
     thread_catalog_changed: bool,
     users_reset: bool,
@@ -193,6 +194,10 @@ impl WorkspacePatchApplication {
         &self.changed_conversation_ids
     }
 
+    pub(crate) fn conversation_structure_changed(&self) -> bool {
+        self.conversation_structure_changed
+    }
+
     pub(crate) fn thread_catalog_changed(&self) -> bool {
         self.thread_catalog_changed
     }
@@ -230,9 +235,15 @@ impl WorkspacePatchApplication {
         }
     }
 
+    fn record_conversation_structure_change(&mut self, channel_id: &str) {
+        self.conversation_structure_changed = true;
+        self.record_conversation_change(channel_id);
+    }
+
     fn record_conversation_reset(&mut self) {
         self.conversation_changed = true;
         self.conversation_reset = true;
+        self.conversation_structure_changed = true;
         self.changed_conversation_ids.clear();
     }
 }
@@ -323,11 +334,11 @@ impl WorkspaceSessionState {
                             .push(conversation.id.clone());
                     }
                     catalog.upsert_authoritative(conversation.clone());
-                    application.record_conversation_change(&conversation.id);
+                    application.record_conversation_structure_change(&conversation.id);
                 }
                 WorkspaceChange::ConversationMetadataUpsert(conversation) => {
                     catalog.upsert_metadata(conversation.clone());
-                    application.record_conversation_change(&conversation.id);
+                    application.record_conversation_structure_change(&conversation.id);
                 }
                 WorkspaceChange::ConversationAttentionObserved {
                     channel_id,
@@ -391,7 +402,7 @@ impl WorkspaceSessionState {
                         was_visible: view.visible_channel_id() == Some(channel_id),
                     });
                     view.remove_conversation(channel_id);
-                    application.record_conversation_change(channel_id);
+                    application.record_conversation_structure_change(channel_id);
                 }
                 WorkspaceChange::UnreadChanged { snapshot } => {
                     if !snapshot.unread_state.known || snapshot.channel_id.trim().is_empty() {
@@ -2028,6 +2039,7 @@ mod tests {
         let bootstrap_application = state.apply_workspace_patch(&bootstrap).unwrap();
         assert!(bootstrap_application.conversation_changed());
         assert!(bootstrap_application.conversation_reset());
+        assert!(bootstrap_application.conversation_structure_changed());
         assert!(bootstrap_application.changed_conversation_ids().is_empty());
         state.view.borrow_mut().select_conversation("C1");
 
@@ -2038,6 +2050,7 @@ mod tests {
         let newer_application = state.apply_workspace_patch(&newer).unwrap();
         assert!(newer_application.conversation_changed());
         assert!(!newer_application.conversation_reset());
+        assert!(newer_application.conversation_structure_changed());
         assert_eq!(
             newer_application.changed_conversation_ids(),
             &["C1".to_string()]
@@ -2077,6 +2090,7 @@ mod tests {
             },
         );
         let application = state.apply_workspace_patch(&removal).unwrap();
+        assert!(application.conversation_structure_changed());
         assert_eq!(application.removals().len(), 1);
         assert_eq!(application.removals()[0].channel_id(), "C1");
         assert!(application.removals()[0].was_visible());
@@ -2104,6 +2118,40 @@ mod tests {
             application.changed_conversation_ids(),
             &["C1".to_string(), "C2".to_string()]
         );
+        assert!(application.conversation_structure_changed());
+    }
+
+    #[test]
+    fn unread_patch_is_a_presentation_only_conversation_change() {
+        let state = WorkspaceSessionState::default();
+        let revision_one = WorkspaceRevision::INITIAL.successor();
+        state
+            .apply_workspace_patch(&conversation_patch(
+                revision_one,
+                WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                    conversations: vec![conversation("C1", "general")],
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+
+        let application = state
+            .apply_workspace_patch(&conversation_patch(
+                revision_one.successor(),
+                WorkspaceChange::UnreadChanged {
+                    snapshot: SlackConversationUnreadSnapshot {
+                        channel_id: "C1".to_string(),
+                        unread_state: SlackUnreadState::from_parts(true, true, 2),
+                        latest: Some("2.0".to_string()),
+                        ..Default::default()
+                    },
+                },
+            ))
+            .unwrap();
+
+        assert!(application.conversation_changed());
+        assert!(!application.conversation_structure_changed());
+        assert_eq!(application.changed_conversation_ids(), &["C1".to_string()]);
     }
 
     #[test]
@@ -2308,6 +2356,7 @@ mod tests {
             ))
             .unwrap();
         assert!(first.conversation_changed());
+        assert!(!first.conversation_structure_changed());
         assert_eq!(first.changed_conversation_ids(), &["C1".to_string()]);
         assert_eq!(first.unread_start("C1"), Some("11.0"));
         let duplicate = state

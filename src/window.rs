@@ -86,13 +86,13 @@ use crate::runtime::{
     SessionId, UploadAttachment,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
+#[cfg(test)]
+use crate::sidebar::SidebarItemKey;
 use crate::sidebar::{
     self, ConversationKind, ConversationPickerAction, ConversationPickerItem,
     ConversationPickerSections, KeyedSidebarItem, SidebarItemModel, SidebarProjection,
-    SidebarProjectionOperation, SidebarSectionKind,
+    SidebarProjectionOperation, SidebarRowModel, SidebarSectionKind,
 };
-#[cfg(test)]
-use crate::sidebar::{SidebarItemKey, SidebarRowModel};
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::slack::SlackMessageActionRequest;
 use crate::slack_link::{
@@ -2181,6 +2181,15 @@ fn sidebar_selected_position(items: &[KeyedSidebarItem]) -> u32 {
         })
         .and_then(|position| u32::try_from(position).ok())
         .unwrap_or(gtk::INVALID_LIST_POSITION)
+}
+
+fn sidebar_row_has_stable_incremental_membership(row: &SidebarRowModel) -> bool {
+    !matches!(
+        row.kind,
+        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
+    ) || row.unread
+        || row.selected
+        || row.starred
 }
 
 fn toggle_sidebar_section_state(
@@ -10768,14 +10777,17 @@ impl ConduitWindow {
             if application.conversation_reset() {
                 self.sync_conversations_from_catalog();
             } else {
-                self.sync_changed_conversations(application.changed_conversation_ids());
+                self.sync_changed_conversations(
+                    application.changed_conversation_ids(),
+                    application.conversation_structure_changed(),
+                );
             }
         }
         if application.thread_catalog_changed() {
             match self.current_main_view() {
                 MainMessageView::Threads => self.populate_threads(),
                 MainMessageView::Unreads if !application.conversation_changed() => {
-                    self.populate_unreads(self.unread_items());
+                    self.populate_unreads_content(self.unread_items());
                 }
                 _ => {}
             }
@@ -11152,19 +11164,21 @@ impl ConduitWindow {
         self.request_conversation_user_names();
         self.render_conversations();
         if self.current_main_view() == MainMessageView::Unreads {
-            self.populate_unreads(self.unread_items());
+            self.populate_unreads_content(self.unread_items());
         } else {
             self.refresh_current_conversation_title();
         }
         self.finish_conversation_catalog_sync();
     }
 
-    fn sync_changed_conversations(&self, changed_channel_ids: &[String]) {
+    fn sync_changed_conversations(&self, changed_channel_ids: &[String], structure_changed: bool) {
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_changed_conversation_user_names(changed_channel_ids);
-        self.render_conversations();
+        if structure_changed || !self.render_changed_conversations(changed_channel_ids) {
+            self.render_conversations();
+        }
         if self.current_main_view() == MainMessageView::Unreads {
-            self.populate_unreads(self.unread_items());
+            self.populate_unreads_content(self.unread_items());
         } else if self.selected_channel_id().as_ref().is_some_and(|selected| {
             changed_channel_ids
                 .iter()
@@ -11173,6 +11187,69 @@ impl ConduitWindow {
             self.refresh_current_conversation_title();
         }
         self.finish_conversation_catalog_sync();
+    }
+
+    fn render_changed_conversations(&self, changed_channel_ids: &[String]) -> bool {
+        if changed_channel_ids.is_empty() {
+            return true;
+        }
+        let started = Instant::now();
+        let rows = {
+            let imp = self.imp();
+            let conversations = imp.workspace.conversations.borrow();
+            let user_names = imp.user_names.borrow();
+            let user_search_aliases = imp.user_search_aliases.borrow();
+            let user_full_names = imp.user_full_names.borrow();
+            let user_statuses = imp.user_statuses.borrow();
+            let current_user_id = imp.current_user_id.borrow();
+            let query = imp.sidebar_filter_entry.text();
+            let selected_channel = self.visible_channel_id();
+            let active_huddle_channel_id = imp
+                .huddle_snapshot
+                .borrow()
+                .huddle
+                .as_ref()
+                .map(|huddle| huddle.channel_id.clone());
+            let options = sidebar::SidebarBuildOptions {
+                selected_channel: selected_channel.as_deref(),
+                active_huddle_channel_id: active_huddle_channel_id.as_deref(),
+                current_user_id: current_user_id.as_deref(),
+                query: query.as_str(),
+                unread_only: imp.sidebar_unread_filter_button.is_active(),
+                show_unreads_section: self.show_unreads_section(),
+                show_all: imp.sidebar_all_filter_button.is_active(),
+                loading: false,
+                has_error: imp.sidebar_error.borrow().is_some(),
+                user_search_aliases: Some(&user_search_aliases),
+                user_full_names: Some(&user_full_names),
+                user_statuses: Some(&user_statuses),
+            };
+            let mut rows = Vec::with_capacity(changed_channel_ids.len());
+            for channel_id in changed_channel_ids {
+                let Some(conversation) = conversations.get(channel_id) else {
+                    return false;
+                };
+                let row = sidebar::sidebar_row_for_conversation(conversation, &user_names, options);
+                if !sidebar_row_has_stable_incremental_membership(&row) {
+                    return false;
+                }
+                rows.push(row);
+            }
+            rows
+        };
+
+        if !self.reconcile_sidebar_conversation_rows(&rows) {
+            return false;
+        }
+        self.sync_workspace_chrome();
+        log_performance(started, |elapsed_ms| {
+            format!(
+                "sidebar_patch conversations={} elapsed_ms={:.2}",
+                rows.len(),
+                elapsed_ms
+            )
+        });
+        true
     }
 
     fn finish_conversation_catalog_sync(&self) {
@@ -11773,6 +11850,28 @@ impl ConduitWindow {
         let selected_position = sidebar_selected_position(projection.items());
         drop(projection);
         selection.set_selected(selected_position);
+    }
+
+    fn reconcile_sidebar_conversation_rows(&self, rows: &[SidebarRowModel]) -> bool {
+        let imp = self.imp();
+        let selection = imp
+            .conversation_list
+            .model()
+            .and_downcast::<gtk::SingleSelection>()
+            .expect("sidebar list should own a single-selection model");
+        let store = selection
+            .model()
+            .and_downcast::<gio::ListStore>()
+            .expect("sidebar selection should own a list store");
+        let mut projection = imp.sidebar_projection.borrow_mut();
+        let Some(operations) = projection.update_conversation_rows(rows) else {
+            return false;
+        };
+        apply_sidebar_store_operations(&store, projection.items(), &operations);
+        let selected_position = sidebar_selected_position(projection.items());
+        drop(projection);
+        selection.set_selected(selected_position);
+        true
     }
 
     fn activate_sidebar_item(&self, position: u32) {
@@ -13115,9 +13214,12 @@ impl ConduitWindow {
     }
 
     fn populate_unreads(&self, items: Vec<ActivityItem>) {
-        let imp = self.imp();
-        imp.message_title.set_title(&gettext("Unreads"));
         self.render_conversations();
+        self.populate_unreads_content(items);
+    }
+
+    fn populate_unreads_content(&self, items: Vec<ActivityItem>) {
+        self.imp().message_title.set_title(&gettext("Unreads"));
         self.load_message_html(&message_html::unreads_document(&items));
     }
 
@@ -14268,7 +14370,7 @@ impl ConduitWindow {
                     self.populate_history(&channel_id, messages);
                 }
             }
-            MainMessageView::Unreads => self.populate_unreads(self.unread_items()),
+            MainMessageView::Unreads => self.populate_unreads_content(self.unread_items()),
             MainMessageView::Threads => self.populate_threads(),
             MainMessageView::Search => {
                 let results = self.imp().workspace.view.borrow().search_results().to_vec();
@@ -15696,6 +15798,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn incremental_sidebar_membership_falls_back_at_the_recent_dm_boundary() {
+        let mut direct = sidebar_row("D1", "Ada");
+        assert!(!sidebar_row_has_stable_incremental_membership(&direct));
+
+        direct.unread = true;
+        assert!(sidebar_row_has_stable_incremental_membership(&direct));
+        direct.unread = false;
+        direct.selected = true;
+        assert!(sidebar_row_has_stable_incremental_membership(&direct));
+        direct.selected = false;
+        direct.starred = true;
+        assert!(sidebar_row_has_stable_incremental_membership(&direct));
+
+        direct.starred = false;
+        direct.kind = ConversationKind::PublicChannel;
+        assert!(sidebar_row_has_stable_incremental_membership(&direct));
+    }
+
     fn picker_item(id: &str, title: &str) -> ConversationPickerItem {
         ConversationPickerItem {
             row: sidebar_row(id, title),
@@ -15733,13 +15854,12 @@ mod tests {
         let retained_before = store.item(699).unwrap();
         let updated_before = store.item(700).unwrap();
 
-        let mut next = initial;
-        let SidebarItemModel::Conversation(row) = &mut next[700].model else {
-            unreachable!();
-        };
-        row.unread = true;
-        row.unread_count = 4;
-        let operations = projection.reconcile(&next);
+        let mut changed = sidebar_row("C700", "Channel 700");
+        changed.selected = true;
+        changed.muted = true;
+        let operations = projection
+            .update_conversation_rows(&[changed])
+            .expect("presentation-only update should preserve projection structure");
         apply_sidebar_store_operations(&store, projection.items(), &operations);
 
         assert_eq!(store.n_items(), 1_430);

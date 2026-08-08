@@ -241,6 +241,7 @@ pub enum SidebarProjectionOperation {
 #[derive(Debug, Default)]
 pub struct SidebarProjection {
     items: Vec<KeyedSidebarItem>,
+    conversation_positions: HashMap<String, Vec<usize>>,
 }
 
 impl SidebarProjection {
@@ -280,8 +281,78 @@ impl SidebarProjection {
         };
 
         self.items = next.to_vec();
+        self.rebuild_conversation_positions();
         operations
     }
+
+    /// Replaces every visible occurrence of the supplied conversations when
+    /// their section membership and ordering inputs are unchanged.
+    ///
+    /// Returning `None` asks the caller to rebuild the complete projection.
+    pub fn update_conversation_rows(
+        &mut self,
+        next_rows: &[SidebarRowModel],
+    ) -> Option<Vec<SidebarProjectionOperation>> {
+        let mut requested_ids = HashSet::with_capacity(next_rows.len());
+        let mut updates = Vec::new();
+        for next in next_rows {
+            if !requested_ids.insert(next.id.as_str()) {
+                return None;
+            }
+            let positions = self.conversation_positions.get(next.id.as_str())?;
+            for &position in positions {
+                let item = self.items.get(position)?;
+                let SidebarItemKey::Conversation { section, id } = &item.key else {
+                    return None;
+                };
+                let SidebarItemModel::Conversation(previous) = &item.model else {
+                    return None;
+                };
+                if id != &next.id || !sidebar_row_can_update_in_place(previous, next, *section) {
+                    return None;
+                }
+                if previous != next {
+                    updates.push((position, next));
+                }
+            }
+        }
+
+        let mut operations = Vec::with_capacity(updates.len());
+        for (position, next) in updates {
+            self.items[position].model = SidebarItemModel::Conversation(next.clone());
+            operations.push(SidebarProjectionOperation::Update { position });
+        }
+        Some(operations)
+    }
+
+    fn rebuild_conversation_positions(&mut self) {
+        self.conversation_positions.clear();
+        for (position, item) in self.items.iter().enumerate() {
+            if let SidebarItemKey::Conversation { id, .. } = &item.key {
+                self.conversation_positions
+                    .entry(id.clone())
+                    .or_default()
+                    .push(position);
+            }
+        }
+    }
+}
+
+fn sidebar_row_can_update_in_place(
+    previous: &SidebarRowModel,
+    next: &SidebarRowModel,
+    section: Option<SidebarSectionKind>,
+) -> bool {
+    previous.id == next.id
+        && previous.title == next.title
+        && previous.kind == next.kind
+        && previous.unread == next.unread
+        && previous.selected == next.selected
+        && previous.starred == next.starred
+        && previous.user_deleted == next.user_deleted
+        && previous.search_aliases == next.search_aliases
+        && (section != Some(SidebarSectionKind::Unreads)
+            || previous.unread_count == next.unread_count)
 }
 
 fn keyed_sidebar_items_are_unique(items: &[KeyedSidebarItem]) -> bool {
@@ -493,6 +564,25 @@ impl SidebarRowModel {
     }
 }
 
+pub(crate) fn sidebar_row_for_conversation(
+    conversation: &SlackConversation,
+    user_names: &HashMap<String, String>,
+    options: SidebarBuildOptions<'_>,
+) -> SidebarRowModel {
+    SidebarRowModel::from_conversation_with_aliases(
+        conversation,
+        user_names,
+        SidebarRowOptions {
+            selected_channel: options.selected_channel,
+            current_user_id: options.current_user_id,
+            active_huddle_channel_id: options.active_huddle_channel_id,
+            user_search_aliases: options.user_search_aliases,
+            user_full_names: options.user_full_names,
+            user_statuses: options.user_statuses,
+        },
+    )
+}
+
 pub fn user_search_aliases(users: &[SlackUser]) -> UserSearchAliases {
     users
         .iter()
@@ -576,20 +666,7 @@ where
                     recent_history_direct_messages.contains(&conversation.id),
                 )
         })
-        .map(|conversation| {
-            SidebarRowModel::from_conversation_with_aliases(
-                conversation,
-                user_names,
-                SidebarRowOptions {
-                    selected_channel: options.selected_channel,
-                    current_user_id: options.current_user_id,
-                    active_huddle_channel_id: options.active_huddle_channel_id,
-                    user_search_aliases: options.user_search_aliases,
-                    user_full_names: options.user_full_names,
-                    user_statuses: options.user_statuses,
-                },
-            )
-        })
+        .map(|conversation| sidebar_row_for_conversation(conversation, user_names, options))
         .filter(|row| {
             row.match_score(&query).is_some()
                 && (!options.unread_only || row.unread || row.selected)
@@ -3459,6 +3536,153 @@ mod tests {
         assert_eq!(
             projection.reconcile(&next),
             vec![SidebarProjectionOperation::Update { position: 713 }]
+        );
+    }
+
+    #[test]
+    fn sidebar_projection_updates_one_row_without_rebuilding_a_large_model() {
+        let mut rows = (0..1_430)
+            .map(|index| row(&format!("C{index}"), 1, false))
+            .collect::<Vec<_>>();
+        for row in &mut rows {
+            row.unread = true;
+        }
+        let initial = SidebarListModel::Rows(rows).keyed_items();
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&initial);
+        let mut changed = row("C713", 4, false);
+        changed.unread = true;
+
+        assert_eq!(
+            projection.update_conversation_rows(&[changed]),
+            Some(vec![SidebarProjectionOperation::Update { position: 713 }])
+        );
+    }
+
+    #[test]
+    fn sidebar_projection_updates_every_duplicate_conversation_placement() {
+        let mut duplicated = row("C1", 2, false);
+        duplicated.unread = true;
+        duplicated.starred = true;
+        let items = SidebarListModel::Sections(vec![
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Priority,
+                title: SidebarSectionKind::Priority.title(),
+                rows: vec![duplicated.clone()],
+            },
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Channels,
+                title: SidebarSectionKind::Channels.title(),
+                rows: vec![duplicated.clone()],
+            },
+        ])
+        .keyed_items();
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&items);
+        duplicated.muted = true;
+
+        assert_eq!(
+            projection.update_conversation_rows(&[duplicated]),
+            Some(vec![
+                SidebarProjectionOperation::Update { position: 1 },
+                SidebarProjectionOperation::Update { position: 3 },
+            ])
+        );
+    }
+
+    #[test]
+    fn sidebar_projection_rebuilds_when_unread_membership_or_order_can_change() {
+        let mut unread = row("C1", 2, false);
+        unread.unread = true;
+        let items = SidebarListModel::Sections(vec![SidebarSectionModel {
+            kind: SidebarSectionKind::Unreads,
+            title: SidebarSectionKind::Unreads.title(),
+            rows: vec![unread.clone()],
+        }])
+        .keyed_items();
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&items);
+
+        let mut reordered = unread.clone();
+        reordered.unread_count = 3;
+        assert_eq!(projection.update_conversation_rows(&[reordered]), None);
+
+        let mut membership_changed = unread;
+        membership_changed.unread = false;
+        assert_eq!(
+            projection.update_conversation_rows(&[membership_changed]),
+            None
+        );
+    }
+
+    #[test]
+    fn sidebar_projection_targeted_updates_are_atomic_and_require_existing_rows() {
+        let mut first = row("C1", 1, false);
+        first.unread = true;
+        let mut second = row("C2", 1, false);
+        second.unread = true;
+        let items = SidebarListModel::Rows(vec![first.clone(), second.clone()]).keyed_items();
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&items);
+
+        first.muted = true;
+        second.unread = false;
+        assert_eq!(
+            projection.update_conversation_rows(&[first.clone(), second]),
+            None
+        );
+        assert_eq!(projection.items(), items);
+
+        assert_eq!(
+            projection.update_conversation_rows(&[row("missing", 0, false)]),
+            None
+        );
+        assert_eq!(projection.items(), items);
+    }
+
+    #[test]
+    fn collapsed_unreads_allow_regular_row_count_updates() {
+        let mut unread = row("C1", 2, false);
+        unread.unread = true;
+        let model = SidebarListModel::Sections(vec![
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Unreads,
+                title: SidebarSectionKind::Unreads.title(),
+                rows: vec![unread.clone()],
+            },
+            SidebarSectionModel {
+                kind: SidebarSectionKind::Channels,
+                title: SidebarSectionKind::Channels.title(),
+                rows: vec![unread.clone()],
+            },
+        ]);
+        let items = model
+            .keyed_items_with_collapsed_sections(&HashSet::from([SidebarSectionKind::Unreads]));
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&items);
+        unread.unread_count = 3;
+
+        assert_eq!(
+            projection.update_conversation_rows(&[unread]),
+            Some(vec![SidebarProjectionOperation::Update { position: 2 }])
+        );
+    }
+
+    #[test]
+    fn targeted_update_uses_positions_rebuilt_after_structural_reconciliation() {
+        let initial =
+            SidebarListModel::Rows(vec![row("C1", 0, false), row("C2", 0, false)]).keyed_items();
+        let reordered =
+            SidebarListModel::Rows(vec![row("C2", 0, false), row("C1", 0, false)]).keyed_items();
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&initial);
+        projection.reconcile(&reordered);
+        let mut changed = row("C1", 0, false);
+        changed.muted = true;
+
+        assert_eq!(
+            projection.update_conversation_rows(&[changed]),
+            Some(vec![SidebarProjectionOperation::Update { position: 1 }])
         );
     }
 
