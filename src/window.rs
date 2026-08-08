@@ -286,6 +286,12 @@ mod imp {
         #[template_child]
         pub message_status_label: TemplateChild<gtk::Label>,
         #[template_child]
+        pub message_title_stack: TemplateChild<gtk::Stack>,
+        #[template_child]
+        pub message_title_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub message_title_action: TemplateChild<adw::WindowTitle>,
+        #[template_child]
         pub message_title: TemplateChild<adw::WindowTitle>,
         #[template_child]
         pub navigation_back_button: TemplateChild<gtk::Button>,
@@ -2429,27 +2435,59 @@ fn sidebar_conversation_star_action(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SidebarConversationProfileAction {
+struct ConversationProfileAction {
     user_id: String,
 }
 
-impl SidebarConversationProfileAction {
+impl ConversationProfileAction {
     fn label(&self) -> &'static str {
         "Profile"
     }
 }
 
-fn sidebar_conversation_profile_action(
+fn conversation_profile_action(
     conversation: &SlackConversation,
-) -> Option<SidebarConversationProfileAction> {
+) -> Option<ConversationProfileAction> {
     (sidebar::conversation_kind(conversation) == ConversationKind::DirectMessage)
         .then_some(conversation.user.as_deref())
         .flatten()
         .map(str::trim)
         .filter(|user_id| !user_id.is_empty())
-        .map(|user_id| SidebarConversationProfileAction {
+        .map(|user_id| ConversationProfileAction {
             user_id: user_id.to_string(),
         })
+}
+
+fn message_title_profile_action(
+    main_view: MainMessageView,
+    profile_visible: bool,
+    editing_message: bool,
+    conversation: Option<&SlackConversation>,
+) -> Option<ConversationProfileAction> {
+    if main_view != MainMessageView::Conversation || profile_visible || editing_message {
+        return None;
+    }
+    conversation.and_then(conversation_profile_action)
+}
+
+fn message_title_profile_label(title: &str) -> String {
+    gettext("Open profile for {name}").replace("{name}", title)
+}
+
+fn message_title_profile_status_description(status: &str) -> String {
+    gettext("Status: {status}").replace("{status}", status)
+}
+
+fn message_title_profile_tooltip(label: &str, status_description: Option<&str>) -> String {
+    status_description.map_or_else(|| label.to_string(), |status| format!("{label}\n{status}"))
+}
+
+fn accepts_user_profile_completion(
+    profile_visible: bool,
+    pending_user_id: Option<&str>,
+    completed_user_id: &str,
+) -> bool {
+    profile_visible && pending_user_id == Some(completed_user_id)
 }
 
 fn sidebar_context_menu_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
@@ -5704,6 +5742,9 @@ impl ConduitWindow {
 
         clear_stale_upload_staging(&self.imp().drafts.borrow());
         self.setup_window_actions();
+        self.connect_widget(&imp.message_title_button.get(), |window| {
+            window.open_message_title_profile()
+        });
         let edit_cancel_controller = gtk::EventControllerKey::new();
         edit_cancel_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak_window = self.downgrade();
@@ -6543,6 +6584,7 @@ impl ConduitWindow {
                 .update_property(&[gtk::accessible::Property::Label(&gettext("Send Message"))]);
             self.refresh_current_conversation_title();
         }
+        self.sync_message_title_profile_action();
     }
 
     fn start_message_edit(&self) -> bool {
@@ -8367,12 +8409,16 @@ impl ConduitWindow {
             RuntimeEventKind::WorkspaceRefreshRequested => self.refresh_conversations(),
             RuntimeEventKind::Huddle(event) => self.handle_huddle_event(event),
             RuntimeEventKind::UserProfileLoadCompleted { user_id } => {
-                let expected = self.imp().pending_profile_user_id.borrow().clone();
-                if expected.as_deref() == Some(user_id.as_str()) {
-                    self.imp().pending_profile_user_id.borrow_mut().take();
-                    if let Some(user) = self.imp().workspace.users.borrow().get(&user_id).cloned() {
-                        self.imp()
-                            .message_title
+                let imp = self.imp();
+                let expected = imp.pending_profile_user_id.borrow().clone();
+                if accepts_user_profile_completion(
+                    imp.profile_visible.get(),
+                    expected.as_deref(),
+                    &user_id,
+                ) {
+                    imp.pending_profile_user_id.borrow_mut().take();
+                    if let Some(user) = imp.workspace.users.borrow().get(&user_id).cloned() {
+                        imp.message_title
                             .set_title(&user.display_name().unwrap_or_else(|| gettext("Profile")));
                         let context = self.message_html_context(None);
                         self.load_message_html(&message_html::user_profile_document(
@@ -8930,7 +8976,9 @@ impl ConduitWindow {
 
     fn record_navigation(&self, target: &MainNavigationTarget) {
         let imp = self.imp();
-        imp.profile_visible.set(false);
+        if imp.profile_visible.replace(false) {
+            imp.pending_profile_user_id.borrow_mut().take();
+        }
         if imp.restoring_navigation.get() {
             return;
         }
@@ -8958,6 +9006,7 @@ impl ConduitWindow {
         let imp = self.imp();
         if imp.profile_visible.replace(false) {
             imp.pending_profile_user_id.borrow_mut().take();
+            self.refresh_current_conversation_title();
             self.queue_ui_invalidations(UiInvalidations::MAIN);
             self.sync_back_button();
             return;
@@ -9595,6 +9644,7 @@ impl ConduitWindow {
         self.sync_back_button();
         *self.imp().pending_profile_user_id.borrow_mut() = Some(user_id.to_string());
         self.imp().message_title.set_title(&gettext("Profile"));
+        self.sync_message_title_profile_action();
         self.load_message_html(&message_html::placeholder_document(
             &gettext("Profile"),
             &gettext("Loading profile"),
@@ -9706,6 +9756,7 @@ impl ConduitWindow {
             Some("profile-close") => {
                 self.imp().profile_visible.set(false);
                 self.imp().pending_profile_user_id.borrow_mut().take();
+                self.refresh_current_conversation_title();
                 self.queue_ui_invalidations(UiInvalidations::MAIN);
                 self.sync_back_button();
                 true
@@ -11693,10 +11744,7 @@ impl ConduitWindow {
             menu.append(&star_button);
         }
 
-        if let Some(action) = conversation
-            .as_ref()
-            .and_then(sidebar_conversation_profile_action)
-        {
+        if let Some(action) = conversation.as_ref().and_then(conversation_profile_action) {
             let profile_button = gtk::Button::with_label(&gettext(action.label()));
             profile_button.add_css_class("flat");
             let weak_window = self.downgrade();
@@ -12732,6 +12780,69 @@ impl ConduitWindow {
                 self.refresh_conversation_title_status(&channel_id);
             }
         }
+        self.sync_message_title_profile_action();
+    }
+
+    fn current_message_title_profile_action(&self) -> Option<ConversationProfileAction> {
+        let imp = self.imp();
+        let conversation = self.visible_channel_id().and_then(|channel_id| {
+            imp.workspace
+                .conversations
+                .borrow()
+                .get(&channel_id)
+                .cloned()
+        });
+        message_title_profile_action(
+            self.current_main_view(),
+            imp.profile_visible.get(),
+            self.message_edit_is_active(),
+            conversation.as_ref(),
+        )
+    }
+
+    fn sync_message_title_profile_action(&self) {
+        let imp = self.imp();
+        let action = self.current_message_title_profile_action();
+        let interactive = action.is_some();
+        imp.message_title_action
+            .set_title(imp.message_title.title().as_str());
+        imp.message_title_action
+            .set_subtitle(imp.message_title.subtitle().as_str());
+        let status_description = action.as_ref().and_then(|action| {
+            imp.user_statuses
+                .borrow()
+                .get(&action.user_id)
+                .and_then(|status| {
+                    user_status_presentation(
+                        status,
+                        &imp.custom_emojis.borrow(),
+                        current_unix_seconds(),
+                    )
+                })
+                .map(|status| message_title_profile_status_description(&status.accessible_text))
+        });
+        let label = action.map(|_| message_title_profile_label(imp.message_title.title().as_str()));
+        let tooltip = label
+            .as_deref()
+            .map(|label| message_title_profile_tooltip(label, status_description.as_deref()));
+        imp.message_title_button
+            .set_tooltip_text(tooltip.as_deref());
+        imp.message_title_button
+            .update_property(&[gtk::accessible::Property::Label(
+                label.as_deref().unwrap_or_default(),
+            )]);
+        imp.message_title_button
+            .update_property(&[gtk::accessible::Property::Description(
+                status_description.as_deref().unwrap_or_default(),
+            )]);
+        imp.message_title_stack
+            .set_visible_child_name(if interactive { "profile" } else { "passive" });
+    }
+
+    fn open_message_title_profile(&self) {
+        if let Some(action) = self.current_message_title_profile_action() {
+            self.show_user_profile(&action.user_id);
+        }
     }
 
     fn refresh_workspace_title_status(&self) {
@@ -12845,6 +12956,7 @@ impl ConduitWindow {
             imp.message_title
                 .update_property(&[gtk::accessible::Property::Description("")]);
         }
+        self.sync_message_title_profile_action();
         self.update_huddle_surface();
     }
 
@@ -12926,6 +13038,7 @@ impl ConduitWindow {
             .select_conversation(channel_id);
         imp.message_title.set_title(title);
         self.refresh_conversation_title_status(channel_id);
+        self.sync_message_title_profile_action();
         self.restore_channel_draft(channel_id);
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
         self.close_thread_pane();
@@ -17720,7 +17833,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_profile_action_targets_only_one_to_one_dm_people() {
+    fn profile_action_targets_only_one_to_one_dm_people() {
         let direct_message = SlackConversation {
             is_im: Some(true),
             user: Some("U123".into()),
@@ -17746,16 +17859,76 @@ mod tests {
             ..Default::default()
         };
 
-        let action = sidebar_conversation_profile_action(&direct_message).unwrap();
+        let action = conversation_profile_action(&direct_message).unwrap();
         assert_eq!(action.label(), "Profile");
         assert_eq!(action.user_id, "U123");
+        assert_eq!(conversation_profile_action(&group_direct_message), None);
+        assert_eq!(conversation_profile_action(&channel), None);
+        assert_eq!(conversation_profile_action(&missing_user), None);
+        assert_eq!(conversation_profile_action(&blank_user), None);
+
+        let title_action = message_title_profile_action(
+            MainMessageView::Conversation,
+            false,
+            false,
+            Some(&direct_message),
+        )
+        .unwrap();
+        assert_eq!(title_action.user_id, "U123");
+        assert_eq!(message_title_profile_label("Ada"), "Open profile for Ada");
+        let status = message_title_profile_status_description("Working remotely");
+        assert_eq!(status, "Status: Working remotely");
         assert_eq!(
-            sidebar_conversation_profile_action(&group_direct_message),
+            message_title_profile_tooltip("Open profile for Ada", Some(&status)),
+            "Open profile for Ada\nStatus: Working remotely"
+        );
+        assert_eq!(
+            message_title_profile_tooltip("Open profile for Ada", None),
+            "Open profile for Ada"
+        );
+        assert_eq!(
+            message_title_profile_action(
+                MainMessageView::Conversation,
+                true,
+                false,
+                Some(&direct_message),
+            ),
             None
         );
-        assert_eq!(sidebar_conversation_profile_action(&channel), None);
-        assert_eq!(sidebar_conversation_profile_action(&missing_user), None);
-        assert_eq!(sidebar_conversation_profile_action(&blank_user), None);
+        assert_eq!(
+            message_title_profile_action(
+                MainMessageView::Conversation,
+                false,
+                true,
+                Some(&direct_message),
+            ),
+            None
+        );
+        for view in [
+            MainMessageView::Placeholder,
+            MainMessageView::Unreads,
+            MainMessageView::Threads,
+            MainMessageView::Search,
+            MainMessageView::Files,
+            MainMessageView::Saved,
+        ] {
+            assert_eq!(
+                message_title_profile_action(view, false, false, Some(&direct_message)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn profile_completion_requires_visible_matching_request() {
+        assert!(accepts_user_profile_completion(true, Some("U123"), "U123"));
+        assert!(!accepts_user_profile_completion(
+            false,
+            Some("U123"),
+            "U123"
+        ));
+        assert!(!accepts_user_profile_completion(true, None, "U123"));
+        assert!(!accepts_user_profile_completion(true, Some("U456"), "U123"));
     }
 
     #[test]
@@ -17916,6 +18089,32 @@ mod tests {
             .map(|(object, _)| object)
             .expect("message status label should be a complete template object");
         assert!(message_status.contains("<property name=\"accessible-role\">status</property>"));
+
+        let message_title_stack = template
+            .find("GtkStack\" id=\"message_title_stack\"")
+            .expect("message title should have passive and profile-action modes");
+        let message_title = template
+            .find("AdwWindowTitle\" id=\"message_title\"")
+            .expect("message title should keep a passive presentation");
+        let message_title_button = template
+            .find("GtkButton\" id=\"message_title_button\"")
+            .expect("DM title should have a profile button");
+        let message_title_action = template
+            .find("AdwWindowTitle\" id=\"message_title_action\"")
+            .expect("profile button should preserve title and subtitle layout");
+        assert!(message_title_stack < message_title);
+        assert!(message_title < message_title_button);
+        assert!(message_title_button < message_title_action);
+        let title_button_contract = &template[message_title_button..message_title_action];
+        assert!(title_button_contract.contains("<class name=\"flat\"/>"));
+        assert!(!title_button_contract.contains("accessible-role"));
+        let title_action_contract = template[message_title_action..]
+            .split_once("</object>")
+            .map(|(object, _)| object)
+            .expect("profile button title should be a complete template object");
+        assert!(title_action_contract.starts_with("AdwWindowTitle\" id=\"message_title_action\""));
+        assert!(title_action_contract
+            .contains("<property name=\"accessible-role\">presentation</property>"));
 
         let status_action = template
             .find("<attribute name=\"action\">win.change-status</attribute>")
