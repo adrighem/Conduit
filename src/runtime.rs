@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::ErrorKind;
@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
 #[cfg(test)]
@@ -70,6 +70,18 @@ const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
 const BACKGROUND_TASK_CONCURRENCY: usize = 3;
 const IMAGE_TASK_CONCURRENCY: usize = 4;
 const UPLOAD_TASK_CONCURRENCY: usize = 2;
+const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 8;
+const RUNTIME_NAVIGATION_QUEUE_CAPACITY: usize = 16;
+const RUNTIME_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
+const RUNTIME_BACKGROUND_QUEUE_CAPACITY: usize = 128;
+const RUNTIME_IMAGE_QUEUE_CAPACITY: usize = 256;
+const RUNTIME_UPLOAD_QUEUE_CAPACITY: usize = 32;
+const RUNTIME_NAVIGATION_TASK_CAPACITY: usize = 4;
+const RUNTIME_INTERACTIVE_TASK_CAPACITY: usize = 32;
+const RUNTIME_BACKGROUND_TASK_CAPACITY: usize = 12;
+const RUNTIME_IMAGE_TASK_CAPACITY: usize = 32;
+const RUNTIME_UPLOAD_TASK_CAPACITY: usize = 8;
+const RUNTIME_CONTROL_DISPATCH_BURST: usize = 4;
 const REALTIME_PERSISTENCE_QUEUE_CAPACITY: usize = 256;
 const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -367,7 +379,7 @@ impl std::fmt::Debug for OpaqueAdmissionTarget {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RuntimeAdmissionKey {
     Authentication,
     Navigation(NavigationSlot),
@@ -382,7 +394,7 @@ enum RuntimeAdmissionKey {
     MessagePermalink(OpaqueAdmissionTarget),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RuntimeAdmissionPolicy {
     kind: RuntimeAdmissionKind,
     replacement_key: Option<RuntimeAdmissionKey>,
@@ -436,8 +448,12 @@ struct RuntimeTraceFields {
 }
 
 impl RuntimeTraceFields {
+    #[cfg(test)]
     fn for_command(identity: RuntimeIdentity, command: &RuntimeCommand) -> Self {
-        let descriptor = command.descriptor();
+        Self::for_descriptor(identity, &command.descriptor())
+    }
+
+    fn for_descriptor(identity: RuntimeIdentity, descriptor: &RuntimeCommandDescriptor) -> Self {
         Self {
             session: identity.session,
             request: identity.request,
@@ -918,12 +934,19 @@ impl RuntimeCommand {
         self.descriptor().supersedes_previous
     }
 
-    fn navigation_slot(&self) -> Option<NavigationSlot> {
-        self.descriptor().navigation_slot
+    fn starts_session(&self) -> bool {
+        matches!(
+            self,
+            Self::LoadStoredToken
+                | Self::StartOAuth { .. }
+                | Self::StartBrowserSession { .. }
+                | Self::SignOut
+                | Self::Disconnect
+        )
     }
 
-    fn task_lane(&self) -> RuntimeTaskLane {
-        self.descriptor().lane
+    fn navigation_slot(&self) -> Option<NavigationSlot> {
+        self.descriptor().navigation_slot
     }
 
     pub fn operation_context(&self) -> OperationContext {
@@ -1358,10 +1381,63 @@ pub struct RuntimeEvent {
     pub kind: RuntimeEventKind,
 }
 
-#[derive(Debug)]
 struct RuntimeRequest {
     identity: RuntimeIdentity,
     command: RuntimeCommand,
+    descriptor: RuntimeCommandDescriptor,
+    in_flight_key: Option<RuntimeInFlightKey>,
+    starts_session: bool,
+}
+
+impl RuntimeRequest {
+    fn new(identity: RuntimeIdentity, command: RuntimeCommand) -> Self {
+        let descriptor = command.descriptor();
+        let in_flight_key = match descriptor.admission.kind {
+            RuntimeAdmissionKind::Coalescible => Some(RuntimeInFlightKey::Coalescible {
+                session: identity.session,
+                key: descriptor
+                    .admission
+                    .replacement_key
+                    .expect("coalescible command requires a replacement key"),
+            }),
+            RuntimeAdmissionKind::DurableAction | RuntimeAdmissionKind::ReadMarker => {
+                Some(RuntimeInFlightKey::Ordered {
+                    session: identity.session,
+                    context: descriptor.context.clone(),
+                })
+            }
+            RuntimeAdmissionKind::Control | RuntimeAdmissionKind::Supersedable => None,
+        };
+        Self {
+            identity,
+            command,
+            descriptor,
+            in_flight_key,
+            starts_session: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for RuntimeRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeRequest")
+            .field("identity", &self.identity)
+            .field("descriptor", &self.descriptor)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum RuntimeInFlightKey {
+    Coalescible {
+        session: SessionId,
+        key: RuntimeAdmissionKey,
+    },
+    Ordered {
+        session: SessionId,
+        context: OperationContext,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1371,6 +1447,36 @@ enum RuntimeTaskLane {
     Background,
     Image,
     Upload,
+}
+
+impl RuntimeTaskLane {
+    const ALL: [Self; 5] = [
+        Self::Navigation,
+        Self::Interactive,
+        Self::Upload,
+        Self::Background,
+        Self::Image,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Navigation => 0,
+            Self::Interactive => 1,
+            Self::Upload => 2,
+            Self::Background => 3,
+            Self::Image => 4,
+        }
+    }
+
+    const fn running_capacity(self) -> usize {
+        match self {
+            Self::Navigation => NAVIGATION_TASK_CONCURRENCY,
+            Self::Interactive => INTERACTIVE_TASK_CONCURRENCY,
+            Self::Background => BACKGROUND_TASK_CONCURRENCY,
+            Self::Image => IMAGE_TASK_CONCURRENCY,
+            Self::Upload => UPLOAD_TASK_CONCURRENCY,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1386,6 +1492,7 @@ struct RuntimeTaskLimits {
     background: Arc<Semaphore>,
     image: Arc<Semaphore>,
     upload: Arc<Semaphore>,
+    capacities: [u32; 5],
 }
 
 impl RuntimeTaskLimits {
@@ -1396,27 +1503,655 @@ impl RuntimeTaskLimits {
         image: usize,
         upload: usize,
     ) -> Self {
+        let capacities = [navigation, interactive, upload, background, image]
+            .map(|capacity| u32::try_from(capacity).expect("runtime task capacity exceeds u32"));
         Self {
             navigation: Arc::new(Semaphore::new(navigation)),
             interactive: Arc::new(Semaphore::new(interactive)),
             background: Arc::new(Semaphore::new(background)),
             image: Arc::new(Semaphore::new(image)),
             upload: Arc::new(Semaphore::new(upload)),
+            capacities,
         }
     }
 
-    async fn acquire(&self, lane: RuntimeTaskLane) -> OwnedSemaphorePermit {
-        let semaphore = match lane {
+    fn semaphore(&self, lane: RuntimeTaskLane) -> Arc<Semaphore> {
+        match lane {
             RuntimeTaskLane::Navigation => Arc::clone(&self.navigation),
             RuntimeTaskLane::Interactive => Arc::clone(&self.interactive),
             RuntimeTaskLane::Background => Arc::clone(&self.background),
             RuntimeTaskLane::Image => Arc::clone(&self.image),
             RuntimeTaskLane::Upload => Arc::clone(&self.upload),
-        };
-        semaphore
+        }
+    }
+
+    async fn acquire(&self, lane: RuntimeTaskLane) -> OwnedSemaphorePermit {
+        self.semaphore(lane)
             .acquire_owned()
             .await
             .expect("runtime task semaphore unexpectedly closed")
+    }
+
+    async fn wait_idle(&self) {
+        let mut permits = Vec::with_capacity(RuntimeTaskLane::ALL.len());
+        for lane in RuntimeTaskLane::ALL {
+            permits.push(
+                self.semaphore(lane)
+                    .acquire_many_owned(self.capacities[lane.index()])
+                    .await
+                    .expect("runtime task semaphore unexpectedly closed"),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeCommandAdmissionConfig {
+    control_capacity: usize,
+    lane_capacities: [usize; 5],
+}
+
+impl RuntimeCommandAdmissionConfig {
+    fn production() -> Self {
+        Self {
+            control_capacity: RUNTIME_CONTROL_QUEUE_CAPACITY,
+            lane_capacities: [
+                RUNTIME_NAVIGATION_QUEUE_CAPACITY,
+                RUNTIME_INTERACTIVE_QUEUE_CAPACITY,
+                RUNTIME_UPLOAD_QUEUE_CAPACITY,
+                RUNTIME_BACKGROUND_QUEUE_CAPACITY,
+                RUNTIME_IMAGE_QUEUE_CAPACITY,
+            ],
+        }
+    }
+
+    #[cfg(test)]
+    fn uniform(control_capacity: usize, lane_capacity: usize) -> Self {
+        Self {
+            control_capacity,
+            lane_capacities: [lane_capacity; 5],
+        }
+    }
+
+    fn lane_capacity(self, lane: RuntimeTaskLane) -> usize {
+        self.lane_capacities[lane.index()]
+    }
+
+    fn validate(self) {
+        assert!(
+            self.control_capacity > 0,
+            "control capacity must be non-zero"
+        );
+        assert!(
+            self.lane_capacities.iter().all(|capacity| *capacity > 0),
+            "lane capacities must be non-zero"
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeCommandAdmissionOutcome {
+    Enqueued,
+    Coalesced,
+    Superseded,
+    DroppedStale,
+    StaleSession,
+    DroppedAtCapacity,
+    Closed,
+}
+
+struct RuntimeCommandAdmissionError {
+    outcome: RuntimeCommandAdmissionOutcome,
+    request: RuntimeRequest,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimeCommandAdmissionSnapshot {
+    admitted: u64,
+    dequeued: u64,
+    coalesced: u64,
+    superseded: u64,
+    cancelled: u64,
+    rejected: u64,
+    depth: usize,
+    peak_depth: usize,
+    in_flight: usize,
+    peak_in_flight: usize,
+}
+
+#[derive(Default)]
+struct RuntimeCommandAdmissionCounters {
+    admitted: u64,
+    dequeued: u64,
+    coalesced: u64,
+    superseded: u64,
+    cancelled: u64,
+    rejected: u64,
+    peak_depth: usize,
+    peak_in_flight: usize,
+}
+
+struct RuntimeCommandAdmissionState {
+    senders_closed: bool,
+    receiver_closed: bool,
+    newest_session: SessionId,
+    pending_session_starts: VecDeque<SessionId>,
+    control: VecDeque<RuntimeRequest>,
+    lanes: [VecDeque<RuntimeRequest>; 5],
+    in_flight: HashSet<RuntimeInFlightKey>,
+    counters: RuntimeCommandAdmissionCounters,
+}
+
+impl RuntimeCommandAdmissionState {
+    fn new() -> Self {
+        Self {
+            senders_closed: false,
+            receiver_closed: false,
+            newest_session: SessionId::default(),
+            pending_session_starts: VecDeque::new(),
+            control: VecDeque::new(),
+            lanes: std::array::from_fn(|_| VecDeque::new()),
+            in_flight: HashSet::new(),
+            counters: RuntimeCommandAdmissionCounters::default(),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.control.len() + self.lanes.iter().map(VecDeque::len).sum::<usize>()
+    }
+
+    fn record_depth(&mut self) {
+        self.counters.peak_depth = self.counters.peak_depth.max(self.depth());
+    }
+
+    fn has_ordered_work_before(&self, session: SessionId) -> bool {
+        self.lanes.iter().flatten().any(|request| {
+            request.identity.session < session
+                && matches!(
+                    request.descriptor.admission.kind,
+                    RuntimeAdmissionKind::DurableAction | RuntimeAdmissionKind::ReadMarker
+                )
+        }) || self.in_flight.iter().any(|key| {
+            matches!(
+                key,
+                RuntimeInFlightKey::Ordered {
+                    session: ordered_session,
+                    ..
+                } if *ordered_session < session
+            )
+        })
+    }
+
+    fn has_pending_session_start_at_or_before(&self, session: SessionId) -> bool {
+        self.pending_session_starts
+            .front()
+            .is_some_and(|pending| *pending <= session)
+    }
+
+    fn snapshot(&self) -> RuntimeCommandAdmissionSnapshot {
+        RuntimeCommandAdmissionSnapshot {
+            admitted: self.counters.admitted,
+            dequeued: self.counters.dequeued,
+            coalesced: self.counters.coalesced,
+            superseded: self.counters.superseded,
+            cancelled: self.counters.cancelled,
+            rejected: self.counters.rejected,
+            depth: self.depth(),
+            peak_depth: self.counters.peak_depth,
+            in_flight: self.in_flight.len(),
+            peak_in_flight: self.counters.peak_in_flight,
+        }
+    }
+}
+
+struct RuntimeCommandAdmission {
+    config: RuntimeCommandAdmissionConfig,
+    state: Mutex<RuntimeCommandAdmissionState>,
+    control_ready: Notify,
+    lane_ready: [Notify; 5],
+}
+
+impl RuntimeCommandAdmission {
+    fn channel(
+        config: RuntimeCommandAdmissionConfig,
+    ) -> (RuntimeCommandSender, RuntimeCommandReceiver) {
+        config.validate();
+        let admission = Arc::new(Self {
+            config,
+            state: Mutex::new(RuntimeCommandAdmissionState::new()),
+            control_ready: Notify::new(),
+            lane_ready: std::array::from_fn(|_| Notify::new()),
+        });
+        let sender_lifetime = Arc::new(RuntimeCommandSenderLifetime {
+            admission: Arc::clone(&admission),
+        });
+        let receiver_lifetime = Arc::new(RuntimeCommandReceiverLifetime {
+            admission: Arc::clone(&admission),
+        });
+        (
+            RuntimeCommandSender {
+                admission: Arc::clone(&admission),
+                lifetime: sender_lifetime,
+            },
+            RuntimeCommandReceiver {
+                admission,
+                lifetime: receiver_lifetime,
+            },
+        )
+    }
+
+    fn try_send(
+        self: &Arc<Self>,
+        mut request: RuntimeRequest,
+    ) -> std::result::Result<RuntimeCommandAdmissionOutcome, Box<RuntimeCommandAdmissionError>>
+    {
+        let lane = request.descriptor.lane;
+        let policy = request.descriptor.admission;
+        let request_session = request.identity.session;
+        let mut state = self
+            .state
+            .lock()
+            .expect("runtime command admission lock poisoned");
+
+        if state.receiver_closed {
+            state.counters.rejected = state.counters.rejected.saturating_add(1);
+            return Err(Box::new(RuntimeCommandAdmissionError {
+                outcome: RuntimeCommandAdmissionOutcome::Closed,
+                request,
+            }));
+        }
+
+        if request.identity.session < state.newest_session {
+            state.counters.rejected = state.counters.rejected.saturating_add(1);
+            return Err(Box::new(RuntimeCommandAdmissionError {
+                outcome: RuntimeCommandAdmissionOutcome::StaleSession,
+                request,
+            }));
+        }
+
+        let command_starts_session = request.command.starts_session();
+        let starts_session = command_starts_session
+            && !state
+                .pending_session_starts
+                .contains(&request.identity.session);
+        let use_control_queue =
+            policy.kind == RuntimeAdmissionKind::Control || command_starts_session;
+        request.starts_session = starts_session;
+
+        if !use_control_queue {
+            if let Some(replacement_key) = policy.replacement_key {
+                let queue = &mut state.lanes[lane.index()];
+                if let Some(position) = queue.iter().position(|queued| {
+                    queued.identity.session == request.identity.session
+                        && queued.descriptor.admission.replacement_key == Some(replacement_key)
+                }) {
+                    let queued = queue
+                        .get_mut(position)
+                        .expect("replacement queue position exists");
+                    if runtime_identity_order(request.identity)
+                        <= runtime_identity_order(queued.identity)
+                    {
+                        state.counters.rejected = state.counters.rejected.saturating_add(1);
+                        return Err(Box::new(RuntimeCommandAdmissionError {
+                            outcome: RuntimeCommandAdmissionOutcome::DroppedStale,
+                            request,
+                        }));
+                    }
+                    *queued = request;
+                    state.newest_session = state.newest_session.max(request_session);
+                    state.counters.admitted = state.counters.admitted.saturating_add(1);
+                    return Ok(match policy.kind {
+                        RuntimeAdmissionKind::Coalescible => {
+                            state.counters.coalesced = state.counters.coalesced.saturating_add(1);
+                            RuntimeCommandAdmissionOutcome::Coalesced
+                        }
+                        RuntimeAdmissionKind::Supersedable => {
+                            state.counters.superseded = state.counters.superseded.saturating_add(1);
+                            RuntimeCommandAdmissionOutcome::Superseded
+                        }
+                        RuntimeAdmissionKind::Control
+                        | RuntimeAdmissionKind::DurableAction
+                        | RuntimeAdmissionKind::ReadMarker => {
+                            unreachable!("only replaceable commands have replacement keys")
+                        }
+                    });
+                }
+            }
+        }
+
+        let full = if use_control_queue {
+            state.control.len() >= self.config.control_capacity
+        } else {
+            state.lanes[lane.index()].len() >= self.config.lane_capacity(lane)
+        };
+        if full {
+            state.counters.rejected = state.counters.rejected.saturating_add(1);
+            return Err(Box::new(RuntimeCommandAdmissionError {
+                outcome: RuntimeCommandAdmissionOutcome::DroppedAtCapacity,
+                request,
+            }));
+        }
+
+        if use_control_queue {
+            state.control.push_back(request);
+        } else {
+            state.lanes[lane.index()].push_back(request);
+        }
+        if starts_session {
+            state.pending_session_starts.push_back(request_session);
+        }
+        state.newest_session = state.newest_session.max(request_session);
+        state.counters.admitted = state.counters.admitted.saturating_add(1);
+        state.record_depth();
+        drop(state);
+
+        if use_control_queue {
+            self.control_ready.notify_one();
+        } else {
+            self.lane_ready[lane.index()].notify_one();
+        }
+        Ok(RuntimeCommandAdmissionOutcome::Enqueued)
+    }
+
+    fn pop_control(self: &Arc<Self>) -> (Option<RuntimeControlRequest>, bool) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("runtime command admission lock poisoned");
+        let request = if state
+            .control
+            .front()
+            .is_some_and(|request| !state.has_ordered_work_before(request.identity.session))
+        {
+            state.control.pop_front()
+        } else {
+            None
+        };
+        if request.is_some() {
+            state.counters.dequeued = state.counters.dequeued.saturating_add(1);
+        }
+        let finished = state.control.is_empty() && state.senders_closed;
+        (
+            request.map(|request| {
+                let session_start =
+                    request
+                        .starts_session
+                        .then(|| RuntimeSessionStartReservation {
+                            admission: Arc::clone(self),
+                            session: request.identity.session,
+                        });
+                RuntimeControlRequest {
+                    request,
+                    session_start,
+                }
+            }),
+            finished,
+        )
+    }
+
+    fn pop_lane(self: &Arc<Self>, lane: RuntimeTaskLane) -> (Option<RuntimeLaneRequest>, bool) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("runtime command admission lock poisoned");
+        let lane_index = lane.index();
+        let supersedable = state.lanes[lane_index].iter().position(|request| {
+            request.descriptor.admission.kind == RuntimeAdmissionKind::Supersedable
+                && !state.has_pending_session_start_at_or_before(request.identity.session)
+                && !state.has_ordered_work_before(request.identity.session)
+        });
+        let position = supersedable.or_else(|| {
+            state.lanes[lane_index].iter().position(|request| {
+                !state.has_pending_session_start_at_or_before(request.identity.session)
+                    && !state.has_ordered_work_before(request.identity.session)
+                    && request
+                        .in_flight_key
+                        .as_ref()
+                        .is_none_or(|key| !state.in_flight.contains(key))
+            })
+        });
+        let request = position.and_then(|position| state.lanes[lane_index].remove(position));
+        let reservation = request
+            .as_ref()
+            .and_then(|request| request.in_flight_key.clone())
+            .map(|key| {
+                assert!(state.in_flight.insert(key.clone()));
+                state.counters.peak_in_flight =
+                    state.counters.peak_in_flight.max(state.in_flight.len());
+                RuntimeCommandReservation {
+                    admission: Arc::clone(self),
+                    lane,
+                    key,
+                }
+            });
+        if request.is_some() {
+            state.counters.dequeued = state.counters.dequeued.saturating_add(1);
+        }
+        let finished = state.lanes[lane_index].is_empty() && state.senders_closed;
+        (
+            request.map(|request| RuntimeLaneRequest {
+                request,
+                reservation,
+            }),
+            finished,
+        )
+    }
+
+    fn release_in_flight(&self, _lane: RuntimeTaskLane, key: &RuntimeInFlightKey) {
+        let removed = self
+            .state
+            .lock()
+            .expect("runtime command admission lock poisoned")
+            .in_flight
+            .remove(key);
+        if removed {
+            self.control_ready.notify_waiters();
+            for ready in &self.lane_ready {
+                ready.notify_waiters();
+            }
+        }
+    }
+
+    fn complete_session_start(&self, session: SessionId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("runtime command admission lock poisoned");
+        let pending = state.pending_session_starts.front().copied();
+        debug_assert_eq!(pending, Some(session));
+        let removed = if pending == Some(session) {
+            state.pending_session_starts.pop_front();
+            true
+        } else if let Some(position) = state
+            .pending_session_starts
+            .iter()
+            .position(|pending| *pending == session)
+        {
+            state.pending_session_starts.remove(position);
+            true
+        } else {
+            false
+        };
+        drop(state);
+        if removed {
+            self.control_ready.notify_waiters();
+            for ready in &self.lane_ready {
+                ready.notify_waiters();
+            }
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeCommandAdmissionSnapshot {
+        self.state
+            .lock()
+            .expect("runtime command admission lock poisoned")
+            .snapshot()
+    }
+
+    fn close_senders(&self) {
+        self.state
+            .lock()
+            .expect("runtime command admission lock poisoned")
+            .senders_closed = true;
+        self.control_ready.notify_waiters();
+        for ready in &self.lane_ready {
+            ready.notify_waiters();
+        }
+    }
+
+    fn close_receiver(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("runtime command admission lock poisoned");
+        if state.receiver_closed {
+            return;
+        }
+        state.receiver_closed = true;
+        let cancelled = state.depth() as u64;
+        state.control.clear();
+        for queue in &mut state.lanes {
+            queue.clear();
+        }
+        state.counters.cancelled = state.counters.cancelled.saturating_add(cancelled);
+        drop(state);
+        self.control_ready.notify_waiters();
+        for ready in &self.lane_ready {
+            ready.notify_waiters();
+        }
+    }
+}
+
+fn runtime_identity_order(identity: RuntimeIdentity) -> (SessionId, RequestId) {
+    (identity.session, identity.request)
+}
+
+struct RuntimeSessionStartReservation {
+    admission: Arc<RuntimeCommandAdmission>,
+    session: SessionId,
+}
+
+impl Drop for RuntimeSessionStartReservation {
+    fn drop(&mut self) {
+        self.admission.complete_session_start(self.session);
+    }
+}
+
+struct RuntimeControlRequest {
+    request: RuntimeRequest,
+    session_start: Option<RuntimeSessionStartReservation>,
+}
+
+struct RuntimeCommandReservation {
+    admission: Arc<RuntimeCommandAdmission>,
+    lane: RuntimeTaskLane,
+    key: RuntimeInFlightKey,
+}
+
+impl Drop for RuntimeCommandReservation {
+    fn drop(&mut self) {
+        self.admission.release_in_flight(self.lane, &self.key);
+    }
+}
+
+struct RuntimeLaneRequest {
+    request: RuntimeRequest,
+    reservation: Option<RuntimeCommandReservation>,
+}
+
+struct RuntimeCommandLease {
+    _reservation: RuntimeCommandReservation,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct RuntimeCommandSenderLifetime {
+    admission: Arc<RuntimeCommandAdmission>,
+}
+
+impl Drop for RuntimeCommandSenderLifetime {
+    fn drop(&mut self) {
+        self.admission.close_senders();
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeCommandSender {
+    admission: Arc<RuntimeCommandAdmission>,
+    lifetime: Arc<RuntimeCommandSenderLifetime>,
+}
+
+impl RuntimeCommandSender {
+    fn try_send(
+        &self,
+        request: RuntimeRequest,
+    ) -> std::result::Result<RuntimeCommandAdmissionOutcome, Box<RuntimeCommandAdmissionError>>
+    {
+        self.admission.try_send(request)
+    }
+
+    #[cfg(test)]
+    fn send(&self, request: RuntimeRequest) -> RuntimeCommandAdmissionOutcome {
+        match self.try_send(request) {
+            Ok(outcome) => outcome,
+            Err(error) => error.outcome,
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> RuntimeCommandAdmissionSnapshot {
+        self.admission.snapshot()
+    }
+}
+
+impl std::fmt::Debug for RuntimeCommandSender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _keep_open = &self.lifetime;
+        formatter.write_str("RuntimeCommandSender")
+    }
+}
+
+struct RuntimeCommandReceiverLifetime {
+    admission: Arc<RuntimeCommandAdmission>,
+}
+
+impl Drop for RuntimeCommandReceiverLifetime {
+    fn drop(&mut self) {
+        self.admission.close_receiver();
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeCommandReceiver {
+    admission: Arc<RuntimeCommandAdmission>,
+    lifetime: Arc<RuntimeCommandReceiverLifetime>,
+}
+
+impl RuntimeCommandReceiver {
+    async fn recv_control(&self) -> Option<RuntimeControlRequest> {
+        loop {
+            let notified = self.admission.control_ready.notified();
+            let (request, finished) = self.admission.pop_control();
+            if request.is_some() || finished {
+                return request;
+            }
+            notified.await;
+        }
+    }
+
+    async fn recv_lane(&self, lane: RuntimeTaskLane) -> Option<RuntimeLaneRequest> {
+        loop {
+            let notified = self.admission.lane_ready[lane.index()].notified();
+            let (request, finished) = self.admission.pop_lane(lane);
+            if request.is_some() || finished {
+                return request;
+            }
+            notified.await;
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeCommandAdmissionSnapshot {
+        let _keep_open = &self.lifetime;
+        self.admission.snapshot()
     }
 }
 
@@ -2298,7 +3033,12 @@ fn spawn_runtime_task<F>(
 
 #[derive(Clone, Debug)]
 pub struct AppRuntime {
-    commands: mpsc::UnboundedSender<RuntimeRequest>,
+    commands: RuntimeCommandSender,
+}
+
+pub(crate) struct RuntimeCommandRejection {
+    pub(crate) context: OperationContext,
+    pub(crate) command: RuntimeCommand,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -3157,9 +3897,150 @@ fn remove_completed_upload_files(attachments: &[UploadAttachment]) {
     }
 }
 
+struct RuntimeReadyRequest {
+    request: RuntimeRequest,
+    lease: Option<RuntimeCommandLease>,
+    session_start: Option<RuntimeSessionStartReservation>,
+}
+
+struct RuntimeReadyReceivers {
+    control: Option<mpsc::Receiver<RuntimeReadyRequest>>,
+    lanes: [Option<mpsc::Receiver<RuntimeReadyRequest>>; 5],
+    next_lane: usize,
+    control_budget: usize,
+}
+
+impl RuntimeReadyReceivers {
+    async fn recv(&mut self) -> Option<RuntimeReadyRequest> {
+        std::future::poll_fn(|context| {
+            let mut open = false;
+            let control_first = self.control_budget > 0;
+            if control_first {
+                if let Some(receiver) = self.control.as_mut() {
+                    match std::pin::Pin::new(receiver).poll_recv(context) {
+                        std::task::Poll::Ready(Some(request)) => {
+                            self.control_budget -= 1;
+                            return std::task::Poll::Ready(Some(request));
+                        }
+                        std::task::Poll::Ready(None) => self.control = None,
+                        std::task::Poll::Pending => open = true,
+                    }
+                }
+            }
+            for offset in 0..RuntimeTaskLane::ALL.len() {
+                let lane_position = (self.next_lane + offset) % RuntimeTaskLane::ALL.len();
+                let lane = RuntimeTaskLane::ALL[lane_position];
+                let index = lane.index();
+                if let Some(receiver) = self.lanes[index].as_mut() {
+                    match std::pin::Pin::new(receiver).poll_recv(context) {
+                        std::task::Poll::Ready(Some(request)) => {
+                            self.next_lane = (lane_position + 1) % RuntimeTaskLane::ALL.len();
+                            self.control_budget = RUNTIME_CONTROL_DISPATCH_BURST;
+                            return std::task::Poll::Ready(Some(request));
+                        }
+                        std::task::Poll::Ready(None) => self.lanes[index] = None,
+                        std::task::Poll::Pending => open = true,
+                    }
+                }
+            }
+            if !control_first {
+                if let Some(receiver) = self.control.as_mut() {
+                    match std::pin::Pin::new(receiver).poll_recv(context) {
+                        std::task::Poll::Ready(Some(request)) => {
+                            return std::task::Poll::Ready(Some(request));
+                        }
+                        std::task::Poll::Ready(None) => self.control = None,
+                        std::task::Poll::Pending => open = true,
+                    }
+                }
+            }
+            if open {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        })
+        .await
+    }
+}
+
+fn spawn_runtime_command_drivers(
+    commands: &RuntimeCommandReceiver,
+    limits: &RuntimeTaskLimits,
+) -> RuntimeReadyReceivers {
+    let (control_sender, control) = mpsc::channel(1);
+    let control_commands = commands.clone();
+    std::mem::drop(tokio::spawn(async move {
+        while let Some(control_request) = control_commands.recv_control().await {
+            let RuntimeControlRequest {
+                request,
+                session_start,
+            } = control_request;
+            if control_sender
+                .send(RuntimeReadyRequest {
+                    request,
+                    lease: None,
+                    session_start,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }));
+
+    let mut receivers: [Option<mpsc::Receiver<RuntimeReadyRequest>>; 5] =
+        std::array::from_fn(|_| None);
+    for lane in RuntimeTaskLane::ALL {
+        let (sender, receiver) = mpsc::channel(lane.running_capacity());
+        receivers[lane.index()] = Some(receiver);
+        let lane_commands = commands.clone();
+        let lane_limits = limits.clone();
+        std::mem::drop(tokio::spawn(async move {
+            while let Some(lane_request) = lane_commands.recv_lane(lane).await {
+                let RuntimeLaneRequest {
+                    request,
+                    reservation,
+                } = lane_request;
+                let lease =
+                    if request.descriptor.admission.kind == RuntimeAdmissionKind::Supersedable {
+                        debug_assert!(reservation.is_none());
+                        None
+                    } else {
+                        Some(RuntimeCommandLease {
+                            _permit: lane_limits.acquire(lane).await,
+                            _reservation: reservation
+                                .expect("admitted command requires an in-flight reservation"),
+                        })
+                    };
+                if sender
+                    .send(RuntimeReadyRequest {
+                        request,
+                        lease,
+                        session_start: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
+    }
+
+    RuntimeReadyReceivers {
+        control: Some(control),
+        lanes: receivers,
+        next_lane: 0,
+        control_budget: RUNTIME_CONTROL_DISPATCH_BURST,
+    }
+}
+
 impl AppRuntime {
     pub fn start() -> (Self, mpsc::UnboundedReceiver<RuntimeEvent>) {
-        let (commands, receiver) = mpsc::unbounded_channel::<RuntimeRequest>();
+        let (commands, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::production());
         let (events, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
 
         thread::spawn(move || {
@@ -3199,13 +4080,45 @@ impl AppRuntime {
         (Self { commands }, event_receiver)
     }
 
-    pub fn send(&self, identity: RuntimeIdentity, command: RuntimeCommand) {
-        let _ = self.commands.send(RuntimeRequest { identity, command });
+    pub(crate) fn send(
+        &self,
+        identity: RuntimeIdentity,
+        command: RuntimeCommand,
+    ) -> std::result::Result<(), Box<RuntimeCommandRejection>> {
+        match self
+            .commands
+            .try_send(RuntimeRequest::new(identity, command))
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.outcome == RuntimeCommandAdmissionOutcome::DroppedStale => Ok(()),
+            Err(error) => {
+                crate::debug::log(
+                    "runtime",
+                    &format!(
+                        "RuntimeCommandRejected outcome={:?} session={:?} request={:?} operation={:?} admission={:?}",
+                        error.outcome,
+                        error.request.identity.session,
+                        error.request.identity.request,
+                        error.request.descriptor.context.operation,
+                        error.request.descriptor.admission.kind,
+                    ),
+                );
+                let RuntimeRequest {
+                    command,
+                    descriptor,
+                    ..
+                } = error.request;
+                Err(Box::new(RuntimeCommandRejection {
+                    context: descriptor.context,
+                    command,
+                }))
+            }
+        }
     }
 }
 
 async fn run_runtime(
-    mut commands: mpsc::UnboundedReceiver<RuntimeRequest>,
+    commands: RuntimeCommandReceiver,
     events: mpsc::UnboundedSender<RuntimeEvent>,
 ) {
     maintain_attachment_cache(None).await;
@@ -3220,10 +4133,23 @@ async fn run_runtime(
         IMAGE_TASK_CONCURRENCY,
         UPLOAD_TASK_CONCURRENCY,
     );
+    let admission_limits = RuntimeTaskLimits::new(
+        RUNTIME_NAVIGATION_TASK_CAPACITY,
+        RUNTIME_INTERACTIVE_TASK_CAPACITY,
+        RUNTIME_BACKGROUND_TASK_CAPACITY,
+        RUNTIME_IMAGE_TASK_CAPACITY,
+        RUNTIME_UPLOAD_TASK_CAPACITY,
+    );
+    let mut ready = spawn_runtime_command_drivers(&commands, &admission_limits);
 
-    while let Some(request) = commands.recv().await {
-        let RuntimeRequest { identity, command } = request;
-        let trace_fields = RuntimeTraceFields::for_command(identity, &command);
+    while let Some(ready_request) = ready.recv().await {
+        let RuntimeReadyRequest {
+            request,
+            lease,
+            session_start,
+        } = ready_request;
+        let identity = request.identity;
+        let trace_fields = RuntimeTraceFields::for_descriptor(identity, &request.descriptor);
         let span = trace_fields.span();
         let _entered = span.enter();
         let active_session = state
@@ -3231,6 +4157,7 @@ async fn run_runtime(
             .expect("runtime state lock poisoned")
             .active_session;
         if identity.session < active_session {
+            drop(session_start);
             continue;
         }
         if identity.session > active_session {
@@ -3238,30 +4165,68 @@ async fn run_runtime(
         }
 
         let event_sender =
-            RuntimeEventSender::new(events.clone(), identity, command.operation_context());
+            RuntimeEventSender::new(events.clone(), identity, request.descriptor.context.clone());
         dispatch_command(
-            command,
-            identity,
+            request,
             event_sender,
-            &state,
-            &oauth,
-            &image_cache,
-            &limits,
+            RuntimeDispatchResources {
+                state: &state,
+                oauth: &oauth,
+                image_cache: &image_cache,
+                limits: &limits,
+            },
+            lease,
         );
+        drop(session_start);
     }
 
+    admission_limits.wait_idle().await;
+    let admission = commands.snapshot();
+    crate::debug::log(
+        "runtime",
+        &format!(
+            "RuntimeCommandAdmissionClosed admitted={} dequeued={} coalesced={} superseded={} cancelled={} rejected={} depth={} peak={} in_flight={} peak_in_flight={}",
+            admission.admitted,
+            admission.dequeued,
+            admission.coalesced,
+            admission.superseded,
+            admission.cancelled,
+            admission.rejected,
+            admission.depth,
+            admission.peak_depth,
+            admission.in_flight,
+            admission.peak_in_flight,
+        ),
+    );
     replace_session_and_drain(&state, SessionId::default()).await;
 }
 
+struct RuntimeDispatchResources<'a> {
+    state: &'a Arc<Mutex<RuntimeState>>,
+    oauth: &'a SlackOAuthClient,
+    image_cache: &'a ImageAssetCache,
+    limits: &'a RuntimeTaskLimits,
+}
+
 fn dispatch_command(
-    command: RuntimeCommand,
-    identity: RuntimeIdentity,
+    request: RuntimeRequest,
     events: RuntimeEventSender,
-    state: &Arc<Mutex<RuntimeState>>,
-    oauth: &SlackOAuthClient,
-    image_cache: &ImageAssetCache,
-    limits: &RuntimeTaskLimits,
+    resources: RuntimeDispatchResources<'_>,
+    lease: Option<RuntimeCommandLease>,
 ) {
+    let RuntimeRequest {
+        identity,
+        command,
+        descriptor,
+        ..
+    } = request;
+    let RuntimeDispatchResources {
+        state,
+        oauth,
+        image_cache,
+        limits,
+    } = resources;
+    let lane = descriptor.lane;
     match command {
         RuntimeCommand::LoadStoredToken => {
             events.send_event(RuntimeEventKind::WorkspaceLifecycle(
@@ -3310,6 +4275,7 @@ fn dispatch_command(
                 identity,
                 events,
                 limits.clone(),
+                lease,
                 failure_context,
                 async move {
                     let token = if token.should_refresh() {
@@ -3335,6 +4301,7 @@ fn dispatch_command(
                 identity,
                 events,
                 limits.clone(),
+                lease,
                 AuthenticationFailureContext::Default,
                 async move {
                     let token = oauth
@@ -3378,19 +4345,23 @@ fn dispatch_command(
                 identity,
                 events,
                 limits.clone(),
+                lease,
                 AuthenticationFailureContext::BrowserSession,
                 authenticate_token(token),
             );
         }
         RuntimeCommand::SignOut => {
+            debug_assert!(lease.is_none());
             finish_sign_out(&events, TokenStore.clear());
         }
         RuntimeCommand::Disconnect => {
+            debug_assert!(lease.is_none());
             events.send_event(RuntimeEventKind::WorkspaceLifecycle(
                 WorkspaceLifecycleEvent::SignedOut,
             ));
         }
         RuntimeCommand::UpdateAttentionPreferences(preferences) => {
+            let _lease = lease.expect("attention preference command requires an admission lease");
             state
                 .lock()
                 .expect("runtime state lock poisoned")
@@ -3408,12 +4379,12 @@ fn dispatch_command(
                 )));
                 return;
             };
-            let lane = command.task_lane();
             let tracked_request = TrackedRequest::for_command(identity, &command);
             let image_cache = image_cache.clone();
-            let limits = limits.clone();
+            let execution_limits = limits.clone();
             spawn_request_task(state, tracked_request, async move {
-                let _permit = limits.acquire(lane).await;
+                let _lease = lease;
+                let _execution_permit = execution_limits.acquire(lane).await;
                 if let Err(error) =
                     handle_connected_command(command, connection, &events, &image_cache).await
                 {
@@ -3465,12 +4436,14 @@ fn spawn_authentication_task<F>(
     identity: RuntimeIdentity,
     events: RuntimeEventSender,
     limits: RuntimeTaskLimits,
+    lease: Option<RuntimeCommandLease>,
     failure_context: AuthenticationFailureContext,
     future: F,
 ) where
     F: Future<Output = Result<(StoredToken, SlackApi, AuthInfo)>> + Send + 'static,
 {
     let state_for_task = Arc::clone(state);
+    let execution_limits = limits.clone();
     spawn_request_task(
         state,
         TrackedRequest::new(
@@ -3478,6 +4451,8 @@ fn spawn_authentication_task<F>(
             OperationContext::new(RuntimeOperation::Authenticate, RuntimeTarget::Workspace),
         ),
         async move {
+            let _lease = lease;
+            let _execution_permit = execution_limits.acquire(RuntimeTaskLane::Interactive).await;
             let result = future.await;
             match result {
                 Ok((token, api, auth)) => {
@@ -7620,10 +8595,858 @@ mod tests {
     use std::future;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::workspace_pipeline::{MessageChange, StoreChange, WorkspaceChange};
+
+    fn admission_request(session: u64, request: u64, command: RuntimeCommand) -> RuntimeRequest {
+        RuntimeRequest::new(
+            RuntimeIdentity {
+                session: SessionId(session),
+                request: RequestId::new(request),
+            },
+            command,
+        )
+    }
+
+    fn admission_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to build admission test runtime")
+    }
+
+    #[test]
+    fn runtime_command_admission_coalesces_queued_work_with_latest_identity() {
+        let (sender, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+        assert_eq!(
+            sender.send(admission_request(
+                1,
+                1,
+                RuntimeCommand::LoadMedia {
+                    url: "https://files.example.test/video.mp4".into(),
+                    name: "first".into(),
+                },
+            )),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+        assert_eq!(
+            sender.send(admission_request(
+                1,
+                2,
+                RuntimeCommand::LoadMedia {
+                    url: "https://files.example.test/video.mp4".into(),
+                    name: "latest".into(),
+                },
+            )),
+            RuntimeCommandAdmissionOutcome::Coalesced
+        );
+
+        let queued = admission_test_runtime().block_on(receiver.recv_lane(RuntimeTaskLane::Image));
+        let queued = queued.expect("coalesced request should remain queued");
+        assert_eq!(queued.request.identity.request, RequestId::new(2));
+        assert!(matches!(
+            &queued.request.command,
+            RuntimeCommand::LoadMedia { name, .. } if name == "latest"
+        ));
+        drop(queued);
+        assert_eq!(
+            sender.snapshot(),
+            RuntimeCommandAdmissionSnapshot {
+                admitted: 2,
+                dequeued: 1,
+                coalesced: 1,
+                peak_depth: 1,
+                peak_in_flight: 1,
+                ..RuntimeCommandAdmissionSnapshot::default()
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_command_admission_keeps_one_latest_follow_up_for_in_flight_key() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (sender, receiver) =
+                RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(3, 3));
+            let media = |request: u64, name: &str| {
+                admission_request(
+                    1,
+                    request,
+                    RuntimeCommand::LoadMedia {
+                        url: "https://files.example.test/video.mp4".into(),
+                        name: name.into(),
+                    },
+                )
+            };
+            assert_eq!(
+                sender.send(media(1, "running")),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+            let running = receiver
+                .recv_lane(RuntimeTaskLane::Image)
+                .await
+                .expect("first media request should reserve its key");
+            assert_eq!(
+                sender.send(media(2, "pending")),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+            assert_eq!(
+                sender.send(media(3, "latest")),
+                RuntimeCommandAdmissionOutcome::Coalesced
+            );
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                receiver.recv_lane(RuntimeTaskLane::Image),
+            )
+            .await
+            .is_err());
+
+            drop(running);
+            let follow_up = tokio::time::timeout(
+                Duration::from_secs(1),
+                receiver.recv_lane(RuntimeTaskLane::Image),
+            )
+            .await
+            .expect("latest follow-up stayed blocked after completion")
+            .expect("admission receiver closed early");
+            assert_eq!(follow_up.request.identity.request, RequestId::new(3));
+            assert!(matches!(
+                &follow_up.request.command,
+                RuntimeCommand::LoadMedia { name, .. } if name == "latest"
+            ));
+            let snapshot = sender.snapshot();
+            assert_eq!(snapshot.peak_in_flight, 1);
+            assert_eq!(snapshot.coalesced, 1);
+        });
+    }
+
+    #[test]
+    fn runtime_command_admission_supersedes_queued_navigation_in_place() {
+        let (sender, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+        assert_eq!(
+            sender.send(admission_request(
+                1,
+                1,
+                RuntimeCommand::LoadHistory {
+                    channel_id: "C1".into(),
+                },
+            )),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+        assert_eq!(
+            sender.send(admission_request(
+                1,
+                2,
+                RuntimeCommand::SearchMessages {
+                    query: "latest".into(),
+                },
+            )),
+            RuntimeCommandAdmissionOutcome::Superseded
+        );
+
+        let queued = admission_test_runtime()
+            .block_on(receiver.recv_lane(RuntimeTaskLane::Navigation))
+            .expect("superseding request should remain queued");
+        assert_eq!(queued.request.identity.request, RequestId::new(2));
+        assert!(matches!(
+            &queued.request.command,
+            RuntimeCommand::SearchMessages { .. }
+        ));
+        let snapshot = sender.snapshot();
+        assert_eq!(snapshot.superseded, 1);
+        assert_eq!(snapshot.depth, 0);
+        assert_eq!(snapshot.peak_depth, 1);
+    }
+
+    #[test]
+    fn runtime_command_admission_never_coalesces_read_markers() {
+        let (sender, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+        for request in 1..=2 {
+            assert_eq!(
+                sender.send(admission_request(
+                    1,
+                    request,
+                    RuntimeCommand::MarkConversationRead {
+                        channel_id: "C1".into(),
+                        ts: format!("{request}.0"),
+                    },
+                )),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+        }
+
+        let runtime = admission_test_runtime();
+        for request in 1..=2 {
+            let queued = runtime
+                .block_on(receiver.recv_lane(RuntimeTaskLane::Interactive))
+                .expect("read marker should remain queued");
+            assert_eq!(queued.request.identity.request, RequestId::new(request));
+        }
+        let snapshot = sender.snapshot();
+        assert_eq!(snapshot.admitted, 2);
+        assert_eq!(snapshot.dequeued, 2);
+        assert_eq!(snapshot.coalesced, 0);
+        assert_eq!(snapshot.superseded, 0);
+    }
+
+    #[test]
+    fn runtime_command_admission_serializes_ordered_actions_per_target() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (sender, receiver) =
+                RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+            for (request, add) in [(1, true), (2, false)] {
+                assert_eq!(
+                    sender.send(admission_request(
+                        1,
+                        request,
+                        RuntimeCommand::SetReaction {
+                            channel_id: "C1".into(),
+                            ts: "1.0".into(),
+                            name: "eyes".into(),
+                            add,
+                            thread_ts: None,
+                        },
+                    )),
+                    RuntimeCommandAdmissionOutcome::Enqueued
+                );
+            }
+
+            let first = receiver
+                .recv_lane(RuntimeTaskLane::Interactive)
+                .await
+                .expect("first reaction should reserve its target");
+            assert_eq!(first.request.identity.request, RequestId::new(1));
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                receiver.recv_lane(RuntimeTaskLane::Interactive),
+            )
+            .await
+            .is_err());
+            drop(first);
+            let second = tokio::time::timeout(
+                Duration::from_secs(1),
+                receiver.recv_lane(RuntimeTaskLane::Interactive),
+            )
+            .await
+            .expect("second reaction stayed blocked after completion")
+            .expect("admission receiver closed early");
+            assert_eq!(second.request.identity.request, RequestId::new(2));
+        });
+    }
+
+    #[test]
+    fn runtime_command_admission_rejects_durable_overload_without_blocking() {
+        let (sender, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(1, 1));
+        assert_eq!(
+            sender.send(admission_request(
+                1,
+                1,
+                RuntimeCommand::UpdateAttentionPreferences(AttentionPreferences::default()),
+            )),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+
+        let rejected = sender
+            .try_send(admission_request(
+                1,
+                2,
+                RuntimeCommand::UpdateAttentionPreferences(AttentionPreferences::default()),
+            ))
+            .expect_err("full durable lane should reject without waiting");
+        assert_eq!(
+            rejected.outcome,
+            RuntimeCommandAdmissionOutcome::DroppedAtCapacity
+        );
+        assert_eq!(rejected.request.identity.request, RequestId::new(2));
+
+        let runtime = admission_test_runtime();
+        let first = runtime
+            .block_on(receiver.recv_lane(RuntimeTaskLane::Interactive))
+            .expect("first durable command should remain queued");
+        assert_eq!(first.request.identity.request, RequestId::new(1));
+        drop(first);
+
+        let snapshot = sender.snapshot();
+        assert_eq!(snapshot.cancelled, 0);
+        assert_eq!(snapshot.rejected, 1);
+        assert_eq!(snapshot.depth, 0);
+    }
+
+    #[test]
+    fn runtime_command_admission_never_evicts_distinct_queued_work() {
+        let (sender, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+        assert_eq!(
+            sender.send(admission_request(
+                1,
+                1,
+                RuntimeCommand::DownloadAttachment {
+                    url: "https://files.example.test/report.pdf".into(),
+                    name: "report.pdf".into(),
+                },
+            )),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+        assert_eq!(
+            sender.send(admission_request(
+                1,
+                2,
+                RuntimeCommand::LoadMedia {
+                    url: "https://files.example.test/old.mp4".into(),
+                    name: "old".into(),
+                },
+            )),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+        let rejected = sender
+            .try_send(admission_request(
+                1,
+                3,
+                RuntimeCommand::LoadMedia {
+                    url: "https://files.example.test/latest.mp4".into(),
+                    name: "latest".into(),
+                },
+            ))
+            .expect_err("distinct full-lane request should be returned to its caller");
+        assert_eq!(
+            rejected.outcome,
+            RuntimeCommandAdmissionOutcome::DroppedAtCapacity
+        );
+        assert!(matches!(
+            rejected.request.command,
+            RuntimeCommand::LoadMedia { name, .. } if name == "latest"
+        ));
+
+        let runtime = admission_test_runtime();
+        let durable = runtime
+            .block_on(receiver.recv_lane(RuntimeTaskLane::Image))
+            .expect("durable attachment should remain queued");
+        assert!(matches!(
+            &durable.request.command,
+            RuntimeCommand::DownloadAttachment { .. }
+        ));
+        let original = runtime
+            .block_on(receiver.recv_lane(RuntimeTaskLane::Image))
+            .expect("original distinct media should remain queued");
+        assert!(matches!(
+            &original.request.command,
+            RuntimeCommand::LoadMedia { name, .. } if name == "old"
+        ));
+        let snapshot = sender.snapshot();
+        assert_eq!(snapshot.cancelled, 0);
+        assert_eq!(snapshot.rejected, 1);
+        assert_eq!(snapshot.peak_depth, 2);
+    }
+
+    #[test]
+    fn runtime_command_admission_rejects_delayed_older_key_without_replacement() {
+        let (sender, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(1, 1));
+        let media = |name: &str| RuntimeCommand::LoadMedia {
+            url: "https://files.example.test/video.mp4".into(),
+            name: name.into(),
+        };
+        assert_eq!(
+            sender.send(admission_request(2, 2, media("current"))),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+        assert_eq!(
+            sender.send(admission_request(2, 1, media("delayed"))),
+            RuntimeCommandAdmissionOutcome::DroppedStale
+        );
+        assert_eq!(
+            sender.send(admission_request(1, 3, media("old-session"))),
+            RuntimeCommandAdmissionOutcome::StaleSession
+        );
+
+        let queued = admission_test_runtime()
+            .block_on(receiver.recv_lane(RuntimeTaskLane::Image))
+            .expect("current-session request should remain queued");
+        assert_eq!(queued.request.identity.session, SessionId(2));
+        assert!(matches!(
+            &queued.request.command,
+            RuntimeCommand::LoadMedia { name, .. } if name == "current"
+        ));
+    }
+
+    #[test]
+    fn runtime_command_admission_preserves_control_fifo_across_sessions() {
+        let (sender, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+        assert_eq!(
+            sender.send(admission_request(1, 1, RuntimeCommand::SignOut)),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+        assert_eq!(
+            sender.send(admission_request(2, 2, RuntimeCommand::Disconnect)),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+
+        let runtime = admission_test_runtime();
+        let first = runtime
+            .block_on(receiver.recv_control())
+            .expect("sign-out should remain queued");
+        assert!(matches!(&first.request.command, RuntimeCommand::SignOut));
+        drop(first);
+        let second = runtime
+            .block_on(receiver.recv_control())
+            .expect("disconnect should remain queued");
+        assert!(matches!(
+            &second.request.command,
+            RuntimeCommand::Disconnect
+        ));
+    }
+
+    #[test]
+    fn runtime_command_drivers_do_not_overtake_sign_out_with_newer_authentication() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (sender, receiver) =
+                RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let mut ready = spawn_runtime_command_drivers(&receiver, &limits);
+            assert_eq!(
+                sender.send(admission_request(1, 1, RuntimeCommand::SignOut)),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+            assert_eq!(
+                sender.send(admission_request(2, 2, RuntimeCommand::LoadStoredToken)),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+
+            let first = tokio::time::timeout(Duration::from_secs(1), ready.recv())
+                .await
+                .expect("sign-out did not reach ready dispatch")
+                .expect("ready drivers closed before sign-out");
+            assert_eq!(first.request.identity.session, SessionId(1));
+            assert!(matches!(&first.request.command, RuntimeCommand::SignOut));
+            drop(first);
+
+            let second = tokio::time::timeout(Duration::from_secs(1), ready.recv())
+                .await
+                .expect("authentication did not reach ready dispatch")
+                .expect("ready drivers closed before authentication");
+            assert_eq!(second.request.identity.session, SessionId(2));
+            assert!(matches!(
+                &second.request.command,
+                RuntimeCommand::LoadStoredToken
+            ));
+        });
+    }
+
+    #[test]
+    fn runtime_command_admission_drains_ordered_work_before_newer_session_dispatch() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (sender, receiver) =
+                RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(3, 3));
+            assert_eq!(
+                sender.send(admission_request(
+                    1,
+                    1,
+                    RuntimeCommand::SetReaction {
+                        channel_id: "C1".into(),
+                        ts: "1.0".into(),
+                        name: "eyes".into(),
+                        add: true,
+                        thread_ts: None,
+                    },
+                )),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+            assert_eq!(
+                sender.send(admission_request(2, 2, RuntimeCommand::Disconnect)),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+            assert_eq!(
+                sender.send(admission_request(
+                    2,
+                    3,
+                    RuntimeCommand::UpdateAttentionPreferences(AttentionPreferences::default()),
+                )),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), receiver.recv_control())
+                    .await
+                    .is_err()
+            );
+            let ordered = receiver
+                .recv_lane(RuntimeTaskLane::Interactive)
+                .await
+                .expect("older durable work should remain dispatchable");
+            assert_eq!(ordered.request.identity.session, SessionId(1));
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                receiver.recv_lane(RuntimeTaskLane::Interactive),
+            )
+            .await
+            .is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), receiver.recv_control())
+                    .await
+                    .is_err()
+            );
+
+            drop(ordered);
+            let control = tokio::time::timeout(Duration::from_secs(1), receiver.recv_control())
+                .await
+                .expect("new-session control stayed blocked after durable completion")
+                .expect("control receiver closed early");
+            assert_eq!(control.request.identity.session, SessionId(2));
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                receiver.recv_lane(RuntimeTaskLane::Interactive),
+            )
+            .await
+            .is_err());
+
+            drop(control);
+            let newer = tokio::time::timeout(
+                Duration::from_secs(1),
+                receiver.recv_lane(RuntimeTaskLane::Interactive),
+            )
+            .await
+            .expect("new-session work stayed blocked after session dispatch")
+            .expect("interactive receiver closed early");
+            assert_eq!(newer.request.identity.session, SessionId(2));
+        });
+    }
+
+    #[test]
+    fn runtime_command_admission_rejects_delayed_work_from_an_older_session() {
+        let (sender, _receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+        assert_eq!(
+            sender.send(admission_request(2, 1, RuntimeCommand::LoadStoredToken)),
+            RuntimeCommandAdmissionOutcome::Enqueued
+        );
+        let rejected = sender
+            .try_send(admission_request(
+                1,
+                2,
+                RuntimeCommand::MarkConversationRead {
+                    channel_id: "C1".into(),
+                    ts: "2.0".into(),
+                },
+            ))
+            .expect_err("older-session work must not enter after a newer session");
+        assert_eq!(
+            rejected.outcome,
+            RuntimeCommandAdmissionOutcome::StaleSession
+        );
+        assert!(matches!(
+            rejected.request.command,
+            RuntimeCommand::MarkConversationRead { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_command_lane_driver_reserves_capacity_before_ready_dispatch() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (sender, receiver) =
+                RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let mut ready = spawn_runtime_command_drivers(&receiver, &limits);
+            for request in 1..=2 {
+                assert_eq!(
+                    sender.send(admission_request(
+                        1,
+                        request,
+                        RuntimeCommand::LoadMedia {
+                            url: format!("https://files.example.test/{request}.mp4"),
+                            name: request.to_string(),
+                        },
+                    )),
+                    RuntimeCommandAdmissionOutcome::Enqueued
+                );
+            }
+
+            let first = tokio::time::timeout(Duration::from_secs(1), ready.recv())
+                .await
+                .expect("first image request did not become ready")
+                .expect("ready drivers closed early");
+            assert_eq!(first.request.identity.request, RequestId::new(1));
+            assert!(first.lease.is_some());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), ready.recv())
+                    .await
+                    .is_err()
+            );
+
+            drop(first);
+            let second = tokio::time::timeout(Duration::from_secs(1), ready.recv())
+                .await
+                .expect("second image request did not wait for capacity")
+                .expect("ready drivers closed early");
+            assert_eq!(second.request.identity.request, RequestId::new(2));
+            assert!(second.lease.is_some());
+        });
+    }
+
+    #[test]
+    fn runtime_command_sender_close_drains_ready_work_before_admission_idle() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (sender, receiver) =
+                RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let mut ready = spawn_runtime_command_drivers(&receiver, &limits);
+            assert_eq!(
+                sender.send(admission_request(
+                    1,
+                    1,
+                    RuntimeCommand::UpdateAttentionPreferences(AttentionPreferences::default()),
+                )),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+            drop(sender);
+
+            let admitted = tokio::time::timeout(Duration::from_secs(1), ready.recv())
+                .await
+                .expect("accepted command did not reach ready dispatch")
+                .expect("ready drivers closed before draining accepted work");
+            let limits_for_idle = limits.clone();
+            let mut idle = tokio::spawn(async move {
+                limits_for_idle.wait_idle().await;
+            });
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut idle)
+                .await
+                .is_err());
+
+            drop(admitted);
+            tokio::time::timeout(Duration::from_secs(1), idle)
+                .await
+                .expect("admission idle barrier stayed blocked after lease release")
+                .expect("admission idle barrier task failed");
+            assert!(tokio::time::timeout(Duration::from_secs(1), ready.recv())
+                .await
+                .expect("ready drivers did not close after sender shutdown")
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn runtime_command_task_admission_waits_for_accepted_work_to_finish() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let permit = limits.acquire(RuntimeTaskLane::Image).await;
+            let limits_for_drain = limits.clone();
+            let mut drain = tokio::spawn(async move {
+                limits_for_drain.wait_idle().await;
+            });
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain)
+                .await
+                .is_err());
+            drop(permit);
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .expect("accepted work barrier stayed blocked")
+                .expect("accepted work barrier task failed");
+        });
+    }
+
+    #[test]
+    fn runtime_command_supersedable_work_bypasses_saturated_task_admission() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (sender, receiver) =
+                RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
+            let limits = RuntimeTaskLimits::new(1, 1, 1, 1, 1);
+            let mut ready = spawn_runtime_command_drivers(&receiver, &limits);
+            assert_eq!(
+                sender.send(admission_request(
+                    1,
+                    1,
+                    RuntimeCommand::UpdateAttentionPreferences(AttentionPreferences::default()),
+                )),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+
+            let durable = tokio::time::timeout(Duration::from_secs(1), ready.recv())
+                .await
+                .expect("durable command did not become ready")
+                .expect("ready drivers closed early");
+            assert!(durable.lease.is_some());
+
+            assert_eq!(
+                sender.send(admission_request(1, 2, RuntimeCommand::LoadStoredToken)),
+                RuntimeCommandAdmissionOutcome::Enqueued
+            );
+            let superseding = tokio::time::timeout(Duration::from_secs(1), ready.recv())
+                .await
+                .expect("supersedable command waited for saturated task admission")
+                .expect("ready drivers closed early");
+            assert_eq!(superseding.request.identity.request, RequestId::new(2));
+            assert!(matches!(
+                superseding.request.command,
+                RuntimeCommand::LoadStoredToken
+            ));
+            assert!(superseding.lease.is_none());
+        });
+    }
+
+    #[test]
+    fn runtime_command_ready_dispatch_prioritizes_control_and_rotates_lanes() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (control_sender, control) = mpsc::channel(1);
+            let (navigation_sender, navigation) = mpsc::channel(2);
+            let (image_sender, image) = mpsc::channel(1);
+            let mut lanes = std::array::from_fn(|_| None);
+            lanes[RuntimeTaskLane::Navigation.index()] = Some(navigation);
+            lanes[RuntimeTaskLane::Image.index()] = Some(image);
+            let mut ready = RuntimeReadyReceivers {
+                control: Some(control),
+                lanes,
+                next_lane: 0,
+                control_budget: RUNTIME_CONTROL_DISPATCH_BURST,
+            };
+            let ready_request = |request| RuntimeReadyRequest {
+                request,
+                lease: None,
+                session_start: None,
+            };
+
+            navigation_sender
+                .try_send(ready_request(admission_request(
+                    1,
+                    1,
+                    RuntimeCommand::LoadHistory {
+                        channel_id: "C1".into(),
+                    },
+                )))
+                .unwrap();
+            navigation_sender
+                .try_send(ready_request(admission_request(
+                    1,
+                    2,
+                    RuntimeCommand::SearchMessages {
+                        query: "next".into(),
+                    },
+                )))
+                .unwrap();
+            image_sender
+                .try_send(ready_request(admission_request(
+                    1,
+                    3,
+                    RuntimeCommand::LoadMedia {
+                        url: "https://files.example.test/video.mp4".into(),
+                        name: "video".into(),
+                    },
+                )))
+                .unwrap();
+            control_sender
+                .try_send(ready_request(admission_request(
+                    1,
+                    4,
+                    RuntimeCommand::Disconnect,
+                )))
+                .unwrap();
+
+            let control = ready.recv().await.expect("control command should be ready");
+            assert!(matches!(
+                control.request.command,
+                RuntimeCommand::Disconnect
+            ));
+            let navigation = ready
+                .recv()
+                .await
+                .expect("first navigation command should be ready");
+            assert_eq!(navigation.request.identity.request, RequestId::new(1));
+            let image = ready.recv().await.expect("image command should be ready");
+            assert_eq!(image.request.identity.request, RequestId::new(3));
+            let navigation = ready
+                .recv()
+                .await
+                .expect("second navigation command should be ready");
+            assert_eq!(navigation.request.identity.request, RequestId::new(2));
+        });
+    }
+
+    #[test]
+    fn runtime_command_ready_dispatch_bounds_control_bursts() {
+        let runtime = admission_test_runtime();
+        runtime.block_on(async {
+            let (control_sender, control) = mpsc::channel(3);
+            let (navigation_sender, navigation) = mpsc::channel(1);
+            let mut lanes = std::array::from_fn(|_| None);
+            lanes[RuntimeTaskLane::Navigation.index()] = Some(navigation);
+            let mut ready = RuntimeReadyReceivers {
+                control: Some(control),
+                lanes,
+                next_lane: 0,
+                control_budget: 2,
+            };
+            let ready_request = |request| RuntimeReadyRequest {
+                request,
+                lease: None,
+                session_start: None,
+            };
+            for request in 1..=3 {
+                control_sender
+                    .try_send(ready_request(admission_request(
+                        1,
+                        request,
+                        RuntimeCommand::Disconnect,
+                    )))
+                    .unwrap();
+            }
+            navigation_sender
+                .try_send(ready_request(admission_request(
+                    1,
+                    4,
+                    RuntimeCommand::LoadHistory {
+                        channel_id: "C1".into(),
+                    },
+                )))
+                .unwrap();
+
+            assert_eq!(
+                ready.recv().await.unwrap().request.identity.request,
+                RequestId::new(1)
+            );
+            assert_eq!(
+                ready.recv().await.unwrap().request.identity.request,
+                RequestId::new(2)
+            );
+            assert_eq!(
+                ready.recv().await.unwrap().request.identity.request,
+                RequestId::new(4)
+            );
+            assert_eq!(
+                ready.recv().await.unwrap().request.identity.request,
+                RequestId::new(3)
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_command_admission_closed_receiver_returns_original_request() {
+        let (sender, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(1, 1));
+        drop(receiver);
+        let rejected = sender
+            .try_send(admission_request(
+                1,
+                1,
+                RuntimeCommand::UpdateAttentionPreferences(AttentionPreferences::default()),
+            ))
+            .expect_err("closed receiver should reject immediately");
+        assert_eq!(rejected.outcome, RuntimeCommandAdmissionOutcome::Closed);
+        assert_eq!(rejected.request.identity.request, RequestId::new(1));
+    }
 
     fn timeline_patch_summary(changes: &[WorkspaceChange]) -> Vec<(String, Option<String>)> {
         changes

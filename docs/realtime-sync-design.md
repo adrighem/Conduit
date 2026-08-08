@@ -22,8 +22,16 @@ persistence. The actor admits at most 256 pending events. Its asynchronous trans
 for capacity instead of dropping or reordering an event. Socket Mode admission and acknowledgment
 share a three-second deadline; a timeout or closed actor leaves the envelope unacknowledged and
 reconnects so Slack can retry it. Browser RTM applies socket backpressure while admission waits. The
-actor drains before a normal reconnect or supervised session shutdown. Live trace events report queue high-water marks at depth 1
-and each new power-of-two peak.
+actor drains before a normal reconnect or supervised session shutdown. Live trace events report
+queue high-water marks at depth 1 and each new power-of-two peak.
+
+GTK-to-runtime commands use a separate bounded admission layer before task creation. A reserved FIFO
+serves session and control work, while navigation, interactive, upload, background, and image lanes
+have independent queue and task caps. Durable actions and read markers stay FIFO and serialize per
+target. Only explicitly replaceable synchronization is coalesced or superseded. Saturation returns
+the rejected command to GTK immediately so request-specific UI state can recover without blocking
+the main thread. Session starts remain FIFO and wait for older accepted durable/read work before
+replacement; normal runtime shutdown drains every accepted command lease.
 
 The workspace coordinator classifies every normalized message with the canonical attention policy.
 Realtime persistence first performs a pure preview, then atomically records the observation and

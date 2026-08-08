@@ -73,9 +73,11 @@ raw baselines remain separate when later message reconciliation builds the local
 
 One session-owned actor queue carries realtime messages, user/profile changes, and reactions.
 Message and reaction UI fan-out stays ordered behind the actor; user changes also use it for cache
-persistence. The callback-facing queue is intentionally unbounded because the Slack transport
-callback is synchronous and cannot await capacity without blocking the transport. The actor drains
-before reconnect.
+persistence. The actor admits at most 256 pending events. Its asynchronous transport callback waits
+for capacity instead of dropping or reordering accepted work. Socket Mode shares a three-second
+deadline between admission and acknowledgment; timeout or closure leaves the envelope unacknowledged
+so Slack can retry it. Browser RTM applies socket backpressure while admission waits. The actor drains
+before reconnect or supervised session shutdown.
 
 Message observation and notification claiming share one SQLite transaction. The 512 most recently
 recorded message identities are retained per conversation, while the notification-delivery ledger

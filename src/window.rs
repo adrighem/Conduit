@@ -81,9 +81,9 @@ use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering;
 use crate::runtime::{
     preview_workspace_cache_key, preview_workspace_scope, AppRuntime, CachedAssetDescriptor,
-    OperationContext, RequestId, RuntimeCommand, RuntimeEvent, RuntimeEventKind, RuntimeEventMeta,
-    RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity, RuntimeOperation, RuntimeTarget,
-    SessionId, UploadAttachment,
+    OperationContext, RequestId, RuntimeCommand, RuntimeCommandRejection, RuntimeEvent,
+    RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity,
+    RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 #[cfg(test)]
@@ -2475,7 +2475,7 @@ fn remove_patch_departures_from_discovery(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct RequestCoordinator {
     session: SessionId,
     next_request: u64,
@@ -5769,7 +5769,7 @@ impl ConduitWindow {
             window.toggle_huddle_screen_share()
         });
         self.connect_widget(&imp.huddle_leave_button.get(), |window| {
-            window.send_command(RuntimeCommand::Huddle(HuddleCommand::Leave))
+            window.send_command(RuntimeCommand::Huddle(HuddleCommand::Leave));
         });
         self.connect_widget(&imp.huddle_dismiss_button.get(), |window| {
             window.dismiss_huddle()
@@ -6347,7 +6347,7 @@ impl ConduitWindow {
 
     fn setup_window_actions(&self) {
         self.add_window_action("sign-out", |window| {
-            window.send_session_command(RuntimeCommand::SignOut)
+            window.send_session_command(RuntimeCommand::SignOut);
         });
         self.add_window_action("switch-conversation", |window| {
             window.show_conversation_switcher()
@@ -9252,12 +9252,14 @@ impl ConduitWindow {
             if !self.remember_submitted_draft(&channel_id, thread_ts.as_deref(), &submitted) {
                 return;
             }
-            self.send_command(RuntimeCommand::PostMessage {
+            if !self.send_command(RuntimeCommand::PostMessage {
                 channel_id,
                 text: payload.fallback_text,
                 blocks_json: Some(payload.blocks_json),
                 thread_ts,
-            });
+            }) {
+                return;
+            }
             self.set_composer_submission_sensitive(target, false);
             self.set_status(match target {
                 ComposerTarget::Message => "Sending message",
@@ -9284,12 +9286,14 @@ impl ConduitWindow {
                 remove_after_upload: attachment.remove_after_upload,
             })
             .collect();
-        self.send_command(RuntimeCommand::UploadFiles {
+        if !self.send_command(RuntimeCommand::UploadFiles {
             channel_id,
             thread_ts,
             attachments,
             blocks_json: payload.map(|payload| payload.blocks_json),
-        });
+        }) {
+            return;
+        }
         self.set_composer_submission_sensitive(target, false);
         let progress = self.composer_upload_progress(target);
         progress.set_visible(true);
@@ -9770,21 +9774,22 @@ impl ConduitWindow {
                 let name = query_param(url, "name").unwrap_or_else(|| "thumbsup".to_string());
                 let add = query_param(url, "add").is_none_or(|value| value == "true");
                 let thread_ts = query_param(url, "thread_ts");
-                if add {
-                    self.remember_recent_reaction(&name);
-                }
-                self.send_command(RuntimeCommand::SetReaction {
+                if self.send_command(RuntimeCommand::SetReaction {
                     channel_id,
                     ts,
-                    name,
+                    name: name.clone(),
                     add,
                     thread_ts,
-                });
-                self.set_status(if add {
-                    "Adding reaction"
-                } else {
-                    "Removing reaction"
-                });
+                }) {
+                    if add {
+                        self.remember_recent_reaction(&name);
+                    }
+                    self.set_status(if add {
+                        "Adding reaction"
+                    } else {
+                        "Removing reaction"
+                    });
+                }
                 true
             }
             Some("save") => {
@@ -9796,17 +9801,18 @@ impl ConduitWindow {
                 };
                 let add = query_param(url, "add").is_none_or(|value| value == "true");
                 let thread_ts = query_param(url, "thread_ts");
-                self.send_command(RuntimeCommand::SetSaved {
+                if self.send_command(RuntimeCommand::SetSaved {
                     channel_id,
                     ts,
                     add,
                     thread_ts,
-                });
-                self.set_status(if add {
-                    "Saving message"
-                } else {
-                    "Removing saved message"
-                });
+                }) {
+                    self.set_status(if add {
+                        "Saving message"
+                    } else {
+                        "Removing saved message"
+                    });
+                }
                 true
             }
             Some("copy-message") => {
@@ -9900,15 +9906,17 @@ impl ConduitWindow {
         };
 
         let MessageControlSelection::Control(key) = target.selection() else {
-            self.imp()
-                .message_control_registry
-                .borrow_mut()
-                .complete(&control_handle);
             self.set_status("Opening message in Slack");
-            self.send_command(RuntimeCommand::ResolveMessagePermalink {
+            let admitted = self.send_command(RuntimeCommand::ResolveMessagePermalink {
                 channel_id: message_ref.channel_id().to_string(),
                 ts: message_ref.timestamp().to_string(),
             });
+            let mut registry = self.imp().message_control_registry.borrow_mut();
+            if admitted {
+                registry.complete(&control_handle);
+            } else {
+                registry.release(&control_handle);
+            }
             return;
         };
         let Some(control) = message.document.control(key).cloned() else {
@@ -10051,13 +10059,16 @@ impl ConduitWindow {
             "Choose a conversation",
             false,
             move |window, action| {
-                window.send_command(RuntimeCommand::PostMessage {
+                let admitted = window.send_command(RuntimeCommand::PostMessage {
                     channel_id: action.channel_id,
                     text: permalink.clone(),
                     blocks_json: None,
                     thread_ts: None,
                 });
-                window.set_status("Forwarding message");
+                if admitted {
+                    window.set_status("Forwarding message");
+                }
+                admitted
             },
         );
     }
@@ -10136,7 +10147,9 @@ impl ConduitWindow {
     }
 
     pub(crate) fn show_connect_requested(&self) {
-        self.send_session_command(RuntimeCommand::Disconnect);
+        if !self.send_session_command(RuntimeCommand::Disconnect) {
+            return;
+        }
         self.imp().connect_requested.set(true);
         self.clear_last_conversation();
         self.imp()
@@ -11909,17 +11922,18 @@ impl ConduitWindow {
             |window, action| match action.action {
                 ConversationPickerAction::OpenConversation => {
                     let title = window.conversation_title(&action.channel_id);
-                    window.select_conversation(&action.channel_id, &title)
+                    window.select_conversation(&action.channel_id, &title);
+                    true
                 }
                 ConversationPickerAction::JoinChannel => {
                     window.send_command(RuntimeCommand::JoinConversation {
                         channel_id: action.channel_id,
-                    });
+                    })
                 }
                 ConversationPickerAction::OpenDirectMessage => {
                     window.send_command(RuntimeCommand::OpenDirectMessage {
                         user_id: action.channel_id,
-                    });
+                    })
                 }
             },
         );
@@ -12180,9 +12194,9 @@ impl ConduitWindow {
                 if user_ids.len() == 1 {
                     window.send_command(RuntimeCommand::OpenDirectMessage {
                         user_id: user_ids[0].clone(),
-                    });
+                    })
                 } else {
-                    window.send_command(RuntimeCommand::OpenGroupDirectMessage { user_ids });
+                    window.send_command(RuntimeCommand::OpenGroupDirectMessage { user_ids })
                 }
             },
         );
@@ -12200,12 +12214,12 @@ impl ConduitWindow {
                     user_ids.extend(conversation.display_user_ids());
                     user_ids.sort();
                     user_ids.dedup();
-                    window.send_command(RuntimeCommand::OpenGroupDirectMessage { user_ids });
+                    window.send_command(RuntimeCommand::OpenGroupDirectMessage { user_ids })
                 } else {
                     window.send_command(RuntimeCommand::InviteToChannel {
                         channel_id: conversation.id.clone(),
                         user_ids,
-                    });
+                    })
                 }
             },
         );
@@ -12218,7 +12232,7 @@ impl ConduitWindow {
         excluded_user_ids: &[String],
         on_submit: F,
     ) where
-        F: Fn(&Self, Vec<String>) + 'static,
+        F: Fn(&Self, Vec<String>) -> bool + 'static,
     {
         let dialog = gtk::Window::builder()
             .title(title)
@@ -12276,8 +12290,9 @@ impl ConduitWindow {
                 .map(|person| person.user_id.clone())
                 .collect::<Vec<_>>();
             if let Some(window) = weak_window.upgrade() {
-                on_submit(&window, user_ids);
-                dialog_for_submit.close();
+                if on_submit(&window, user_ids) {
+                    dialog_for_submit.close();
+                }
             }
         });
 
@@ -12410,11 +12425,12 @@ impl ConduitWindow {
         let name_for_create = name.clone();
         create.connect_clicked(move |_| {
             if let Some(window) = weak_window.upgrade() {
-                window.send_command(RuntimeCommand::CreateChannel {
+                if window.send_command(RuntimeCommand::CreateChannel {
                     name: name_for_create.text().trim().to_string(),
                     is_private: private.is_active(),
-                });
-                dialog_for_create.close();
+                }) {
+                    dialog_for_create.close();
+                }
             }
         });
         dialog.present();
@@ -12428,7 +12444,7 @@ impl ConduitWindow {
         include_discovery: bool,
         on_activate: F,
     ) where
-        F: Fn(&Self, SidebarRowAction) + 'static,
+        F: Fn(&Self, SidebarRowAction) -> bool + 'static,
     {
         if !include_discovery && self.imp().workspace.conversations.borrow().is_empty() {
             self.set_status(&gettext("No conversations loaded"));
@@ -12532,8 +12548,9 @@ impl ConduitWindow {
         list.connect_row_activated(move |_, row| {
             let action = sidebar_row_action_for_index(&actions_for_activate.borrow(), row.index());
             if let (Some(window), Some(action)) = (weak_window.upgrade(), action) {
-                on_activate(&window, action);
-                dialog_for_activate.close();
+                if on_activate(&window, action) {
+                    dialog_for_activate.close();
+                }
             }
         });
 
@@ -13970,36 +13987,45 @@ impl ConduitWindow {
                     ));
                 }
                 SlackUriResolution::Open => {
-                    self.imp().pending_slack_uris.borrow_mut().pop_front();
-                    self.activate_slack_uri(uri);
-                    opened = true;
+                    if self.activate_slack_uri(uri) {
+                        self.imp().pending_slack_uris.borrow_mut().pop_front();
+                        opened = true;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
         opened
     }
 
-    fn activate_slack_uri(&self, uri: SlackUri) {
+    fn activate_slack_uri(&self, uri: SlackUri) -> bool {
         match uri.target().clone() {
-            SlackUriTarget::Open => self.present(),
+            SlackUriTarget::Open => {
+                self.present();
+                true
+            }
             SlackUriTarget::Channel(channel_id) => {
                 if channel_id.starts_with('D') {
                     let title = self.conversation_title(&channel_id);
                     self.select_conversation(&channel_id, &title);
+                    true
                 } else {
-                    self.open_channel_reference(&channel_id);
+                    self.open_channel_reference(&channel_id)
                 }
             }
             SlackUriTarget::User(user_id) => {
-                self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
+                self.send_command(RuntimeCommand::OpenDirectMessage { user_id })
             }
             SlackUriTarget::File { file_id, action } => {
                 self.show_slack_file(&file_id, action == SlackFileAction::Share);
+                true
             }
             SlackUriTarget::App { app_id, .. } => {
                 if let Some(team_id) = uri.team_id() {
                     self.open_external_link(&slack_app_web_fallback(team_id, &app_id));
                 }
+                true
             }
         }
     }
@@ -14028,7 +14054,6 @@ impl ConduitWindow {
                 false
             }
             NotificationTargetResolution::Open => {
-                self.imp().pending_notification_target.borrow_mut().take();
                 let action = {
                     let conversations = self.imp().workspace.conversations.borrow();
                     conversation_target_action(&target.channel_id, conversations.iter())
@@ -14043,10 +14068,12 @@ impl ConduitWindow {
                         self.visible_channel_id().as_deref() == Some(channel_id.as_str())
                     }
                     ConversationTargetAction::OpenDirectMessage(user_id) => {
-                        self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
-                        true
+                        self.send_command(RuntimeCommand::OpenDirectMessage { user_id })
                     }
                 };
+                if opened {
+                    self.imp().pending_notification_target.borrow_mut().take();
+                }
                 self.present();
                 opened
             }
@@ -14067,7 +14094,7 @@ impl ConduitWindow {
             .unwrap_or_else(|| "Slack".to_string())
     }
 
-    fn open_channel_reference(&self, channel_id: &str) {
+    fn open_channel_reference(&self, channel_id: &str) -> bool {
         if self
             .imp()
             .workspace
@@ -14078,10 +14105,11 @@ impl ConduitWindow {
         {
             let title = self.conversation_title(channel_id);
             self.select_conversation(channel_id, &title);
+            true
         } else {
             self.send_command(RuntimeCommand::JoinConversation {
                 channel_id: channel_id.to_string(),
-            });
+            })
         }
     }
 
@@ -14228,28 +14256,69 @@ impl ConduitWindow {
             .clone()
     }
 
-    fn send_command(&self, command: RuntimeCommand) {
-        let identity = self.imp().request_coordinator.borrow_mut().issue(&command);
-        self.send_identified_command(identity, command);
+    fn send_command(&self, command: RuntimeCommand) -> bool {
+        let (identity, previous) = {
+            let mut coordinator = self.imp().request_coordinator.borrow_mut();
+            let previous = coordinator.clone();
+            (coordinator.issue(&command), previous)
+        };
+        self.send_identified_command(identity, command, previous)
     }
 
-    fn send_session_command(&self, command: RuntimeCommand) {
-        self.imp()
-            .message_control_registry
-            .borrow_mut()
-            .reset_session();
-        let identity = self
-            .imp()
-            .request_coordinator
-            .borrow_mut()
-            .begin_session(&command);
-        self.send_identified_command(identity, command);
+    fn send_session_command(&self, command: RuntimeCommand) -> bool {
+        let (identity, previous) = {
+            let mut coordinator = self.imp().request_coordinator.borrow_mut();
+            let previous = coordinator.clone();
+            (coordinator.begin_session(&command), previous)
+        };
+        let admitted = self.send_identified_command(identity, command, previous);
+        if admitted {
+            self.imp()
+                .message_control_registry
+                .borrow_mut()
+                .reset_session();
+        }
+        admitted
     }
 
-    fn send_identified_command(&self, identity: RuntimeIdentity, command: RuntimeCommand) {
+    fn send_identified_command(
+        &self,
+        identity: RuntimeIdentity,
+        command: RuntimeCommand,
+        previous: RequestCoordinator,
+    ) -> bool {
         let runtime = self.imp().runtime.borrow().clone();
-        if let Some(runtime) = runtime {
-            runtime.send(identity, command);
+        let rejection = match runtime {
+            Some(runtime) => runtime.send(identity, command).err(),
+            None => {
+                let context = command.operation_context();
+                Some(Box::new(RuntimeCommandRejection { context, command }))
+            }
+        };
+        let Some(rejection) = rejection else {
+            return true;
+        };
+        *self.imp().request_coordinator.borrow_mut() = previous;
+        self.handle_command_rejection(rejection);
+        false
+    }
+
+    fn handle_command_rejection(&self, rejection: Box<RuntimeCommandRejection>) {
+        let RuntimeCommandRejection { context, command } = *rejection;
+        let recover_failed_operation = !matches!(
+            &command,
+            RuntimeCommand::SignOut | RuntimeCommand::Disconnect
+        );
+        if let RuntimeCommand::ExecuteMessageAction { control_handle, .. } = &command {
+            self.imp()
+                .message_control_registry
+                .borrow_mut()
+                .release(control_handle);
+        }
+        let failure = RuntimeFailure::validation(gettext("Conduit is busy. Try again."));
+        self.set_status(&failure.message);
+        if recover_failed_operation {
+            self.handle_runtime_error(&context, &failure);
         }
     }
 
@@ -15970,6 +16039,30 @@ mod tests {
             signed_out,
             OperationContext::new(RuntimeOperation::SignOut, RuntimeTarget::Workspace),
         )));
+    }
+
+    #[test]
+    fn request_coordinator_checkpoint_restores_rejected_admission() {
+        let mut coordinator = RequestCoordinator::default();
+        let accepted = coordinator.begin_session(&RuntimeCommand::SearchMessages {
+            query: "accepted".to_string(),
+        });
+        let context = OperationContext::new(RuntimeOperation::Search, RuntimeTarget::Workspace);
+
+        let before_replacement = coordinator.clone();
+        let replacement = coordinator.issue(&RuntimeCommand::SearchMessages {
+            query: "rejected".to_string(),
+        });
+        assert!(!coordinator.accepts(&RuntimeEventMeta::new(accepted, context.clone())));
+        assert!(coordinator.accepts(&RuntimeEventMeta::new(replacement, context.clone())));
+        coordinator = before_replacement;
+        assert!(coordinator.accepts(&RuntimeEventMeta::new(accepted, context.clone())));
+
+        let before_session = coordinator.clone();
+        let _rejected_session = coordinator.begin_session(&RuntimeCommand::Disconnect);
+        assert!(!coordinator.accepts(&RuntimeEventMeta::new(accepted, context.clone())));
+        coordinator = before_session;
+        assert!(coordinator.accepts(&RuntimeEventMeta::new(accepted, context)));
     }
 
     #[test]
@@ -17972,6 +18065,32 @@ mod tests {
             .map(|(source, _)| source)
             .expect("composer submission should be bounded");
         assert!(submit.contains("RuntimeCommand::UploadFiles"));
+    }
+
+    #[test]
+    fn composer_success_state_starts_only_after_runtime_admission() {
+        let source = include_str!("window.rs");
+        let submit = source
+            .split_once("fn submit_composer")
+            .and_then(|(_, source)| source.split_once("fn choose_file_for_upload"))
+            .map(|(source, _)| source)
+            .expect("composer submission should be bounded");
+
+        let post_admission = submit
+            .find("if !self.send_command(RuntimeCommand::PostMessage")
+            .expect("message posting should check runtime admission");
+        let upload_admission = submit
+            .find("if !self.send_command(RuntimeCommand::UploadFiles")
+            .expect("file uploading should check runtime admission");
+        let submission_disabled = submit
+            .find("self.set_composer_submission_sensitive(target, false)")
+            .expect("admitted submission should disable its composer");
+        let upload_progress = submit
+            .find("progress.set_visible(true)")
+            .expect("admitted upload should reveal progress");
+
+        assert!(post_admission < submission_disabled);
+        assert!(upload_admission < upload_progress);
     }
 
     #[test]
