@@ -33,6 +33,17 @@ the rejected command to GTK immediately so request-specific UI state can recover
 the main thread. Session starts remain FIFO and wait for older accepted durable/read work before
 replacement; normal runtime shutdown drains every accepted command lease.
 
+Runtime-to-GTK publication uses a separate FIFO mailbox with capacity 256. Non-progress events wait
+synchronously for space behind FIFO tickets, so task cancellation cannot interrupt publication
+after a workspace patch has been persisted. Attachment-download and file-upload progress are the
+only lossy events. They share a 32-entry sub-cap and replace older queued progress for the same
+session, request, context, and progress kind; progress is dropped when either cap is full or reliable
+publication is already waiting. Matching success or error events remove stale progress before
+entering the reliable FIFO. Sender closure drains accepted events before EOF, while receiver closure
+wakes blocked producers. GTK consumes events serially and yields after each eight-event batch.
+Mailbox metrics cover admission, dequeue, blocking, closure, depth, peak depth, and coalesced or
+dropped progress.
+
 The workspace coordinator classifies every normalized message with the canonical attention policy.
 Realtime persistence first performs a pure preview, then atomically records the observation and
 notification claim. The committed reduction reclassifies under the latest live preference snapshot

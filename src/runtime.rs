@@ -4,7 +4,7 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -82,6 +82,8 @@ const RUNTIME_BACKGROUND_TASK_CAPACITY: usize = 12;
 const RUNTIME_IMAGE_TASK_CAPACITY: usize = 32;
 const RUNTIME_UPLOAD_TASK_CAPACITY: usize = 8;
 const RUNTIME_CONTROL_DISPATCH_BURST: usize = 4;
+const RUNTIME_EVENT_QUEUE_CAPACITY: usize = 256;
+const RUNTIME_EVENT_PROGRESS_CAPACITY: usize = 32;
 const REALTIME_PERSISTENCE_QUEUE_CAPACITY: usize = 256;
 const SOCKET_MODE_INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SOCKET_MODE_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -1379,6 +1381,410 @@ impl RuntimeEventMeta {
 pub struct RuntimeEvent {
     pub meta: RuntimeEventMeta,
     pub kind: RuntimeEventKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeProgressKind {
+    AttachmentDownload,
+    FileUpload,
+}
+
+impl RuntimeEvent {
+    fn progress_kind(&self) -> Option<RuntimeProgressKind> {
+        match self.kind {
+            RuntimeEventKind::AttachmentDownloadProgress { .. } => {
+                Some(RuntimeProgressKind::AttachmentDownload)
+            }
+            RuntimeEventKind::FileUploadProgress { .. } => Some(RuntimeProgressKind::FileUpload),
+            _ => None,
+        }
+    }
+
+    fn replaces_progress(&self, queued: &Self) -> bool {
+        self.meta == queued.meta && self.progress_kind() == queued.progress_kind()
+    }
+
+    fn completes_progress(&self, queued: &Self) -> bool {
+        if self.meta != queued.meta {
+            return false;
+        }
+
+        matches!(
+            (&self.kind, queued.progress_kind()),
+            (
+                RuntimeEventKind::AttachmentDownloaded { .. },
+                Some(RuntimeProgressKind::AttachmentDownload)
+            ) | (
+                RuntimeEventKind::FileUploaded(_),
+                Some(RuntimeProgressKind::FileUpload)
+            ) | (RuntimeEventKind::Error(_), Some(_))
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimeEventMailboxSnapshot {
+    admitted: u64,
+    dequeued: u64,
+    blocked: u64,
+    closed: u64,
+    depth: usize,
+    peak_depth: usize,
+    coalesced_progress: u64,
+    dropped_progress: u64,
+}
+
+#[derive(Debug)]
+struct RuntimeEventMailboxState {
+    queue: VecDeque<RuntimeEvent>,
+    capacity: usize,
+    progress_capacity: usize,
+    progress_depth: usize,
+    next_reliable_ticket: u64,
+    serving_reliable_ticket: u64,
+    sender_count: usize,
+    receiver_open: bool,
+    metrics: RuntimeEventMailboxSnapshot,
+}
+
+impl RuntimeEventMailboxState {
+    fn snapshot(&self) -> RuntimeEventMailboxSnapshot {
+        RuntimeEventMailboxSnapshot {
+            depth: self.queue.len(),
+            ..self.metrics
+        }
+    }
+
+    fn record_admitted(&mut self) {
+        self.metrics.admitted = self.metrics.admitted.saturating_add(1);
+        self.metrics.peak_depth = self.metrics.peak_depth.max(self.queue.len());
+    }
+
+    fn has_reliable_waiters(&self) -> bool {
+        self.next_reliable_ticket != self.serving_reliable_ticket
+    }
+
+    fn reserve_reliable_ticket(&mut self) -> u64 {
+        let ticket = self.next_reliable_ticket;
+        self.next_reliable_ticket = self
+            .next_reliable_ticket
+            .checked_add(1)
+            .expect("runtime event reliable ticket overflow");
+        ticket
+    }
+
+    fn complete_reliable_ticket(&mut self, ticket: u64) {
+        debug_assert_eq!(ticket, self.serving_reliable_ticket);
+        self.serving_reliable_ticket = self
+            .serving_reliable_ticket
+            .checked_add(1)
+            .expect("runtime event reliable ticket overflow");
+        if self.serving_reliable_ticket == self.next_reliable_ticket {
+            self.serving_reliable_ticket = 0;
+            self.next_reliable_ticket = 0;
+        }
+    }
+
+    fn evict_completed_progress(&mut self, terminal: &RuntimeEvent) {
+        let original_depth = self.queue.len();
+        self.queue
+            .retain(|queued| !terminal.completes_progress(queued));
+        let removed = original_depth - self.queue.len();
+        self.progress_depth -= removed;
+        self.metrics.coalesced_progress = self
+            .metrics
+            .coalesced_progress
+            .saturating_add(removed as u64);
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeEventMailboxInner {
+    state: Mutex<RuntimeEventMailboxState>,
+    available: tokio::sync::Notify,
+    space: Condvar,
+}
+
+struct RuntimeEventMailboxSender {
+    inner: Arc<RuntimeEventMailboxInner>,
+}
+
+impl std::fmt::Debug for RuntimeEventMailboxSender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RuntimeEventMailboxSender").finish()
+    }
+}
+
+impl Clone for RuntimeEventMailboxSender {
+    fn clone(&self) -> Self {
+        self.inner
+            .state
+            .lock()
+            .expect("runtime event mailbox lock poisoned")
+            .sender_count += 1;
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Drop for RuntimeEventMailboxSender {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("runtime event mailbox lock poisoned");
+        state.sender_count -= 1;
+        let closed = state.sender_count == 0;
+        drop(state);
+        if closed {
+            // `notify_one` stores a permit if the receiver is between checking
+            // sender_count and polling `notified`, preventing a lost EOF wake.
+            self.inner.available.notify_one();
+        }
+    }
+}
+
+impl RuntimeEventMailboxSender {
+    fn send(&self, event: RuntimeEvent) -> std::result::Result<(), Box<RuntimeEvent>> {
+        let is_progress = event.progress_kind().is_some();
+        let mut event = Some(event);
+        let mut recorded_block = false;
+        let mut reliable_ticket = None;
+
+        loop {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("runtime event mailbox lock poisoned");
+            if !state.receiver_open {
+                state.metrics.closed = state.metrics.closed.saturating_add(1);
+                return Err(Box::new(event.take().expect("runtime event missing")));
+            }
+
+            let pending = event.as_ref().expect("runtime event missing");
+            if is_progress {
+                if state.has_reliable_waiters() {
+                    state.metrics.dropped_progress =
+                        state.metrics.dropped_progress.saturating_add(1);
+                    return Ok(());
+                }
+                if let Some(index) = state
+                    .queue
+                    .iter()
+                    .position(|queued| pending.replaces_progress(queued))
+                {
+                    state.queue.remove(index);
+                    state.progress_depth -= 1;
+                    state.metrics.coalesced_progress =
+                        state.metrics.coalesced_progress.saturating_add(1);
+                } else if state.progress_depth >= state.progress_capacity
+                    || state.queue.len() >= state.capacity
+                {
+                    state.metrics.dropped_progress =
+                        state.metrics.dropped_progress.saturating_add(1);
+                    return Ok(());
+                }
+            } else if reliable_ticket.is_none() && state.has_reliable_waiters() {
+                reliable_ticket = Some(state.reserve_reliable_ticket());
+            }
+
+            if let Some(ticket) = reliable_ticket {
+                if ticket != state.serving_reliable_ticket {
+                    if !recorded_block {
+                        state.metrics.blocked = state.metrics.blocked.saturating_add(1);
+                        recorded_block = true;
+                    }
+                    state = wait_for_runtime_event_space(&self.inner.space, state);
+                    drop(state);
+                    continue;
+                }
+            }
+
+            if !is_progress {
+                state.evict_completed_progress(pending);
+            }
+
+            if state.queue.len() < state.capacity {
+                state
+                    .queue
+                    .push_back(event.take().expect("runtime event missing"));
+                if is_progress {
+                    state.progress_depth += 1;
+                }
+                state.record_admitted();
+                if let Some(ticket) = reliable_ticket {
+                    state.complete_reliable_ticket(ticket);
+                }
+                drop(state);
+                self.inner.available.notify_one();
+                if reliable_ticket.is_some() {
+                    self.inner.space.notify_all();
+                }
+                return Ok(());
+            }
+
+            if reliable_ticket.is_none() {
+                reliable_ticket = Some(state.reserve_reliable_ticket());
+            }
+            if !recorded_block {
+                state.metrics.blocked = state.metrics.blocked.saturating_add(1);
+                recorded_block = true;
+            }
+            state = wait_for_runtime_event_space(&self.inner.space, state);
+            drop(state);
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeEventMailboxSnapshot {
+        self.inner
+            .state
+            .lock()
+            .expect("runtime event mailbox lock poisoned")
+            .snapshot()
+    }
+}
+
+fn wait_for_runtime_event_space<'a>(
+    space: &Condvar,
+    state: std::sync::MutexGuard<'a, RuntimeEventMailboxState>,
+) -> std::sync::MutexGuard<'a, RuntimeEventMailboxState> {
+    let wait = || {
+        space
+            .wait(state)
+            .expect("runtime event mailbox lock poisoned")
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        // Production saturation happens only on the multi-thread runtime while
+        // GLib drains independently. This direct wait is for the pre-runtime
+        // startup thread and tests whose consumer runs on another thread; a
+        // saturated current-thread runtime with an in-runtime consumer would
+        // deadlock and is not a supported mailbox topology.
+        _ => wait(),
+    }
+}
+
+pub struct RuntimeEventReceiver {
+    inner: Arc<RuntimeEventMailboxInner>,
+}
+
+impl RuntimeEventReceiver {
+    pub async fn recv(&mut self) -> Option<RuntimeEvent> {
+        loop {
+            let available = self.inner.available.notified();
+            {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .expect("runtime event mailbox lock poisoned");
+                if let Some(event) = state.queue.pop_front() {
+                    if event.progress_kind().is_some() {
+                        state.progress_depth -= 1;
+                    }
+                    state.metrics.dequeued = state.metrics.dequeued.saturating_add(1);
+                    drop(state);
+                    self.inner.space.notify_all();
+                    return Some(event);
+                }
+                if state.sender_count == 0 {
+                    return None;
+                }
+            }
+            available.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> std::result::Result<RuntimeEvent, mpsc::error::TryRecvError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("runtime event mailbox lock poisoned");
+        if let Some(event) = state.queue.pop_front() {
+            if event.progress_kind().is_some() {
+                state.progress_depth -= 1;
+            }
+            state.metrics.dequeued = state.metrics.dequeued.saturating_add(1);
+            drop(state);
+            self.inner.space.notify_all();
+            return Ok(event);
+        }
+        if state.sender_count == 0 {
+            Err(mpsc::error::TryRecvError::Disconnected)
+        } else {
+            Err(mpsc::error::TryRecvError::Empty)
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> RuntimeEventMailboxSnapshot {
+        self.inner
+            .state
+            .lock()
+            .expect("runtime event mailbox lock poisoned")
+            .snapshot()
+    }
+}
+
+impl Drop for RuntimeEventReceiver {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("runtime event mailbox lock poisoned");
+        state.receiver_open = false;
+        state.queue.clear();
+        state.progress_depth = 0;
+        drop(state);
+        self.inner.space.notify_all();
+    }
+}
+
+fn runtime_event_channel() -> (RuntimeEventMailboxSender, RuntimeEventReceiver) {
+    runtime_event_channel_with_capacity(
+        RUNTIME_EVENT_QUEUE_CAPACITY,
+        RUNTIME_EVENT_PROGRESS_CAPACITY,
+    )
+}
+
+fn runtime_event_channel_with_capacity(
+    capacity: usize,
+    progress_capacity: usize,
+) -> (RuntimeEventMailboxSender, RuntimeEventReceiver) {
+    assert!(capacity > 0, "runtime event capacity must be positive");
+    assert!(
+        progress_capacity <= capacity,
+        "runtime event progress capacity exceeds total capacity"
+    );
+    let inner = Arc::new(RuntimeEventMailboxInner {
+        state: Mutex::new(RuntimeEventMailboxState {
+            queue: VecDeque::with_capacity(capacity),
+            capacity,
+            progress_capacity,
+            progress_depth: 0,
+            next_reliable_ticket: 0,
+            serving_reliable_ticket: 0,
+            sender_count: 1,
+            receiver_open: true,
+            metrics: RuntimeEventMailboxSnapshot::default(),
+        }),
+        available: tokio::sync::Notify::new(),
+        space: Condvar::new(),
+    });
+    (
+        RuntimeEventMailboxSender {
+            inner: inner.clone(),
+        },
+        RuntimeEventReceiver { inner },
+    )
 }
 
 struct RuntimeRequest {
@@ -4038,10 +4444,10 @@ fn spawn_runtime_command_drivers(
 }
 
 impl AppRuntime {
-    pub fn start() -> (Self, mpsc::UnboundedReceiver<RuntimeEvent>) {
+    pub fn start() -> (Self, RuntimeEventReceiver) {
         let (commands, receiver) =
             RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::production());
-        let (events, event_receiver) = mpsc::unbounded_channel::<RuntimeEvent>();
+        let (events, event_receiver) = runtime_event_channel();
 
         thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -4117,10 +4523,7 @@ impl AppRuntime {
     }
 }
 
-async fn run_runtime(
-    commands: RuntimeCommandReceiver,
-    events: mpsc::UnboundedSender<RuntimeEvent>,
-) {
+async fn run_runtime(commands: RuntimeCommandReceiver, events: RuntimeEventMailboxSender) {
     maintain_attachment_cache(None).await;
     let state = Arc::new(Mutex::new(RuntimeState::new(SessionId::default())));
     let oauth = SlackOAuthClient::new();
@@ -4199,6 +4602,21 @@ async fn run_runtime(
         ),
     );
     replace_session_and_drain(&state, SessionId::default()).await;
+    let event_metrics = events.snapshot();
+    crate::debug::log(
+        "runtime",
+        &format!(
+            "RuntimeEventMailboxSummary admitted={} dequeued={} blocked={} closed={} depth={} peak={} coalesced_progress={} dropped_progress={}",
+            event_metrics.admitted,
+            event_metrics.dequeued,
+            event_metrics.blocked,
+            event_metrics.closed,
+            event_metrics.depth,
+            event_metrics.peak_depth,
+            event_metrics.coalesced_progress,
+            event_metrics.dropped_progress,
+        ),
+    );
 }
 
 struct RuntimeDispatchResources<'a> {
@@ -8483,7 +8901,7 @@ trait EventSenderExt {
 
 #[derive(Clone, Debug)]
 struct RuntimeEventSender {
-    sender: mpsc::UnboundedSender<RuntimeEvent>,
+    sender: RuntimeEventMailboxSender,
     session: SessionId,
     request: Option<RequestId>,
     fallback: OperationContext,
@@ -8512,7 +8930,7 @@ impl TestWorkspacePatchSendGate {
 
 impl RuntimeEventSender {
     fn new(
-        sender: mpsc::UnboundedSender<RuntimeEvent>,
+        sender: RuntimeEventMailboxSender,
         identity: RuntimeIdentity,
         fallback: OperationContext,
     ) -> Self {
@@ -8616,6 +9034,444 @@ mod tests {
             .enable_all()
             .build()
             .expect("failed to build admission test runtime")
+    }
+
+    fn mailbox_event(
+        request: u64,
+        context: OperationContext,
+        kind: RuntimeEventKind,
+    ) -> RuntimeEvent {
+        RuntimeEvent {
+            meta: RuntimeEventMeta {
+                session: SessionId(1),
+                request: Some(RequestId::new(request)),
+                context,
+            },
+            kind,
+        }
+    }
+
+    fn mailbox_status_event(request: u64, status: &str) -> RuntimeEvent {
+        mailbox_event(
+            request,
+            OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace),
+            RuntimeEventKind::Status(status.to_string()),
+        )
+    }
+
+    fn mailbox_status(event: RuntimeEvent) -> String {
+        let RuntimeEventKind::Status(status) = event.kind else {
+            panic!("expected status event");
+        };
+        status
+    }
+
+    async fn wait_for_mailbox_block(sender: &RuntimeEventMailboxSender, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sender.snapshot().blocked < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime event producer did not block");
+    }
+
+    #[test]
+    fn runtime_event_mailbox_bounds_capacity_and_preserves_fifo_after_backpressure() {
+        admission_test_runtime().block_on(async {
+            let (sender, mut receiver) = runtime_event_channel_with_capacity(2, 1);
+            sender.send(mailbox_status_event(1, "first")).unwrap();
+            sender.send(mailbox_status_event(2, "second")).unwrap();
+
+            let blocked_sender = sender.clone();
+            let blocked = tokio::spawn(async move {
+                blocked_sender
+                    .send(mailbox_status_event(3, "third"))
+                    .unwrap();
+            });
+            wait_for_mailbox_block(&sender, 1).await;
+            assert_eq!(
+                receiver.snapshot(),
+                RuntimeEventMailboxSnapshot {
+                    admitted: 2,
+                    blocked: 1,
+                    depth: 2,
+                    peak_depth: 2,
+                    ..RuntimeEventMailboxSnapshot::default()
+                }
+            );
+
+            assert_eq!(mailbox_status(receiver.recv().await.unwrap()), "first");
+            tokio::time::timeout(Duration::from_secs(1), blocked)
+                .await
+                .expect("blocked producer did not resume")
+                .unwrap();
+            assert_eq!(mailbox_status(receiver.recv().await.unwrap()), "second");
+            assert_eq!(mailbox_status(receiver.recv().await.unwrap()), "third");
+            let snapshot = receiver.snapshot();
+            assert_eq!(snapshot.admitted, 3);
+            assert_eq!(snapshot.dequeued, 3);
+            assert_eq!(snapshot.depth, 0);
+            assert_eq!(snapshot.peak_depth, 2);
+            assert_eq!(RUNTIME_EVENT_QUEUE_CAPACITY, 256);
+            assert_eq!(RUNTIME_EVENT_PROGRESS_CAPACITY, 32);
+        });
+    }
+
+    #[test]
+    fn runtime_event_mailbox_tickets_prevent_reliable_and_progress_overtaking() {
+        admission_test_runtime().block_on(async {
+            let (sender, mut receiver) = runtime_event_channel_with_capacity(1, 1);
+            sender.send(mailbox_status_event(1, "head")).unwrap();
+
+            let first_sender = sender.clone();
+            let first = tokio::spawn(async move {
+                first_sender
+                    .send(mailbox_status_event(2, "first blocked"))
+                    .unwrap();
+            });
+            wait_for_mailbox_block(&sender, 1).await;
+            let second_sender = sender.clone();
+            let second = tokio::spawn(async move {
+                second_sender
+                    .send(mailbox_status_event(3, "second blocked"))
+                    .unwrap();
+            });
+            wait_for_mailbox_block(&sender, 2).await;
+
+            // Free one slot without waking producers. This creates the exact
+            // scheduling window where a later producer could otherwise barge.
+            let head = {
+                let mut state = receiver
+                    .inner
+                    .state
+                    .lock()
+                    .expect("runtime event mailbox lock poisoned");
+                let head = state.queue.pop_front().unwrap();
+                state.metrics.dequeued = state.metrics.dequeued.saturating_add(1);
+                head
+            };
+            assert_eq!(mailbox_status(head), "head");
+            sender
+                .send(mailbox_event(
+                    4,
+                    OperationContext::new(
+                        RuntimeOperation::AttachmentDownload,
+                        RuntimeTarget::Attachment("download".to_string()),
+                    ),
+                    RuntimeEventKind::AttachmentDownloadProgress {
+                        fraction: 0.5,
+                        label: "must not steal".to_string(),
+                    },
+                ))
+                .unwrap();
+            assert_eq!(sender.snapshot().depth, 0);
+            assert_eq!(sender.snapshot().dropped_progress, 1);
+
+            receiver.inner.space.notify_all();
+            assert_eq!(
+                mailbox_status(
+                    tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                        .await
+                        .expect("first reliable producer stayed blocked")
+                        .unwrap()
+                ),
+                "first blocked"
+            );
+            assert_eq!(
+                mailbox_status(
+                    tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                        .await
+                        .expect("second reliable producer stayed blocked")
+                        .unwrap()
+                ),
+                "second blocked"
+            );
+            first.await.unwrap();
+            second.await.unwrap();
+            assert!(receiver.try_recv().is_err());
+            let snapshot = receiver.snapshot();
+            assert_eq!(snapshot.admitted, 3);
+            assert_eq!(snapshot.dequeued, 3);
+            assert_eq!(snapshot.blocked, 2);
+            assert_eq!(snapshot.dropped_progress, 1);
+            assert_eq!(snapshot.depth, 0);
+        });
+    }
+
+    #[test]
+    fn runtime_event_mailbox_abort_while_full_still_admits_lossless_patch_group() {
+        admission_test_runtime().block_on(async {
+            let (sender, mut receiver) = runtime_event_channel_with_capacity(1, 0);
+            sender.send(mailbox_status_event(1, "head")).unwrap();
+            let event_sender = RuntimeEventSender::new(
+                sender.clone(),
+                RuntimeIdentity {
+                    session: SessionId(1),
+                    request: RequestId::new(2),
+                },
+                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
+            );
+            let patch = WorkspacePatch::new(
+                WorkspaceRevision::INITIAL.successor(),
+                vec![WorkspaceChange::ConversationRemoved {
+                    channel_id: "C1".to_string(),
+                }],
+            )
+            .unwrap();
+            let producer = tokio::spawn(async move {
+                event_sender.send_workspace_patch(patch);
+                event_sender.send_event(RuntimeEventKind::ConversationsSynchronized);
+            });
+            wait_for_mailbox_block(&sender, 1).await;
+            producer.abort();
+
+            assert_eq!(mailbox_status(receiver.recv().await.unwrap()), "head");
+            let patch = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("cancelled producer lost workspace patch")
+                .unwrap();
+            assert!(matches!(patch.kind, RuntimeEventKind::WorkspacePatch(_)));
+            let completion = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("cancelled producer lost grouped completion")
+                .unwrap();
+            assert!(matches!(
+                completion.kind,
+                RuntimeEventKind::ConversationsSynchronized
+            ));
+            let _ = producer.await;
+        });
+    }
+
+    #[test]
+    fn runtime_event_mailbox_bounds_progress_and_keeps_latest_before_terminal() {
+        admission_test_runtime().block_on(async {
+            let (sender, mut receiver) = runtime_event_channel_with_capacity(4, 2);
+            let attachment_context = OperationContext::new(
+                RuntimeOperation::AttachmentDownload,
+                RuntimeTarget::Attachment("download".to_string()),
+            );
+            let upload_context = OperationContext::new(
+                RuntimeOperation::FileUpload,
+                RuntimeTarget::Upload {
+                    channel_id: "C1".to_string(),
+                    thread_ts: None,
+                },
+            );
+            for step in 0..10_000 {
+                let fraction = f64::from(step) / 9_999.0;
+                sender
+                    .send(mailbox_event(
+                        1,
+                        attachment_context.clone(),
+                        RuntimeEventKind::AttachmentDownloadProgress {
+                            fraction,
+                            label: format!("{fraction}"),
+                        },
+                    ))
+                    .unwrap();
+            }
+            let latest = receiver.recv().await.unwrap();
+            assert!(matches!(
+                latest.kind,
+                RuntimeEventKind::AttachmentDownloadProgress { fraction, .. }
+                    if fraction == 1.0
+            ));
+            sender
+                .send(mailbox_event(
+                    1,
+                    attachment_context.clone(),
+                    RuntimeEventKind::AttachmentDownloadProgress {
+                        fraction: 1.0,
+                        label: "complete".to_string(),
+                    },
+                ))
+                .unwrap();
+            sender
+                .send(mailbox_event(
+                    2,
+                    upload_context,
+                    RuntimeEventKind::FileUploadProgress {
+                        fraction: 0.5,
+                        label: "upload".to_string(),
+                    },
+                ))
+                .unwrap();
+            sender
+                .send(mailbox_event(
+                    3,
+                    attachment_context.clone(),
+                    RuntimeEventKind::AttachmentDownloadProgress {
+                        fraction: 0.2,
+                        label: "dropped".to_string(),
+                    },
+                ))
+                .unwrap();
+            assert_eq!(receiver.snapshot().depth, 2);
+            assert_eq!(receiver.snapshot().coalesced_progress, 9_999);
+            assert_eq!(receiver.snapshot().dropped_progress, 1);
+
+            sender
+                .send(mailbox_event(
+                    1,
+                    attachment_context,
+                    RuntimeEventKind::AttachmentDownloaded {
+                        url: "https://example.test/file".to_string(),
+                        name: "file".to_string(),
+                        path: PathBuf::from("/tmp/file"),
+                    },
+                ))
+                .unwrap();
+            let upload = receiver.recv().await.unwrap();
+            assert!(matches!(
+                upload.kind,
+                RuntimeEventKind::FileUploadProgress { .. }
+            ));
+            let terminal = receiver.recv().await.unwrap();
+            assert!(matches!(
+                terminal.kind,
+                RuntimeEventKind::AttachmentDownloaded { .. }
+            ));
+            let snapshot = receiver.snapshot();
+            assert_eq!(snapshot.depth, 0);
+            assert_eq!(snapshot.peak_depth, 2);
+            assert_eq!(snapshot.coalesced_progress, 10_000);
+            assert_eq!(snapshot.dropped_progress, 1);
+        });
+    }
+
+    #[test]
+    fn runtime_event_mailbox_upload_terminal_and_error_evict_pending_progress() {
+        admission_test_runtime().block_on(async {
+            let (sender, mut receiver) = runtime_event_channel_with_capacity(2, 1);
+            let context = OperationContext::new(
+                RuntimeOperation::FileUpload,
+                RuntimeTarget::Upload {
+                    channel_id: "C1".to_string(),
+                    thread_ts: None,
+                },
+            );
+            sender
+                .send(mailbox_event(
+                    1,
+                    context.clone(),
+                    RuntimeEventKind::FileUploadProgress {
+                        fraction: 0.4,
+                        label: "upload".to_string(),
+                    },
+                ))
+                .unwrap();
+            sender
+                .send(mailbox_event(
+                    1,
+                    context.clone(),
+                    RuntimeEventKind::FileUploaded("file".to_string()),
+                ))
+                .unwrap();
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::FileUploaded(_)
+            ));
+            sender
+                .send(mailbox_event(
+                    2,
+                    context.clone(),
+                    RuntimeEventKind::FileUploadProgress {
+                        fraction: 0.8,
+                        label: "retry".to_string(),
+                    },
+                ))
+                .unwrap();
+            sender
+                .send(mailbox_event(
+                    2,
+                    context,
+                    RuntimeEventKind::Error(RuntimeFailure::validation("upload failed")),
+                ))
+                .unwrap();
+
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::Error(_)
+            ));
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(receiver.snapshot().coalesced_progress, 2);
+        });
+    }
+
+    #[test]
+    fn runtime_event_mailbox_receiver_close_wakes_blocked_producer() {
+        admission_test_runtime().block_on(async {
+            let (sender, receiver) = runtime_event_channel_with_capacity(1, 0);
+            sender.send(mailbox_status_event(1, "first")).unwrap();
+            let blocked_sender = sender.clone();
+            let blocked = tokio::spawn(async move {
+                blocked_sender
+                    .send(mailbox_status_event(2, "second"))
+                    .is_err()
+            });
+            wait_for_mailbox_block(&sender, 1).await;
+            drop(receiver);
+
+            assert!(tokio::time::timeout(Duration::from_secs(1), blocked)
+                .await
+                .expect("closed receiver did not wake producer")
+                .unwrap());
+            let snapshot = sender.snapshot();
+            assert_eq!(snapshot.closed, 1);
+            assert_eq!(snapshot.depth, 0);
+        });
+    }
+
+    #[test]
+    fn runtime_event_mailbox_sender_close_drains_before_eof() {
+        admission_test_runtime().block_on(async {
+            let (sender, mut receiver) = runtime_event_channel_with_capacity(2, 0);
+            sender.send(mailbox_status_event(1, "first")).unwrap();
+            sender.send(mailbox_status_event(2, "second")).unwrap();
+            drop(sender);
+
+            assert_eq!(mailbox_status(receiver.recv().await.unwrap()), "first");
+            assert_eq!(mailbox_status(receiver.recv().await.unwrap()), "second");
+            assert!(receiver.recv().await.is_none());
+        });
+    }
+
+    #[test]
+    fn runtime_event_mailbox_preserves_startup_failure_lifecycle_order() {
+        admission_test_runtime().block_on(async {
+            let (sender, mut receiver) = runtime_event_channel_with_capacity(2, 0);
+            let context =
+                OperationContext::new(RuntimeOperation::Startup, RuntimeTarget::Workspace);
+            sender
+                .send(mailbox_event(
+                    1,
+                    context.clone(),
+                    RuntimeEventKind::WorkspaceLifecycle(WorkspaceLifecycleEvent::StartupFailed),
+                ))
+                .unwrap();
+            sender
+                .send(mailbox_event(
+                    1,
+                    context,
+                    RuntimeEventKind::RuntimeStartFailed(RuntimeFailure::validation(
+                        "runtime failed",
+                    )),
+                ))
+                .unwrap();
+            drop(sender);
+
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::WorkspaceLifecycle(WorkspaceLifecycleEvent::StartupFailed)
+            ));
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::RuntimeStartFailed(_)
+            ));
+            assert!(receiver.recv().await.is_none());
+        });
     }
 
     #[test]
@@ -9681,7 +10537,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let session = SessionId::default().next();
             let events = RuntimeEventSender::new(
                 sender,
@@ -9780,7 +10636,7 @@ mod tests {
             assert_eq!(thread_records.len(), 1);
             store.store_thread_catalog(&thread_records).await.unwrap();
 
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender {
                 sender,
                 session: SessionId::default().next(),
@@ -9915,7 +10771,7 @@ mod tests {
                     .unwrap();
 
                 let workspace = WorkspaceReducerAdapter::default();
-                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let (sender, mut receiver) = runtime_event_channel();
                 let events = RuntimeEventSender {
                     sender,
                     session: SessionId::default().next(),
@@ -10056,7 +10912,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let session = SessionId::default().next();
             let first_events = RuntimeEventSender::new(
                 sender.clone(),
@@ -10170,7 +11026,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let session = SessionId::default().next();
             let events = RuntimeEventSender::new(
                 sender,
@@ -10335,7 +11191,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -10549,7 +11405,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -10739,7 +11595,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -10913,7 +11769,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -11107,7 +11963,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -11256,7 +12112,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -11486,7 +12342,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -11784,7 +12640,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -11893,7 +12749,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let session = SessionId::default().next();
             let (publication_started, publication_reached) = std::sync::mpsc::channel();
             let (release_publication, release) = std::sync::mpsc::channel();
@@ -12260,7 +13116,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = runtime_event_channel();
         let events = RuntimeEventSender {
             sender,
             session: SessionId::default().next(),
@@ -12436,7 +13292,7 @@ mod tests {
             let generation = store.recovery_generation();
             let base_revision = workspace.revision();
             assert!(!store.conversation_cache_needs_repair());
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender {
                 sender,
                 session: SessionId::default().next(),
@@ -13043,7 +13899,7 @@ mod tests {
             .build()
             .unwrap();
         let merged = runtime.block_on(async {
-            let (sender, _receiver) = mpsc::unbounded_channel();
+            let (sender, _receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -13531,7 +14387,7 @@ mod tests {
             .expect("failed to build test runtime");
 
         runtime.block_on(async {
-            let (sender, mut events) = mpsc::unbounded_channel();
+            let (sender, mut events) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -13568,7 +14424,7 @@ mod tests {
             .expect("failed to build test runtime");
 
         runtime.block_on(async {
-            let (sender, mut events) = mpsc::unbounded_channel();
+            let (sender, mut events) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -13677,7 +14533,7 @@ mod tests {
             .expect("failed to build test runtime");
         runtime.block_on(async {
             let workspace = WorkspaceReducerAdapter::default();
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 sender,
                 RuntimeIdentity {
@@ -13836,7 +14692,7 @@ mod tests {
             }),
         );
         let base_revision = workspace.revision();
-        let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+        let (runtime_events, mut runtime_receiver) = runtime_event_channel();
         let events = RuntimeEventSender::new(
             runtime_events,
             RuntimeIdentity {
@@ -14107,7 +14963,7 @@ mod tests {
                 std::process::id()
             ));
             let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let (runtime_events, _receiver) = mpsc::unbounded_channel();
+            let (runtime_events, _receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -14203,7 +15059,7 @@ mod tests {
                 WorkspaceMutation::ConversationUpsert(conversation),
             );
             let admission = workspace.store_batch_admission.lock().await;
-            let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut runtime_receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -14352,7 +15208,7 @@ mod tests {
                 WorkspaceMutation::ConversationUpsert(conversation),
             );
 
-            let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut runtime_receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -14507,7 +15363,7 @@ mod tests {
                 MutationOrigin::Cache,
                 WorkspaceMutation::ConversationUpsert(conversation),
             );
-            let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut runtime_receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -14803,7 +15659,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut runtime_receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -14955,7 +15811,7 @@ mod tests {
                 }),
             );
 
-            let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut runtime_receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -15037,7 +15893,7 @@ mod tests {
                 std::process::id()
             ));
             let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut runtime_receiver) = runtime_event_channel();
             let events = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -15214,7 +16070,7 @@ mod tests {
         workspace.update_attention_context(WorkspaceAttentionContext {
             current_user_id: Some("U_SELF".into()),
         });
-        let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+        let (runtime_events, mut runtime_receiver) = runtime_event_channel();
         let events = RuntimeEventSender::new(
             runtime_events,
             RuntimeIdentity {
@@ -15436,7 +16292,7 @@ mod tests {
                 }])
                 .await
                 .unwrap();
-            let (runtime_events, _receiver) = mpsc::unbounded_channel();
+            let (runtime_events, _receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -15530,7 +16386,7 @@ mod tests {
                 }])
                 .await
                 .unwrap();
-            let (runtime_events, mut runtime_receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut runtime_receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -15648,7 +16504,7 @@ mod tests {
                 }])
                 .await
                 .unwrap();
-            let (runtime_events, mut receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -15758,7 +16614,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let (runtime_events, mut receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -15925,7 +16781,7 @@ mod tests {
             );
             let baseline = workspace.attention_metrics_snapshot();
 
-            let (runtime_events, mut receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -15934,6 +16790,24 @@ mod tests {
                 },
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
             );
+            let event_collector = tokio::spawn(async move {
+                let mut notification_events = 0;
+                let mut message_patches = 0;
+                while let Some(event) = receiver.recv().await {
+                    match event.kind {
+                        RuntimeEventKind::AttentionNotificationCandidate { .. } => {
+                            notification_events += 1;
+                        }
+                        RuntimeEventKind::WorkspacePatch(patch)
+                            if !timeline_patch_summary(patch.changes()).is_empty() =>
+                        {
+                            message_patches += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                (notification_events, message_patches, receiver.snapshot())
+            });
             let (sender, persistence_receiver) =
                 realtime_persistence_channel(workspace.attention_metrics_handle());
             let started = Instant::now();
@@ -16054,23 +16928,15 @@ mod tests {
             assert!((1..=REALTIME_PERSISTENCE_QUEUE_CAPACITY as u64).contains(&queue_peak));
             assert_eq!(metrics.queue_rejected, 0);
 
-            let mut notification_events = 0;
-            let mut message_patches = 0;
-            while let Ok(event) = receiver.try_recv() {
-                match event.kind {
-                    RuntimeEventKind::AttentionNotificationCandidate { .. } => {
-                        notification_events += 1;
-                    }
-                    RuntimeEventKind::WorkspacePatch(patch)
-                        if !timeline_patch_summary(patch.changes()).is_empty() =>
-                    {
-                        message_patches += 1;
-                    }
-                    _ => {}
-                }
-            }
+            let (notification_events, message_patches, event_metrics) =
+                event_collector.await.unwrap();
             assert_eq!(notification_events, 500);
             assert_eq!(message_patches, 1_000);
+            assert_eq!(event_metrics.admitted, 1_500);
+            assert_eq!(event_metrics.dequeued, 1_500);
+            assert_eq!(event_metrics.depth, 0);
+            assert!(event_metrics.peak_depth <= RUNTIME_EVENT_QUEUE_CAPACITY);
+            assert_eq!(event_metrics.dropped_progress, 0);
 
             let before_reconciliation = workspace
                 .coordinator
@@ -16226,7 +17092,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let (runtime_events, mut receiver) = mpsc::unbounded_channel();
+            let (runtime_events, mut receiver) = runtime_event_channel();
             let event_sender = RuntimeEventSender::new(
                 runtime_events,
                 RuntimeIdentity {
@@ -17581,7 +18447,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = runtime_event_channel();
         let events = RuntimeEventSender {
             sender,
             session: SessionId::default().next(),
@@ -17668,7 +18534,7 @@ mod tests {
                 MutationOrigin::Cache,
                 WorkspaceMutation::ConversationUpsert(initial.clone()),
             );
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender {
                 sender,
                 session: SessionId::default().next(),
@@ -17745,7 +18611,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+            let (event_sender, mut event_receiver) = runtime_event_channel();
             let events = RuntimeEventSender {
                 sender: event_sender,
                 session: SessionId::default().next(),
@@ -17804,7 +18670,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+            let (event_sender, mut event_receiver) = runtime_event_channel();
             let events = RuntimeEventSender {
                 sender: event_sender,
                 session: SessionId::default().next(),
@@ -18574,7 +19440,7 @@ mod tests {
                     ..Default::default()
                 },
             ];
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender {
                 sender,
                 session: SessionId::default().next(),
@@ -18665,7 +19531,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender {
                 sender,
                 session: SessionId::default().next(),
@@ -18735,7 +19601,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let (sender, mut receiver) = runtime_event_channel();
             let events = RuntimeEventSender {
                 sender,
                 session: SessionId::default().next(),
