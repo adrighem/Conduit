@@ -37,8 +37,24 @@ coordinator transition and resulting effects have finished.
 
 Session replacement and shutdown stop and drain the realtime actor first, then drain and reset the
 huddle actor and wait for its task to finish. Huddle actor metrics contain queue and lifecycle
-metadata only, never huddle payload content or Slack identifiers. This slice bounds huddle state
-coordination; native transport and media-resource admission and teardown remain the next slice.
+metadata only, never huddle payload content or Slack identifiers.
+
+The optional generic native media engine and synthetic harness use another session-scoped mailbox for
+custom GStreamer callbacks. It holds at most 64 entries. SDP, ICE, and failure callbacks are reliable
+FIFO items; statistics use one latest-only entry. Reliable callbacks evict pending statistics first.
+If reliable callbacks fill the mailbox, the next reliable callback clears queued negotiation values,
+emits one terminal `AdmissionSaturated` failure, and closes that generation. Generation checks reject
+callbacks left over from a stopped session after restart.
+
+Native media admission limits SDP to 256 KiB, each ICE candidate to 8 KiB, and remote ICE to 256
+candidates per session. Only one offer promise, one statistics promise, one incoming audio branch,
+and one incoming video branch may exist at a time. Each GStreamer queue allows eight buffers and
+250 ms, uses no byte limit, and leaks downstream. Stop closes and clears callback admission before
+capture and pipeline teardown; repeated stops are safe.
+
+No production runtime event pump consumes this mailbox, and no verified Slack bootstrap or Amazon
+Chime adapter exists. Production native joining therefore remains unavailable. Portal lifecycle,
+production signalling, and synthetic-harness hardening remain a separate next slice.
 
 GTK-to-runtime commands use a separate bounded admission layer before task creation. A reserved FIFO
 serves session and control work, while navigation, interactive, upload, background, and image lanes

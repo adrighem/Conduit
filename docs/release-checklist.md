@@ -30,8 +30,14 @@
 - Confirm unsupported native joining offers **Open in Slack** for the exact team and conversation and does not loop through Conduit's `slack://` handler.
 - Confirm visible huddle notification text contains no participant, channel, workspace, or call details and opens the matching conversation.
 - In the synthetic harness, exercise offer/answer, ICE, mute, camera, screen sharing, reconnect, statistics, and immediate teardown.
+- Fill the 64-entry native media callback mailbox and confirm reliable SDP, ICE, and failure callbacks stay FIFO, only the latest statistics entry remains, and reliable callbacks evict statistics first.
+- Fill the mailbox entirely with reliable callbacks and confirm one terminal `AdmissionSaturated` failure closes that generation, queued SDP and ICE values are cleared, and stale callbacks cannot enter a restarted session.
+- Confirm native media rejects SDP over 256 KiB, ICE candidates over 8 KiB, and more than 256 remote ICE candidates, while allowing at most one offer promise and one statistics promise in flight.
+- Confirm only one incoming audio and one incoming video branch can exist, and every GStreamer queue uses eight buffers, 250 ms, no byte limit, and downstream leaking.
+- Stop native media repeatedly and confirm admission closes and clears before capture and pipeline teardown, with no callback accepted after stop.
 - Cancel screen sharing at each portal step, then stop sharing and leave; every path must close the portal session and PipeWire remote without resuming camera or sharing after reconnect.
 - Review huddle diagnostics and cache data for raw payloads, SDP, ICE/TURN credentials, browser-session values, device identifiers, or captured media.
+- Confirm the optional mailbox remains disconnected from the production runtime event pump and native joining remains unavailable without verified Slack bootstrap and Amazon Chime adapters.
 - Capture real screenshots before adding AppStream screenshot entries.
 
 ## Flatpak

@@ -33,9 +33,38 @@ During session replacement or shutdown, supervision first stops and drains realt
 then drains and resets the huddle actor and waits for the actor task to finish. Actor metrics contain
 queue and lifecycle metadata only, not participant names, call identifiers, room links, or payloads.
 
-This boundary covers huddle state coordination only. Bounded admission and teardown for native
-transport and media resources remain the next implementation slice; the actor boundary does not
-make production native Slack joining available.
+The huddle actor boundary does not make production native Slack joining available. Native media
+callbacks use the separate boundary below only in the optional generic engine and synthetic harness.
+
+## Native media callback admission
+
+Each optional native media session owns a custom callback mailbox with a capacity of 64. SDP, ICE,
+and failure callbacks are reliable and remain FIFO after admission. Statistics are replaceable: the
+mailbox retains only the latest pending statistics update. A reliable callback evicts that statistics
+entry before consuming reliable capacity.
+
+If all 64 entries are reliable, another reliable callback cannot wait safely inside GStreamer. The
+mailbox clears queued SDP and ICE values, emits one terminal `AdmissionSaturated` failure, and closes
+that media generation. Callbacks carry their generation identity, so callbacks from a stopped session
+cannot enter a restarted session.
+
+Admission also enforces these resource limits:
+
+- SDP is at most 256 KiB, and each ICE candidate is at most 8 KiB.
+- A session accepts at most 256 remote ICE candidates.
+- At most one offer promise and one statistics promise may be in flight.
+- At most one incoming audio branch and one incoming video branch may be installed.
+- Every GStreamer queue is limited to eight buffers and 250 ms, with an unlimited byte threshold and
+  downstream leak policy (`max-size-buffers=8`, `max-size-time=250000000`, `max-size-bytes=0`,
+  `leaky=downstream`).
+
+Stopping first closes callback admission and clears queued negotiation values, then tears down
+capture and the pipeline. Repeated stop requests are safe and leave the session stopped.
+
+This mailbox is not connected to a production runtime event pump. Conduit still has no verified Slack
+bootstrap adapter or Amazon Chime signalling and media bridge, so production native joining remains
+unavailable. Portal lifecycle, production signalling, and synthetic-harness hardening are a separate
+next slice.
 
 ## Build options
 
