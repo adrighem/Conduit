@@ -1,5 +1,91 @@
 # Changelog
 
+## [0.4.0](https://github.com/adrighem/Conduit/compare/v0.3.0...v0.4.0) (2026-08-08)
+
+
+### Features
+
+* **assets:** serve bounded timeline cache entries ([44f1c0f](https://github.com/adrighem/Conduit/commit/44f1c0f6979eba2fe72239e9f95a912c7600becc))
+* **composer:** add rich formatting toolbars ([467cc7d](https://github.com/adrighem/Conduit/commit/467cc7d045af65b432d3618f7d6dda5983bcc123))
+* **composer:** model Slack rich text ([096cc88](https://github.com/adrighem/Conduit/commit/096cc888a4404d7cc82ed037e89a3e1c847ec38f))
+* **composer:** persist and send rich drafts ([62a0d7a](https://github.com/adrighem/Conduit/commit/62a0d7a27fa9afd7739cf2b142d36e2ea19e12fc))
+* **composer:** send staged media in one batch ([2bfa87e](https://github.com/adrighem/Conduit/commit/2bfa87e9f8e52d75974ecb07d2bd93d8000f7771))
+* **composer:** stage attachment previews ([e9ed127](https://github.com/adrighem/Conduit/commit/e9ed1276e3ac4ae3c916c4ea9adfdfa903e5e397))
+* **emoji:** add bounded picker bridge protocol ([d9382e8](https://github.com/adrighem/Conduit/commit/d9382e8cc2cbcd6ae14d3c9fe0e0d24ddd689bdc)), closes [#10](https://github.com/adrighem/Conduit/issues/10)
+* **emoji:** materialize picker results on demand ([c115324](https://github.com/adrighem/Conduit/commit/c11532455d9b4ff64e803f5e04a4eb6d4e50c1ce)), closes [#10](https://github.com/adrighem/Conduit/issues/10)
+* **messages:** edit last sent message ([c5c1d08](https://github.com/adrighem/Conduit/commit/c5c1d085fac569529c62c155b809e1e8470dd750))
+* **messages:** execute Slack app callback buttons ([acfdc0c](https://github.com/adrighem/Conduit/commit/acfdc0c800d255636ff0c4e8fad7a25a53c1bfa2))
+* **metrics:** add pipeline activity counters ([0e3939f](https://github.com/adrighem/Conduit/commit/0e3939f6ea348a903c26a63a44f92a000b23f313)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **navigation:** restore last conversation ([725a59c](https://github.com/adrighem/Conduit/commit/725a59c8ef31e89421738d588ddd5e74be84e847))
+* **reactions:** rank four quick responses by usage ([8528d0a](https://github.com/adrighem/Conduit/commit/8528d0ada351f69bd7c99c6584710994598076c8))
+* **runtime:** integrate bounded SyncJob scheduler ([e056d48](https://github.com/adrighem/Conduit/commit/e056d4804c06f00902c837a226803714d0ad4927)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **sidebar:** define keyed projection operations ([5cb5167](https://github.com/adrighem/Conduit/commit/5cb5167ad85503fbe9862a041be36a5b80a0c47c)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **sidebar:** migrate to incremental list view ([fdc127c](https://github.com/adrighem/Conduit/commit/fdc127cb8bc78d01c77af2d79af6522d5cdafe38)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **sidebar:** prioritize unread conversations ([028bc3f](https://github.com/adrighem/Conduit/commit/028bc3fc97ae77a56394ee556ea43520802d0e94))
+* **slack:** post rich text blocks ([bb868ec](https://github.com/adrighem/Conduit/commit/bb868ec4c1d1657f96f3d531cfc3d29dbdb06847))
+* **status:** align emoji picker layout ([47ee7eb](https://github.com/adrighem/Conduit/commit/47ee7ebe12c54258b2eca1d916311b1fc76e9284)), closes [#10](https://github.com/adrighem/Conduit/issues/10)
+* **store:** execute coordinator batches atomically ([820aef1](https://github.com/adrighem/Conduit/commit/820aef1c1201ff125d1a666e2adf7d1ee2bc4ffe)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **store:** persist message deltas ([0982111](https://github.com/adrighem/Conduit/commit/0982111e6448917e1f6b37ea3babd4e0a46dfb03)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **sync:** add scheduler counters ([147f934](https://github.com/adrighem/Conduit/commit/147f934bebcb2a818f1a2077b43d6a8e6223a110)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **sync:** add scheduler lifecycle ([841d550](https://github.com/adrighem/Conduit/commit/841d5501ea2d517976ec62fa201934ddd423cba4)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **sync:** bound scheduler admission ([cded7d7](https://github.com/adrighem/Conduit/commit/cded7d7e8e0480472cb697ed0fbcb9e2380e2857)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **sync:** define bounded job contracts ([a5b6742](https://github.com/adrighem/Conduit/commit/a5b6742867e451ec47ce650c1735202d2d1ff663)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **thread:** create WebView on first open ([9e415cf](https://github.com/adrighem/Conduit/commit/9e415cfab5622709f623a24721cce47d1e45d8db)), closes [#10](https://github.com/adrighem/Conduit/issues/10)
+* **timeline:** batch incremental frame updates ([b1f136a](https://github.com/adrighem/Conduit/commit/b1f136a06aaf8c3829819d5c59c2b29e6d849b49))
+* **timeline:** define revisioned presenter contract ([9a37fad](https://github.com/adrighem/Conduit/commit/9a37fada7bbc5dac55ee52e79dcf25304ee1372a)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **timeline:** increase unread message visibility threshold to 90% ([df56697](https://github.com/adrighem/Conduit/commit/df56697873bdc38ac82ebfd11086949ad74f588f))
+* **ui:** open profiles from DM titles ([8f92c5f](https://github.com/adrighem/Conduit/commit/8f92c5fa284fc65c3680c09a27cdcca149e7b500))
+* **workspace:** centralize conversation authority ([0bff772](https://github.com/adrighem/Conduit/commit/0bff772fed534bc78147de0c873ef3cf2d034389)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **workspace:** deliver revisioned conversation patches ([0e39acd](https://github.com/adrighem/Conduit/commit/0e39acd8b51fd53928cea66ec5ae0184af56f46a)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **workspace:** persist conversation refresh batches ([e451ce0](https://github.com/adrighem/Conduit/commit/e451ce0d2cfc4ddc73583b375e651e9e95c81999)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **workspace:** persist prefetched history ([2eb1c6d](https://github.com/adrighem/Conduit/commit/2eb1c6d889ed8a69c0af6215d2042fe8258cb225)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **workspace:** unify history and realtime authority ([3c1adf8](https://github.com/adrighem/Conduit/commit/3c1adf8fc17ef40fe5708b028fb3a2257cda3569)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+
+
+### Bug Fixes
+
+* **ci:** release view borrow before await ([20fa47f](https://github.com/adrighem/Conduit/commit/20fa47f0bcd0693319b2a5ea15c2e69491695376)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **ci:** satisfy pinned clippy ([84b5474](https://github.com/adrighem/Conduit/commit/84b54744063644e9b7150245c9e3d7253e4ace44)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **ci:** scope pending-write test lock ([1523d6c](https://github.com/adrighem/Conduit/commit/1523d6c53b24fa003d1cffbcf4e986accbc360b3)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **composer:** make formatting controls square ([6ecc627](https://github.com/adrighem/Conduit/commit/6ecc6272a6acc535553bee770b4fe4bb045d20b0))
+* **composer:** preserve rich formatting on send ([6921b56](https://github.com/adrighem/Conduit/commit/6921b5633697a63930d5f6118a164da610dfc1e3))
+* **composer:** repair build startup and preview layout ([0b7213f](https://github.com/adrighem/Conduit/commit/0b7213f1b5a1031aa45a45040c4482be9631ee01))
+* **composer:** use explicit slice iteration ([9094a5f](https://github.com/adrighem/Conduit/commit/9094a5f390cc617287f42c694f33e55ae65c4471))
+* **emoji:** render Slack skin-tone modifiers everywhere ([206a712](https://github.com/adrighem/Conduit/commit/206a712b030526bfca3d5b0035ac250b3fd08bdb))
+* **emoji:** resolve Slack canonical reaction names ([82c622d](https://github.com/adrighem/Conduit/commit/82c622d2279f96993bb6f68a70665feec937e561))
+* **huddles:** bound native media callbacks ([ad2a153](https://github.com/adrighem/Conduit/commit/ad2a153b409e5068f6aa529150e44b80fbd19a61)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **huddles:** harden session teardown ([38bf6c6](https://github.com/adrighem/Conduit/commit/38bf6c6260e3111892531c2ca9564f70d2b8857f)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **messages:** preserve URL preview images ([c3a7eb1](https://github.com/adrighem/Conduit/commit/c3a7eb169e1f8a469ef93a5ab07cbe5c142b9cd3))
+* **messages:** render animated Slack GIF shares ([8129099](https://github.com/adrighem/Conduit/commit/8129099f16a05fde767d2c2e4c2a0d1d0788fd90))
+* **messages:** render attachment-embedded GIF blocks ([fbe931c](https://github.com/adrighem/Conduit/commit/fbe931cac763a27ab5b4302f52b95d6fe837f79f))
+* **runtime:** admit startup follow-up sync jobs ([91303bb](https://github.com/adrighem/Conduit/commit/91303bb8dfb420c0c67f22e3f8def5fc11feb70b)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **runtime:** bound command admission before task creation ([7ecc75c](https://github.com/adrighem/Conduit/commit/7ecc75c4de439591b8a71aa48a2d4b32b439e3e0)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **runtime:** bound huddle actor admission ([321eab8](https://github.com/adrighem/Conduit/commit/321eab853df09e6ee90b15e25f00189bf07322a0)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **runtime:** bound runtime event publication ([7c644ab](https://github.com/adrighem/Conduit/commit/7c644ab2e14f574632d299743258f29d703d6a3d))
+* **runtime:** drain realtime work on session shutdown ([65e16fd](https://github.com/adrighem/Conduit/commit/65e16fdb4cf6d84aea97b372ba5c19377a8e35c5)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **runtime:** optimize startup user directory sync ([6590ad0](https://github.com/adrighem/Conduit/commit/6590ad079985dc8ce057b04e6658eb0977767fc2)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **runtime:** schedule startup workspace refresh with Interactive priority ([be3309d](https://github.com/adrighem/Conduit/commit/be3309d6d68580161c6c8e19ab65f30a21fabd46)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **runtime:** use div_ceil for preview bounds ([a99cd59](https://github.com/adrighem/Conduit/commit/a99cd596f73777bdcc8876902009e163f5fbd564)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **status:** animate custom emoji previews ([a4fcab4](https://github.com/adrighem/Conduit/commit/a4fcab4e8c73b3d88b5d68a1bf2351f7b19e26cc)), closes [#10](https://github.com/adrighem/Conduit/issues/10)
+* **status:** render selected custom emoji preview ([51522cd](https://github.com/adrighem/Conduit/commit/51522cdb7b610f36c2f1bea232c087d60f829ebf)), closes [#10](https://github.com/adrighem/Conduit/issues/10)
+* **status:** satisfy picker type lint ([46e1f95](https://github.com/adrighem/Conduit/commit/46e1f95d78d40de837193ae584fe7a87aee77156)), closes [#10](https://github.com/adrighem/Conduit/issues/10)
+* **store:** harden coordinator batch recovery ([c8b31da](https://github.com/adrighem/Conduit/commit/c8b31daf8f688be655666685ac6eb54b3c3898cd)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **store:** preserve conversation authority ([640658d](https://github.com/adrighem/Conduit/commit/640658dfc7261001ec9a1cc02a51dee29fba2d71)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **store:** satisfy current clippy iterator rules ([0501fef](https://github.com/adrighem/Conduit/commit/0501fef58a70266e47019fe0fb3ef0bf4701143a)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **thread:** satisfy strict lazy renderer lint ([014708a](https://github.com/adrighem/Conduit/commit/014708a0426473e9a0d1ba30e7f34459a969db7c)), closes [#10](https://github.com/adrighem/Conduit/issues/10)
+* **timeline:** bound cached preview assets ([a102fca](https://github.com/adrighem/Conduit/commit/a102fcaf63f2d5e6873290c43dbb746eb4a95fc6)), closes [#9](https://github.com/adrighem/Conduit/issues/9)
+* **unread:** acknowledge only visible activity ([9d9019b](https://github.com/adrighem/Conduit/commit/9d9019b9c219613d9ba91f7ec5af36b35903db80)), closes [#11](https://github.com/adrighem/Conduit/issues/11)
+* **window:** dismiss syncing screen immediately when local cache is loaded ([1e021f4](https://github.com/adrighem/Conduit/commit/1e021f4f8671d621846a74b81129042def94ea0c)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **window:** keep new message picker responsive ([d204494](https://github.com/adrighem/Conduit/commit/d2044943654e0d8fbcef79f50e4a295b2ef3a682))
+* **window:** resume cached workspace startup ([706c496](https://github.com/adrighem/Conduit/commit/706c496604e6dc28efc39adbefc1c7ec9b00476a)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+
+
+### Performance Improvements
+
+* **runtime:** bound realtime persistence ([fcf641c](https://github.com/adrighem/Conduit/commit/fcf641ce05b9f046a288313d0e68069e6c9024ea)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+* **sidebar:** borrow conversation catalog reads ([130266c](https://github.com/adrighem/Conduit/commit/130266c5681003ed4df353e8de8d610defa82cd9))
+* **sidebar:** update changed rows incrementally ([80e672f](https://github.com/adrighem/Conduit/commit/80e672f5840824d29fbb03be909d9ecef7db8107)), closes [#12](https://github.com/adrighem/Conduit/issues/12)
+
 ## [0.3.0](https://github.com/adrighem/Conduit/compare/v0.2.0...v0.3.0) (2026-07-29)
 
 
