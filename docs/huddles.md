@@ -63,8 +63,42 @@ capture and the pipeline. Repeated stop requests are safe and leave the session 
 
 This mailbox is not connected to a production runtime event pump. Conduit still has no verified Slack
 bootstrap adapter or Amazon Chime signalling and media bridge, so production native joining remains
-unavailable. Portal lifecycle, production signalling, and synthetic-harness hardening are a separate
-next slice.
+unavailable.
+
+## Generic signalling and teardown
+
+The optional generic signalling path bounds bootstrap material before retaining it. Meeting,
+attendee, and call identifiers are each limited to 512 bytes; a service URL is limited to 8 KiB; a
+join token is limited to 16 KiB; and a session accepts at most 16 TURN URIs of at most 2 KiB each. A
+second join is rejected while another join or cleanup remains pending. Bootstrap or bridge connection
+failure attempts rollback of every acquired resource and retains failed obligations for retry.
+
+Stop attempts every cleanup step even when an earlier step fails. Each failed obligation remains
+owned by the session and is retried by the next stop; only completed obligations are discarded. Stop
+is idempotent, including a no-op for an idle session. Diagnostics redact join tokens, service URLs,
+TURN credentials, and negotiation payloads. Teardown clears all retained volatile copies.
+
+The optional ScreenCast portal path keeps session cleanup explicit:
+
+- `CreateSession` is driven to completion after it starts, even if cooperative cancellation arrives,
+  so any returned session handle can be closed. Callers must continue polling both request and close
+  futures.
+- The PipeWire file descriptor is transferred at most once. Teardown releases it before awaiting the
+  portal close.
+- Close is idempotent and retryable. A failed close retains its cleanup lease. When an operation and
+  its cleanup both fail, the operation remains the primary error and the pending lease accompanies it.
+- Destruction does not spawn asynchronous cleanup. Arbitrary task abort and a generation-owning
+  production supervisor remain future actor work.
+
+The synthetic harness treats setup as one transaction. Failed setup rolls back acquired resources;
+leave detaches media, closes the portal, stops media, disconnects the bridge, releases bootstrap, then
+stops the coordinator. It attempts every safe cleanup step and retains failed obligations for a later
+retry. Coordinator state cannot become idle until media has stopped. Repeated leave is a no-op after
+cleanup completes.
+
+These signalling, portal, and harness contracts remain generic and synthetic-only. No production
+runtime event pump consumes them. Verified Slack bootstrap and Amazon Chime adapters remain absent,
+so production native joining remains unavailable.
 
 ## Build options
 

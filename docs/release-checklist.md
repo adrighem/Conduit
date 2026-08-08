@@ -35,9 +35,17 @@
 - Confirm native media rejects SDP over 256 KiB, ICE candidates over 8 KiB, and more than 256 remote ICE candidates, while allowing at most one offer promise and one statistics promise in flight.
 - Confirm only one incoming audio and one incoming video branch can exist, and every GStreamer queue uses eight buffers, 250 ms, no byte limit, and downstream leaking.
 - Stop native media repeatedly and confirm admission closes and clears before capture and pipeline teardown, with no callback accepted after stop.
-- Cancel screen sharing at each portal step, then stop sharing and leave; every path must close the portal session and PipeWire remote without resuming camera or sharing after reconnect.
+- Exercise generic signalling with meeting, attendee, and call identifiers at 512 and 513 bytes, a service URL at 8 KiB and 8 KiB plus one byte, and a join token at 16 KiB and 16 KiB plus one byte.
+- Exercise TURN configuration with 16 and 17 URIs and with URI sizes of 2 KiB and 2 KiB plus one byte; exact limits must succeed and every plus-one case must fail without retaining volatile input.
+- Reject a second join while bootstrap, bridge connection, or cleanup is pending. Inject bootstrap and bridge connection failures and confirm all acquired resources roll back.
+- Fail each signalling cleanup step in turn. Confirm every other step is attempted, failed obligations survive for retry, completed obligations are not repeated, an idle stop is a no-op, and diagnostics contain no join token, service URL, TURN credential, or negotiation value.
+- Request cancellation before and during `CreateSession`, `SelectSources`, `Start`, and `OpenPipeWireRemote`. An in-flight `CreateSession` must finish and yield a closeable lease; callers must drive request and close futures to completion.
+- Transfer the PipeWire file descriptor once, then stop sharing and leave. Confirm the descriptor is released before the awaited portal close and cannot be transferred again.
+- Fail portal close after a primary request failure and confirm the primary error is preserved with a retryable cleanup lease. Retry close to success, repeat close as a no-op, and confirm no cleanup task is spawned by destruction.
+- Fail each synthetic-harness setup and leave step. Confirm rollback and leave attempt media detach, portal close, media stop, bridge disconnect, bootstrap release, and coordinator finalization in that order; failed obligations retry, coordinator state remains non-idle while media is active, and repeated successful leave is a no-op.
+- Confirm every cancellation and cleanup-failure path leaks no portal session, PipeWire file descriptor, microphone, camera, or screen capture, and reconnect does not resume camera or sharing.
 - Review huddle diagnostics and cache data for raw payloads, SDP, ICE/TURN credentials, browser-session values, device identifiers, or captured media.
-- Confirm the optional mailbox remains disconnected from the production runtime event pump and native joining remains unavailable without verified Slack bootstrap and Amazon Chime adapters.
+- Confirm the optional mailbox, generic signalling, portal, and synthetic harness remain disconnected from the production runtime event pump and native joining remains unavailable without verified Slack bootstrap and Amazon Chime adapters.
 - Capture real screenshots before adding AppStream screenshot entries.
 
 ## Flatpak

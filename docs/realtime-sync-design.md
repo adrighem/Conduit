@@ -53,8 +53,30 @@ and one incoming video branch may exist at a time. Each GStreamer queue allows e
 capture and pipeline teardown; repeated stops are safe.
 
 No production runtime event pump consumes this mailbox, and no verified Slack bootstrap or Amazon
-Chime adapter exists. Production native joining therefore remains unavailable. Portal lifecycle,
-production signalling, and synthetic-harness hardening remain a separate next slice.
+Chime adapter exists. Production native joining therefore remains unavailable.
+
+The optional generic signalling layer bounds meeting, attendee, and call identifiers at 512 bytes
+each, service URLs at 8 KiB, join tokens at 16 KiB, and TURN configuration at 16 URIs of 2 KiB each.
+It rejects another join while a join or cleanup is pending. Bootstrap and bridge connection failures
+attempt rollback of every acquired resource and retain failed obligations for retry. Stop attempts
+every cleanup obligation, retains failures for retry, discards only completed obligations, and is an
+idempotent no-op when idle. Secrets are redacted from diagnostics and retained volatile negotiation
+material is cleared during cleanup.
+
+Portal requests use cooperative cancellation between lifecycle steps, but never abandon an in-flight
+`CreateSession`: it is driven to completion so any returned session can be closed. File-descriptor
+ownership transfers once and the PipeWire descriptor is released before the portal close is awaited.
+Close is explicit, idempotent, and retryable; no asynchronous cleanup is spawned from destruction. If
+an operation fails and closing also fails, the primary failure is preserved with a pending cleanup
+lease. The caller must drive request and close futures. Arbitrary task abort and generation-owned
+supervision remain future production actor work.
+
+The synthetic harness makes setup transactional. Rollback and leave attempt, in order, media detach,
+portal close, media stop, bridge disconnect, bootstrap release, and coordinator stop. Failed cleanup
+obligations remain pending for retry; coordinator state cannot become idle before media stops;
+repeated leave is a no-op once all obligations finish. This signalling, portal, and harness path is
+generic and synthetic-only. No production runtime event pump consumes it, and production Slack/Chime
+joining remains unavailable.
 
 GTK-to-runtime commands use a separate bounded admission layer before task creation. A reserved FIFO
 serves session and control work, while navigation, interactive, upload, background, and image lanes
