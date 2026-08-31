@@ -511,3 +511,16 @@
 - Coverage tooling is not configured. Local strict Clippy remains unavailable because installed Clippy is Rust 1.87 while CI uses the project toolchain.
 - Exact-head CI first exposed Rust 1.97's `type_complexity` lint on the picker callback. Commit `46e1f95` introduced a named handler type, after which CI `30809821964`, CodeQL `30809821289`, and guarded release automation `30810336492` passed.
 - No issue comments, labels, closures, or pull request actions were performed.
+
+## 2026-08-31 Security Remediation & Maintainer Pass
+
+- Scope: address CodeQL high-severity cleartext logging of sensitive information alerts #2 and #3 in `src/auth.rs` and `src/runtime.rs`.
+- Remediated cleartext logging vulnerabilities:
+  - In `src/auth.rs`, replaced dynamic error/token formatting inside `auth_debug` stderr logs with static, redacted strings to cut CodeQL taint flows originating from OAuth callback web query-params.
+  - In `src/runtime.rs`, modified test-assertion panic strings to use static failure messages, preventing the static trace runner from formatting potentially tainted secret or output strings in failure flows.
+- Local checks:
+  - `cargo fmt --check`: pass (after executing automatic formatting)
+  - `cargo test --locked`: pass, 1092 tests passed
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, all 17 integration and headless UI test suites passed
+- No public GitHub action was taken. Pushing the local commits requires explicit approval.

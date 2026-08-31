@@ -197,3 +197,9 @@
 - Fixed ISSUE:12's startup scheduler integration first because constant cancellation identity `0` deterministically rejected follow-up refresh and user-directory jobs.
 - Established a pure keyed `SidebarProjection` before changing GTK widgets. Large-workspace tests require one row update or insertion to remain local.
 - No public GitHub action was taken.
+
+## 2026-08-31 Security Remediation
+
+- Decided to remediate the high-severity CodeQL cleartext logging alerts in `src/auth.rs` and `src/runtime.rs` immediately by eliminating dynamic, tainted values from stderr/panic sinks.
+- In `src/auth.rs`, replaced dynamic formatting of the OAuth callback `callback.error` parameter and token exchange properties (`team_id`, `user_id`, `scope`) with static log messages (`"Slack returned authorize error"`, `"token exchange succeeded"`). Returning the original error message in the return `Result` remains safe since the return value does not flow to a logging/stderr sink.
+- In `src/runtime.rs`, replaced trace assertion failure formatting containing `{secret}` or `{output}` with static string failure messages (`"trace leaked confidential content"`, `"trace omitted expected stable trace category"`, `"attention trace leaked private input"`). This maintains test assertion logic while preventing the test panic from acting as a static-analysis logging leak.

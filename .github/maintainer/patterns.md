@@ -132,3 +132,11 @@
 - Best-effort cache persistence should follow the authoritative UI event when a later sync can reconstruct the cache.
 - Deferred persistence needs a shutdown path. Mark pending mutations explicitly, clear the marker only after a successful write, and make close-time flush honor it even when visible editor state is unchanged.
 - Bottom-pinned timeline updates do not need anchor discovery. Avoid whole-timeline scans and forced layout unless preserving a scrolled-up reading position.
+
+## 2026-08-31 Security Taint Mitigation
+
+- Static code analysis engines (such as CodeQL) employ conservative, broad taint propagation tracking. If any field of a parsed network/untrusted response is considered sensitive (like authentication tokens or query-string params), the entire deserialized structure is often tainted.
+- Standard trace outputs (such as stderr, stdout, or logs) and panic handlers (including assertion failure formatting) act as taint sinks. Formatting any part of a tainted struct or string into these sinks triggers cleartext logging alerts.
+- Mitigate this safely and robustly by:
+  1. Separating technical debugging (which can print static progress details like `"token exchange succeeded"` or `"Slack returned authorize error"`) from error propagation (which can return the original dynamic error up the stack via a typed `Result` or `anyhow!`).
+  2. Employing static assertion failure messages instead of formatting variables in unit-test panics when testing trace outputs or redaction behavior. This preserves full test assertion strength while entirely severing the taint flow.
