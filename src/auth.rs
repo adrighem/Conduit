@@ -203,7 +203,7 @@ impl SlackOAuthClient {
         }
 
         if let Some(error) = callback.error {
-            auth_debug(debug, &format!("Slack returned authorize error={error}"));
+            auth_debug(debug, "Slack returned authorize error");
             return Err(anyhow!("Slack authorization failed: {error}"));
         }
 
@@ -529,15 +529,7 @@ async fn exchange_user_code(
     .await?;
 
     let token = token_from_response(response, Some(client_id), None)?;
-    auth_debug(
-        debug,
-        &format!(
-            "token exchange succeeded team_id={} user_id={} scope={}",
-            token.team_id.as_deref().unwrap_or("<unknown>"),
-            token.user_id.as_deref().unwrap_or("<unknown>"),
-            token.scope.as_deref().unwrap_or("<unknown>")
-        ),
-    );
+    auth_debug(debug, "token exchange succeeded");
     Ok(token)
 }
 

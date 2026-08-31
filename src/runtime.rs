@@ -14397,7 +14397,10 @@ mod tests {
             "preview",
             "private filename",
         ] {
-            assert!(!output.contains(secret), "trace leaked {secret}: {output}");
+            assert!(
+                !output.contains(secret),
+                "trace leaked confidential content"
+            );
         }
     }
 
@@ -14478,7 +14481,7 @@ mod tests {
         ] {
             assert!(
                 output.contains(expected),
-                "trace omitted {expected}: {output}"
+                "trace omitted expected stable trace category"
             );
         }
         for private in [
@@ -14491,7 +14494,7 @@ mod tests {
         ] {
             assert!(
                 !output.contains(private),
-                "attention trace leaked private input: {output}"
+                "attention trace leaked private input"
             );
         }
     }
