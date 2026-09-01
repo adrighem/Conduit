@@ -1,7 +1,7 @@
 {
   "track_id": "lazy_webview_emoji_20260729",
   "type": "performance",
-  "status": "in_progress",
+  "status": "completed",
   "created_at": "2026-07-29T18:55:04Z",
   "updated_at": "2026-08-04T09:34:01Z",
   "description": "Lazy-create the thread WebView and materialize bounded emoji picker results on demand."
