@@ -19,6 +19,7 @@ Conduit is a lightweight GNOME desktop client for Slack written in Rust with GTK
 - Adaptive sidebar navigation for messages, unread conversations, files, and saved items.
 - Priority sidebar section presenting starred VIP direct messages and channels.
 - Fast Ctrl-K conversation switcher with unread-aware ranking across active and cached conversations.
+- Lazy secondary WebViews and on-demand bounded emoji picker with usage-ranked quick reactions.
 - Native WYSIWYG rich-text composer with mention autocompletion, inline formatting, and staged media file sharing.
 - Cached conversations and message histories.
 - Actionable desktop notifications and internal navigation from search results.

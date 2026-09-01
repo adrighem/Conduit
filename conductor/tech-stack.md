@@ -65,6 +65,8 @@
 - `WorkspaceViewState` consumes workspace patches to update cached projections and derives the narrow sidebar, title, picker, main-view, and thread presentation changes needed for each patch.
 - Each message WebView owns a revision-aware timeline presenter. Navigation loads a generated document, while cached-to-fresh snapshots, realtime messages, response regions, user details, and loaded media are coalesced into one anchor-preserving typed DOM delta per GTK frame; full reloads are reserved for initial navigation, revision mismatch, and unrecoverable presentation recovery.
 - Cached message media uses an exact raster/video MIME allowlist, content-signature validation, and 8/16 MiB per-file bounds. Raw payloads live under workspace-scoped SHA-256 keys in a deterministic 512 MiB/16,384-entry/30-day disk cache; failed enforcement rolls back the new file. The UI retains only descriptors for a 64 MiB/2,048-entry logical ready set, with bounded source and request state. A private `conduit-asset` WebKit scheme revalidates each file, serves only registered keys with bounded single-range video responses, and invalidates broken DOM sources before one recovery attempt.
+- The thread timeline WebView is created lazily on first thread open to minimize baseline process-tree footprint.
+- The emoji reaction and status pickers use an on-demand, bounded native query model with usage-ranked quick reactions and full Slack skin-tone modifier sequence composition.
 - Desktop notifications use stable workspace/user/channel IDs and typed application actions so activation can survive a cold start.
 
 ## External Slack URI Integration
