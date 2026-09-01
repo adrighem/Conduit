@@ -74,7 +74,3 @@ This file tracks all major tracks for the project. Each track has its own detail
 ## [x] Track: Installed branding consistency
 *Link: [./conductor/tracks/branding_install_20260728/](./conductor/tracks/branding_install_20260728/)*
 
----
-
-## [x] Track: Lazy WebView and on-demand emoji materialization
-*Link: [./conductor/tracks/lazy_webview_emoji_20260729/](./conductor/tracks/lazy_webview_emoji_20260729/)*
