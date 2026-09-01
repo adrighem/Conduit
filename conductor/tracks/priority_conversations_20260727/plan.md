@@ -27,13 +27,13 @@
 - [x] Task: Make composer toolbar controls square and recalculate overflow 6ecc627
 - [x] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md) 0a45694
 
-## Phase 4: Inline staged media
+## Phase 4: Inline staged media [checkpoint: fd45ede]
 
 - [x] Task: Add failing staged-media draft, batch-upload, and terminal-progress coverage 0c8f23f
 - [x] Task: Preview removable image and video attachments inside both composers e9ed127
 - [x] Task: Send staged media and rich text as one Slack file-share message 2bfa87e
 - [x] Task: Fix manual composer verification regressions 0b7213f
-- [ ] Task: Conductor - User Manual Verification 'Inline staged media' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Inline staged media' (Protocol in workflow.md) fd45ede
 
 ## Phase 5: Last conversation restoration
 
