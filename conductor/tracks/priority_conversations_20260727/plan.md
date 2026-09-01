@@ -17,7 +17,7 @@
 - [x] Task: Open New message immediately and refresh it when people arrive d204494
 - [x] Task: Conductor - User Manual Verification 'Reliable new-message picker' (Protocol in workflow.md) 87550c2
 
-## Phase 3: WYSIWYG rich-text composer
+## Phase 3: WYSIWYG rich-text composer [checkpoint: 0a45694]
 
 - [x] Task: Add failing rich document, draft, and Slack payload coverage 0c48aa4
 - [x] Task: Add formatting toolbars, native rich editing, and emoji insertion to message and reply composers 467cc7d
@@ -25,7 +25,7 @@
 - [x] Task: Add regressions for compact overflow, rich response rendering, and logical newlines 0512bd8
 - [x] Task: Keep composer controls compact and preserve rich formatting and newlines after Send 6921b56
 - [x] Task: Make composer toolbar controls square and recalculate overflow 6ecc627
-- [ ] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'WYSIWYG rich-text composer' (Protocol in workflow.md) 0a45694
 
 ## Phase 4: Inline staged media
 
