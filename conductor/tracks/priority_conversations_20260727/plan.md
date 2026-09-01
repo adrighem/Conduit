@@ -35,7 +35,7 @@
 - [x] Task: Fix manual composer verification regressions 0b7213f
 - [x] Task: Conductor - User Manual Verification 'Inline staged media' (Protocol in workflow.md) fd45ede
 
-## Phase 5: Last conversation restoration
+## Phase 5: Last conversation restoration [checkpoint: 3007ebb]
 
 - [x] Task: Persist and restore the last selected conversation with restart coverage 725a59c
-- [ ] Task: Conductor - User Manual Verification 'Last conversation restoration' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Last conversation restoration' (Protocol in workflow.md) 3007ebb
