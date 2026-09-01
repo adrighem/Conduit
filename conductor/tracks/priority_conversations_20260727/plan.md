@@ -11,11 +11,11 @@
 - [x] Task: Add person @ completion to message and thread composers 7c88040
 - [x] Task: Conductor - User Manual Verification 'Starred priority conversations' (Protocol in workflow.md) 11efc64
 
-## Phase 2: Reliable new-message picker
+## Phase 2: Reliable new-message picker [checkpoint: 87550c2]
 
 - [x] Task: Add failing coverage for opening New message before people discovery completes dd28cd3
 - [x] Task: Open New message immediately and refresh it when people arrive d204494
-- [~] Task: Conductor - User Manual Verification 'Reliable new-message picker' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Reliable new-message picker' (Protocol in workflow.md) 87550c2
 
 ## Phase 3: WYSIWYG rich-text composer
 
