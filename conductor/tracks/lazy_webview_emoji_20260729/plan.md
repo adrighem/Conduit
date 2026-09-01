@@ -29,11 +29,11 @@
 - [x] Task: Render selected custom emoji images and animation beside status text 51522cd
 - [x] Task: Conductor - User Manual Verification 'Selected status emoji preview' (Protocol in workflow.md) 085e93a
 
-## Phase 5: Usage-ranked quick reactions
+## Phase 5: Usage-ranked quick reactions [checkpoint: e359afa]
 
 - [x] Task: Add failing ranking, bounded-history, four-button, and hover-close coverage bf96cc2
 - [x] Task: Rank four quick reactions by frequency across the latest 20 additions and close overflow on hover end 8528d0a
-- [ ] Task: Conductor - User Manual Verification 'Usage-ranked quick reactions' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Usage-ranked quick reactions' (Protocol in workflow.md) e359afa
 
 ## Phase 6: Slack skin-tone emoji modifiers [checkpoint: 125ccff]
 
