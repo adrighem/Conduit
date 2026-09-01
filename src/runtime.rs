@@ -2677,6 +2677,14 @@ impl WorkspaceReducerAdapter {
             .conversations()
     }
 
+    fn conversation(&self, channel_id: &str) -> Option<SlackConversation> {
+        self.coordinator
+            .lock()
+            .expect("workspace coordinator lock poisoned")
+            .conversation(channel_id)
+            .cloned()
+    }
+
     fn message(&self, channel_id: &str, message_ts: &str) -> Option<SlackMessage> {
         self.coordinator
             .lock()
@@ -7182,33 +7190,55 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             thread_ts,
         } => {
             let api = require_slack(context.slack)?;
-            api.set_reaction(&channel_id, &ts, &name, add).await?;
-            let completion = RuntimeEventKind::ReactionUpdateCompleted {
-                channel_id: channel_id.clone(),
-                message_ts: ts.clone(),
-                thread_ts,
-                projected: context.current_user_id.is_some(),
-            };
-            if let Some(user_id) = context.current_user_id {
-                context
+            let optimistic_applied = if let Some(user_id) = context.current_user_id {
+                let reductions = context
                     .workspace
-                    .apply_persisted_and_publish_with_completion(
+                    .apply_persisted_and_publish(
                         context.workspace_store.as_ref(),
                         context.events,
                         MutationOrigin::Local,
                         WorkspaceMutation::ReactionChanged {
-                            channel_id,
-                            message_ts: ts,
-                            name,
+                            channel_id: channel_id.clone(),
+                            message_ts: ts.clone(),
+                            name: name.clone(),
                             user_id: user_id.to_string(),
                             added: add,
                         },
-                        completion,
                     )
                     .await?;
+                !reductions.is_empty()
             } else {
-                context.events.send_event(completion);
+                false
+            };
+            if let Err(error) = api.set_reaction(&channel_id, &ts, &name, add).await {
+                if optimistic_applied {
+                    if let Some(user_id) = context.current_user_id {
+                        let _ = context
+                            .workspace
+                            .apply_persisted_and_publish(
+                                context.workspace_store.as_ref(),
+                                context.events,
+                                MutationOrigin::Local,
+                                WorkspaceMutation::ReactionChanged {
+                                    channel_id: channel_id.clone(),
+                                    message_ts: ts.clone(),
+                                    name: name.clone(),
+                                    user_id: user_id.to_string(),
+                                    added: !add,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                return Err(error.into());
             }
+            let completion = RuntimeEventKind::ReactionUpdateCompleted {
+                channel_id,
+                message_ts: ts,
+                thread_ts,
+                projected: context.current_user_id.is_some(),
+            };
+            context.events.send_event(completion);
         }
         RuntimeCommand::SetSaved {
             channel_id,
@@ -7217,10 +7247,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             thread_ts,
         } => {
             let api = require_slack(context.slack)?;
-            api.set_saved(&channel_id, &ts, add).await?;
-            if let Some(mut message) = context.workspace.message(&channel_id, &ts) {
+            let previous_message = context.workspace.message(&channel_id, &ts);
+            let optimistic_applied = if let Some(mut message) = previous_message.clone() {
                 message.is_starred = Some(add);
-                context
+                let reductions = context
                     .workspace
                     .apply_persisted_and_publish(
                         context.workspace_store.as_ref(),
@@ -7234,6 +7264,30 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                         },
                     )
                     .await?;
+                !reductions.is_empty()
+            } else {
+                false
+            };
+            if let Err(error) = api.set_saved(&channel_id, &ts, add).await {
+                if optimistic_applied {
+                    if let Some(message) = previous_message {
+                        let _ = context
+                            .workspace
+                            .apply_persisted_and_publish(
+                                context.workspace_store.as_ref(),
+                                context.events,
+                                MutationOrigin::Local,
+                                WorkspaceMutation::MessageChanged {
+                                    channel_id: channel_id.clone(),
+                                    message,
+                                    kind: MessageMutationKind::Changed,
+                                    origin: MutationOrigin::Local,
+                                },
+                            )
+                            .await;
+                    }
+                }
+                return Err(error.into());
             }
             context.events.send_event(RuntimeEventKind::SavedUpdated {
                 channel_id,
@@ -7248,15 +7302,47 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         } => {
             let _star_sync_guard = context.conversation_star_sync.lock().await;
             let api = require_slack(context.slack)?;
-            api.set_conversation_starred(&channel_id, starred).await?;
-            persist_confirmed_conversation_star(
-                context.events,
-                context.workspace,
-                context.workspace_store.as_ref(),
-                channel_id,
-                starred,
-            )
-            .await?;
+            let previous_starred = context
+                .workspace
+                .conversation(&channel_id)
+                .and_then(|c| c.is_starred);
+            let reductions = context
+                .workspace
+                .apply_persisted_and_publish(
+                    context.workspace_store.as_ref(),
+                    context.events,
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ConversationStarChanged {
+                        channel_id: channel_id.clone(),
+                        starred,
+                    },
+                )
+                .await?;
+            let optimistic_applied = !reductions.is_empty();
+            if let Err(error) = api.set_conversation_starred(&channel_id, starred).await {
+                if optimistic_applied {
+                    let rollback_starred = previous_starred.unwrap_or(!starred);
+                    let _ = context
+                        .workspace
+                        .apply_persisted_and_publish(
+                            context.workspace_store.as_ref(),
+                            context.events,
+                            MutationOrigin::Local,
+                            WorkspaceMutation::ConversationStarChanged {
+                                channel_id: channel_id.clone(),
+                                starred: rollback_starred,
+                            },
+                        )
+                        .await;
+                }
+                return Err(error.into());
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationStarUpdateCompleted {
+                    channel_id,
+                    starred,
+                });
         }
         RuntimeCommand::SetCurrentUserStatus { status } => {
             let user_id = context
@@ -8532,6 +8618,7 @@ fn socket_mode_reconnect_timing(
     }
 }
 
+#[cfg(test)]
 async fn persist_confirmed_conversation_star(
     events: &RuntimeEventSender,
     workspace: &WorkspaceReducerAdapter,
@@ -19326,6 +19413,586 @@ mod tests {
                     starred: true,
                 } if channel_id == "C1"
             ));
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    fn test_interactive_runtime_connection(
+        slack: SlackApi,
+        store: Option<WorkspaceStore>,
+        workspace: WorkspaceReducerAdapter,
+        current_user_id: Option<String>,
+    ) -> RuntimeConnection {
+        let (huddles, _huddle_receiver) = huddle_actor_channel();
+        RuntimeConnection {
+            slack,
+            workspace_url: None,
+            workspace_store: store,
+            image_cache_scope: "test-workspace".to_string(),
+            workspace,
+            current_user_id,
+            user_cache: Arc::new(Mutex::new(HashMap::new())),
+            read_marks: Arc::new(Mutex::new(HashMap::new())),
+            message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
+            conversation_star_sync: ConversationStarSyncGate::default(),
+            user_status_sync: UserStatusSync::default(),
+            team_id: None,
+            huddles,
+            scheduler: Arc::new(Mutex::new(SyncScheduler::new(
+                SchedulerConfig::new(256, 8, 5).unwrap(),
+            ))),
+            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
+            next_job_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cached_bootstrap_load_gate: None,
+        }
+    }
+
+    #[test]
+    fn optimistic_reaction_success_and_failure_rollback() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-reaction-optimistic-test-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let workspace = WorkspaceReducerAdapter::default();
+            let initial_message = SlackMessage {
+                ts: "1710000000.000100".to_string(),
+                text: Some("Hello reaction".to_string()),
+                user: Some("U_OTHER".to_string()),
+                reactions: Some(vec![]),
+                ..Default::default()
+            };
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".to_string(),
+                    message: initial_message.clone(),
+                    kind: MessageMutationKind::Changed,
+                    origin: MutationOrigin::Cache,
+                },
+            );
+
+            let (sender, mut receiver) = runtime_event_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+            let image_cache = ImageAssetCache::new(directory.join("images"));
+
+            // 1. Success case: optimistic add reaction succeeds and persists
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let server_addr = server.server_addr();
+            let server_thread = std::thread::spawn(move || {
+                let request = server.recv().unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(r#"{"ok":true}"#).with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            });
+
+            let mut slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            slack.api_base_url = format!("http://{server_addr}/api");
+
+            let connection = test_interactive_runtime_connection(
+                slack,
+                Some(store.clone()),
+                workspace.clone(),
+                Some("U123".to_string()),
+            );
+
+            let result = handle_connected_command(
+                RuntimeCommand::SetReaction {
+                    channel_id: "C1".to_string(),
+                    ts: "1710000000.000100".to_string(),
+                    name: "thumbsup".to_string(),
+                    add: true,
+                    thread_ts: None,
+                },
+                connection,
+                &events,
+                &image_cache,
+            )
+            .await;
+            server_thread.join().unwrap();
+            assert!(result.is_ok());
+
+            let updated_msg = workspace.message("C1", "1710000000.000100").unwrap();
+            let reactions = updated_msg.reactions.as_deref().unwrap_or(&[]);
+            assert_eq!(reactions.len(), 1);
+            assert_eq!(reactions[0].name.as_deref(), Some("thumbsup"));
+            assert_eq!(reactions[0].count, Some(1));
+            assert_eq!(reactions[0].users.as_deref(), Some(&["U123".to_string()][..]));
+
+            let mut got_patch = false;
+            let mut got_completion = false;
+            while let Ok(event) = receiver.try_recv() {
+                match event.kind {
+                    RuntimeEventKind::WorkspacePatch(_) => got_patch = true,
+                    RuntimeEventKind::ReactionUpdateCompleted {
+                        channel_id,
+                        message_ts,
+                        projected,
+                        ..
+                    } => {
+                        assert_eq!(channel_id, "C1");
+                        assert_eq!(message_ts, "1710000000.000100");
+                        assert!(projected);
+                        got_completion = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(got_patch, "WorkspacePatch should be emitted");
+            assert!(got_completion, "ReactionUpdateCompleted should be emitted");
+
+            // 2. Failure case: optimistic add reaction rolls back on API failure
+            let fail_server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let fail_server_addr = fail_server.server_addr();
+            let fail_thread = std::thread::spawn(move || {
+                let request = fail_server.recv().unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(r#"{"ok":false,"error":"bad_reaction"}"#)
+                            .with_header(
+                                tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                    .unwrap(),
+                            ),
+                    )
+                    .unwrap();
+            });
+
+            let mut fail_slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            fail_slack.api_base_url = format!("http://{fail_server_addr}/api");
+
+            let fail_connection = test_interactive_runtime_connection(
+                fail_slack,
+                Some(store.clone()),
+                workspace.clone(),
+                Some("U123".to_string()),
+            );
+
+            let fail_result = handle_connected_command(
+                RuntimeCommand::SetReaction {
+                    channel_id: "C1".to_string(),
+                    ts: "1710000000.000100".to_string(),
+                    name: "heart".to_string(),
+                    add: true,
+                    thread_ts: None,
+                },
+                fail_connection,
+                &events,
+                &image_cache,
+            )
+            .await;
+            fail_thread.join().unwrap();
+            assert!(fail_result.is_err());
+
+            let rolled_back_msg = workspace.message("C1", "1710000000.000100").unwrap();
+            let rolled_back_reactions = rolled_back_msg.reactions.as_deref().unwrap_or(&[]);
+            assert_eq!(rolled_back_reactions.len(), 1);
+            assert_eq!(rolled_back_reactions[0].name.as_deref(), Some("thumbsup"));
+
+            let mut patch_count = 0;
+            let mut got_fail_completion = false;
+            while let Ok(event) = receiver.try_recv() {
+                match event.kind {
+                    RuntimeEventKind::WorkspacePatch(_) => patch_count += 1,
+                    RuntimeEventKind::ReactionUpdateCompleted { .. } => {
+                        got_fail_completion = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                patch_count >= 2,
+                "both optimistic and rollback patches should be emitted"
+            );
+            assert!(
+                !got_fail_completion,
+                "ReactionUpdateCompleted must NOT be emitted on API failure"
+            );
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn optimistic_saved_success_and_failure_rollback() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-saved-optimistic-test-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let workspace = WorkspaceReducerAdapter::default();
+            let initial_message = SlackMessage {
+                ts: "1710000000.000200".to_string(),
+                text: Some("Hello saved".to_string()),
+                is_starred: Some(false),
+                ..Default::default()
+            };
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".to_string(),
+                    message: initial_message.clone(),
+                    kind: MessageMutationKind::Changed,
+                    origin: MutationOrigin::Cache,
+                },
+            );
+
+            let (sender, mut receiver) = runtime_event_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+            let image_cache = ImageAssetCache::new(directory.join("images"));
+
+            // 1. Success case: optimistic saved succeeds
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let server_addr = server.server_addr();
+            let server_thread = std::thread::spawn(move || {
+                let request = server.recv().unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(r#"{"ok":true}"#).with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            });
+
+            let mut slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            slack.api_base_url = format!("http://{server_addr}/api");
+
+            let connection = test_interactive_runtime_connection(
+                slack,
+                Some(store.clone()),
+                workspace.clone(),
+                Some("U123".to_string()),
+            );
+
+            let result = handle_connected_command(
+                RuntimeCommand::SetSaved {
+                    channel_id: "C1".to_string(),
+                    ts: "1710000000.000200".to_string(),
+                    add: true,
+                    thread_ts: None,
+                },
+                connection,
+                &events,
+                &image_cache,
+            )
+            .await;
+            server_thread.join().unwrap();
+            assert!(result.is_ok());
+
+            let updated_msg = workspace.message("C1", "1710000000.000200").unwrap();
+            assert_eq!(updated_msg.is_starred, Some(true));
+
+            let mut got_saved_event = false;
+            while let Ok(event) = receiver.try_recv() {
+                if let RuntimeEventKind::SavedUpdated {
+                    channel_id,
+                    message_ts,
+                    saved,
+                    ..
+                } = event.kind
+                {
+                    assert_eq!(channel_id, "C1");
+                    assert_eq!(message_ts, "1710000000.000200");
+                    assert!(saved);
+                    got_saved_event = true;
+                }
+            }
+            assert!(got_saved_event, "SavedUpdated event should be emitted");
+
+            // 2. Failure case: optimistic saved rolls back on API failure
+            let fail_server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let fail_server_addr = fail_server.server_addr();
+            let fail_thread = std::thread::spawn(move || {
+                let request = fail_server.recv().unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(r#"{"ok":false,"error":"cant_star"}"#)
+                            .with_header(
+                                tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                    .unwrap(),
+                            ),
+                    )
+                    .unwrap();
+            });
+
+            let mut fail_slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            fail_slack.api_base_url = format!("http://{fail_server_addr}/api");
+
+            let fail_connection = test_interactive_runtime_connection(
+                fail_slack,
+                Some(store.clone()),
+                workspace.clone(),
+                Some("U123".to_string()),
+            );
+
+            let fail_result = handle_connected_command(
+                RuntimeCommand::SetSaved {
+                    channel_id: "C1".to_string(),
+                    ts: "1710000000.000200".to_string(),
+                    add: false,
+                    thread_ts: None,
+                },
+                fail_connection,
+                &events,
+                &image_cache,
+            )
+            .await;
+            fail_thread.join().unwrap();
+            assert!(fail_result.is_err());
+
+            let rolled_back_msg = workspace.message("C1", "1710000000.000200").unwrap();
+            assert_eq!(
+                rolled_back_msg.is_starred,
+                Some(true),
+                "is_starred should roll back to true"
+            );
+
+            let mut got_fail_saved_event = false;
+            while let Ok(event) = receiver.try_recv() {
+                if let RuntimeEventKind::SavedUpdated { .. } = event.kind {
+                    got_fail_saved_event = true;
+                }
+            }
+            assert!(
+                !got_fail_saved_event,
+                "SavedUpdated must NOT be emitted on API failure"
+            );
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn optimistic_conversation_star_success_and_failure_rollback() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-conv-star-optimistic-test-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let workspace = WorkspaceReducerAdapter::default();
+            let initial = SlackConversation {
+                id: "C1".to_string(),
+                name: Some("general".to_string()),
+                is_channel: Some(true),
+                is_starred: Some(false),
+                ..Default::default()
+            };
+            workspace.apply(
+                MutationOrigin::Cache,
+                WorkspaceMutation::ConversationUpsert(initial.clone()),
+            );
+
+            let (sender, mut receiver) = runtime_event_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+            let image_cache = ImageAssetCache::new(directory.join("images"));
+
+            // 1. Success case: optimistic conversation star succeeds
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let server_addr = server.server_addr();
+            let server_thread = std::thread::spawn(move || {
+                let request = server.recv().unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(r#"{"ok":true}"#).with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            });
+
+            let mut slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            slack.api_base_url = format!("http://{server_addr}/api");
+
+            let connection = test_interactive_runtime_connection(
+                slack,
+                Some(store.clone()),
+                workspace.clone(),
+                Some("U123".to_string()),
+            );
+
+            let result = handle_connected_command(
+                RuntimeCommand::SetConversationStarred {
+                    channel_id: "C1".to_string(),
+                    starred: true,
+                },
+                connection,
+                &events,
+                &image_cache,
+            )
+            .await;
+            server_thread.join().unwrap();
+            assert!(result.is_ok());
+
+            assert!(workspace
+                .coordinator
+                .lock()
+                .unwrap()
+                .conversation("C1")
+                .unwrap()
+                .is_starred());
+
+            let mut got_conv_star_event = false;
+            while let Ok(event) = receiver.try_recv() {
+                if let RuntimeEventKind::ConversationStarUpdateCompleted {
+                    channel_id,
+                    starred,
+                } = event.kind
+                {
+                    assert_eq!(channel_id, "C1");
+                    assert!(starred);
+                    got_conv_star_event = true;
+                }
+            }
+            assert!(
+                got_conv_star_event,
+                "ConversationStarUpdateCompleted event should be emitted"
+            );
+
+            // 2. Failure case: optimistic conversation star rolls back on API failure
+            let fail_server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let fail_server_addr = fail_server.server_addr();
+            let fail_thread = std::thread::spawn(move || {
+                let request = fail_server.recv().unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(
+                            r#"{"ok":false,"error":"channel_not_found"}"#,
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            });
+
+            let mut fail_slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            fail_slack.api_base_url = format!("http://{fail_server_addr}/api");
+
+            let fail_connection = test_interactive_runtime_connection(
+                fail_slack,
+                Some(store.clone()),
+                workspace.clone(),
+                Some("U123".to_string()),
+            );
+
+            let fail_result = handle_connected_command(
+                RuntimeCommand::SetConversationStarred {
+                    channel_id: "C1".to_string(),
+                    starred: false,
+                },
+                fail_connection,
+                &events,
+                &image_cache,
+            )
+            .await;
+            fail_thread.join().unwrap();
+            assert!(fail_result.is_err());
+
+            assert!(
+                workspace
+                    .coordinator
+                    .lock()
+                    .unwrap()
+                    .conversation("C1")
+                    .unwrap()
+                    .is_starred(),
+                "conversation is_starred should roll back to true"
+            );
+
+            let mut got_fail_conv_star_event = false;
+            while let Ok(event) = receiver.try_recv() {
+                if let RuntimeEventKind::ConversationStarUpdateCompleted { .. } = event.kind {
+                    got_fail_conv_star_event = true;
+                }
+            }
+            assert!(
+                !got_fail_conv_star_event,
+                "ConversationStarUpdateCompleted must NOT be emitted on API failure"
+            );
 
             let _ = std::fs::remove_dir_all(directory);
         });

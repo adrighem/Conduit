@@ -350,7 +350,7 @@ fn filter_workspace_search_matches(query: &str, matches: Vec<SearchMatch>) -> Ve
 #[derive(Clone)]
 pub struct SlackApi {
     http: Client,
-    api_base_url: String,
+    pub(crate) api_base_url: String,
     access_token: String,
     scopes: HashSet<String>,
     browser_cookie_d: Option<String>,

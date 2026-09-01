@@ -195,6 +195,10 @@ impl MessageControl {
         &self.label
     }
 
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
     pub(crate) fn key(&self) -> Option<MessageControlKey> {
         self.key
     }

@@ -115,6 +115,7 @@ fn normalize_block(
                 .collect::<Vec<_>>();
             (!controls.is_empty()).then_some(RichNode::Actions(controls))
         }
+        "call" => normalize_call_block(block),
         "rich_text" => {
             let nodes = block
                 .get("elements")
@@ -183,6 +184,48 @@ fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
     (url.is_some() || !alt.trim().is_empty()).then_some(RichImage { url, alt, title })
 }
 
+fn normalize_call_block(block: &Value) -> Option<RichNode> {
+    let call_val = block.get("call");
+    let v1_val = call_val.and_then(|c| c.get("v1"));
+
+    let join_url = v1_val
+        .and_then(|v1| v1.get("join_url"))
+        .and_then(Value::as_str)
+        .or_else(|| call_val.and_then(|c| c.get("join_url")).and_then(Value::as_str))
+        .or_else(|| v1_val.and_then(|v1| v1.get("desktop_app_join_url")).and_then(Value::as_str))
+        .or_else(|| call_val.and_then(|c| c.get("desktop_app_join_url")).and_then(Value::as_str))
+        .or_else(|| block.get("join_url").and_then(Value::as_str))
+        .or_else(|| block.get("url").and_then(Value::as_str));
+
+    let name = v1_val
+        .and_then(|v1| v1.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| call_val.and_then(|c| c.get("name")).and_then(Value::as_str))
+        .or_else(|| block.get("name").and_then(Value::as_str))
+        .filter(|n| !n.trim().is_empty());
+
+    let is_teams = name.is_some_and(|n| n.to_lowercase().contains("teams"))
+        || call_val.and_then(|c| c.get("media_backend_type")).and_then(Value::as_str) == Some("msteams")
+        || join_url.is_some_and(|u| u.contains("teams.microsoft.com") || u.starts_with("msteams:"));
+
+    let default_title = if is_teams { "Microsoft Teams Meeting" } else { "Call" };
+    let title = name.unwrap_or(default_title);
+
+    let Some(url) = join_url else {
+        return Some(RichNode::Header(title.to_string()));
+    };
+
+    Some(RichNode::Section {
+        text: Some(format!("*{title}*")),
+        fields: Vec::new(),
+        accessory: Some(RichAccessory::Control(RichControl::presentation(
+            "Join".to_string(),
+            Some(url.to_string()),
+            false,
+        ))),
+    })
+}
+
 fn normalize_control(
     value: &Value,
     block_id: Option<&str>,
@@ -191,8 +234,9 @@ fn normalize_control(
     retain_callbacks: bool,
 ) -> Option<RichControl> {
     let kind = value.get("type")?.as_str()?;
+    let url = extract_control_url(value);
     let label = match kind {
-        "button" => block_text(value)?,
+        "button" => control_label(value, url.as_deref()),
         "static_select" | "multi_static_select" => value
             .get("placeholder")
             .and_then(block_text)
@@ -202,7 +246,7 @@ fn normalize_control(
     };
     if kind == "button"
         && retain_callbacks
-        && value.get("url").and_then(Value::as_str).is_none()
+        && url.is_none()
         && value
             .get("action_id")
             .and_then(Value::as_str)
@@ -234,12 +278,50 @@ fn normalize_control(
     }
     Some(RichControl::presentation(
         label,
-        value
-            .get("url")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
+        url,
         value.get("confirm").is_some(),
     ))
+}
+
+fn control_label(value: &Value, url: Option<&str>) -> String {
+    block_text(value)
+        .or_else(|| value.get("label").and_then(block_text))
+        .or_else(|| value.get("label").and_then(Value::as_str).map(ToString::to_string))
+        .or_else(|| value.get("name").and_then(Value::as_str).map(ToString::to_string))
+        .or_else(|| {
+            value
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|v| !v.starts_with("http://") && !v.starts_with("https://") && !v.starts_with("msteams:"))
+                .map(ToString::to_string)
+        })
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| {
+            if let Some(url) = url {
+                if url.contains("teams.microsoft.com") || url.starts_with("msteams:") || url.contains("zoom.us") {
+                    "Join".to_string()
+                } else {
+                    "Open".to_string()
+                }
+            } else {
+                "Action".to_string()
+            }
+        })
+}
+
+fn extract_control_url(value: &Value) -> Option<String> {
+    value
+        .get("url")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("action_url").and_then(Value::as_str))
+        .or_else(|| value.get("join_url").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|v| v.starts_with("http://") || v.starts_with("https://") || v.starts_with("msteams:"))
+        })
+        .map(ToString::to_string)
 }
 
 fn normalize_block_confirmation(value: Option<&Value>) -> Option<MessageControlConfirmation> {
@@ -663,6 +745,50 @@ mod tests {
         assert_eq!(
             accessory.url.as_deref(),
             Some("https://files.slack.com/files-pri/F2/accessory.gif")
+        );
+    }
+
+    #[test]
+    fn normalizes_call_blocks_with_join_button() {
+        let document = normalize_blocks_with_files(
+            &serde_json::json!([
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "A new call was started by Slack Teams Calls"
+                    }
+                },
+                {
+                    "type": "call",
+                    "call_id": "R01234567",
+                    "call": {
+                        "media_backend_type": "msteams",
+                        "v1": {
+                            "id": "R01234567",
+                            "name": "Microsoft Teams Meeting",
+                            "join_url": "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc"
+                        }
+                    }
+                }
+            ]),
+            "Choose",
+            "More actions",
+            &[],
+        );
+
+        let [RichNode::Section { text: text1, .. }, RichNode::Section { text: text2, accessory, .. }] = document.nodes() else {
+            panic!("expected two sections");
+        };
+        assert_eq!(text1.as_deref(), Some("A new call was started by Slack Teams Calls"));
+        assert_eq!(text2.as_deref(), Some("*Microsoft Teams Meeting*"));
+        let Some(RichAccessory::Control(control)) = accessory else {
+            panic!("expected control accessory");
+        };
+        assert_eq!(control.label(), "Join");
+        assert_eq!(
+            control.url(),
+            Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc")
         );
     }
 }

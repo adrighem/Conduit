@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::huddles::model::{SlackHuddleRoom, SlackHuddleState};
-use crate::rich_message::{MessageAuthor, MessageDocument, MESSAGE_CONTENT_VERSION};
+use crate::rich_message::{MessageAuthor, MessageDocument, MessageNode, MESSAGE_CONTENT_VERSION};
 
 const CONVERSATION_MEMBER_KEYS: [&str; 2] = ["members", "users"];
 const SEEN_ATTENTION_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
@@ -22,7 +22,7 @@ pub(crate) fn conversation_metadata_key_is_unread_owned(key: &str) -> bool {
         || key == LOCAL_READ_TS_KEY
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredToken {
     pub access_token: String,
     pub token_type: Option<String>,
@@ -1250,6 +1250,10 @@ pub struct SlackMessage {
     pub no_notifications: Option<bool>,
     #[serde(default, skip_serializing)]
     pub room: Option<SlackHuddleRoom>,
+    #[serde(default)]
+    pub call: Option<Value>,
+    #[serde(default)]
+    pub call_id: Option<String>,
 }
 
 impl std::fmt::Debug for SlackMessage {
@@ -1270,6 +1274,72 @@ impl std::fmt::Debug for SlackMessage {
 }
 
 impl SlackMessage {
+    fn synthesize_call_node(&self) -> Option<MessageNode> {
+        let call_join_url = self.call.as_ref().and_then(|call| {
+            call.get("v1")
+                .and_then(|v1| v1.get("join_url"))
+                .and_then(Value::as_str)
+                .or_else(|| call.get("join_url").and_then(Value::as_str))
+                .or_else(|| {
+                    call.get("v1")
+                        .and_then(|v1| v1.get("desktop_app_join_url"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| call.get("desktop_app_join_url").and_then(Value::as_str))
+        });
+
+        let room_join_url = self.room.as_ref().and_then(|room| {
+            room.huddle_link
+                .as_deref()
+                .or_else(|| room.extra.get("join_url").and_then(Value::as_str))
+                .or_else(|| room.extra.get("desktop_app_join_url").and_then(Value::as_str))
+                .or_else(|| {
+                    room.extra
+                        .get("v1")
+                        .and_then(|v1| v1.get("join_url"))
+                        .and_then(Value::as_str)
+                })
+        });
+
+        let join_url = call_join_url.or(room_join_url)?;
+
+        let call_name = self
+            .call
+            .as_ref()
+            .and_then(|c| {
+                c.get("v1")
+                    .and_then(|v1| v1.get("name"))
+                    .and_then(Value::as_str)
+                    .or_else(|| c.get("name").and_then(Value::as_str))
+            })
+            .or_else(|| self.room.as_ref().and_then(|r| r.name.as_deref()))
+            .filter(|n| !n.trim().is_empty());
+
+        let is_teams = call_name.is_some_and(|n| n.to_lowercase().contains("teams"))
+            || self.username.as_deref().is_some_and(|u| u.to_lowercase().contains("teams"))
+            || join_url.contains("teams.microsoft.com")
+            || join_url.starts_with("msteams:");
+
+        let default_name = if is_teams {
+            "Microsoft Teams Meeting"
+        } else {
+            "Call"
+        };
+        let name = call_name.unwrap_or(default_name);
+
+        Some(MessageNode::Section {
+            text: Some(format!("*{name}*")),
+            fields: Vec::new(),
+            accessory: Some(crate::rich_message::MessageAccessory::Control(
+                crate::rich_message::MessageControl::presentation(
+                    "Join".to_string(),
+                    Some(join_url.to_string()),
+                    false,
+                ),
+            )),
+        })
+    }
+
     pub(crate) fn refresh_canonical_content(&mut self) {
         self.author =
             if self.bot_id.is_some() || self.app_id.is_some() || self.bot_profile.is_some() {
@@ -1326,6 +1396,16 @@ impl SlackMessage {
             )
             .nodes,
         );
+        if !nodes.iter().any(|node| matches!(node, MessageNode::Control(_) | MessageNode::Actions(_) | MessageNode::Section { accessory: Some(_), .. })) {
+            if let Some(call_node) = self.synthesize_call_node() {
+                if nodes.is_empty() {
+                    if let Some(text) = non_empty(self.text.as_deref()) {
+                        nodes.push(MessageNode::Text(text.to_string()));
+                    }
+                }
+                nodes.push(call_node);
+            }
+        }
         self.document = MessageDocument::new(
             nodes,
             non_empty(self.text.as_deref()).map(ToString::to_string),

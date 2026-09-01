@@ -336,27 +336,50 @@ pub fn update_user_patch(
 #[allow(dead_code)]
 pub fn timeline_dom_patch_call(patch: &TimelineDomPatch) -> String {
     let payload = timeline_dom_payload(patch);
-    format!(
-        "window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch({payload}) : false;"
-    )
+    let mut script = String::with_capacity(payload.len() + 75);
+    script.push_str("window.conduitApplyTimelinePatch ? window.conduitApplyTimelinePatch(");
+    script.push_str(&payload);
+    script.push_str(") : false;");
+    script
 }
 
 /// JavaScript suitable for applying one frame's timeline patches in one WebKit call.
 pub fn timeline_dom_delta_call(patches: &[TimelineDomPatch]) -> String {
     let payload = timeline_dom_payload(patches);
-    format!(
-        "window.conduitApplyTimelineDelta ? window.conduitApplyTimelineDelta({payload}) : false;"
-    )
+    let mut script = String::with_capacity(payload.len() + 75);
+    script.push_str("window.conduitApplyTimelineDelta ? window.conduitApplyTimelineDelta(");
+    script.push_str(&payload);
+    script.push_str(") : false;");
+    script
 }
 
 fn timeline_dom_payload<T: serde::Serialize + ?Sized>(value: &T) -> String {
-    serde_json::to_string(value)
-        .expect("timeline DOM data should serialize")
-        .replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
+    let json = serde_json::to_string(value).expect("timeline DOM data should serialize");
+    escape_json_for_html_script(&json)
+}
+
+fn escape_json_for_html_script(raw: &str) -> String {
+    if !raw
+        .as_bytes()
+        .iter()
+        .any(|&b| b == b'&' || b == b'<' || b == b'>')
+        && !raw.contains('\u{2028}')
+        && !raw.contains('\u{2029}')
+    {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len() + 64);
+    for c in raw.chars() {
+        match c {
+            '&' => out.push_str("\\u0026"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 impl TimelineScrollBehavior {
@@ -807,7 +830,9 @@ pub fn conversation_document_with_focus(
         .and(context.first_unread_ts.as_deref())
         .map(|ts| format!(" data-first-unread-ts=\"{}\"", escape_html(ts)))
         .unwrap_or_default();
-    let mut body = format!(
+    let estimated_capacity = 24_576 + messages.len() * 1536;
+    let mut body = String::with_capacity(estimated_capacity);
+    body.push_str(&format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\" \
          data-timeline-positioning=\"pending\" data-timeline-mode=\"{}\" \
          data-timeline-sticky-key=\"{}\" data-timeline-anchor-key=\"{}\"\
@@ -816,7 +841,7 @@ pub fn conversation_document_with_focus(
         escape_html(&sticky_key),
         escape_html(&anchor_key),
         document_heading(&title)
-    );
+    ));
     if context.thread_ts.is_none() {
         if let Some(url) = context.load_more_url.as_deref() {
             body.push_str(&load_more_action_html(url, &gettext("Load older messages")));
@@ -849,7 +874,7 @@ fn conversation_list_items_html(
     messages: &[SlackMessage],
     context: &MessageHtmlContext,
 ) -> String {
-    let mut html = String::new();
+    let mut html = String::with_capacity(messages.len() * 1024);
     for group in message_groups(messages, context.first_unread_ts.as_deref()) {
         if group
             .first()
@@ -867,10 +892,11 @@ fn conversation_list_items_html(
 pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -> String {
     let title = gettext("Saved items");
     let mut rendered = 0;
-    let mut body = format!(
+    let mut body = String::with_capacity(items.len() * 1536 + 2048);
+    body.push_str(&format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
         document_heading(&title)
-    );
+    ));
 
     for item in items {
         if let (Some(channel_id), Some(message)) = (item.channel.as_deref(), item.message.as_ref())
@@ -903,10 +929,11 @@ pub fn unreads_document(items: &[ActivityItem]) -> String {
     }
 
     let title = gettext("Unreads");
-    let mut body = format!(
+    let mut body = String::with_capacity(items.len() * 512 + 1024);
+    body.push_str(&format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ul class=\"activity-list\">",
         document_heading(&title)
-    );
+    ));
     for item in items {
         body.push_str(&activity_item_html(item));
     }
@@ -931,10 +958,11 @@ pub fn threads_document(items: &[ThreadInboxItem], context: &MessageHtmlContext)
     }
 
     let title = gettext("Threads");
-    let mut body = format!(
+    let mut body = String::with_capacity(items.len() * 1536 + 2048);
+    body.push_str(&format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
         document_heading(&title)
-    );
+    ));
     for item in items {
         let reply_count = item.root.reply_count.unwrap_or_default();
         let mut label = gettext("{channel} · {count} replies")
@@ -963,10 +991,11 @@ pub fn files_document(files: &[SlackFile]) -> String {
     }
 
     let title = gettext("Files");
-    let mut body = format!(
+    let mut body = String::with_capacity(files.len() * 512 + 1024);
+    body.push_str(&format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ul class=\"file-list\">",
         document_heading(&title)
-    );
+    ));
     for file in files {
         body.push_str(&file_item_html(file));
     }
@@ -981,10 +1010,11 @@ pub fn search_results_document(results: &[SearchMatch], context: &MessageHtmlCon
     }
 
     let title = gettext("Search results");
-    let mut body = format!(
+    let mut body = String::with_capacity(results.len() * 1536 + 2048);
+    body.push_str(&format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
         document_heading(&title)
-    );
+    ));
     for result in results {
         body.push_str("<li class=\"message-list-item\">");
         body.push_str(&search_result_article(result, context));
@@ -2254,10 +2284,9 @@ fn message_groups<'a>(
     messages: &'a [SlackMessage],
     first_unread_ts: Option<&str>,
 ) -> Vec<Vec<&'a SlackMessage>> {
-    let ordered = messages.iter().rev().collect::<Vec<_>>();
-    let mut groups: Vec<Vec<&SlackMessage>> = Vec::new();
+    let mut groups: Vec<Vec<&'a SlackMessage>> = Vec::with_capacity(messages.len());
 
-    for message in ordered {
+    for message in messages.iter().rev() {
         if let Some(group) = groups.last_mut() {
             if first_unread_ts != Some(message.ts.as_str())
                 && group
@@ -2269,7 +2298,9 @@ fn message_groups<'a>(
             }
         }
 
-        groups.push(vec![message]);
+        let mut group = Vec::with_capacity(4);
+        group.push(message);
+        groups.push(group);
     }
 
     groups
@@ -2284,7 +2315,7 @@ fn unread_separator_html() -> String {
 }
 
 fn can_group_messages(previous: &SlackMessage, current: &SlackMessage) -> bool {
-    if sender_key(previous) != sender_key(current) {
+    if !same_author(previous, current) {
         return false;
     }
 
@@ -2299,8 +2330,52 @@ fn can_group_messages(previous: &SlackMessage, current: &SlackMessage) -> bool {
     (0.0..180.0).contains(&delta)
 }
 
-fn sender_key(message: &SlackMessage) -> String {
-    message.author_key()
+fn same_author(previous: &SlackMessage, current: &SlackMessage) -> bool {
+    if previous.content_version == crate::rich_message::MESSAGE_CONTENT_VERSION
+        && current.content_version == crate::rich_message::MESSAGE_CONTENT_VERSION
+    {
+        match (&previous.author, &current.author) {
+            (
+                crate::rich_message::MessageAuthor::User { user_id: u1 },
+                crate::rich_message::MessageAuthor::User { user_id: u2 },
+            ) => u1 == u2,
+            (
+                crate::rich_message::MessageAuthor::App {
+                    app_id: a1,
+                    bot_id: b1,
+                    display_name: d1,
+                    ..
+                },
+                crate::rich_message::MessageAuthor::App {
+                    app_id: a2,
+                    bot_id: b2,
+                    display_name: d2,
+                    ..
+                },
+            ) => {
+                let key1 = a1
+                    .as_deref()
+                    .map(|id| (0, id))
+                    .or_else(|| b1.as_deref().map(|id| (1, id)));
+                let key2 = a2
+                    .as_deref()
+                    .map(|id| (0, id))
+                    .or_else(|| b2.as_deref().map(|id| (1, id)));
+                match (key1, key2) {
+                    (Some(k1), Some(k2)) => k1 == k2,
+                    (None, None) => d1 == d2,
+                    _ => false,
+                }
+            }
+            (
+                crate::rich_message::MessageAuthor::Unknown { display_name: d1 },
+                crate::rich_message::MessageAuthor::Unknown { display_name: d2 },
+            ) => d1 == d2,
+            _ => false,
+        }
+    } else {
+        previous.author_key() == current.author_key()
+    }
 }
 
 fn slack_ts_seconds(ts: &str) -> Option<f64> {
@@ -4210,7 +4285,7 @@ fn external_link_html(url: &str, label: &str) -> String {
 
 fn is_http_url(value: &str) -> bool {
     url::Url::parse(value)
-        .map(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| matches!(url.scheme(), "http" | "https" | "msteams" | "zoommtg"))
         .unwrap_or(false)
 }
 
@@ -6962,5 +7037,44 @@ mod tests {
         assert!(!expiration_detail.contains("class=\"emoji\""));
         assert!(html.contains("title=\":working:\""));
         assert!(html.contains("title=\":coffee:\""));
+    }
+
+    #[test]
+    fn renders_microsoft_teams_call_message_with_join_button() {
+        let mut message = crate::models::SlackMessage {
+            ts: "1710000000.000100".into(),
+            username: Some("Microsoft Teams Calls".into()),
+            text: Some("A new call was started by Slack Teams Calls".into()),
+            blocks: Some(serde_json::json!([
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "A new call was started by Slack Teams Calls"
+                    }
+                },
+                {
+                    "type": "call",
+                    "call_id": "R01234567",
+                    "call": {
+                        "media_backend_type": "msteams",
+                        "v1": {
+                            "id": "R01234567",
+                            "name": "Microsoft Teams Meeting",
+                            "join_url": "https://teams.microsoft.com/l/meetup-join/19%3ameeting_xyz"
+                        }
+                    }
+                }
+            ])),
+            ..Default::default()
+        };
+        message.refresh_canonical_content();
+        let context = MessageHtmlContext::default();
+        let html = message_body_html(None, &message, &context);
+
+        assert!(html.contains("A new call was started by Slack Teams Calls"));
+        assert!(html.contains("Microsoft Teams Meeting"));
+        assert!(html.contains("href=\"https://teams.microsoft.com/l/meetup-join/19%3ameeting_xyz\""));
+        assert!(html.contains(">Join</a>"));
     }
 }

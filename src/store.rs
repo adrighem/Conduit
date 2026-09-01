@@ -218,7 +218,7 @@ impl StoreHub {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
-        self.dispatch(self.inner.writer.clone(), task).await
+        self.dispatch(&self.inner.writer, task).await
     }
 
     pub(crate) async fn query<T, F>(&self, task: F) -> Result<T>
@@ -228,8 +228,7 @@ impl StoreHub {
     {
         let reader =
             self.inner.next_reader.fetch_add(1, Ordering::Relaxed) % self.inner.readers.len();
-        self.dispatch(self.inner.readers[reader].clone(), task)
-            .await
+        self.dispatch(&self.inner.readers[reader], task).await
     }
 
     pub(crate) async fn write_maintenance<T, F>(&self, task: F) -> Result<T>
@@ -301,14 +300,13 @@ impl StoreHub {
 
     async fn dispatch<T, F>(
         &self,
-        worker: tokio::sync::mpsc::Sender<StoreWorkerRequest>,
+        worker: &tokio::sync::mpsc::Sender<StoreWorkerRequest>,
         task: F,
     ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
-        let admission = self.inner.admission.lock().await;
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(StoreError::HubClosed);
         }
@@ -322,7 +320,6 @@ impl StoreHub {
             })
             .await
             .map_err(|_| StoreError::HubClosed)?;
-        drop(admission);
 
         let value = result.await.map_err(|_| StoreError::HubClosed)??;
         value.downcast::<T>().map(|value| *value).map_err(|_| {
@@ -6235,6 +6232,42 @@ mod tests {
                     .unwrap();
                 assert_eq!(value, 42);
             }
+            hub.shutdown().await.unwrap();
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn store_hub_query_does_not_contend_on_admission_lock() {
+        let directory = temp_cache_dir("store-hub-query-uncontended");
+        runtime().block_on(async {
+            let hub = StoreHub::open(directory.clone()).await.unwrap();
+            hub.write(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE uncontended_probe (value INTEGER NOT NULL);
+                     INSERT INTO uncontended_probe(value) VALUES (99);",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            hub.barrier().await.unwrap();
+
+            let admission_guard = hub.inner.admission.lock().await;
+
+            let value: i64 = hub
+                .query(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT value FROM uncontended_probe",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(value, 99);
+
+            drop(admission_guard);
             hub.shutdown().await.unwrap();
         });
         let _ = std::fs::remove_dir_all(directory);

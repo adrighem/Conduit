@@ -9614,7 +9614,7 @@ impl ConduitWindow {
 
         match url.scheme() {
             "conduit" => self.handle_message_action_url(&url),
-            "http" | "https" => {
+            "http" | "https" | "msteams" | "zoommtg" => {
                 let workspace_url = self.imp().workspace_url.borrow().clone();
                 if let Some(location) = slack_message_location(uri, workspace_url.as_deref()) {
                     self.open_message_context(location);
@@ -13350,7 +13350,9 @@ impl ConduitWindow {
 
     fn populate_unreads_content(&self, items: Vec<ActivityItem>) {
         self.imp().message_title.set_title(&gettext("Unreads"));
-        self.load_message_html(&message_html::unreads_document(&items));
+        self.load_message_html(&generate_html("unreads", || {
+            message_html::unreads_document(&items)
+        }));
     }
 
     fn populate_threads(&self) {
@@ -13377,7 +13379,9 @@ impl ConduitWindow {
             .collect::<Vec<_>>();
         self.imp().message_title.set_title(&gettext("Threads"));
         let context = self.message_html_context(None);
-        self.load_message_html(&message_html::threads_document(&items, &context));
+        self.load_message_html(&generate_html("threads", || {
+            message_html::threads_document(&items, &context)
+        }));
     }
 
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
@@ -13390,14 +13394,18 @@ impl ConduitWindow {
                 .collect(),
         );
         let context = self.message_html_context(None);
-        self.load_message_html(&message_html::search_results_document(&results, &context));
+        self.load_message_html(&generate_html("search", || {
+            message_html::search_results_document(&results, &context)
+        }));
     }
 
     fn populate_files(&self, files: Vec<SlackFile>) {
         let imp = self.imp();
         imp.message_title.set_title(&gettext("Files"));
         self.render_conversations();
-        self.load_message_html(&message_html::files_document(&files));
+        self.load_message_html(&generate_html("files", || {
+            message_html::files_document(&files)
+        }));
     }
 
     fn populate_saved_items(&self, items: Vec<SavedItem>) {
@@ -13414,7 +13422,9 @@ impl ConduitWindow {
         self.request_user_names(&messages_for_names);
         self.request_image_assets(saved_messages);
         let context = self.message_html_context(None);
-        self.load_message_html(&message_html::saved_items_document(&items, &context));
+        self.load_message_html(&generate_html("saved_items", || {
+            message_html::saved_items_document(&items, &context)
+        }));
     }
 
     fn handle_huddle_event(&self, event: HuddleEvent) {
