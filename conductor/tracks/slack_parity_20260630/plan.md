@@ -29,8 +29,8 @@
   - [x] Sub-task: Keep explicit refresh behavior available
 - [x] Task: Conductor - User Manual Verification 'Quick History Switching' (Protocol in workflow.md) afaa24e
 
-## Phase 5: Unread-Aware Conversation Ranking
+## Phase 5: Unread-Aware Conversation Ranking [checkpoint: 77a71ff]
 - [x] Task: Add failing sidebar-filter and conversation-switcher unread-category ranking coverage 6ad51a8
 - [x] Task: Add failing final-priority coverage for a deactivated `Csaba Karpati` direct-message conversation 92cc903
 - [x] Task: Rank equal-relevance matches by unread category and demote deactivated direct messages before alphabetic ordering 028bc3f
-- [~] Task: Conductor - User Manual Verification 'Unread-Aware Conversation Ranking' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Unread-Aware Conversation Ranking' (Protocol in workflow.md) 77a71ff
