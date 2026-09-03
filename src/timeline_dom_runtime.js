@@ -589,12 +589,12 @@
       }
       if (typeof patch.focus_message_ts === "string" && patch.focus_message_ts) {
         timeline.dataset.focusMessageTs = patch.focus_message_ts;
-      } else if (patch.focus_message_ts !== undefined) {
+      } else {
         delete timeline.dataset.focusMessageTs;
       }
       if (typeof patch.generation === "number") {
         timeline.dataset.timelineGeneration = String(patch.generation);
-      } else if (patch.generation !== undefined) {
+      } else {
         delete timeline.dataset.timelineGeneration;
       }
       if (patch.read_marker_url !== undefined || patch.first_unread_ts !== undefined) {
