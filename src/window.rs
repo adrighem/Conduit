@@ -5739,7 +5739,11 @@ impl ConduitWindow {
             let main_view = window.imp().message_view.borrow().clone();
             let secondary_view = window.imp().secondary_message_view.borrow().clone();
             let thread_view = window.thread_pane().web_view();
-            for web_view in main_view.into_iter().chain(secondary_view).chain(thread_view) {
+            for web_view in main_view
+                .into_iter()
+                .chain(secondary_view)
+                .chain(thread_view)
+            {
                 web_view.evaluate_javascript(
                     CANCEL_REACTION_PICKER_SCRIPT,
                     None,

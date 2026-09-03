@@ -191,9 +191,21 @@ fn normalize_call_block(block: &Value) -> Option<RichNode> {
     let join_url = v1_val
         .and_then(|v1| v1.get("join_url"))
         .and_then(Value::as_str)
-        .or_else(|| call_val.and_then(|c| c.get("join_url")).and_then(Value::as_str))
-        .or_else(|| v1_val.and_then(|v1| v1.get("desktop_app_join_url")).and_then(Value::as_str))
-        .or_else(|| call_val.and_then(|c| c.get("desktop_app_join_url")).and_then(Value::as_str))
+        .or_else(|| {
+            call_val
+                .and_then(|c| c.get("join_url"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            v1_val
+                .and_then(|v1| v1.get("desktop_app_join_url"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            call_val
+                .and_then(|c| c.get("desktop_app_join_url"))
+                .and_then(Value::as_str)
+        })
         .or_else(|| block.get("join_url").and_then(Value::as_str))
         .or_else(|| block.get("url").and_then(Value::as_str));
 
@@ -205,10 +217,17 @@ fn normalize_call_block(block: &Value) -> Option<RichNode> {
         .filter(|n| !n.trim().is_empty());
 
     let is_teams = name.is_some_and(|n| n.to_lowercase().contains("teams"))
-        || call_val.and_then(|c| c.get("media_backend_type")).and_then(Value::as_str) == Some("msteams")
+        || call_val
+            .and_then(|c| c.get("media_backend_type"))
+            .and_then(Value::as_str)
+            == Some("msteams")
         || join_url.is_some_and(|u| u.contains("teams.microsoft.com") || u.starts_with("msteams:"));
 
-    let default_title = if is_teams { "Microsoft Teams Meeting" } else { "Call" };
+    let default_title = if is_teams {
+        "Microsoft Teams Meeting"
+    } else {
+        "Call"
+    };
     let title = name.unwrap_or(default_title);
 
     let Some(url) = join_url else {
@@ -286,19 +305,36 @@ fn normalize_control(
 fn control_label(value: &Value, url: Option<&str>) -> String {
     block_text(value)
         .or_else(|| value.get("label").and_then(block_text))
-        .or_else(|| value.get("label").and_then(Value::as_str).map(ToString::to_string))
-        .or_else(|| value.get("name").and_then(Value::as_str).map(ToString::to_string))
+        .or_else(|| {
+            value
+                .get("label")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
         .or_else(|| {
             value
                 .get("value")
                 .and_then(Value::as_str)
-                .filter(|v| !v.starts_with("http://") && !v.starts_with("https://") && !v.starts_with("msteams:"))
+                .filter(|v| {
+                    !v.starts_with("http://")
+                        && !v.starts_with("https://")
+                        && !v.starts_with("msteams:")
+                })
                 .map(ToString::to_string)
         })
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| {
             if let Some(url) = url {
-                if url.contains("teams.microsoft.com") || url.starts_with("msteams:") || url.contains("zoom.us") {
+                if url.contains("teams.microsoft.com")
+                    || url.starts_with("msteams:")
+                    || url.contains("zoom.us")
+                {
                     "Join".to_string()
                 } else {
                     "Open".to_string()
@@ -316,10 +352,9 @@ fn extract_control_url(value: &Value) -> Option<String> {
         .or_else(|| value.get("action_url").and_then(Value::as_str))
         .or_else(|| value.get("join_url").and_then(Value::as_str))
         .or_else(|| {
-            value
-                .get("value")
-                .and_then(Value::as_str)
-                .filter(|v| v.starts_with("http://") || v.starts_with("https://") || v.starts_with("msteams:"))
+            value.get("value").and_then(Value::as_str).filter(|v| {
+                v.starts_with("http://") || v.starts_with("https://") || v.starts_with("msteams:")
+            })
         })
         .map(ToString::to_string)
 }
@@ -777,10 +812,18 @@ mod tests {
             &[],
         );
 
-        let [RichNode::Section { text: text1, .. }, RichNode::Section { text: text2, accessory, .. }] = document.nodes() else {
+        let [RichNode::Section { text: text1, .. }, RichNode::Section {
+            text: text2,
+            accessory,
+            ..
+        }] = document.nodes()
+        else {
             panic!("expected two sections");
         };
-        assert_eq!(text1.as_deref(), Some("A new call was started by Slack Teams Calls"));
+        assert_eq!(
+            text1.as_deref(),
+            Some("A new call was started by Slack Teams Calls")
+        );
         assert_eq!(text2.as_deref(), Some("*Microsoft Teams Meeting*"));
         let Some(RichAccessory::Control(control)) = accessory else {
             panic!("expected control accessory");

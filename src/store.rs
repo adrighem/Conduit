@@ -6257,11 +6257,8 @@ mod tests {
 
             let value: i64 = hub
                 .query(|connection| {
-                    Ok(connection.query_row(
-                        "SELECT value FROM uncontended_probe",
-                        [],
-                        |row| row.get(0),
-                    )?)
+                    Ok(connection
+                        .query_row("SELECT value FROM uncontended_probe", [], |row| row.get(0))?)
                 })
                 .await
                 .unwrap();

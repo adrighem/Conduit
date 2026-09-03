@@ -1292,7 +1292,11 @@ impl SlackMessage {
             room.huddle_link
                 .as_deref()
                 .or_else(|| room.extra.get("join_url").and_then(Value::as_str))
-                .or_else(|| room.extra.get("desktop_app_join_url").and_then(Value::as_str))
+                .or_else(|| {
+                    room.extra
+                        .get("desktop_app_join_url")
+                        .and_then(Value::as_str)
+                })
                 .or_else(|| {
                     room.extra
                         .get("v1")
@@ -1316,7 +1320,10 @@ impl SlackMessage {
             .filter(|n| !n.trim().is_empty());
 
         let is_teams = call_name.is_some_and(|n| n.to_lowercase().contains("teams"))
-            || self.username.as_deref().is_some_and(|u| u.to_lowercase().contains("teams"))
+            || self
+                .username
+                .as_deref()
+                .is_some_and(|u| u.to_lowercase().contains("teams"))
             || join_url.contains("teams.microsoft.com")
             || join_url.starts_with("msteams:");
 
@@ -1396,7 +1403,17 @@ impl SlackMessage {
             )
             .nodes,
         );
-        if !nodes.iter().any(|node| matches!(node, MessageNode::Control(_) | MessageNode::Actions(_) | MessageNode::Section { accessory: Some(_), .. })) {
+        if !nodes.iter().any(|node| {
+            matches!(
+                node,
+                MessageNode::Control(_)
+                    | MessageNode::Actions(_)
+                    | MessageNode::Section {
+                        accessory: Some(_),
+                        ..
+                    }
+            )
+        }) {
             if let Some(call_node) = self.synthesize_call_node() {
                 if nodes.is_empty() {
                     if let Some(text) = non_empty(self.text.as_deref()) {

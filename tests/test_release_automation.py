@@ -257,6 +257,14 @@ def test_local_meson_suite_enforces_strict_rust_lints() -> None:
     assert "suite: 'rust-lint'" in rust_build
 
 
+def test_local_meson_suite_enforces_rust_formatting() -> None:
+    rust_build = read("src/meson.build")
+    assert "test('Rust formatting'" in rust_build
+    assert "'fmt'," in rust_build
+    assert "'--check'," in rust_build
+    assert "suite: 'rust'" in rust_build
+
+
 def test_cargo_build_depends_on_compiled_resources() -> None:
     rust_build = read("src/meson.build")
     assert "conduit_resources = gnome.compile_resources" in rust_build

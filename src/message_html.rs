@@ -7200,7 +7200,9 @@ mod tests {
 
         assert!(html.contains("A new call was started by Slack Teams Calls"));
         assert!(html.contains("Microsoft Teams Meeting"));
-        assert!(html.contains("href=\"https://teams.microsoft.com/l/meetup-join/19%3ameeting_xyz\""));
+        assert!(
+            html.contains("href=\"https://teams.microsoft.com/l/meetup-join/19%3ameeting_xyz\"")
+        );
         assert!(html.contains(">Join</a>"));
     }
 }

@@ -19545,7 +19545,10 @@ mod tests {
             assert_eq!(reactions.len(), 1);
             assert_eq!(reactions[0].name.as_deref(), Some("thumbsup"));
             assert_eq!(reactions[0].count, Some(1));
-            assert_eq!(reactions[0].users.as_deref(), Some(&["U123".to_string()][..]));
+            assert_eq!(
+                reactions[0].users.as_deref(),
+                Some(&["U123".to_string()][..])
+            );
 
             let mut got_patch = false;
             let mut got_completion = false;

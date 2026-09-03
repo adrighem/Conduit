@@ -107,6 +107,18 @@ test('Cargo tests',
   depends: cargo_build,
 )
 
+test('Rust formatting',
+  cargo_bin,
+  args: [
+    'fmt',
+    '--check',
+    '--manifest-path', meson.project_source_root() / 'Cargo.toml',
+  ],
+  env: cargo_env,
+  suite: 'rust',
+  timeout: 60,
+)
+
 cargo_clippy_compatible = false
 if cargo_clippy_bin.found()
   clippy_version = run_command(cargo_clippy_bin, '--version', check: false)
