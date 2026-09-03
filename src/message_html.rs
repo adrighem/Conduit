@@ -109,6 +109,22 @@ pub enum TimelineDomPatch {
     ReplaceSnapshot {
         list_html: String,
         load_more_html: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeline_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sticky_key: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        anchor_key: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        focus_message_ts: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        empty_label: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        read_marker_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_unread_ts: Option<String>,
     },
     InsertMessage {
         position: TimelineInsertPosition,
@@ -236,13 +252,45 @@ pub fn conversation_snapshot_patch(
     messages: &[SlackMessage],
     context: &MessageHtmlContext,
 ) -> TimelineDomPatch {
+    conversation_snapshot_patch_with_focus(channel_id, messages, context, None)
+}
+
+#[allow(dead_code)]
+pub fn conversation_snapshot_patch_with_focus(
+    channel_id: &str,
+    messages: &[SlackMessage],
+    context: &MessageHtmlContext,
+    focus_message_ts: Option<&str>,
+) -> TimelineDomPatch {
+    let scroll_identity = timeline_scroll_identity(channel_id, context.thread_ts.as_deref());
+    let sticky_key = format!("conduit:timeline-at-bottom:{scroll_identity}");
+    let anchor_key = format!("conduit:timeline-anchor:{scroll_identity}");
+    let empty_label = if context.thread_ts.is_some() {
+        gettext("No replies")
+    } else {
+        gettext("No messages")
+    };
     TimelineDomPatch::ReplaceSnapshot {
         list_html: conversation_list_items_html(channel_id, messages, context),
-        load_more_html: context
-            .load_more_url
-            .as_deref()
-            .map(|url| load_more_action_html(url, &gettext("Load older messages")))
-            .unwrap_or_default(),
+        load_more_html: if context.thread_ts.is_none() {
+            context
+                .load_more_url
+                .as_deref()
+                .map(|url| load_more_action_html(url, &gettext("Load older messages")))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+        timeline_mode: Some(context.timeline_scroll.js_mode().to_string()),
+        sticky_key: Some(sticky_key),
+        anchor_key: Some(anchor_key),
+        generation: context.timeline_generation,
+        focus_message_ts: focus_message_ts.map(ToString::to_string),
+        empty_label: Some(empty_label),
+        read_marker_url: active_read_marker_url(context).map(ToString::to_string),
+        first_unread_ts: active_read_marker_url(context)
+            .and(context.first_unread_ts.as_deref())
+            .map(ToString::to_string),
     }
 }
 
@@ -6843,6 +6891,11 @@ mod tests {
         let TimelineDomPatch::ReplaceSnapshot {
             list_html,
             load_more_html,
+            timeline_mode,
+            sticky_key,
+            anchor_key,
+            empty_label,
+            ..
         } = patch
         else {
             panic!("expected snapshot patch");
@@ -6852,12 +6905,85 @@ mod tests {
         assert!(list_html.contains("unread-separator"));
         assert!(load_more_html.contains("Load older messages"));
         assert!(load_more_html.contains("cursor=next"));
+        assert_eq!(timeline_mode.as_deref(), Some("preserve"));
+        assert_eq!(
+            sticky_key.as_deref(),
+            Some("conduit:timeline-at-bottom:channel:C123")
+        );
+        assert_eq!(
+            anchor_key.as_deref(),
+            Some("conduit:timeline-anchor:channel:C123")
+        );
+        assert_eq!(empty_label.as_deref(), Some("No messages"));
 
         let script = timeline_dom_patch_call(&TimelineDomPatch::ReplaceSnapshot {
             list_html,
             load_more_html,
+            timeline_mode,
+            sticky_key,
+            anchor_key,
+            generation: None,
+            focus_message_ts: None,
+            empty_label,
+            read_marker_url: None,
+            first_unread_ts: None,
         });
         assert!(script.contains("\"type\":\"replace-snapshot\""));
+        assert!(script.contains("\"sticky_key\":\"conduit:timeline-at-bottom:channel:C123\""));
+    }
+
+    #[test]
+    fn conversation_snapshot_patch_with_focus_serializes_document_identity_and_focus() {
+        let mut target = message("target");
+        target.ts = "1710000005.000100".to_string();
+        let context = MessageHtmlContext {
+            timeline_scroll: TimelineScrollBehavior::StickToBottom,
+            timeline_generation: Some(42),
+            read_marker_url: Some(mark_read_action_url("C123", "0")),
+            first_unread_ts: Some(target.ts.clone()),
+            ..Default::default()
+        };
+
+        let patch = conversation_snapshot_patch_with_focus(
+            "C123",
+            &[target],
+            &context,
+            Some("1710000005.000100"),
+        );
+        let TimelineDomPatch::ReplaceSnapshot {
+            timeline_mode,
+            sticky_key,
+            anchor_key,
+            generation,
+            focus_message_ts,
+            empty_label,
+            read_marker_url,
+            first_unread_ts,
+            ..
+        } = &patch
+        else {
+            panic!("expected snapshot patch");
+        };
+
+        assert_eq!(timeline_mode.as_deref(), Some("stick-to-bottom"));
+        assert_eq!(
+            sticky_key.as_deref(),
+            Some("conduit:timeline-at-bottom:channel:C123")
+        );
+        assert_eq!(
+            anchor_key.as_deref(),
+            Some("conduit:timeline-anchor:channel:C123")
+        );
+        assert_eq!(*generation, Some(42));
+        assert_eq!(focus_message_ts.as_deref(), Some("1710000005.000100"));
+        assert_eq!(empty_label.as_deref(), Some("No messages"));
+        assert!(read_marker_url.as_ref().unwrap().contains("channel=C123"));
+        assert_eq!(first_unread_ts.as_deref(), Some("1710000005.000100"));
+
+        let script = timeline_dom_patch_call(&patch);
+        assert!(script.contains("\"type\":\"replace-snapshot\""));
+        assert!(script.contains("\"focus_message_ts\":\"1710000005.000100\""));
+        assert!(script.contains("\"generation\":42"));
     }
 
     #[test]

@@ -87,9 +87,13 @@ impl ThreadPane {
         ));
     }
 
-    pub(crate) fn load_document(&self, html: &str) {
+    pub(crate) fn ensure_open(&self) {
         self.title.set_title(&gettext("Thread"));
         self.split.set_show_sidebar(true);
+    }
+
+    pub(crate) fn load_document(&self, html: &str) {
+        self.ensure_open();
         self.load_html(html);
     }
 

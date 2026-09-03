@@ -103,13 +103,8 @@
   let rememberViewportAnchorFrame = 0;
   let resizeCorrectionFrame = 0;
   let scrollMutationGeneration = 0;
+  let snapshotReplaced = false;
   const timeline = document.querySelector(".timeline");
-  const initialMode = timeline ? timeline.dataset.timelineMode || "preserve" : "preserve";
-  const stickyKey = timeline ? timeline.dataset.timelineStickyKey : "";
-  const anchorKey = timeline ? timeline.dataset.timelineAnchorKey : "";
-  const generation = timeline && timeline.dataset.timelineGeneration
-    ? Number(timeline.dataset.timelineGeneration)
-    : null;
   let initialPositionPending = Boolean(timeline);
   let automaticPositioning = false;
   let userInteracted = false;
@@ -117,6 +112,10 @@
   let updateReadMarker = null;
 
   function notifyHost(action) {
+    if (!timeline) return;
+    const generation = timeline.dataset.timelineGeneration
+      ? Number(timeline.dataset.timelineGeneration)
+      : null;
     if (generation !== null) {
       window.location.href = "conduit://timeline-" + action + "?generation=" +
         encodeURIComponent(String(generation));
@@ -124,7 +123,10 @@
   }
 
   function storedAtBottom() {
-    if (initialMode === "bottom") return true;
+    if (!timeline) return true;
+    const mode = timeline.dataset.timelineMode || "preserve";
+    if (mode === "bottom") return true;
+    const stickyKey = timeline.dataset.timelineStickyKey;
     if (!stickyKey) return true;
     try {
       return sessionStorage.getItem(stickyKey) !== "false";
@@ -134,6 +136,8 @@
   }
 
   function storedAnchor() {
+    if (!timeline) return null;
+    const anchorKey = timeline.dataset.timelineAnchorKey;
     if (!anchorKey) return null;
     try {
       return JSON.parse(sessionStorage.getItem(anchorKey) || "null");
@@ -154,6 +158,8 @@
       payload.ts = anchor.dataset.messageTs;
       payload.top = anchor.getBoundingClientRect().top;
     }
+    const stickyKey = timeline.dataset.timelineStickyKey;
+    const anchorKey = timeline.dataset.timelineAnchorKey;
     try {
       if (stickyKey) sessionStorage.setItem(stickyKey, isNearBottom() ? "true" : "false");
       if (anchorKey) sessionStorage.setItem(anchorKey, JSON.stringify(payload));
@@ -177,14 +183,17 @@
   }
 
   function applyInitialPosition() {
-    if (!initialPositionPending || userInteracted) return;
+    if (!timeline || !initialPositionPending || userInteracted) return;
     automaticPositioning = true;
     const targetTs = timeline.dataset.focusMessageTs;
     const target = targetTs ? messageElement(targetTs) : null;
     if (target) {
       target.scrollIntoView({ block: "center", inline: "nearest" });
       viewportPinnedToBottom = false;
-    } else if (initialMode === "preserve-prepend" || !storedAtBottom()) {
+    } else if (
+      (timeline.dataset.timelineMode || "preserve") === "preserve-prepend" ||
+      !storedAtBottom()
+    ) {
       restoreStoredAnchor();
       viewportPinnedToBottom = isNearBottom();
     } else {
@@ -504,8 +513,12 @@
     const anchorTs = anchor ? anchor.dataset.messageTs : null;
     const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
     const oldScrollTop = root.scrollTop;
+    snapshotReplaced = false;
     const changed = mutate(arrivalVisible);
     if (!changed) return false;
+    if (snapshotReplaced) {
+      return true;
+    }
     const generation = ++scrollMutationGeneration;
     function restore() {
       if (generation !== scrollMutationGeneration) return;
@@ -538,18 +551,86 @@
     }
 
     if (patch.type === "replace-snapshot") {
-        const list = document.querySelector(".message-list");
-        if (
-          !list ||
-          typeof patch.list_html !== "string" ||
-          typeof patch.load_more_html !== "string"
-        ) return false;
-        const previous = list.previousElementSibling;
-        if (previous && previous.matches(".timeline-action")) previous.remove();
-        if (patch.load_more_html) list.before(fragment(patch.load_more_html));
-        list.replaceChildren(fragment(patch.list_html));
-        return true;
+      const list = document.querySelector(".message-list");
+      if (
+        !list ||
+        !timeline ||
+        typeof patch.list_html !== "string" ||
+        typeof patch.load_more_html !== "string"
+      ) return false;
+
+      snapshotReplaced = true;
+
+      if (rememberViewportAnchorFrame) {
+        window.cancelAnimationFrame(rememberViewportAnchorFrame);
+        rememberViewportAnchorFrame = 0;
       }
+      if (resizeCorrectionFrame) {
+        window.cancelAnimationFrame(resizeCorrectionFrame);
+        resizeCorrectionFrame = 0;
+      }
+
+      const previous = list.previousElementSibling;
+      if (previous && previous.matches(".timeline-action")) previous.remove();
+      if (patch.load_more_html) list.before(fragment(patch.load_more_html));
+      list.replaceChildren(fragment(patch.list_html));
+
+      if (typeof patch.empty_label === "string") {
+        list.dataset.emptyLabel = patch.empty_label;
+      }
+      if (typeof patch.timeline_mode === "string") {
+        timeline.dataset.timelineMode = patch.timeline_mode;
+      }
+      if (typeof patch.sticky_key === "string") {
+        timeline.dataset.timelineStickyKey = patch.sticky_key;
+      }
+      if (typeof patch.anchor_key === "string") {
+        timeline.dataset.timelineAnchorKey = patch.anchor_key;
+      }
+      if (typeof patch.focus_message_ts === "string" && patch.focus_message_ts) {
+        timeline.dataset.focusMessageTs = patch.focus_message_ts;
+      } else if (patch.focus_message_ts !== undefined) {
+        delete timeline.dataset.focusMessageTs;
+      }
+      if (typeof patch.generation === "number") {
+        timeline.dataset.timelineGeneration = String(patch.generation);
+      } else if (patch.generation !== undefined) {
+        delete timeline.dataset.timelineGeneration;
+      }
+      if (patch.read_marker_url !== undefined || patch.first_unread_ts !== undefined) {
+        configureReadMarker(patch.read_marker_url, patch.first_unread_ts);
+      }
+
+      if (window.getSelection) {
+        try {
+          const sel = window.getSelection();
+          if (sel) sel.removeAllRanges();
+        } catch (_) {}
+      }
+      document.querySelectorAll("details.author-actions[open]").forEach(function (menu) {
+        menu.open = false;
+      });
+      document.querySelectorAll(".mention-actions > button[aria-expanded='true']").forEach(function (button) {
+        button.setAttribute("aria-expanded", "false");
+        if (button.nextElementSibling) button.nextElementSibling.hidden = true;
+      });
+
+      viewportAnchor = null;
+      viewportAnchorTop = 0;
+      restoringViewportAnchor = false;
+      userInteracted = false;
+      initialPositionPending = true;
+      automaticPositioning = true;
+      timeline.setAttribute("data-timeline-positioning", "pending");
+
+      applyInitialPosition();
+      requestAnimationFrame(function () {
+        applyInitialPosition();
+        requestAnimationFrame(commitInitialPosition);
+      });
+
+      return true;
+    }
 
       if (patch.type === "insert-message") {
         const list = document.querySelector(".message-list");
