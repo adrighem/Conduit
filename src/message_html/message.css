@@ -79,3 +79,67 @@
 .block-action.is-unavailable {
   opacity: 0.65;
 }
+
+.quoted-message {
+  display: grid;
+  flex: 1 1 100%;
+  gap: 4px;
+  min-inline-size: 0;
+  margin-block: 4px;
+  margin-inline: 0;
+  padding-block: 8px;
+  padding-inline: 12px;
+  border-inline-start: 4px solid var(--line);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--soft) 55%, transparent);
+}
+
+.quoted-message-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.quoted-message-avatar {
+  inline-size: 16px;
+  block-size: 16px;
+  border-radius: 3px;
+  object-fit: cover;
+}
+
+.quoted-message-author {
+  font-weight: 600;
+}
+
+.quoted-message-channel-ref {
+  font-weight: normal;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quoted-message-body {
+  min-inline-size: 0;
+}
+
+.quoted-message-body p {
+  margin: 0;
+}
+
+.quoted-message-footer {
+  margin-block-start: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quoted-message-nav-link {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.quoted-message-nav-link:hover {
+  text-decoration: underline;
+  color: var(--accent);
+}

@@ -1119,6 +1119,33 @@ impl SlackAttachmentAction {
     }
 }
 
+fn deserialize_flexible_slack_ts<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FlexibleTs {
+        String(String),
+        Integer(i64),
+        Float(f64),
+    }
+
+    match Option::<FlexibleTs>::deserialize(deserializer)? {
+        Some(FlexibleTs::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(FlexibleTs::Integer(n)) => Ok(Some(n.to_string())),
+        Some(FlexibleTs::Float(f)) => Ok(Some(f.to_string())),
+        None => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlackAttachment {
     pub id: Option<u64>,
@@ -1129,6 +1156,16 @@ pub struct SlackAttachment {
     pub author_name: Option<String>,
     pub author_link: Option<String>,
     pub author_icon: Option<String>,
+    pub author_id: Option<String>,
+    pub author_subname: Option<String>,
+    pub channel_id: Option<String>,
+    pub channel_team: Option<String>,
+    #[serde(default)]
+    pub is_msg_unfurl: Option<bool>,
+    #[serde(default)]
+    pub is_reply_unfurl: Option<bool>,
+    pub from_url: Option<String>,
+    pub original_url: Option<String>,
     pub title: Option<String>,
     pub title_link: Option<String>,
     pub text: Option<String>,
@@ -1137,12 +1174,19 @@ pub struct SlackAttachment {
     pub thumb_url: Option<String>,
     pub footer: Option<String>,
     pub footer_icon: Option<String>,
-    pub ts: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_flexible_slack_ts")]
+    pub ts: Option<String>,
     pub callback_id: Option<String>,
     pub actions: Option<Vec<SlackAttachmentAction>>,
 }
 
 impl SlackAttachment {
+    pub fn is_quote_unfurl(&self) -> bool {
+        self.is_msg_unfurl == Some(true)
+            || self.is_reply_unfurl == Some(true)
+            || (self.channel_id.is_some() && self.ts.is_some())
+    }
+
     /// Text represented by the attachment's non-interactive visual content.
     ///
     /// Slack's `fallback` is used only when no structured text is available,
@@ -1199,6 +1243,7 @@ impl SlackAttachment {
         !self.visible_text().is_empty()
             || non_empty(self.image_url.as_deref()).is_some()
             || non_empty(self.thumb_url.as_deref()).is_some()
+            || self.is_quote_unfurl()
             || self.actions.as_ref().is_some_and(|actions| {
                 actions.iter().any(|action| {
                     action.label().is_some() || non_empty(action.url.as_deref()).is_some()
@@ -3009,5 +3054,32 @@ mod tests {
         assert_eq!(conversation.last_read_ts(), Some("2.0"));
         assert!(conversation.has_unread_activity());
         assert_eq!(conversation.unread_activity_count(), 1);
+    }
+
+    #[test]
+    fn slack_attachment_deserializes_flexible_ts_and_detects_quotes() {
+        let string_ts: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "is_msg_unfurl": true,
+            "ts": "1785770122.389189",
+            "channel_id": "C0123"
+        }))
+        .expect("attachment with string ts deserializes");
+        assert_eq!(string_ts.ts.as_deref(), Some("1785770122.389189"));
+        assert!(string_ts.is_quote_unfurl());
+        assert!(string_ts.has_visible_content());
+
+        let int_ts: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "ts": 1785770122,
+            "channel_id": "C0123"
+        }))
+        .expect("attachment with int ts deserializes");
+        assert_eq!(int_ts.ts.as_deref(), Some("1785770122"));
+        assert!(int_ts.is_quote_unfurl());
+
+        let empty_ts: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "ts": "  "
+        }))
+        .expect("attachment with empty ts deserializes");
+        assert_eq!(empty_ts.ts, None);
     }
 }

@@ -991,7 +991,9 @@ impl ConduitApplication {
             return;
         };
 
-        gtk::IconTheme::for_display(&display).add_resource_path("/eu/vanadrighem/conduit/icons");
+        let icon_theme = gtk::IconTheme::for_display(&display);
+        icon_theme.add_resource_path("/eu/vanadrighem/conduit/icons");
+        icon_theme.add_resource_path("/eu/vanadrighem/conduit/icons/hicolor");
     }
 
     fn show_shortcuts(&self) {

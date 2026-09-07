@@ -59,11 +59,18 @@ pub fn sidebar_row_widget(
     let row = gtk::ListBoxRow::new();
     row.set_selectable(true);
     row.set_activatable(true);
+    if model.selected {
+        row.add_css_class("selected");
+    }
     let accessible_label = model.accessible_label();
     row.set_tooltip_text(Some(&accessible_label));
     row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
 
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    content.add_css_class("sidebar-row-content");
+    if model.selected {
+        content.add_css_class("active-conversation");
+    }
     content.set_margin_top(layout.margin_top);
     content.set_margin_bottom(layout.margin_bottom);
     content.set_margin_start(layout.margin_start);

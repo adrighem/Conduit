@@ -53,7 +53,7 @@ endif
 
 cargo_features_arg = ','.join(cargo_features)
 
-if get_option('buildtype') == 'release'
+if get_option('buildtype') in ['release', 'debugoptimized', 'minsize']
   cargo_release_arg = '--release'
   rust_target = 'release'
 else

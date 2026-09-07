@@ -273,8 +273,16 @@
         nextItem = nextItem.nextElementSibling;
       }
       const separator = document.querySelector(".unread-separator");
-      if (separator && nextItem) nextItem.before(separator);
-      else if (separator) separator.remove();
+      if (!separator) return;
+      const host = separator.closest(".unread-boundary-item") || separator;
+      if (nextItem) {
+        nextItem.before(host);
+      } else {
+        separator.classList.add("collapsing");
+        window.setTimeout(function () {
+          if (host && host.isConnected) host.remove();
+        }, 220);
+      }
     }
 
     function schedule() {

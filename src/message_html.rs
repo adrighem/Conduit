@@ -1278,6 +1278,16 @@ a:hover {{
   color: var(--accent);
   font-size: 12px;
   font-weight: 700;
+  max-height: 24px;
+  opacity: 1;
+  overflow: hidden;
+  transition: opacity 200ms ease, max-height 200ms ease, margin-block 200ms ease;
+}}
+
+.unread-separator.collapsing {{
+  opacity: 0;
+  max-height: 0;
+  margin-block: 0;
 }}
 
 .unread-separator::before,
@@ -3902,12 +3912,20 @@ pub fn mark_thread_read_action_url(channel_id: &str, thread_ts: &str, ts: &str) 
 }
 
 pub fn message_context_action_url(location: &SearchMessageLocation) -> String {
+    message_target_action_url(
+        location.channel_id(),
+        location.message_ts(),
+        location.thread_ts(),
+    )
+}
+
+pub fn message_target_action_url(channel_id: &str, ts: &str, thread_ts: Option<&str>) -> String {
     let mut url = format!(
         "conduit://message?channel={}&ts={}",
-        encode_query(location.channel_id()),
-        encode_query(location.message_ts())
+        encode_query(channel_id),
+        encode_query(ts)
     );
-    append_thread_ts_query(&mut url, location.thread_ts());
+    append_thread_ts_query(&mut url, thread_ts);
     url
 }
 
@@ -6146,7 +6164,8 @@ mod tests {
         assert!(script.contains("observer.observe(message)"));
         assert!(script.contains("observer.unobserve(message)"));
         assert!(script.contains("message.closest(\".message-list-item\")"));
-        assert!(script.contains("nextItem.before(separator)"));
+        assert!(script.contains("nextItem.before(host)"));
+        assert!(script.contains("separator.classList.add(\"collapsing\")"));
         assert!(script.contains("patch.type === \"configure-read-state\""));
         assert!(script.contains("configurationLastSent = \"\""));
         assert!(script.contains("if (!lastSent || timestampAfter(candidate, lastSent))"));
@@ -7204,5 +7223,43 @@ mod tests {
             html.contains("href=\"https://teams.microsoft.com/l/meetup-join/19%3ameeting_xyz\"")
         );
         assert!(html.contains(">Join</a>"));
+    }
+
+    #[test]
+    fn renders_quoted_message_unfurl_with_navigation_links() {
+        let mut message = crate::models::SlackMessage {
+            ts: "1786109048.687719".into(),
+            user: Some("U016H7932KA".into()),
+            text: Some("Here is a quote".into()),
+            attachments: Some(vec![crate::models::SlackAttachment {
+                is_msg_unfurl: Some(true),
+                is_reply_unfurl: Some(true),
+                ts: Some("1785770122.389189".into()),
+                author_name: Some("Vincent van Adrighem".into()),
+                author_id: Some("U0156N1291A".into()),
+                channel_id: Some("C0B7NRGNSSW".into()),
+                from_url: Some("https://signicat.slack.com/archives/C0B7NRGNSSW/p1785770122389189?thread_ts=1785745809.323539&cid=C0B7NRGNSSW".into()),
+                text: Some("This week is fine. Next week isn't".into()),
+                footer: Some("Thread in Slack conversation".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        message.refresh_canonical_content();
+
+        let mut context = MessageHtmlContext::default();
+        let mut conversation_titles = HashMap::new();
+        conversation_titles.insert("C0B7NRGNSSW".into(), "general".into());
+        context.conversation_titles = conversation_titles;
+
+        let html = message_body_html(None, &message, &context);
+
+        assert!(html.contains("class=\"quoted-message\""));
+        assert!(html.contains("class=\"quoted-message-author\""));
+        assert!(html.contains("Vincent van Adrighem"));
+        assert!(html.contains("in <a class=\"channel-reference\" href=\"conduit://channel?channel=C0B7NRGNSSW\">#general</a>"));
+        assert!(html.contains("This week is fine. Next week isn&#39;t"));
+        assert!(html.contains("href=\"conduit://message?channel=C0B7NRGNSSW&amp;ts=1785770122.389189&amp;thread_ts=1785745809.323539\""));
+        assert!(html.contains("Thread in Slack conversation ↗"));
     }
 }

@@ -20,14 +20,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, Metadata};
-use std::io::{self, Read, Seek, SeekFrom};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -53,10 +49,7 @@ use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::emoji::{
     emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
-    EmojiPickerGenerationGate, EmojiPickerModel, EmojiPickerMove, EmojiPickerQuery,
-    EmojiPickerResult, EmojiPickerResultEntry, EmojiPickerResultValueKind, EmojiValue,
-    EMOJI_PICKER_CATEGORIES, EMOJI_PICKER_MAX_QUERY_CHARS, EMOJI_PICKER_PROTOCOL_VERSION,
-    EMOJI_PICKER_RESULT_LIMIT,
+    EmojiPickerGenerationGate, EmojiPickerModel, EmojiPickerMove, EmojiPickerQuery, EmojiValue,
 };
 use crate::huddles::fallback::external_huddle_url;
 use crate::huddles::presentation::{present_huddle, HuddlePrimaryAction};
@@ -80,10 +73,10 @@ use crate::models::{
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering;
 use crate::runtime::{
-    preview_workspace_cache_key, preview_workspace_scope, AppRuntime, CachedAssetDescriptor,
-    OperationContext, RequestId, RuntimeCommand, RuntimeCommandRejection, RuntimeEvent,
-    RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity,
-    RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
+    preview_workspace_cache_key, preview_workspace_scope, AppRuntime, OperationContext, RequestId,
+    RuntimeCommand, RuntimeCommandRejection, RuntimeEvent, RuntimeEventKind, RuntimeEventMeta,
+    RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity, RuntimeOperation, RuntimeTarget,
+    SessionId, UploadAttachment,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 #[cfg(test)]
@@ -99,6 +92,7 @@ use crate::slack_link::{
     resolve_slack_uri, slack_app_web_fallback, SlackFileAction, SlackUri, SlackUriResolution,
     SlackUriTarget,
 };
+use crate::status_dialog::*;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
@@ -122,74 +116,6 @@ struct HuddlePreflightDialog {
     microphone: HuddleDevicePicker,
     speaker: HuddleDevicePicker,
     camera: HuddleDevicePicker,
-}
-
-#[derive(Debug, Clone)]
-struct StatusDialogState {
-    dialog: adw::AlertDialog,
-    status_entry: adw::EntryRow,
-    emoji_picker: StatusEmojiPicker,
-    expiration_choice_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct PendingStatusUpdate {
-    requested: SlackUserStatus,
-    dialog_draft: SlackUserStatus,
-    clearing: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusExpirationChoice {
-    Never,
-    Minutes30,
-    Hour1,
-    Hours4,
-    Today,
-    ThisWeek,
-    Existing(i64),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UserStatusPresentation {
-    subtitle: String,
-    accessible_text: String,
-}
-
-type StatusEmojiChoiceHandler = Rc<dyn Fn(Option<EmojiPickerResultEntry>)>;
-
-#[derive(Debug, Clone)]
-struct StatusEmojiPickerModel {
-    emojis: EmojiPickerModel,
-}
-
-#[derive(Debug, Clone)]
-struct StatusEmojiPicker {
-    row: adw::ActionRow,
-    selected_preview: gtk::Box,
-    popover: gtk::Popover,
-    search: gtk::SearchEntry,
-    page: StatusEmojiPickerPage,
-    source: Rc<RefCell<StatusEmojiPickerModel>>,
-    selected_name: Rc<RefCell<String>>,
-    active_category: Rc<RefCell<String>>,
-    offset: Rc<Cell<usize>>,
-    category_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct StatusEmojiPickerPage {
-    grid: gtk::FlowBox,
-    empty_label: gtk::Label,
-    category_bar: gtk::Widget,
-    page_controls: gtk::Widget,
-    page_status: gtk::Label,
-    previous: gtk::Button,
-    next: gtk::Button,
-    visible_choices: Rc<RefCell<Vec<EmojiPickerResultEntry>>>,
-    total: Rc<Cell<usize>>,
-    has_previous: Rc<Cell<bool>>,
-    has_more: Rc<Cell<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -827,6 +753,19 @@ button.message-edit-action {
   background-color: @success_bg_color;
   color: @success_fg_color;
 }
+listview.navigation-sidebar row.activatable:hover {
+  background-color: color-mix(in srgb, currentColor 5%, transparent);
+}
+listview.navigation-sidebar row:selected {
+  background-color: color-mix(in srgb, currentColor 12%, transparent);
+}
+listview.navigation-sidebar row:selected .sidebar-row-content.active-conversation {
+  background-color: transparent;
+}
+listview.navigation-sidebar row:not(:selected) .sidebar-row-content.active-conversation {
+  background-color: color-mix(in srgb, currentColor 12%, transparent);
+  border-radius: 6px;
+}
 "#;
 const MAX_COMPOSER_ATTACHMENTS: usize = 10;
 
@@ -838,885 +777,9 @@ fn composer_format_toolbar_width(control_count: usize) -> i32 {
     control_count * COMPOSER_FORMAT_CONTROL_SIZE
         + (control_count - 1) * COMPOSER_FORMAT_CONTROL_SPACING
 }
+use crate::timeline_presenter::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimelineSurface {
-    Main,
-    Thread,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-enum TimelineDocument {
-    Conversation(String),
-    Thread { channel_id: String, ts: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-struct TimelineDelta {
-    document: TimelineDocument,
-    base_revision: WorkspaceRevision,
-    revision: WorkspaceRevision,
-    patches: Vec<TimelineDomPatch>,
-    scroll: TimelineScrollBehavior,
-}
-
-#[allow(dead_code)]
-impl TimelineDelta {
-    fn new(
-        document: TimelineDocument,
-        base_revision: WorkspaceRevision,
-        revision: WorkspaceRevision,
-        patches: Vec<TimelineDomPatch>,
-        scroll: TimelineScrollBehavior,
-    ) -> Option<Self> {
-        // Derived presentation enrichments (for example a delayed asset) can
-        // stay on the same authoritative workspace revision.
-        (revision >= base_revision && !patches.is_empty()).then_some(Self {
-            document,
-            base_revision,
-            revision,
-            patches,
-            scroll,
-        })
-    }
-
-    fn document(&self) -> &TimelineDocument {
-        &self.document
-    }
-
-    fn base_revision(&self) -> WorkspaceRevision {
-        self.base_revision
-    }
-
-    fn revision(&self) -> WorkspaceRevision {
-        self.revision
-    }
-
-    fn patches(&self) -> &[TimelineDomPatch] {
-        &self.patches
-    }
-
-    fn scroll(&self) -> TimelineScrollBehavior {
-        self.scroll
-    }
-
-    fn merge(&mut self, next: Self) {
-        debug_assert_eq!(self.document, next.document);
-        debug_assert_eq!(self.revision, next.base_revision);
-        self.revision = next.revision;
-        self.patches.extend(next.patches);
-        self.scroll = merge_timeline_delta_scroll(self.scroll, next.scroll);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum TimelinePresenterAction {
-    LoadDocument,
-    ReloadDocument,
-    ScheduleFrame,
-    Queued,
-    Ready,
-}
-
-#[derive(Debug, Default)]
-#[allow(dead_code)]
-struct TimelinePresenter {
-    document: Option<TimelineDocument>,
-    presented_revision: WorkspaceRevision,
-    loading: bool,
-    reload_required: bool,
-    pending: Option<TimelineDelta>,
-    pinned_to_bottom: bool,
-    user_scrolled: bool,
-}
-
-#[allow(dead_code)]
-impl TimelinePresenter {
-    fn prepare_document(
-        &mut self,
-        document: TimelineDocument,
-        revision: WorkspaceRevision,
-        scroll: TimelineScrollBehavior,
-    ) -> TimelinePresenterAction {
-        if self.document.is_none() || self.reload_required {
-            return self.begin_document(document, revision, scroll);
-        }
-        if self.loading {
-            if self.document.as_ref() == Some(&document) {
-                return TimelinePresenterAction::Queued;
-            }
-            return self.begin_document(document, revision, scroll);
-        }
-        let expected_revision = self.expected_revision();
-        if self.document.as_ref() != Some(&document) {
-            self.recycle_document(document, revision, scroll);
-            return TimelinePresenterAction::Ready;
-        }
-        if revision < expected_revision {
-            return self.begin_document(document, revision, scroll);
-        }
-        TimelinePresenterAction::Ready
-    }
-
-    fn recycle_document(
-        &mut self,
-        document: TimelineDocument,
-        revision: WorkspaceRevision,
-        scroll: TimelineScrollBehavior,
-    ) {
-        self.document = Some(document);
-        self.presented_revision = revision;
-        self.loading = false;
-        self.reload_required = false;
-        self.pending = None;
-        self.pinned_to_bottom = matches!(
-            scroll,
-            TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
-        );
-        self.user_scrolled = false;
-    }
-
-    fn begin_document(
-        &mut self,
-        document: TimelineDocument,
-        revision: WorkspaceRevision,
-        scroll: TimelineScrollBehavior,
-    ) -> TimelinePresenterAction {
-        self.document = Some(document);
-        self.presented_revision = revision;
-        self.loading = true;
-        self.reload_required = false;
-        self.pending = None;
-        self.pinned_to_bottom = matches!(
-            scroll,
-            TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
-        );
-        self.user_scrolled = false;
-        TimelinePresenterAction::LoadDocument
-    }
-
-    fn document_loaded(
-        &mut self,
-        document: &TimelineDocument,
-        revision: WorkspaceRevision,
-    ) -> TimelinePresenterAction {
-        if self.document.as_ref() != Some(document) || self.presented_revision != revision {
-            return self.require_reload();
-        }
-        self.loading = false;
-        if self.pending.is_some() {
-            TimelinePresenterAction::ScheduleFrame
-        } else {
-            TimelinePresenterAction::Ready
-        }
-    }
-
-    fn queue_delta(&mut self, mut delta: TimelineDelta) -> TimelinePresenterAction {
-        let expected_revision = self
-            .pending
-            .as_ref()
-            .map(TimelineDelta::revision)
-            .unwrap_or(self.presented_revision);
-        if self.document.as_ref() != Some(&delta.document)
-            || delta.base_revision != expected_revision
-        {
-            return self.require_reload();
-        }
-
-        delta.scroll = effective_timeline_delta_scroll(
-            delta.scroll,
-            self.pinned_to_bottom,
-            self.user_scrolled,
-        );
-        if let Some(pending) = self.pending.as_mut() {
-            pending.merge(delta);
-            TimelinePresenterAction::Queued
-        } else {
-            self.pending = Some(delta);
-            if self.loading {
-                TimelinePresenterAction::Queued
-            } else {
-                TimelinePresenterAction::ScheduleFrame
-            }
-        }
-    }
-
-    fn take_frame(&mut self) -> Option<TimelineDelta> {
-        if self.loading {
-            return None;
-        }
-        let delta = self.pending.take()?;
-        debug_assert_eq!(delta.base_revision, self.presented_revision);
-        self.presented_revision = delta.revision;
-        Some(delta)
-    }
-
-    fn note_user_scrolled(&mut self) {
-        self.user_scrolled = true;
-        self.pinned_to_bottom = false;
-        if let Some(pending) = self.pending.as_mut() {
-            pending.scroll = effective_timeline_delta_scroll(pending.scroll, false, true);
-        }
-    }
-
-    fn note_pinned_to_bottom(&mut self) {
-        self.user_scrolled = false;
-        self.pinned_to_bottom = true;
-    }
-
-    fn patch_failed(&mut self) -> TimelinePresenterAction {
-        self.require_reload()
-    }
-
-    fn document(&self) -> Option<&TimelineDocument> {
-        self.document.as_ref()
-    }
-
-    fn expected_revision(&self) -> WorkspaceRevision {
-        self.pending
-            .as_ref()
-            .map(TimelineDelta::revision)
-            .unwrap_or(self.presented_revision)
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn presented_revision(&self) -> WorkspaceRevision {
-        self.presented_revision
-    }
-
-    fn is_loading(&self) -> bool {
-        self.loading
-    }
-
-    fn reload_required(&self) -> bool {
-        self.reload_required
-    }
-
-    fn require_reload(&mut self) -> TimelinePresenterAction {
-        self.loading = true;
-        self.reload_required = true;
-        self.pending = None;
-        TimelinePresenterAction::ReloadDocument
-    }
-}
-
-fn effective_timeline_delta_scroll(
-    requested: TimelineScrollBehavior,
-    pinned_to_bottom: bool,
-    user_scrolled: bool,
-) -> TimelineScrollBehavior {
-    if requested == TimelineScrollBehavior::PreservePrepend {
-        TimelineScrollBehavior::PreservePrepend
-    } else if user_scrolled || !pinned_to_bottom {
-        TimelineScrollBehavior::Preserve
-    } else if matches!(
-        requested,
-        TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
-    ) {
-        TimelineScrollBehavior::StickToBottom
-    } else {
-        TimelineScrollBehavior::Preserve
-    }
-}
-
-fn merge_timeline_delta_scroll(
-    current: TimelineScrollBehavior,
-    next: TimelineScrollBehavior,
-) -> TimelineScrollBehavior {
-    if current == TimelineScrollBehavior::PreservePrepend
-        || next == TimelineScrollBehavior::PreservePrepend
-    {
-        TimelineScrollBehavior::PreservePrepend
-    } else if matches!(
-        current,
-        TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
-    ) || matches!(
-        next,
-        TimelineScrollBehavior::Bottom | TimelineScrollBehavior::StickToBottom
-    ) {
-        TimelineScrollBehavior::StickToBottom
-    } else {
-        TimelineScrollBehavior::Preserve
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct UiInvalidations(u8);
-
-impl UiInvalidations {
-    const SIDEBAR: Self = Self(1 << 0);
-    const MAIN: Self = Self(1 << 1);
-    const THREAD: Self = Self(1 << 2);
-    const TITLE: Self = Self(1 << 3);
-    const PICKER: Self = Self(1 << 4);
-
-    fn contains(self, invalidation: Self) -> bool {
-        self.0 & invalidation.0 != 0
-    }
-
-    fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    fn insert(&mut self, invalidations: Self) -> bool {
-        let was_empty = self.0 == 0;
-        self.0 |= invalidations.0;
-        was_empty
-    }
-
-    fn take(&mut self) -> Self {
-        std::mem::take(self)
-    }
-}
-
-impl std::ops::BitOr for UiInvalidations {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self::Output {
-        Self(self.0 | rhs.0)
-    }
-}
-
-fn timeline_surface_invalidation(surface: TimelineSurface) -> UiInvalidations {
-    match surface {
-        TimelineSurface::Main => UiInvalidations::MAIN,
-        TimelineSurface::Thread => UiInvalidations::THREAD,
-    }
-}
-
-const CONDUIT_ASSET_REGISTRY_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const CONDUIT_ASSET_REGISTRY_MAX_ENTRIES: usize = 2_048;
-const CONDUIT_ASSET_VALIDATION_PREFIX_BYTES: u64 = 64;
-const IMAGE_ASSET_SOURCE_MAX_BYTES: usize = 8 * 1024;
-const IMAGE_ASSET_KEY_SET_MAX_BYTES: usize = 8 * 1024 * 1024;
-const IMAGE_ASSET_KEY_SET_MAX_ENTRIES: usize = 2_048;
-
-#[derive(Debug, Default)]
-pub(super) struct BoundedImageAssetKeys {
-    entries: HashMap<String, u64>,
-    total_bytes: usize,
-    clock: u64,
-}
-
-impl BoundedImageAssetKeys {
-    fn try_insert(&mut self, key: String) -> bool {
-        if self.entries.contains_key(&key)
-            || key.is_empty()
-            || key.len() > IMAGE_ASSET_SOURCE_MAX_BYTES
-            || self.entries.len() >= IMAGE_ASSET_KEY_SET_MAX_ENTRIES
-            || self.total_bytes.saturating_add(key.len()) > IMAGE_ASSET_KEY_SET_MAX_BYTES
-        {
-            return false;
-        }
-        self.clock = self.clock.saturating_add(1);
-        self.total_bytes = self.total_bytes.saturating_add(key.len());
-        self.entries.insert(key, self.clock);
-        true
-    }
-
-    fn insert_evicting(&mut self, key: String) -> bool {
-        if self.entries.contains_key(&key)
-            || key.is_empty()
-            || key.len() > IMAGE_ASSET_SOURCE_MAX_BYTES
-            || key.len() > IMAGE_ASSET_KEY_SET_MAX_BYTES
-        {
-            return false;
-        }
-        self.clock = self.clock.saturating_add(1);
-        self.total_bytes = self.total_bytes.saturating_add(key.len());
-        self.entries.insert(key.clone(), self.clock);
-        while self.entries.len() > IMAGE_ASSET_KEY_SET_MAX_ENTRIES
-            || self.total_bytes > IMAGE_ASSET_KEY_SET_MAX_BYTES
-        {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by(|(left_key, left_clock), (right_key, right_clock)| {
-                    left_clock
-                        .cmp(right_clock)
-                        .then_with(|| left_key.cmp(right_key))
-                })
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            self.remove(&oldest);
-        }
-        self.entries.contains_key(&key)
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        self.entries.contains_key(key)
-    }
-
-    fn remove(&mut self, key: &str) -> bool {
-        let Some((key, _)) = self.entries.remove_entry(key) else {
-            return false;
-        };
-        self.total_bytes = self.total_bytes.saturating_sub(key.len());
-        true
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.total_bytes = 0;
-        self.clock = 0;
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &String> {
-        self.entries.keys()
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageAssetRecoveryAction {
-    Retry,
-    AlreadyPending,
-    Fail,
-}
-
-fn image_asset_recovery_action(
-    recovering: &mut BoundedImageAssetKeys,
-    pending: &mut BoundedImageAssetKeys,
-    key: &str,
-) -> ImageAssetRecoveryAction {
-    if !recovering.try_insert(key.to_string()) {
-        return ImageAssetRecoveryAction::Fail;
-    }
-    if pending.try_insert(key.to_string()) {
-        ImageAssetRecoveryAction::Retry
-    } else if pending.contains(key) {
-        ImageAssetRecoveryAction::AlreadyPending
-    } else {
-        ImageAssetRecoveryAction::Fail
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ConduitAssetEntry {
-    descriptor: CachedAssetDescriptor,
-    last_used: u64,
-}
-
-#[derive(Debug)]
-struct BoundedConduitAssets {
-    workspace_key: Option<String>,
-    entries: HashMap<String, ConduitAssetEntry>,
-    total_bytes: u64,
-    max_bytes: u64,
-    max_entries: usize,
-    clock: u64,
-}
-
-impl Default for BoundedConduitAssets {
-    fn default() -> Self {
-        Self::new(
-            CONDUIT_ASSET_REGISTRY_MAX_BYTES,
-            CONDUIT_ASSET_REGISTRY_MAX_ENTRIES,
-        )
-    }
-}
-
-impl BoundedConduitAssets {
-    fn new(max_bytes: u64, max_entries: usize) -> Self {
-        Self {
-            workspace_key: None,
-            entries: HashMap::new(),
-            total_bytes: 0,
-            max_bytes,
-            max_entries,
-            clock: 0,
-        }
-    }
-
-    fn set_workspace(&mut self, workspace_key: Option<String>) {
-        if self.workspace_key != workspace_key {
-            self.clear();
-            self.workspace_key = workspace_key;
-        }
-    }
-
-    fn insert(&mut self, descriptor: CachedAssetDescriptor) -> Option<Vec<String>> {
-        let workspace_key = self.workspace_key.as_deref()?;
-        let cache_key = descriptor.cache_key().to_string();
-        let uri = descriptor.uri();
-        if descriptor.workspace_key() != workspace_key
-            || descriptor.size() == 0
-            || descriptor.size() > self.max_bytes
-            || conduit_asset_request_key(&uri).as_deref() != Some(cache_key.as_str())
-        {
-            return None;
-        }
-
-        self.clock = self.clock.saturating_add(1);
-        if let Some(replaced) = self.entries.remove(&cache_key) {
-            self.total_bytes = self.total_bytes.saturating_sub(replaced.descriptor.size());
-        }
-        self.total_bytes = self.total_bytes.saturating_add(descriptor.size());
-        self.entries.insert(
-            cache_key,
-            ConduitAssetEntry {
-                descriptor,
-                last_used: self.clock,
-            },
-        );
-
-        let mut evicted = Vec::new();
-        while self.total_bytes > self.max_bytes || self.entries.len() > self.max_entries {
-            let Some(oldest_key) = self
-                .entries
-                .iter()
-                .min_by(|(left_key, left), (right_key, right)| {
-                    left.last_used
-                        .cmp(&right.last_used)
-                        .then_with(|| left_key.cmp(right_key))
-                })
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some(entry) = self.entries.remove(&oldest_key) {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.descriptor.size());
-                evicted.push(oldest_key);
-            }
-        }
-        Some(evicted)
-    }
-
-    fn get(&mut self, cache_key: &str) -> Option<CachedAssetDescriptor> {
-        let workspace_key = self.workspace_key.as_deref()?;
-        let entry = self.entries.get_mut(cache_key)?;
-        if entry.descriptor.workspace_key() != workspace_key {
-            return None;
-        }
-        self.clock = self.clock.saturating_add(1);
-        entry.last_used = self.clock;
-        Some(entry.descriptor.clone())
-    }
-
-    fn remove(&mut self, cache_key: &str) -> Option<CachedAssetDescriptor> {
-        let entry = self.entries.remove(cache_key)?;
-        self.total_bytes = self.total_bytes.saturating_sub(entry.descriptor.size());
-        Some(entry.descriptor)
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.total_bytes = 0;
-        self.clock = 0;
-    }
-
-    fn contains_key(&self, cache_key: &str) -> bool {
-        self.entries.contains_key(cache_key)
-    }
-
-    #[cfg(test)]
-    fn total_bytes(&self) -> u64 {
-        self.total_bytes
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-fn conduit_asset_request_key(uri: &str) -> Option<String> {
-    let parsed = url::Url::parse(uri).ok()?;
-    if parsed.scheme() != "conduit-asset"
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.port().is_some()
-        || !parsed.path().is_empty()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return None;
-    }
-    let key = parsed.host_str()?;
-    let valid_key = key.len() == 64
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    (valid_key && uri == format!("conduit-asset://{key}")).then(|| key.to_string())
-}
-
-fn conduit_asset_for_request(
-    uri: &str,
-    assets: &mut BoundedConduitAssets,
-) -> Option<CachedAssetDescriptor> {
-    let key = conduit_asset_request_key(uri)?;
-    assets.get(&key)
-}
-
-fn cached_asset_source_is_registered(
-    source: &CachedAssetSource,
-    assets: &BoundedConduitAssets,
-) -> bool {
-    conduit_asset_request_key(source.uri()).is_some_and(|key| assets.contains_key(&key))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConduitAssetResponsePlan {
-    Full,
-    Partial { start: u64, end: u64 },
-    NotSatisfiable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ConduitAssetServeOutcome {
-    Rejected,
-    Served(String),
-    Invalidated(String),
-}
-
-fn conduit_asset_request_method(method: Option<&str>) -> Option<&str> {
-    match method {
-        Some(method @ ("GET" | "HEAD")) => Some(method),
-        _ => None,
-    }
-}
-
-fn conduit_asset_response_plan(range: Option<&str>, size: u64) -> ConduitAssetResponsePlan {
-    let Some(range) = range else {
-        return ConduitAssetResponsePlan::Full;
-    };
-    let Some(specification) = range.trim().strip_prefix("bytes=") else {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    };
-    if specification.contains(',') || size == 0 {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    }
-    let Some((start, end)) = specification.split_once('-') else {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    };
-    let start = start.trim();
-    let end = end.trim();
-    if start.is_empty() {
-        let Ok(suffix_length) = end.parse::<u64>() else {
-            return ConduitAssetResponsePlan::NotSatisfiable;
-        };
-        if suffix_length == 0 {
-            return ConduitAssetResponsePlan::NotSatisfiable;
-        }
-        let suffix_length = suffix_length.min(size);
-        return ConduitAssetResponsePlan::Partial {
-            start: size - suffix_length,
-            end: size - 1,
-        };
-    }
-
-    let Ok(start) = start.parse::<u64>() else {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    };
-    if start >= size {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    }
-    let end = if end.is_empty() {
-        size - 1
-    } else {
-        let Ok(end) = end.parse::<u64>() else {
-            return ConduitAssetResponsePlan::NotSatisfiable;
-        };
-        if end < start {
-            return ConduitAssetResponsePlan::NotSatisfiable;
-        }
-        end.min(size - 1)
-    };
-    ConduitAssetResponsePlan::Partial { start, end }
-}
-
-#[cfg(unix)]
-fn same_opened_file(left: &Metadata, right: &Metadata) -> bool {
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_opened_file(left: &Metadata, right: &Metadata) -> bool {
-    left.len() == right.len()
-        && left.modified().ok().is_some()
-        && left.modified().ok() == right.modified().ok()
-}
-
-fn open_conduit_asset(descriptor: &CachedAssetDescriptor) -> io::Result<File> {
-    open_conduit_asset_at(descriptor, &config::image_asset_cache_dir())
-}
-
-fn open_conduit_asset_at(
-    descriptor: &CachedAssetDescriptor,
-    cache_root: &Path,
-) -> io::Result<File> {
-    let path = descriptor.path_in(cache_root);
-    let before = std::fs::symlink_metadata(&path)?;
-    if !before.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cached asset",
-        ));
-    }
-    #[cfg(unix)]
-    if before.nlink() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cached asset",
-        ));
-    }
-
-    let mut file = File::open(&path)?;
-    let opened = file.metadata()?;
-    let after = std::fs::symlink_metadata(&path)?;
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || !same_opened_file(&before, &opened)
-        || !same_opened_file(&opened, &after)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cached asset",
-        ));
-    }
-
-    let mut prefix =
-        Vec::with_capacity(opened.len().min(CONDUIT_ASSET_VALIDATION_PREFIX_BYTES) as usize);
-    file.by_ref()
-        .take(CONDUIT_ASSET_VALIDATION_PREFIX_BYTES)
-        .read_to_end(&mut prefix)?;
-    let validated = file.metadata()?;
-    if !same_opened_file(&opened, &validated)
-        || !descriptor.validates_opened_content(validated.len(), &prefix)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cached asset",
-        ));
-    }
-    file.seek(SeekFrom::Start(0))?;
-    Ok(file)
-}
-
-fn finish_conduit_asset_error(request: &webkit6::URISchemeRequest) {
-    let mut error = glib::Error::new(
-        gio::IOErrorEnum::NotFound,
-        "unknown or invalid Conduit asset",
-    );
-    request.finish_error(&mut error);
-}
-
-fn finish_conduit_asset_response(
-    request: &webkit6::URISchemeRequest,
-    descriptor: &CachedAssetDescriptor,
-    mut file: File,
-    method: &str,
-    plan: ConduitAssetResponsePlan,
-) -> io::Result<()> {
-    let total_length = descriptor.size();
-    let (status, reason, start, end, content_length) = match plan {
-        ConduitAssetResponsePlan::Full => {
-            (200, "OK", 0, total_length.saturating_sub(1), total_length)
-        }
-        ConduitAssetResponsePlan::Partial { start, end } => {
-            (206, "Partial Content", start, end, end - start + 1)
-        }
-        ConduitAssetResponsePlan::NotSatisfiable => {
-            let stream = gio::MemoryInputStream::new();
-            let response = webkit6::URISchemeResponse::new(&stream, 0);
-            response.set_status(416, Some("Range Not Satisfiable"));
-            response.set_content_type(descriptor.content_type());
-            let headers =
-                webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
-            headers.replace("Accept-Ranges", "bytes");
-            headers.replace("Cache-Control", "no-store");
-            headers.replace("Content-Length", "0");
-            headers.replace("Content-Range", &format!("bytes */{total_length}"));
-            headers.replace("X-Content-Type-Options", "nosniff");
-            response.set_http_headers(headers);
-            request.finish_with_response(&response);
-            return Ok(());
-        }
-    };
-
-    let stream: gio::InputStream = if method == "HEAD" {
-        gio::MemoryInputStream::new().upcast()
-    } else {
-        file.seek(SeekFrom::Start(start))?;
-        gio::ReadInputStream::new(file.take(content_length)).upcast()
-    };
-    let stream_length = if method == "HEAD" {
-        0
-    } else {
-        content_length as i64
-    };
-    let response = webkit6::URISchemeResponse::new(&stream, stream_length);
-    response.set_status(status, Some(reason));
-    response.set_content_type(descriptor.content_type());
-    let headers = webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
-    headers.replace("Accept-Ranges", "bytes");
-    headers.replace("Cache-Control", "no-store");
-    headers.replace("Content-Length", &content_length.to_string());
-    headers.replace("X-Content-Type-Options", "nosniff");
-    if status == 206 {
-        headers.replace(
-            "Content-Range",
-            &format!("bytes {start}-{end}/{total_length}"),
-        );
-    }
-    response.set_http_headers(headers);
-    request.finish_with_response(&response);
-    Ok(())
-}
-
-fn serve_conduit_asset_request(
-    request: &webkit6::URISchemeRequest,
-    assets: &Rc<RefCell<BoundedConduitAssets>>,
-) -> ConduitAssetServeOutcome {
-    let Some(uri) = request.uri() else {
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Rejected;
-    };
-    let Some(cache_key) = conduit_asset_request_key(uri.as_str()) else {
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Rejected;
-    };
-    let Some(descriptor) = conduit_asset_for_request(uri.as_str(), &mut assets.borrow_mut()) else {
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Rejected;
-    };
-    let method = request.http_method();
-    let Some(method) = conduit_asset_request_method(method.as_deref()) else {
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Rejected;
-    };
-    let range = request
-        .http_headers()
-        .and_then(|headers| headers.one("Range"))
-        .map(|range| range.to_string());
-    let plan = conduit_asset_response_plan(range.as_deref(), descriptor.size());
-    let Ok(file) = open_conduit_asset(&descriptor) else {
-        assets.borrow_mut().remove(&cache_key);
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Invalidated(cache_key);
-    };
-    if finish_conduit_asset_response(request, &descriptor, file, method, plan).is_err() {
-        assets.borrow_mut().remove(&cache_key);
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Invalidated(cache_key);
-    }
-    ConduitAssetServeOutcome::Served(cache_key)
-}
+use crate::asset_server::*;
 
 fn generate_html(label: &str, render: impl FnOnce() -> String) -> String {
     let started = Instant::now();
@@ -1782,7 +845,6 @@ const COMPOSER_TARGETS: [ComposerTarget; 2] = [ComposerTarget::Message, Composer
 const UI_EVENT_BATCH_LIMIT: usize = 8;
 const MAX_PENDING_SLACK_URIS: usize = 16;
 const MAX_PENDING_MESSAGE_NOTIFICATIONS: usize = 128;
-const PICKER_POPULATION_BATCH_SIZE: usize = 24;
 const EMOJI_PICKER_MESSAGE_HANDLER: &str = "conduitEmojiPicker";
 const APPLY_EMOJI_PICKER_RESULT_SCRIPT: &str =
     "window.conduitReceiveEmojiPickerResult(JSON.parse(payload));";
@@ -2038,75 +1100,7 @@ glib::wrapper! {
         @implements gio::ActionGroup, gio::ActionMap;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SidebarRowAction {
-    channel_id: String,
-    title: String,
-    action: ConversationPickerAction,
-}
-
-#[derive(Debug, Clone)]
-struct ConversationPickerView {
-    list: gtk::ListBox,
-    search: gtk::SearchEntry,
-    actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
-    include_discovery: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PeoplePickerRow {
-    user_id: String,
-    searchable_name: String,
-    check: gtk::CheckButton,
-    row: gtk::ListBoxRow,
-}
-
-#[derive(Debug, Clone)]
-struct PeoplePickerView {
-    list: gtk::ListBox,
-    search: gtk::SearchEntry,
-    confirm: gtk::Button,
-    rows: Rc<RefCell<Vec<PeoplePickerRow>>>,
-    excluded_user_ids: HashSet<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ConversationPickerListEntry {
-    Header(String),
-    Item(ConversationPickerItem),
-    Placeholder(String),
-}
-
-#[derive(Debug)]
-struct ConversationPickerPopulation {
-    generation: u64,
-    entries: VecDeque<ConversationPickerListEntry>,
-}
-
-impl ConversationPickerPopulation {
-    fn new(generation: u64, entries: VecDeque<ConversationPickerListEntry>) -> Self {
-        Self {
-            generation,
-            entries,
-        }
-    }
-
-    fn next_batch(&mut self, current_generation: u64) -> Option<Vec<ConversationPickerListEntry>> {
-        if self.generation != current_generation {
-            self.entries.clear();
-            return None;
-        }
-        if self.entries.is_empty() {
-            return None;
-        }
-        let batch_size = self.entries.len().min(PICKER_POPULATION_BATCH_SIZE);
-        Some(self.entries.drain(..batch_size).collect())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
+use crate::picker_views::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaKind {
@@ -2140,23 +1134,6 @@ struct MediaViewer {
     zoom: f64,
     natural_size: (i32, i32),
     loaded_path: Option<PathBuf>,
-}
-
-impl SidebarRowAction {
-    fn from_picker_item(item: &ConversationPickerItem) -> Self {
-        Self {
-            channel_id: item.row.id.clone(),
-            title: item.row.title.clone(),
-            action: item.action,
-        }
-    }
-}
-
-fn sidebar_row_action_for_index(
-    actions: &HashMap<i32, SidebarRowAction>,
-    row_index: i32,
-) -> Option<SidebarRowAction> {
-    actions.get(&row_index).cloned()
 }
 
 fn sidebar_section_accessible_label(title: &str, collapsed: bool) -> String {
@@ -2238,78 +1215,6 @@ fn toggle_sidebar_section_state(
     if !collapsed_sections.insert(section) {
         collapsed_sections.remove(&section);
     }
-}
-
-fn picker_sections(
-    include_discovery: bool,
-    source: sidebar::ConversationPickerSource<'_>,
-    query: &str,
-) -> ConversationPickerSections {
-    let sidebar::ConversationPickerSource {
-        conversations,
-        discovered_channels,
-        discovered_users,
-        user_names,
-        current_user_id,
-        known_user_search_aliases,
-        user_full_names,
-        user_statuses,
-    } = source;
-    let channels = if include_discovery {
-        discovered_channels
-    } else {
-        &[]
-    };
-    let users = if include_discovery {
-        discovered_users
-    } else {
-        &[]
-    };
-    sidebar::conversation_picker_sections_with_statuses(
-        sidebar::ConversationPickerSource {
-            conversations,
-            discovered_channels: channels,
-            discovered_users: users,
-            user_names,
-            current_user_id,
-            known_user_search_aliases,
-            user_full_names,
-            user_statuses,
-        },
-        query,
-    )
-}
-
-fn conversation_picker_population_entries(
-    sections: &ConversationPickerSections,
-) -> VecDeque<ConversationPickerListEntry> {
-    let mut entries = VecDeque::new();
-    if let Some(results) = sections.search_results.as_deref() {
-        entries.extend(
-            results
-                .iter()
-                .cloned()
-                .map(ConversationPickerListEntry::Item),
-        );
-    } else {
-        for (title, items) in [
-            ("Conversations", sections.conversations.as_slice()),
-            ("Channels you can join", sections.channels.as_slice()),
-            ("People", sections.people.as_slice()),
-        ] {
-            if items.is_empty() {
-                continue;
-            }
-            entries.push_back(ConversationPickerListEntry::Header(title.to_string()));
-            entries.extend(items.iter().cloned().map(ConversationPickerListEntry::Item));
-        }
-    }
-    if entries.is_empty() {
-        entries.push_back(ConversationPickerListEntry::Placeholder(gettext(
-            "No matching conversations",
-        )));
-    }
-    entries
 }
 
 fn valid_channel_name(name: &str) -> bool {
@@ -3139,102 +2044,6 @@ fn current_unix_seconds() -> i64 {
         .unwrap_or_default()
 }
 
-fn status_expiration_for_choice(
-    choice: StatusExpirationChoice,
-    now: i64,
-    end_today: i64,
-    end_week: i64,
-) -> i64 {
-    match choice {
-        StatusExpirationChoice::Never => 0,
-        StatusExpirationChoice::Minutes30 => now.saturating_add(30 * 60),
-        StatusExpirationChoice::Hour1 => now.saturating_add(60 * 60),
-        StatusExpirationChoice::Hours4 => now.saturating_add(4 * 60 * 60),
-        StatusExpirationChoice::Today => end_today,
-        StatusExpirationChoice::ThisWeek => end_week,
-        StatusExpirationChoice::Existing(expiration) => expiration,
-    }
-}
-
-fn status_from_dialog_input(
-    text: &str,
-    emoji: &str,
-    expiration_choice: StatusExpirationChoice,
-    now: i64,
-    end_today: i64,
-    end_week: i64,
-) -> SlackUserStatus {
-    SlackUserStatus {
-        text: text.trim().chars().take(100).collect(),
-        emoji: emoji.trim().trim_matches(':').to_string(),
-        expiration: status_expiration_for_choice(expiration_choice, now, end_today, end_week),
-    }
-}
-
-fn status_expiration_boundaries(now: i64) -> (i64, i64) {
-    let fallback = (
-        now.saturating_add(24 * 60 * 60),
-        now.saturating_add(7 * 24 * 60 * 60),
-    );
-    let Ok(local) = glib::DateTime::now_local() else {
-        return fallback;
-    };
-    let Ok(end_today) = glib::DateTime::from_local(
-        local.year(),
-        local.month(),
-        local.day_of_month(),
-        23,
-        59,
-        59.0,
-    ) else {
-        return fallback;
-    };
-    let Ok(end_week_date) = local.add_days(7_i32.saturating_sub(local.day_of_week())) else {
-        return (end_today.to_unix(), fallback.1);
-    };
-    let Ok(end_week) = glib::DateTime::from_local(
-        end_week_date.year(),
-        end_week_date.month(),
-        end_week_date.day_of_month(),
-        23,
-        59,
-        59.0,
-    ) else {
-        return (end_today.to_unix(), fallback.1);
-    };
-    (end_today.to_unix(), end_week.to_unix())
-}
-
-fn user_status_presentation(
-    status: &SlackUserStatus,
-    custom_emojis: &HashMap<String, String>,
-    now: i64,
-) -> Option<UserStatusPresentation> {
-    if !status.active_at(now) {
-        return None;
-    }
-    let text = status.text.trim();
-    let emoji = (!status.emoji_name().is_empty()).then(|| {
-        EmojiCatalog::new(custom_emojis)
-            .resolve(status.emoji_name())
-            .and_then(|value| match value {
-                EmojiValue::Unicode(glyph) => Some(glyph.to_string()),
-                EmojiValue::CustomImage(_) => None,
-            })
-            .unwrap_or_else(|| "●".to_string())
-    });
-    let subtitle = match (emoji.as_deref(), text.is_empty()) {
-        (Some(emoji), false) => format!("{emoji} {text}"),
-        (Some(emoji), true) => emoji.to_string(),
-        (None, false) => text.to_string(),
-        (None, true) => return None,
-    };
-    Some(UserStatusPresentation {
-        subtitle,
-        accessible_text: status.accessible_text(),
-    })
-}
-
 #[cfg(test)]
 fn apply_user_status_snapshot(
     current: &mut HashMap<String, SlackUserStatus>,
@@ -3284,865 +2093,6 @@ fn current_user_header_title(
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| gettext("Workspace"))
-}
-
-impl StatusEmojiPickerModel {
-    fn new(custom_emojis: &HashMap<String, String>, selected_emoji: &str) -> Self {
-        // Slack status emoji are submitted as team-enabled shortcodes. Keep the
-        // picker to catalog entries that have a valid shortcode name.
-        let catalog = EmojiCatalog::new(custom_emojis);
-        let catalog_entries = catalog.entries();
-        let workspace_names = catalog_entries
-            .iter()
-            .filter(|entry| entry.category == "Workspace")
-            .map(|entry| entry.name.clone())
-            .collect::<HashSet<_>>();
-        let mut seen = HashSet::new();
-        let mut entries = catalog_entries
-            .into_iter()
-            .filter(|entry| entry.category == "Workspace" || !workspace_names.contains(&entry.name))
-            .filter(|entry| seen.insert(entry.name.clone()))
-            .collect::<Vec<_>>();
-
-        let selected_emoji = selected_emoji.trim().trim_matches(':');
-        if !selected_emoji.is_empty() && seen.insert(selected_emoji.to_string()) {
-            entries.push(EmojiEntry {
-                name: selected_emoji.to_string(),
-                label: selected_emoji.replace(['_', '-'], " "),
-                category: "Current status",
-                value: catalog
-                    .resolve(selected_emoji)
-                    .unwrap_or_else(|| EmojiValue::CustomImage(String::new())),
-            });
-        }
-
-        Self {
-            emojis: EmojiPickerModel::new(entries),
-        }
-    }
-
-    fn choice_count(&self) -> usize {
-        self.emojis.entries().len() + 1
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        name.is_empty() || self.emojis.entries().iter().any(|entry| entry.name == name)
-    }
-
-    fn selected_entry(&self, name: &str) -> Option<EmojiPickerResultEntry> {
-        self.emojis
-            .entries()
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(EmojiPickerResultEntry::from)
-    }
-
-    fn page(&self, query: &str, category: Option<&str>, offset: usize) -> EmojiPickerResult {
-        self.emojis
-            .query(&EmojiPickerQuery {
-                version: EMOJI_PICKER_PROTOCOL_VERSION,
-                generation: 1,
-                query: query.chars().take(EMOJI_PICKER_MAX_QUERY_CHARS).collect(),
-                category: category.map(str::to_string),
-                offset,
-            })
-            .expect("status emoji picker creates valid bounded queries")
-    }
-}
-
-fn status_emoji_result_label(entry: &EmojiPickerResultEntry) -> String {
-    match entry.value_kind {
-        EmojiPickerResultValueKind::Unicode => {
-            format!("{} :{}: - {}", entry.value, entry.name, entry.label)
-        }
-        EmojiPickerResultValueKind::CustomImage => {
-            format!(":{}: - {}", entry.name, entry.label)
-        }
-    }
-}
-
-fn update_status_emoji_selected_preview(
-    preview: &gtk::Box,
-    row: &adw::ActionRow,
-    selection: Option<&EmojiPickerResultEntry>,
-) {
-    while let Some(child) = preview.first_child() {
-        preview.remove(&child);
-    }
-
-    let Some(selection) = selection else {
-        preview.set_visible(false);
-        row.set_subtitle(&gettext("No emoji"));
-        return;
-    };
-    let visual: gtk::Widget = match selection.value_kind {
-        EmojiPickerResultValueKind::Unicode => {
-            let label = gtk::Label::new(Some(&selection.value));
-            label.add_css_class("title-3");
-            label.update_property(&[gtk::accessible::Property::Label(
-                &selection.accessible_label,
-            )]);
-            label.upcast()
-        }
-        EmojiPickerResultValueKind::CustomImage
-            if selection.value.starts_with("https://")
-                || selection.value.starts_with("http://") =>
-        {
-            status_emoji_custom_picture(&selection.value, &selection.accessible_label).upcast()
-        }
-        EmojiPickerResultValueKind::CustomImage => {
-            preview.set_visible(false);
-            row.set_subtitle(&status_emoji_result_label(selection));
-            return;
-        }
-    };
-    preview.append(&visual);
-    preview.set_visible(true);
-    row.set_subtitle(&format!("- {}", selection.label));
-}
-
-fn record_test_status_emoji_animation_frame() {
-    let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_ANIMATION_FILE") else {
-        return;
-    };
-    let frame_updates = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|state| serde_json::from_str::<serde_json::Value>(&state).ok())
-        .and_then(|state| state.get("frame_updates")?.as_u64())
-        .unwrap_or_default()
-        + 1;
-    let _ = std::fs::write(
-        path,
-        serde_json::json!({ "frame_updates": frame_updates }).to_string(),
-    );
-}
-
-fn record_test_status_emoji_animation_error(stage: &str) {
-    let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_ANIMATION_FILE") else {
-        return;
-    };
-    let _ = std::fs::write(
-        path,
-        serde_json::json!({ "error": stage, "frame_updates": 0 }).to_string(),
-    );
-}
-
-fn set_status_emoji_animation_frame(
-    picture: &gtk::Picture,
-    animation: &gdk_pixbuf::PixbufAnimationIter,
-) {
-    picture.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&animation.pixbuf())));
-    record_test_status_emoji_animation_frame();
-}
-
-fn schedule_status_emoji_animation_frame(
-    weak_picture: glib::WeakRef<gtk::Picture>,
-    animation: Rc<gdk_pixbuf::PixbufAnimationIter>,
-) {
-    let delay = animation
-        .delay_time()
-        .filter(|delay| !delay.is_zero())
-        .unwrap_or(Duration::from_millis(100))
-        .max(Duration::from_millis(16));
-    glib::timeout_add_local_once(delay, move || {
-        let Some(picture) = weak_picture.upgrade() else {
-            return;
-        };
-        if animation.advance(SystemTime::now()) {
-            set_status_emoji_animation_frame(&picture, &animation);
-        }
-        schedule_status_emoji_animation_frame(weak_picture, animation);
-    });
-}
-
-fn status_emoji_custom_picture(url: &str, label: &str) -> gtk::Picture {
-    let picture = gtk::Picture::new();
-    picture.set_alternative_text(Some(label));
-    picture.set_can_shrink(true);
-    picture.set_content_fit(gtk::ContentFit::Contain);
-    picture.set_size_request(30, 30);
-
-    let weak_picture = picture.downgrade();
-    let file = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE")
-        .map(gio::File::for_path)
-        .unwrap_or_else(|| gio::File::for_uri(url));
-    file.read_async(
-        glib::Priority::DEFAULT,
-        gio::Cancellable::NONE,
-        move |stream| {
-            let Ok(stream) = stream else {
-                record_test_status_emoji_animation_error("open");
-                return;
-            };
-            let weak_picture = weak_picture.clone();
-            gdk_pixbuf::PixbufAnimation::from_stream_async(
-                &stream,
-                gio::Cancellable::NONE,
-                move |animation| {
-                    let Some(picture) = weak_picture.upgrade() else {
-                        return;
-                    };
-                    let Ok(animation) = animation else {
-                        record_test_status_emoji_animation_error("decode");
-                        return;
-                    };
-                    let frame = Rc::new(animation.iter(Some(SystemTime::now())));
-                    set_status_emoji_animation_frame(&picture, &frame);
-                    if !animation.is_static_image() {
-                        schedule_status_emoji_animation_frame(weak_picture, frame);
-                    }
-                },
-            );
-        },
-    );
-    picture
-}
-
-fn status_emoji_picker_choice(entry: &EmojiPickerResultEntry) -> gtk::FlowBoxChild {
-    let child = gtk::FlowBoxChild::new();
-    child.set_tooltip_text(Some(&format!(":{}:", entry.name)));
-    child.update_property(&[gtk::accessible::Property::Label(&entry.accessible_label)]);
-    let content: gtk::Widget = match entry.value_kind {
-        EmojiPickerResultValueKind::Unicode => {
-            let label = gtk::Label::new(Some(&entry.value));
-            label.add_css_class("title-3");
-            label.upcast()
-        }
-        EmojiPickerResultValueKind::CustomImage
-            if entry.value.starts_with("https://") || entry.value.starts_with("http://") =>
-        {
-            status_emoji_custom_picture(&entry.value, &entry.label).upcast()
-        }
-        EmojiPickerResultValueKind::CustomImage => {
-            let label = gtk::Label::new(Some(&format!(":{}:", entry.name)));
-            label.upcast()
-        }
-    };
-    content.set_margin_top(6);
-    content.set_margin_bottom(6);
-    content.set_margin_start(6);
-    content.set_margin_end(6);
-    child.set_child(Some(&content));
-    child
-}
-
-impl StatusEmojiPickerPage {
-    fn clear(&self) {
-        while let Some(child) = self.grid.first_child() {
-            self.grid.remove(&child);
-        }
-        self.visible_choices.borrow_mut().clear();
-        self.total.set(0);
-        self.has_previous.set(false);
-        self.has_more.set(false);
-        self.page_status.set_label("");
-        self.page_controls.set_visible(false);
-        self.empty_label.set_visible(false);
-    }
-
-    fn populate(
-        &self,
-        source: &StatusEmojiPickerModel,
-        query: &str,
-        category: &str,
-        offset: usize,
-        selected_name: &str,
-    ) {
-        let category = query.trim().is_empty().then_some(category);
-        let result = source.page(query, category, offset);
-        self.clear();
-        for entry in &result.entries {
-            self.grid.insert(&status_emoji_picker_choice(entry), -1);
-        }
-        self.visible_choices.replace(result.entries);
-        self.total.set(result.total);
-        self.has_previous.set(result.has_previous);
-        self.has_more.set(result.has_more);
-        self.previous.set_sensitive(result.has_previous);
-        self.next.set_sensitive(result.has_more);
-        self.category_bar.set_visible(query.trim().is_empty());
-        self.empty_label
-            .set_visible(self.visible_choices.borrow().is_empty());
-        self.page_controls
-            .set_visible(result.has_previous || result.has_more);
-        let end = result.offset + self.visible_choices.borrow().len();
-        let page_label = if result.total == 0 {
-            String::new()
-        } else {
-            format!("{}-{end} / {}", result.offset + 1, result.total)
-        };
-        self.page_status.set_label(&page_label);
-        self.grid.unselect_all();
-        if let Some(index) = self
-            .visible_choices
-            .borrow()
-            .iter()
-            .position(|choice| choice.name == selected_name)
-        {
-            if let Some(child) = self.grid.child_at_index(index as i32) {
-                self.grid.select_child(&child);
-            }
-        }
-    }
-}
-
-impl StatusEmojiPicker {
-    fn new(
-        custom_emojis: &HashMap<String, String>,
-        selected_emoji: &str,
-        on_selected: impl Fn(&str) + 'static,
-    ) -> Self {
-        Self::new_with_options(
-            custom_emojis,
-            selected_emoji,
-            Some(gettext("No emoji")),
-            gettext("Choose a status emoji"),
-            on_selected,
-        )
-    }
-
-    fn new_for_composer(
-        custom_emojis: &HashMap<String, String>,
-        on_selected: impl Fn(&str) + 'static,
-    ) -> Self {
-        Self::new_with_options(
-            custom_emojis,
-            "",
-            None,
-            gettext("Insert emoji"),
-            on_selected,
-        )
-    }
-
-    fn new_with_options(
-        custom_emojis: &HashMap<String, String>,
-        selected_emoji: &str,
-        clear_label: Option<String>,
-        tooltip: String,
-        on_selected: impl Fn(&str) + 'static,
-    ) -> Self {
-        let selected_name = Rc::new(RefCell::new(
-            selected_emoji.trim().trim_matches(':').to_string(),
-        ));
-        let source = Rc::new(RefCell::new(StatusEmojiPickerModel::new(
-            custom_emojis,
-            selected_emoji,
-        )));
-        let visible_choices = Rc::new(RefCell::new(Vec::new()));
-        let active_category = Rc::new(RefCell::new(EMOJI_PICKER_CATEGORIES[0].to_string()));
-        let offset = Rc::new(Cell::new(0_usize));
-
-        let grid = gtk::FlowBox::new();
-        grid.set_activate_on_single_click(true);
-        grid.set_column_spacing(4);
-        grid.set_row_spacing(4);
-        grid.set_homogeneous(true);
-        grid.set_min_children_per_line(6);
-        grid.set_max_children_per_line(8);
-        grid.set_selection_mode(gtk::SelectionMode::Single);
-        grid.update_property(&[gtk::accessible::Property::Label(&gettext(
-            "Status emoji choices",
-        ))]);
-
-        let search = gtk::SearchEntry::new();
-        search.set_placeholder_text(Some(&gettext("Search emoji")));
-        search.update_property(&[gtk::accessible::Property::Label(&gettext("Search emoji"))]);
-        search.set_key_capture_widget(Some(&grid));
-
-        let category_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        let mut category_buttons = Vec::new();
-        let mut first_category_button: Option<gtk::ToggleButton> = None;
-        for category in EMOJI_PICKER_CATEGORIES {
-            let category_button = gtk::ToggleButton::with_label(category);
-            category_button.add_css_class("flat");
-            if let Some(first) = first_category_button.as_ref() {
-                category_button.set_group(Some(first));
-            } else {
-                category_button.set_active(true);
-                first_category_button = Some(category_button.clone());
-            }
-            category_box.append(&category_button);
-            category_buttons.push(((*category).to_string(), category_button));
-        }
-        let category_scroller = gtk::ScrolledWindow::new();
-        category_scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
-        category_scroller.set_child(Some(&category_box));
-
-        let empty_label = gtk::Label::new(Some(&gettext("No emoji found")));
-        empty_label.add_css_class("dim-label");
-        empty_label.set_margin_top(16);
-        empty_label.set_margin_bottom(16);
-        empty_label.set_visible(false);
-
-        let scroller = gtk::ScrolledWindow::new();
-        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        scroller.set_min_content_width(420);
-        scroller.set_min_content_height(280);
-        scroller.set_max_content_height(360);
-        scroller.set_propagate_natural_height(true);
-        scroller.set_child(Some(&grid));
-
-        let previous = gtk::Button::with_label(&gettext("Previous"));
-        previous.add_css_class("flat");
-        let page_status = gtk::Label::new(None);
-        page_status.set_hexpand(true);
-        page_status.add_css_class("dim-label");
-        let next = gtk::Button::with_label(&gettext("Next"));
-        next.add_css_class("flat");
-        let page_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        page_controls.append(&previous);
-        page_controls.append(&page_status);
-        page_controls.append(&next);
-        page_controls.set_visible(false);
-
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let heading = gtk::Label::new(Some(&gettext("Choose emoji")));
-        heading.add_css_class("heading");
-        heading.set_xalign(0.0);
-        heading.set_hexpand(true);
-        header.append(&heading);
-        let clear_button = clear_label.map(|label| {
-            let button = gtk::Button::with_label(&label);
-            button.add_css_class("flat");
-            header.append(&button);
-            button
-        });
-
-        let picker_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        picker_content.set_size_request(480, -1);
-        picker_content.set_margin_top(8);
-        picker_content.set_margin_bottom(8);
-        picker_content.set_margin_start(8);
-        picker_content.set_margin_end(8);
-        picker_content.append(&header);
-        picker_content.append(&search);
-        picker_content.append(&category_scroller);
-        picker_content.append(&scroller);
-        picker_content.append(&empty_label);
-        picker_content.append(&page_controls);
-
-        let popover = gtk::Popover::new();
-        popover.set_autohide(true);
-        popover.set_position(gtk::PositionType::Left);
-        popover.set_child(Some(&picker_content));
-
-        let button = gtk::MenuButton::new();
-        button.set_direction(gtk::ArrowType::Left);
-        button.set_icon_name("pan-down-symbolic");
-        button.set_popover(Some(&popover));
-        button.set_tooltip_text(Some(&tooltip));
-        button.set_valign(gtk::Align::Center);
-        button.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
-
-        let row = adw::ActionRow::builder().title(gettext("Emoji")).build();
-        let selected_preview = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        selected_preview.set_valign(gtk::Align::Center);
-        row.add_prefix(&selected_preview);
-        row.add_suffix(&button);
-        row.set_activatable_widget(Some(&button));
-        let selection = source.borrow().selected_entry(&selected_name.borrow());
-        update_status_emoji_selected_preview(&selected_preview, &row, selection.as_ref());
-
-        let page = StatusEmojiPickerPage {
-            grid: grid.clone(),
-            empty_label,
-            category_bar: category_scroller.upcast(),
-            page_controls: page_controls.upcast(),
-            page_status,
-            previous: previous.clone(),
-            next: next.clone(),
-            visible_choices: visible_choices.clone(),
-            total: Rc::new(Cell::new(0)),
-            has_previous: Rc::new(Cell::new(false)),
-            has_more: Rc::new(Cell::new(false)),
-        };
-
-        {
-            let source = source.clone();
-            let page = page.clone();
-            let selected_name = selected_name.clone();
-            let active_category = active_category.clone();
-            let offset = offset.clone();
-            let weak_popover = popover.downgrade();
-            search.connect_search_changed(move |search| {
-                if !weak_popover
-                    .upgrade()
-                    .is_some_and(|popover| popover.is_visible())
-                {
-                    return;
-                }
-                offset.set(0);
-                page.populate(
-                    &source.borrow(),
-                    search.text().as_str(),
-                    &active_category.borrow(),
-                    0,
-                    &selected_name.borrow(),
-                );
-            });
-        }
-
-        let on_selected: Rc<dyn Fn(&str)> = Rc::new(on_selected);
-        let select_choice: StatusEmojiChoiceHandler = {
-            let selected_name = selected_name.clone();
-            let weak_preview = selected_preview.downgrade();
-            let weak_row = row.downgrade();
-            let weak_popover = popover.downgrade();
-            let weak_search = search.downgrade();
-            let on_selected = on_selected.clone();
-            Rc::new(move |selection| {
-                let name = selection
-                    .as_ref()
-                    .map(|selection| selection.name.as_str())
-                    .unwrap_or_default();
-                selected_name.replace(name.to_string());
-                if let (Some(preview), Some(row)) = (weak_preview.upgrade(), weak_row.upgrade()) {
-                    update_status_emoji_selected_preview(&preview, &row, selection.as_ref());
-                }
-                on_selected(name);
-                if let Some(search) = weak_search.upgrade() {
-                    search.set_text("");
-                }
-                if let Some(popover) = weak_popover.upgrade() {
-                    popover.popdown();
-                }
-            })
-        };
-
-        {
-            let visible_choices = visible_choices.clone();
-            let select_choice = select_choice.clone();
-            grid.connect_child_activated(move |_, child| {
-                let Some(choice) = visible_choices
-                    .borrow()
-                    .get(child.index() as usize)
-                    .cloned()
-                else {
-                    return;
-                };
-                select_choice(Some(choice));
-            });
-        }
-
-        {
-            let visible_choices = visible_choices.clone();
-            let select_choice = select_choice.clone();
-            search.connect_activate(move |search| {
-                if search.text().trim().is_empty() {
-                    return;
-                }
-                let Some(choice) = visible_choices.borrow().first().cloned() else {
-                    return;
-                };
-                select_choice(Some(choice));
-            });
-        }
-
-        {
-            let weak_grid = grid.downgrade();
-            let controller = gtk::EventControllerKey::new();
-            controller.connect_key_pressed(move |_, key, _, _| {
-                if key != gtk::gdk::Key::Down {
-                    return glib::Propagation::Proceed;
-                }
-                if let Some(grid) = weak_grid.upgrade() {
-                    if let Some(child) = grid.child_at_index(0) {
-                        grid.select_child(&child);
-                        child.grab_focus();
-                    }
-                }
-                glib::Propagation::Stop
-            });
-            search.add_controller(controller);
-        }
-
-        {
-            let weak_search = search.downgrade();
-            let source = source.clone();
-            let page = page.clone();
-            let active_category = active_category.clone();
-            let selected_name = selected_name.clone();
-            let offset = offset.clone();
-            popover.connect_visible_notify(move |popover| {
-                if popover.is_visible() {
-                    if let Some(search) = weak_search.upgrade() {
-                        offset.set(0);
-                        page.populate(
-                            &source.borrow(),
-                            search.text().as_str(),
-                            &active_category.borrow(),
-                            0,
-                            &selected_name.borrow(),
-                        );
-                        search.grab_focus();
-                    }
-                }
-            });
-        }
-
-        for (category, category_button) in category_buttons {
-            let source = source.clone();
-            let page = page.clone();
-            let search = search.clone();
-            let active_category = active_category.clone();
-            let selected_name = selected_name.clone();
-            let offset = offset.clone();
-            category_button.connect_toggled(move |button| {
-                if !button.is_active() {
-                    return;
-                }
-                active_category.replace(category.clone());
-                offset.set(0);
-                if search.text().is_empty() {
-                    page.populate(
-                        &source.borrow(),
-                        "",
-                        &active_category.borrow(),
-                        0,
-                        &selected_name.borrow(),
-                    );
-                } else {
-                    search.set_text("");
-                }
-            });
-        }
-
-        {
-            let source = source.clone();
-            let page = page.clone();
-            let search = search.clone();
-            let active_category = active_category.clone();
-            let selected_name = selected_name.clone();
-            let offset = offset.clone();
-            previous.connect_clicked(move |_| {
-                if !page.has_previous.get() {
-                    return;
-                }
-                let next_offset = offset.get().saturating_sub(EMOJI_PICKER_RESULT_LIMIT);
-                offset.set(next_offset);
-                page.populate(
-                    &source.borrow(),
-                    search.text().as_str(),
-                    &active_category.borrow(),
-                    next_offset,
-                    &selected_name.borrow(),
-                );
-            });
-        }
-
-        {
-            let source = source.clone();
-            let page = page.clone();
-            let search = search.clone();
-            let active_category = active_category.clone();
-            let selected_name = selected_name.clone();
-            let offset = offset.clone();
-            next.connect_clicked(move |_| {
-                if !page.has_more.get() {
-                    return;
-                }
-                let next_offset = offset.get() + page.visible_choices.borrow().len();
-                offset.set(next_offset);
-                page.populate(
-                    &source.borrow(),
-                    search.text().as_str(),
-                    &active_category.borrow(),
-                    next_offset,
-                    &selected_name.borrow(),
-                );
-            });
-        }
-
-        if let Some(clear_button) = clear_button {
-            let select_choice = select_choice.clone();
-            clear_button.connect_clicked(move |_| select_choice(None));
-        }
-
-        {
-            let weak_popover = popover.downgrade();
-            search.connect_stop_search(move |_| {
-                if let Some(popover) = weak_popover.upgrade() {
-                    popover.popdown();
-                }
-            });
-        }
-
-        {
-            let weak_search = search.downgrade();
-            let page = page.clone();
-            let offset = offset.clone();
-            popover.connect_closed(move |_| {
-                page.clear();
-                offset.set(0);
-                if let Some(search) = weak_search.upgrade() {
-                    search.set_text("");
-                }
-            });
-        }
-
-        if let Some(query) = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_QUERY") {
-            let query = query.to_string_lossy();
-            search.set_text(&query);
-            search.emit_by_name::<()>("search-changed", &[]);
-        }
-
-        Self {
-            row,
-            selected_preview,
-            popover,
-            search,
-            page,
-            source,
-            selected_name,
-            active_category,
-            offset,
-            category_count: EMOJI_PICKER_CATEGORIES.len(),
-        }
-    }
-
-    fn selected_name(&self) -> String {
-        self.selected_name.borrow().clone()
-    }
-
-    fn selected_name_state(&self) -> Rc<RefCell<String>> {
-        self.selected_name.clone()
-    }
-
-    fn source_choice_count(&self) -> usize {
-        self.source.borrow().choice_count()
-    }
-
-    fn visible_choice_count(&self) -> u32 {
-        self.page.visible_choices.borrow().len() as u32
-    }
-
-    fn first_visible_name(&self) -> Option<String> {
-        self.page
-            .visible_choices
-            .borrow()
-            .first()
-            .map(|choice| choice.name.clone())
-    }
-
-    fn selected_visible_name(&self) -> Option<String> {
-        let selected = self.page.grid.selected_children().first()?.index();
-        self.page
-            .visible_choices
-            .borrow()
-            .get(selected as usize)
-            .map(|choice| choice.name.clone())
-    }
-
-    fn selected_summary_kind(&self) -> &'static str {
-        match self.selected_preview.first_child() {
-            Some(child) if child.is::<gtk::Picture>() => "custom-image",
-            Some(child) if child.is::<gtk::Label>() => "unicode",
-            _ => "text",
-        }
-    }
-
-    fn category_count(&self) -> usize {
-        self.category_count
-    }
-
-    fn page_total(&self) -> usize {
-        self.page.total.get()
-    }
-
-    fn active_category(&self) -> String {
-        self.active_category.borrow().clone()
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.source.borrow().contains(name)
-    }
-
-    fn refresh_catalog(&self, custom_emojis: &HashMap<String, String>) {
-        let selected_name = self.selected_name();
-        self.source
-            .replace(StatusEmojiPickerModel::new(custom_emojis, &selected_name));
-        let selection = self.source.borrow().selected_entry(&selected_name);
-        update_status_emoji_selected_preview(&self.selected_preview, &self.row, selection.as_ref());
-        if self.popover.is_visible() {
-            self.page.populate(
-                &self.source.borrow(),
-                self.search.text().as_str(),
-                &self.active_category.borrow(),
-                self.offset.get(),
-                &selected_name,
-            );
-        }
-    }
-}
-
-fn status_expiration_options(
-    existing_expiration: i64,
-    now: i64,
-) -> (Vec<String>, Vec<StatusExpirationChoice>, u32) {
-    let mut labels = vec![
-        gettext("Don't clear"),
-        gettext("30 minutes"),
-        gettext("1 hour"),
-        gettext("4 hours"),
-        gettext("End of today"),
-        gettext("End of this week"),
-    ];
-    let mut choices = vec![
-        StatusExpirationChoice::Never,
-        StatusExpirationChoice::Minutes30,
-        StatusExpirationChoice::Hour1,
-        StatusExpirationChoice::Hours4,
-        StatusExpirationChoice::Today,
-        StatusExpirationChoice::ThisWeek,
-    ];
-    let selected = if existing_expiration > now {
-        let formatted = glib::DateTime::from_unix_local(existing_expiration)
-            .ok()
-            .and_then(|date_time| date_time.format("%a %H:%M").ok())
-            .map(|date_time| date_time.to_string())
-            .unwrap_or_else(|| existing_expiration.to_string());
-        labels.push(
-            gettext("Keep current clear time ({time})").replace("{time}", formatted.as_str()),
-        );
-        choices.push(StatusExpirationChoice::Existing(existing_expiration));
-        choices.len() - 1
-    } else {
-        0
-    };
-    (labels, choices, selected as u32)
-}
-
-fn update_status_dialog_save_response(
-    dialog: &adw::AlertDialog,
-    status_entry: &adw::EntryRow,
-    selected_emoji: &str,
-) {
-    dialog.set_response_enabled(
-        "save",
-        !status_entry.text().trim().is_empty() || !selected_emoji.is_empty(),
-    );
-}
-
-fn status_dialog_clear_available(status: &SlackUserStatus, now: i64, clearing_retry: bool) -> bool {
-    clearing_retry || status.active_at(now)
-}
-
-fn enforce_status_text_limit(status_entry: &adw::EntryRow) {
-    let text = status_entry.text();
-    if text.chars().count() <= 100 {
-        return;
-    }
-    let limited = text.chars().take(100).collect::<String>();
-    status_entry.set_text(&limited);
-    status_entry.set_position(-1);
-}
-
-fn nearest_status_expiration(statuses: &HashMap<String, SlackUserStatus>, now: i64) -> Option<i64> {
-    statuses
-        .values()
-        .map(|status| status.expiration)
-        .filter(|expiration| *expiration > now)
-        .min()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4520,6 +2470,86 @@ fn create_cache_directory(path: &Path) {
 
 fn message_permalink(workspace_url: &str, channel_id: &str, ts: &str) -> Option<String> {
     crate::slack::constructed_message_permalink(workspace_url, channel_id, ts)
+}
+
+#[derive(Clone, Copy)]
+struct ForwardMessageContext<'a> {
+    source_channel_id: &'a str,
+    target_channel_id: &'a str,
+    message_ts: &'a str,
+    source_message: Option<&'a SlackMessage>,
+    source_conversation: Option<&'a SlackConversation>,
+    workspace_url: Option<&'a str>,
+    user_display_name: Option<&'a str>,
+    user_avatar_url: Option<&'a str>,
+}
+
+fn build_forward_message_payload(context: ForwardMessageContext<'_>) -> (String, Option<String>) {
+    let is_visible_to_receiver = if context.target_channel_id == context.source_channel_id {
+        true
+    } else if let Some(source) = context.source_conversation {
+        matches!(
+            crate::sidebar::conversation_kind(source),
+            crate::sidebar::ConversationKind::PublicChannel
+        )
+    } else {
+        false
+    };
+
+    let permalink = context
+        .workspace_url
+        .and_then(|url| message_permalink(url, context.source_channel_id, context.message_ts));
+
+    if let (true, Some(permalink)) = (is_visible_to_receiver, permalink) {
+        (permalink, None)
+    } else {
+        let author_name = context
+            .user_display_name
+            .map(str::to_string)
+            .or_else(|| context.source_message.map(|message| message.author_label()))
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let text = context
+            .source_message
+            .and_then(|message| message.text.as_deref())
+            .unwrap_or_default();
+        let footer = context
+            .source_conversation
+            .and_then(|conversation| conversation.name.as_deref())
+            .map(|name| format!("Slack conversation in #{name}"))
+            .unwrap_or_else(|| "Slack conversation".to_string());
+
+        let ts_val = serde_json::to_value(context.message_ts)
+            .unwrap_or_else(|_| serde_json::Value::String(context.message_ts.to_string()));
+
+        let mut attachment = serde_json::json!({
+            "author_name": author_name,
+            "text": text,
+            "footer": footer,
+            "ts": ts_val,
+            "mrkdwn_in": ["text", "pretext"],
+            "is_msg_unfurl": true,
+        });
+
+        if let Some(icon) = context.user_avatar_url {
+            attachment["author_icon"] = serde_json::Value::String(icon.to_string());
+        }
+        if let Some(blocks) = context
+            .source_message
+            .and_then(|message| message.blocks.clone())
+        {
+            attachment["blocks"] = blocks;
+        }
+
+        let attachments_json = serde_json::to_string(&vec![attachment]).ok();
+        let fallback_text = if !text.is_empty() {
+            format!("[Forwarded message from {author_name}]: {text}")
+        } else {
+            format!("[Forwarded message from {author_name}]")
+        };
+
+        (fallback_text, attachments_json)
+    }
 }
 
 fn slack_timestamp_from_permalink(value: &str) -> Option<String> {
@@ -5758,6 +3788,7 @@ impl ConduitWindow {
     }
 
     fn setup_sidebar_list(&self) {
+        self.ensure_composer_format_control_css();
         let factory = gtk::SignalListItemFactory::new();
         let weak_window = self.downgrade();
         factory.connect_bind(move |_, object| {
@@ -9372,6 +7403,7 @@ impl ConduitWindow {
                 channel_id,
                 text: payload.fallback_text,
                 blocks_json: Some(payload.blocks_json),
+                attachments_json: None,
                 thread_ts,
             }) {
                 return;
@@ -10164,23 +8196,49 @@ impl ConduitWindow {
     }
 
     fn forward_message(&self, channel_id: &str, ts: &str) {
-        let Some(workspace_url) = self.imp().workspace_url.borrow().clone() else {
-            self.set_status("Workspace URL is not available");
-            return;
-        };
-        let Some(permalink) = message_permalink(&workspace_url, channel_id, ts) else {
-            self.set_status("Could not build message link");
-            return;
-        };
+        let source_channel_id = channel_id.to_string();
+        let message_ts = ts.to_string();
+        let source_message = self.find_message(channel_id, ts);
+        let source_conversation = self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .cloned();
+        let workspace_url = self.imp().workspace_url.borrow().clone();
+
         self.show_conversation_picker(
             "Forward message",
             "Choose a conversation",
             false,
             move |window, action| {
+                let user_info = source_message
+                    .as_ref()
+                    .and_then(|message| message.author_user_id())
+                    .and_then(|uid| window.imp().workspace.users.borrow().get(uid).cloned());
+                let user_display_name = user_info
+                    .as_ref()
+                    .and_then(|user| user.display_name().or_else(|| user.full_name()));
+                let user_avatar_url = user_info.as_ref().and_then(|user| user.avatar_url());
+
+                let (text, attachments_json) =
+                    build_forward_message_payload(ForwardMessageContext {
+                        source_channel_id: &source_channel_id,
+                        target_channel_id: &action.channel_id,
+                        message_ts: &message_ts,
+                        source_message: source_message.as_ref(),
+                        source_conversation: source_conversation.as_ref(),
+                        workspace_url: workspace_url.as_deref(),
+                        user_display_name: user_display_name.as_deref(),
+                        user_avatar_url: user_avatar_url.as_deref(),
+                    });
+
                 let admitted = window.send_command(RuntimeCommand::PostMessage {
                     channel_id: action.channel_id,
-                    text: permalink.clone(),
+                    text,
                     blocks_json: None,
+                    attachments_json,
                     thread_ts: None,
                 });
                 if admitted {
@@ -11986,7 +10044,13 @@ impl ConduitWindow {
         apply_sidebar_store_operations(&store, projection.items(), &operations);
         let selected_position = sidebar_selected_position(projection.items());
         drop(projection);
-        selection.set_selected(selected_position);
+        if selected_position == gtk::INVALID_LIST_POSITION {
+            selection.set_can_unselect(true);
+            selection.set_selected(gtk::INVALID_LIST_POSITION);
+        } else {
+            selection.set_selected(selected_position);
+            selection.set_can_unselect(false);
+        }
     }
 
     fn reconcile_sidebar_conversation_rows(&self, rows: &[SidebarRowModel]) -> bool {
@@ -12007,7 +10071,13 @@ impl ConduitWindow {
         apply_sidebar_store_operations(&store, projection.items(), &operations);
         let selected_position = sidebar_selected_position(projection.items());
         drop(projection);
-        selection.set_selected(selected_position);
+        if selected_position == gtk::INVALID_LIST_POSITION {
+            selection.set_can_unselect(true);
+            selection.set_selected(gtk::INVALID_LIST_POSITION);
+        } else {
+            selection.set_selected(selected_position);
+            selection.set_can_unselect(false);
+        }
         true
     }
 
@@ -15206,7 +13276,10 @@ fn update_huddle_device_picker(
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
+    use crate::runtime::CachedAssetDescriptor;
     use crate::slack::PreviewAssetMime;
 
     #[test]
@@ -15568,16 +13641,6 @@ mod tests {
         }
     }
 
-    fn timeline_revision(value: usize) -> WorkspaceRevision {
-        (0..value).fold(WorkspaceRevision::INITIAL, |revision, _| {
-            revision.successor()
-        })
-    }
-
-    fn timeline_document() -> TimelineDocument {
-        TimelineDocument::Conversation("C123".to_string())
-    }
-
     #[test]
     fn conduit_asset_requests_require_an_exact_known_cache_key() {
         let key = "a".repeat(64);
@@ -15834,317 +13897,6 @@ mod tests {
         }
 
         std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    fn timeline_delta(
-        base: usize,
-        revision: usize,
-        patch: TimelineDomPatch,
-        scroll: TimelineScrollBehavior,
-    ) -> TimelineDelta {
-        TimelineDelta::new(
-            timeline_document(),
-            timeline_revision(base),
-            timeline_revision(revision),
-            vec![patch],
-            scroll,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn timeline_presenter_queues_loading_deltas_and_batches_one_frame() {
-        let document = timeline_document();
-        let mut presenter = TimelinePresenter::default();
-        assert_eq!(
-            presenter.begin_document(
-                document.clone(),
-                timeline_revision(1),
-                TimelineScrollBehavior::Bottom,
-            ),
-            TimelinePresenterAction::LoadDocument
-        );
-
-        let patches = [
-            TimelineDomPatch::InsertMessage {
-                position: TimelineInsertPosition::Append,
-                message_ts: "insert".to_string(),
-                arrival: None,
-                html: "<li>insert</li>".to_string(),
-            },
-            TimelineDomPatch::ReplaceMessage {
-                message_ts: "edit".to_string(),
-                arrival: None,
-                html: "<article>edit</article>".to_string(),
-                part_html: "<div>edit</div>".to_string(),
-            },
-            TimelineDomPatch::RemoveMessage {
-                message_ts: "delete".to_string(),
-            },
-            TimelineDomPatch::UpdateUser {
-                user_id: "U1".to_string(),
-                name: "Ada".to_string(),
-                status_html: String::new(),
-            },
-        ];
-        for (offset, patch) in patches.into_iter().enumerate() {
-            assert_eq!(
-                presenter.queue_delta(timeline_delta(
-                    1 + offset,
-                    2 + offset,
-                    patch,
-                    TimelineScrollBehavior::StickToBottom,
-                )),
-                TimelinePresenterAction::Queued
-            );
-        }
-
-        assert_eq!(
-            presenter.document_loaded(&document, timeline_revision(1)),
-            TimelinePresenterAction::ScheduleFrame
-        );
-        let batch = presenter.take_frame().unwrap();
-        assert_eq!(batch.base_revision(), timeline_revision(1));
-        assert_eq!(batch.revision(), timeline_revision(5));
-        assert_eq!(batch.patches().len(), 4);
-        assert_eq!(batch.scroll(), TimelineScrollBehavior::StickToBottom);
-        assert_eq!(presenter.presented_revision(), timeline_revision(5));
-        assert_eq!(presenter.take_frame(), None);
-    }
-
-    #[test]
-    fn timeline_presenter_loads_only_initial_mismatched_or_corrupt_documents() {
-        let document = timeline_document();
-        let mut presenter = TimelinePresenter::default();
-
-        assert_eq!(
-            presenter.prepare_document(
-                document.clone(),
-                timeline_revision(1),
-                TimelineScrollBehavior::Bottom,
-            ),
-            TimelinePresenterAction::LoadDocument
-        );
-        assert_eq!(
-            presenter.prepare_document(
-                document.clone(),
-                timeline_revision(1),
-                TimelineScrollBehavior::Bottom,
-            ),
-            TimelinePresenterAction::Queued
-        );
-        assert_eq!(
-            presenter.document_loaded(&document, timeline_revision(1)),
-            TimelinePresenterAction::Ready
-        );
-        assert_eq!(
-            presenter.prepare_document(
-                document.clone(),
-                timeline_revision(1),
-                TimelineScrollBehavior::Preserve,
-            ),
-            TimelinePresenterAction::Ready
-        );
-
-        presenter.patch_failed();
-        assert_eq!(
-            presenter.prepare_document(
-                document.clone(),
-                timeline_revision(2),
-                TimelineScrollBehavior::Preserve,
-            ),
-            TimelinePresenterAction::LoadDocument
-        );
-
-        assert_eq!(
-            presenter.prepare_document(
-                TimelineDocument::Conversation("C999".to_string()),
-                timeline_revision(3),
-                TimelineScrollBehavior::Preserve,
-            ),
-            TimelinePresenterAction::LoadDocument
-        );
-
-        // Once loaded, navigating to another channel or thread recycles in-place.
-        assert_eq!(
-            presenter.document_loaded(
-                &TimelineDocument::Conversation("C999".to_string()),
-                timeline_revision(3)
-            ),
-            TimelinePresenterAction::Ready
-        );
-        let recycled_channel = TimelineDocument::Conversation("C888".to_string());
-        assert_eq!(
-            presenter.prepare_document(
-                recycled_channel.clone(),
-                timeline_revision(4),
-                TimelineScrollBehavior::Bottom,
-            ),
-            TimelinePresenterAction::Ready
-        );
-        assert_eq!(presenter.document(), Some(&recycled_channel));
-        assert_eq!(presenter.presented_revision(), timeline_revision(4));
-        assert!(!presenter.is_loading());
-        assert!(!presenter.reload_required());
-
-        // Deltas for the recycled document queue and schedule frames cleanly.
-        let recycled_delta = TimelineDelta::new(
-            recycled_channel.clone(),
-            timeline_revision(4),
-            timeline_revision(5),
-            vec![TimelineDomPatch::InsertMessage {
-                position: TimelineInsertPosition::Append,
-                message_ts: "recycled_msg".to_string(),
-                arrival: None,
-                html: "<li>recycled</li>".to_string(),
-            }],
-            TimelineScrollBehavior::Bottom,
-        )
-        .unwrap();
-        assert_eq!(
-            presenter.queue_delta(recycled_delta),
-            TimelinePresenterAction::ScheduleFrame
-        );
-        let frame = presenter.take_frame().unwrap();
-        assert_eq!(frame.document(), &recycled_channel);
-        assert_eq!(frame.base_revision(), timeline_revision(4));
-        assert_eq!(frame.revision(), timeline_revision(5));
-    }
-
-    #[test]
-    fn timeline_presenter_revision_or_document_mismatch_requires_reload() {
-        let document = timeline_document();
-        let mut presenter = TimelinePresenter::default();
-        presenter.begin_document(
-            document.clone(),
-            timeline_revision(3),
-            TimelineScrollBehavior::Preserve,
-        );
-        presenter.document_loaded(&document, timeline_revision(3));
-
-        assert_eq!(
-            presenter.queue_delta(timeline_delta(
-                1,
-                4,
-                TimelineDomPatch::RemoveMessage {
-                    message_ts: "stale".to_string(),
-                },
-                TimelineScrollBehavior::Preserve,
-            )),
-            TimelinePresenterAction::ReloadDocument
-        );
-        assert!(presenter.is_loading());
-        assert_eq!(presenter.take_frame(), None);
-
-        let other = TimelineDocument::Conversation("C999".to_string());
-        let mismatched = TimelineDelta::new(
-            other,
-            timeline_revision(3),
-            timeline_revision(4),
-            vec![TimelineDomPatch::RemoveMessage {
-                message_ts: "other".to_string(),
-            }],
-            TimelineScrollBehavior::Preserve,
-        )
-        .unwrap();
-        assert_eq!(
-            presenter.queue_delta(mismatched),
-            TimelinePresenterAction::ReloadDocument
-        );
-
-        presenter.begin_document(
-            document.clone(),
-            timeline_revision(3),
-            TimelineScrollBehavior::Preserve,
-        );
-        presenter.document_loaded(&document, timeline_revision(3));
-        assert_eq!(
-            presenter.patch_failed(),
-            TimelinePresenterAction::ReloadDocument
-        );
-        assert!(presenter.is_loading());
-    }
-
-    #[test]
-    fn timeline_presenter_preserves_prepend_anchor_across_enrichment() {
-        let document = timeline_document();
-        let mut presenter = TimelinePresenter::default();
-        presenter.begin_document(
-            document.clone(),
-            timeline_revision(1),
-            TimelineScrollBehavior::Preserve,
-        );
-        presenter.document_loaded(&document, timeline_revision(1));
-        assert_eq!(
-            presenter.queue_delta(timeline_delta(
-                1,
-                2,
-                TimelineDomPatch::RemoveMessage {
-                    message_ts: "older".to_string(),
-                },
-                TimelineScrollBehavior::PreservePrepend,
-            )),
-            TimelinePresenterAction::ScheduleFrame
-        );
-        assert_eq!(
-            presenter.queue_delta(timeline_delta(
-                2,
-                3,
-                TimelineDomPatch::UpdateUser {
-                    user_id: "U1".to_string(),
-                    name: "Ada".to_string(),
-                    status_html: String::new(),
-                },
-                TimelineScrollBehavior::Preserve,
-            )),
-            TimelinePresenterAction::Queued
-        );
-
-        assert_eq!(
-            presenter.take_frame().unwrap().scroll(),
-            TimelineScrollBehavior::PreservePrepend
-        );
-    }
-
-    #[test]
-    fn timeline_presenter_user_scroll_cancels_bottom_and_delayed_media_following() {
-        let document = timeline_document();
-        let mut presenter = TimelinePresenter::default();
-        presenter.begin_document(
-            document.clone(),
-            timeline_revision(1),
-            TimelineScrollBehavior::Bottom,
-        );
-        presenter.document_loaded(&document, timeline_revision(1));
-        presenter.note_user_scrolled();
-        presenter.queue_delta(timeline_delta(
-            1,
-            1,
-            TimelineDomPatch::UpdateImage {
-                asset_key: "asset".to_string(),
-                source: CachedAssetSource::from_cache_key(&"a".repeat(64), CachedAssetKind::Image),
-            },
-            TimelineScrollBehavior::StickToBottom,
-        ));
-
-        assert_eq!(
-            presenter.take_frame().unwrap().scroll(),
-            TimelineScrollBehavior::Preserve
-        );
-
-        presenter.note_pinned_to_bottom();
-        presenter.queue_delta(timeline_delta(
-            1,
-            2,
-            TimelineDomPatch::RemoveMessage {
-                message_ts: "new".to_string(),
-            },
-            TimelineScrollBehavior::StickToBottom,
-        ));
-        assert_eq!(
-            presenter.take_frame().unwrap().scroll(),
-            TimelineScrollBehavior::StickToBottom
-        );
     }
 
     fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {
@@ -16956,276 +14708,6 @@ mod tests {
         ]);
 
         assert_eq!(nearest_status_expiration(&statuses, 100), Some(150));
-    }
-
-    #[test]
-    fn status_expiration_choices_resolve_to_absolute_slack_timestamps() {
-        let now = 1_000;
-
-        assert_eq!(
-            status_expiration_for_choice(StatusExpirationChoice::Never, now, 2_000, 7_000),
-            0
-        );
-        assert_eq!(
-            status_expiration_for_choice(StatusExpirationChoice::Minutes30, now, 2_000, 7_000),
-            2_800
-        );
-        assert_eq!(
-            status_expiration_for_choice(StatusExpirationChoice::Hour1, now, 2_000, 7_000),
-            4_600
-        );
-        assert_eq!(
-            status_expiration_for_choice(StatusExpirationChoice::Hours4, now, 2_000, 7_000),
-            15_400
-        );
-        assert_eq!(
-            status_expiration_for_choice(StatusExpirationChoice::Today, now, 2_000, 7_000),
-            2_000
-        );
-        assert_eq!(
-            status_expiration_for_choice(StatusExpirationChoice::ThisWeek, now, 2_000, 7_000),
-            7_000
-        );
-        assert_eq!(
-            status_expiration_for_choice(
-                StatusExpirationChoice::Existing(3_500),
-                now,
-                2_000,
-                7_000,
-            ),
-            3_500
-        );
-    }
-
-    #[test]
-    fn status_dialog_builds_text_only_and_emoji_only_statuses() {
-        assert_eq!(
-            status_from_dialog_input(
-                " Focus time ",
-                "",
-                StatusExpirationChoice::Hour1,
-                1_000,
-                2_000,
-                7_000,
-            ),
-            SlackUserStatus {
-                text: "Focus time".to_string(),
-                emoji: String::new(),
-                expiration: 4_600,
-            }
-        );
-        assert_eq!(
-            status_from_dialog_input(
-                "",
-                ":headphones:",
-                StatusExpirationChoice::Never,
-                1_000,
-                2_000,
-                7_000,
-            ),
-            SlackUserStatus {
-                text: String::new(),
-                emoji: "headphones".to_string(),
-                expiration: 0,
-            }
-        );
-        assert_eq!(
-            status_from_dialog_input(
-                &"a".repeat(101),
-                "",
-                StatusExpirationChoice::Never,
-                1_000,
-                2_000,
-                7_000,
-            )
-            .text
-            .chars()
-            .count(),
-            100
-        );
-    }
-
-    #[test]
-    fn status_emoji_picker_pages_the_entire_compatible_source_by_shared_category() {
-        let custom = HashMap::from([(
-            "party_parrot".to_string(),
-            "https://emoji.example/party-parrot.gif".to_string(),
-        )]);
-        let model = StatusEmojiPickerModel::new(&custom, "");
-        let smileys = model.page("", Some("Smileys"), 0);
-
-        assert_eq!(
-            smileys.entries.len(),
-            crate::emoji::EMOJI_PICKER_RESULT_LIMIT
-        );
-        assert!(smileys.has_more);
-        assert_eq!(smileys.offset, 0);
-        let next_smileys = model.page("", Some("Smileys"), EMOJI_PICKER_RESULT_LIMIT);
-        assert!(next_smileys.has_previous);
-        assert_eq!(next_smileys.offset, EMOJI_PICKER_RESULT_LIMIT);
-        assert_eq!(next_smileys.total, smileys.total);
-        assert!(next_smileys.entries.len() <= EMOJI_PICKER_RESULT_LIMIT);
-        let workspace = model.page("", Some("Workspace"), 0);
-        assert!(workspace
-            .entries
-            .iter()
-            .any(|choice| choice.name == "party_parrot"));
-        assert!(model
-            .page(&"x".repeat(EMOJI_PICKER_MAX_QUERY_CHARS + 1), None, 0,)
-            .entries
-            .is_empty());
-        assert_eq!(
-            model
-                .page("PARTY parr", None, 0)
-                .entries
-                .first()
-                .map(|choice| choice.name.as_str()),
-            Some("party_parrot")
-        );
-    }
-
-    #[test]
-    fn status_emoji_picker_preserves_selection_and_prefers_workspace_collisions() {
-        let selected = StatusEmojiPickerModel::new(&HashMap::new(), ":still_loading:");
-        assert!(selected.contains("still_loading"));
-        assert_eq!(
-            selected
-                .selected_entry("still_loading")
-                .as_ref()
-                .map(status_emoji_result_label),
-            Some(":still_loading: - still loading".to_string())
-        );
-
-        let toned = StatusEmojiPickerModel::new(&HashMap::new(), ":+1::skin-tone-3:");
-        assert_eq!(
-            toned
-                .selected_entry("+1::skin-tone-3")
-                .map(|entry| (entry.value_kind, entry.value)),
-            Some((
-                crate::emoji::EmojiPickerResultValueKind::Unicode,
-                "👍🏼".to_string(),
-            ))
-        );
-
-        let custom = HashMap::from([(
-            "rocket".to_string(),
-            "https://emoji.example/custom-rocket.gif".to_string(),
-        )]);
-        let refreshed = StatusEmojiPickerModel::new(&custom, "still_loading");
-        assert!(refreshed.contains("still_loading"));
-        assert_eq!(
-            refreshed
-                .page("rocket", None, 0)
-                .entries
-                .first()
-                .map(|choice| (choice.name.as_str(), choice.value_kind)),
-            Some((
-                "rocket",
-                crate::emoji::EmojiPickerResultValueKind::CustomImage
-            ))
-        );
-    }
-
-    #[test]
-    fn status_dialog_keeps_clear_available_for_a_failed_clear_retry() {
-        assert!(!status_dialog_clear_available(
-            &SlackUserStatus::default(),
-            100,
-            false
-        ));
-        assert!(status_dialog_clear_available(
-            &SlackUserStatus::default(),
-            100,
-            true
-        ));
-        assert!(status_dialog_clear_available(
-            &SlackUserStatus {
-                text: "Focus".to_string(),
-                ..Default::default()
-            },
-            100,
-            false
-        ));
-    }
-
-    #[test]
-    fn user_status_presentation_handles_text_unicode_custom_and_expiry() {
-        let custom = HashMap::from([(
-            "working_remotely".to_string(),
-            "https://emoji.example/remote.png".to_string(),
-        )]);
-
-        assert_eq!(
-            user_status_presentation(
-                &SlackUserStatus {
-                    text: "Focus time".to_string(),
-                    ..Default::default()
-                },
-                &custom,
-                100,
-            ),
-            Some(UserStatusPresentation {
-                subtitle: "Focus time".to_string(),
-                accessible_text: "Focus time".to_string(),
-            })
-        );
-        assert_eq!(
-            user_status_presentation(
-                &SlackUserStatus {
-                    text: "Approved".to_string(),
-                    emoji: ":+1::skin-tone-3:".to_string(),
-                    ..Default::default()
-                },
-                &custom,
-                100,
-            ),
-            Some(UserStatusPresentation {
-                subtitle: "👍🏼 Approved".to_string(),
-                accessible_text: "Approved".to_string(),
-            })
-        );
-        assert_eq!(
-            user_status_presentation(
-                &SlackUserStatus {
-                    text: "Focus time".to_string(),
-                    emoji: ":headphones:".to_string(),
-                    ..Default::default()
-                },
-                &custom,
-                100,
-            ),
-            Some(UserStatusPresentation {
-                subtitle: "🎧 Focus time".to_string(),
-                accessible_text: "Focus time".to_string(),
-            })
-        );
-        assert_eq!(
-            user_status_presentation(
-                &SlackUserStatus {
-                    text: "Remote".to_string(),
-                    emoji: ":working_remotely:".to_string(),
-                    ..Default::default()
-                },
-                &custom,
-                100,
-            ),
-            Some(UserStatusPresentation {
-                subtitle: "● Remote".to_string(),
-                accessible_text: "Remote".to_string(),
-            })
-        );
-        assert_eq!(
-            user_status_presentation(
-                &SlackUserStatus {
-                    text: "Expired".to_string(),
-                    expiration: 100,
-                    ..Default::default()
-                },
-                &custom,
-                100,
-            ),
-            None
-        );
     }
 
     #[test]
@@ -18765,5 +16247,111 @@ mod tests {
         );
 
         assert!(messages_use_image_asset(&[message], image_url));
+    }
+
+    #[test]
+    fn forward_message_payload_uses_permalink_when_visible() {
+        let public_channel = SlackConversation {
+            id: "C123".to_string(),
+            name: Some("general".to_string()),
+            is_channel: Some(true),
+            is_private: Some(false),
+            ..Default::default()
+        };
+        let msg = SlackMessage {
+            ts: "1710000000.000100".to_string(),
+            text: Some("Hello everyone".to_string()),
+            ..Default::default()
+        };
+
+        // Forward from public channel to another conversation
+        let (text, attachments) = build_forward_message_payload(ForwardMessageContext {
+            source_channel_id: "C123",
+            target_channel_id: "D456",
+            message_ts: "1710000000.000100",
+            source_message: Some(&msg),
+            source_conversation: Some(&public_channel),
+            workspace_url: Some("https://workspace.slack.com"),
+            user_display_name: Some("Scott"),
+            user_avatar_url: None,
+        });
+
+        assert_eq!(
+            text,
+            "https://workspace.slack.com/archives/C123/p1710000000000100"
+        );
+        assert!(attachments.is_none());
+
+        // Forward to same channel
+        let (same_text, same_attachments) = build_forward_message_payload(ForwardMessageContext {
+            source_channel_id: "D789",
+            target_channel_id: "D789",
+            message_ts: "1710000000.000100",
+            source_message: Some(&msg),
+            source_conversation: None,
+            workspace_url: Some("https://workspace.slack.com"),
+            user_display_name: Some("Scott"),
+            user_avatar_url: None,
+        });
+        assert_eq!(
+            same_text,
+            "https://workspace.slack.com/archives/D789/p1710000000000100"
+        );
+        assert!(same_attachments.is_none());
+    }
+
+    #[test]
+    fn forward_message_payload_formats_quote_attachment_when_not_visible() {
+        let private_dm = SlackConversation {
+            id: "D111".to_string(),
+            name: Some("secret-chat".to_string()),
+            is_im: Some(true),
+            is_private: Some(true),
+            ..Default::default()
+        };
+        let msg = SlackMessage {
+            ts: "1710000000.000100".to_string(),
+            text: Some("Private proposal details".to_string()),
+            ..Default::default()
+        };
+
+        let (text, attachments) = build_forward_message_payload(ForwardMessageContext {
+            source_channel_id: "D111",
+            target_channel_id: "D222",
+            message_ts: "1710000000.000100",
+            source_message: Some(&msg),
+            source_conversation: Some(&private_dm),
+            workspace_url: Some("https://workspace.slack.com"),
+            user_display_name: Some("Scott"),
+            user_avatar_url: Some("https://avatar.url/pic.png"),
+        });
+
+        assert_eq!(
+            text,
+            "[Forwarded message from Scott]: Private proposal details"
+        );
+        assert!(attachments.is_some());
+        let attachments_json: serde_json::Value =
+            serde_json::from_str(&attachments.unwrap()).expect("valid JSON attachments");
+        assert_eq!(
+            attachments_json[0]["author_name"],
+            serde_json::json!("Scott")
+        );
+        assert_eq!(
+            attachments_json[0]["author_icon"],
+            serde_json::json!("https://avatar.url/pic.png")
+        );
+        assert_eq!(
+            attachments_json[0]["text"],
+            serde_json::json!("Private proposal details")
+        );
+        assert_eq!(
+            attachments_json[0]["footer"],
+            serde_json::json!("Slack conversation in #secret-chat")
+        );
+        assert_eq!(
+            attachments_json[0]["is_msg_unfurl"],
+            serde_json::json!(true)
+        );
     }
 }

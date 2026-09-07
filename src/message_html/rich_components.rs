@@ -2,7 +2,7 @@ use gettextrs::gettext;
 
 use super::rich_model::{
     RichAccessory, RichAttachment, RichControl, RichField, RichImage, RichInline, RichInlineStyle,
-    RichLinkedText, RichNode, RichTextNode,
+    RichLinkedText, RichNode, RichQuote, RichTextNode,
 };
 use super::rich_plan::{plan_control, ControlPlan, RichRenderPlan};
 use super::MessageHtmlContext;
@@ -65,6 +65,7 @@ fn render_node(node: &RichNode, plan: &RichRenderPlan, context: &MessageHtmlCont
             .map(|node| render_rich_text_node(node, context))
             .collect(),
         RichNode::Attachment(attachment) => render_attachment(attachment, plan, context),
+        RichNode::Quote(quote) => render_quote(quote, plan, context),
         RichNode::Unsupported { fallback, .. } => fallback
             .as_deref()
             .map(|text| super::text_block_html(text, Some("unsupported-block"), context))
@@ -364,4 +365,110 @@ fn render_field(field: &RichField, context: &MessageHtmlContext) -> String {
         ),
         (None, None) => String::new(),
     }
+}
+
+fn render_quote(quote: &RichQuote, plan: &RichRenderPlan, context: &MessageHtmlContext) -> String {
+    let mut header = String::new();
+
+    let user_avatar_url = quote
+        .author_id
+        .as_deref()
+        .and_then(|user_id| context.user_avatar_urls.get(user_id))
+        .map(String::as_str);
+    let avatar_src = user_avatar_url
+        .or(quote.author_icon.as_deref())
+        .and_then(|url| context.image_assets.get(url))
+        .filter(|source| source.kind() == super::CachedAssetKind::Image)
+        .map(|source| source.uri().to_string())
+        .or_else(|| {
+            quote
+                .author_icon
+                .clone()
+                .filter(|url| super::is_http_url(url))
+        });
+
+    if let Some(src) = avatar_src {
+        header.push_str(&format!(
+            "<img class=\"quoted-message-avatar\" src=\"{}\" alt=\"\" aria-hidden=\"true\">",
+            super::escape_html(&src)
+        ));
+    }
+
+    let fallback_unknown = gettext("Unknown");
+    let author_name = quote
+        .author_id
+        .as_deref()
+        .and_then(|uid| context.user_names.get(uid).map(String::as_str))
+        .or(quote.author_name.as_deref())
+        .unwrap_or(&fallback_unknown);
+    header.push_str(&format!(
+        "<span class=\"quoted-message-author\">{}</span>",
+        super::escape_html(author_name)
+    ));
+
+    if let Some(channel_id) = quote.channel_id.as_deref() {
+        let channel_name = context
+            .conversation_titles
+            .get(channel_id)
+            .map(String::as_str)
+            .unwrap_or(channel_id);
+        header.push_str(&format!(
+            "<span class=\"quoted-message-channel-ref\"> in <a class=\"channel-reference\" href=\"{}\">#{}</a></span>",
+            super::escape_html(&super::channel_action_url(channel_id)),
+            super::escape_html(channel_name)
+        ));
+    }
+
+    let nav_url = match (quote.channel_id.as_deref(), quote.message_ts.as_deref()) {
+        (Some(channel_id), Some(ts)) => Some(super::message_target_action_url(
+            channel_id,
+            ts,
+            quote.thread_ts.as_deref(),
+        )),
+        _ => quote
+            .permalink_url
+            .clone()
+            .filter(|u| super::is_http_url(u)),
+    };
+
+    let body_html = if quote.body.is_empty() {
+        String::new()
+    } else {
+        quote
+            .body
+            .iter()
+            .map(|node| render_node(node, plan, context))
+            .collect::<String>()
+    };
+
+    let mut footer = String::new();
+    if let Some(footer_text) = quote.footer.as_deref() {
+        if let Some(nav_url) = &nav_url {
+            footer.push_str(&format!(
+                "<footer class=\"quoted-message-footer\"><a class=\"quoted-message-nav-link\" href=\"{}\">{} ↗</a></footer>",
+                super::escape_html(nav_url),
+                super::escape_html(footer_text)
+            ));
+        } else {
+            footer.push_str(&format!(
+                "<footer class=\"quoted-message-footer\">{}</footer>",
+                super::escape_html(footer_text)
+            ));
+        }
+    } else if let Some(nav_url) = &nav_url {
+        let label = if quote.is_reply {
+            gettext("Open thread ↗")
+        } else {
+            gettext("Open message ↗")
+        };
+        footer.push_str(&format!(
+            "<footer class=\"quoted-message-footer\"><a class=\"quoted-message-nav-link\" href=\"{}\">{}</a></footer>",
+            super::escape_html(nav_url),
+            super::escape_html(&label)
+        ));
+    }
+
+    format!(
+        "<blockquote class=\"quoted-message\"><header class=\"quoted-message-header\">{header}</header><div class=\"quoted-message-body\">{body_html}</div>{footer}</blockquote>"
+    )
 }

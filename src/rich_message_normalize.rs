@@ -6,8 +6,8 @@ use crate::rich_message::{
     MessageAccessory as RichAccessory, MessageAttachment as RichAttachment,
     MessageControl as RichControl, MessageControlConfirmation, MessageDocument as RichDocument,
     MessageField as RichField, MessageImage as RichImage, MessageLinkedText as RichLinkedText,
-    MessageNode as RichNode, RichInline, RichInlineStyle, RichTextNode, SensitiveValue,
-    SlackControlAction,
+    MessageNode as RichNode, MessageQuote as RichQuote, RichInline, RichInlineStyle, RichTextNode,
+    SensitiveValue, SlackControlAction,
 };
 
 pub(crate) fn normalize_blocks_with_files(
@@ -429,6 +429,39 @@ fn normalize_inline(value: &Value) -> Option<RichInline> {
             value.get("channel_id")?.as_str()?.to_string(),
         )),
         "emoji" => Some(RichInline::Emoji(value.get("name")?.as_str()?.to_string())),
+        "message_mention" => {
+            let channel_id = value.get("channel_id").and_then(Value::as_str);
+            let message_ts = value.get("message_ts").and_then(Value::as_str);
+            let thread_ts = value.get("thread_ts").and_then(Value::as_str);
+            let fallback_url = value.get("url").and_then(Value::as_str).unwrap_or("");
+            let url = if let (Some(channel), Some(ts)) = (channel_id, message_ts) {
+                let mut u = format!(
+                    "conduit://message?channel={}&ts={}",
+                    urlencoding::encode(channel),
+                    urlencoding::encode(ts)
+                );
+                if let Some(th) = thread_ts {
+                    u.push_str(&format!("&thread_ts={}", urlencoding::encode(th)));
+                }
+                u
+            } else {
+                fallback_url.to_string()
+            };
+            let default_label = if fallback_url.is_empty() {
+                "Quoted message"
+            } else {
+                fallback_url
+            };
+            let label = value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or(default_label);
+            Some(RichInline::Link {
+                label: label.to_string(),
+                url,
+                style,
+            })
+        }
         _ => None,
     }
 }
@@ -466,6 +499,10 @@ pub(crate) fn normalize_attachments(
 ) -> RichDocument {
     let mut nodes = Vec::new();
     for (attachment_index, attachment) in attachments.iter().enumerate() {
+        if let Some(quote) = normalize_quote_attachment(attachment, files) {
+            nodes.push(RichNode::Quote(Box::new(quote)));
+            continue;
+        }
         if let Some(blocks) = attachment.blocks.as_ref() {
             let embedded = normalize_blocks_with_callback_mode(
                 blocks,
@@ -485,6 +522,70 @@ pub(crate) fn normalize_attachments(
         }
     }
     RichDocument::new(nodes, None)
+}
+
+fn normalize_quote_attachment(
+    attachment: &SlackAttachment,
+    files: &[SlackFile],
+) -> Option<RichQuote> {
+    if !attachment.is_quote_unfurl() {
+        return None;
+    }
+
+    let mut thread_ts = None;
+    for url_str in [
+        attachment.original_url.as_deref(),
+        attachment.from_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(parsed_url) = url::Url::parse(url_str) {
+            for (k, v) in parsed_url.query_pairs() {
+                if k == "thread_ts" && !v.trim().is_empty() {
+                    thread_ts = Some(v.to_string());
+                    break;
+                }
+            }
+        }
+        if thread_ts.is_some() {
+            break;
+        }
+    }
+
+    let body = if let Some(blocks) = attachment.blocks.as_ref() {
+        normalize_blocks_with_callback_mode(
+            blocks,
+            "Choose an option",
+            "More actions",
+            files,
+            false,
+        )
+        .nodes
+    } else if let Some(text) = non_empty(attachment.text.as_deref()) {
+        vec![RichNode::Text(text.to_string())]
+    } else if let Some(fallback) = non_empty(attachment.fallback.as_deref()) {
+        vec![RichNode::Text(fallback.to_string())]
+    } else {
+        Vec::new()
+    };
+
+    Some(RichQuote {
+        author_name: non_empty(attachment.author_name.as_deref())
+            .or_else(|| non_empty(attachment.author_subname.as_deref()))
+            .map(ToString::to_string),
+        author_icon: non_empty(attachment.author_icon.as_deref()).map(ToString::to_string),
+        author_id: non_empty(attachment.author_id.as_deref()).map(ToString::to_string),
+        channel_id: non_empty(attachment.channel_id.as_deref()).map(ToString::to_string),
+        message_ts: non_empty(attachment.ts.as_deref()).map(ToString::to_string),
+        thread_ts,
+        permalink_url: non_empty(attachment.original_url.as_deref())
+            .or_else(|| non_empty(attachment.from_url.as_deref()))
+            .map(ToString::to_string),
+        footer: non_empty(attachment.footer.as_deref()).map(ToString::to_string),
+        is_reply: attachment.is_reply_unfurl.unwrap_or(false),
+        body,
+    })
 }
 
 fn normalize_attachment(
@@ -832,6 +933,96 @@ mod tests {
         assert_eq!(
             control.url(),
             Some("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc")
+        );
+    }
+
+    #[test]
+    fn normalizes_message_mention_inlines() {
+        let document = normalize_blocks_with_files(
+            &serde_json::json!([
+                {
+                    "type": "rich_text",
+                    "elements": [
+                        {
+                            "type": "rich_text_section",
+                            "elements": [
+                                {
+                                    "type": "text",
+                                    "text": "Check this out: "
+                                },
+                                {
+                                    "type": "message_mention",
+                                    "channel_id": "C0123",
+                                    "message_ts": "1785770122.389189",
+                                    "thread_ts": "1785745809.323539",
+                                    "url": "https://slack.com/archives/C0123/p1785770122389189"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]),
+            "Choose",
+            "More actions",
+            &[],
+        );
+
+        let [RichNode::RichText(nodes)] = document.nodes() else {
+            panic!("expected rich text node");
+        };
+        let [RichTextNode::Paragraph(inlines)] = nodes.as_slice() else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(inlines.len(), 2);
+        let RichInline::Link { label, url, .. } = &inlines[1] else {
+            panic!("expected link inline for message mention");
+        };
+        assert_eq!(
+            url,
+            "conduit://message?channel=C0123&ts=1785770122.389189&thread_ts=1785745809.323539"
+        );
+        assert_eq!(label, "https://slack.com/archives/C0123/p1785770122389189");
+    }
+
+    #[test]
+    fn normalizes_quote_unfurl_attachment() {
+        let attachment: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "is_msg_unfurl": true,
+            "is_reply_unfurl": true,
+            "ts": "1785770122.389189",
+            "author_id": "U0156N1291A",
+            "author_subname": "Vincent van Adrighem",
+            "author_name": "Vincent van Adrighem",
+            "author_icon": "https://avatars.slack-edge.com/avatar.jpg",
+            "channel_id": "C0B7NRGNSSW",
+            "from_url": "https://signicat.slack.com/archives/C0B7NRGNSSW/p1785770122389189?thread_ts=1785745809.323539&cid=C0B7NRGNSSW",
+            "text": "This week is fine. Next week isn't",
+            "footer": "Thread in Slack conversation"
+        }))
+        .expect("attachment deserializes");
+
+        let document = normalize_attachments(&[attachment], &[]);
+        let [RichNode::Quote(quote)] = document.nodes() else {
+            panic!("expected quote node");
+        };
+
+        assert_eq!(quote.author_name.as_deref(), Some("Vincent van Adrighem"));
+        assert_eq!(
+            quote.author_icon.as_deref(),
+            Some("https://avatars.slack-edge.com/avatar.jpg")
+        );
+        assert_eq!(quote.author_id.as_deref(), Some("U0156N1291A"));
+        assert_eq!(quote.channel_id.as_deref(), Some("C0B7NRGNSSW"));
+        assert_eq!(quote.message_ts.as_deref(), Some("1785770122.389189"));
+        assert_eq!(quote.thread_ts.as_deref(), Some("1785745809.323539"));
+        assert!(quote.is_reply);
+        assert_eq!(
+            quote.footer.as_deref(),
+            Some("Thread in Slack conversation")
+        );
+        assert_eq!(
+            document.visible_text(),
+            "Vincent van Adrighem\nThis week is fine. Next week isn't\nThread in Slack conversation"
         );
     }
 }

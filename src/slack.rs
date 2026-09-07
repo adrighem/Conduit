@@ -16,8 +16,9 @@ use tokio::io::AsyncWriteExt;
 use crate::auth::browser_session_cookie_header;
 use crate::http_client;
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackMessageEdit,
-    SlackUnreadState, SlackUser, SlackUserGroup, SlackUserProfile, SlackUserStatus, StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SlackAttachment, SlackConversation, SlackFile, SlackMessage,
+    SlackMessageEdit, SlackUnreadState, SlackUser, SlackUserGroup, SlackUserProfile,
+    SlackUserStatus, StoredToken,
 };
 use crate::rich_message::SlackControlAction;
 use crate::search::{
@@ -1257,10 +1258,18 @@ impl SlackApi {
         channel_id: &str,
         text: &str,
         blocks_json: Option<&str>,
+        attachments_json: Option<&str>,
         thread_ts: Option<&str>,
     ) -> Result<SlackMessage> {
         let client_msg_id = next_client_message_id();
-        let params = post_message_params(channel_id, text, blocks_json, thread_ts, &client_msg_id);
+        let params = post_message_params(
+            channel_id,
+            text,
+            blocks_json,
+            attachments_json,
+            thread_ts,
+            &client_msg_id,
+        );
 
         let response: PostMessageResponse = self.post_form("chat.postMessage", &params).await?;
         let mut message = response.message;
@@ -1271,6 +1280,17 @@ impl SlackApi {
                 .and_then(|blocks| serde_json::from_str::<Value>(blocks).ok())
             {
                 message.blocks = Some(blocks);
+                message.refresh_canonical_content();
+            }
+        }
+        if message.attachments.is_none() {
+            if let Some(attachments) = attachments_json
+                .filter(|attachments| !attachments.trim().is_empty())
+                .and_then(|attachments| {
+                    serde_json::from_str::<Vec<SlackAttachment>>(attachments).ok()
+                })
+            {
+                message.attachments = Some(attachments);
                 message.refresh_canonical_content();
             }
         }
@@ -1811,6 +1831,7 @@ fn post_message_params(
     channel_id: &str,
     text: &str,
     blocks_json: Option<&str>,
+    attachments_json: Option<&str>,
     thread_ts: Option<&str>,
     client_msg_id: &str,
 ) -> Vec<(&'static str, String)> {
@@ -1821,6 +1842,11 @@ fn post_message_params(
     ];
     if let Some(blocks_json) = blocks_json.filter(|blocks| !blocks.trim().is_empty()) {
         params.push(("blocks", blocks_json.to_string()));
+    }
+    if let Some(attachments_json) =
+        attachments_json.filter(|attachments| !attachments.trim().is_empty())
+    {
+        params.push(("attachments", attachments_json.to_string()));
     }
     if let Some(thread_ts) = thread_ts.filter(|thread_ts| !thread_ts.trim().is_empty()) {
         params.push(("thread_ts", thread_ts.to_string()));
@@ -3876,6 +3902,7 @@ mod tests {
             "C123",
             "Hello <@UADA>",
             Some(r#"[{"type":"rich_text"}]"#),
+            None,
             Some("1710000000.000100"),
             "client-message-id",
         );
@@ -3917,7 +3944,7 @@ mod tests {
 
         let message = tokio::runtime::Runtime::new()
             .expect("test runtime should start")
-            .block_on(api.post_message("C123", "Hello", Some(blocks), None))
+            .block_on(api.post_message("C123", "Hello", Some(blocks), None, None))
             .expect("message should post");
 
         assert!(matches!(
@@ -3929,6 +3956,50 @@ mod tests {
             .into_owned()
             .collect::<HashMap<_, _>>();
         assert_eq!(form.get("blocks").map(String::as_str), Some(blocks));
+    }
+
+    #[test]
+    fn rich_message_post_sends_attachments_and_restores_omitted_attachments() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"message":{"ts":"1710000000.000100","text":"Forwarded"}}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            body
+        });
+        let attachments = r#"[{"author_name":"Scott","text":"Original message","footer":"Slack conversation","ts":"1710000000"}]"#;
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+
+        let message = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.post_message("C123", "Forwarded", None, Some(attachments), None))
+            .expect("message should post");
+
+        assert!(message.attachments.is_some());
+        let body = received.join().expect("mock Slack server should finish");
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            form.get("attachments").map(String::as_str),
+            Some(attachments)
+        );
     }
 
     #[test]

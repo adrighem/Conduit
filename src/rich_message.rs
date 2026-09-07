@@ -224,10 +224,25 @@ pub enum MessageNode {
     Actions(Vec<MessageControl>),
     RichText(Vec<RichTextNode>),
     Attachment(Box<MessageAttachment>),
+    Quote(Box<MessageQuote>),
     Unsupported {
         type_label: String,
         fallback: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageQuote {
+    pub(crate) author_name: Option<String>,
+    pub(crate) author_icon: Option<String>,
+    pub(crate) author_id: Option<String>,
+    pub(crate) channel_id: Option<String>,
+    pub(crate) message_ts: Option<String>,
+    pub(crate) thread_ts: Option<String>,
+    pub(crate) permalink_url: Option<String>,
+    pub(crate) footer: Option<String>,
+    pub(crate) is_reply: bool,
+    pub(crate) body: Vec<MessageNode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,18 +342,11 @@ impl MessageDocument {
     }
 
     pub fn image_urls(&self) -> impl Iterator<Item = &str> {
-        self.nodes.iter().filter_map(|node| {
-            let image = match node {
-                MessageNode::Image(image) => Some(image),
-                MessageNode::Section {
-                    accessory: Some(MessageAccessory::Image(image)),
-                    ..
-                } => Some(image),
-                MessageNode::Attachment(attachment) => attachment.image.as_ref(),
-                _ => None,
-            }?;
-            image.url.as_deref().and_then(non_empty)
-        })
+        let mut urls = Vec::new();
+        for node in &self.nodes {
+            collect_image_urls(node, &mut urls);
+        }
+        urls.into_iter()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -400,6 +408,43 @@ impl MessageDocument {
     }
 }
 
+fn collect_image_urls<'a>(node: &'a MessageNode, urls: &mut Vec<&'a str>) {
+    match node {
+        MessageNode::Image(image) => {
+            if let Some(url) = image.url.as_deref().and_then(non_empty) {
+                urls.push(url);
+            }
+        }
+        MessageNode::Section {
+            accessory: Some(MessageAccessory::Image(image)),
+            ..
+        } => {
+            if let Some(url) = image.url.as_deref().and_then(non_empty) {
+                urls.push(url);
+            }
+        }
+        MessageNode::Attachment(attachment) => {
+            if let Some(url) = attachment
+                .image
+                .as_ref()
+                .and_then(|img| img.url.as_deref())
+                .and_then(non_empty)
+            {
+                urls.push(url);
+            }
+        }
+        MessageNode::Quote(quote) => {
+            if let Some(icon) = quote.author_icon.as_deref().and_then(non_empty) {
+                urls.push(icon);
+            }
+            for inner in &quote.body {
+                collect_image_urls(inner, urls);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn assign_control_keys(nodes: &mut [MessageNode]) {
     let mut next = 1_u32;
     for node in nodes {
@@ -421,6 +466,11 @@ fn visit_node_controls_mut(node: &mut MessageNode, visitor: &mut impl FnMut(&mut
         } => visitor(control),
         MessageNode::Actions(controls) => controls.iter_mut().for_each(visitor),
         MessageNode::Attachment(attachment) => attachment.actions.iter_mut().for_each(visitor),
+        MessageNode::Quote(quote) => {
+            for inner in &mut quote.body {
+                visit_node_controls_mut(inner, visitor);
+            }
+        }
         _ => {}
     }
 }
@@ -434,6 +484,11 @@ fn visit_node_controls<'a>(node: &'a MessageNode, visitor: &mut impl FnMut(&'a M
         } => visitor(control),
         MessageNode::Actions(controls) => controls.iter().for_each(visitor),
         MessageNode::Attachment(attachment) => attachment.actions.iter().for_each(visitor),
+        MessageNode::Quote(quote) => {
+            for inner in &quote.body {
+                visit_node_controls(inner, visitor);
+            }
+        }
         _ => {}
     }
 }
@@ -506,6 +561,17 @@ fn project_node_text(node: &MessageNode, include_controls: bool, parts: &mut Vec
                 }
             }
         }
+        MessageNode::Quote(quote) => {
+            if let Some(author) = &quote.author_name {
+                push_text(parts, author);
+            }
+            for inner in &quote.body {
+                project_node_text(inner, include_controls, parts);
+            }
+            if let Some(footer) = &quote.footer {
+                push_text(parts, footer);
+            }
+        }
         MessageNode::Unsupported {
             fallback: Some(text),
             ..
@@ -543,6 +609,16 @@ fn message_node_user_ids(node: &MessageNode) -> Box<dyn Iterator<Item = &str> + 
                     _ => None,
                 }),
         ),
+        MessageNode::Quote(quote) => {
+            let mut ids = Vec::new();
+            if let Some(author_id) = quote.author_id.as_deref() {
+                ids.push(author_id);
+            }
+            for inner in &quote.body {
+                ids.extend(message_node_user_ids(inner));
+            }
+            Box::new(ids.into_iter())
+        }
         _ => Box::new(std::iter::empty()),
     }
 }
@@ -674,6 +750,49 @@ mod tests {
                 "https://files.slack.com/accessory.png",
                 "https://files.slack.com/attachment.png",
             ]
+        );
+    }
+
+    #[test]
+    fn quote_node_yields_author_icon_and_body_images_and_text() {
+        let image = |url: &str| MessageImage {
+            url: Some(url.to_string()),
+            alt: "Preview".to_string(),
+            title: None,
+        };
+        let document = MessageDocument::new(
+            vec![MessageNode::Quote(Box::new(MessageQuote {
+                author_name: Some("Alice".to_string()),
+                author_icon: Some("https://avatars.slack.com/alice.png".to_string()),
+                author_id: Some("U123".to_string()),
+                channel_id: Some("C123".to_string()),
+                message_ts: Some("1710000000.000100".to_string()),
+                thread_ts: None,
+                permalink_url: None,
+                footer: Some("Slack thread".to_string()),
+                is_reply: false,
+                body: vec![
+                    MessageNode::Text("Quoted text".to_string()),
+                    MessageNode::Image(image("https://files.slack.com/inner.png")),
+                ],
+            }))],
+            None,
+        );
+
+        assert_eq!(
+            document.image_urls().collect::<Vec<_>>(),
+            vec![
+                "https://avatars.slack.com/alice.png",
+                "https://files.slack.com/inner.png",
+            ]
+        );
+        assert_eq!(
+            document.visible_text(),
+            "Alice\nQuoted text\nPreview\nSlack thread"
+        );
+        assert_eq!(
+            document.mentioned_user_ids().collect::<Vec<_>>(),
+            vec!["U123"]
         );
     }
 }
