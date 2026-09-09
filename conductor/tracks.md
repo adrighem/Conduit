@@ -74,3 +74,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 ## [x] Track: Installed branding consistency
 *Link: [./conductor/tracks/branding_install_20260728/](./conductor/tracks/branding_install_20260728/)*
 
+---
+
+## [~] Track: Code review findings remediation
+*Link: [./conductor/tracks/code_review_findings_20260909/](./conductor/tracks/code_review_findings_20260909/)*
+

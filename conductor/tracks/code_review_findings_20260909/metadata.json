@@ -1,0 +1,8 @@
+{
+  "track_id": "code_review_findings_20260909",
+  "type": "bugfix",
+  "status": "in_progress",
+  "created_at": "2026-09-08T00:00:00Z",
+  "updated_at": "2026-09-09T00:00:00Z",
+  "description": "Investigate and fix findings from a full-codebase senior-engineer review (correctness, performance, readability, error handling, security) covering auth/network, data/sync, HTML rendering, window/runtime, sidebar/composer/state, huddles, and remaining source files."
+}
