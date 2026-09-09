@@ -1832,27 +1832,32 @@ fn apply_projection_message_changes(
     for change in changes {
         match change {
             MessageChange::Upsert(message) if accepts(message) => {
-                if let Some(existing) = messages.iter_mut().find(|known| known.ts == message.ts) {
-                    if existing != message.as_ref() {
-                        existing.clone_from(message);
+                if let Some(pos) = messages.iter().position(|known| known.ts == message.ts) {
+                    if &messages[pos] != message.as_ref() {
+                        messages[pos].clone_from(message);
                         changed = true;
                     }
                 } else {
-                    messages.push((**message).clone());
+                    // messages is sorted descending by ts (newest first).
+                    if messages.first().is_none_or(|newest| message.ts > newest.ts) {
+                        messages.insert(0, (**message).clone());
+                    } else if messages.last().is_some_and(|oldest| message.ts < oldest.ts) {
+                        messages.push((**message).clone());
+                    } else {
+                        let idx = messages.partition_point(|known| known.ts > message.ts);
+                        messages.insert(idx, (**message).clone());
+                    }
                     changed = true;
                 }
             }
             MessageChange::Upsert(_) => {}
             MessageChange::Remove { message_ts } => {
-                let previous_len = messages.len();
-                messages.retain(|message| message.ts != *message_ts);
-                changed |= messages.len() != previous_len;
+                if let Some(pos) = messages.iter().position(|known| known.ts == *message_ts) {
+                    messages.remove(pos);
+                    changed = true;
+                }
             }
         }
-    }
-    if changed {
-        messages.sort_by(|left, right| right.ts.cmp(&left.ts));
-        messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
     }
     changed
 }
@@ -1862,27 +1867,33 @@ fn timeline_projection_operations(
     changes: &[MessageChange],
     accepts: impl Fn(&SlackMessage) -> bool,
 ) -> Vec<TimelineProjectionOperation> {
-    let mut known = messages
+    let mut known: HashMap<&str, &SlackMessage> = messages
         .iter()
-        .map(|message| (message.ts.clone(), message.clone()))
-        .collect::<HashMap<_, _>>();
+        .map(|message| (message.ts.as_str(), message))
+        .collect();
+    let mut newly_inserted: HashMap<String, Box<SlackMessage>> = HashMap::new();
     let mut operations = Vec::new();
     for change in changes {
         match change {
             MessageChange::Upsert(message) if accepts(message) => {
-                let inserted = !known.contains_key(&message.ts);
-                if known.get(&message.ts) != Some(message.as_ref()) {
+                let message_ts = message.ts.as_str();
+                let existing = known
+                    .get(message_ts)
+                    .copied()
+                    .or_else(|| newly_inserted.get(message_ts).map(|m| m.as_ref()));
+                let inserted = existing.is_none();
+                if existing != Some(message.as_ref()) {
                     let position = if inserted
                         && !messages.is_empty()
                         && messages
-                            .iter()
-                            .all(|known| slack_timestamp_is_after(&known.ts, &message.ts))
+                            .last()
+                            .is_some_and(|oldest| slack_timestamp_is_after(&oldest.ts, &message.ts))
                     {
                         TimelineProjectionPosition::Prepend
                     } else {
                         TimelineProjectionPosition::Append
                     };
-                    known.insert(message.ts.clone(), (**message).clone());
+                    newly_inserted.insert(message.ts.clone(), message.clone());
                     operations.push(TimelineProjectionOperation::Upsert {
                         message: message.clone(),
                         inserted,
@@ -1892,7 +1903,9 @@ fn timeline_projection_operations(
             }
             MessageChange::Upsert(_) => {}
             MessageChange::Remove { message_ts } => {
-                if known.remove(message_ts).is_some() {
+                let existed = known.remove(message_ts.as_str()).is_some()
+                    || newly_inserted.remove(message_ts).is_some();
+                if existed {
                     operations.push(TimelineProjectionOperation::Remove {
                         message_ts: message_ts.clone(),
                     });
@@ -3725,5 +3738,120 @@ mod tests {
         assert!(!state.apply_message_context(&location, vec![message("2", "stale")]));
         assert_eq!(state.visible_channel_id(), Some("C2"));
         assert_eq!(state.channels["C1"].messages[0].body_text(), "latest");
+    }
+
+    #[test]
+    fn apply_projection_message_changes_preserves_order_and_avoids_redundant_work() {
+        let mut messages = Vec::new();
+        let m2 = message("2.0", "two");
+        let m4 = message("4.0", "four");
+        let m1 = message("1.0", "one");
+        let m3 = message("3.0", "three");
+
+        // 1. Insert into empty
+        let changed = apply_projection_message_changes(
+            &mut messages,
+            &[MessageChange::Upsert(Box::new(m2.clone()))],
+            |_| true,
+        );
+        assert!(changed);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].ts, "2.0");
+
+        // 2. Insert newer (becomes index 0 in descending order)
+        let changed = apply_projection_message_changes(
+            &mut messages,
+            &[MessageChange::Upsert(Box::new(m4.clone()))],
+            |_| true,
+        );
+        assert!(changed);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].ts, "4.0");
+        assert_eq!(messages[1].ts, "2.0");
+
+        // 3. Insert older (becomes end in descending order)
+        let changed = apply_projection_message_changes(
+            &mut messages,
+            &[MessageChange::Upsert(Box::new(m1.clone()))],
+            |_| true,
+        );
+        assert!(changed);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].ts, "4.0");
+        assert_eq!(messages[1].ts, "2.0");
+        assert_eq!(messages[2].ts, "1.0");
+
+        // 4. Insert middle (ts 3.0 between 4.0 and 2.0)
+        let changed = apply_projection_message_changes(
+            &mut messages,
+            &[MessageChange::Upsert(Box::new(m3.clone()))],
+            |_| true,
+        );
+        assert!(changed);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].ts, "4.0");
+        assert_eq!(messages[1].ts, "3.0");
+        assert_eq!(messages[2].ts, "2.0");
+        assert_eq!(messages[3].ts, "1.0");
+
+        // 5. Update existing in place
+        let mut m3_updated = m3.clone();
+        m3_updated.text = Some("three updated".to_string());
+        let changed = apply_projection_message_changes(
+            &mut messages,
+            &[MessageChange::Upsert(Box::new(m3_updated.clone()))],
+            |_| true,
+        );
+        assert!(changed);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].text.as_deref(), Some("three updated"));
+
+        // 6. Delete middle
+        let changed = apply_projection_message_changes(
+            &mut messages,
+            &[MessageChange::Remove {
+                message_ts: "3.0".to_string(),
+            }],
+            |_| true,
+        );
+        assert!(changed);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].ts, "4.0");
+        assert_eq!(messages[1].ts, "2.0");
+        assert_eq!(messages[2].ts, "1.0");
+
+        // 7. Test timeline_projection_operations without clones
+        let ops = timeline_projection_operations(
+            &messages,
+            &[
+                MessageChange::Upsert(Box::new(message("5.0", "five"))),
+                MessageChange::Upsert(Box::new(message("0.5", "half"))),
+                MessageChange::Remove {
+                    message_ts: "2.0".to_string(),
+                },
+            ],
+            |_| true,
+        );
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(
+            &ops[0],
+            TimelineProjectionOperation::Upsert {
+                position: TimelineProjectionPosition::Append,
+                inserted: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &ops[1],
+            TimelineProjectionOperation::Upsert {
+                position: TimelineProjectionPosition::Prepend,
+                inserted: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &ops[2],
+            TimelineProjectionOperation::Remove { message_ts } if message_ts == "2.0"
+        ));
     }
 }
