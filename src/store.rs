@@ -2668,6 +2668,30 @@ fn apply_store_change(
                 &channel_timeline_messages(normalize_cached_messages(messages)),
             )
         }
+        StoreChange::HistoryDelta {
+            channel_id,
+            messages,
+        } => {
+            require_store_key("channel history", &channel_id)?;
+            let messages = normalize_cached_messages(messages);
+            let existing = normalize_cached_messages(
+                load_sqlite_item::<Vec<SlackMessage>>(
+                    transaction,
+                    workspace_key,
+                    "channel_history",
+                    &channel_id,
+                )?
+                .unwrap_or_default(),
+            );
+            let merged = merge_channel_history_pages(&existing, &messages);
+            upsert_sqlite_item(
+                transaction,
+                workspace_key,
+                "channel_history",
+                &channel_id,
+                &merged,
+            )
+        }
         StoreChange::HistoryRemoved { channel_id } => {
             require_store_key("channel history", &channel_id)?;
             Ok(transaction.execute(
@@ -2689,6 +2713,32 @@ fn apply_store_change(
                 "thread_replies",
                 &thread_key(&channel_id, &thread_ts),
                 &pruned_history(normalize_cached_messages(messages)),
+            )
+        }
+        StoreChange::ThreadDelta {
+            channel_id,
+            thread_ts,
+            messages,
+        } => {
+            require_store_key("thread channel", &channel_id)?;
+            require_store_key("thread timestamp", &thread_ts)?;
+            let messages = normalize_cached_messages(messages);
+            let existing = normalize_cached_messages(
+                load_sqlite_item::<Vec<SlackMessage>>(
+                    transaction,
+                    workspace_key,
+                    "thread_replies",
+                    &thread_key(&channel_id, &thread_ts),
+                )?
+                .unwrap_or_default(),
+            );
+            let merged = merge_thread_replies_pages(&existing, &messages);
+            upsert_sqlite_item(
+                transaction,
+                workspace_key,
+                "thread_replies",
+                &thread_key(&channel_id, &thread_ts),
+                &merged,
             )
         }
         StoreChange::ThreadCatalogReplaced(records) => {
@@ -3947,7 +3997,6 @@ fn thread_key(channel_id: &str, thread_ts: &str) -> String {
     format!("{channel_id}:{thread_ts}")
 }
 
-#[cfg(test)]
 fn merge_history_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
     // Incoming API/realtime data wins for duplicate timestamps while cached
     // messages missing from a bounded or in-flight page remain available.
@@ -3956,12 +4005,18 @@ fn merge_history_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<
     pruned_history(messages)
 }
 
-#[cfg(test)]
 fn merge_channel_history_pages(
     existing: &[SlackMessage],
     page: &[SlackMessage],
 ) -> Vec<SlackMessage> {
     channel_timeline_messages(merge_history_pages(existing, page))
+}
+
+fn merge_thread_replies_pages(
+    existing: &[SlackMessage],
+    page: &[SlackMessage],
+) -> Vec<SlackMessage> {
+    pruned_history(merge_history_pages(existing, page))
 }
 
 fn channel_timeline_messages(messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
@@ -8849,6 +8904,92 @@ mod tests {
                 .pop()
                 .unwrap();
             assert_eq!(conversation.unread_activity_count(), 1);
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn history_and_thread_deltas_merge_successively_without_full_replaces() {
+        let directory = temp_cache_dir("workspace-store-history-thread-deltas");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let revision = WorkspaceRevision::INITIAL.successor();
+            // Page 1: History delta with message 2.0
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![StoreChange::HistoryDelta {
+                            channel_id: "C123".into(),
+                            messages: vec![SlackMessage {
+                                ts: "2.0".into(),
+                                text: Some("page 1 message".into()),
+                                ..Default::default()
+                            }],
+                        }],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let history = store.load_history("C123").await.unwrap().unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].ts, "2.0");
+
+            // Page 2: Older message 1.0 merged in
+            let revision2 = revision.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision2,
+                        vec![StoreChange::HistoryDelta {
+                            channel_id: "C123".into(),
+                            messages: vec![SlackMessage {
+                                ts: "1.0".into(),
+                                text: Some("page 2 message".into()),
+                                ..Default::default()
+                            }],
+                        }],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let history = store.load_history("C123").await.unwrap().unwrap();
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0].ts, "2.0");
+            assert_eq!(history[1].ts, "1.0");
+
+            // Thread delta for replies
+            let revision3 = revision2.successor();
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision3,
+                        vec![StoreChange::ThreadDelta {
+                            channel_id: "C123".into(),
+                            thread_ts: "1.0".into(),
+                            messages: vec![SlackMessage {
+                                ts: "1.1".into(),
+                                thread_ts: Some("1.0".into()),
+                                text: Some("reply 1".into()),
+                                ..Default::default()
+                            }],
+                        }],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let thread = store.load_thread("C123", "1.0").await.unwrap().unwrap();
+            assert_eq!(thread.len(), 1);
+            assert_eq!(thread[0].ts, "1.1");
         });
 
         let _ = std::fs::remove_dir_all(directory);

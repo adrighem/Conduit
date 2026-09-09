@@ -337,10 +337,19 @@ pub(crate) enum StoreChange {
         channel_id: String,
         messages: Vec<SlackMessage>,
     },
+    HistoryDelta {
+        channel_id: String,
+        messages: Vec<SlackMessage>,
+    },
     HistoryRemoved {
         channel_id: String,
     },
     ThreadReplaced {
+        channel_id: String,
+        thread_ts: String,
+        messages: Vec<SlackMessage>,
+    },
+    ThreadDelta {
         channel_id: String,
         thread_ts: String,
         messages: Vec<SlackMessage>,
@@ -1494,9 +1503,16 @@ impl WorkspaceCoordinator {
         }
         let timeline_changed = !changes.is_empty();
         accepted_messages.sort_by(|left, right| left.ts.cmp(&right.ts));
-        let messages = timeline.messages();
-        let store_change = (timeline_changed && origin != MutationOrigin::Cache)
-            .then(|| store_timeline_replacement(&target, messages));
+        let store_change = if timeline_changed && origin != MutationOrigin::Cache {
+            if page_complete {
+                let messages = timeline.messages();
+                Some(store_timeline_replacement(&target, messages))
+            } else {
+                Some(store_timeline_delta(&target, accepted_messages.clone()))
+            }
+        } else {
+            None
+        };
         let catalog_delta = match &target {
             TimelineTarget::Channel(channel_id) => {
                 self.thread_catalog.observe_history(channel_id, &catalog_messages)
@@ -2650,6 +2666,23 @@ fn store_timeline_replacement(target: &TimelineTarget, messages: Vec<SlackMessag
             channel_id,
             thread_ts,
         } => StoreChange::ThreadReplaced {
+            channel_id: channel_id.clone(),
+            thread_ts: thread_ts.clone(),
+            messages,
+        },
+    }
+}
+
+fn store_timeline_delta(target: &TimelineTarget, messages: Vec<SlackMessage>) -> StoreChange {
+    match target {
+        TimelineTarget::Channel(channel_id) => StoreChange::HistoryDelta {
+            channel_id: channel_id.clone(),
+            messages,
+        },
+        TimelineTarget::Thread {
+            channel_id,
+            thread_ts,
+        } => StoreChange::ThreadDelta {
             channel_id: channel_id.clone(),
             thread_ts: thread_ts.clone(),
             messages,
@@ -5248,7 +5281,7 @@ mod tests {
     }
 
     #[test]
-    fn timeline_snapshots_and_pages_keep_full_store_replacements() {
+    fn timeline_snapshots_replace_while_intermediate_pages_use_delta() {
         let mut coordinator = WorkspaceCoordinator::default();
         let history = coordinator
             .apply_from(
@@ -5294,7 +5327,7 @@ mod tests {
         let store_changes = thread.store_batch().unwrap().changes();
         assert!(store_changes.iter().any(|change| matches!(
             change,
-            StoreChange::ThreadReplaced {
+            StoreChange::ThreadDelta {
                 channel_id,
                 thread_ts,
                 messages,
