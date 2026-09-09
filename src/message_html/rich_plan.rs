@@ -38,11 +38,20 @@ pub(super) fn plan_control(
     url: Option<&str>,
     confirmation_required: bool,
     callback_available: bool,
+    is_call: bool,
 ) -> ControlPlan {
     match url {
-        Some(url) if !super::is_http_url(url) => ControlPlan::Unavailable {
-            label: label.to_string(),
-        },
+        Some(url)
+            if if is_call {
+                !super::is_call_url(url)
+            } else {
+                !super::is_http_url(url)
+            } =>
+        {
+            ControlPlan::Unavailable {
+                label: label.to_string(),
+            }
+        }
         Some(url) if !confirmation_required => ControlPlan::Navigate {
             label: label.to_string(),
             url: url.to_string(),
@@ -63,23 +72,75 @@ mod tests {
     #[test]
     fn classifies_safe_external_and_unavailable_controls() {
         assert!(matches!(
-            plan_control("Open", Some("https://example.test/item"), false, false),
+            plan_control(
+                "Open",
+                Some("https://example.test/item"),
+                false,
+                false,
+                false
+            ),
             ControlPlan::Navigate { .. }
         ));
         assert!(matches!(
-            plan_control("Approve", None, false, false),
+            plan_control("Approve", None, false, false, false),
             ControlPlan::SlackHandoff { .. }
         ));
         assert!(matches!(
-            plan_control("Confirm", Some("https://example.test/item"), true, false),
+            plan_control(
+                "Confirm",
+                Some("https://example.test/item"),
+                true,
+                false,
+                false
+            ),
             ControlPlan::SlackHandoff { .. }
         ));
         assert!(matches!(
-            plan_control("Unsafe", Some("javascript:alert(1)"), false, false),
+            plan_control("Unsafe", Some("javascript:alert(1)"), false, false, false),
             ControlPlan::Unavailable { .. }
         ));
         assert!(matches!(
-            plan_control("Approve", None, true, true),
+            plan_control(
+                "CustomSchemeNonCall",
+                Some("msteams:/l/meetup-join/123"),
+                false,
+                false,
+                false
+            ),
+            ControlPlan::Unavailable { .. }
+        ));
+        assert!(matches!(
+            plan_control(
+                "CustomSchemeCall",
+                Some("msteams:/l/meetup-join/123"),
+                false,
+                false,
+                true
+            ),
+            ControlPlan::Navigate { .. }
+        ));
+        assert!(matches!(
+            plan_control(
+                "ZoomSchemeCall",
+                Some("zoommtg://zoom.us/join?confno=123"),
+                false,
+                false,
+                true
+            ),
+            ControlPlan::Navigate { .. }
+        ));
+        assert!(matches!(
+            plan_control(
+                "UnsafeSchemeCall",
+                Some("javascript:alert(1)"),
+                false,
+                false,
+                true
+            ),
+            ControlPlan::Unavailable { .. }
+        ));
+        assert!(matches!(
+            plan_control("Approve", None, true, true, false),
             ControlPlan::ExecuteCallback { .. }
         ));
     }

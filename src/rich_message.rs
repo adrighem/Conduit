@@ -144,6 +144,8 @@ pub struct MessageControl {
     action: Option<SlackControlAction>,
     #[serde(default)]
     pub(crate) confirmation: Option<MessageControlConfirmation>,
+    #[serde(default)]
+    pub(crate) is_call: bool,
 }
 
 impl MessageControl {
@@ -156,6 +158,7 @@ impl MessageControl {
             value,
             action: None,
             confirmation: None,
+            is_call: false,
         }
     }
 
@@ -172,6 +175,20 @@ impl MessageControl {
             value: None,
             action: None,
             confirmation: None,
+            is_call: false,
+        }
+    }
+
+    pub(crate) fn call(label: impl Into<String>, url: Option<String>) -> Self {
+        Self {
+            key: None,
+            label: label.into(),
+            url,
+            confirmation_required: false,
+            value: None,
+            action: None,
+            confirmation: None,
+            is_call: true,
         }
     }
 
@@ -188,6 +205,7 @@ impl MessageControl {
             value: None,
             action: Some(action),
             confirmation,
+            is_call: false,
         }
     }
 
@@ -197,6 +215,10 @@ impl MessageControl {
 
     pub fn url(&self) -> Option<&str> {
         self.url.as_deref()
+    }
+
+    pub fn is_call(&self) -> bool {
+        self.is_call
     }
 
     pub(crate) fn key(&self) -> Option<MessageControlKey> {

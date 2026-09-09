@@ -184,6 +184,12 @@ fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
     (url.is_some() || !alt.trim().is_empty()).then_some(RichImage { url, alt, title })
 }
 
+fn is_call_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .map(|url| matches!(url.scheme(), "http" | "https" | "msteams" | "zoommtg"))
+        .unwrap_or(false)
+}
+
 fn normalize_call_block(block: &Value) -> Option<RichNode> {
     let call_val = block.get("call");
     let v1_val = call_val.and_then(|c| c.get("v1"));
@@ -207,7 +213,8 @@ fn normalize_call_block(block: &Value) -> Option<RichNode> {
                 .and_then(Value::as_str)
         })
         .or_else(|| block.get("join_url").and_then(Value::as_str))
-        .or_else(|| block.get("url").and_then(Value::as_str));
+        .or_else(|| block.get("url").and_then(Value::as_str))
+        .filter(|u| is_call_url(u));
 
     let name = v1_val
         .and_then(|v1| v1.get("name"))
@@ -237,10 +244,9 @@ fn normalize_call_block(block: &Value) -> Option<RichNode> {
     Some(RichNode::Section {
         text: Some(format!("*{title}*")),
         fields: Vec::new(),
-        accessory: Some(RichAccessory::Control(RichControl::presentation(
+        accessory: Some(RichAccessory::Control(RichControl::call(
             "Join".to_string(),
             Some(url.to_string()),
-            false,
         ))),
     })
 }
@@ -321,20 +327,13 @@ fn control_label(value: &Value, url: Option<&str>) -> String {
             value
                 .get("value")
                 .and_then(Value::as_str)
-                .filter(|v| {
-                    !v.starts_with("http://")
-                        && !v.starts_with("https://")
-                        && !v.starts_with("msteams:")
-                })
+                .filter(|v| !v.starts_with("http://") && !v.starts_with("https://"))
                 .map(ToString::to_string)
         })
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| {
             if let Some(url) = url {
-                if url.contains("teams.microsoft.com")
-                    || url.starts_with("msteams:")
-                    || url.contains("zoom.us")
-                {
+                if url.contains("teams.microsoft.com") || url.contains("zoom.us") {
                     "Join".to_string()
                 } else {
                     "Open".to_string()
@@ -352,9 +351,10 @@ fn extract_control_url(value: &Value) -> Option<String> {
         .or_else(|| value.get("action_url").and_then(Value::as_str))
         .or_else(|| value.get("join_url").and_then(Value::as_str))
         .or_else(|| {
-            value.get("value").and_then(Value::as_str).filter(|v| {
-                v.starts_with("http://") || v.starts_with("https://") || v.starts_with("msteams:")
-            })
+            value
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|v| v.starts_with("http://") || v.starts_with("https://"))
         })
         .map(ToString::to_string)
 }

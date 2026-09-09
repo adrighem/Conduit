@@ -4349,7 +4349,13 @@ fn external_link_html(url: &str, label: &str) -> String {
     )
 }
 
-fn is_http_url(value: &str) -> bool {
+pub(super) fn is_http_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .map(|url| matches!(url.scheme(), "http" | "https"))
+        .unwrap_or(false)
+}
+
+pub(super) fn is_call_url(value: &str) -> bool {
     url::Url::parse(value)
         .map(|url| matches!(url.scheme(), "http" | "https" | "msteams" | "zoommtg"))
         .unwrap_or(false)
@@ -7261,5 +7267,89 @@ mod tests {
         assert!(html.contains("This week is fine. Next week isn&#39;t"));
         assert!(html.contains("href=\"conduit://message?channel=C0B7NRGNSSW&amp;ts=1785770122.389189&amp;thread_ts=1785745809.323539\""));
         assert!(html.contains("Thread in Slack conversation ↗"));
+    }
+
+    #[test]
+    fn message_body_does_not_render_custom_url_schemes_as_links() {
+        let mut message = crate::models::SlackMessage {
+            ts: "1710000000.000100".into(),
+            text: Some("Join via <msteams:/l/meetup-join/123|Teams> or <zoommtg://zoom.us/join?confno=123|Zoom>".into()),
+            ..Default::default()
+        };
+        message.refresh_canonical_content();
+        let context = MessageHtmlContext::default();
+        let html = message_body_html(None, &message, &context);
+
+        assert!(
+            !html.contains("href=\"msteams:"),
+            "unexpected msteams link: {html}"
+        );
+        assert!(
+            !html.contains("href=\"zoommtg:"),
+            "unexpected zoommtg link: {html}"
+        );
+    }
+
+    #[test]
+    fn renders_call_block_with_custom_scheme_join_button() {
+        let mut message = crate::models::SlackMessage {
+            ts: "1710000000.000100".into(),
+            blocks: Some(serde_json::json!([
+                {
+                    "type": "call",
+                    "call_id": "R01234567",
+                    "call": {
+                        "media_backend_type": "msteams",
+                        "v1": {
+                            "id": "R01234567",
+                            "name": "Teams Sync",
+                            "join_url": "msteams:/l/meetup-join/123"
+                        }
+                    }
+                }
+            ])),
+            ..Default::default()
+        };
+        message.refresh_canonical_content();
+        let context = MessageHtmlContext::default();
+        let html = message_body_html(None, &message, &context);
+
+        assert!(
+            html.contains("href=\"msteams:/l/meetup-join/123\""),
+            "expected msteams link in call block: {html}"
+        );
+        assert!(html.contains(">Join</a>"));
+    }
+
+    #[test]
+    fn non_call_action_button_does_not_render_custom_scheme_link() {
+        let mut message = crate::models::SlackMessage {
+            ts: "1710000000.000100".into(),
+            blocks: Some(serde_json::json!([
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Launch Teams"
+                            },
+                            "url": "msteams:/l/meetup-join/123"
+                        }
+                    ]
+                }
+            ])),
+            ..Default::default()
+        };
+        message.refresh_canonical_content();
+        let context = MessageHtmlContext::default();
+        let html = message_body_html(None, &message, &context);
+
+        assert!(
+            !html.contains("href=\"msteams:"),
+            "unexpected msteams link in action button: {html}"
+        );
+        assert!(html.contains("is-unavailable"));
     }
 }

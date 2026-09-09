@@ -102,6 +102,7 @@ fn render_control(
         control.url.as_deref(),
         control.confirmation_required,
         control.action().is_some(),
+        control.is_call(),
     ) {
         ControlPlan::Navigate { url, .. } => format!(
             "<a class=\"block-action\" href=\"{}\" rel=\"noreferrer noopener\">{label_html}</a>",
