@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::os::fd::OwnedFd;
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -615,9 +615,16 @@ fn finite_rate(value: Option<f64>) -> u64 {
     value.floor().min(u64::MAX as f64) as u64
 }
 
+pub(crate) fn prepare_pipewire_source_fd(remote_fd: &OwnedFd) -> Result<RawFd, MediaError> {
+    remote_fd
+        .try_clone()
+        .map(IntoRawFd::into_raw_fd)
+        .map_err(|_| MediaError::OperationFailed)
+}
+
 #[cfg(feature = "native-media")]
 mod native {
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
     use std::sync::{Arc, Condvar, Mutex};
 
     use gst::glib;
@@ -1211,7 +1218,8 @@ mod native {
                     return Err(MediaError::AlreadyRunning);
                 }
                 let source = make("pipewiresrc", "huddle-screen-source")?;
-                source.set_property("fd", remote_fd.as_raw_fd());
+                let pipewire_fd = super::prepare_pipewire_source_fd(&remote_fd)?;
+                source.set_property("fd", pipewire_fd);
                 source.set_property("target-object", node_id.to_string());
                 let queue = make("queue", "huddle-screen-source-queue")?;
                 let convert = make("videoconvert", "huddle-screen-convert")?;
@@ -2190,5 +2198,30 @@ mod tests {
             .unwrap();
         assert!(!engine.camera_capture_active());
         engine.stop().unwrap();
+    }
+
+    #[test]
+    fn screen_share_fd_is_duplicated_to_prevent_double_close() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let (remote, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let remote_fd: OwnedFd = remote.into();
+        let original_raw_fd = remote_fd.as_raw_fd();
+
+        let pipewire_raw_fd = prepare_pipewire_source_fd(&remote_fd).unwrap();
+
+        // The dup'd descriptor must be distinct from the engine's OwnedFd
+        assert_ne!(pipewire_raw_fd, original_raw_fd);
+
+        // Simulate PipeWire closing its descriptor on stream teardown
+        let pipewire_owned = unsafe { OwnedFd::from_raw_fd(pipewire_raw_fd) };
+        drop(pipewire_owned);
+
+        // The original remote_fd must remain valid and open
+        let check_clone = remote_fd.try_clone();
+        assert!(
+            check_clone.is_ok(),
+            "remote_fd must remain valid and open after pipewire fd is closed"
+        );
     }
 }
