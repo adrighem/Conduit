@@ -428,7 +428,11 @@ impl WorkspaceSessionState {
                     }
                 }
                 WorkspaceChange::ThreadCatalogChanged(records) => {
-                    *threads = ThreadCatalog::from_records(records.clone());
+                    if records.is_empty() {
+                        *threads = ThreadCatalog::default();
+                    } else {
+                        threads.upsert_records(records.iter().cloned());
+                    }
                     application.thread_catalog_changed = true;
                 }
                 WorkspaceChange::UsersReset(updated) => {

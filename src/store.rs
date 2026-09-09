@@ -1864,7 +1864,8 @@ impl WorkspaceStore {
                 let records =
                     load_sqlite_kind_values(&transaction, &workspace_key, "thread_record")?;
                 let mut catalog = ThreadCatalog::from_records(records);
-                let cleared_reply_ts = catalog.mark_read(&channel_id, &root_ts, &last_read);
+                let (cleared_reply_ts, _) =
+                    catalog.mark_read(&channel_id, &root_ts, &last_read);
                 let records = catalog.into_records();
                 changed |= sync_sqlite_kind(
                     &transaction,
@@ -2693,6 +2694,9 @@ fn apply_store_change(
         StoreChange::ThreadCatalogReplaced(records) => {
             sync_thread_records(transaction, workspace_key, records)
         }
+        StoreChange::ThreadRecordsUpserted(records) => {
+            upsert_thread_records(transaction, workspace_key, records)
+        }
     }
 }
 
@@ -3399,6 +3403,31 @@ fn sync_thread_records(
         })
         .collect::<Result<Vec<_>>>()?;
     sync_sqlite_kind(transaction, workspace_key, "thread_record", records)
+}
+
+fn upsert_thread_records(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    records: Vec<ThreadRecord>,
+) -> Result<bool> {
+    if records.is_empty() {
+        return Ok(false);
+    }
+    let mut changed = false;
+    for record in records {
+        require_store_key("thread channel", &record.key.channel_id)?;
+        require_store_key("thread timestamp", &record.key.root_ts)?;
+        let item_key = thread_key(&record.key.channel_id, &record.key.root_ts);
+        let payload =
+            serde_json::to_string(&record).context("failed to serialize cached thread record")?;
+        changed |= transaction.execute(
+            "INSERT INTO workspace_items(workspace_key, kind, item_key, payload_json)
+             VALUES (?1, 'thread_record', ?2, ?3)
+             ON CONFLICT(workspace_key, kind, item_key) DO UPDATE SET payload_json = excluded.payload_json",
+            params![workspace_key, item_key, payload],
+        )? > 0;
+    }
+    Ok(changed)
 }
 
 fn apply_store_attention_observations(

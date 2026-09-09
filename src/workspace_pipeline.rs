@@ -346,6 +346,7 @@ pub(crate) enum StoreChange {
         messages: Vec<SlackMessage>,
     },
     ThreadCatalogReplaced(Vec<ThreadRecord>),
+    ThreadRecordsUpserted(Vec<ThreadRecord>),
 }
 
 #[derive(Debug, Clone)]
@@ -483,7 +484,7 @@ pub(crate) struct WorkspaceCoordinator {
     threads: HashMap<(String, String), TimelineState>,
     message_authority_by_ts: HashMap<(String, String), MessageProjectionAuthority>,
     message_authority_by_client_id: HashMap<(String, String), MessageProjectionAuthority>,
-    thread_catalog: Vec<ThreadRecord>,
+    thread_catalog: ThreadCatalog,
     attention_context: WorkspaceAttentionContext,
     attention_preferences: AttentionPreferences,
     attention_policy: AttentionPolicy,
@@ -717,7 +718,7 @@ impl WorkspaceCoordinator {
                 .histories
                 .iter()
                 .all(|(channel_id, messages)| self.history(channel_id) == *messages)
-            && self.thread_catalog == data.threads;
+            && self.thread_catalog.to_records() == data.threads;
         if unchanged && repaired_conversations.is_empty() {
             return None;
         }
@@ -767,7 +768,7 @@ impl WorkspaceCoordinator {
             .collect();
         self.message_authority_by_ts.clear();
         self.message_authority_by_client_id.clear();
-        self.thread_catalog = data.threads.clone();
+        self.thread_catalog = ThreadCatalog::from_records(data.threads.clone());
         let store_changes = if origin == MutationOrigin::Cache {
             repaired_conversations
                 .into_iter()
@@ -991,7 +992,7 @@ impl WorkspaceCoordinator {
         let revision = self.next_revision();
         let mut patch_changes = Vec::new();
         let mut store_changes = Vec::new();
-        let thread_catalog = ThreadCatalog::from_records(self.thread_catalog.clone());
+        let thread_catalog = &self.thread_catalog;
 
         for refresh in refreshes {
             let base_revision = refresh.base_revision();
@@ -1028,7 +1029,7 @@ impl WorkspaceCoordinator {
                 {
                     let before = entry.value.clone();
                     let preserved_thread_attention = thread_attention_message_ts_to_preserve(
-                        &thread_catalog,
+                        thread_catalog,
                         &entry.value,
                         &channel_id,
                     );
@@ -1085,13 +1086,13 @@ impl WorkspaceCoordinator {
         {
             return None;
         }
-        let thread_catalog = ThreadCatalog::from_records(self.thread_catalog.clone());
+        let thread_catalog = &self.thread_catalog;
         let preserved_thread_attention = self
             .conversations
             .get(&snapshot.channel_id)
             .map(|entry| {
                 thread_attention_message_ts_to_preserve(
-                    &thread_catalog,
+                    thread_catalog,
                     &entry.value,
                     &snapshot.channel_id,
                 )
@@ -1496,18 +1497,20 @@ impl WorkspaceCoordinator {
         let messages = timeline.messages();
         let store_change = (timeline_changed && origin != MutationOrigin::Cache)
             .then(|| store_timeline_replacement(&target, messages));
-        let catalog_records = match &target {
-            TimelineTarget::Channel(channel_id) => self.update_thread_catalog(|catalog| {
-                catalog.observe_history(channel_id, &catalog_messages);
-            }),
+        let catalog_delta = match &target {
+            TimelineTarget::Channel(channel_id) => {
+                self.thread_catalog.observe_history(channel_id, &catalog_messages)
+            }
             TimelineTarget::Thread {
                 channel_id,
                 thread_ts,
-            } => self.update_thread_catalog(|catalog| {
-                catalog.observe_thread(channel_id, thread_ts, &catalog_messages, page_complete);
-            }),
+            } => self
+                .thread_catalog
+                .observe_thread(channel_id, thread_ts, &catalog_messages, page_complete)
+                .map(|record| vec![record])
+                .unwrap_or_default(),
         };
-        if !timeline_changed && catalog_records.is_none() {
+        if !timeline_changed && catalog_delta.is_empty() {
             return None;
         }
         let reconciled_message_ts =
@@ -1537,7 +1540,7 @@ impl WorkspaceCoordinator {
             TimelineTarget::Channel(channel_id) => channel_id.clone(),
             TimelineTarget::Thread { channel_id, .. } => channel_id.clone(),
         };
-        let thread_catalog = ThreadCatalog::from_records(self.thread_catalog.clone());
+        let thread_catalog = &self.thread_catalog;
         let mut attention_observations = Vec::new();
         if let Some(entry) = self.conversations.get_mut(&attention_channel_id) {
             for effect in attention_effects.iter().filter(|effect| {
@@ -1582,10 +1585,10 @@ impl WorkspaceCoordinator {
             .into_iter()
             .collect::<Vec<_>>();
         let mut store_changes = store_change.into_iter().collect::<Vec<_>>();
-        if let Some(records) = catalog_records {
-            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(records.clone()));
+        if !catalog_delta.is_empty() {
+            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(catalog_delta.clone()));
             if origin != MutationOrigin::Cache {
-                store_changes.push(StoreChange::ThreadCatalogReplaced(records));
+                store_changes.push(StoreChange::ThreadRecordsUpserted(catalog_delta));
             }
         }
         if !attention_observations.is_empty() {
@@ -1675,8 +1678,7 @@ impl WorkspaceCoordinator {
             .and_then(|timeline| timeline.identity_message(&message));
         let previous_catalog_root_message = self
             .thread_catalog
-            .iter()
-            .find(|record| record.key.channel_id == channel_id && record.key.root_ts == message.ts)
+            .get(channel_id, &message.ts)
             .and_then(|record| record.root.clone());
         if kind == MessageMutationKind::Changed && message.thread_root_ts().is_none() {
             preserve_missing_root_aggregates(
@@ -1718,8 +1720,8 @@ impl WorkspaceCoordinator {
             || message.reply_users.is_some();
         let catalog_own_thread_root = self
             .thread_catalog
-            .iter()
-            .any(|record| record.key.channel_id == channel_id && record.key.root_ts == message.ts);
+            .get(channel_id, &message.ts)
+            .is_some();
         if let Some(thread_ts) = message.thread_root_ts() {
             targets.push(TimelineTarget::Thread {
                 channel_id: channel_id.to_string(),
@@ -1931,7 +1933,7 @@ impl WorkspaceCoordinator {
                             })
                         },
                         |root_ts| {
-                            ThreadCatalog::from_records(self.thread_catalog.clone())
+                            self.thread_catalog
                                 .reply_is_acknowledged(channel_id, root_ts, &effect.message.ts)
                         },
                     );
@@ -1961,18 +1963,20 @@ impl WorkspaceCoordinator {
             }
         }
         let current_user_id = self.attention_context.current_user_id.clone();
-        let catalog_records = match kind {
-            MessageMutationKind::Posted => self.update_thread_catalog(|catalog| {
-                catalog.observe_realtime(channel_id, &message, current_user_id.as_deref());
-            }),
-            MessageMutationKind::Changed => self.update_thread_catalog(|catalog| {
-                catalog.observe_history(channel_id, std::slice::from_ref(&message));
-            }),
-            MessageMutationKind::Deleted => None,
+        let catalog_delta = match kind {
+            MessageMutationKind::Posted => self
+                .thread_catalog
+                .observe_realtime(channel_id, &message, current_user_id.as_deref())
+                .map(|record| vec![record])
+                .unwrap_or_default(),
+            MessageMutationKind::Changed => {
+                self.thread_catalog.observe_history(channel_id, std::slice::from_ref(&message))
+            }
+            MessageMutationKind::Deleted => Vec::new(),
         };
-        if let Some(records) = catalog_records {
-            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(records.clone()));
-            store_changes.push(StoreChange::ThreadCatalogReplaced(records));
+        if !catalog_delta.is_empty() {
+            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(catalog_delta.clone()));
+            store_changes.push(StoreChange::ThreadRecordsUpserted(catalog_delta));
         }
         if patch_changes.is_empty() {
             return None;
@@ -1997,7 +2001,7 @@ impl WorkspaceCoordinator {
                     .is_some_and(|last_read| !slack_timestamp_is_after(&message.ts, last_read))
             },
             |root_ts| {
-                ThreadCatalog::from_records(self.thread_catalog.clone()).reply_is_acknowledged(
+                self.thread_catalog.reply_is_acknowledged(
                     channel_id,
                     root_ts,
                     &message.ts,
@@ -2100,9 +2104,7 @@ impl WorkspaceCoordinator {
             return HashSet::new();
         }
         if let TimelineTarget::Thread { thread_ts, .. } = target {
-            let Some(record) = self.thread_catalog.iter().find(|record| {
-                record.key.channel_id == *channel_id && record.key.root_ts == *thread_ts
-            }) else {
+            let Some(record) = self.thread_catalog.get(channel_id, thread_ts) else {
                 return HashSet::new();
             };
             let ThreadUnreadState::Known { count, last_read } = &record.unread else {
@@ -2148,10 +2150,7 @@ impl WorkspaceCoordinator {
             .get(channel_id)
             .and_then(|timeline| timeline.messages.get(root_ts))
             .map(|entry| &entry.value);
-        let record = self
-            .thread_catalog
-            .iter()
-            .find(|record| record.key.channel_id == channel_id && record.key.root_ts == root_ts);
+        let record = self.thread_catalog.get(channel_id, root_ts);
         let persisted_root = record.and_then(|record| record.root.as_ref());
         if [root, persisted_root]
             .into_iter()
@@ -2364,30 +2363,16 @@ impl WorkspaceCoordinator {
                 .cmp(&right.key.channel_id)
                 .then_with(|| left.key.root_ts.cmp(&right.key.root_ts))
         });
-        if self.thread_catalog == records {
+        if self.thread_catalog.to_records() == records {
             return None;
         }
         let revision = self.next_revision();
-        self.thread_catalog = records.clone();
+        self.thread_catalog = ThreadCatalog::from_records(records.clone());
         self.commit(
             revision,
             vec![WorkspaceChange::ThreadCatalogChanged(records.clone())],
             vec![StoreChange::ThreadCatalogReplaced(records)],
         )
-    }
-
-    fn update_thread_catalog(
-        &mut self,
-        update: impl FnOnce(&mut ThreadCatalog),
-    ) -> Option<Vec<ThreadRecord>> {
-        let mut catalog = ThreadCatalog::from_records(self.thread_catalog.clone());
-        update(&mut catalog);
-        let records = catalog.into_records();
-        if records == self.thread_catalog {
-            return None;
-        }
-        self.thread_catalog.clone_from(&records);
-        Some(records)
     }
 
     fn apply_thread_read(
@@ -2402,10 +2387,9 @@ impl WorkspaceCoordinator {
         {
             return None;
         }
-        let mut catalog = ThreadCatalog::from_records(self.thread_catalog.clone());
-        let cleared_reply_ts = catalog.mark_read(channel_id, thread_ts, last_read);
-        let records = catalog.into_records();
-        let catalog_changed = records != self.thread_catalog;
+        let (cleared_reply_ts, updated_record) =
+            self.thread_catalog.mark_read(channel_id, thread_ts, last_read);
+        let catalog_changed = updated_record.is_some();
         let mut updated_conversation = self
             .conversations
             .get(channel_id)
@@ -2420,10 +2404,9 @@ impl WorkspaceCoordinator {
         let revision = self.next_revision();
         let mut patch_changes = Vec::new();
         let mut store_changes = Vec::new();
-        if catalog_changed {
-            self.thread_catalog.clone_from(&records);
-            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(records.clone()));
-            store_changes.push(StoreChange::ThreadCatalogReplaced(records));
+        if let Some(record) = updated_record {
+            patch_changes.push(WorkspaceChange::ThreadCatalogChanged(vec![record.clone()]));
+            store_changes.push(StoreChange::ThreadRecordsUpserted(vec![record]));
         }
         if attention_changed {
             let entry = self.conversations.get_mut(channel_id).unwrap();
@@ -2826,7 +2809,7 @@ impl Default for WorkspaceCoordinator {
             threads: HashMap::new(),
             message_authority_by_ts: HashMap::new(),
             message_authority_by_client_id: HashMap::new(),
-            thread_catalog: Vec::new(),
+            thread_catalog: ThreadCatalog::default(),
             attention_context: WorkspaceAttentionContext::default(),
             attention_preferences: AttentionPreferences::default(),
             attention_policy: AttentionPolicy::default(),
@@ -3987,7 +3970,7 @@ mod tests {
         assert!(matches!(
             reduction.store_batch().unwrap().changes(),
             [
-                StoreChange::ThreadCatalogReplaced(_),
+                StoreChange::ThreadRecordsUpserted(_),
                 StoreChange::ConversationUpsert(_),
             ]
         ));
@@ -5321,7 +5304,7 @@ mod tests {
         )));
         assert!(store_changes
             .iter()
-            .any(|change| matches!(change, StoreChange::ThreadCatalogReplaced(_))));
+            .any(|change| matches!(change, StoreChange::ThreadRecordsUpserted(_))));
     }
 
     #[test]
@@ -5371,7 +5354,7 @@ mod tests {
             .unwrap()
             .changes()
             .iter()
-            .any(|change| matches!(change, StoreChange::ThreadCatalogReplaced(_))));
+            .any(|change| matches!(change, StoreChange::ThreadRecordsUpserted(_))));
         let patch_changes = reduction.patch().changes();
         assert!(matches!(
             &patch_changes[..2],

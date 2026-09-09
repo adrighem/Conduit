@@ -95,7 +95,7 @@ impl ThreadRecord {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ThreadCatalog {
     records: HashMap<ThreadKey, ThreadRecord>,
 }
@@ -120,6 +120,23 @@ impl ThreadCatalog {
                 .then_with(|| left.key.root_ts.cmp(&right.key.root_ts))
         });
         records
+    }
+
+    pub(crate) fn to_records(&self) -> Vec<ThreadRecord> {
+        let mut records = self.records.values().cloned().collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.key
+                .channel_id
+                .cmp(&right.key.channel_id)
+                .then_with(|| left.key.root_ts.cmp(&right.key.root_ts))
+        });
+        records
+    }
+
+    pub(crate) fn upsert_records(&mut self, records: impl IntoIterator<Item = ThreadRecord>) {
+        for record in records {
+            self.records.insert(record.key.clone(), record);
+        }
     }
 
     pub(crate) fn get(&self, channel_id: &str, root_ts: &str) -> Option<&ThreadRecord> {
@@ -215,10 +232,23 @@ impl ThreadCatalog {
     }
 
     /// Additively discovers roots and orphan replies in any history page.
-    pub(crate) fn observe_history(&mut self, channel_id: &str, messages: &[SlackMessage]) {
+    pub(crate) fn observe_history(
+        &mut self,
+        channel_id: &str,
+        messages: &[SlackMessage],
+    ) -> Vec<ThreadRecord> {
+        let mut changed_keys = HashSet::new();
         for message in messages {
-            self.observe_message(channel_id, message, false);
+            if let Some((key, changed)) = self.observe_message(channel_id, message, false) {
+                if changed {
+                    changed_keys.insert(key);
+                }
+            }
         }
+        changed_keys
+            .into_iter()
+            .filter_map(|key| self.records.get(&key).cloned())
+            .collect()
     }
 
     /// Applies replies from `conversations.replies`. `complete` means every
@@ -230,10 +260,9 @@ impl ThreadCatalog {
         root_ts: &str,
         messages: &[SlackMessage],
         complete: bool,
-    ) {
-        let Some(key) = ThreadKey::new(channel_id, root_ts) else {
-            return;
-        };
+    ) -> Option<ThreadRecord> {
+        let key = ThreadKey::new(channel_id, root_ts)?;
+        let previous = self.records.get(&key).cloned();
         self.records
             .entry(key.clone())
             .or_insert_with(|| ThreadRecord::placeholder(key.clone()));
@@ -241,9 +270,7 @@ impl ThreadCatalog {
             self.observe_message(channel_id, message, true);
         }
 
-        let Some(record) = self.records.get_mut(&key) else {
-            return;
-        };
+        let record = self.records.get_mut(&key)?;
         if complete {
             record.reply_count = record.reply_count.max(record.seen_reply_ts.len() as u64);
             let last_read = record
@@ -272,6 +299,11 @@ impl ThreadCatalog {
                     .collect();
             }
         }
+        if previous.as_ref() != self.records.get(&key) {
+            self.records.get(&key).cloned()
+        } else {
+            None
+        }
     }
 
     /// Applies a realtime message and increments known subscribed unread state
@@ -281,13 +313,15 @@ impl ThreadCatalog {
         channel_id: &str,
         message: &SlackMessage,
         current_user_id: Option<&str>,
-    ) {
+    ) -> Option<ThreadRecord> {
         let Some(root_ts) = reply_root_ts(message) else {
-            self.observe_message(channel_id, message, false);
-            return;
+            let (key, changed) = self.observe_message(channel_id, message, false)?;
+            return changed.then(|| self.records.get(&key).cloned()).flatten();
         };
-        let (duplicate, previous_reply_count) = self
-            .get(channel_id, root_ts)
+        let key = ThreadKey::new(channel_id, root_ts)?;
+        let previous = self.records.get(&key).cloned();
+        let (duplicate, previous_reply_count) = previous
+            .as_ref()
             .map(|record| {
                 (
                     record.seen_reply_ts.contains(&message.ts)
@@ -301,14 +335,13 @@ impl ThreadCatalog {
             .unwrap_or((false, 0));
         self.observe_message(channel_id, message, true);
         if duplicate || message.user.as_deref() == current_user_id {
-            return;
+            return if previous.as_ref() != self.records.get(&key) {
+                self.records.get(&key).cloned()
+            } else {
+                None
+            };
         }
-        let Some(key) = ThreadKey::new(channel_id, root_ts) else {
-            return;
-        };
-        let Some(record) = self.records.get_mut(&key) else {
-            return;
-        };
+        let record = self.records.get_mut(&key)?;
         record.reply_count = record
             .reply_count
             .max(previous_reply_count.saturating_add(1));
@@ -318,6 +351,11 @@ impl ThreadCatalog {
                 record.unread_reply_ts.insert(message.ts.clone());
             }
         }
+        if previous.as_ref() != self.records.get(&key) {
+            self.records.get(&key).cloned()
+        } else {
+            None
+        }
     }
 
     #[allow(dead_code)]
@@ -326,13 +364,14 @@ impl ThreadCatalog {
         channel_id: &str,
         root_ts: &str,
         last_read: &str,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Option<ThreadRecord>) {
         if last_read.trim().is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let Some(key) = ThreadKey::new(channel_id, root_ts) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
+        let previous = self.records.get(&key).cloned();
         if let Some(record) = self.records.get_mut(&key) {
             let effective_last_read = record
                 .read_cursor()
@@ -378,12 +417,22 @@ impl ThreadCatalog {
                     root.unread_count = Some(*count);
                 }
             }
-            return cleared_reply_ts;
+            let updated = if previous.as_ref() != self.records.get(&key) {
+                self.records.get(&key).cloned()
+            } else {
+                None
+            };
+            return (cleared_reply_ts, updated);
         }
-        Vec::new()
+        (Vec::new(), None)
     }
 
-    fn observe_message(&mut self, channel_id: &str, message: &SlackMessage, thread_response: bool) {
+    fn observe_message(
+        &mut self,
+        channel_id: &str,
+        message: &SlackMessage,
+        thread_response: bool,
+    ) -> Option<(ThreadKey, bool)> {
         let root_ts = if thread_response {
             message
                 .thread_ts
@@ -395,15 +444,14 @@ impl ThreadCatalog {
         } else if message.has_thread() {
             message.ts.as_str()
         } else {
-            return;
+            return None;
         };
-        let Some(key) = ThreadKey::new(channel_id, root_ts) else {
-            return;
-        };
+        let key = ThreadKey::new(channel_id, root_ts)?;
+        let previous = self.records.get(&key).cloned();
         let record = self
             .records
             .entry(key.clone())
-            .or_insert_with(|| ThreadRecord::placeholder(key));
+            .or_insert_with(|| ThreadRecord::placeholder(key.clone()));
         if message.ts == root_ts {
             merge_root_metadata(record, message);
         } else {
@@ -425,6 +473,8 @@ impl ThreadCatalog {
                 record.latest_reply = Some(message.ts.clone());
             }
         }
+        let changed = previous.as_ref() != self.records.get(&key);
+        Some((key, changed))
     }
 }
 
@@ -678,7 +728,7 @@ mod tests {
         catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"));
 
         assert_eq!(
-            catalog.mark_read("C1", "1.0", "3.0"),
+            catalog.mark_read("C1", "1.0", "3.0").0,
             vec!["2.0".to_string(), "3.0".to_string()]
         );
     }
@@ -696,7 +746,7 @@ mod tests {
         );
 
         assert_eq!(
-            catalog.mark_read("C1", "1.0", "3.0"),
+            catalog.mark_read("C1", "1.0", "3.0").0,
             vec!["2.0".to_string(), "3.0".to_string()]
         );
     }
@@ -711,11 +761,11 @@ mod tests {
         catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
 
         assert_eq!(
-            catalog.mark_read("C1", "1.0", "2.0"),
+            catalog.mark_read("C1", "1.0", "2.0").0,
             vec!["2.0".to_string()]
         );
         assert_eq!(
-            catalog.mark_read("C1", "1.0", "2.0"),
+            catalog.mark_read("C1", "1.0", "2.0").0,
             vec!["2.0".to_string()]
         );
         assert_eq!(
@@ -774,7 +824,7 @@ mod tests {
         catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"));
 
         assert_eq!(
-            catalog.mark_read("C1", "1.0", "2.0"),
+            catalog.mark_read("C1", "1.0", "2.0").0,
             vec!["2.0".to_string()]
         );
         assert_eq!(
