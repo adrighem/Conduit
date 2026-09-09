@@ -11712,7 +11712,7 @@ mod tests {
             assert!(matches!(
                 reductions[1].store_batch().unwrap().changes(),
                 [
-                    StoreChange::HistoryReplaced { .. },
+                    StoreChange::HistoryDelta { .. },
                     StoreChange::ConversationAttentionObserved { .. },
                 ]
             ));
@@ -11914,7 +11914,7 @@ mod tests {
             assert!(matches!(
                 reductions[0].store_batch().unwrap().changes(),
                 [
-                    StoreChange::HistoryReplaced { .. },
+                    StoreChange::HistoryDelta { .. },
                     StoreChange::ConversationAttentionObserved { .. },
                 ]
             ));

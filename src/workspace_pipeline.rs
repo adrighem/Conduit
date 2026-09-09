@@ -1514,9 +1514,9 @@ impl WorkspaceCoordinator {
             None
         };
         let catalog_delta = match &target {
-            TimelineTarget::Channel(channel_id) => {
-                self.thread_catalog.observe_history(channel_id, &catalog_messages)
-            }
+            TimelineTarget::Channel(channel_id) => self
+                .thread_catalog
+                .observe_history(channel_id, &catalog_messages),
             TimelineTarget::Thread {
                 channel_id,
                 thread_ts,
@@ -1734,10 +1734,7 @@ impl WorkspaceCoordinator {
         let has_thread_root_aggregate = message.reply_count.is_some()
             || message.latest_reply.is_some()
             || message.reply_users.is_some();
-        let catalog_own_thread_root = self
-            .thread_catalog
-            .get(channel_id, &message.ts)
-            .is_some();
+        let catalog_own_thread_root = self.thread_catalog.get(channel_id, &message.ts).is_some();
         if let Some(thread_ts) = message.thread_root_ts() {
             targets.push(TimelineTarget::Thread {
                 channel_id: channel_id.to_string(),
@@ -1949,8 +1946,11 @@ impl WorkspaceCoordinator {
                             })
                         },
                         |root_ts| {
-                            self.thread_catalog
-                                .reply_is_acknowledged(channel_id, root_ts, &effect.message.ts)
+                            self.thread_catalog.reply_is_acknowledged(
+                                channel_id,
+                                root_ts,
+                                &effect.message.ts,
+                            )
                         },
                     );
                     if let Some(entry) = self.conversations.get_mut(channel_id) {
@@ -1985,9 +1985,9 @@ impl WorkspaceCoordinator {
                 .observe_realtime(channel_id, &message, current_user_id.as_deref())
                 .map(|record| vec![record])
                 .unwrap_or_default(),
-            MessageMutationKind::Changed => {
-                self.thread_catalog.observe_history(channel_id, std::slice::from_ref(&message))
-            }
+            MessageMutationKind::Changed => self
+                .thread_catalog
+                .observe_history(channel_id, std::slice::from_ref(&message)),
             MessageMutationKind::Deleted => Vec::new(),
         };
         if !catalog_delta.is_empty() {
@@ -2017,11 +2017,8 @@ impl WorkspaceCoordinator {
                     .is_some_and(|last_read| !slack_timestamp_is_after(&message.ts, last_read))
             },
             |root_ts| {
-                self.thread_catalog.reply_is_acknowledged(
-                    channel_id,
-                    root_ts,
-                    &message.ts,
-                )
+                self.thread_catalog
+                    .reply_is_acknowledged(channel_id, root_ts, &message.ts)
             },
         );
         if origin == MutationOrigin::Realtime && already_read {
@@ -2403,8 +2400,9 @@ impl WorkspaceCoordinator {
         {
             return None;
         }
-        let (cleared_reply_ts, updated_record) =
-            self.thread_catalog.mark_read(channel_id, thread_ts, last_read);
+        let (cleared_reply_ts, updated_record) = self
+            .thread_catalog
+            .mark_read(channel_id, thread_ts, last_read);
         let catalog_changed = updated_record.is_some();
         let mut updated_conversation = self
             .conversations

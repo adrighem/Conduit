@@ -1864,8 +1864,7 @@ impl WorkspaceStore {
                 let records =
                     load_sqlite_kind_values(&transaction, &workspace_key, "thread_record")?;
                 let mut catalog = ThreadCatalog::from_records(records);
-                let (cleared_reply_ts, _) =
-                    catalog.mark_read(&channel_id, &root_ts, &last_read);
+                let (cleared_reply_ts, _) = catalog.mark_read(&channel_id, &root_ts, &last_read);
                 let records = catalog.into_records();
                 changed |= sync_sqlite_kind(
                     &transaction,
