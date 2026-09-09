@@ -258,7 +258,7 @@ impl ThreadCatalog {
                 let count = record
                     .seen_reply_ts
                     .iter()
-                    .filter(|reply_ts| reply_ts.as_str() > last_read.as_str())
+                    .filter(|reply_ts| slack_timestamp_is_after(reply_ts, &last_read))
                     .count() as u64;
                 record.unread = ThreadUnreadState::Known {
                     count,
@@ -267,7 +267,7 @@ impl ThreadCatalog {
                 record.unread_reply_ts = record
                     .seen_reply_ts
                     .iter()
-                    .filter(|reply_ts| reply_ts.as_str() > last_read.as_str())
+                    .filter(|reply_ts| slack_timestamp_is_after(reply_ts, &last_read))
                     .cloned()
                     .collect();
             }
@@ -292,10 +292,9 @@ impl ThreadCatalog {
                 (
                     record.seen_reply_ts.contains(&message.ts)
                         || (record.seen_reply_ts.is_empty()
-                            && record
-                                .latest_reply
-                                .as_deref()
-                                .is_some_and(|latest| message.ts.as_str() <= latest)),
+                            && record.latest_reply.as_deref().is_some_and(|latest| {
+                                !slack_timestamp_is_after(&message.ts, latest)
+                            })),
                     record.reply_count,
                 )
             })
@@ -418,7 +417,11 @@ impl ThreadCatalog {
             }
             record.seen_reply_ts.insert(message.ts.clone());
             record.reply_count = record.reply_count.max(record.seen_reply_ts.len() as u64);
-            if record.latest_reply.as_deref() < Some(message.ts.as_str()) {
+            if record
+                .latest_reply
+                .as_deref()
+                .is_none_or(|latest| slack_timestamp_is_after(&message.ts, latest))
+            {
                 record.latest_reply = Some(message.ts.clone());
             }
         }
@@ -434,7 +437,13 @@ fn reply_root_ts(message: &SlackMessage) -> Option<&str> {
 
 fn merge_root_metadata(record: &mut ThreadRecord, root: &SlackMessage) {
     record.reply_count = record.reply_count.max(root.reply_count.unwrap_or_default());
-    if record.latest_reply.as_deref() < root.latest_reply.as_deref() {
+    let incoming_latest_is_newer =
+        match (record.latest_reply.as_deref(), root.latest_reply.as_deref()) {
+            (None, Some(_)) => true,
+            (Some(current), Some(incoming)) => slack_timestamp_is_after(incoming, current),
+            _ => false,
+        };
+    if incoming_latest_is_newer {
         record.latest_reply = root.latest_reply.clone();
     }
     if root.subscribed.is_some() {
@@ -466,7 +475,7 @@ fn merge_root_metadata(record: &mut ThreadRecord, root: &SlackMessage) {
                 record.unread_reply_ts = record
                     .seen_reply_ts
                     .iter()
-                    .filter(|reply_ts| reply_ts.as_str() > last_read)
+                    .filter(|reply_ts| slack_timestamp_is_after(reply_ts, last_read))
                     .cloned()
                     .collect();
             } else if unread_count == 0 {
@@ -861,5 +870,98 @@ mod tests {
         assert_eq!(projection[0].1.reply_count, Some(3));
         assert_eq!(projection[0].1.unread_count, Some(2));
         assert_eq!(projection[0].1.latest_reply.as_deref(), Some("4.0"));
+    }
+
+    #[test]
+    fn canonical_timestamp_comparison_unread_reply_logic() {
+        let mut catalog = ThreadCatalog::default();
+        let mut root_msg = root("1.0", 2);
+        root_msg.last_read = Some("9.999999".into());
+        catalog.observe_thread(
+            "C1",
+            "1.0",
+            &[root_msg, reply("10.000000", "1.0", "U2")],
+            true,
+        );
+        assert_eq!(
+            catalog.get("C1", "1.0").unwrap().unread,
+            ThreadUnreadState::Known {
+                count: 1,
+                last_read: Some("9.999999".into())
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_timestamp_comparison_realtime_duplicate() {
+        let mut catalog = ThreadCatalog::default();
+        let mut root_msg = root("1.0", 1);
+        root_msg.subscribed = Some(true);
+        root_msg.unread_count = Some(0);
+        root_msg.latest_reply = Some("10.000000".into());
+        catalog.observe_thread("C1", "1.0", &[root_msg], false);
+
+        catalog.observe_realtime("C1", &reply("9.999999", "1.0", "U2"), Some("ME"));
+        assert_eq!(
+            catalog.get("C1", "1.0").unwrap().unread,
+            ThreadUnreadState::Known {
+                count: 0,
+                last_read: None
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_timestamp_comparison_observe_message_latest() {
+        let mut catalog = ThreadCatalog::default();
+        let mut root_msg = root("1.0", 1);
+        root_msg.latest_reply = Some("10.000000".into());
+        catalog.observe_thread("C1", "1.0", &[root_msg], false);
+
+        catalog.observe_message("C1", &reply("9.999999", "1.0", "U2"), true);
+
+        assert_eq!(
+            catalog.get("C1", "1.0").unwrap().latest_reply.as_deref(),
+            Some("10.000000")
+        );
+    }
+
+    #[test]
+    fn canonical_timestamp_comparison_merge_root_metadata_latest() {
+        let mut catalog = ThreadCatalog::default();
+        let mut root_msg = root("1.0", 1);
+        root_msg.latest_reply = Some("10.000000".into());
+        catalog.observe_thread("C1", "1.0", &[root_msg], false);
+
+        let mut root_msg_new = root("1.0", 1);
+        root_msg_new.latest_reply = Some("9.999999".into());
+        catalog.observe_thread("C1", "1.0", &[root_msg_new], false);
+
+        assert_eq!(
+            catalog.get("C1", "1.0").unwrap().latest_reply.as_deref(),
+            Some("10.000000")
+        );
+    }
+
+    #[test]
+    fn canonical_timestamp_comparison_merge_root_metadata_unread_reply_ts() {
+        let mut catalog = ThreadCatalog::default();
+        catalog.observe_thread(
+            "C1",
+            "1.0",
+            &[root("1.0", 1), reply("10.000000", "1.0", "U2")],
+            true,
+        );
+
+        let mut root_msg = root("1.0", 1);
+        root_msg.unread_count = Some(1);
+        root_msg.last_read = Some("9.999999".into());
+        catalog.observe_thread("C1", "1.0", &[root_msg], false);
+
+        let record = catalog.get("C1", "1.0").unwrap();
+        assert!(
+            record.unread_reply_ts.contains("10.000000"),
+            "unread_reply_ts should contain '10.000000'"
+        );
     }
 }
