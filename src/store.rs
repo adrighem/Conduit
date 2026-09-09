@@ -63,6 +63,12 @@ pub(crate) enum StoreError {
     IncompatibleSchema { found: u32, supported: u32 },
     #[error("derived workspace cache is invalid: {message}")]
     InvalidDerivedCache { message: String },
+    #[error("corrupt workspace item kind='{kind}' item_key='{item_key}': {message}")]
+    CorruptItem {
+        kind: String,
+        item_key: String,
+        message: String,
+    },
     #[error("workspace store hub is closed")]
     HubClosed,
     #[error(transparent)]
@@ -92,11 +98,24 @@ impl StoreError {
         }
     }
 
+    fn corrupt_item(
+        kind: impl Into<String>,
+        item_key: impl Into<String>,
+        message: impl std::fmt::Display,
+    ) -> Self {
+        Self::CorruptItem {
+            kind: kind.into(),
+            item_key: item_key.into(),
+            message: message.to_string(),
+        }
+    }
+
     pub(crate) fn category(&self) -> StoreErrorCategory {
         match self {
             Self::RejectedUpdate { .. } => StoreErrorCategory::RejectedUpdate,
             Self::IncompatibleSchema { .. } => StoreErrorCategory::IncompatibleSchema,
             Self::InvalidDerivedCache { .. } => StoreErrorCategory::CorruptData,
+            Self::CorruptItem { .. } => StoreErrorCategory::CorruptData,
             Self::HubClosed => StoreErrorCategory::TemporarilyUnavailable,
             Self::Database(error) => classify_database_error(error),
             Self::Io(_) => StoreErrorCategory::LocalIo,
@@ -761,6 +780,25 @@ impl WorkspaceStore {
     {
         let hub = self.hub().await?;
         match hub.query(query).await {
+            Err(StoreError::CorruptItem {
+                kind,
+                item_key,
+                message,
+            }) => {
+                crate::debug::log(
+                    "store",
+                    &format!("CorruptWorkspaceItemDiscarded kind={kind} key={item_key}: {message}"),
+                );
+                let workspace_key = self.workspace_key.clone();
+                let recovery_generation = Arc::clone(&self.recovery_generation);
+                hub.write(move |connection| {
+                    delete_sqlite_workspace_item(connection, &workspace_key, &kind, &item_key)?;
+                    recovery_generation.fetch_add(1, Ordering::Release);
+                    Ok(())
+                })
+                .await?;
+                Ok(empty)
+            }
             Err(error) if error.category() == StoreErrorCategory::CorruptData => {
                 let workspace_key = self.workspace_key.clone();
                 let store_batch_revision = Arc::clone(&self.store_batch_revision);
@@ -2340,11 +2378,9 @@ fn load_sqlite_kind_map<T: DeserializeOwned>(
     let mut values = HashMap::new();
     for row in rows {
         let (key, payload) = row?;
-        values.insert(
-            key,
-            serde_json::from_str(&payload)
-                .with_context(|| format!("invalid cached {kind} item"))?,
-        );
+        let value = serde_json::from_str(&payload)
+            .map_err(|error| StoreError::corrupt_item(kind, &key, error))?;
+        values.insert(key, value);
     }
     Ok(values)
 }
@@ -2376,8 +2412,7 @@ fn load_sqlite_item<T: DeserializeOwned>(
     payload
         .map(|payload| {
             serde_json::from_str(&payload)
-                .with_context(|| format!("invalid cached {kind} item"))
-                .map_err(StoreError::from)
+                .map_err(|error| StoreError::corrupt_item(kind, item_key, error))
         })
         .transpose()
 }
@@ -2399,10 +2434,9 @@ fn load_sqlite_conversation(
     let conversation = payload
         .map(|payload| {
             serde_json::from_str::<SlackConversation>(&payload)
-                .context("invalid cached conversation")
+                .map_err(|error| StoreError::corrupt_item("conversation", channel_id, error))
         })
-        .transpose()
-        .map_err(StoreError::from)?;
+        .transpose()?;
     Ok(conversation.filter(|conversation| conversation.id == channel_id))
 }
 
@@ -2471,26 +2505,26 @@ fn load_sqlite_search_state(
     for row in rows {
         let (kind, item_key, payload) = row?;
         match kind.as_str() {
-            "conversation" => state
-                .conversations
-                .push(serde_json::from_str(&payload).context("invalid cached conversation")?),
+            "conversation" => {
+                let item = serde_json::from_str(&payload)
+                    .map_err(|error| StoreError::corrupt_item("conversation", &item_key, error))?;
+                state.conversations.push(item);
+            }
             "user_name" => {
-                state.user_names.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached user name")?,
-                );
+                let item = serde_json::from_str(&payload)
+                    .map_err(|error| StoreError::corrupt_item("user_name", &item_key, error))?;
+                state.user_names.insert(item_key, item);
             }
             "user_full_name" => {
-                state.user_full_names.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached user full name")?,
-                );
+                let item = serde_json::from_str(&payload).map_err(|error| {
+                    StoreError::corrupt_item("user_full_name", &item_key, error)
+                })?;
+                state.user_full_names.insert(item_key, item);
             }
             "user_aliases" => {
-                state.user_search_aliases.insert(
-                    item_key,
-                    serde_json::from_str(&payload).context("invalid cached user aliases")?,
-                );
+                let item = serde_json::from_str(&payload)
+                    .map_err(|error| StoreError::corrupt_item("user_aliases", &item_key, error))?;
+                state.user_search_aliases.insert(item_key, item);
             }
             _ => unreachable!("search-state query returned an unexpected item kind"),
         }
@@ -2894,7 +2928,7 @@ fn load_sqlite_channel_threads(
         }
         let root_ts = root_ts.to_string();
         let messages = serde_json::from_str::<Vec<SlackMessage>>(&payload)
-            .context("invalid cached thread_replies item")?;
+            .map_err(|error| StoreError::corrupt_item("thread_replies", &item_key, error))?;
         let messages = pruned_history(normalize_cached_messages(messages));
         threads.push(StoredThreadTimeline {
             item_key,
@@ -3494,6 +3528,22 @@ fn reset_sqlite_workspace(connection: &mut Connection, workspace_key: &str) -> R
     transaction.execute(
         "DELETE FROM workspaces WHERE workspace_key = ?1",
         [workspace_key],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn delete_sqlite_workspace_item(
+    connection: &mut Connection,
+    workspace_key: &str,
+    kind: &str,
+    item_key: &str,
+) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "DELETE FROM workspace_items
+         WHERE workspace_key = ?1 AND kind = ?2 AND item_key = ?3",
+        params![workspace_key, kind, item_key],
     )?;
     transaction.commit()?;
     Ok(())
@@ -7160,6 +7210,146 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unrelated_payload, "{broken");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn corrupt_row_recovery_deletes_only_corrupt_row_preserving_workspace_and_other_items() {
+        let directory = temp_cache_dir("workspace-store-corrupt-row-recovery");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_history(
+                    "C1",
+                    &[SlackMessage {
+                        ts: "100.0".to_string(),
+                        text: Some("hello".to_string()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .expect("store history C1 failed");
+
+            store
+                .store_history(
+                    "C2",
+                    &[SlackMessage {
+                        ts: "200.0".to_string(),
+                        text: Some("world".to_string()),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .expect("store history C2 failed");
+
+            // Corrupt C2 row in workspace_items
+            let connection = Connection::open(store.database_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE workspace_items SET payload_json = '{invalid_json'
+                     WHERE workspace_key = ?1 AND kind = 'channel_history' AND item_key = 'C2'",
+                    [&store.workspace_key],
+                )
+                .unwrap();
+            drop(connection);
+
+            // Load C2: this should recover from the corrupt row by deleting only C2
+            let c2_history = store.load_history("C2").await.unwrap();
+            assert!(c2_history.is_none(), "C2 history should be discarded");
+
+            // C1 history must still exist! (Under old code, C1 was wiped by reset_sqlite_workspace)
+            let c1_history = store.load_history("C1").await.unwrap();
+            assert!(
+                c1_history.is_some(),
+                "C1 history must still exist and not be wiped by C2's corruption"
+            );
+            assert_eq!(c1_history.unwrap()[0].text.as_deref(), Some("hello"));
+
+            // Verify the C2 row was deleted from sqlite
+            let connection = Connection::open(store.database_path()).unwrap();
+            let c2_count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM workspace_items
+                     WHERE workspace_key = ?1 AND kind = 'channel_history' AND item_key = 'C2'",
+                    [&store.workspace_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(c2_count, 0, "corrupt C2 row should be deleted");
+
+            // Verify the workspace itself was not reset (still exists)
+            let ws_count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM workspaces WHERE workspace_key = ?1",
+                    [&store.workspace_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ws_count, 1, "workspace must not be deleted");
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn corrupt_conversation_row_recovery_preserves_other_conversations() {
+        let directory = temp_cache_dir("workspace-store-corrupt-conv-recovery");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            store
+                .store_conversations(&[
+                    SlackConversation {
+                        id: "C1".to_string(),
+                        name: Some("general".to_string()),
+                        ..Default::default()
+                    },
+                    SlackConversation {
+                        id: "C2".to_string(),
+                        name: Some("random".to_string()),
+                        ..Default::default()
+                    },
+                ])
+                .await
+                .expect("store conversations failed");
+
+            // Corrupt C2 row in workspace_items
+            let connection = Connection::open(store.database_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE workspace_items SET payload_json = '{invalid_json'
+                     WHERE workspace_key = ?1 AND kind = 'conversation' AND item_key = 'C2'",
+                    [&store.workspace_key],
+                )
+                .unwrap();
+            drop(connection);
+
+            // First load: C2 error triggers deleting C2
+            let conversations = store.load_conversations().await.unwrap();
+            assert!(conversations.is_none());
+
+            // Second load: C2 was deleted, so C1 is still present and loads cleanly
+            let conversations = store.load_conversations().await.unwrap();
+            assert!(conversations.is_some(), "C1 must still be cached");
+            let list = conversations.unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].id, "C1");
+
+            // Verify the workspace itself was not wiped
+            let connection = Connection::open(store.database_path()).unwrap();
+            let ws_count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM workspaces WHERE workspace_key = ?1",
+                    [&store.workspace_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ws_count, 1, "workspace must not be deleted");
+        });
 
         let _ = std::fs::remove_dir_all(directory);
     }
