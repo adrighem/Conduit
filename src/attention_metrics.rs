@@ -437,4 +437,107 @@ mod tests {
         assert_eq!(snapshot.queue_peak_depth, 0);
         assert_eq!(snapshot.queue_rejected, 1);
     }
+
+    #[test]
+    fn origin_codes_and_indexes_cover_all_variants_and_match_count() {
+        const ALL_ORIGINS: [MutationOrigin; ORIGIN_COUNT] = [
+            MutationOrigin::Cache,
+            MutationOrigin::WebApi,
+            MutationOrigin::Local,
+            MutationOrigin::Realtime,
+        ];
+        for origin in ALL_ORIGINS {
+            match origin {
+                MutationOrigin::Cache
+                | MutationOrigin::WebApi
+                | MutationOrigin::Local
+                | MutationOrigin::Realtime => {}
+            }
+        }
+        let mut codes = ALL_ORIGINS
+            .iter()
+            .map(|&origin| origin_code(origin))
+            .collect::<Vec<_>>();
+        let mut indexes = ALL_ORIGINS
+            .iter()
+            .map(|&origin| origin_index(origin))
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        indexes.sort_unstable();
+        indexes.dedup();
+
+        assert_eq!(codes.len(), ORIGIN_COUNT);
+        assert_eq!(indexes, (0..ORIGIN_COUNT).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn delivery_codes_and_indexes_cover_all_variants_and_match_count() {
+        const ALL_DELIVERIES: [DeliveryState; DELIVERY_COUNT] = [
+            DeliveryState::Fresh,
+            DeliveryState::Reconciled,
+            DeliveryState::Historical,
+            DeliveryState::Stale,
+            DeliveryState::Duplicate,
+        ];
+        for delivery in ALL_DELIVERIES {
+            match delivery {
+                DeliveryState::Fresh
+                | DeliveryState::Reconciled
+                | DeliveryState::Historical
+                | DeliveryState::Stale
+                | DeliveryState::Duplicate => {}
+            }
+        }
+        let mut codes = ALL_DELIVERIES
+            .iter()
+            .map(|&delivery| delivery_code(delivery))
+            .collect::<Vec<_>>();
+        let mut indexes = ALL_DELIVERIES
+            .iter()
+            .map(|&delivery| delivery_index(delivery))
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        indexes.sort_unstable();
+        indexes.dedup();
+
+        assert_eq!(codes.len(), DELIVERY_COUNT);
+        assert_eq!(indexes, (0..DELIVERY_COUNT).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn persistence_outcome_codes_and_indexes_cover_all_variants_and_match_count() {
+        const ALL_OUTCOMES: [AttentionPersistenceOutcome; PERSISTENCE_OUTCOME_COUNT] = [
+            AttentionPersistenceOutcome::NotApplicable,
+            AttentionPersistenceOutcome::Accepted,
+            AttentionPersistenceOutcome::AlreadyObserved,
+            AttentionPersistenceOutcome::AtOrBeforeReadCursor,
+            AttentionPersistenceOutcome::Failed,
+        ];
+        for outcome in ALL_OUTCOMES {
+            match outcome {
+                AttentionPersistenceOutcome::NotApplicable
+                | AttentionPersistenceOutcome::Accepted
+                | AttentionPersistenceOutcome::AlreadyObserved
+                | AttentionPersistenceOutcome::AtOrBeforeReadCursor
+                | AttentionPersistenceOutcome::Failed => {}
+            }
+        }
+        let mut codes = ALL_OUTCOMES
+            .iter()
+            .map(|outcome| outcome.code())
+            .collect::<Vec<_>>();
+        let mut indexes = ALL_OUTCOMES
+            .iter()
+            .map(|outcome| outcome.index())
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        indexes.sort_unstable();
+        indexes.dedup();
+
+        assert_eq!(codes.len(), PERSISTENCE_OUTCOME_COUNT);
+        assert_eq!(indexes, (0..PERSISTENCE_OUTCOME_COUNT).collect::<Vec<_>>());
+    }
 }
