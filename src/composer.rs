@@ -300,6 +300,26 @@ impl MessageDraftBuilder {
     }
 }
 
+fn normalize_block_element_for_matching(mut element: Value) -> Value {
+    if element.get("type").and_then(Value::as_str) == Some("link") {
+        let url = element.get("url").and_then(Value::as_str);
+        let text = element.get("text").and_then(Value::as_str);
+        if let (Some(u), Some(t)) = (url, text) {
+            if u == t {
+                if let Some(obj) = element.as_object_mut() {
+                    obj.remove("text");
+                }
+            }
+        }
+    }
+    if let Some(elements) = element.get_mut("elements").and_then(Value::as_array_mut) {
+        for el in elements {
+            *el = normalize_block_element_for_matching(el.clone());
+        }
+    }
+    element
+}
+
 fn blocks_match_editable_draft(message: &SlackMessage, draft: &RichComposerDraft) -> bool {
     let Some(Value::Array(original_blocks)) = message.blocks.as_ref() else {
         return false;
@@ -318,10 +338,14 @@ fn blocks_match_editable_draft(message: &SlackMessage, draft: &RichComposerDraft
             if let Some(block) = block.as_object_mut() {
                 block.remove("block_id");
             }
-            block
+            normalize_block_element_for_matching(block)
         })
         .collect::<Vec<_>>();
-    normalized_original == generated_blocks
+    let normalized_generated = generated_blocks
+        .into_iter()
+        .map(normalize_block_element_for_matching)
+        .collect::<Vec<_>>();
+    normalized_original == normalized_generated
 }
 
 /// Converts a plain or wholly rich-text Slack message into an editable composer draft.
@@ -441,6 +465,171 @@ fn composer_line_kind(
         .map(|span| span.kind)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawLinkToken {
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+    pub label: Option<String>,
+}
+
+pub fn is_valid_link_url(candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(candidate) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "http" | "https" => parsed
+            .host_str()
+            .is_some_and(|host| !host.trim().is_empty()),
+        "mailto" => !parsed.path().trim().is_empty(),
+        _ => false,
+    }
+}
+
+pub fn is_plain_url_start(characters: &[char], cursor: usize) -> bool {
+    if cursor > 0 && characters[cursor - 1].is_alphanumeric() {
+        return false;
+    }
+    let slice: String = characters[cursor..].iter().take(8).collect();
+    slice.starts_with("https://") || slice.starts_with("http://") || slice.starts_with("mailto:")
+}
+
+pub fn parse_plain_url(characters: &[char], start: usize) -> Option<RawLinkToken> {
+    if !is_plain_url_start(characters, start) {
+        return None;
+    }
+
+    let mut end = start;
+    let mut paren_depth: i32 = 0;
+    let mut bracket_depth: i32 = 0;
+    let mut brace_depth: i32 = 0;
+
+    while end < characters.len() {
+        let ch = characters[end];
+        if ch.is_whitespace() || ch == '<' || ch == '>' {
+            break;
+        }
+        if ch == '(' {
+            paren_depth += 1;
+        } else if ch == ')' {
+            if paren_depth > 0 {
+                paren_depth -= 1;
+            } else {
+                break;
+            }
+        } else if ch == '[' {
+            bracket_depth += 1;
+        } else if ch == ']' {
+            if bracket_depth > 0 {
+                bracket_depth -= 1;
+            } else {
+                break;
+            }
+        } else if ch == '{' {
+            brace_depth += 1;
+        } else if ch == '}' {
+            if brace_depth > 0 {
+                brace_depth -= 1;
+            } else {
+                break;
+            }
+        } else if ch == '"' || ch == '\'' || ch == '`' {
+            break;
+        }
+        end += 1;
+    }
+
+    while end > start {
+        let last_char = characters[end - 1];
+        if matches!(last_char, '.' | ',' | ';' | ':' | '!' | '?' | '\'') {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+
+    if end <= start {
+        return None;
+    }
+
+    let url_str: String = characters[start..end].iter().collect();
+    if is_valid_link_url(&url_str) {
+        Some(RawLinkToken {
+            start,
+            end,
+            url: url_str,
+            label: None,
+        })
+    } else {
+        None
+    }
+}
+
+pub fn parse_slack_link(characters: &[char], start: usize) -> Option<RawLinkToken> {
+    if characters.get(start) != Some(&'<') {
+        return None;
+    }
+    let close_idx = characters[start + 1..].iter().position(|&c| c == '>')? + start + 1;
+    let inner: String = characters[start + 1..close_idx].iter().collect();
+    if inner.starts_with('@') || inner.starts_with('#') || inner.starts_with('!') {
+        return None;
+    }
+    let (url_part, label_part) = match inner.split_once('|') {
+        Some((u, l)) => (u.trim(), Some(l.trim())),
+        None => (inner.trim(), None),
+    };
+    if is_valid_link_url(url_part) {
+        let label = match label_part {
+            Some(l) if !l.is_empty() && l != url_part => Some(l.to_string()),
+            _ => None,
+        };
+        Some(RawLinkToken {
+            start,
+            end: close_idx + 1,
+            url: url_part.to_string(),
+            label,
+        })
+    } else {
+        None
+    }
+}
+
+pub fn parse_markdown_link(characters: &[char], start: usize) -> Option<RawLinkToken> {
+    if characters.get(start) != Some(&'[') {
+        return None;
+    }
+    let bracket_end = characters[start + 1..].iter().position(|&c| c == ']')? + start + 1;
+    if characters.get(bracket_end + 1) != Some(&'(') {
+        return None;
+    }
+    let paren_start = bracket_end + 1;
+    let paren_end = characters[paren_start + 1..]
+        .iter()
+        .position(|&c| c == ')')?
+        + paren_start
+        + 1;
+
+    let label: String = characters[start + 1..bracket_end].iter().collect();
+    let url: String = characters[paren_start + 1..paren_end].iter().collect();
+    let url = url.trim();
+    let label = label.trim();
+
+    if !label.is_empty() && is_valid_link_url(url) {
+        Some(RawLinkToken {
+            start,
+            end: paren_end + 1,
+            url: url.to_string(),
+            label: Some(label.to_string()),
+        })
+    } else {
+        None
+    }
+}
+
 fn composer_rich_text_elements(draft: &RichComposerDraft) -> Vec<Value> {
     let text_length = draft.text.chars().count();
     let lines = composer_lines(&draft.text);
@@ -468,7 +657,7 @@ fn composer_rich_text_elements(draft: &RichComposerDraft) -> Vec<Value> {
                     .map(|line| {
                         json!({
                             "type": "rich_text_section",
-                            "elements": composer_inline_elements(draft, line.start, line.end),
+                            "elements": composer_inline_elements(draft, line.start, line.end, false),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -479,18 +668,25 @@ fn composer_rich_text_elements(draft: &RichComposerDraft) -> Vec<Value> {
                     "elements": items,
                 }));
             }
-            Some(ComposerBlockKind::Quote | ComposerBlockKind::Preformatted) => {
-                let element_type = if kind == Some(ComposerBlockKind::Quote) {
-                    "rich_text_quote"
-                } else {
-                    "rich_text_preformatted"
-                };
+            Some(ComposerBlockKind::Quote) => {
                 elements.push(json!({
-                    "type": element_type,
+                    "type": "rich_text_quote",
                     "elements": composer_inline_elements(
                         draft,
                         lines[index].start,
                         lines[end_index - 1].end,
+                        false,
+                    ),
+                }));
+            }
+            Some(ComposerBlockKind::Preformatted) => {
+                elements.push(json!({
+                    "type": "rich_text_preformatted",
+                    "elements": composer_inline_elements(
+                        draft,
+                        lines[index].start,
+                        lines[end_index - 1].end,
+                        true,
                     ),
                 }));
             }
@@ -501,6 +697,7 @@ fn composer_rich_text_elements(draft: &RichComposerDraft) -> Vec<Value> {
                         draft,
                         lines[index].start,
                         lines[end_index - 1].end,
+                        false,
                     ),
                 }));
             }
@@ -511,10 +708,22 @@ fn composer_rich_text_elements(draft: &RichComposerDraft) -> Vec<Value> {
     elements
 }
 
-fn composer_inline_elements(draft: &RichComposerDraft, start: usize, end: usize) -> Vec<Value> {
+fn composer_inline_elements(
+    draft: &RichComposerDraft,
+    start: usize,
+    end: usize,
+    is_preformatted: bool,
+) -> Vec<Value> {
     let characters = draft.text.chars().collect::<Vec<_>>();
     let start = start.min(characters.len());
     let end = end.min(characters.len()).max(start);
+    if is_preformatted {
+        let text: String = characters[start..end].iter().collect();
+        return vec![json!({
+            "type": "text",
+            "text": text,
+        })];
+    }
     let mentions = valid_composer_mentions(&draft.text, &draft.mentions);
     let entities = valid_composer_entities(&draft.text, &draft.entities)
         .into_iter()
@@ -593,7 +802,11 @@ fn composer_inline_elements(draft: &RichComposerDraft, start: usize, end: usize)
         {
             let element = match &entity.kind {
                 ComposerEntityKind::Link { url } => {
-                    json!({"type": "link", "url": url, "text": entity.label})
+                    let mut elem = json!({"type": "link", "url": url});
+                    if entity.label != *url {
+                        elem["text"] = Value::String(entity.label.clone());
+                    }
+                    elem
                 }
                 ComposerEntityKind::Channel { channel_id } => {
                     json!({"type": "channel", "channel_id": channel_id})
@@ -612,47 +825,136 @@ fn composer_inline_elements(draft: &RichComposerDraft, start: usize, end: usize)
 }
 
 fn composer_text_elements(text: &str, style: ComposerTextStyle) -> Vec<Value> {
+    if style.code {
+        return vec![styled_rich_element(
+            json!({
+                "type": "text",
+                "text": text,
+            }),
+            style,
+        )];
+    }
+
     let characters = text.chars().collect::<Vec<_>>();
     let mut elements = Vec::new();
     let mut cursor = 0;
     let mut plain_start = 0;
+
     while cursor < characters.len() {
-        if characters[cursor] != ':' {
-            cursor += 1;
-            continue;
+        if characters[cursor] == '`' {
+            if cursor + 2 < characters.len()
+                && characters[cursor + 1] == '`'
+                && characters[cursor + 2] == '`'
+            {
+                if let Some(end_rel) = characters[cursor + 3..]
+                    .windows(3)
+                    .position(|w| w == ['`', '`', '`'])
+                {
+                    cursor += 3 + end_rel + 3;
+                    continue;
+                }
+            } else if let Some(end_rel) = characters[cursor + 1..].iter().position(|&c| c == '`') {
+                cursor += 1 + end_rel + 1;
+                continue;
+            }
         }
-        let Some(relative_end) = characters[cursor + 1..]
-            .iter()
-            .position(|character| *character == ':')
-        else {
-            cursor += 1;
-            continue;
-        };
-        let shortcode_end = cursor + 1 + relative_end;
-        let name = characters[cursor + 1..shortcode_end]
-            .iter()
-            .collect::<String>();
-        let valid = !name.is_empty() && name.chars().all(is_shortcode_character);
-        if !valid {
-            cursor += 1;
-            continue;
+
+        if characters[cursor] == '<' {
+            if let Some(token) = parse_slack_link(&characters, cursor) {
+                if plain_start < token.start {
+                    let plain: String = characters[plain_start..token.start].iter().collect();
+                    elements.push(styled_rich_element(
+                        json!({"type": "text", "text": plain}),
+                        style,
+                    ));
+                }
+                let mut link_element = json!({
+                    "type": "link",
+                    "url": token.url,
+                });
+                if let Some(label) = token.label {
+                    link_element["text"] = Value::String(label);
+                }
+                elements.push(styled_rich_element(link_element, style));
+                cursor = token.end;
+                plain_start = cursor;
+                continue;
+            }
+        } else if characters[cursor] == '[' {
+            if let Some(token) = parse_markdown_link(&characters, cursor) {
+                if plain_start < token.start {
+                    let plain: String = characters[plain_start..token.start].iter().collect();
+                    elements.push(styled_rich_element(
+                        json!({"type": "text", "text": plain}),
+                        style,
+                    ));
+                }
+                let mut link_element = json!({
+                    "type": "link",
+                    "url": token.url,
+                });
+                if let Some(label) = token.label {
+                    link_element["text"] = Value::String(label);
+                }
+                elements.push(styled_rich_element(link_element, style));
+                cursor = token.end;
+                plain_start = cursor;
+                continue;
+            }
+        } else if is_plain_url_start(&characters, cursor) {
+            if let Some(token) = parse_plain_url(&characters, cursor) {
+                if plain_start < token.start {
+                    let plain: String = characters[plain_start..token.start].iter().collect();
+                    elements.push(styled_rich_element(
+                        json!({"type": "text", "text": plain}),
+                        style,
+                    ));
+                }
+                let mut link_element = json!({
+                    "type": "link",
+                    "url": token.url,
+                });
+                if let Some(label) = token.label {
+                    link_element["text"] = Value::String(label);
+                }
+                elements.push(styled_rich_element(link_element, style));
+                cursor = token.end;
+                plain_start = cursor;
+                continue;
+            }
+        } else if characters[cursor] == ':' {
+            if let Some(relative_end) = characters[cursor + 1..]
+                .iter()
+                .position(|character| *character == ':')
+            {
+                let shortcode_end = cursor + 1 + relative_end;
+                let name = characters[cursor + 1..shortcode_end]
+                    .iter()
+                    .collect::<String>();
+                if !name.is_empty() && name.chars().all(is_shortcode_character) {
+                    if plain_start < cursor {
+                        elements.push(styled_rich_element(
+                            json!({
+                                "type": "text",
+                                "text": characters[plain_start..cursor].iter().collect::<String>(),
+                            }),
+                            style,
+                        ));
+                    }
+                    elements.push(styled_rich_element(
+                        json!({"type": "emoji", "name": name}),
+                        style,
+                    ));
+                    cursor = shortcode_end + 1;
+                    plain_start = cursor;
+                    continue;
+                }
+            }
         }
-        if plain_start < cursor {
-            elements.push(styled_rich_element(
-                json!({
-                    "type": "text",
-                    "text": characters[plain_start..cursor].iter().collect::<String>(),
-                }),
-                style,
-            ));
-        }
-        elements.push(styled_rich_element(
-            json!({"type": "emoji", "name": name}),
-            style,
-        ));
-        cursor = shortcode_end + 1;
-        plain_start = cursor;
+
+        cursor += 1;
     }
+
     if plain_start < characters.len() {
         elements.push(styled_rich_element(
             json!({
@@ -662,6 +964,7 @@ fn composer_text_elements(text: &str, style: ComposerTextStyle) -> Vec<Value> {
             style,
         ));
     }
+
     elements
 }
 
@@ -1033,6 +1336,7 @@ fn valid_composer_entities<'a>(
     valid
 }
 
+#[cfg(test)]
 pub fn serialize_composer_mentions(text: &str, spans: &[MentionSpan]) -> String {
     let characters = text.chars().collect::<Vec<_>>();
     let valid = valid_composer_mentions(text, spans);
@@ -1050,15 +1354,91 @@ pub fn serialize_composer_mentions(text: &str, spans: &[MentionSpan]) -> String 
     serialized
 }
 
+fn serialize_plain_text_semantics(characters: &[char]) -> String {
+    let mut serialized = String::with_capacity(characters.len());
+    let mut cursor = 0;
+    let mut plain_start = 0;
+
+    while cursor < characters.len() {
+        if characters[cursor] == '`' {
+            if cursor + 2 < characters.len()
+                && characters[cursor + 1] == '`'
+                && characters[cursor + 2] == '`'
+            {
+                if let Some(end_rel) = characters[cursor + 3..]
+                    .windows(3)
+                    .position(|w| w == ['`', '`', '`'])
+                {
+                    cursor += 3 + end_rel + 3;
+                    continue;
+                }
+            } else if let Some(end_rel) = characters[cursor + 1..].iter().position(|&c| c == '`') {
+                cursor += 1 + end_rel + 1;
+                continue;
+            }
+        }
+
+        if characters[cursor] == '<' {
+            if let Some(token) = parse_slack_link(characters, cursor) {
+                if plain_start < token.start {
+                    serialized.extend(characters[plain_start..token.start].iter());
+                }
+                serialized.push('<');
+                serialized.push_str(&token.url);
+                if let Some(label) = token.label {
+                    serialized.push('|');
+                    serialized.push_str(&label);
+                }
+                serialized.push('>');
+                cursor = token.end;
+                plain_start = cursor;
+                continue;
+            }
+        } else if characters[cursor] == '[' {
+            if let Some(token) = parse_markdown_link(characters, cursor) {
+                if plain_start < token.start {
+                    serialized.extend(characters[plain_start..token.start].iter());
+                }
+                serialized.push('<');
+                serialized.push_str(&token.url);
+                if let Some(label) = token.label {
+                    serialized.push('|');
+                    serialized.push_str(&label);
+                }
+                serialized.push('>');
+                cursor = token.end;
+                plain_start = cursor;
+                continue;
+            }
+        } else if is_plain_url_start(characters, cursor) {
+            if let Some(token) = parse_plain_url(characters, cursor) {
+                if plain_start < token.start {
+                    serialized.extend(characters[plain_start..token.start].iter());
+                }
+                serialized.push('<');
+                serialized.push_str(&token.url);
+                serialized.push('>');
+                cursor = token.end;
+                plain_start = cursor;
+                continue;
+            }
+        }
+
+        cursor += 1;
+    }
+
+    if plain_start < characters.len() {
+        serialized.extend(characters[plain_start..].iter());
+    }
+
+    serialized
+}
+
 pub fn serialize_composer_semantics(
     text: &str,
     mentions: &[MentionSpan],
     entities: &[ComposerEntitySpan],
 ) -> String {
-    if entities.is_empty() {
-        return serialize_composer_mentions(text, mentions);
-    }
-
     enum SemanticSpan<'a> {
         Mention(&'a MentionSpan),
         Entity(&'a ComposerEntitySpan),
@@ -1100,7 +1480,11 @@ pub fn serialize_composer_semantics(
     let mut serialized = String::with_capacity(text.len());
     let mut cursor = 0;
     for span in spans {
-        serialized.extend(characters[cursor..span.start()].iter());
+        if cursor < span.start() {
+            serialized.push_str(&serialize_plain_text_semantics(
+                &characters[cursor..span.start()],
+            ));
+        }
         match span {
             SemanticSpan::Mention(span) => {
                 serialized.push_str("<@");
@@ -1129,7 +1513,9 @@ pub fn serialize_composer_semantics(
         }
         cursor = span.end();
     }
-    serialized.extend(characters[cursor..].iter());
+    if cursor < characters.len() {
+        serialized.push_str(&serialize_plain_text_semantics(&characters[cursor..]));
+    }
     serialized
 }
 
@@ -2120,5 +2506,163 @@ mod tests {
         assert_eq!(decode_rich_composer_draft(&stored), Some(draft));
         assert_eq!(decode_rich_composer_draft("legacy <@UADA> draft"), None);
         assert_eq!(decode_rich_composer_draft("conduit-rich-v1:{broken"), None);
+    }
+
+    #[test]
+    fn plain_urls_in_composer_become_link_elements_and_mrkdwn_links() {
+        let draft = RichComposerDraft {
+            text: "Check https://github.com/adrighem/Conduit and mailto:dev@example.com."
+                .to_string(),
+            ..Default::default()
+        };
+
+        let payload = draft.slack_payload().expect("valid payload");
+        assert_eq!(
+            payload.fallback_text,
+            "Check <https://github.com/adrighem/Conduit> and <mailto:dev@example.com>."
+        );
+
+        let blocks: Value = serde_json::from_str(&payload.blocks_json).unwrap();
+        let inlines = blocks[0]["elements"][0]["elements"].as_array().unwrap();
+        assert_eq!(
+            inlines,
+            &vec![
+                json!({"type": "text", "text": "Check "}),
+                json!({"type": "link", "url": "https://github.com/adrighem/Conduit"}),
+                json!({"type": "text", "text": " and "}),
+                json!({"type": "link", "url": "mailto:dev@example.com"}),
+                json!({"type": "text", "text": "."}),
+            ]
+        );
+    }
+
+    #[test]
+    fn slack_and_markdown_link_syntaxes_in_composer_text() {
+        let draft = RichComposerDraft {
+            text: "See <https://example.com|Example> and [Docs](https://conduit.app/docs)."
+                .to_string(),
+            ..Default::default()
+        };
+
+        let payload = draft.slack_payload().expect("valid payload");
+        assert_eq!(
+            payload.fallback_text,
+            "See <https://example.com|Example> and <https://conduit.app/docs|Docs>."
+        );
+
+        let blocks: Value = serde_json::from_str(&payload.blocks_json).unwrap();
+        let inlines = blocks[0]["elements"][0]["elements"].as_array().unwrap();
+        assert_eq!(
+            inlines,
+            &vec![
+                json!({"type": "text", "text": "See "}),
+                json!({"type": "link", "url": "https://example.com", "text": "Example"}),
+                json!({"type": "text", "text": " and "}),
+                json!({"type": "link", "url": "https://conduit.app/docs", "text": "Docs"}),
+                json!({"type": "text", "text": "."}),
+            ]
+        );
+    }
+
+    #[test]
+    fn links_with_formatting_styles_and_emojis() {
+        let draft = RichComposerDraft {
+            text: "🎉 https://example.com 🎉".to_string(),
+            styles: vec![ComposerStyleSpan {
+                start: 2,
+                end: 21,
+                style: ComposerTextStyle {
+                    bold: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let payload = draft.slack_payload().expect("valid payload");
+        assert_eq!(payload.fallback_text, "🎉 <https://example.com> 🎉");
+
+        let blocks: Value = serde_json::from_str(&payload.blocks_json).unwrap();
+        let inlines = blocks[0]["elements"][0]["elements"].as_array().unwrap();
+        assert_eq!(
+            inlines,
+            &vec![
+                json!({"type": "text", "text": "🎉 "}),
+                json!({
+                    "type": "link",
+                    "url": "https://example.com",
+                    "style": {"bold": true}
+                }),
+                json!({"type": "text", "text": " 🎉"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn links_in_code_spans_and_preformatted_blocks_remain_plain_text() {
+        let draft = RichComposerDraft {
+            text: "https://inline-code.com\nhttps://preformatted.com".to_string(),
+            styles: vec![ComposerStyleSpan {
+                start: 0,
+                end: 23,
+                style: ComposerTextStyle {
+                    code: true,
+                    ..Default::default()
+                },
+            }],
+            blocks: vec![ComposerBlockSpan {
+                start: 24,
+                end: 48,
+                kind: ComposerBlockKind::Preformatted,
+            }],
+            ..Default::default()
+        };
+
+        let payload = draft.slack_payload().expect("valid payload");
+        let blocks: Value = serde_json::from_str(&payload.blocks_json).unwrap();
+        let elements = blocks[0]["elements"].as_array().unwrap();
+
+        assert_eq!(
+            elements[0]["elements"][0],
+            json!({
+                "type": "text",
+                "text": "https://inline-code.com",
+                "style": {"code": true}
+            })
+        );
+        assert_eq!(
+            elements[1]["elements"][0],
+            json!({
+                "type": "text",
+                "text": "https://preformatted.com"
+            })
+        );
+    }
+
+    #[test]
+    fn url_parsing_handles_balanced_parentheses_and_punctuation_trimming() {
+        let draft = RichComposerDraft {
+            text: "Wikipedia (https://en.wikipedia.org/wiki/Rust_(programming_language)), (https://example.com)!".to_string(),
+            ..Default::default()
+        };
+
+        let payload = draft.slack_payload().expect("valid payload");
+        assert_eq!(
+            payload.fallback_text,
+            "Wikipedia (<https://en.wikipedia.org/wiki/Rust_(programming_language)>), (<https://example.com>)!"
+        );
+
+        let blocks: Value = serde_json::from_str(&payload.blocks_json).unwrap();
+        let inlines = blocks[0]["elements"][0]["elements"].as_array().unwrap();
+        assert_eq!(
+            inlines,
+            &vec![
+                json!({"type": "text", "text": "Wikipedia ("}),
+                json!({"type": "link", "url": "https://en.wikipedia.org/wiki/Rust_(programming_language)"}),
+                json!({"type": "text", "text": "), ("}),
+                json!({"type": "link", "url": "https://example.com"}),
+                json!({"type": "text", "text": ")!"}),
+            ]
+        );
     }
 }

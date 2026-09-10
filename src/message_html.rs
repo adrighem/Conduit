@@ -4089,6 +4089,14 @@ fn render_inline(text: &str, context: &MessageHtmlContext) -> String {
             continue;
         }
 
+        if !output.chars().last().is_some_and(char::is_alphanumeric) {
+            if let Some((html, consumed)) = render_bare_url(rest) {
+                output.push_str(&html);
+                rest = &rest[consumed..];
+                continue;
+            }
+        }
+
         if let Some((html, consumed)) = render_emoji_shortcode(rest, context) {
             output.push_str(&html);
             rest = &rest[consumed..];
@@ -4198,6 +4206,14 @@ fn channel_reference_html(channel_id: &str, label: &str) -> String {
         escape_html(&channel_action_url(channel_id)),
         escape_html(label)
     )
+}
+
+fn render_bare_url(text: &str) -> Option<(String, usize)> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let token = crate::composer::parse_plain_url(&characters, 0)?;
+    let html = external_link_html(&token.url, &token.url);
+    let consumed_bytes: usize = characters[..token.end].iter().map(|c| c.len_utf8()).sum();
+    Some((html, consumed_bytes))
 }
 
 fn user_group_mention_html(raw: &str, context: &MessageHtmlContext) -> String {
@@ -4351,7 +4367,12 @@ fn external_link_html(url: &str, label: &str) -> String {
 
 fn is_http_url(value: &str) -> bool {
     url::Url::parse(value)
-        .map(|url| matches!(url.scheme(), "http" | "https" | "msteams" | "zoommtg"))
+        .map(|url| {
+            matches!(
+                url.scheme(),
+                "http" | "https" | "msteams" | "zoommtg" | "mailto"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -7261,5 +7282,22 @@ mod tests {
         assert!(html.contains("This week is fine. Next week isn&#39;t"));
         assert!(html.contains("href=\"conduit://message?channel=C0B7NRGNSSW&amp;ts=1785770122.389189&amp;thread_ts=1785745809.323539\""));
         assert!(html.contains("Thread in Slack conversation ↗"));
+    }
+
+    #[test]
+    fn test_renders_bare_urls_and_mailto_links() {
+        let message = SlackMessage {
+            text: Some(
+                "Visit https://conduit.app or email mailto:support@conduit.app for help.".into(),
+            ),
+            ..Default::default()
+        };
+        let context = MessageHtmlContext::default();
+        let html = message_body_html(None, &message, &context);
+
+        assert!(html.contains(
+            "<a href=\"https://conduit.app\" rel=\"noreferrer noopener\">https://conduit.app</a>"
+        ));
+        assert!(html.contains("<a href=\"mailto:support@conduit.app\" rel=\"noreferrer noopener\">mailto:support@conduit.app</a>"));
     }
 }

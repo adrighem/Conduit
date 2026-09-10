@@ -7713,7 +7713,7 @@ impl ConduitWindow {
 
         match url.scheme() {
             "conduit" => self.handle_message_action_url(&url),
-            "http" | "https" | "msteams" | "zoommtg" => {
+            "http" | "https" | "msteams" | "zoommtg" | "mailto" => {
                 let workspace_url = self.imp().workspace_url.borrow().clone();
                 if let Some(location) = slack_message_location(uri, workspace_url.as_deref()) {
                     self.open_message_context(location);
