@@ -524,3 +524,17 @@
   - `meson compile -C _build`: pass
   - `meson test -C _build`: pass, all 17 integration and headless UI test suites passed
 - No public GitHub action was taken. Pushing the local commits requires explicit approval.
+
+## 2026-09-10 CodeQL HTTPS Alert Remediation & Maintainer Pass
+
+- Scope: address CodeQL high-severity failure to use HTTPS URLs alerts #4 and #5 in `src/slack.rs`.
+- Remediated static taint sources:
+  - In `src/services/file_service.rs`, updated mock `download_preview_asset` and `download_media` test fixtures to use HTTPS URLs (`https://example.com/a.png`, `https://example.com/a.jpg`).
+  - In `src/services/workspace_service.rs`, updated mock custom emoji test fixture to use HTTPS URL (`https://example.com/parrot.gif`).
+- Local checks:
+  - `cargo fmt --check`: pass
+  - `cargo clippy --all-targets -- -D warnings`: pass
+  - `cargo test`: pass, 1110 passed, 3 ignored
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, all 19 integration and headless UI test suites passed
+- GitHub status: 0 unread inbox notifications, 0 open issues, 0 open pull requests, 0 open Dependabot alerts.

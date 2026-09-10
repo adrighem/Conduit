@@ -1,22 +1,22 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-08-31-security-remediation",
-  "last_known_open_issues": 3,
-  "last_known_open_pull_requests": 1,
+  "last_manual_run": "2026-09-10-codeql-https-remediation",
+  "last_known_open_issues": 0,
+  "last_known_open_pull_requests": 0,
   "last_known_total_issues": 13,
   "last_known_total_pull_requests": 6,
   "last_checks": {
-    "github_actions": "latest remote CI is green, pending validation of local security commits",
-    "pr_19": "release 0.4.0 PR open and clean",
-    "cargo_test": "pass: 1092 passed, 0 failed, 3 ignored",
-    "meson": "pass: 17/17 integration and headless UI test suites passed",
+    "github_actions": "latest remote CI is green",
+    "cargo_test": "pass: 1110 passed, 0 failed, 3 ignored",
+    "cargo_clippy": "pass: 0 warnings with -D warnings",
+    "meson": "pass: 19/19 integration and headless UI test suites passed",
     "cargo_fmt": "pass",
-    "security_alerts": "0 open Dependabot alerts, 2 high-severity CodeQL alerts remediated locally"
+    "security_alerts": "0 open Dependabot alerts, 2 high-severity CodeQL alerts remediated locally in mock fixtures"
   },
   "notes": {
     "skill_package": "open-source-maintainer active, standard workflow execution",
-    "priority": "Remediated cleartext logging vulnerabilities in auth and runtime traces",
+    "priority": "Remediated CodeQL non-https-url alerts #4 and #5 in file_service and workspace_service mock test fixtures",
     "worktree": "clean and tested, waiting for user push approval",
-    "public_actions": "Remediated CodeQL alerts #2 and #3 locally; no public actions taken without explicit approval"
+    "public_actions": "Remediated CodeQL alerts #4 and #5 locally; no public actions taken without explicit approval"
   }
 }
