@@ -3735,7 +3735,7 @@ fn message_actions_html(
         actions.push_str(&action_button_content_html(
             &reaction_action_url(channel_id, message, &emoji.name, !reacted, thread_ts),
             &emoji_value_html(&emoji.value, false),
-            &gettext("React with {emoji}").replace("{emoji}", &emoji.label),
+            &gettext("React with :{emoji}:").replace("{emoji}", &emoji.name),
             reacted,
         ));
     }
@@ -4027,11 +4027,8 @@ fn reaction_label(name: &str, context: &MessageHtmlContext) -> String {
         .unwrap_or_else(|| escape_html(&format!(":{name}:")))
 }
 
-fn reaction_tooltip_text(name: &str, context: &MessageHtmlContext) -> String {
-    match EmojiCatalog::new(&context.custom_emojis).resolve(name) {
-        Some(EmojiValue::Unicode(value)) => value.to_string(),
-        Some(EmojiValue::CustomImage(_)) | None => format!(":{name}:"),
-    }
+fn reaction_tooltip_text(name: &str, _context: &MessageHtmlContext) -> String {
+    format!(":{name}:")
 }
 
 fn mrkdwn_to_html(text: &str, context: &MessageHtmlContext) -> String {
@@ -5875,14 +5872,16 @@ mod tests {
         ));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
         assert!(html.contains(
-            "href=\"conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true\" title=\"Grace Hopper: 👀\""
+            "href=\"conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true\" title=\"Grace Hopper: :eyes:\""
         ));
         assert!(html.contains(
             "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true"
         ));
         let reaction_chip = html.find("<a class=\"reaction is-active\"").unwrap();
-        assert!(html.contains("title=\"Ada Lovelace, Grace Hopper, Linus Torvalds: 👍\""));
-        assert!(html.contains("aria-label=\"Ada Lovelace, Grace Hopper, Linus Torvalds: 👍\""));
+        assert!(html.contains("title=\"Ada Lovelace, Grace Hopper, Linus Torvalds: :thumbsup:\""));
+        assert!(
+            html.contains("aria-label=\"Ada Lovelace, Grace Hopper, Linus Torvalds: :thumbsup:\"")
+        );
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
         let thread_chip = html.find("<a class=\"reaction thread-reaction\"").unwrap();
         assert!(reaction_chip < thread_chip);
