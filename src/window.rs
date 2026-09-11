@@ -136,6 +136,7 @@ struct ComposerEntityMark {
 
 #[derive(Debug, Clone)]
 struct MessageEditState {
+    target: ComposerTarget,
     channel_id: String,
     original: SlackMessage,
     original_draft: RichComposerDraft,
@@ -587,6 +588,52 @@ mod imp {
                         .channel_messages(test_channel_id)
                         .to_vec();
                     obj.populate_history(test_channel_id, messages);
+                    if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
+                        let mut thread_messages = vec![
+                            SlackMessage {
+                                user: Some("UTEST".to_string()),
+                                text: Some("Thread root message".to_string()),
+                                ts: "1.0".to_string(),
+                                ..SlackMessage::default()
+                            },
+                            SlackMessage {
+                                user: Some("UOTHER".to_string()),
+                                text: Some("Thread reply from someone else".to_string()),
+                                ts: "1.2".to_string(),
+                                thread_ts: Some("1.0".to_string()),
+                                ..SlackMessage::default()
+                            },
+                            SlackMessage {
+                                user: Some("UTEST".to_string()),
+                                text: Some("Last sent thread reply".to_string()),
+                                ts: "1.1".to_string(),
+                                thread_ts: Some("1.0".to_string()),
+                                ..SlackMessage::default()
+                            },
+                        ];
+                        for message in &mut thread_messages {
+                            message.refresh_canonical_content();
+                        }
+                        obj.imp()
+                            .workspace
+                            .view
+                            .borrow_mut()
+                            .open_thread(test_channel_id, "1.0");
+                        obj.imp().workspace.view.borrow_mut().apply_thread(
+                            test_channel_id,
+                            "1.0",
+                            thread_messages.clone(),
+                            false,
+                            None,
+                            true,
+                        );
+                        obj.populate_thread(
+                            test_channel_id,
+                            "1.0",
+                            thread_messages,
+                            TimelineScrollBehavior::Preserve,
+                        );
+                    }
                 }
                 if huddle_test {
                     let huddle = crate::huddles::model::ActiveHuddle {
@@ -1738,6 +1785,7 @@ fn submitted_draft_matches(
 }
 
 fn latest_editable_message(
+    target: ComposerTarget,
     messages: &[SlackMessage],
     current_user_id: Option<&str>,
 ) -> Option<SlackMessage> {
@@ -1746,7 +1794,7 @@ fn latest_editable_message(
         .iter()
         .find(|message| {
             message.author_user_id() == Some(current_user_id)
-                && !message.is_thread_reply()
+                && (target == ComposerTarget::Thread || !message.is_thread_reply())
                 && matches!(message.subtype.as_deref(), None | Some("me_message"))
                 && !message.ts.trim().is_empty()
                 && !message.body_text().trim().is_empty()
@@ -4253,12 +4301,16 @@ impl ConduitWindow {
         let thread_key = self
             .selected_thread_ts()
             .and_then(|thread_ts| self.draft_key(&channel_id, Some(&thread_ts)));
-        let message_text = if self.message_edit_is_active() {
+        let message_text = if self.message_edit_target() == Some(ComposerTarget::Message) {
             String::new()
         } else {
             self.composer_draft_storage(ComposerTarget::Message)
         };
-        let thread_text = self.composer_draft_storage(ComposerTarget::Thread);
+        let thread_text = if self.message_edit_target() == Some(ComposerTarget::Thread) {
+            String::new()
+        } else {
+            self.composer_draft_storage(ComposerTarget::Thread)
+        };
         {
             let mut drafts = self.imp().drafts.borrow_mut();
             let mut changed = drafts.upsert(channel_key, &message_text);
@@ -4635,64 +4687,120 @@ impl ConduitWindow {
         self.imp().message_edit.borrow().is_some()
     }
 
-    fn set_message_edit_submission_state(&self, submitted: bool) {
-        let imp = self.imp();
-        imp.send_button.set_sensitive(!submitted);
-        imp.upload_button.set_sensitive(false);
-        imp.message_attachment_previews.set_sensitive(false);
-        imp.message_entry.set_editable(!submitted);
-        let formatting_supported = imp
+    fn message_edit_target(&self) -> Option<ComposerTarget> {
+        self.imp()
+            .message_edit
+            .borrow()
+            .as_ref()
+            .map(|edit| edit.target)
+    }
+
+    fn set_message_edit_submission_state(&self, target: ComposerTarget, submitted: bool) {
+        let send_button = self.composer_send_button(target);
+        let upload_button = self.composer_upload_button(target);
+        let attachment_host = self.composer_attachment_host(target);
+        let text_view = self.composer_text_view(target);
+        let format_toolbar = self.composer_format_host(target);
+        let format_overflow = self.composer_format_overflow(target);
+
+        send_button.set_sensitive(!submitted);
+        upload_button.set_sensitive(false);
+        attachment_host.set_sensitive(false);
+        text_view.set_editable(!submitted);
+        let formatting_supported = self
+            .imp()
             .message_edit
             .borrow()
             .as_ref()
             .is_some_and(|edit| edit.uses_rich_blocks);
-        imp.message_format_toolbar
-            .set_sensitive(!submitted && formatting_supported);
-        imp.message_format_overflow
-            .set_sensitive(!submitted && formatting_supported);
+        format_toolbar.set_sensitive(!submitted && formatting_supported);
+        format_overflow.set_sensitive(!submitted && formatting_supported);
     }
 
-    fn sync_message_edit_presentation(&self, editing: bool) {
+    fn sync_message_edit_presentation(&self, target: ComposerTarget, editing: bool) {
         let imp = self.imp();
-        if editing {
-            imp.message_title.set_title(&gettext("Edit message"));
-            imp.message_title
-                .set_subtitle(&gettext("Press Escape to cancel"));
-            imp.message_title.set_tooltip_text(None);
-            imp.message_title
-                .update_property(&[gtk::accessible::Property::Description(&gettext(
-                    "Editing message. Press Escape to cancel.",
-                ))]);
-            imp.send_button.remove_css_class("suggested-action");
-            imp.send_button.add_css_class("message-edit-action");
-            imp.send_button.set_icon_name("document-save-symbolic");
-            imp.send_button
-                .set_tooltip_text(Some(&gettext("Save Edited Message")));
-            imp.send_button
-                .update_property(&[gtk::accessible::Property::Label(&gettext(
-                    "Save Edited Message",
-                ))]);
-        } else {
-            imp.send_button.remove_css_class("message-edit-action");
-            imp.send_button.add_css_class("suggested-action");
-            imp.send_button.set_icon_name("mail-send-symbolic");
-            imp.send_button
-                .set_tooltip_text(Some(&gettext("Send Message")));
-            imp.send_button
-                .update_property(&[gtk::accessible::Property::Label(&gettext("Send Message"))]);
-            self.refresh_current_conversation_title();
+        match target {
+            ComposerTarget::Message => {
+                if editing {
+                    imp.message_title.set_title(&gettext("Edit message"));
+                    imp.message_title
+                        .set_subtitle(&gettext("Press Escape to cancel"));
+                    imp.message_title.set_tooltip_text(None);
+                    imp.message_title
+                        .update_property(&[gtk::accessible::Property::Description(&gettext(
+                            "Editing message. Press Escape to cancel.",
+                        ))]);
+                    imp.send_button.remove_css_class("suggested-action");
+                    imp.send_button.add_css_class("message-edit-action");
+                    imp.send_button.set_icon_name("document-save-symbolic");
+                    imp.send_button
+                        .set_tooltip_text(Some(&gettext("Save Edited Message")));
+                    imp.send_button
+                        .update_property(&[gtk::accessible::Property::Label(&gettext(
+                            "Save Edited Message",
+                        ))]);
+                } else {
+                    imp.send_button.remove_css_class("message-edit-action");
+                    imp.send_button.add_css_class("suggested-action");
+                    imp.send_button.set_icon_name("mail-send-symbolic");
+                    imp.send_button
+                        .set_tooltip_text(Some(&gettext("Send Message")));
+                    imp.send_button
+                        .update_property(&[gtk::accessible::Property::Label(&gettext(
+                            "Send Message",
+                        ))]);
+                    self.refresh_current_conversation_title();
+                }
+                self.sync_message_title_profile_action();
+            }
+            ComposerTarget::Thread => {
+                if editing {
+                    imp.thread_title.set_title(&gettext("Edit reply"));
+                    imp.thread_title
+                        .set_subtitle(&gettext("Press Escape to cancel"));
+                    imp.thread_title.set_tooltip_text(None);
+                    imp.thread_title
+                        .update_property(&[gtk::accessible::Property::Description(&gettext(
+                            "Editing reply. Press Escape to cancel.",
+                        ))]);
+                    imp.thread_send_button.remove_css_class("suggested-action");
+                    imp.thread_send_button.add_css_class("message-edit-action");
+                    imp.thread_send_button
+                        .set_icon_name("document-save-symbolic");
+                    imp.thread_send_button
+                        .set_tooltip_text(Some(&gettext("Save Edited Reply")));
+                    imp.thread_send_button
+                        .update_property(&[gtk::accessible::Property::Label(&gettext(
+                            "Save Edited Reply",
+                        ))]);
+                } else {
+                    imp.thread_send_button
+                        .remove_css_class("message-edit-action");
+                    imp.thread_send_button.add_css_class("suggested-action");
+                    imp.thread_send_button.set_icon_name("mail-send-symbolic");
+                    imp.thread_send_button
+                        .set_tooltip_text(Some(&gettext("Send Reply")));
+                    imp.thread_send_button
+                        .update_property(&[gtk::accessible::Property::Label(&gettext(
+                            "Send Reply",
+                        ))]);
+                    imp.thread_title.set_title(&gettext("Thread"));
+                    imp.thread_title.set_subtitle("");
+                    imp.thread_title.set_tooltip_text(None);
+                    imp.thread_title
+                        .update_property(&[gtk::accessible::Property::Description(&gettext(
+                            "Thread",
+                        ))]);
+                }
+            }
         }
-        self.sync_message_title_profile_action();
     }
 
-    fn start_message_edit(&self) -> bool {
-        if self.current_main_view() != MainMessageView::Conversation
-            || self.message_edit_is_active()
-            || !self.imp().send_button.is_sensitive()
-        {
+    fn start_message_edit(&self, target: ComposerTarget) -> bool {
+        if self.message_edit_is_active() || !self.composer_send_button(target).is_sensitive() {
             return false;
         }
-        let current_draft = self.composer_rich_draft(ComposerTarget::Message);
+        let current_draft = self.composer_rich_draft(target);
         if !current_draft.text.is_empty() || !current_draft.attachments.is_empty() {
             return false;
         }
@@ -4702,13 +4810,35 @@ impl ConduitWindow {
         let current_user_id = self.imp().current_user_id.borrow().clone();
         let original = {
             let state = self.imp().workspace.view.borrow();
-            latest_editable_message(
-                state.channel_tail_messages(&channel_id),
-                current_user_id.as_deref(),
-            )
+            match target {
+                ComposerTarget::Message => {
+                    if self.current_main_view() != MainMessageView::Conversation {
+                        return false;
+                    }
+                    latest_editable_message(
+                        ComposerTarget::Message,
+                        state.channel_tail_messages(&channel_id),
+                        current_user_id.as_deref(),
+                    )
+                }
+                ComposerTarget::Thread => {
+                    if self.selected_thread_ts().is_none() {
+                        return false;
+                    }
+                    latest_editable_message(
+                        ComposerTarget::Thread,
+                        state.current_thread_messages(),
+                        current_user_id.as_deref(),
+                    )
+                }
+            }
         };
         let Some(original) = original else {
-            self.set_status(&gettext("No sent message is available to edit."));
+            let error_msg = match target {
+                ComposerTarget::Message => gettext("No sent message is available to edit."),
+                ComposerTarget::Thread => gettext("No sent reply is available to edit."),
+            };
+            self.set_status(&error_msg);
             return false;
         };
         let Some((draft, uses_rich_blocks)) =
@@ -4722,34 +4852,40 @@ impl ConduitWindow {
         }
 
         *self.imp().message_edit.borrow_mut() = Some(MessageEditState {
+            target,
             channel_id,
             original,
             original_draft: draft.clone(),
             uses_rich_blocks,
             submitted: false,
         });
-        self.set_composer_rich_draft(ComposerTarget::Message, &draft);
-        self.sync_message_edit_presentation(true);
-        self.set_message_edit_submission_state(false);
-        let text_view = self.composer_text_view(ComposerTarget::Message);
+        self.set_composer_rich_draft(target, &draft);
+        self.sync_message_edit_presentation(target, true);
+        self.set_message_edit_submission_state(target, false);
+        let text_view = self.composer_text_view(target);
         let buffer = text_view.buffer();
         buffer.place_cursor(&buffer.end_iter());
         text_view.grab_focus();
-        self.set_status(&gettext("Editing message. Press Escape to cancel."));
+        let status_msg = match target {
+            ComposerTarget::Message => gettext("Editing message. Press Escape to cancel."),
+            ComposerTarget::Thread => gettext("Editing reply. Press Escape to cancel."),
+        };
+        self.set_status(&status_msg);
         record_test_message_edit_state(self, "editing");
         true
     }
 
     fn exit_message_edit(&self, status: Option<&str>, test_state: &str) -> bool {
-        if self.imp().message_edit.borrow_mut().take().is_none() {
+        let Some(edit) = self.imp().message_edit.borrow_mut().take() else {
             return false;
-        }
-        self.set_composer_rich_draft(ComposerTarget::Message, &RichComposerDraft::default());
-        self.sync_message_edit_presentation(false);
-        self.imp().message_entry.set_editable(true);
-        self.imp().message_format_toolbar.set_sensitive(true);
-        self.imp().message_format_overflow.set_sensitive(true);
-        self.set_composer_submission_sensitive(ComposerTarget::Message, true);
+        };
+        let target = edit.target;
+        self.set_composer_rich_draft(target, &RichComposerDraft::default());
+        self.sync_message_edit_presentation(target, false);
+        self.composer_text_view(target).set_editable(true);
+        self.composer_format_host(target).set_sensitive(true);
+        self.composer_format_overflow(target).set_sensitive(true);
+        self.set_composer_submission_sensitive(target, true);
         if let Some(status) = status {
             self.set_status(status);
         }
@@ -4758,17 +4894,23 @@ impl ConduitWindow {
     }
 
     fn cancel_message_edit(&self) -> bool {
-        let submitted = self
-            .imp()
-            .message_edit
-            .borrow()
-            .as_ref()
-            .is_some_and(|edit| edit.submitted);
-        if submitted {
-            self.set_status(&gettext("The edited message is being saved."));
+        let edit = self.imp().message_edit.borrow().clone();
+        let Some(edit) = edit else {
+            return false;
+        };
+        if edit.submitted {
+            let msg = match edit.target {
+                ComposerTarget::Message => gettext("The edited message is being saved."),
+                ComposerTarget::Thread => gettext("The edited reply is being saved."),
+            };
+            self.set_status(&msg);
             return true;
         }
-        self.exit_message_edit(Some(&gettext("Message edit canceled.")), "canceled")
+        let cancel_msg = match edit.target {
+            ComposerTarget::Message => gettext("Message edit canceled."),
+            ComposerTarget::Thread => gettext("Reply edit canceled."),
+        };
+        self.exit_message_edit(Some(&cancel_msg), "canceled")
     }
 
     fn finish_message_edit(&self, channel_id: &str, message_ts: &str) -> bool {
@@ -4803,13 +4945,19 @@ impl ConduitWindow {
         path: PathBuf,
         remove_after_upload: bool,
     ) {
-        if target == ComposerTarget::Message && self.message_edit_is_active() {
+        if self.message_edit_target() == Some(target) {
             if remove_after_upload {
                 let _ = std::fs::remove_file(path);
             }
-            self.set_status(&gettext(
-                "Attachments cannot be added while editing a message.",
-            ));
+            let err_msg = match target {
+                ComposerTarget::Message => {
+                    gettext("Attachments cannot be added while editing a message.")
+                }
+                ComposerTarget::Thread => {
+                    gettext("Attachments cannot be added while editing a reply.")
+                }
+            };
+            self.set_status(&err_msg);
             return;
         }
         if !path.is_file() {
@@ -6175,19 +6323,20 @@ impl ConduitWindow {
         key: gtk::gdk::Key,
         state: gtk::gdk::ModifierType,
     ) -> glib::Propagation {
-        if target == ComposerTarget::Message {
-            let draft = self.composer_rich_draft(target);
-            let empty = draft.text.is_empty() && draft.attachments.is_empty();
-            match message_edit_key_action(key, state, empty, self.message_edit_is_active()) {
-                MessageEditKeyAction::Start if self.start_message_edit() => {
-                    return glib::Propagation::Stop;
-                }
-                MessageEditKeyAction::Cancel => {
-                    self.cancel_message_edit();
-                    return glib::Propagation::Stop;
-                }
-                MessageEditKeyAction::Start | MessageEditKeyAction::Ignore => {}
+        let draft = self.composer_rich_draft(target);
+        let empty = draft.text.is_empty() && draft.attachments.is_empty();
+        let is_editing_this_target = self.message_edit_target() == Some(target);
+        match message_edit_key_action(key, state, empty, is_editing_this_target) {
+            MessageEditKeyAction::Start if self.start_message_edit(target) => {
+                return glib::Propagation::Stop;
             }
+            MessageEditKeyAction::Cancel if is_editing_this_target => {
+                self.cancel_message_edit();
+                return glib::Propagation::Stop;
+            }
+            MessageEditKeyAction::Start
+            | MessageEditKeyAction::Cancel
+            | MessageEditKeyAction::Ignore => {}
         }
         let is_open = {
             let completion_ref = self.composer_completion(target).borrow();
@@ -7292,20 +7441,31 @@ impl ConduitWindow {
     }
 
     fn submit_message_edit(&self) {
-        let draft = self.composer_rich_draft(ComposerTarget::Message);
-        if !draft.attachments.is_empty() {
-            self.set_status(&gettext(
-                "Attachments cannot be added while editing a message.",
-            ));
-            return;
-        }
-        let Some(payload) = draft.slack_payload() else {
-            self.set_status(&gettext("An edited message cannot be empty."));
-            return;
-        };
-        let (channel_id, original, unchanged, already_submitted, uses_rich_blocks) = {
+        let (target, channel_id, original, unchanged, already_submitted, uses_rich_blocks, payload) = {
             let edit = self.imp().message_edit.borrow();
             let Some(edit) = edit.as_ref() else {
+                return;
+            };
+            let target = edit.target;
+            let draft = self.composer_rich_draft(target);
+            if !draft.attachments.is_empty() {
+                let err_msg = match target {
+                    ComposerTarget::Message => {
+                        gettext("Attachments cannot be added while editing a message.")
+                    }
+                    ComposerTarget::Thread => {
+                        gettext("Attachments cannot be added while editing a reply.")
+                    }
+                };
+                self.set_status(&err_msg);
+                return;
+            }
+            let Some(payload) = draft.slack_payload() else {
+                let err_msg = match target {
+                    ComposerTarget::Message => gettext("An edited message cannot be empty."),
+                    ComposerTarget::Thread => gettext("An edited reply cannot be empty."),
+                };
+                self.set_status(&err_msg);
                 return;
             };
             let original_payload = edit.original_draft.slack_payload();
@@ -7318,11 +7478,13 @@ impl ConduitWindow {
                 }
             });
             (
+                target,
                 edit.channel_id.clone(),
                 edit.original.clone(),
                 unchanged,
                 edit.submitted,
                 uses_rich_blocks,
+                payload,
             )
         };
         if already_submitted {
@@ -7333,14 +7495,22 @@ impl ConduitWindow {
             return;
         }
         if unchanged {
-            self.exit_message_edit(Some(&gettext("Message was unchanged.")), "unchanged");
+            let unchanged_msg = match target {
+                ComposerTarget::Message => gettext("Message was unchanged."),
+                ComposerTarget::Thread => gettext("Reply was unchanged."),
+            };
+            self.exit_message_edit(Some(&unchanged_msg), "unchanged");
             return;
         }
         if let Some(edit) = self.imp().message_edit.borrow_mut().as_mut() {
             edit.submitted = true;
         }
-        self.set_message_edit_submission_state(true);
-        self.set_status(&gettext("Saving edited message"));
+        self.set_message_edit_submission_state(target, true);
+        let saving_msg = match target {
+            ComposerTarget::Message => gettext("Saving edited message"),
+            ComposerTarget::Thread => gettext("Saving edited reply"),
+        };
+        self.set_status(&saving_msg);
         record_test_message_edit_state(self, "submitted");
         if std::env::var_os("CONDUIT_TEST_MESSAGE_EDIT_NO_RUNTIME").is_some() {
             return;
@@ -7354,7 +7524,7 @@ impl ConduitWindow {
     }
 
     fn submit_composer(&self, target: ComposerTarget) {
-        if target == ComposerTarget::Message && self.message_edit_is_active() {
+        if self.message_edit_target() == Some(target) {
             self.submit_message_edit();
             return;
         }
@@ -8672,8 +8842,10 @@ impl ConduitWindow {
                     })
                 };
                 if edit_active {
-                    self.sync_message_edit_presentation(true);
-                    self.set_message_edit_submission_state(false);
+                    if let Some(target) = self.message_edit_target() {
+                        self.sync_message_edit_presentation(target, true);
+                        self.set_message_edit_submission_state(target, false);
+                    }
                     self.set_status(error);
                     record_test_message_edit_state(self, "failed");
                 } else if self.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
@@ -10914,8 +11086,8 @@ impl ConduitWindow {
     }
 
     fn refresh_current_conversation_title(&self) {
-        if self.message_edit_is_active() {
-            self.sync_message_edit_presentation(true);
+        if self.message_edit_target() == Some(ComposerTarget::Message) {
+            self.sync_message_edit_presentation(ComposerTarget::Message, true);
             return;
         }
         let imp = self.imp();
@@ -11246,8 +11418,8 @@ impl ConduitWindow {
         scroll_behavior: TimelineScrollBehavior,
     ) {
         let imp = self.imp();
-        if self.message_edit_is_active() {
-            self.sync_message_edit_presentation(true);
+        if self.message_edit_target() == Some(ComposerTarget::Message) {
+            self.sync_message_edit_presentation(ComposerTarget::Message, true);
         } else {
             imp.message_title
                 .set_title(&self.conversation_title(channel_id));
@@ -13050,21 +13222,48 @@ fn record_test_message_edit_state(window: &ConduitWindow, state: &str) {
     };
     let imp = window.imp();
     let edit = imp.message_edit.borrow();
+    let target = edit.as_ref().map(|edit| edit.target).unwrap_or_else(|| {
+        if imp.thread_split.shows_sidebar()
+            && std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some()
+        {
+            ComposerTarget::Thread
+        } else {
+            ComposerTarget::Message
+        }
+    });
+    let send_button = window.composer_send_button(target);
+    let upload_button = window.composer_upload_button(target);
+    let text_view = window.composer_text_view(target);
+    let format_toolbar = window.composer_format_host(target);
+    let (header_title, header_subtitle) = match target {
+        ComposerTarget::Message => (
+            imp.message_title.title().to_string(),
+            imp.message_title.subtitle().to_string(),
+        ),
+        ComposerTarget::Thread => (
+            imp.thread_title.title().to_string(),
+            imp.thread_title.subtitle().to_string(),
+        ),
+    };
     let _ = std::fs::write(
         path,
         serde_json::json!({
             "state": state,
+            "target": match target {
+                ComposerTarget::Message => "message",
+                ComposerTarget::Thread => "thread",
+            },
             "channel_id": edit.as_ref().map(|edit| edit.channel_id.as_str()),
             "message_ts": edit.as_ref().map(|edit| edit.original.ts.as_str()),
-            "header_title": imp.message_title.title().to_string(),
-            "header_subtitle": imp.message_title.subtitle().to_string(),
-            "send_tooltip": imp.send_button.tooltip_text().map(|text| text.to_string()),
-            "edit_class": imp.send_button.has_css_class("message-edit-action"),
-            "suggested_class": imp.send_button.has_css_class("suggested-action"),
-            "send_sensitive": imp.send_button.is_sensitive(),
-            "upload_sensitive": imp.upload_button.is_sensitive(),
-            "entry_editable": imp.message_entry.is_editable(),
-            "format_sensitive": imp.message_format_toolbar.is_sensitive(),
+            "header_title": header_title,
+            "header_subtitle": header_subtitle,
+            "send_tooltip": send_button.tooltip_text().map(|text| text.to_string()),
+            "edit_class": send_button.has_css_class("message-edit-action"),
+            "suggested_class": send_button.has_css_class("suggested-action"),
+            "send_sensitive": send_button.is_sensitive(),
+            "upload_sensitive": upload_button.is_sensitive(),
+            "entry_editable": text_view.is_editable(),
+            "format_sensitive": format_toolbar.is_sensitive(),
         })
         .to_string(),
     );
@@ -15198,9 +15397,21 @@ mod tests {
             },
         ];
 
-        let selected = latest_editable_message(&messages, Some("USELF")).unwrap();
+        let selected =
+            latest_editable_message(ComposerTarget::Message, &messages, Some("USELF")).unwrap();
         assert_eq!(selected.ts, "2.0");
-        assert_eq!(latest_editable_message(&messages, None), None);
+        assert_eq!(
+            latest_editable_message(ComposerTarget::Message, &messages, None),
+            None
+        );
+
+        let selected_thread =
+            latest_editable_message(ComposerTarget::Thread, &messages, Some("USELF")).unwrap();
+        assert_eq!(selected_thread.ts, "4.0");
+        assert_eq!(
+            latest_editable_message(ComposerTarget::Thread, &messages, None),
+            None
+        );
     }
 
     #[test]

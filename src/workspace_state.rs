@@ -1493,7 +1493,6 @@ impl WorkspaceViewState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
     pub(crate) fn apply_thread(
         &mut self,
         channel_id: &str,
@@ -1941,14 +1940,12 @@ fn normalize_channel_messages(messages: Vec<SlackMessage>) -> Vec<SlackMessage> 
     )
 }
 
-#[cfg(test)]
 fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
     let mut messages = existing.to_vec();
     messages.extend(page.iter().cloned());
     normalize_messages(messages)
 }
 
-#[cfg(test)]
 fn merge_message_refresh(
     existing: &[SlackMessage],
     snapshot: &[SlackMessage],
