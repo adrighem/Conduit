@@ -538,3 +538,12 @@
   - `meson compile -C _build`: pass
   - `meson test -C _build`: pass, all 19 integration and headless UI test suites passed
 - GitHub status: 0 unread inbox notifications, 0 open issues, 0 open pull requests, 0 open Dependabot alerts.
+
+## 2026-09-11 Maintainer Pass
+
+- Scope: manual pass, backlog + release PR + local in-progress work audit.
+- GitHub: 0 open issues, PR:20 only open PR (release-please 0.5.0), 0 unread Conduit notifications, Dependabot alert 1 fixed, CodeQL alerts 1-5 fixed.
+- PR:20: mergeable, diff limited to release metadata (manifest, changelog, Cargo.lock/toml, AppStream, meson.build). Exact-head CI `34587864117` and CodeQL pass.
+- Worktree: uncommitted thread-reply edit shortcut (`Ctrl+Up` in thread) across `src/window.rs`, `src/workspace_state.rs` (drops `#[cfg(test)]` gating on `apply_thread`/`merge_message_pages`/`merge_message_refresh`, now used outside tests), `tests/test_keyboard_shortcuts.py`.
+- Local checks on dirty worktree: `cargo fmt --check` pass, `cargo test --locked` pass (1116 passed, 3 ignored), `cargo clippy --all-targets -- -D warnings` pass, `meson compile` pass, `meson test` pass (19/19).
+- No public GitHub action or commit/push was taken.

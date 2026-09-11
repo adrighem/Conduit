@@ -1,22 +1,22 @@
 {
   "repo": "adrighem/Conduit",
-  "last_manual_run": "2026-09-10-codeql-https-remediation",
+  "last_manual_run": "2026-09-11-maintainer-pass",
   "last_known_open_issues": 0,
-  "last_known_open_pull_requests": 0,
+  "last_known_open_pull_requests": 1,
   "last_known_total_issues": 13,
-  "last_known_total_pull_requests": 6,
+  "last_known_total_pull_requests": 7,
   "last_checks": {
-    "github_actions": "latest remote CI is green",
-    "cargo_test": "pass: 1110 passed, 0 failed, 3 ignored",
+    "github_actions": "exact-head CI and CodeQL green on PR:20 and main",
+    "cargo_test": "pass: 1116 passed, 0 failed, 3 ignored",
     "cargo_clippy": "pass: 0 warnings with -D warnings",
     "meson": "pass: 19/19 integration and headless UI test suites passed",
     "cargo_fmt": "pass",
-    "security_alerts": "0 open Dependabot alerts, 2 high-severity CodeQL alerts remediated locally in mock fixtures"
+    "security_alerts": "0 open Dependabot alerts, 0 open CodeQL alerts (all fixed)"
   },
   "notes": {
     "skill_package": "open-source-maintainer active, standard workflow execution",
-    "priority": "Remediated CodeQL non-https-url alerts #4 and #5 in file_service and workspace_service mock test fixtures",
-    "worktree": "clean and tested, waiting for user push approval",
-    "public_actions": "Remediated CodeQL alerts #4 and #5 locally; no public actions taken without explicit approval"
+    "priority": "PR:20 release-please 0.5.0 is mergeable and green, pending approval; uncommitted thread-reply edit shortcut passes all local checks, pending commit/push approval",
+    "worktree": "dirty with tested thread-reply edit shortcut work (window.rs, workspace_state.rs, test_keyboard_shortcuts.py)",
+    "public_actions": "none taken this pass; merge and push both need explicit approval"
   }
 }
