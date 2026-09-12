@@ -115,6 +115,40 @@ impl<'a> EmojiCatalog<'a> {
         }));
         entries
     }
+
+    pub fn canonical_name(&self, name: &str) -> String {
+        self.canonical_name_with_seen(name, &mut HashSet::new())
+    }
+
+    fn canonical_name_with_seen(&self, name: &str, seen: &mut HashSet<String>) -> String {
+        if !seen.insert(name.to_string()) {
+            return name.to_string();
+        }
+        if let Some((base, modifier)) = name.rsplit_once("::skin-tone-") {
+            if !base.is_empty() {
+                let canonical_base = self.canonical_name_with_seen(base, seen);
+                return format!("{canonical_base}::skin-tone-{modifier}");
+            }
+        }
+        if let Some(value) = self.custom.get(name) {
+            if let Some(target) = value.strip_prefix("alias:") {
+                return self.canonical_name_with_seen(target, seen);
+            }
+            return name.to_string();
+        }
+        if let Some(canonical) = emojis::get_by_shortcode(name)
+            .or_else(|| {
+                UNICODE_BY_CANONICAL_NAME
+                    .get(&canonical_emoji_name(name))
+                    .copied()
+                    .flatten()
+            })
+            .and_then(|e| e.shortcode())
+        {
+            return canonical.to_string();
+        }
+        name.to_string()
+    }
 }
 
 fn slack_skin_tone(name: &str) -> Option<(&str, emojis::SkinTone)> {
@@ -503,6 +537,41 @@ mod tests {
             EmojiPickerModel::new(EmojiCatalog::new(&HashMap::new()).entries()).search("+1");
 
         assert_eq!(matches.first().map(|entry| entry.name.as_str()), Some("+1"));
+    }
+
+    #[test]
+    fn catalog_canonicalizes_aliases_and_standard_names() {
+        let custom = HashMap::from([
+            ("ohyou".to_string(), "alias:awesome".to_string()),
+            (
+                "awesome".to_string(),
+                "https://emoji.example/awesome.png".to_string(),
+            ),
+            ("approval".to_string(), "alias:+1".to_string()),
+            ("chained".to_string(), "alias:ohyou".to_string()),
+            ("one".to_string(), "alias:two".to_string()),
+            ("two".to_string(), "alias:one".to_string()),
+        ]);
+        let catalog = EmojiCatalog::new(&custom);
+
+        assert_eq!(catalog.canonical_name("thumbsup"), "+1");
+        assert_eq!(catalog.canonical_name("thumbsdown"), "-1");
+        assert_eq!(catalog.canonical_name("+1"), "+1");
+        assert_eq!(
+            catalog.canonical_name("thumbsup::skin-tone-3"),
+            "+1::skin-tone-3"
+        );
+        assert_eq!(catalog.canonical_name("+1::skin-tone-4"), "+1::skin-tone-4");
+        assert_eq!(catalog.canonical_name("ohyou"), "awesome");
+        assert_eq!(catalog.canonical_name("chained"), "awesome");
+        assert_eq!(catalog.canonical_name("approval"), "+1");
+        assert_eq!(
+            catalog.canonical_name("approval::skin-tone-2"),
+            "+1::skin-tone-2"
+        );
+        assert_eq!(catalog.canonical_name("one"), "one");
+        assert_eq!(catalog.canonical_name("party_parrot"), "party_parrot");
+        assert_eq!(catalog.canonical_name("smile"), "smile");
     }
 
     #[test]

@@ -3949,12 +3949,13 @@ fn action_thread_ts<'a>(
 }
 
 fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
+    let catalog = EmojiCatalog::new(&context.custom_emojis);
     let mut usage = HashMap::new();
     for (index, name) in context
         .recent_reactions
         .iter()
         .take(config::RECENT_REACTION_HISTORY_LIMIT)
-        .map(String::as_str)
+        .map(|name| catalog.canonical_name(name))
         .enumerate()
     {
         if name.trim().is_empty() {
@@ -3973,15 +3974,15 @@ fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
         },
     );
     let requested = ranked.into_iter().map(|(name, _)| name).chain([
-        "smile",
-        "thumbsup",
-        "white_check_mark",
-        "heart",
+        "smile".to_string(),
+        "+1".to_string(),
+        "white_check_mark".to_string(),
+        "heart".to_string(),
     ]);
     let mut seen = HashSet::new();
     requested
-        .filter(|name| seen.insert(*name))
-        .filter_map(|name| emoji_entry(name, context))
+        .filter(|name| seen.insert(name.clone()))
+        .filter_map(|name| emoji_entry(&name, context))
         .take(QUICK_REACTION_LIMIT)
         .collect()
 }
@@ -5946,7 +5947,7 @@ mod tests {
             .map(|emoji| emoji.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["heart", "eyes", "thumbsup", "fire"]);
+        assert_eq!(names, ["heart", "eyes", "+1", "fire"]);
 
         let tie_context = MessageHtmlContext {
             recent_reactions: [
@@ -5962,7 +5963,35 @@ mod tests {
             .map(|emoji| emoji.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(tied_names, ["eyes", "heart", "thumbsup", "fire"]);
+        assert_eq!(tied_names, ["eyes", "heart", "+1", "fire"]);
+    }
+
+    #[test]
+    fn quick_reactions_canonicalize_and_deduplicate_aliases() {
+        let custom_emojis = Arc::new(HashMap::from([
+            ("ohyou".to_string(), "alias:awesome".to_string()),
+            (
+                "awesome".to_string(),
+                "https://emoji.example/awesome.png".to_string(),
+            ),
+        ]));
+        let context = MessageHtmlContext {
+            custom_emojis,
+            recent_reactions: vec![
+                "thumbsup".to_string(),
+                "+1".to_string(),
+                "ohyou".to_string(),
+                "awesome".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let names = recent_reactions(&context)
+            .into_iter()
+            .map(|emoji| emoji.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["+1", "awesome", "smile", "white_check_mark"]);
     }
 
     #[test]

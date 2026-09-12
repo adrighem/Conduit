@@ -2534,13 +2534,28 @@ fn apply_reaction_to_message(
     user_id: &str,
     added: bool,
 ) -> bool {
+    let is_same_reaction = |existing: &str| {
+        existing == name
+            || matches!(
+                (existing, name),
+                ("thumbsup", "+1")
+                    | ("+1", "thumbsup")
+                    | ("thumbsdown", "-1")
+                    | ("-1", "thumbsdown")
+            )
+    };
     let reactions = message.reactions.get_or_insert_with(Vec::new);
     let position = reactions
         .iter()
-        .position(|reaction| reaction.name.as_deref() == Some(name));
+        .position(|reaction| reaction.name.as_deref().is_some_and(is_same_reaction));
     if added {
         if let Some(position) = position {
             let reaction = &mut reactions[position];
+            if reaction.name.as_deref() == Some("thumbsup") && name == "+1" {
+                reaction.name = Some("+1".to_string());
+            } else if reaction.name.as_deref() == Some("thumbsdown") && name == "-1" {
+                reaction.name = Some("-1".to_string());
+            }
             let users = reaction.users.get_or_insert_with(Vec::new);
             if users.iter().any(|known| known == user_id) {
                 return false;

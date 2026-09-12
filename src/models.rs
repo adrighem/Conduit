@@ -1706,12 +1706,23 @@ impl SlackMessage {
             return false;
         };
 
+        let is_same_reaction = |name: &str| {
+            name == reaction_name
+                || matches!(
+                    (name, reaction_name),
+                    ("thumbsup", "+1")
+                        | ("+1", "thumbsup")
+                        | ("thumbsdown", "-1")
+                        | ("-1", "thumbsdown")
+                )
+        };
+
         self.reactions
             .as_ref()
             .into_iter()
             .flatten()
             .any(|reaction| {
-                reaction.name.as_deref() == Some(reaction_name)
+                reaction.name.as_deref().is_some_and(is_same_reaction)
                     && reaction
                         .users
                         .as_ref()

@@ -8091,7 +8091,11 @@ impl ConduitWindow {
                 let Some(ts) = query_param(url, "ts") else {
                     return true;
                 };
-                let name = query_param(url, "name").unwrap_or_else(|| "thumbsup".to_string());
+                let name = query_param(url, "name").unwrap_or_else(|| "+1".to_string());
+                let name = {
+                    let custom = self.imp().custom_emojis.borrow();
+                    crate::emoji::EmojiCatalog::new(&custom).canonical_name(&name)
+                };
                 let add = query_param(url, "add").is_none_or(|value| value == "true");
                 let thread_ts = query_param(url, "thread_ts");
                 if self.send_command(RuntimeCommand::SetReaction {
