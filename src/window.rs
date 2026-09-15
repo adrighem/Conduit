@@ -7391,12 +7391,14 @@ impl ConduitWindow {
             }
         };
         let draft = self.composer_rich_draft(target);
-        if let SlashCommandValidation::Unsupported { name, .. } =
-            validate_slash_command(&draft.text)
-        {
-            self.set_status(&format!("Unsupported slash command: /{}", name));
-            return;
-        }
+        let slash_command = match validate_slash_command(&draft.text) {
+            SlashCommandValidation::Unsupported { name, .. } => {
+                self.set_status(&format!("Unsupported slash command: /{}", name));
+                return;
+            }
+            SlashCommandValidation::Supported(cmd) => Some(cmd),
+            SlashCommandValidation::NotACommand => None,
+        };
         let payload = draft.slack_payload();
         if payload.is_none() && draft.attachments.is_empty() {
             return;
@@ -7413,6 +7415,23 @@ impl ConduitWindow {
                 ComposerTarget::Message => "A message is already being sent.",
                 ComposerTarget::Thread => "A reply is already being sent.",
             }));
+            return;
+        }
+
+        if let Some(cmd) = slash_command {
+            if !self.remember_submitted_draft(&channel_id, thread_ts.as_deref(), &submitted) {
+                return;
+            }
+            if !self.send_command(RuntimeCommand::ExecuteSlashCommand {
+                channel_id,
+                command: format!("/{}", cmd.name),
+                text: cmd.arguments,
+                thread_ts,
+            }) {
+                return;
+            }
+            self.set_composer_submission_sensitive(target, false);
+            self.set_status(&format!("Executing /{}", cmd.name));
             return;
         }
 
@@ -16018,6 +16037,35 @@ mod tests {
 
         assert!(slash_check < post_admission);
         assert!(submit.contains("Unsupported slash command: /"));
+    }
+
+    #[test]
+    fn submit_composer_dispatches_supported_slash_commands_via_runtime() {
+        let source = include_str!("window.rs");
+        let submit = source
+            .split_once("fn submit_composer")
+            .and_then(|(_, source)| source.split_once("fn choose_file_for_upload"))
+            .map(|(source, _)| source)
+            .expect("composer submission should be bounded");
+
+        let slash_dispatch = submit
+            .find("if !self.send_command(RuntimeCommand::ExecuteSlashCommand")
+            .expect("slash command execution should check runtime admission");
+        let post_admission = submit
+            .find("if !self.send_command(RuntimeCommand::PostMessage")
+            .expect("message posting should check runtime admission");
+
+        assert!(slash_dispatch < post_admission);
+        assert!(submit.contains("Executing /"));
+
+        let event_handling = source
+            .split_once("RuntimeEventKind::SlashCommandExecuted")
+            .and_then(|(_, source)| source.split_once("RuntimeEventKind::MessageUpdateCompleted"))
+            .map(|(source, _)| source)
+            .expect("slash command event handler should be bounded");
+
+        assert!(event_handling.contains("complete_submitted_draft"));
+        assert!(event_handling.contains("set_composer_submission_sensitive"));
     }
 
     #[test]
