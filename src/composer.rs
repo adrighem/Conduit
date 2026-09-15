@@ -96,6 +96,61 @@ pub struct HydratedComposerText {
     pub mentions: Vec<MentionSpan>,
 }
 
+pub const SUPPORTED_SLASH_COMMANDS: &[&str] = &["giphy"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommandValidation {
+    Supported(SlashCommand),
+    Unsupported { name: String, arguments: String },
+    NotACommand,
+}
+
+pub fn parse_slash_command(text: &str) -> Option<SlashCommand> {
+    let trimmed = text.trim();
+    let stripped = trimmed.strip_prefix('/')?;
+    if stripped.is_empty() {
+        return None;
+    }
+    let mut parts = stripped.splitn(2, |c: char| c.is_whitespace());
+    let name = parts.next().unwrap_or("").to_lowercase();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    let arguments = parts.next().unwrap_or("").trim().to_string();
+    Some(SlashCommand { name, arguments })
+}
+
+pub fn is_supported_slash_command(name: &str) -> bool {
+    let normalized = name.strip_prefix('/').unwrap_or(name).to_lowercase();
+    SUPPORTED_SLASH_COMMANDS.contains(&normalized.as_str())
+}
+
+pub fn validate_slash_command(text: &str) -> SlashCommandValidation {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return SlashCommandValidation::NotACommand;
+    }
+    match parse_slash_command(trimmed) {
+        Some(cmd) => {
+            if is_supported_slash_command(&cmd.name) {
+                SlashCommandValidation::Supported(cmd)
+            } else {
+                SlashCommandValidation::Unsupported {
+                    name: cmd.name,
+                    arguments: cmd.arguments,
+                }
+            }
+        }
+        None => SlashCommandValidation::NotACommand,
+    }
+}
+
 const RICH_COMPOSER_DRAFT_PREFIX: &str = "conduit-rich-v1:";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2121,4 +2176,70 @@ mod tests {
         assert_eq!(decode_rich_composer_draft("legacy <@UADA> draft"), None);
         assert_eq!(decode_rich_composer_draft("conduit-rich-v1:{broken"), None);
     }
+
+    #[test]
+    fn parses_and_validates_slash_commands() {
+        assert_eq!(
+            parse_slash_command("/giphy cats and dogs"),
+            Some(SlashCommand {
+                name: "giphy".to_string(),
+                arguments: "cats and dogs".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/GIPHY   dancing banana   "),
+            Some(SlashCommand {
+                name: "giphy".to_string(),
+                arguments: "dancing banana".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/giphy"),
+            Some(SlashCommand {
+                name: "giphy".to_string(),
+                arguments: String::new(),
+            })
+        );
+        assert_eq!(
+            parse_slash_command("/unknown_command arg1 arg2"),
+            Some(SlashCommand {
+                name: "unknown_command".to_string(),
+                arguments: "arg1 arg2".to_string(),
+            })
+        );
+        assert_eq!(parse_slash_command("/"), None);
+        assert_eq!(parse_slash_command("/ notacommand"), None);
+        assert_eq!(parse_slash_command("not a command /giphy"), None);
+        assert_eq!(parse_slash_command("//comment"), None);
+
+        assert!(is_supported_slash_command("giphy"));
+        assert!(is_supported_slash_command("/giphy"));
+        assert!(is_supported_slash_command("/GIPHY"));
+        assert!(!is_supported_slash_command("unknown"));
+        assert!(!is_supported_slash_command("/shrug"));
+
+        assert_eq!(
+            validate_slash_command("/giphy cat"),
+            SlashCommandValidation::Supported(SlashCommand {
+                name: "giphy".to_string(),
+                arguments: "cat".to_string(),
+            })
+        );
+        assert_eq!(
+            validate_slash_command("/shrug"),
+            SlashCommandValidation::Unsupported {
+                name: "shrug".to_string(),
+                arguments: String::new(),
+            }
+        );
+        assert_eq!(
+            validate_slash_command("hello world"),
+            SlashCommandValidation::NotACommand
+        );
+        assert_eq!(
+            validate_slash_command("/ not a command"),
+            SlashCommandValidation::NotACommand
+        );
+    }
 }
+
