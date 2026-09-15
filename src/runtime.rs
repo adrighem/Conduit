@@ -13914,6 +13914,46 @@ mod tests {
         assert_eq!(fields.target, "exact-message:C123:1.0");
         assert!(!format!("{fields:?}").contains("do not trace this edit"));
         assert!(!format!("{fields:?}").contains("do not trace edited blocks"));
+
+        let slash = RuntimeCommand::ExecuteSlashCommand {
+            channel_id: "C123".to_string(),
+            command: "/giphy".to_string(),
+            text: "do not trace slash argument".to_string(),
+            thread_ts: Some("123.456".to_string()),
+        };
+        let slash_fields = RuntimeTraceFields::for_command(identity, &slash);
+        assert_eq!(slash_fields.session, identity.session);
+        assert_eq!(slash_fields.request, identity.request);
+        assert_eq!(slash_fields.operation, RuntimeOperation::ExecuteSlashCommand);
+        assert_eq!(slash_fields.target, "message:C123:thread:123.456");
+        assert!(!format!("{slash_fields:?}").contains("do not trace slash argument"));
+    }
+
+    #[test]
+    fn execute_slash_command_admits_as_durable_action_and_targets_message_context() {
+        let command = RuntimeCommand::ExecuteSlashCommand {
+            channel_id: "C123".to_string(),
+            command: "/giphy".to_string(),
+            text: "cats".to_string(),
+            thread_ts: None,
+        };
+        let descriptor = command.descriptor();
+        assert_eq!(
+            descriptor.context.operation,
+            RuntimeOperation::ExecuteSlashCommand
+        );
+        assert_eq!(
+            descriptor.context.target,
+            RuntimeTarget::Message {
+                channel_id: "C123".to_string(),
+                thread_ts: None,
+            }
+        );
+        assert_eq!(descriptor.lane, RuntimeTaskLane::Interactive);
+        assert_eq!(
+            descriptor.admission.kind,
+            RuntimeAdmissionKind::DurableAction
+        );
     }
 
     #[test]
