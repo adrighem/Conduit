@@ -13925,7 +13925,7 @@ mod tests {
         assert_eq!(slash_fields.session, identity.session);
         assert_eq!(slash_fields.request, identity.request);
         assert_eq!(slash_fields.operation, RuntimeOperation::ExecuteSlashCommand);
-        assert_eq!(slash_fields.target, "message:C123:thread:123.456");
+        assert_eq!(slash_fields.target, "message:C123:123.456");
         assert!(!format!("{slash_fields:?}").contains("do not trace slash argument"));
     }
 
@@ -18188,7 +18188,7 @@ mod tests {
     #[test]
     fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
         let commands = runtime_command_fixtures();
-        assert_eq!(commands.len(), 42);
+        assert_eq!(commands.len(), 43);
 
         for command in commands {
             let descriptor = command.descriptor();

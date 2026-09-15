@@ -15988,20 +15988,25 @@ mod tests {
             .map(|(source, _)| source)
             .expect("composer submission should be bounded");
 
+        let slash_admission = submit
+            .find("if !self.send_command(RuntimeCommand::ExecuteSlashCommand")
+            .expect("slash command execution should check runtime admission");
         let post_admission = submit
             .find("if !self.send_command(RuntimeCommand::PostMessage")
             .expect("message posting should check runtime admission");
         let upload_admission = submit
             .find("if !self.send_command(RuntimeCommand::UploadFiles")
             .expect("file uploading should check runtime admission");
-        let submission_disabled = submit
-            .find("self.set_composer_submission_sensitive(target, false)")
-            .expect("admitted submission should disable its composer");
         let upload_progress = submit
             .find("progress.set_visible(true)")
             .expect("admitted upload should reveal progress");
 
-        assert!(post_admission < submission_disabled);
+        let slash_branch = &submit[slash_admission..post_admission];
+        assert!(slash_branch.contains("self.set_composer_submission_sensitive(target, false)"));
+
+        let post_branch = &submit[post_admission..upload_admission];
+        assert!(post_branch.contains("self.set_composer_submission_sensitive(target, false)"));
+
         assert!(upload_admission < upload_progress);
     }
 
