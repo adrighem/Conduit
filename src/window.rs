@@ -40,10 +40,11 @@ use crate::composer::{
     emoji_token_at_caret, encode_rich_composer_draft, expand_composer_semantic_selection,
     hydrate_composer_mentions, mention_candidates, mention_token_at_caret, message_edit_key_action,
     replace_emoji_token, replace_mention_token, search_mention_candidates,
-    serialize_composer_semantics, text_view_enter_action, text_view_text, CompletionKeyAction,
-    ComposerAttachmentDraft, ComposerBlockKind, ComposerBlockSpan, ComposerEntityKind,
-    ComposerEntitySpan, ComposerStyleSpan, ComposerTextStyle, EmojiToken, MentionCandidate,
-    MentionSpan, MentionToken, MessageEditKeyAction, RichComposerDraft, TextViewEnterAction,
+    serialize_composer_semantics, text_view_enter_action, text_view_text, validate_slash_command,
+    CompletionKeyAction, ComposerAttachmentDraft, ComposerBlockKind, ComposerBlockSpan,
+    ComposerEntityKind, ComposerEntitySpan, ComposerStyleSpan, ComposerTextStyle, EmojiToken,
+    MentionCandidate, MentionSpan, MentionToken, MessageEditKeyAction, RichComposerDraft,
+    SlashCommandValidation, TextViewEnterAction,
 };
 use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
@@ -7373,6 +7374,12 @@ impl ConduitWindow {
             }
         };
         let draft = self.composer_rich_draft(target);
+        if let SlashCommandValidation::Unsupported { name, .. } =
+            validate_slash_command(&draft.text)
+        {
+            self.set_status(&format!("Unsupported slash command: /{}", name));
+            return;
+        }
         let payload = draft.slack_payload();
         if payload.is_none() && draft.attachments.is_empty() {
             return;
@@ -13906,6 +13913,8 @@ mod tests {
             kind: ConversationKind::DirectMessage,
             unread: false,
             unread_count: 0,
+            has_mention: false,
+            mention_count: 0,
             selected: false,
             starred: false,
             private: true,
@@ -15975,6 +15984,26 @@ mod tests {
     }
 
     #[test]
+    fn submit_composer_guards_against_unsupported_slash_commands() {
+        let source = include_str!("window.rs");
+        let submit = source
+            .split_once("fn submit_composer")
+            .and_then(|(_, source)| source.split_once("fn choose_file_for_upload"))
+            .map(|(source, _)| source)
+            .expect("composer submission should be bounded");
+
+        let slash_check = submit
+            .find("validate_slash_command(&draft.text)")
+            .expect("composer submission should validate slash commands");
+        let post_admission = submit
+            .find("if !self.send_command(RuntimeCommand::PostMessage")
+            .expect("message posting should check runtime admission");
+
+        assert!(slash_check < post_admission);
+        assert!(submit.contains("Unsupported slash command: /"));
+    }
+
+    #[test]
     fn thread_sidebar_resize_follows_end_edge_and_clamps() {
         assert_eq!(
             resized_end_sidebar_fraction(400.0, -100.0, 1_000.0),
@@ -16033,7 +16062,7 @@ mod tests {
             id: "C1".to_string(),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("2", true);
+        conversation.observe_attention_message_at("2", true, false);
         let messages = [SlackMessage {
             ts: "3".to_string(),
             ..Default::default()
@@ -16051,8 +16080,8 @@ mod tests {
             id: "C1".to_string(),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("2", true);
-        conversation.observe_attention_message_at("3", true);
+        conversation.observe_attention_message_at("2", true, false);
+        conversation.observe_attention_message_at("3", true, false);
         let messages = [SlackMessage {
             ts: "3".to_string(),
             ..Default::default()
@@ -16070,8 +16099,8 @@ mod tests {
             id: "C1".to_string(),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("2", true);
-        conversation.observe_attention_message(true);
+        conversation.observe_attention_message_at("2", true, false);
+        conversation.observe_attention_message(true, false);
 
         assert_eq!(
             exact_first_visible_unread_message_ts(&conversation, &[]),
