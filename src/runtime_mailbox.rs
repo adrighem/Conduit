@@ -136,6 +136,12 @@ pub enum RuntimeCommand {
         attachments_json: Option<String>,
         thread_ts: Option<String>,
     },
+    ExecuteSlashCommand {
+        channel_id: String,
+        command: String,
+        text: String,
+        thread_ts: Option<String>,
+    },
     UpdateMessage {
         channel_id: String,
         original: Box<SlackMessage>,
@@ -221,6 +227,7 @@ pub enum RuntimeOperation {
     MessagePermalink,
     MessageAction,
     PostMessage,
+    ExecuteSlashCommand,
     UpdateMessage,
     Reaction,
     Saved,

@@ -6664,6 +6664,23 @@ impl ConduitWindow {
                     thread_ts.as_deref(),
                 );
             }
+            RuntimeEventKind::SlashCommandExecuted {
+                channel_id,
+                command,
+                thread_ts,
+                response: _,
+            } => {
+                self.complete_submitted_draft(&channel_id, thread_ts.as_deref());
+                if self.mutation_target_is_active(&channel_id, thread_ts.as_deref()) {
+                    let target = if thread_ts.is_some() {
+                        ComposerTarget::Thread
+                    } else {
+                        ComposerTarget::Message
+                    };
+                    self.set_composer_submission_sensitive(target, true);
+                    self.set_status(&format!("Executed {}", command));
+                }
+            }
             RuntimeEventKind::MessageUpdateCompleted {
                 channel_id,
                 message_ts,

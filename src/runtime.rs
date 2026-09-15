@@ -510,6 +510,21 @@ impl RuntimeCommand {
                 RuntimeTaskLane::Interactive,
                 RuntimeAdmissionPolicy::durable_action(),
             ),
+            Self::ExecuteSlashCommand {
+                channel_id,
+                thread_ts,
+                ..
+            } => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::ExecuteSlashCommand,
+                    RuntimeTarget::Message {
+                        channel_id: channel_id.clone(),
+                        thread_ts: thread_ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
+            ),
             Self::UpdateMessage {
                 channel_id,
                 original,
@@ -856,6 +871,12 @@ pub enum RuntimeEventKind {
         message_ts: String,
         thread_ts: Option<String>,
     },
+    SlashCommandExecuted {
+        channel_id: String,
+        command: String,
+        thread_ts: Option<String>,
+        response: Box<crate::slack::SlashCommandResponse>,
+    },
     MessageUpdateCompleted {
         channel_id: String,
         message_ts: String,
@@ -1007,6 +1028,7 @@ impl RuntimeEventKind {
             Self::Status(_)
             | Self::Error(_)
             | Self::MessagePostCompleted { .. }
+            | Self::SlashCommandExecuted { .. }
             | Self::MessageUpdateCompleted { .. }
             | Self::ReactionUpdateCompleted { .. }
             | Self::SavedUpdated { .. }
@@ -6394,6 +6416,28 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 )
                 .await?;
         }
+        RuntimeCommand::ExecuteSlashCommand {
+            channel_id,
+            command,
+            text,
+            thread_ts,
+        } => {
+            let api = require_slack(context.slack)?;
+            let response = api
+                .execute_slash_command(
+                    &channel_id,
+                    &command,
+                    &text,
+                    thread_ts.as_deref(),
+                )
+                .await?;
+            context.events.send_event(RuntimeEventKind::SlashCommandExecuted {
+                channel_id,
+                command,
+                thread_ts,
+                response: Box::new(response),
+            });
+        }
         RuntimeCommand::UpdateMessage {
             channel_id,
             original,
@@ -7769,12 +7813,17 @@ async fn persist_socket_attention(
     };
     let channel_id = &message_event.channel_id;
     let message = &message_event.message;
+    // Ambient unread is scoped to messages that belong in the channel's own
+    // timeline, matching the same gate applied in workspace_pipeline.rs, so
+    // this early-claim path and the later reduction agree on what counts.
+    let general_unread = decision.record_unread && message.belongs_in_channel_timeline();
     match store
         .accept_attention_delivery_for_message(
             channel_id,
             &message.ts,
             message.thread_root_ts(),
-            decision.record_unread,
+            general_unread,
+            decision.record_mention,
             decision.send_notification,
         )
         .await
@@ -16373,7 +16422,10 @@ mod tests {
             assert_eq!(thread.len(), 1);
             assert_eq!(thread[0].ts, "3.0");
             let conversation = store.load_conversations().await.unwrap().unwrap().remove(0);
-            assert_eq!(conversation.unread_activity_count(), 3);
+            // The thread reply ("3.0") doesn't belong in the channel's own
+            // timeline, so it contributes to the thread's unread state
+            // (checked above) but not the channel-level ambient count.
+            assert_eq!(conversation.unread_activity_count(), 2);
             let _ = std::fs::remove_dir_all(directory);
         });
     }
@@ -17845,6 +17897,7 @@ mod tests {
             | RuntimeCommand::DownloadAttachment { .. }
             | RuntimeCommand::ExecuteMessageAction { .. }
             | RuntimeCommand::PostMessage { .. }
+            | RuntimeCommand::ExecuteSlashCommand { .. }
             | RuntimeCommand::UpdateMessage { .. }
             | RuntimeCommand::SetReaction { .. }
             | RuntimeCommand::SetSaved { .. }
@@ -17912,6 +17965,7 @@ mod tests {
             | RuntimeCommand::MarkConversationReadAll { .. }
             | RuntimeCommand::MarkThreadRead { .. }
             | RuntimeCommand::PostMessage { .. }
+            | RuntimeCommand::ExecuteSlashCommand { .. }
             | RuntimeCommand::UpdateMessage { .. }
             | RuntimeCommand::SetReaction { .. }
             | RuntimeCommand::SetSaved { .. }
@@ -18041,6 +18095,12 @@ mod tests {
                 text: "message-text-canary".to_string(),
                 blocks_json: Some("blocks-canary".to_string()),
                 attachments_json: None,
+                thread_ts: None,
+            },
+            RuntimeCommand::ExecuteSlashCommand {
+                channel_id: "C1".to_string(),
+                command: "/giphy".to_string(),
+                text: "command-text-canary".to_string(),
                 thread_ts: None,
             },
             RuntimeCommand::UpdateMessage {
@@ -20038,7 +20098,7 @@ mod tests {
     #[test]
     fn raw_unread_direct_message_is_prefetched_after_local_overlay_was_read() {
         let mut offline_unread = dm("D-offline", 2);
-        offline_unread.observe_attention_message(false);
+        offline_unread.observe_attention_message(false, false);
         assert!(!offline_unread.has_unread_activity());
         assert!(offline_unread.raw_has_unread_activity());
 
