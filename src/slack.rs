@@ -1297,6 +1297,17 @@ impl SlackApi {
         Ok(message)
     }
 
+    pub async fn execute_slash_command(
+        &self,
+        channel_id: &str,
+        command: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<SlashCommandResponse> {
+        let params = execute_slash_command_params(channel_id, command, text, thread_ts);
+        self.post_form("chat.command", &params).await
+    }
+
     pub async fn update_message(
         &self,
         channel_id: &str,
@@ -1848,6 +1859,28 @@ fn post_message_params(
     {
         params.push(("attachments", attachments_json.to_string()));
     }
+    if let Some(thread_ts) = thread_ts.filter(|thread_ts| !thread_ts.trim().is_empty()) {
+        params.push(("thread_ts", thread_ts.to_string()));
+    }
+    params
+}
+
+fn execute_slash_command_params(
+    channel_id: &str,
+    command: &str,
+    text: &str,
+    thread_ts: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let command = if command.starts_with('/') {
+        command.to_string()
+    } else {
+        format!("/{}", command)
+    };
+    let mut params = vec![
+        ("channel", channel_id.to_string()),
+        ("command", command),
+        ("text", text.to_string()),
+    ];
     if let Some(thread_ts) = thread_ts.filter(|thread_ts| !thread_ts.trim().is_empty()) {
         params.push(("thread_ts", thread_ts.to_string()));
     }
@@ -2803,6 +2836,16 @@ struct PostMessageResponse {
     message: SlackMessage,
 }
 impl_slack_response!(PostMessageResponse);
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SlashCommandResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub response: Option<String>,
+    pub command: Option<String>,
+    pub channel: Option<String>,
+}
+impl_slack_response!(SlashCommandResponse);
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -3912,6 +3955,66 @@ mod tests {
         assert!(params.contains(&("blocks", r#"[{"type":"rich_text"}]"#.to_string())));
         assert!(params.contains(&("thread_ts", "1710000000.000100".to_string())));
         assert!(params.contains(&("client_msg_id", "client-message-id".to_string())));
+    }
+
+    #[test]
+    fn execute_slash_command_params_formats_command_and_options() {
+        let params = execute_slash_command_params("C123", "giphy", "cat dance", Some("1710000000.000100"));
+        assert!(params.contains(&("channel", "C123".to_string())));
+        assert!(params.contains(&("command", "/giphy".to_string())));
+        assert!(params.contains(&("text", "cat dance".to_string())));
+        assert!(params.contains(&("thread_ts", "1710000000.000100".to_string())));
+
+        let params_no_thread = execute_slash_command_params("C456", "/giphy", "banana", None);
+        assert!(params_no_thread.contains(&("channel", "C456".to_string())));
+        assert!(params_no_thread.contains(&("command", "/giphy".to_string())));
+        assert!(params_no_thread.contains(&("text", "banana".to_string())));
+        assert!(!params_no_thread.iter().any(|(k, _)| *k == "thread_ts"));
+    }
+
+    #[test]
+    fn execute_slash_command_posts_to_chat_command_endpoint() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            assert_eq!(request.url(), "/api/chat.command");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"response":"ok","command":"/giphy","channel":"C123"}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            body
+        });
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+
+        let response = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.execute_slash_command("C123", "/giphy", "cat dance", Some("1710000000.000100")))
+            .expect("slash command should execute");
+
+        assert!(response.ok);
+        assert_eq!(response.command.as_deref(), Some("/giphy"));
+        let body = received.join().expect("mock Slack server should finish");
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(form.get("channel").map(String::as_str), Some("C123"));
+        assert_eq!(form.get("command").map(String::as_str), Some("/giphy"));
+        assert_eq!(form.get("text").map(String::as_str), Some("cat dance"));
+        assert_eq!(form.get("thread_ts").map(String::as_str), Some("1710000000.000100"));
     }
 
     #[test]
