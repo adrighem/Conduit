@@ -2240,6 +2240,21 @@ mod tests {
             validate_slash_command("/ not a command"),
             SlashCommandValidation::NotACommand
         );
+        assert_eq!(
+            validate_slash_command("/giphy 🎉 celebration 🐱"),
+            SlashCommandValidation::Supported(SlashCommand {
+                name: "giphy".to_string(),
+                arguments: "🎉 celebration 🐱".to_string(),
+            })
+        );
+        assert_eq!(
+            validate_slash_command(""),
+            SlashCommandValidation::NotACommand
+        );
+        assert_eq!(
+            validate_slash_command("   "),
+            SlashCommandValidation::NotACommand
+        );
     }
 }
 
