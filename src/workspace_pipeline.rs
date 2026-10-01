@@ -138,6 +138,7 @@ pub(crate) struct MessagePage {
 pub(crate) struct ConversationAttentionObservation {
     pub(crate) message_ts: String,
     pub(crate) record_unread: bool,
+    pub(crate) record_mention: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1582,13 +1583,18 @@ impl WorkspaceCoordinator {
                 if already_read {
                     continue;
                 }
-                if entry
-                    .value
-                    .observe_attention_message_at(&effect.message.ts, effect.decision.record_unread)
-                {
+                let general_unread =
+                    effect.decision.record_unread && effect.message.belongs_in_channel_timeline();
+                let mention_unread = effect.decision.record_mention;
+                if entry.value.observe_attention_message_at(
+                    &effect.message.ts,
+                    general_unread,
+                    mention_unread,
+                ) {
                     attention_observations.push(ConversationAttentionObservation {
                         message_ts: effect.message.ts.clone(),
-                        record_unread: effect.decision.record_unread,
+                        record_unread: general_unread,
+                        record_mention: mention_unread,
                     });
                 }
             }
@@ -1953,17 +1959,29 @@ impl WorkspaceCoordinator {
                             )
                         },
                     );
+                    // Ambient unread is scoped to messages that actually
+                    // belong in the channel's own timeline (top-level posts
+                    // and broadcast replies) so an ordinary reply in a thread
+                    // the user isn't part of doesn't bump the channel badge.
+                    // A mention/priority event surfaces regardless, since
+                    // being addressed in any thread under the channel still
+                    // matters even when the reply itself stays thread-local.
+                    let general_unread = effect.decision.record_unread
+                        && effect.message.belongs_in_channel_timeline();
+                    let mention_unread = effect.decision.record_mention;
                     if let Some(entry) = self.conversations.get_mut(channel_id) {
                         if !already_read
                             && entry.value.observe_attention_message_at(
                                 &effect.message.ts,
-                                effect.decision.record_unread,
+                                general_unread,
+                                mention_unread,
                             )
                         {
                             entry.unread_revision = revision;
                             let observations = vec![ConversationAttentionObservation {
                                 message_ts: effect.message.ts.clone(),
-                                record_unread: effect.decision.record_unread,
+                                record_unread: general_unread,
+                                record_mention: mention_unread,
                             }];
                             patch_changes.push(WorkspaceChange::ConversationAttentionObserved {
                                 channel_id: channel_id.to_string(),
@@ -1979,10 +1997,13 @@ impl WorkspaceCoordinator {
             }
         }
         let current_user_id = self.attention_context.current_user_id.clone();
+        let is_mention = attention_effect
+            .as_ref()
+            .is_some_and(|effect| effect.decision.record_mention);
         let catalog_delta = match kind {
             MessageMutationKind::Posted => self
                 .thread_catalog
-                .observe_realtime(channel_id, &message, current_user_id.as_deref())
+                .observe_realtime(channel_id, &message, current_user_id.as_deref(), is_mention)
                 .map(|record| vec![record])
                 .unwrap_or_default(),
             MessageMutationKind::Changed => self
@@ -2943,8 +2964,8 @@ mod tests {
     #[test]
     fn cache_hydration_repairs_thread_read_attention_and_persists_only_conversation() {
         let mut channel = conversation("C1", "general");
-        channel.observe_attention_message_at("2.0", true);
-        channel.observe_attention_message_at("3.0", true);
+        channel.observe_attention_message_at("2.0", true, false);
+        channel.observe_attention_message_at("3.0", true, false);
 
         let mut catalog = ThreadCatalog::default();
         let mut root = message("1.0", "root");
@@ -3929,9 +3950,9 @@ mod tests {
     fn acknowledging_thread_attention_ignores_filtered_replies_and_preserves_channel_unreads() {
         let mut coordinator = WorkspaceCoordinator::default();
         let mut channel = conversation("C1", "general");
-        channel.observe_attention_message_at("2.0", true);
-        channel.observe_attention_message_at("3.0", false);
-        channel.observe_attention_message_at("10.0", true);
+        channel.observe_attention_message_at("2.0", true, false);
+        channel.observe_attention_message_at("3.0", false, false);
+        channel.observe_attention_message_at("10.0", true, false);
         coordinator.apply(WorkspaceMutation::ConversationUpsert(channel));
 
         coordinator.apply(WorkspaceMutation::AttentionAcknowledged {
@@ -3951,9 +3972,9 @@ mod tests {
     #[test]
     fn thread_read_updates_catalog_and_parent_attention_in_one_reduction() {
         let mut channel = conversation("C1", "general");
-        channel.observe_attention_message_at("2.0", true);
-        channel.observe_attention_message_at("3.0", true);
-        channel.observe_attention_message_at("10.0", true);
+        channel.observe_attention_message_at("2.0", true, false);
+        channel.observe_attention_message_at("3.0", true, false);
+        channel.observe_attention_message_at("10.0", true, false);
 
         let mut catalog = ThreadCatalog::default();
         let mut root = message("1.0", "root");
@@ -4010,8 +4031,8 @@ mod tests {
     #[test]
     fn viewport_read_clears_only_channel_history_identities_through_cursor() {
         let mut channel = conversation("C1", "general");
-        channel.observe_attention_message_at("5.0", true);
-        channel.observe_attention_message_at("10.0", true);
+        channel.observe_attention_message_at("5.0", true, false);
+        channel.observe_attention_message_at("10.0", true, false);
 
         let mut coordinator = WorkspaceCoordinator::default();
         coordinator.apply(WorkspaceMutation::ConversationUpsert(channel));
@@ -4101,20 +4122,64 @@ mod tests {
 
         assert_eq!(attention_effect(&reduction).delivery, DeliveryState::Fresh);
         assert!(attention_effect(&reduction).decision.record_unread);
+        // A plain thread reply doesn't belong in the channel's own timeline,
+        // so it must not inflate the channel-level ambient unread ledger —
+        // only the thread's own unread state (checked elsewhere) tracks it.
         assert_eq!(
             coordinator
                 .conversation("C1")
                 .unwrap()
                 .tracked_unread_message_timestamps(),
-            Some(vec!["10.0"])
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn mention_in_an_unrelated_thread_reply_surfaces_at_channel_level_without_ambient_unread() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(conversation(
+            "C1", "general",
+        )));
+
+        let mut reply = message("10.0", "hey <@U_SELF> check this out");
+        reply.thread_ts = Some("1.0".to_string());
+        reply.user = Some("U_OTHER".to_string());
+        coordinator
+            .apply_from(
+                MutationOrigin::Realtime,
+                WorkspaceMutation::MessageChanged {
+                    channel_id: "C1".to_string(),
+                    message: reply,
+                    kind: MessageMutationKind::Posted,
+                    origin: MutationOrigin::Realtime,
+                },
+            )
+            .expect("mentioned thread reply should remain fresh");
+
+        let conversation = coordinator.conversation("C1").unwrap();
+        assert!(
+            !conversation.has_unread_activity(),
+            "an unrelated thread reply must not bump the ambient channel badge"
+        );
+        assert!(
+            conversation.has_mention_activity(),
+            "a direct mention must surface at channel level even from an unrelated thread"
+        );
+        assert_eq!(conversation.mention_activity_count(), 1);
+
+        let thread_record = coordinator.thread_catalog.get("C1", "1.0");
+        assert!(
+            thread_record.is_some_and(|record| record.has_unread_mention),
+            "the thread's own record must also carry the mention independent of subscription"
         );
     }
 
     #[test]
     fn server_read_clears_channel_attention_but_preserves_unread_thread_reply() {
         let mut channel = conversation("C1", "general");
-        channel.observe_attention_message_at("5.0", true);
-        channel.observe_attention_message_at("10.0", true);
+        channel.observe_attention_message_at("5.0", true, false);
+        channel.observe_attention_message_at("10.0", true, false);
 
         let mut catalog = ThreadCatalog::default();
         let mut root = message("1.0", "root");
@@ -4178,8 +4243,8 @@ mod tests {
         channel
             .extra
             .insert("latest".to_string(), serde_json::json!("10.0"));
-        channel.observe_attention_message_at("5.0", true);
-        channel.observe_attention_message_at("20.0", true);
+        channel.observe_attention_message_at("5.0", true, false);
+        channel.observe_attention_message_at("20.0", true, false);
 
         let mut coordinator = WorkspaceCoordinator::default();
         coordinator.apply(WorkspaceMutation::ConversationUpsert(channel));
@@ -4216,7 +4281,7 @@ mod tests {
         let mut channel = conversation("C1", "general");
         channel.advance_read_cursor_position("20.0");
         channel.set_local_read_ts("20.0");
-        channel.observe_attention_message_at("30.0", true);
+        channel.observe_attention_message_at("30.0", true, false);
 
         let mut coordinator = WorkspaceCoordinator::default();
         coordinator.apply(WorkspaceMutation::ConversationUpsert(channel));
@@ -4577,7 +4642,7 @@ mod tests {
             is_im: Some(true),
             ..Default::default()
         };
-        direct.observe_attention_message_at("10.0", true);
+        direct.observe_attention_message_at("10.0", true, false);
         coordinator.apply(WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
             conversations: vec![direct],
             ..Default::default()
@@ -4805,14 +4870,17 @@ mod tests {
                 ConversationAttentionObservation {
                     message_ts: "11.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 },
                 ConversationAttentionObservation {
                     message_ts: "12.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 },
                 ConversationAttentionObservation {
                     message_ts: "13.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 },
             ]
         );
@@ -4841,14 +4909,17 @@ mod tests {
                 ConversationAttentionObservation {
                     message_ts: "11.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 },
                 ConversationAttentionObservation {
                     message_ts: "12.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 },
                 ConversationAttentionObservation {
                     message_ts: "13.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 },
             ]
         );
@@ -4875,6 +4946,7 @@ mod tests {
                 && observations == &[ConversationAttentionObservation {
                     message_ts: "14.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 }]
         ));
         assert!(matches!(
@@ -4889,6 +4961,7 @@ mod tests {
                 && observations == &[ConversationAttentionObservation {
                     message_ts: "14.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 }]
         ));
         assert!(coordinator
@@ -4956,6 +5029,7 @@ mod tests {
                 && observations == &[ConversationAttentionObservation {
                     message_ts: "11.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 }]
         ));
         assert!(matches!(
@@ -4967,6 +5041,7 @@ mod tests {
                 && observations == &[ConversationAttentionObservation {
                     message_ts: "11.0".to_string(),
                     record_unread: true,
+                    record_mention: false,
                 }]
         ));
     }

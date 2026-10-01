@@ -767,6 +767,9 @@ listview.navigation-sidebar row:not(:selected) .sidebar-row-content.active-conve
   background-color: color-mix(in srgb, currentColor 12%, transparent);
   border-radius: 6px;
 }
+listview.navigation-sidebar label.status-emoji {
+  line-height: 1;
+}
 "#;
 const MAX_COMPOSER_ATTACHMENTS: usize = 10;
 

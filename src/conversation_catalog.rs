@@ -204,8 +204,9 @@ impl ConversationCatalog {
         id: &str,
         message_ts: &str,
         record_unread: bool,
+        record_mention: bool,
     ) -> bool {
-        self.apply_attention_observation(id, message_ts, record_unread)
+        self.apply_attention_observation(id, message_ts, record_unread, record_mention)
             .0
     }
 
@@ -216,6 +217,7 @@ impl ConversationCatalog {
         id: &str,
         message_ts: &str,
         record_unread: bool,
+        record_mention: bool,
     ) -> (bool, bool) {
         if id.trim().is_empty() || message_ts.trim().is_empty() {
             return (false, false);
@@ -241,9 +243,11 @@ impl ConversationCatalog {
                 metadata_revision: revision,
                 unread_revision: revision,
             });
-        let changed = entry
-            .conversation
-            .observe_attention_message_at(message_ts, record_unread);
+        let changed = entry.conversation.observe_attention_message_at(
+            message_ts,
+            record_unread,
+            record_mention,
+        );
         if changed {
             entry.unread_revision = revision;
             entry.membership_revision = entry.membership_revision.max(revision);
@@ -545,13 +549,13 @@ mod tests {
         cached.unread_count = Some(0);
         let mut catalog = ConversationCatalog::from_cached([cached]);
 
-        assert!(catalog.observe_attention_message("C1", "1.0", false));
+        assert!(catalog.observe_attention_message("C1", "1.0", false, false));
         catalog.apply_realtime_unread("C1", SlackUnreadState::from_parts(true, true, 1));
         let filtered = catalog.get("C1").unwrap();
         assert_eq!(filtered.raw_unread_activity_count(), 1);
         assert!(!filtered.has_unread_activity());
 
-        assert!(catalog.observe_attention_message("C1", "2.0", true));
+        assert!(catalog.observe_attention_message("C1", "2.0", true, false));
         assert_eq!(catalog.get("C1").unwrap().unread_activity_count(), 1);
         catalog.advance_read_cursor("C1", "20.0", 0);
         assert!(!catalog.get("C1").unwrap().has_unread_activity());

@@ -102,6 +102,17 @@ pub struct ConversationAttentionState {
     raw_has_unread: bool,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     unread_message_ts: BTreeSet<String>,
+    /// Priority-tier subset of `unread_message_ts`: direct messages, direct
+    /// mentions, broadcast mentions, configured names/keywords, or replies to
+    /// a thread the user started, participated in, or subscribed to. Tracked
+    /// independently so muting can suppress the ambient signal above while
+    /// still surfacing this one.
+    #[serde(default)]
+    pub mention_count: u64,
+    #[serde(default)]
+    pub has_mention: bool,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    mention_message_ts: BTreeSet<String>,
 }
 
 impl SlackConversation {
@@ -302,6 +313,21 @@ impl SlackConversation {
         )
     }
 
+    /// Priority-tier unread: direct messages, direct/broadcast mentions,
+    /// configured names/keywords, or thread replies the user is following.
+    /// Independent of mute, unlike the ambient signal above.
+    pub fn has_mention_activity(&self) -> bool {
+        self.attention
+            .as_ref()
+            .is_some_and(|state| state.has_mention || state.mention_count > 0)
+    }
+
+    pub fn mention_activity_count(&self) -> u64 {
+        self.attention
+            .as_ref()
+            .map_or(0, |state| state.mention_count)
+    }
+
     pub fn unread_state(&self) -> SlackUnreadState {
         self.attention.as_ref().map_or_else(
             || self.raw_unread_state(),
@@ -309,7 +335,7 @@ impl SlackConversation {
         )
     }
 
-    pub fn observe_attention_message(&mut self, record_unread: bool) {
+    pub fn observe_attention_message(&mut self, record_unread: bool, record_mention: bool) {
         let raw = self.raw_unread_state();
         let state = self.attention.get_or_insert(ConversationAttentionState {
             unread_count: 0,
@@ -317,10 +343,17 @@ impl SlackConversation {
             raw_unread_count: raw.display_count,
             raw_has_unread: raw.has_unread,
             unread_message_ts: BTreeSet::new(),
+            mention_count: 0,
+            has_mention: false,
+            mention_message_ts: BTreeSet::new(),
         });
         if record_unread {
             state.unread_count = state.unread_count.saturating_add(1);
             state.has_unread = true;
+        }
+        if record_mention {
+            state.mention_count = state.mention_count.saturating_add(1);
+            state.has_mention = true;
         }
     }
 
@@ -350,17 +383,23 @@ impl SlackConversation {
         &mut self,
         message_ts: &str,
         record_unread: bool,
+        record_mention: bool,
     ) -> bool {
         if message_ts.trim().is_empty() || self.has_observed_attention_message(message_ts) {
             return false;
         }
-        self.observe_attention_message(record_unread);
-        if record_unread {
-            self.attention
+        self.observe_attention_message(record_unread, record_mention);
+        if record_unread || record_mention {
+            let state = self
+                .attention
                 .as_mut()
-                .expect("attention state was initialized above")
-                .unread_message_ts
-                .insert(message_ts.to_string());
+                .expect("attention state was initialized above");
+            if record_unread {
+                state.unread_message_ts.insert(message_ts.to_string());
+            }
+            if record_mention {
+                state.mention_message_ts.insert(message_ts.to_string());
+            }
         }
         let mut seen = self
             .extra
@@ -402,6 +441,12 @@ impl SlackConversation {
         // Legacy untracked counts cannot be proven newer than the cursor.
         attention.unread_count = tracked_after;
         attention.has_unread = attention.unread_count > 0;
+        attention
+            .mention_message_ts
+            .retain(|message_ts| slack_timestamp_is_after(message_ts, read_ts));
+        attention.mention_count =
+            u64::try_from(attention.mention_message_ts.len()).unwrap_or(u64::MAX);
+        attention.has_mention = attention.mention_count > 0;
     }
 
     pub(crate) fn clear_raw_unread_activity(&mut self) {
@@ -430,6 +475,12 @@ impl SlackConversation {
         }
         attention.unread_count -= acknowledged;
         attention.has_unread = attention.unread_count > 0;
+        for message_ts in message_ts {
+            if attention.mention_message_ts.remove(message_ts) {
+                attention.mention_count = attention.mention_count.saturating_sub(1);
+            }
+        }
+        attention.has_mention = attention.mention_count > 0;
         acknowledged
     }
 
@@ -2616,7 +2667,7 @@ mod tests {
         }))
         .unwrap();
 
-        conversation.observe_attention_message(false);
+        conversation.observe_attention_message(false, false);
         conversation.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
             channel_id: "C1".to_string(),
             unread_state: SlackUnreadState::from_parts(true, true, 3),
@@ -2636,7 +2687,7 @@ mod tests {
             ..Default::default()
         };
 
-        conversation.observe_attention_message(true);
+        conversation.observe_attention_message(true, false);
         assert_eq!(conversation.unread_activity_count(), 1);
         conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 2));
         assert_eq!(conversation.raw_unread_activity_count(), 2);
@@ -2655,8 +2706,8 @@ mod tests {
             unread_count: Some(2),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("1.0", true);
-        conversation.observe_attention_message_at("2.0", true);
+        conversation.observe_attention_message_at("1.0", true, false);
+        conversation.observe_attention_message_at("2.0", true, false);
 
         conversation.advance_raw_read_cursor("3.0", 0);
 
@@ -2675,9 +2726,9 @@ mod tests {
             unread_count: Some(9),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("1.0", true);
-        conversation.observe_attention_message_at("2.0", true);
-        conversation.observe_attention_message_at("3.0", true);
+        conversation.observe_attention_message_at("1.0", true, false);
+        conversation.observe_attention_message_at("2.0", true, false);
+        conversation.observe_attention_message_at("3.0", true, false);
 
         assert_eq!(
             conversation.acknowledge_attention_messages(&["1.0".to_string(), "2.0".to_string()]),
@@ -2715,7 +2766,7 @@ mod tests {
             unread_count: Some(3),
             ..Default::default()
         };
-        conversation.observe_attention_message(true);
+        conversation.observe_attention_message(true, false);
 
         conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 0));
 
@@ -2731,7 +2782,7 @@ mod tests {
             id: "D1".to_string(),
             ..Default::default()
         };
-        conversation.observe_attention_message(true);
+        conversation.observe_attention_message(true, false);
         let serialized = serde_json::to_string(&conversation).unwrap();
         let mut restored: SlackConversation = serde_json::from_str(&serialized).unwrap();
 
@@ -2749,8 +2800,8 @@ mod tests {
             unread_count: Some(2),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("19.0", true);
-        conversation.observe_attention_message_at("21.0", true);
+        conversation.observe_attention_message_at("19.0", true, false);
+        conversation.observe_attention_message_at("21.0", true, false);
 
         conversation.advance_read_cursor("20.0", 0);
 
@@ -2759,8 +2810,41 @@ mod tests {
         assert!(conversation.has_unread_activity());
         assert!(conversation.has_observed_attention_message("19.0"));
         assert!(conversation.has_observed_attention_message("21.0"));
-        assert!(!conversation.observe_attention_message_at("21.0", true));
+        assert!(!conversation.observe_attention_message_at("21.0", true, false));
         assert_eq!(conversation.unread_activity_count(), 1);
+    }
+
+    #[test]
+    fn mention_ledger_tracks_independently_of_ambient_unread() {
+        let mut conversation = SlackConversation {
+            id: "C1".to_string(),
+            ..Default::default()
+        };
+        // An ordinary message: counts as ambient unread only.
+        conversation.observe_attention_message_at("1.0", true, false);
+        // A mention: counts toward both ledgers.
+        conversation.observe_attention_message_at("2.0", true, true);
+        // A mention buried in a thread reply that doesn't belong to the
+        // channel's own timeline: mention-only, no ambient bump.
+        conversation.observe_attention_message_at("3.0", false, true);
+
+        assert_eq!(conversation.unread_activity_count(), 2);
+        assert!(conversation.has_unread_activity());
+        assert_eq!(conversation.mention_activity_count(), 2);
+        assert!(conversation.has_mention_activity());
+
+        // Reading through "2.0" clears both the ordinary and mention entries
+        // at or before the cursor, but the later mention-only entry survives.
+        conversation.advance_read_cursor("2.0", 0);
+        assert_eq!(conversation.unread_activity_count(), 0);
+        assert!(!conversation.has_unread_activity());
+        assert_eq!(conversation.mention_activity_count(), 1);
+        assert!(conversation.has_mention_activity());
+
+        let acknowledged = conversation.acknowledge_attention_messages(&["3.0".to_string()]);
+        assert_eq!(acknowledged, 0, "already below the ambient cursor");
+        assert_eq!(conversation.mention_activity_count(), 0);
+        assert!(!conversation.has_mention_activity());
     }
 
     #[test]

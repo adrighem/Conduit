@@ -74,6 +74,11 @@ pub struct SidebarRowModel {
     pub kind: ConversationKind,
     pub unread: bool,
     pub unread_count: u64,
+    /// Priority-tier unread: direct message, direct/broadcast mention,
+    /// configured name/keyword, or a followed thread reply. Unlike `unread`/
+    /// `unread_count`, this stays true even while `muted` is set.
+    pub has_mention: bool,
+    pub mention_count: u64,
     pub selected: bool,
     pub starred: bool,
     pub private: bool,
@@ -115,8 +120,23 @@ impl SidebarRowModel {
         }
     }
 
+    pub fn mention_badge_label(&self) -> Option<String> {
+        match self.mention_count {
+            0 => None,
+            1..=99 => Some(self.mention_count.to_string()),
+            _ => Some("99+".to_string()),
+        }
+    }
+
     pub fn accessible_label(&self) -> String {
         let mut label = format!("{}: {}", self.kind.accessible_name(), self.title);
+        if self.mention_count == 1 {
+            label.push_str(", 1 mention");
+        } else if self.mention_count > 1 {
+            label.push_str(&format!(", {} mentions", self.mention_count));
+        } else if self.has_mention {
+            label.push_str(", mentioned");
+        }
         if self.unread_count == 1 {
             label.push_str(", 1 unread");
         } else if self.unread_count > 1 {
@@ -521,6 +541,16 @@ impl SidebarRowModel {
             .flatten()
             .cloned()
             .collect();
+        let muted = conversation.is_muted_conversation();
+        // Muting suppresses the ambient "something's new" signal, matching
+        // Slack, but never the priority/mention signal below — a muted
+        // channel still surfaces a direct mention.
+        let unread = conversation.has_unread_activity() && !muted;
+        let unread_count = if muted {
+            0
+        } else {
+            conversation.unread_activity_count()
+        };
         Self {
             id: conversation.id.clone(),
             title: conversation.navigation_name_with_users(
@@ -529,14 +559,16 @@ impl SidebarRowModel {
                 options.current_user_id,
             ),
             kind,
-            unread: conversation.has_unread_activity(),
-            unread_count: conversation.unread_activity_count(),
+            unread,
+            unread_count,
+            has_mention: conversation.has_mention_activity(),
+            mention_count: conversation.mention_activity_count(),
             selected: options.selected_channel == Some(conversation.id.as_str()),
             starred: conversation.is_starred(),
             private: conversation.is_private.unwrap_or(false)
                 || conversation.is_group.unwrap_or(false)
                 || matches!(kind, ConversationKind::PrivateChannel),
-            muted: conversation.is_muted_conversation(),
+            muted,
             external: conversation.is_external_conversation(),
             huddle_active: options.active_huddle_channel_id == Some(conversation.id.as_str()),
             user_deleted: kind == ConversationKind::DirectMessage && conversation.is_user_deleted(),
@@ -1003,6 +1035,8 @@ pub fn conversation_picker_sections_with_statuses(
                 kind: ConversationKind::DirectMessage,
                 unread: false,
                 unread_count: 0,
+                has_mention: false,
+                mention_count: 0,
                 selected: false,
                 starred: false,
                 private: true,
@@ -1529,6 +1563,8 @@ mod tests {
             kind: ConversationKind::PublicChannel,
             unread: unread_count > 0,
             unread_count,
+            has_mention: false,
+            mention_count: 0,
             selected,
             starred: false,
             private: false,
@@ -1957,6 +1993,31 @@ mod tests {
         assert!(row.starred);
         assert!(row.muted);
         assert!(row.external);
+    }
+
+    #[test]
+    fn muting_suppresses_ambient_unread_but_not_a_pending_mention() {
+        let mut muted_with_mention = channel("C1", "alpha");
+        muted_with_mention
+            .extra
+            .insert("is_muted".to_string(), serde_json::json!(true));
+        // An ordinary unread message (ambient only) plus a mention.
+        muted_with_mention.observe_attention_message_at("1.0", true, false);
+        muted_with_mention.observe_attention_message_at("2.0", true, true);
+
+        let row =
+            SidebarRowModel::from_conversation(&muted_with_mention, &HashMap::new(), None, None);
+
+        assert!(row.muted);
+        assert!(
+            !row.unread,
+            "muting must suppress the ambient bold/unread signal"
+        );
+        assert_eq!(row.unread_count, 0);
+        assert_eq!(row.unread_badge_label(), None);
+        assert!(row.has_mention, "muting must not suppress a direct mention");
+        assert_eq!(row.mention_count, 1);
+        assert_eq!(row.mention_badge_label(), Some("1".to_string()));
     }
 
     #[test]

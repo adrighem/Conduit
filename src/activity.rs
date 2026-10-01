@@ -441,7 +441,7 @@ mod tests {
             is_channel: Some(true),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("2.0", true);
+        conversation.observe_attention_message_at("2.0", true, false);
         let mut root = SlackMessage {
             ts: "1.0".to_string(),
             text: Some("Deployment status".to_string()),
@@ -480,7 +480,7 @@ mod tests {
             ..Default::default()
         };
         for message_ts in ["2.0", "3.0", "4.0"] {
-            conversation.observe_attention_message_at(message_ts, true);
+            conversation.observe_attention_message_at(message_ts, true, false);
         }
         let mut catalog = ThreadCatalog::default();
         for (root_ts, reply_ts) in [("1.0", "2.0"), ("1.5", "3.0")] {
@@ -534,7 +534,7 @@ mod tests {
             is_channel: Some(true),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("2.0", true);
+        conversation.observe_attention_message_at("2.0", true, false);
         let mut catalog = ThreadCatalog::default();
         catalog.observe_thread(
             "C1",
@@ -576,7 +576,7 @@ mod tests {
             is_channel: Some(true),
             ..Default::default()
         };
-        conversation.observe_attention_message_at("2.0", true);
+        conversation.observe_attention_message_at("2.0", true, false);
 
         let items = build_unread_activity_items(
             &[conversation],

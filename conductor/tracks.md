@@ -79,3 +79,9 @@ This file tracks all major tracks for the project. Each track has its own detail
 ## [~] Track: Code review findings remediation
 *Link: [./conductor/tracks/code_review_findings_20260909/](./conductor/tracks/code_review_findings_20260909/)*
 
+---
+
+## [~] Track: Slash command detection and Giphy support
+*Link: [./conductor/tracks/slash_commands_giphy_20260915/](./conductor/tracks/slash_commands_giphy_20260915/)*
+
+

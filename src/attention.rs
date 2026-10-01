@@ -91,6 +91,7 @@ pub enum AttentionReason {
     OrdinaryMessage,
     DirectMessage,
     DirectMention,
+    BroadcastMention,
     NameOrAlias,
     KeywordOrPhrase,
     StartedThreadReply,
@@ -105,7 +106,7 @@ pub enum AttentionReason {
 }
 
 impl AttentionReason {
-    pub(crate) const COUNT: usize = 19;
+    pub(crate) const COUNT: usize = 20;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::MembershipLifecycle,
         Self::NonMessageNoise,
@@ -115,6 +116,7 @@ impl AttentionReason {
         Self::OrdinaryMessage,
         Self::DirectMessage,
         Self::DirectMention,
+        Self::BroadcastMention,
         Self::NameOrAlias,
         Self::KeywordOrPhrase,
         Self::StartedThreadReply,
@@ -138,6 +140,7 @@ impl AttentionReason {
             Self::OrdinaryMessage => "ordinary_message",
             Self::DirectMessage => "direct_message",
             Self::DirectMention => "direct_mention",
+            Self::BroadcastMention => "broadcast_mention",
             Self::NameOrAlias => "name_or_alias",
             Self::KeywordOrPhrase => "keyword_or_phrase",
             Self::StartedThreadReply => "started_thread_reply",
@@ -162,17 +165,18 @@ impl AttentionReason {
             Self::OrdinaryMessage => 5,
             Self::DirectMessage => 6,
             Self::DirectMention => 7,
-            Self::NameOrAlias => 8,
-            Self::KeywordOrPhrase => 9,
-            Self::StartedThreadReply => 10,
-            Self::ParticipatedThreadReply => 11,
-            Self::SubscribedThreadReply => 12,
-            Self::NotificationsDisabled => 13,
-            Self::MutedConversation => 14,
-            Self::ActiveTarget => 15,
-            Self::HistoricalDelivery => 16,
-            Self::StaleDelivery => 17,
-            Self::DuplicateDelivery => 18,
+            Self::BroadcastMention => 8,
+            Self::NameOrAlias => 9,
+            Self::KeywordOrPhrase => 10,
+            Self::StartedThreadReply => 11,
+            Self::ParticipatedThreadReply => 12,
+            Self::SubscribedThreadReply => 13,
+            Self::NotificationsDisabled => 14,
+            Self::MutedConversation => 15,
+            Self::ActiveTarget => 16,
+            Self::HistoricalDelivery => 17,
+            Self::StaleDelivery => 18,
+            Self::DuplicateDelivery => 19,
         }
     }
 }
@@ -180,6 +184,12 @@ impl AttentionReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionDecision {
     pub(crate) record_unread: bool,
+    /// Whether this message is priority-tier (direct message, direct mention,
+    /// broadcast mention, configured name/keyword, or a reply to a thread the
+    /// user started, participated in, or subscribed to). Content-based only —
+    /// independent of notification preferences and of mute, so it can drive a
+    /// persisted "you were addressed" signal that survives both.
+    pub(crate) record_mention: bool,
     pub(crate) send_notification: bool,
     pub(crate) reasons: Vec<AttentionReason>,
 }
@@ -196,14 +206,16 @@ impl AttentionDecision {
 
         self.reasons.iter().copied().any(|reason| match reason {
             AttentionReason::DirectMessage => preferences.direct_messages,
-            AttentionReason::DirectMention => preferences.mentions_and_names,
+            AttentionReason::DirectMention | AttentionReason::BroadcastMention => {
+                preferences.mentions_and_names
+            }
             AttentionReason::StartedThreadReply
             | AttentionReason::ParticipatedThreadReply
             | AttentionReason::SubscribedThreadReply => preferences.thread_replies,
             _ => false,
         }) || (preferences.mentions_and_names
-            && configured_terms_match(text, &preferences.names_and_aliases))
-            || configured_terms_match(text, &preferences.keywords)
+            && (configured_terms_match(text, &preferences.names_and_aliases)
+                || configured_terms_match(text, &preferences.keywords)))
     }
 }
 
@@ -229,6 +241,7 @@ impl AttentionPolicy {
         if is_membership_lifecycle_subtype(candidate.subtype) {
             return AttentionDecision {
                 record_unread: false,
+                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::MembershipLifecycle],
             };
@@ -236,6 +249,7 @@ impl AttentionPolicy {
         if candidate.no_notifications || is_non_message_noise_subtype(candidate.subtype) {
             return AttentionDecision {
                 record_unread: false,
+                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::NonMessageNoise],
             };
@@ -243,6 +257,7 @@ impl AttentionPolicy {
         if !candidate.has_content {
             return AttentionDecision {
                 record_unread: false,
+                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::EmptyMessage],
             };
@@ -250,6 +265,7 @@ impl AttentionPolicy {
         if candidate.mutation != MessageMutation::Posted {
             return AttentionDecision {
                 record_unread: false,
+                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::NonPostedMutation],
             };
@@ -257,6 +273,7 @@ impl AttentionPolicy {
         if candidate.author_is_self {
             return AttentionDecision {
                 record_unread: false,
+                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::SelfAuthored],
             };
@@ -272,6 +289,9 @@ impl AttentionPolicy {
         }
         if contains_direct_mention(candidate.text, candidate.current_user_id) {
             reasons.push(AttentionReason::DirectMention);
+        }
+        if contains_broadcast_mention(candidate.text) {
+            reasons.push(AttentionReason::BroadcastMention);
         }
         if self
             .names_and_aliases
@@ -297,6 +317,22 @@ impl AttentionPolicy {
                 }
             });
         }
+        // Priority tier: content-based only, independent of notification
+        // preferences and mute, matching Slack's "muted channels still show a
+        // mention badge" behavior.
+        let is_priority = reasons.iter().copied().any(|reason| {
+            matches!(
+                reason,
+                AttentionReason::DirectMessage
+                    | AttentionReason::DirectMention
+                    | AttentionReason::BroadcastMention
+                    | AttentionReason::NameOrAlias
+                    | AttentionReason::KeywordOrPhrase
+                    | AttentionReason::StartedThreadReply
+                    | AttentionReason::ParticipatedThreadReply
+                    | AttentionReason::SubscribedThreadReply
+            )
+        });
         let notification_relevant = reasons
             .iter()
             .copied()
@@ -328,6 +364,7 @@ impl AttentionPolicy {
         }
 
         let record_unread = records_unread;
+        let record_mention = records_unread && is_priority;
         let send_notification = candidate.delivery == DeliveryState::Fresh
             && notification_relevant
             && self.preferences.desktop_notifications
@@ -335,6 +372,7 @@ impl AttentionPolicy {
             && !candidate.actively_reading;
         AttentionDecision {
             record_unread,
+            record_mention,
             send_notification,
             reasons,
         }
@@ -350,10 +388,10 @@ impl Default for AttentionPolicy {
 fn relevance_reason_enabled(reason: AttentionReason, preferences: &AttentionPreferences) -> bool {
     match reason {
         AttentionReason::DirectMessage => preferences.direct_messages,
-        AttentionReason::DirectMention | AttentionReason::NameOrAlias => {
-            preferences.mentions_and_names
-        }
-        AttentionReason::KeywordOrPhrase => true,
+        AttentionReason::DirectMention
+        | AttentionReason::BroadcastMention
+        | AttentionReason::NameOrAlias
+        | AttentionReason::KeywordOrPhrase => preferences.mentions_and_names,
         AttentionReason::StartedThreadReply
         | AttentionReason::ParticipatedThreadReply
         | AttentionReason::SubscribedThreadReply => preferences.thread_replies,
@@ -444,6 +482,25 @@ fn contains_direct_mention(text: &str, current_user_id: Option<&str>) -> bool {
         };
         let mentioned_user = rest[..end].split('|').next().unwrap_or_default().trim();
         if mentioned_user == current_user_id {
+            return true;
+        }
+        rest = &rest[end + 1..];
+    }
+    false
+}
+
+/// Matches Slack's `<!channel>`, `<!here>`, and `<!everyone>` broadcast
+/// entities. These notify every member of the conversation, so they carry
+/// the same priority tier as a direct mention.
+fn contains_broadcast_mention(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(start) = rest.find("<!") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('>') else {
+            return false;
+        };
+        let entity = rest[..end].split('|').next().unwrap_or_default();
+        if matches!(entity, "channel" | "here" | "everyone") {
             return true;
         }
         rest = &rest[end + 1..];
@@ -867,7 +924,7 @@ mod tests {
 
     #[test]
     fn malformed_or_other_user_mentions_do_not_match() {
-        for text in ["<@U_OTHER>", "<@U_SELFISH>", "<@U_SELF", "<!channel>"] {
+        for text in ["<@U_OTHER>", "<@U_SELFISH>", "<@U_SELF"] {
             let mut message = candidate();
             message.text = text;
             assert!(!decision(message).send_notification, "{text}");
@@ -875,6 +932,31 @@ mod tests {
         let mut labeled = candidate();
         labeled.text = "<@U_SELF|vincent>";
         assert!(decision(labeled).send_notification);
+    }
+
+    #[test]
+    fn broadcast_mentions_notify_like_a_direct_mention() {
+        for text in [
+            "<!channel>",
+            "<!here>",
+            "<!everyone>",
+            "<!channel|@channel>",
+        ] {
+            let mut message = candidate();
+            message.text = text;
+            let actual = decision(message);
+            assert!(actual.send_notification, "{text}");
+            assert!(actual.record_mention, "{text}");
+            assert!(actual.reasons.contains(&AttentionReason::BroadcastMention));
+        }
+
+        let mut malformed = candidate();
+        malformed.text = "<!channel";
+        assert!(!decision(malformed).record_mention);
+
+        let mut unrelated = candidate();
+        unrelated.text = "<!date^1234567890^{date_short}|fallback>";
+        assert!(!decision(unrelated).record_mention);
     }
 
     #[test]
@@ -924,6 +1006,7 @@ mod tests {
             decision(empty),
             AttentionDecision {
                 record_unread: false,
+                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::EmptyMessage],
             }
@@ -935,6 +1018,7 @@ mod tests {
             decision(noise),
             AttentionDecision {
                 record_unread: false,
+                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::NonMessageNoise],
             }

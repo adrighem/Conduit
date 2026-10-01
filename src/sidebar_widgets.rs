@@ -80,12 +80,16 @@ pub fn sidebar_row_widget(
     icon.set_tooltip_text(Some(model.kind.accessible_name()));
     content.append(&icon);
 
+    // A pending mention can exist without the ambient unread flag (e.g. a
+    // mention in a thread reply that doesn't belong to the channel's own
+    // timeline), so the row still needs to stand out in that case.
+    let emphasized = model.unread || model.has_mention;
     let title = gtk::Label::new(Some(&model.title));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.set_attributes(Some(&sidebar_title_attributes(model.unread)));
-    if model.unread {
+    title.set_attributes(Some(&sidebar_title_attributes(emphasized)));
+    if emphasized {
         title.add_css_class("heading");
     }
     content.append(&title);
@@ -93,18 +97,29 @@ pub fn sidebar_row_widget(
     if let Some(status) = model.status.as_ref() {
         let text = status.accessible_text();
         let indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+
+        let emoji_size = sidebar_target_emoji_size(&title);
+
         match EmojiCatalog::new(custom_emojis).resolve(status.emoji_name()) {
             Some(EmojiValue::Unicode(glyph)) => {
-                indicator.append(&gtk::Label::new(Some(glyph)));
+                let label = gtk::Label::new(Some(glyph));
+                label.add_css_class("status-emoji");
+                indicator.append(&label);
             }
             Some(EmojiValue::CustomImage(url)) => {
-                let picture = gtk::Picture::for_file(&gtk::gio::File::for_uri(&url));
-                picture.set_content_fit(gtk::ContentFit::Contain);
-                picture.set_width_request(16);
-                picture.set_height_request(16);
+                let picture = sidebar_status_emoji_picture(
+                    &url,
+                    &text,
+                    emoji_size,
+                );
+                picture.add_css_class("status-emoji");
                 indicator.append(&picture);
             }
-            None => indicator.append(&gtk::Label::new(Some("●"))),
+            None => {
+                let label = gtk::Label::new(Some("●"));
+                label.add_css_class("status-emoji");
+                indicator.append(&label);
+            }
         }
         indicator.set_focusable(true);
         indicator.set_tooltip_text(Some(&text));
@@ -124,6 +139,15 @@ pub fn sidebar_row_widget(
         unread.add_css_class("caption");
         unread.add_css_class("heading");
         content.append(&unread);
+    }
+
+    if let Some(mention_label) = model.mention_badge_label() {
+        let mention = gtk::Label::new(Some(&mention_label));
+        mention.add_css_class("caption");
+        mention.add_css_class("heading");
+        mention.add_css_class("accent");
+        mention.set_tooltip_text(Some("Mentioned"));
+        content.append(&mention);
     }
 
     if model.muted {
@@ -155,6 +179,63 @@ fn sidebar_title_attributes(unread: bool) -> gtk::pango::AttrList {
         unread,
     )));
     attributes
+}
+
+fn sidebar_target_emoji_size(widget: &impl gtk::prelude::WidgetExt) -> i32 {
+    let context = widget.pango_context();
+    let metrics = context.metrics(None, None);
+    let height = (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE;
+    if height > 0 {
+        height.clamp(12, 48)
+    } else {
+        16
+    }
+}
+
+fn sidebar_status_emoji_picture(url: &str, label: &str, size: i32) -> gtk::Picture {
+    let picture = gtk::Picture::new();
+    picture.set_alternative_text(Some(label));
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_size_request(size, size);
+    picture.set_halign(gtk::Align::Center);
+    picture.set_valign(gtk::Align::Center);
+
+    let weak_picture = picture.downgrade();
+    let file = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE")
+        .map(gtk::gio::File::for_path)
+        .unwrap_or_else(|| gtk::gio::File::for_uri(url));
+
+    file.read_async(
+        gtk::glib::Priority::DEFAULT,
+        gtk::gio::Cancellable::NONE,
+        move |stream| {
+            let Ok(stream) = stream else { return };
+            let weak_picture = weak_picture.clone();
+            gdk_pixbuf::PixbufAnimation::from_stream_async(
+                &stream,
+                gtk::gio::Cancellable::NONE,
+                move |animation| {
+                    let Some(picture) = weak_picture.upgrade() else { return };
+                    let Ok(animation) = animation else { return };
+                    let frame = std::rc::Rc::new(animation.iter(Some(std::time::SystemTime::now())));
+                    let pixbuf = frame.pixbuf();
+                    let w = pixbuf.width();
+                    let h = pixbuf.height();
+                    let (target_w, target_h) = if w > h {
+                        (size, (size * h / w).max(1))
+                    } else {
+                        ((size * w / h).max(1), size)
+                    };
+                    let scaled = pixbuf
+                        .scale_simple(target_w, target_h, gdk_pixbuf::InterpType::Bilinear)
+                        .unwrap_or(pixbuf);
+                    picture.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&scaled)));
+                },
+            );
+        },
+    );
+    picture
 }
 
 fn sidebar_title_weight(unread: bool) -> gtk::pango::Weight {

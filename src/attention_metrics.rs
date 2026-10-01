@@ -375,6 +375,7 @@ mod tests {
         let metrics = AttentionMetrics::default();
         let decision = AttentionDecision {
             record_unread: true,
+            record_mention: true,
             send_notification: true,
             reasons: vec![
                 AttentionReason::DirectMessage,

@@ -671,7 +671,7 @@ pub(crate) struct SyncFreshness {
 #[cfg(test)]
 enum ConversationRowMutation<R> {
     Unchanged(R),
-    Upsert(SlackConversation, R),
+    Upsert(Box<SlackConversation>, R),
     Delete(R),
 }
 
@@ -1169,7 +1169,7 @@ impl WorkspaceStore {
                 .into_iter()
                 .next()
                 .expect("metadata upsert should produce a conversation");
-            ConversationRowMutation::Upsert(conversation, ())
+            ConversationRowMutation::Upsert(Box::new(conversation), ())
         })
         .await
     }
@@ -1220,7 +1220,7 @@ impl WorkspaceStore {
             }
             conversation.clear_local_read_ts();
             conversation.apply_unread_snapshot(&snapshot);
-            ConversationRowMutation::Upsert(conversation, true)
+            ConversationRowMutation::Upsert(Box::new(conversation), true)
         })
         .await
     }
@@ -1269,7 +1269,7 @@ impl WorkspaceStore {
         channel_id: &str,
         message_ts: &str,
     ) -> Result<bool> {
-        self.observe_conversation_attention_from_event(channel_id, message_ts, true)
+        self.observe_conversation_attention_from_event(channel_id, message_ts, true, false)
             .await
     }
 
@@ -1279,6 +1279,7 @@ impl WorkspaceStore {
         channel_id: &str,
         message_ts: &str,
         record_unread: bool,
+        record_mention: bool,
     ) -> Result<bool> {
         if channel_id.trim().is_empty() || message_ts.trim().is_empty() {
             return Ok(false);
@@ -1298,10 +1299,14 @@ impl WorkspaceStore {
             {
                 return ConversationRowMutation::Unchanged(false);
             }
-            if !conversation.observe_attention_message_at(&message_ts, record_unread) {
+            if !conversation.observe_attention_message_at(
+                &message_ts,
+                record_unread,
+                record_mention,
+            ) {
                 return ConversationRowMutation::Unchanged(false);
             }
-            ConversationRowMutation::Upsert(conversation, true)
+            ConversationRowMutation::Upsert(Box::new(conversation), true)
         })
         .await
     }
@@ -1310,7 +1315,7 @@ impl WorkspaceStore {
     pub async fn observe_conversation_attention_batch(
         &self,
         channel_id: &str,
-        observations: Vec<(String, bool)>,
+        observations: Vec<(String, bool, bool)>,
     ) -> Result<Vec<String>> {
         if channel_id.trim().is_empty() {
             return Ok(Vec::new());
@@ -1318,11 +1323,12 @@ impl WorkspaceStore {
 
         let observations = observations
             .into_iter()
-            .filter(|(message_ts, _)| !message_ts.trim().is_empty())
+            .filter(|(message_ts, _, _)| !message_ts.trim().is_empty())
             .map(
-                |(message_ts, record_unread)| ConversationAttentionObservation {
+                |(message_ts, record_unread, record_mention)| ConversationAttentionObservation {
                     message_ts,
                     record_unread,
+                    record_mention,
                 },
             )
             .collect::<Vec<_>>();
@@ -1365,6 +1371,7 @@ impl WorkspaceStore {
         channel_id: &str,
         message_ts: &str,
         record_unread: bool,
+        record_mention: bool,
         claim_notification: bool,
     ) -> Result<AttentionDeliveryOutcome> {
         self.accept_attention_delivery_for_message(
@@ -1372,6 +1379,7 @@ impl WorkspaceStore {
             message_ts,
             None,
             record_unread,
+            record_mention,
             claim_notification,
         )
         .await
@@ -1383,6 +1391,7 @@ impl WorkspaceStore {
         message_ts: &str,
         thread_root_ts: Option<&str>,
         record_unread: bool,
+        record_mention: bool,
         claim_notification: bool,
     ) -> Result<AttentionDeliveryOutcome> {
         if channel_id.trim().is_empty() || message_ts.trim().is_empty() {
@@ -1431,7 +1440,11 @@ impl WorkspaceStore {
                         notification_claimed: false,
                     });
                 }
-                if !conversation.observe_attention_message_at(&message_ts, record_unread) {
+                if !conversation.observe_attention_message_at(
+                    &message_ts,
+                    record_unread,
+                    record_mention,
+                ) {
                     transaction.rollback()?;
                     return Ok(AttentionDeliveryOutcome {
                         observation: AttentionObservationStatus::AlreadyObserved,
@@ -1907,7 +1920,7 @@ impl WorkspaceStore {
                 return ConversationRowMutation::Unchanged(false);
             };
             update(&mut conversation);
-            ConversationRowMutation::Upsert(conversation, true)
+            ConversationRowMutation::Upsert(Box::new(conversation), true)
         })
         .await
     }
@@ -3512,8 +3525,11 @@ fn apply_store_attention_observations(
         if local_read
             .as_deref()
             .is_some_and(|last_read| !slack_timestamp_is_after(&observation.message_ts, last_read))
-            || !conversation
-                .observe_attention_message_at(&observation.message_ts, observation.record_unread)
+            || !conversation.observe_attention_message_at(
+                &observation.message_ts,
+                observation.record_unread,
+                observation.record_mention,
+            )
         {
             continue;
         }
@@ -4478,6 +4494,7 @@ mod tests {
                 observations: vec![ConversationAttentionObservation {
                     message_ts: "11.0".into(),
                     record_unread: true,
+                    record_mention: false,
                 }],
             };
             assert_eq!(
@@ -4523,6 +4540,7 @@ mod tests {
                                 observations: vec![ConversationAttentionObservation {
                                     message_ts: "19.0".into(),
                                     record_unread: true,
+                                    record_mention: false,
                                 }],
                             }],
                         )
@@ -4556,6 +4574,7 @@ mod tests {
                                 observations: vec![ConversationAttentionObservation {
                                     message_ts: "21.0".into(),
                                     record_unread: true,
+                                    record_mention: false,
                                 }],
                             }],
                         )
@@ -4608,6 +4627,7 @@ mod tests {
                                 observations: vec![ConversationAttentionObservation {
                                     message_ts: " ".into(),
                                     record_unread: true,
+                                    record_mention: false,
                                 }],
                             },
                         ],
@@ -4636,6 +4656,7 @@ mod tests {
                                 observations: vec![ConversationAttentionObservation {
                                     message_ts: "23.0".into(),
                                     record_unread: true,
+                                    record_mention: false,
                                 }],
                             },
                         ],
@@ -7758,7 +7779,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(store
-                .observe_conversation_attention_from_event("C1", "10.0", false)
+                .observe_conversation_attention_from_event("C1", "10.0", false, false)
                 .await
                 .unwrap());
             assert!(store
@@ -7796,7 +7817,10 @@ mod tests {
             let accepted = store
                 .observe_conversation_attention_batch(
                     "C1",
-                    vec![("10.0".to_string(), false), ("11.0".to_string(), true)],
+                    vec![
+                        ("10.0".to_string(), false, false),
+                        ("11.0".to_string(), true, false),
+                    ],
                 )
                 .await
                 .unwrap();
@@ -7804,7 +7828,10 @@ mod tests {
             assert!(store
                 .observe_conversation_attention_batch(
                     "C1",
-                    vec![("10.0".to_string(), false), ("11.0".to_string(), true)],
+                    vec![
+                        ("10.0".to_string(), false, false),
+                        ("11.0".to_string(), true, false),
+                    ],
                 )
                 .await
                 .unwrap()
@@ -7865,7 +7892,7 @@ mod tests {
             let store = WorkspaceStore::new(directory.clone(), "T123:U123");
             assert_eq!(
                 store
-                    .accept_attention_delivery("", "1710000001.000001", true, true)
+                    .accept_attention_delivery("", "1710000001.000001", true, false, true)
                     .await
                     .unwrap(),
                 AttentionDeliveryOutcome {
@@ -7874,7 +7901,7 @@ mod tests {
                 }
             );
             let first = store
-                .accept_attention_delivery("D1", "1710000001.000001", true, true)
+                .accept_attention_delivery("D1", "1710000001.000001", true, false, true)
                 .await
                 .unwrap();
             assert_eq!(
@@ -7886,7 +7913,7 @@ mod tests {
             );
             assert_eq!(
                 store
-                    .accept_attention_delivery("D1", "1710000001.000001", true, true)
+                    .accept_attention_delivery("D1", "1710000001.000001", true, false, true)
                     .await
                     .unwrap(),
                 AttentionDeliveryOutcome {
@@ -7899,7 +7926,7 @@ mod tests {
             let reopened = WorkspaceStore::new(directory.clone(), "T123:U123");
             assert_eq!(
                 reopened
-                    .accept_attention_delivery("D1", "1710000001.000001", true, true)
+                    .accept_attention_delivery("D1", "1710000001.000001", true, false, true)
                     .await
                     .unwrap(),
                 AttentionDeliveryOutcome {
@@ -7940,7 +7967,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 store
-                    .accept_attention_delivery("C1", "10.0", true, true)
+                    .accept_attention_delivery("C1", "10.0", true, false, true)
                     .await
                     .unwrap(),
                 AttentionDeliveryOutcome {
@@ -8008,7 +8035,14 @@ mod tests {
 
             assert_eq!(
                 store
-                    .accept_attention_delivery_for_message("C1", "10.0", Some("1.0"), true, true,)
+                    .accept_attention_delivery_for_message(
+                        "C1",
+                        "10.0",
+                        Some("1.0"),
+                        true,
+                        false,
+                        true,
+                    )
                     .await
                     .unwrap(),
                 AttentionDeliveryOutcome {
@@ -8031,7 +8065,14 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 store
-                    .accept_attention_delivery_for_message("C1", "12.0", Some("1.0"), true, true,)
+                    .accept_attention_delivery_for_message(
+                        "C1",
+                        "12.0",
+                        Some("1.0"),
+                        true,
+                        false,
+                        true,
+                    )
                     .await
                     .unwrap(),
                 AttentionDeliveryOutcome {
@@ -8855,9 +8896,9 @@ mod tests {
                 id: "C123".into(),
                 ..Default::default()
             };
-            conversation.observe_attention_message_at("2.0", true);
-            conversation.observe_attention_message_at("3.0", false);
-            conversation.observe_attention_message_at("10.0", true);
+            conversation.observe_attention_message_at("2.0", true, false);
+            conversation.observe_attention_message_at("3.0", false, false);
+            conversation.observe_attention_message_at("10.0", true, false);
             store.store_conversations(&[conversation]).await.unwrap();
 
             let mut catalog = ThreadCatalog::default();

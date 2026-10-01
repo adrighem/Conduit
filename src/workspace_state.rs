@@ -371,6 +371,7 @@ impl WorkspaceSessionState {
                                 channel_id,
                                 &observation.message_ts,
                                 observation.record_unread,
+                                observation.record_mention,
                             )
                             .1;
                         if changed {
@@ -2362,6 +2363,7 @@ mod tests {
         let observation = ConversationAttentionObservation {
             message_ts: "11.0".to_string(),
             record_unread: true,
+            record_mention: false,
         };
         let first = state
             .apply_workspace_patch(&conversation_patch(
@@ -2415,6 +2417,7 @@ mod tests {
                         observations: vec![ConversationAttentionObservation {
                             message_ts: "19.0".to_string(),
                             record_unread: true,
+                            record_mention: false,
                         }],
                     },
                 ),
@@ -2445,6 +2448,7 @@ mod tests {
                         observations: vec![ConversationAttentionObservation {
                             message_ts: "21.0".to_string(),
                             record_unread: true,
+                            record_mention: false,
                         }],
                     },
                 ),
@@ -2482,6 +2486,7 @@ mod tests {
                     observations: vec![ConversationAttentionObservation {
                         message_ts: "29.0".to_string(),
                         record_unread: true,
+                        record_mention: false,
                     }],
                 },
             ))

@@ -52,6 +52,15 @@ pub struct ThreadRecord {
     /// aggregate unread count. Older records deserialize safely without them.
     #[serde(default)]
     unread_reply_ts: HashSet<String>,
+    /// Priority-tier subset of unread replies: a direct message, direct or
+    /// broadcast mention, or configured name/keyword match, independent of
+    /// whether the thread is otherwise "subscribed". Tracked separately from
+    /// `unread`/`unread_reply_ts` so a mention buried in a thread the user
+    /// isn't following still surfaces.
+    #[serde(default)]
+    pub(crate) has_unread_mention: bool,
+    #[serde(default)]
+    mention_reply_ts: HashSet<String>,
 }
 
 impl ThreadRecord {
@@ -66,6 +75,8 @@ impl ThreadRecord {
             participant_user_ids: HashSet::new(),
             seen_reply_ts: HashSet::new(),
             unread_reply_ts: HashSet::new(),
+            has_unread_mention: false,
+            mention_reply_ts: HashSet::new(),
         }
     }
 
@@ -313,6 +324,7 @@ impl ThreadCatalog {
         channel_id: &str,
         message: &SlackMessage,
         current_user_id: Option<&str>,
+        is_mention: bool,
     ) -> Option<ThreadRecord> {
         let Some(root_ts) = reply_root_ts(message) else {
             let (key, changed) = self.observe_message(channel_id, message, false)?;
@@ -350,6 +362,13 @@ impl ThreadCatalog {
                 *count = count.saturating_add(1);
                 record.unread_reply_ts.insert(message.ts.clone());
             }
+        }
+        // Unlike the ambient count above, a mention is tracked regardless of
+        // subscription state: being personally addressed in a thread matters
+        // even if the thread isn't otherwise being followed.
+        if is_mention {
+            record.has_unread_mention = true;
+            record.mention_reply_ts.insert(message.ts.clone());
         }
         if previous.as_ref() != self.records.get(&key) {
             self.records.get(&key).cloned()
@@ -412,11 +431,15 @@ impl ThreadCatalog {
                 ThreadUnreadState::Unknown => ThreadUnreadState::Unknown,
             };
             if let Some(root) = record.root.as_mut() {
-                root.last_read = Some(effective_last_read);
+                root.last_read = Some(effective_last_read.clone());
                 if let ThreadUnreadState::Known { count, .. } = &record.unread {
                     root.unread_count = Some(*count);
                 }
             }
+            record
+                .mention_reply_ts
+                .retain(|reply_ts| slack_timestamp_is_after(reply_ts, &effective_last_read));
+            record.has_unread_mention = !record.mention_reply_ts.is_empty();
             let updated = if previous.as_ref() != self.records.get(&key) {
                 self.records.get(&key).cloned()
             } else {
@@ -673,8 +696,8 @@ mod tests {
         initial.subscribed = Some(true);
         initial.unread_count = Some(0);
         catalog.observe_thread("C1", "1.0", &[initial], false);
-        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
-        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"), false);
+        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"), false);
         catalog.mark_read("C1", "1.0", "2.0");
 
         let mut stale = root("1.0", 2);
@@ -705,8 +728,8 @@ mod tests {
         root.unread_count = Some(0);
         catalog.observe_thread("C1", "1.0", &[root], false);
         let reply = reply("2.0", "1.0", "U2");
-        catalog.observe_realtime("C1", &reply, Some("ME"));
-        catalog.observe_realtime("C1", &reply, Some("ME"));
+        catalog.observe_realtime("C1", &reply, Some("ME"), false);
+        catalog.observe_realtime("C1", &reply, Some("ME"), false);
         assert_eq!(
             catalog.get("C1", "1.0").unwrap().unread,
             ThreadUnreadState::Known {
@@ -724,8 +747,8 @@ mod tests {
         root.subscribed = Some(true);
         root.unread_count = Some(0);
         catalog.observe_thread("C1", "1.0", &[root], false);
-        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
-        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"), false);
+        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"), false);
 
         assert_eq!(
             catalog.mark_read("C1", "1.0", "3.0").0,
@@ -758,7 +781,7 @@ mod tests {
         root.subscribed = Some(true);
         root.unread_count = Some(0);
         catalog.observe_thread("C1", "1.0", &[root], false);
-        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"), false);
 
         assert_eq!(
             catalog.mark_read("C1", "1.0", "2.0").0,
@@ -785,8 +808,8 @@ mod tests {
         root.unread_count = Some(0);
         catalog.observe_thread("C1", "1.0", &[root], false);
 
-        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U2"), Some("ME"));
-        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U3"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U2"), Some("ME"), false);
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U3"), Some("ME"), false);
 
         let record = catalog.get("C1", "1.0").unwrap();
         assert_eq!(record.reply_count, 2);
@@ -820,8 +843,8 @@ mod tests {
         root.subscribed = Some(true);
         root.unread_count = Some(0);
         catalog.observe_thread("C1", "1.0", &[root], false);
-        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"));
-        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U2"), Some("ME"), false);
+        catalog.observe_realtime("C1", &reply("3.0", "1.0", "U3"), Some("ME"), false);
 
         assert_eq!(
             catalog.mark_read("C1", "1.0", "2.0").0,
@@ -880,7 +903,7 @@ mod tests {
         let mut catalog = ThreadCatalog::default();
         catalog.observe_history("C2", &[root("2.0", 1)]);
         catalog.observe_history("C1", &[root("1.0", 1)]);
-        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U_SELF"), Some("U_SELF"));
+        catalog.observe_realtime("C1", &reply("2.0", "1.0", "U_SELF"), Some("U_SELF"), false);
         let records = catalog.into_records();
         assert_eq!(records[0].key, ThreadKey::new("C1", "1.0").unwrap());
         assert!(records[0].participant_user_ids.contains("U_SELF"));
@@ -951,7 +974,7 @@ mod tests {
         root_msg.latest_reply = Some("10.000000".into());
         catalog.observe_thread("C1", "1.0", &[root_msg], false);
 
-        catalog.observe_realtime("C1", &reply("9.999999", "1.0", "U2"), Some("ME"));
+        catalog.observe_realtime("C1", &reply("9.999999", "1.0", "U2"), Some("ME"), false);
         assert_eq!(
             catalog.get("C1", "1.0").unwrap().unread,
             ThreadUnreadState::Known {
