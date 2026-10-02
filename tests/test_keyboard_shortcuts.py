@@ -446,6 +446,84 @@ def verify_message_edit_shortcut(
     assert composer_text(window_id) == "Last sent message updated"
 
 
+def verify_thread_message_edit_shortcut(
+    window_id: str, state_path: Path, completion_path: Path
+) -> None:
+    press(window_id, "ctrl+m")
+    time.sleep(0.1)
+
+    replace_composer_text(window_id, "Existing reply draft")
+    press(window_id, "ctrl+Up")
+    time.sleep(0.1)
+    assert composer_text(window_id) == "Existing reply draft"
+    assert not state_path.exists()
+    replace_composer_text(window_id, "")
+
+    press(window_id, "ctrl+Up")
+    editing = wait_until(lambda: message_edit_state(state_path, "editing"))
+    assert editing["target"] == "thread"
+    assert editing["message_ts"] == "1.1"
+    assert editing["header_title"] == "Edit reply"
+    assert editing["header_subtitle"] == "Press Escape to cancel"
+    assert editing["send_tooltip"] == "Save Edited Reply"
+    assert editing["edit_class"] is True
+    assert editing["suggested_class"] is False
+    assert editing["send_sensitive"] is True
+    assert editing["upload_sensitive"] is False
+    assert editing["entry_editable"] is True
+    assert editing["format_sensitive"] is False
+    assert composer_text(window_id) == "Last sent thread reply"
+
+    replace_composer_text(window_id, "@ada")
+    wait_for_completion_ready(completion_path, "thread", "mention", "ada", "UADA")
+    press(window_id, "Escape")
+    canceled = wait_until(lambda: message_edit_state(state_path, "canceled"))
+    assert canceled["target"] == "thread"
+    assert canceled["header_title"] == "Thread"
+    assert canceled["header_subtitle"] == ""
+    assert canceled["send_tooltip"] == "Send Reply"
+    assert canceled["edit_class"] is False
+    assert canceled["suggested_class"] is True
+    assert canceled["send_sensitive"] is True
+    assert canceled["upload_sensitive"] is True
+    assert canceled["entry_editable"] is True
+    assert canceled["format_sensitive"] is True
+    type_text(window_id, "x")
+    assert composer_text(window_id) == "x"
+    replace_composer_text(window_id, "")
+
+    press(window_id, "ctrl+Up")
+    wait_until(lambda: message_edit_state(state_path, "editing"))
+    press(window_id, "Return")
+    unchanged = wait_until(lambda: message_edit_state(state_path, "unchanged"))
+    assert unchanged["target"] == "thread"
+    assert unchanged["header_title"] == "Thread"
+    type_text(window_id, "x")
+    assert composer_text(window_id) == "x"
+    replace_composer_text(window_id, "")
+
+    press(window_id, "ctrl+Up")
+    wait_until(lambda: message_edit_state(state_path, "editing"))
+    press(window_id, "End")
+    type_text(window_id, " updated")
+    press(window_id, "Return")
+    submitted = wait_until(lambda: message_edit_state(state_path, "submitted"))
+    assert submitted["target"] == "thread"
+    assert submitted["channel_id"] == "C_TEST"
+    assert submitted["message_ts"] == "1.1"
+    assert submitted["header_title"] == "Edit reply"
+    assert submitted["send_tooltip"] == "Save Edited Reply"
+    assert submitted["edit_class"] is True
+    assert submitted["suggested_class"] is False
+    assert submitted["send_sensitive"] is False
+    assert submitted["upload_sensitive"] is False
+    assert submitted["entry_editable"] is False
+    assert submitted["format_sensitive"] is False
+    assert composer_text(window_id) == "Last sent thread reply updated"
+    type_text(window_id, " ignored")
+    assert composer_text(window_id) == "Last sent thread reply updated"
+
+
 def stop_process(process: subprocess.Popen[str]) -> None:
     process.terminate()
     try:
@@ -542,6 +620,35 @@ def main() -> None:
             window_id = wait_for_window(process)
             verify_message_edit_shortcut(
                 window_id, message_edit_path, message_edit_completion_path
+            )
+        finally:
+            stop_process(process)
+
+        thread_edit_path = temporary_path / "thread-edit.json"
+        thread_edit_completion_path = temporary_path / "thread-edit-completion.json"
+        thread_edit_environment = environment.copy()
+        thread_edit_environment.update(
+            {
+                "CONDUIT_TEST_MESSAGE_EDIT": "1",
+                "CONDUIT_TEST_THREAD_COMPOSER": "1",
+                "CONDUIT_TEST_MESSAGE_EDIT_FILE": str(thread_edit_path),
+                "CONDUIT_TEST_MESSAGE_EDIT_NO_RUNTIME": "1",
+                "CONDUIT_TEST_COMPOSER_COMPLETION_FILE": str(
+                    thread_edit_completion_path
+                ),
+                "CONDUIT_TEST_COMPOSER_HYDRATION": "1",
+            }
+        )
+        process = subprocess.Popen(
+            [str(binary)],
+            env=thread_edit_environment,
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            window_id = wait_for_window(process)
+            verify_thread_message_edit_shortcut(
+                window_id, thread_edit_path, thread_edit_completion_path
             )
         finally:
             stop_process(process)

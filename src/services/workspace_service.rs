@@ -188,7 +188,7 @@ mod tests {
             let mut emojis = HashMap::new();
             emojis.insert(
                 "parrot".to_string(),
-                "http://example.com/parrot.gif".to_string(),
+                "https://example.com/parrot.gif".to_string(),
             );
             Ok(emojis)
         }

@@ -203,3 +203,10 @@
 - Decided to remediate the high-severity CodeQL cleartext logging alerts in `src/auth.rs` and `src/runtime.rs` immediately by eliminating dynamic, tainted values from stderr/panic sinks.
 - In `src/auth.rs`, replaced dynamic formatting of the OAuth callback `callback.error` parameter and token exchange properties (`team_id`, `user_id`, `scope`) with static log messages (`"Slack returned authorize error"`, `"token exchange succeeded"`). Returning the original error message in the return `Result` remains safe since the return value does not flow to a logging/stderr sink.
 - In `src/runtime.rs`, replaced trace assertion failure formatting containing `{secret}` or `{output}` with static string failure messages (`"trace leaked confidential content"`, `"trace omitted expected stable trace category"`, `"attention trace leaked private input"`). This maintains test assertion logic while preventing the test panic from acting as a static-analysis logging leak.
+
+## 2026-09-12 Emoji Reaction Alias Normalization
+
+- Fixed duplicate reaction pills (`+1` vs `thumbsup`, custom emoji aliases like `:ohyou:` vs `:awesome:`) occurring when reacting via quick actions or picker.
+- Resolved root cause: Conduit optimistic updates applied non-canonical alias names locally while Slack API server normalized aliases before emitting WebSocket `reaction_added` events, causing Conduit to store and render both as separate reactions.
+- Added `EmojiCatalog::canonical_name` to follow custom emoji alias chains and map standard Slack emoji aliases (`thumbsup` -> `+1`, `thumbsdown` -> `-1`, preserving skin tone suffixes).
+- Canonicalized reaction names at user action entry points (`conduit://reaction` handler, quick reaction bar), and ensured `SlackMessage::user_reacted` and `apply_reaction_to_message` recognize standard alias equivalence.

@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/adrighem/Conduit/compare/v0.4.0...v0.5.0) (2026-09-12)
+
+
+### Features
+
+* **composer:** add keyboard shortcut to edit thread replies ([095c75d](https://github.com/adrighem/Conduit/commit/095c75d9ce1838145594d8607bfb5a889a6e0e2b))
+* **composer:** convert links to clickable links when sending messages ([04b9442](https://github.com/adrighem/Conduit/commit/04b9442d0562df987ed1f6623723763ab4815181))
+
+
+### Bug Fixes
+
+* **reactions:** canonicalize emoji aliases before mutation and api dispatch ([08b5920](https://github.com/adrighem/Conduit/commit/08b59202b8ac7d776edba008dc0cb7e60d662ba1))
+* **reactions:** display shortcode in reaction and quick action tooltips ([b410892](https://github.com/adrighem/Conduit/commit/b41089202c250a6d9944d53e240f6c764ca6691a))
+* **services:** update test fixture URLs to HTTPS ([2eecfb4](https://github.com/adrighem/Conduit/commit/2eecfb47191a4a8c01ce617b166a83de53b85750))
+
 ## [0.4.0](https://github.com/adrighem/Conduit/compare/v0.3.0...v0.4.0) (2026-09-01)
 
 

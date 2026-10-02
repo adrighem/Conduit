@@ -152,14 +152,14 @@ mod tests {
             assert_eq!(file.id.as_deref(), Some("F999"));
 
             let asset = service
-                .download_preview_asset("http://example.com/a.png")
+                .download_preview_asset("https://example.com/a.png")
                 .await
                 .unwrap();
             assert_eq!(asset.bytes, vec![1, 2, 3]);
             assert_eq!(asset.mime_type, PreviewAssetMime::Png);
 
             let media = service
-                .download_media("http://example.com/a.jpg", Path::new("/tmp/test.jpg"))
+                .download_media("https://example.com/a.jpg", Path::new("/tmp/test.jpg"))
                 .await
                 .unwrap();
             assert_eq!(media.path, PathBuf::from("/tmp/test.jpg"));

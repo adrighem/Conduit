@@ -524,3 +524,26 @@
   - `meson compile -C _build`: pass
   - `meson test -C _build`: pass, all 17 integration and headless UI test suites passed
 - No public GitHub action was taken. Pushing the local commits requires explicit approval.
+
+## 2026-09-10 CodeQL HTTPS Alert Remediation & Maintainer Pass
+
+- Scope: address CodeQL high-severity failure to use HTTPS URLs alerts #4 and #5 in `src/slack.rs`.
+- Remediated static taint sources:
+  - In `src/services/file_service.rs`, updated mock `download_preview_asset` and `download_media` test fixtures to use HTTPS URLs (`https://example.com/a.png`, `https://example.com/a.jpg`).
+  - In `src/services/workspace_service.rs`, updated mock custom emoji test fixture to use HTTPS URL (`https://example.com/parrot.gif`).
+- Local checks:
+  - `cargo fmt --check`: pass
+  - `cargo clippy --all-targets -- -D warnings`: pass
+  - `cargo test`: pass, 1110 passed, 3 ignored
+  - `meson compile -C _build`: pass
+  - `meson test -C _build`: pass, all 19 integration and headless UI test suites passed
+- GitHub status: 0 unread inbox notifications, 0 open issues, 0 open pull requests, 0 open Dependabot alerts.
+
+## 2026-09-11 Maintainer Pass
+
+- Scope: manual pass, backlog + release PR + local in-progress work audit.
+- GitHub: 0 open issues, PR:20 only open PR (release-please 0.5.0), 0 unread Conduit notifications, Dependabot alert 1 fixed, CodeQL alerts 1-5 fixed.
+- PR:20: mergeable, diff limited to release metadata (manifest, changelog, Cargo.lock/toml, AppStream, meson.build). Exact-head CI `34587864117` and CodeQL pass.
+- Worktree: uncommitted thread-reply edit shortcut (`Ctrl+Up` in thread) across `src/window.rs`, `src/workspace_state.rs` (drops `#[cfg(test)]` gating on `apply_thread`/`merge_message_pages`/`merge_message_refresh`, now used outside tests), `tests/test_keyboard_shortcuts.py`.
+- Local checks on dirty worktree: `cargo fmt --check` pass, `cargo test --locked` pass (1116 passed, 3 ignored), `cargo clippy --all-targets -- -D warnings` pass, `meson compile` pass, `meson test` pass (19/19).
+- No public GitHub action or commit/push was taken.

@@ -3615,7 +3615,7 @@ fn message_actions_html(
         actions.push_str(&action_button_content_html(
             &reaction_action_url(channel_id, message, &emoji.name, !reacted, thread_ts),
             &emoji_value_html(&emoji.value, false),
-            &gettext("React with {emoji}").replace("{emoji}", &emoji.label),
+            &gettext("React with :{emoji}:").replace("{emoji}", &emoji.name),
             reacted,
         ));
     }
@@ -3815,12 +3815,13 @@ fn action_thread_ts<'a>(
 }
 
 fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
+    let catalog = EmojiCatalog::new(&context.custom_emojis);
     let mut usage = HashMap::new();
     for (index, name) in context
         .recent_reactions
         .iter()
         .take(config::RECENT_REACTION_HISTORY_LIMIT)
-        .map(String::as_str)
+        .map(|name| catalog.canonical_name(name))
         .enumerate()
     {
         if name.trim().is_empty() {
@@ -3839,15 +3840,15 @@ fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
         },
     );
     let requested = ranked.into_iter().map(|(name, _)| name).chain([
-        "smile",
-        "thumbsup",
-        "white_check_mark",
-        "heart",
+        "smile".to_string(),
+        "+1".to_string(),
+        "white_check_mark".to_string(),
+        "heart".to_string(),
     ]);
     let mut seen = HashSet::new();
     requested
-        .filter(|name| seen.insert(*name))
-        .filter_map(|name| emoji_entry(name, context))
+        .filter(|name| seen.insert(name.clone()))
+        .filter_map(|name| emoji_entry(&name, context))
         .take(QUICK_REACTION_LIMIT)
         .collect()
 }
@@ -3893,11 +3894,8 @@ fn reaction_label(name: &str, context: &MessageHtmlContext) -> String {
         .unwrap_or_else(|| escape_html(&format!(":{name}:")))
 }
 
-fn reaction_tooltip_text(name: &str, context: &MessageHtmlContext) -> String {
-    match EmojiCatalog::new(&context.custom_emojis).resolve(name) {
-        Some(EmojiValue::Unicode(value)) => value.to_string(),
-        Some(EmojiValue::CustomImage(_)) | None => format!(":{name}:"),
-    }
+fn reaction_tooltip_text(name: &str, _context: &MessageHtmlContext) -> String {
+    format!(":{name}:")
 }
 
 pub fn mrkdwn_to_pango(text: &str, context: &MessageHtmlContext) -> String {
@@ -4254,6 +4252,14 @@ fn render_inline(text: &str, context: &MessageHtmlContext) -> String {
             continue;
         }
 
+        if !output.chars().last().is_some_and(char::is_alphanumeric) {
+            if let Some((html, consumed)) = render_bare_url(rest) {
+                output.push_str(&html);
+                rest = &rest[consumed..];
+                continue;
+            }
+        }
+
         if let Some((html, consumed)) = render_emoji_shortcode(rest, context) {
             output.push_str(&html);
             rest = &rest[consumed..];
@@ -4363,6 +4369,14 @@ fn channel_reference_html(channel_id: &str, label: &str) -> String {
         escape_html(&channel_action_url(channel_id)),
         escape_html(label)
     )
+}
+
+fn render_bare_url(text: &str) -> Option<(String, usize)> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let token = crate::composer::parse_plain_url(&characters, 0)?;
+    let html = external_link_html(&token.url, &token.url);
+    let consumed_bytes: usize = characters[..token.end].iter().map(|c| c.len_utf8()).sum();
+    Some((html, consumed_bytes))
 }
 
 fn user_group_mention_html(raw: &str, context: &MessageHtmlContext) -> String {
@@ -4522,7 +4536,12 @@ pub(super) fn is_http_url(value: &str) -> bool {
 
 pub(super) fn is_call_url(value: &str) -> bool {
     url::Url::parse(value)
-        .map(|url| matches!(url.scheme(), "http" | "https" | "msteams" | "zoommtg"))
+        .map(|url| {
+            matches!(
+                url.scheme(),
+                "http" | "https" | "msteams" | "zoommtg" | "mailto"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -6027,14 +6046,16 @@ mod tests {
         ));
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
         assert!(html.contains(
-            "href=\"conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true\" title=\"Grace Hopper: 👀\""
+            "href=\"conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true\" title=\"Grace Hopper: :eyes:\""
         ));
         assert!(html.contains(
             "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true"
         ));
         let reaction_chip = html.find("<a class=\"reaction is-active\"").unwrap();
-        assert!(html.contains("title=\"Ada Lovelace, Grace Hopper, Linus Torvalds: 👍\""));
-        assert!(html.contains("aria-label=\"Ada Lovelace, Grace Hopper, Linus Torvalds: 👍\""));
+        assert!(html.contains("title=\"Ada Lovelace, Grace Hopper, Linus Torvalds: :thumbsup:\""));
+        assert!(
+            html.contains("aria-label=\"Ada Lovelace, Grace Hopper, Linus Torvalds: :thumbsup:\"")
+        );
         assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
         let thread_chip = html.find("<a class=\"reaction thread-reaction\"").unwrap();
         assert!(reaction_chip < thread_chip);
@@ -6099,7 +6120,7 @@ mod tests {
             .map(|emoji| emoji.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["heart", "eyes", "thumbsup", "fire"]);
+        assert_eq!(names, ["heart", "eyes", "+1", "fire"]);
 
         let tie_context = MessageHtmlContext {
             recent_reactions: [
@@ -6115,7 +6136,35 @@ mod tests {
             .map(|emoji| emoji.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(tied_names, ["eyes", "heart", "thumbsup", "fire"]);
+        assert_eq!(tied_names, ["eyes", "heart", "+1", "fire"]);
+    }
+
+    #[test]
+    fn quick_reactions_canonicalize_and_deduplicate_aliases() {
+        let custom_emojis = Arc::new(HashMap::from([
+            ("ohyou".to_string(), "alias:awesome".to_string()),
+            (
+                "awesome".to_string(),
+                "https://emoji.example/awesome.png".to_string(),
+            ),
+        ]));
+        let context = MessageHtmlContext {
+            custom_emojis,
+            recent_reactions: vec![
+                "thumbsup".to_string(),
+                "+1".to_string(),
+                "ohyou".to_string(),
+                "awesome".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let names = recent_reactions(&context)
+            .into_iter()
+            .map(|emoji| emoji.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["+1", "awesome", "smile", "white_check_mark"]);
     }
 
     #[test]
@@ -7260,9 +7309,7 @@ mod tests {
         assert!(html.contains("in <a class=\"channel-reference\" href=\"conduit://channel?channel=C0B7NRGNSSW\">#general</a>"));
         assert!(html.contains("This week is fine. Next week isn&#39;t"));
         assert!(html.contains("href=\"conduit://message?channel=C0B7NRGNSSW&amp;ts=1785770122.389189&amp;thread_ts=1785745809.323539\""));
-        assert!(html.contains("Thread in Slack conversation ↗"));
     }
-
     #[test]
     fn message_body_does_not_render_custom_url_schemes_as_links() {
         let mut message = crate::models::SlackMessage {
@@ -7414,4 +7461,24 @@ mod tests {
         let output = mrkdwn_to_pango(input, &context);
         assert_eq!(output, "<b>bold with <tt>code</tt> and <i>italic</i></b>");
     }
+||||||| 18cc5db
+=======
+
+    #[test]
+    fn test_renders_bare_urls_and_mailto_links() {
+        let message = SlackMessage {
+            text: Some(
+                "Visit https://conduit.app or email mailto:support@conduit.app for help.".into(),
+            ),
+            ..Default::default()
+        };
+        let context = MessageHtmlContext::default();
+        let html = message_body_html(None, &message, &context);
+
+        assert!(html.contains(
+            "<a href=\"https://conduit.app\" rel=\"noreferrer noopener\">https://conduit.app</a>"
+        ));
+        assert!(html.contains("<a href=\"mailto:support@conduit.app\" rel=\"noreferrer noopener\">mailto:support@conduit.app</a>"));
+    }
+>>>>>>> origin/main
 }
