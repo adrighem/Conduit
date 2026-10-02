@@ -4,7 +4,6 @@ use std::sync::{Arc, OnceLock};
 use gettextrs::gettext;
 use serde::Serialize;
 
-use crate::activity::ActivityItem;
 use crate::config;
 use crate::debug;
 use crate::emoji::{
@@ -50,8 +49,6 @@ pub struct MessageHtmlContext {
     pub failed_image_urls: HashSet<String>,
     pub recent_reactions: Vec<String>,
     pub custom_emojis: Arc<HashMap<String, String>>,
-    pub read_marker_url: Option<String>,
-    pub first_unread_ts: Option<String>,
     pub timeline_generation: Option<u64>,
     pub(crate) message_control_handles: HashMap<MessageRef, MessageControlHandle>,
     pub(crate) message_control_action_handles:
@@ -102,10 +99,6 @@ pub enum TimelineScrollBehavior {
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[allow(dead_code)]
 pub enum TimelineDomPatch {
-    ConfigureReadState {
-        read_marker_url: Option<String>,
-        first_unread_ts: Option<String>,
-    },
     ReplaceSnapshot {
         list_html: String,
         load_more_html: String,
@@ -121,10 +114,6 @@ pub enum TimelineDomPatch {
         focus_message_ts: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         empty_label: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        read_marker_url: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        first_unread_ts: Option<String>,
     },
     InsertMessage {
         position: TimelineInsertPosition,
@@ -232,15 +221,12 @@ pub fn insert_message_patch(
     position: TimelineInsertPosition,
     arrival: Option<TimelineMessageArrival>,
 ) -> TimelineDomPatch {
-    let unread_separator = (context.first_unread_ts.as_deref() == Some(message.ts.as_str()))
-        .then(unread_separator_html)
-        .unwrap_or_default();
     TimelineDomPatch::InsertMessage {
         position,
         message_ts: message.ts.clone(),
         arrival,
         html: format!(
-            "{unread_separator}<li class=\"message-list-item\">{}</li>",
+            "<li class=\"message-list-item\">{}</li>",
             message_article(Some(channel_id), message, context)
         ),
     }
@@ -287,22 +273,6 @@ pub fn conversation_snapshot_patch_with_focus(
         generation: context.timeline_generation,
         focus_message_ts: focus_message_ts.map(ToString::to_string),
         empty_label: Some(empty_label),
-        read_marker_url: active_read_marker_url(context).map(ToString::to_string),
-        first_unread_ts: active_read_marker_url(context)
-            .and(context.first_unread_ts.as_deref())
-            .map(ToString::to_string),
-    }
-}
-
-#[allow(dead_code)]
-pub fn configure_read_state_patch(context: &MessageHtmlContext) -> TimelineDomPatch {
-    let read_marker_url = active_read_marker_url(context).map(ToString::to_string);
-    let first_unread_ts = read_marker_url
-        .as_ref()
-        .and(context.first_unread_ts.clone());
-    TimelineDomPatch::ConfigureReadState {
-        read_marker_url,
-        first_unread_ts,
     }
 }
 
@@ -847,7 +817,7 @@ pub fn conversation_document_with_focus(
     context: &MessageHtmlContext,
     focus_message_ts: Option<&str>,
 ) -> String {
-    let groups = message_groups(messages, context.first_unread_ts.as_deref());
+    let groups = message_groups(messages);
     debug::log(
         "render",
         &format!(
@@ -871,20 +841,13 @@ pub fn conversation_document_with_focus(
         .timeline_generation
         .map(|generation| format!(" data-timeline-generation=\"{generation}\""))
         .unwrap_or_default();
-    let read_marker_attribute = active_read_marker_url(context)
-        .map(|url| format!(" data-read-marker-url=\"{}\"", escape_html(url)))
-        .unwrap_or_default();
-    let first_unread_attribute = active_read_marker_url(context)
-        .and(context.first_unread_ts.as_deref())
-        .map(|ts| format!(" data-first-unread-ts=\"{}\"", escape_html(ts)))
-        .unwrap_or_default();
     let estimated_capacity = 24_576 + messages.len() * 1536;
     let mut body = String::with_capacity(estimated_capacity);
     body.push_str(&format!(
         "<main class=\"timeline\" aria-labelledby=\"document-title\" \
          data-timeline-positioning=\"pending\" data-timeline-mode=\"{}\" \
          data-timeline-sticky-key=\"{}\" data-timeline-anchor-key=\"{}\"\
-         {generation_attribute}{focus_attribute}{read_marker_attribute}{first_unread_attribute}>{}",
+         {generation_attribute}{focus_attribute}>{}",
         context.timeline_scroll.js_mode(),
         escape_html(&sticky_key),
         escape_html(&anchor_key),
@@ -923,13 +886,7 @@ fn conversation_list_items_html(
     context: &MessageHtmlContext,
 ) -> String {
     let mut html = String::with_capacity(messages.len() * 1024);
-    for group in message_groups(messages, context.first_unread_ts.as_deref()) {
-        if group
-            .first()
-            .is_some_and(|message| context.first_unread_ts.as_deref() == Some(message.ts.as_str()))
-        {
-            html.push_str(&unread_separator_html());
-        }
+    for group in message_groups(messages) {
         html.push_str("<li class=\"message-list-item\">");
         html.push_str(&message_group_article(Some(channel_id), &group, context));
         html.push_str("</li>");
@@ -971,25 +928,6 @@ pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -
     html_document(&title, &body)
 }
 
-pub fn unreads_document(items: &[ActivityItem]) -> String {
-    if items.is_empty() {
-        return placeholder_document(&gettext("Unreads"), &gettext("No unread conversations"));
-    }
-
-    let title = gettext("Unreads");
-    let mut body = String::with_capacity(items.len() * 512 + 1024);
-    body.push_str(&format!(
-        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ul class=\"activity-list\">",
-        document_heading(&title)
-    ));
-    for item in items {
-        body.push_str(&activity_item_html(item));
-    }
-    body.push_str("</ul></main>");
-
-    html_document(&title, &body)
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadInboxItem {
     pub channel_id: String,
@@ -1013,14 +951,9 @@ pub fn threads_document(items: &[ThreadInboxItem], context: &MessageHtmlContext)
     ));
     for item in items {
         let reply_count = item.root.reply_count.unwrap_or_default();
-        let mut label = gettext("{channel} · {count} replies")
+        let label = gettext("{channel} · {count} replies")
             .replace("{channel}", &item.channel_title)
             .replace("{count}", &reply_count.to_string());
-        if let Some(unread_count) = item.root.unread_count.filter(|count| *count > 0) {
-            label.push_str(
-                &gettext(" · {count} unread").replace("{count}", &unread_count.to_string()),
-            );
-        }
         body.push_str(&format!(
             "<li class=\"message-list-item\"><a class=\"activity-row\" href=\"{}\">{}</a>{}</li>",
             escape_html(&thread_action_url(&item.channel_id, &item.root.ts)),
@@ -1269,35 +1202,6 @@ a:hover {{
   text-align: center;
   content: attr(data-empty-label);
 }}
-
-.unread-separator {{
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-block: 4px;
-  color: var(--accent);
-  font-size: 12px;
-  font-weight: 700;
-  max-height: 24px;
-  opacity: 1;
-  overflow: hidden;
-  transition: opacity 200ms ease, max-height 200ms ease, margin-block 200ms ease;
-}}
-
-.unread-separator.collapsing {{
-  opacity: 0;
-  max-height: 0;
-  margin-block: 0;
-}}
-
-.unread-separator::before,
-.unread-separator::after {{
-  content: "";
-  flex: 1;
-  border-block-start: 1px solid currentColor;
-}}
-
-.unread-boundary-item:empty {{ display: none; }}
 
 [data-message-region]:empty {{
   display: none;
@@ -1632,20 +1536,6 @@ pre code {{
 .activity-meta {{
   color: var(--muted);
   font-size: 12px;
-}}
-
-.activity-badge {{
-  align-self: center;
-  grid-row: 1 / span 2;
-  grid-column: 2;
-  min-inline-size: 24px;
-  padding-block: 2px;
-  padding-inline: 8px;
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--text);
-  font-size: 12px;
-  text-align: center;
 }}
 
 .file-list {{
@@ -2098,13 +1988,6 @@ fn timeline_scroll_identity(channel_id: &str, thread_ts: Option<&str>) -> String
     }
 }
 
-fn active_read_marker_url(context: &MessageHtmlContext) -> Option<&str> {
-    context
-        .read_marker_url
-        .as_deref()
-        .filter(|_| context.thread_ts.is_some() || context.first_unread_ts.is_some())
-}
-
 fn timeline_dom_runtime_script() -> &'static str {
     include_str!("timeline_dom_runtime.js")
 }
@@ -2142,27 +2025,6 @@ fn load_more_action_html(url: &str, label: &str) -> String {
         "<nav class=\"timeline-action\"><a href=\"{}\">{}</a></nav>",
         escape_html(url),
         escape_html(label)
-    )
-}
-
-fn activity_item_html(item: &ActivityItem) -> String {
-    let action_url = item
-        .thread_ts
-        .as_deref()
-        .map(|thread_ts| thread_action_url(&item.channel_id, thread_ts))
-        .unwrap_or_else(|| unreads_open_action_url(&item.channel_id));
-    format!(
-        concat!(
-            "<li><a class=\"activity-row\" href=\"{}\">",
-            "<span class=\"activity-title\" dir=\"auto\">{}</span>",
-            "<span class=\"activity-badge\">{}</span>",
-            "<span class=\"activity-meta\">{}</span>",
-            "</a></li>"
-        ),
-        escape_html(&action_url),
-        escape_html(&item.title),
-        escape_html(&item.unread_label()),
-        escape_html(&item.kind.label())
     )
 }
 
@@ -2338,18 +2200,14 @@ fn message_author_attribute(message: &SlackMessage) -> String {
         .unwrap_or_default()
 }
 
-fn message_groups<'a>(
-    messages: &'a [SlackMessage],
-    first_unread_ts: Option<&str>,
-) -> Vec<Vec<&'a SlackMessage>> {
+fn message_groups<'a>(messages: &'a [SlackMessage]) -> Vec<Vec<&'a SlackMessage>> {
     let mut groups: Vec<Vec<&'a SlackMessage>> = Vec::with_capacity(messages.len());
 
     for message in messages.iter().rev() {
         if let Some(group) = groups.last_mut() {
-            if first_unread_ts != Some(message.ts.as_str())
-                && group
-                    .last()
-                    .is_some_and(|previous| can_group_messages(previous, message))
+            if group
+                .last()
+                .is_some_and(|previous| can_group_messages(previous, message))
             {
                 group.push(message);
                 continue;
@@ -2362,14 +2220,6 @@ fn message_groups<'a>(
     }
 
     groups
-}
-
-fn unread_separator_html() -> String {
-    format!(
-        "<li class=\"unread-boundary-item\"><div class=\"unread-separator\" role=\"separator\" aria-label=\"{}\"><span>{}</span></div></li>",
-        escape_html(&gettext("Unread messages")),
-        escape_html(&gettext("New"))
-    )
 }
 
 fn can_group_messages(previous: &SlackMessage, current: &SlackMessage) -> bool {
@@ -3875,21 +3725,6 @@ pub fn load_more_action_url(channel_id: &str, cursor: &str, thread_ts: Option<&s
     url
 }
 
-pub fn unreads_open_action_url(channel_id: &str) -> String {
-    format!(
-        "conduit://unreads-open?channel={}",
-        encode_query(channel_id)
-    )
-}
-
-pub fn mark_read_action_url(channel_id: &str, ts: &str) -> String {
-    format!(
-        "conduit://mark-read?channel={}&ts={}",
-        encode_query(channel_id),
-        encode_query(ts)
-    )
-}
-
 pub fn user_message_action_url(user_id: &str) -> String {
     format!("conduit://user-message?user={}", encode_query(user_id))
 }
@@ -3900,15 +3735,6 @@ pub fn channel_action_url(channel_id: &str) -> String {
 
 pub fn user_profile_action_url(user_id: &str) -> String {
     format!("conduit://user-profile?user={}", encode_query(user_id))
-}
-
-pub fn mark_thread_read_action_url(channel_id: &str, thread_ts: &str, ts: &str) -> String {
-    format!(
-        "conduit://mark-read?channel={}&thread_ts={}&ts={}",
-        encode_query(channel_id),
-        encode_query(thread_ts),
-        encode_query(ts)
-    )
 }
 
 pub fn message_context_action_url(location: &SearchMessageLocation) -> String {
@@ -4425,7 +4251,6 @@ fn push_escaped_html_character(output: &mut String, character: char) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::{ActivityItem, ActivityKind};
     use crate::message_handoff::{MessageControlRegistry, TimelineSurfaceId};
     use crate::models::{SavedItem, SlackFile, SlackReaction};
     use std::time::Instant;
@@ -6084,30 +5909,19 @@ mod tests {
     }
 
     #[test]
-    fn unread_conversation_advances_to_the_newest_visible_message() {
+    fn conversation_document_emits_generation_and_positioning_callbacks() {
         let context = MessageHtmlContext {
-            read_marker_url: Some(mark_read_action_url("C123", "1710000000.000100")),
-            first_unread_ts: Some("1710000000.000100".into()),
             timeline_generation: Some(42),
             ..Default::default()
         };
 
-        let html = conversation_document("C123", &[message("unread")], &context);
+        let html = conversation_document("C123", &[message("hello")], &context);
 
-        assert!(html.contains("class=\"unread-separator\""));
-        assert!(html.contains("data-first-unread-ts=\"1710000000.000100\""));
         assert!(html.contains("data-timeline-generation=\"42\""));
         assert!(html.contains("data-timeline-positioning=\"pending\""));
         assert!(html.contains("\"conduit://timeline-\" + action"));
         assert!(html.contains("notifyHost(\"positioned\")"));
         assert!(html.contains("notifyHost(\"interacted\")"));
-        assert!(html.contains("new IntersectionObserver"));
-        assert!(html.contains("function armReadMarker"));
-        assert!(html.contains("commitInitialPosition"));
-        assert!(html.contains("entry.intersectionRatio >= 0.90"));
-        assert!(html.contains("timeline.dataset.firstUnreadTs || \"\""));
-        assert!(html.contains("target.searchParams.set(\"ts\", candidate)"));
-        assert!(html.contains("timestampAfter(candidate, lastSent)"));
         assert!(!html.contains("function focusTarget()"));
         assert!(!html.contains("function applyScroll()"));
     }
@@ -6119,64 +5933,6 @@ mod tests {
 
         assert!(!html.contains("data-timeline-generation="));
         assert!(html.contains("if (generation !== null)"));
-    }
-
-    #[test]
-    fn read_channel_without_visible_unread_does_not_arm_a_marker_url() {
-        let context = MessageHtmlContext {
-            read_marker_url: Some(mark_read_action_url("C123", "0")),
-            ..Default::default()
-        };
-
-        let html = conversation_document("C123", &[message("read")], &context);
-
-        assert!(!html.contains("conduit://mark-read?channel=C123"));
-        assert!(!html.contains("data-first-unread-ts="));
-        assert!(html.contains("function configureReadMarker"));
-    }
-
-    #[test]
-    fn thread_read_marker_uses_continuous_message_observation() {
-        let context = MessageHtmlContext {
-            thread_ts: Some("1710000000.000100".into()),
-            read_marker_url: Some(mark_thread_read_action_url(
-                "C123",
-                "1710000000.000100",
-                "1710000001.000200",
-            )),
-            timeline_scroll: TimelineScrollBehavior::StickToBottom,
-            ..Default::default()
-        };
-
-        let html = conversation_document("C123", &[message("reply")], &context);
-
-        assert!(!html.contains("timeline-read-sentinel"));
-        assert!(html.contains("thread_ts=1710000000.000100"));
-        assert!(html.contains("conduit:timeline-at-bottom:thread:C123:1710000000.000100"));
-        assert!(html.contains("observer.observe(message)"));
-        assert!(html.contains("new MutationObserver(observeMessages)"));
-        assert!(!html.contains("observer.disconnect()"));
-    }
-
-    #[test]
-    fn read_observer_requires_stable_visibility_and_tracks_new_messages() {
-        let script = timeline_dom_runtime_script();
-
-        assert!(script.contains("entry.intersectionRatio >= 0.90"));
-        assert!(script.contains("if (timer && pending === newest) return"));
-        assert!(script.contains("newestVisibleTimestamp() !== candidate"));
-        assert!(script.contains("}, 500);"));
-        assert!(script.contains("new MutationObserver(observeMessages)"));
-        assert!(script.contains("observer.observe(message)"));
-        assert!(script.contains("observer.unobserve(message)"));
-        assert!(script.contains("message.closest(\".message-list-item\")"));
-        assert!(script.contains("nextItem.before(host)"));
-        assert!(script.contains("separator.classList.add(\"collapsing\")"));
-        assert!(script.contains("patch.type === \"configure-read-state\""));
-        assert!(script.contains("configurationLastSent = \"\""));
-        assert!(script.contains("if (!lastSent || timestampAfter(candidate, lastSent))"));
-        assert!(!script.contains("observeUnreadMessages"));
-        assert!(!script.contains("timeline-read-sentinel"));
     }
 
     #[test]
@@ -6476,51 +6232,6 @@ mod tests {
 
         assert!(html.contains("saved"));
         assert!(!html.contains("No saved items"));
-    }
-
-    #[test]
-    fn unreads_document_renders_rows() {
-        let items = vec![ActivityItem {
-            channel_id: "C123".to_string(),
-            thread_ts: None,
-            title: "#general & friends".to_string(),
-            kind: ActivityKind::PublicChannel,
-            unread: true,
-            unread_count: 3,
-        }];
-
-        let html = unreads_document(&items);
-
-        assert!(html.contains("<main class=\"timeline\" aria-labelledby=\"document-title\">"));
-        assert!(html.contains("<ul class=\"activity-list\"><li>"));
-        assert!(html.contains("class=\"activity-title\" dir=\"auto\""));
-        assert!(html.contains("#general &amp; friends"));
-        assert!(html.contains("3 unread"));
-        assert!(html.contains("Channel"));
-        assert!(html.contains("conduit://unreads-open?channel=C123"));
-    }
-
-    #[test]
-    fn unreads_document_uses_empty_state_without_rows() {
-        let html = unreads_document(&[]);
-
-        assert!(html.contains("No unread conversations"));
-        assert!(!html.contains("<a class=\"activity-row\""));
-    }
-
-    #[test]
-    fn unreads_document_links_thread_activity_to_the_thread() {
-        let html = unreads_document(&[ActivityItem {
-            channel_id: "C123".to_string(),
-            thread_ts: Some("1710000000.000100".to_string()),
-            title: "#general: Deployment".to_string(),
-            kind: ActivityKind::Thread,
-            unread: true,
-            unread_count: 2,
-        }]);
-
-        assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains("Thread"));
     }
 
     #[test]
@@ -6908,7 +6619,6 @@ mod tests {
         newer.ts = "1710000001.000100".to_string();
         let context = MessageHtmlContext {
             load_more_url: Some(load_more_action_url("C123", "next", None)),
-            first_unread_ts: Some(newer.ts.clone()),
             ..Default::default()
         };
 
@@ -6927,7 +6637,6 @@ mod tests {
         };
         assert!(list_html.contains("older"));
         assert!(list_html.contains("newer"));
-        assert!(list_html.contains("unread-separator"));
         assert!(load_more_html.contains("Load older messages"));
         assert!(load_more_html.contains("cursor=next"));
         assert_eq!(timeline_mode.as_deref(), Some("preserve"));
@@ -6950,8 +6659,6 @@ mod tests {
             generation: None,
             focus_message_ts: None,
             empty_label,
-            read_marker_url: None,
-            first_unread_ts: None,
         });
         assert!(script.contains("\"type\":\"replace-snapshot\""));
         assert!(script.contains("\"sticky_key\":\"conduit:timeline-at-bottom:channel:C123\""));
@@ -6964,8 +6671,6 @@ mod tests {
         let context = MessageHtmlContext {
             timeline_scroll: TimelineScrollBehavior::StickToBottom,
             timeline_generation: Some(42),
-            read_marker_url: Some(mark_read_action_url("C123", "0")),
-            first_unread_ts: Some(target.ts.clone()),
             ..Default::default()
         };
 
@@ -6982,8 +6687,6 @@ mod tests {
             generation,
             focus_message_ts,
             empty_label,
-            read_marker_url,
-            first_unread_ts,
             ..
         } = &patch
         else {
@@ -7002,62 +6705,11 @@ mod tests {
         assert_eq!(*generation, Some(42));
         assert_eq!(focus_message_ts.as_deref(), Some("1710000005.000100"));
         assert_eq!(empty_label.as_deref(), Some("No messages"));
-        assert!(read_marker_url.as_ref().unwrap().contains("channel=C123"));
-        assert_eq!(first_unread_ts.as_deref(), Some("1710000005.000100"));
 
         let script = timeline_dom_patch_call(&patch);
         assert!(script.contains("\"type\":\"replace-snapshot\""));
         assert!(script.contains("\"focus_message_ts\":\"1710000005.000100\""));
         assert!(script.contains("\"generation\":42"));
-    }
-
-    #[test]
-    fn configure_read_state_patch_serializes_visible_channel_boundary() {
-        let context = MessageHtmlContext {
-            read_marker_url: Some(mark_read_action_url("C123", "0")),
-            first_unread_ts: Some("1710000001.000100".into()),
-            ..Default::default()
-        };
-
-        let script = timeline_dom_patch_call(&configure_read_state_patch(&context));
-
-        assert!(script.contains("\"type\":\"configure-read-state\""));
-        assert!(
-            script.contains("\"read_marker_url\":\"conduit://mark-read?channel=C123\\u0026ts=0\"")
-        );
-        assert!(script.contains("\"first_unread_ts\":\"1710000001.000100\""));
-    }
-
-    #[test]
-    fn configure_read_state_patch_disables_channel_without_visible_unread() {
-        let context = MessageHtmlContext {
-            read_marker_url: Some(mark_read_action_url("C123", "0")),
-            ..Default::default()
-        };
-
-        let script = timeline_dom_patch_call(&configure_read_state_patch(&context));
-
-        assert!(script.contains("\"read_marker_url\":null"));
-        assert!(script.contains("\"first_unread_ts\":null"));
-    }
-
-    #[test]
-    fn configure_read_state_patch_keeps_thread_observation_without_boundary() {
-        let context = MessageHtmlContext {
-            thread_ts: Some("1710000000.000100".into()),
-            read_marker_url: Some(mark_thread_read_action_url(
-                "C123",
-                "1710000000.000100",
-                "1710000001.000100",
-            )),
-            ..Default::default()
-        };
-
-        let script = timeline_dom_patch_call(&configure_read_state_patch(&context));
-
-        assert!(script.contains("\"type\":\"configure-read-state\""));
-        assert!(script.contains("thread_ts=1710000000.000100"));
-        assert!(script.contains("\"first_unread_ts\":null"));
     }
 
     #[test]

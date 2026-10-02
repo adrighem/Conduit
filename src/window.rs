@@ -31,7 +31,6 @@ use gettextrs::gettext;
 use gtk::{gio, glib};
 use webkit6::prelude::*;
 
-use crate::activity::{self, ActivityItem};
 use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
@@ -97,11 +96,11 @@ use crate::status_dialog::*;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
-    resolve_first_unread_message_ts, ConversationOpenCoordinator, ConversationOpenIntent,
-    ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
-    ConversationSelectionDecision, MainMessageView, ThreadApplyOutcome, ThreadOpenOutcome,
-    TimelineProjectionApplication, TimelineProjectionOperation, TimelineProjectionPosition,
-    WorkspaceLifecycle, WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
+    ConversationOpenCoordinator, ConversationOpenIntent, ConversationOpenPosition,
+    ConversationOpenRenderAction, ConversationPatchRemoval, ConversationSelectionDecision,
+    MainMessageView, ThreadApplyOutcome, ThreadOpenOutcome, TimelineProjectionApplication,
+    TimelineProjectionOperation, TimelineProjectionPosition, WorkspaceLifecycle,
+    WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
 };
 
 #[derive(Debug, Clone)]
@@ -189,8 +188,6 @@ mod imp {
         #[template_child]
         pub messages_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
-        pub unreads_button: TemplateChild<gtk::ToggleButton>,
-        #[template_child]
         pub threads_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub files_button: TemplateChild<gtk::ToggleButton>,
@@ -200,8 +197,6 @@ mod imp {
         pub refresh_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub sidebar_filter_entry: TemplateChild<gtk::SearchEntry>,
-        #[template_child]
-        pub sidebar_unread_filter_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
         pub sidebar_all_filter_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
@@ -315,7 +310,6 @@ mod imp {
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
-        pub local_read_ts_by_channel: RefCell<HashMap<String, String>>,
         pub(super) pending_last_conversation: RefCell<Option<LastConversation>>,
         pub user_names: RefCell<Arc<HashMap<String, String>>>,
         pub user_full_names: RefCell<Arc<HashMap<String, String>>>,
@@ -1207,8 +1201,7 @@ fn sidebar_row_has_stable_incremental_membership(row: &SidebarRowModel) -> bool 
     !matches!(
         row.kind,
         ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
-    ) || row.unread
-        || row.selected
+    ) || row.selected
         || row.starred
 }
 
@@ -1283,7 +1276,6 @@ fn media_zoom_size(natural: (i32, i32), viewport: (i32, i32), zoom: f64) -> (i32
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceNavigationSelection {
     Messages,
-    Unreads,
     Threads,
     Files,
     Saved,
@@ -1292,7 +1284,6 @@ enum WorkspaceNavigationSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MainNavigationTarget {
     Conversation(String),
-    Unreads,
     Threads,
     Search,
     Files,
@@ -1320,7 +1311,6 @@ fn workspace_navigation_selection(
 ) -> Option<WorkspaceNavigationSelection> {
     match main_view {
         MainMessageView::Conversation => Some(WorkspaceNavigationSelection::Messages),
-        MainMessageView::Unreads => Some(WorkspaceNavigationSelection::Unreads),
         MainMessageView::Threads => Some(WorkspaceNavigationSelection::Threads),
         MainMessageView::Files => Some(WorkspaceNavigationSelection::Files),
         MainMessageView::Saved => Some(WorkspaceNavigationSelection::Saved),
@@ -2640,60 +2630,6 @@ fn resized_end_sidebar_fraction(
     })
 }
 
-fn first_unread_message_ts(
-    messages: &[SlackMessage],
-    last_read: Option<&str>,
-    unread_count: u64,
-) -> Option<String> {
-    resolve_first_unread_message_ts(messages, last_read, unread_count)
-}
-
-/// `None` means the identity ledger is incomplete and aggregate fallback is required.
-/// `Some(None)` means all classified unread identities are hidden from this channel timeline.
-fn exact_first_visible_unread_message_ts(
-    conversation: &SlackConversation,
-    messages: &[SlackMessage],
-) -> Option<Option<String>> {
-    let tracked = conversation.tracked_unread_message_timestamps()?;
-    let unread_count = conversation.unread_activity_count();
-    if unread_count == 0 {
-        return (!conversation.has_unread_activity()).then_some(None);
-    }
-    if u64::try_from(tracked.len()).unwrap_or(u64::MAX) != unread_count {
-        return None;
-    }
-    let tracked = tracked.into_iter().collect::<HashSet<_>>();
-    Some(
-        messages
-            .iter()
-            .map(|message| message.ts.as_str())
-            .filter(|message_ts| tracked.contains(message_ts))
-            .min()
-            .map(ToString::to_string),
-    )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConversationReadPresentationSignature {
-    has_unread: bool,
-    unread_count: u64,
-    last_read: Option<String>,
-    tracked_message_ts: Option<Vec<String>>,
-}
-
-impl ConversationReadPresentationSignature {
-    fn from_conversation(conversation: &SlackConversation) -> Self {
-        Self {
-            has_unread: conversation.has_unread_activity(),
-            unread_count: conversation.unread_activity_count(),
-            last_read: conversation.last_read_ts().map(ToString::to_string),
-            tracked_message_ts: conversation
-                .tracked_unread_message_timestamps()
-                .map(|values| values.into_iter().map(ToString::to_string).collect()),
-        }
-    }
-}
-
 fn timeline_scroll_behavior(behavior: WorkspaceScrollBehavior) -> TimelineScrollBehavior {
     match behavior {
         WorkspaceScrollBehavior::PreservePrepend => TimelineScrollBehavior::PreservePrepend,
@@ -2956,10 +2892,6 @@ impl ConduitWindow {
             (
                 imp.messages_button.get().upcast::<gtk::Widget>(),
                 gettext("Messages"),
-            ),
-            (
-                imp.unreads_button.get().upcast::<gtk::Widget>(),
-                gettext("Unreads"),
             ),
             (
                 imp.threads_button.get().upcast::<gtk::Widget>(),
@@ -3410,8 +3342,7 @@ impl ConduitWindow {
         }
         match imp.workspace.view.borrow().main_view() {
             MainMessageView::Conversation | MainMessageView::Placeholder => "timeline",
-            MainMessageView::Unreads
-            | MainMessageView::Threads
+            MainMessageView::Threads
             | MainMessageView::Search
             | MainMessageView::Files
             | MainMessageView::Saved => "secondary",
@@ -3874,7 +3805,6 @@ impl ConduitWindow {
         });
         self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
         self.connect_widget(&imp.messages_button.get(), |window| window.show_messages());
-        self.connect_widget(&imp.unreads_button.get(), |window| window.show_unreads());
         self.connect_widget(&imp.threads_button.get(), |window| window.show_threads());
         self.connect_widget(&imp.files_button.get(), |window| window.show_files());
         self.connect_widget(&imp.refresh_button.get(), |window| {
@@ -3944,13 +3874,6 @@ impl ConduitWindow {
         imp.sidebar_filter_entry.connect_search_changed(move |_| {
             if let Some(window) = weak_window.upgrade() {
                 window.schedule_sidebar_filter();
-            }
-        });
-
-        let weak_window = self.downgrade();
-        imp.sidebar_unread_filter_button.connect_toggled(move |_| {
-            if let Some(window) = weak_window.upgrade() {
-                window.queue_ui_invalidations(UiInvalidations::SIDEBAR);
             }
         });
 
@@ -4029,15 +3952,6 @@ impl ConduitWindow {
             .unwrap_or_default();
         *self.imp().pending_last_conversation.borrow_mut() =
             LastConversation::new(&workspace_id, &channel_id);
-        let weak_window = self.downgrade();
-        settings.connect_changed(
-            Some(config::SIDEBAR_SHOW_UNREADS_SECTION_KEY),
-            move |_, _| {
-                if let Some(window) = weak_window.upgrade() {
-                    window.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-                }
-            },
-        );
         let weak_window = self.downgrade();
         settings.connect_changed(None, move |_, key| {
             if attention_settings::is_attention_setting(key) {
@@ -4501,7 +4415,6 @@ impl ConduitWindow {
         self.add_window_action("go-back", |window| window.go_back());
         self.add_window_action("search-workspace", |window| window.focus_workspace_search());
         self.add_window_action("show-messages", |window| window.show_messages());
-        self.add_window_action("show-unreads", |window| window.show_unreads());
         self.add_window_action("show-files", |window| window.show_files());
         self.add_window_action("show-later", |window| window.show_later());
         self.add_window_action("refresh-conversations", |window| {
@@ -7084,7 +6997,6 @@ impl ConduitWindow {
             MainMessageView::Conversation => view
                 .visible_channel_id()
                 .map(|channel_id| MainNavigationTarget::Conversation(channel_id.to_string())),
-            MainMessageView::Unreads => Some(MainNavigationTarget::Unreads),
             MainMessageView::Threads => Some(MainNavigationTarget::Threads),
             MainMessageView::Search => Some(MainNavigationTarget::Search),
             MainMessageView::Files => Some(MainNavigationTarget::Files),
@@ -7140,7 +7052,6 @@ impl ConduitWindow {
                 let title = self.conversation_title(&channel_id);
                 self.select_conversation(&channel_id, &title);
             }
-            MainNavigationTarget::Unreads => self.show_unreads(),
             MainNavigationTarget::Threads => self.show_threads(),
             MainNavigationTarget::Search => {
                 if !self.flush_current_drafts() {
@@ -7174,18 +7085,6 @@ impl ConduitWindow {
             self.render_closed_thread();
             self.render_conversations();
         }
-        self.imp().workspace_split.set_show_content(true);
-    }
-
-    fn show_unreads(&self) {
-        if !self.flush_current_drafts() {
-            return;
-        }
-        self.record_navigation(&MainNavigationTarget::Unreads);
-        self.imp().workspace.view.borrow_mut().show_unreads();
-        self.render_closed_thread();
-        let items = self.unread_items();
-        self.populate_unreads(items);
         self.imp().workspace_split.set_show_content(true);
     }
 
@@ -7858,28 +7757,6 @@ impl ConduitWindow {
                 self.activate_message_control(control_handle, target);
                 true
             }
-            Some("mark-read") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                if let Some(thread_ts) = query_param(url, "thread_ts") {
-                    if self.visible_channel_id().as_deref() == Some(channel_id.as_str())
-                        && self.selected_thread_ts().as_deref() == Some(thread_ts.as_str())
-                    {
-                        self.send_command(RuntimeCommand::MarkThreadRead {
-                            channel_id,
-                            thread_ts,
-                            ts,
-                        });
-                    }
-                } else if self.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
-                    self.send_command(RuntimeCommand::MarkConversationRead { channel_id, ts });
-                }
-                true
-            }
             Some("channel") => {
                 if let Some(channel_id) = query_param(url, "channel") {
                     self.open_channel_reference(&channel_id);
@@ -7950,14 +7827,6 @@ impl ConduitWindow {
                     self.set_status("Loading older messages");
                     self.send_command(RuntimeCommand::LoadOlderHistory { channel_id, cursor });
                 }
-                true
-            }
-            Some("unreads-open") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let title = self.conversation_title(&channel_id);
-                self.select_conversation(&channel_id, &title);
                 true
             }
             Some("reaction") => {
@@ -8419,7 +8288,6 @@ impl ConduitWindow {
         *imp.workspace_team_id.borrow_mut() = None;
         imp.workspace_ready.set(false);
         imp.initial_sync_complete.set(false);
-        imp.local_read_ts_by_channel.borrow_mut().clear();
         imp.pending_message_notifications.borrow_mut().clear();
         imp.pending_opened_conversation_ids.borrow_mut().clear();
         imp.pending_sent_drafts.borrow_mut().clear();
@@ -8452,7 +8320,6 @@ impl ConduitWindow {
             self.reset_composer_upload_progress(target);
         }
         imp.sidebar_filter_entry.set_text("");
-        imp.sidebar_unread_filter_button.set_active(false);
         imp.sidebar_all_filter_button.set_active(false);
         imp.workspace_title_label.set_title(&gettext("Workspace"));
         imp.workspace_title_label.set_subtitle("");
@@ -8932,22 +8799,9 @@ impl ConduitWindow {
 
     fn apply_workspace_patch(&self, patch: &crate::workspace_pipeline::WorkspacePatch) {
         let selected_before = self.selected_channel_id();
-        let selected_read_before = selected_before.as_deref().and_then(|channel_id| {
-            self.imp()
-                .workspace
-                .conversations
-                .borrow()
-                .get(channel_id)
-                .map(ConversationReadPresentationSignature::from_conversation)
-        });
         let pending_before = self.imp().pending_last_conversation.borrow().clone();
         let revision = patch.revision();
-        let application = {
-            let local_reads = self.imp().local_read_ts_by_channel.borrow();
-            self.imp()
-                .workspace
-                .apply_workspace_patch_with_local_reads(patch, &local_reads)
-        };
+        let application = self.imp().workspace.apply_workspace_patch(patch);
         let Some(application) = application else {
             crate::debug::log(
                 "ui",
@@ -8958,24 +8812,6 @@ impl ConduitWindow {
             );
             return;
         };
-        {
-            let mut local_reads = self.imp().local_read_ts_by_channel.borrow_mut();
-            for channel_id in application.acknowledged_local_reads() {
-                local_reads.remove(channel_id);
-            }
-        }
-        let selected_after = self.selected_channel_id();
-        let selected_read_after = selected_after.as_deref().and_then(|channel_id| {
-            self.imp()
-                .workspace
-                .conversations
-                .borrow()
-                .get(channel_id)
-                .map(ConversationReadPresentationSignature::from_conversation)
-        });
-        let visible_read_state_changed = selected_before == selected_after
-            && selected_read_before != selected_read_after
-            && self.current_main_view() == MainMessageView::Conversation;
         if application.users_reset() || !application.changed_user_ids().is_empty() {
             self.sync_workspace_user_projection(
                 application.users_reset(),
@@ -8983,11 +8819,7 @@ impl ConduitWindow {
             );
         }
         if !application.timeline_changes().is_empty() {
-            self.apply_workspace_timeline_projection(
-                revision,
-                application.timeline_changes(),
-                &application,
-            );
+            self.apply_workspace_timeline_projection(revision, application.timeline_changes());
         }
         if application.conversation_changed() {
             remove_patch_departures_from_discovery(
@@ -9007,10 +8839,6 @@ impl ConduitWindow {
                     .pending_opened_conversation_ids
                     .borrow_mut()
                     .remove(channel_id);
-                self.imp()
-                    .local_read_ts_by_channel
-                    .borrow_mut()
-                    .remove(channel_id);
                 if removal.was_visible() {
                     let title = gettext("Select a conversation");
                     self.imp().message_title.set_title(&title);
@@ -9027,50 +8855,11 @@ impl ConduitWindow {
                 );
             }
         }
-        if application.thread_catalog_changed() {
-            match self.current_main_view() {
-                MainMessageView::Threads => self.populate_threads(),
-                MainMessageView::Unreads if !application.conversation_changed() => {
-                    self.populate_unreads_content(self.unread_items());
-                }
-                _ => {}
-            }
+        if application.thread_catalog_changed()
+            && self.current_main_view() == MainMessageView::Threads
+        {
+            self.populate_threads();
         }
-        if visible_read_state_changed {
-            if application.timeline_changes().is_empty() {
-                self.reconcile_current_conversation_snapshot();
-            } else {
-                self.configure_current_conversation_read_state(revision);
-            }
-        }
-    }
-
-    fn configure_current_conversation_read_state(&self, revision: WorkspaceRevision) {
-        let projection = {
-            let view = self.imp().workspace.view.borrow();
-            if view.main_view() != MainMessageView::Conversation {
-                None
-            } else {
-                view.last_channel_id().map(|channel_id| {
-                    (
-                        channel_id.to_string(),
-                        view.channel_messages(channel_id).to_vec(),
-                    )
-                })
-            }
-        };
-        let Some((channel_id, messages)) = projection else {
-            return;
-        };
-        let mut context = self.message_html_context(None);
-        self.configure_conversation_read_context(&channel_id, &messages, &mut context);
-        self.apply_timeline_patch_at_revision(
-            TimelineSurface::Main,
-            revision,
-            message_html::configure_read_state_patch(&context),
-            TimelineScrollBehavior::Preserve,
-            UiInvalidations::MAIN,
-        );
     }
 
     fn sync_workspace_user_projection(&self, reset: bool, changed_user_ids: &[String]) {
@@ -9192,7 +8981,6 @@ impl ConduitWindow {
         &self,
         revision: WorkspaceRevision,
         changes: &[TimelineProjectionApplication],
-        application: &crate::workspace_state::WorkspacePatchApplication,
     ) {
         let mut refresh_derived_view = false;
         for change in changes {
@@ -9299,12 +9087,7 @@ impl ConduitWindow {
                                     ),
                                 );
                         }
-                        let mut context = self.message_patch_context(thread_ts, &message);
-                        if thread_ts.is_none()
-                            && application.unread_start(channel_id) == Some(message.ts.as_str())
-                        {
-                            context.first_unread_ts = Some(message.ts.clone());
-                        }
+                        let context = self.message_patch_context(thread_ts, &message);
                         patches.push(if inserted {
                             message_html::insert_message_patch(
                                 channel_id,
@@ -9407,11 +9190,7 @@ impl ConduitWindow {
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_conversation_user_names();
         self.render_conversations();
-        if self.current_main_view() == MainMessageView::Unreads {
-            self.populate_unreads_content(self.unread_items());
-        } else {
-            self.refresh_current_conversation_title();
-        }
+        self.refresh_current_conversation_title();
         self.finish_conversation_catalog_sync();
     }
 
@@ -9421,9 +9200,7 @@ impl ConduitWindow {
         if structure_changed || !self.render_changed_conversations(changed_channel_ids) {
             self.render_conversations();
         }
-        if self.current_main_view() == MainMessageView::Unreads {
-            self.populate_unreads_content(self.unread_items());
-        } else if self.selected_channel_id().as_ref().is_some_and(|selected| {
+        if self.selected_channel_id().as_ref().is_some_and(|selected| {
             changed_channel_ids
                 .iter()
                 .any(|channel_id| channel_id == selected)
@@ -9459,8 +9236,6 @@ impl ConduitWindow {
                 active_huddle_channel_id: active_huddle_channel_id.as_deref(),
                 current_user_id: current_user_id.as_deref(),
                 query: query.as_str(),
-                unread_only: imp.sidebar_unread_filter_button.is_active(),
-                show_unreads_section: self.show_unreads_section(),
                 show_all: imp.sidebar_all_filter_button.is_active(),
                 loading: false,
                 has_error: imp.sidebar_error.borrow().is_some(),
@@ -9588,19 +9363,6 @@ impl ConduitWindow {
             MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
                 messages_use_user(state.channel_messages(channel_id), user_id)
             }),
-            MainMessageView::Unreads => self
-                .imp()
-                .workspace
-                .conversations
-                .borrow()
-                .iter()
-                .filter(|conversation| conversation.has_unread_activity())
-                .any(|conversation| {
-                    conversation
-                        .display_user_ids()
-                        .iter()
-                        .any(|candidate| candidate == user_id)
-                }),
             MainMessageView::Threads => {
                 let observed = state.observed_threads();
                 observed.iter().any(|(_, message)| {
@@ -9650,10 +9412,9 @@ impl ConduitWindow {
                     messages_use_image_asset(std::slice::from_ref(message), key)
                 })
             }),
-            MainMessageView::Unreads
-            | MainMessageView::Search
-            | MainMessageView::Files
-            | MainMessageView::Placeholder => false,
+            MainMessageView::Search | MainMessageView::Files | MainMessageView::Placeholder => {
+                false
+            }
         }
     }
 
@@ -9758,8 +9519,6 @@ impl ConduitWindow {
                     active_huddle_channel_id: active_huddle_channel_id.as_deref(),
                     current_user_id: imp.current_user_id.borrow().as_deref(),
                     query: imp.sidebar_filter_entry.text().as_str(),
-                    unread_only: imp.sidebar_unread_filter_button.is_active(),
-                    show_unreads_section: self.show_unreads_section(),
                     show_all: imp.sidebar_all_filter_button.is_active(),
                     loading: false,
                     has_error: imp.sidebar_error.borrow().is_some(),
@@ -9782,15 +9541,6 @@ impl ConduitWindow {
                 conversation_count, elapsed_ms
             )
         });
-    }
-
-    fn show_unreads_section(&self) -> bool {
-        self.imp()
-            .settings
-            .borrow()
-            .as_ref()
-            .map(|settings| settings.boolean(config::SIDEBAR_SHOW_UNREADS_SECTION_KEY))
-            .unwrap_or(false)
     }
 
     fn sidebar_item_widget(&self, item: &KeyedSidebarItem) -> gtk::Widget {
@@ -9938,19 +9688,6 @@ impl ConduitWindow {
             menu.append(&profile_button);
         }
 
-        let mark_read_button = gtk::Button::with_label(&gettext("Mark as read"));
-        mark_read_button.add_css_class("flat");
-        let mark_read_channel_id = channel_id.to_string();
-        let weak_window = self.downgrade();
-        let popover_for_mark_read = popover.clone();
-        mark_read_button.connect_clicked(move |_| {
-            popover_for_mark_read.popdown();
-            if let Some(window) = weak_window.upgrade() {
-                window.mark_channel_read_through_latest(&mark_read_channel_id);
-            }
-        });
-        menu.append(&mark_read_button);
-
         if let Some(conversation) = conversation.as_ref() {
             let add_people_button = gtk::Button::with_label(&gettext("Add people"));
             add_people_button.add_css_class("flat");
@@ -10016,34 +9753,6 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::LeaveConversation {
             channel_id: channel_id.to_string(),
         });
-    }
-
-    fn mark_channel_read_through_latest(&self, channel_id: &str) {
-        let latest = SlackMessage::latest_ts(
-            self.imp()
-                .workspace
-                .view
-                .borrow()
-                .channel_messages(channel_id)
-                .iter(),
-        )
-        .or_else(|| {
-            self.imp()
-                .workspace
-                .conversations
-                .borrow()
-                .get(channel_id)
-                .and_then(SlackConversation::latest_message_ts)
-                .map(ToString::to_string)
-        });
-        if let Some(ts) = latest {
-            self.send_command(RuntimeCommand::MarkConversationReadAll {
-                channel_id: channel_id.to_string(),
-                ts,
-            });
-        } else {
-            self.set_status(&gettext("No message available to mark as read"));
-        }
     }
 
     fn sidebar_section_widget(&self, title: &str, collapsed: bool) -> gtk::Widget {
@@ -11132,8 +10841,6 @@ impl ConduitWindow {
         let selection = workspace_navigation_selection(main_view);
         imp.messages_button
             .set_active(selection == Some(WorkspaceNavigationSelection::Messages));
-        imp.unreads_button
-            .set_active(selection == Some(WorkspaceNavigationSelection::Unreads));
         imp.threads_button
             .set_active(selection == Some(WorkspaceNavigationSelection::Threads));
         imp.files_button
@@ -11187,39 +10894,7 @@ impl ConduitWindow {
             .borrow()
             .channel_messages(channel_id)
             .to_vec();
-        let (has_unread, last_read, unread_count, exact_first_unread) = imp
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    imp.local_read_ts_by_channel
-                        .borrow()
-                        .get(channel_id)
-                        .cloned()
-                        .or_else(|| conversation.last_read_ts().map(ToString::to_string)),
-                    conversation.unread_activity_count(),
-                    exact_first_visible_unread_message_ts(conversation, &current_messages),
-                )
-            })
-            .unwrap_or_default();
-        let open_intent = if explicit_message_ts.is_some() {
-            ConversationOpenIntent::choose(
-                explicit_message_ts,
-                has_unread,
-                last_read.as_deref(),
-                unread_count,
-            )
-        } else if let Some(first_unread) = exact_first_unread {
-            first_unread.map_or(
-                ConversationOpenIntent::Latest,
-                ConversationOpenIntent::Message,
-            )
-        } else {
-            ConversationOpenIntent::choose(None, has_unread, last_read.as_deref(), unread_count)
-        };
+        let open_intent = ConversationOpenIntent::choose(explicit_message_ts);
         imp.conversation_opening
             .borrow_mut()
             .begin(channel_id, open_intent);
@@ -11306,7 +10981,6 @@ impl ConduitWindow {
         if !imp.workspace.view.borrow().has_channel_context(channel_id) {
             context.load_more_url = self.channel_load_more_url(channel_id);
         }
-        self.configure_conversation_read_context(channel_id, &messages, &mut context);
         context.timeline_scroll = scroll_behavior;
         let active_open_generation = imp
             .conversation_opening
@@ -11390,54 +11064,18 @@ impl ConduitWindow {
                 self.apply_timeline_patches_at_revision(
                     TimelineSurface::Main,
                     revision,
-                    vec![
-                        message_html::conversation_snapshot_patch_with_focus(
-                            channel_id,
-                            &messages,
-                            &context,
-                            focus_message_ts.as_deref(),
-                        ),
-                        message_html::configure_read_state_patch(&context),
-                    ],
+                    vec![message_html::conversation_snapshot_patch_with_focus(
+                        channel_id,
+                        &messages,
+                        &context,
+                        focus_message_ts.as_deref(),
+                    )],
                     context.timeline_scroll,
                     UiInvalidations::MAIN,
                 );
             }
         }
         self.queue_history_asset_followups(channel_id, messages);
-    }
-
-    fn configure_conversation_read_context(
-        &self,
-        channel_id: &str,
-        messages: &[SlackMessage],
-        context: &mut MessageHtmlContext,
-    ) {
-        let imp = self.imp();
-        let (has_unread, last_read, unread_count, exact_first_unread) = imp
-            .workspace
-            .conversations
-            .borrow()
-            .get(channel_id)
-            .map(|conversation| {
-                (
-                    conversation.has_unread_activity(),
-                    imp.local_read_ts_by_channel
-                        .borrow()
-                        .get(channel_id)
-                        .cloned()
-                        .or_else(|| conversation.last_read_ts().map(ToString::to_string)),
-                    conversation.unread_activity_count(),
-                    exact_first_visible_unread_message_ts(conversation, messages),
-                )
-            })
-            .unwrap_or_default();
-        context.read_marker_url = Some(message_html::mark_read_action_url(channel_id, "0"));
-        context.first_unread_ts = exact_first_unread.unwrap_or_else(|| {
-            has_unread
-                .then(|| first_unread_message_ts(messages, last_read.as_deref(), unread_count))
-                .flatten()
-        });
     }
 
     fn reconcile_current_conversation_snapshot(&self) {
@@ -11502,8 +11140,6 @@ impl ConduitWindow {
             context.load_more_url = self.thread_load_more_url(channel_id, ts);
         }
         context.timeline_scroll = scroll_behavior;
-        context.read_marker_url = SlackMessage::latest_ts(messages.iter())
-            .map(|latest_ts| message_html::mark_thread_read_action_url(channel_id, ts, &latest_ts));
         let focus_message_ts = imp
             .workspace
             .view
@@ -11536,31 +11172,16 @@ impl ConduitWindow {
             self.apply_timeline_patches_at_revision(
                 TimelineSurface::Thread,
                 revision,
-                vec![
-                    message_html::conversation_snapshot_patch_with_focus(
-                        channel_id,
-                        &messages,
-                        &context,
-                        focus_message_ts.as_deref(),
-                    ),
-                    message_html::configure_read_state_patch(&context),
-                ],
+                vec![message_html::conversation_snapshot_patch_with_focus(
+                    channel_id,
+                    &messages,
+                    &context,
+                    focus_message_ts.as_deref(),
+                )],
                 context.timeline_scroll,
                 UiInvalidations::THREAD,
             );
         }
-    }
-
-    fn populate_unreads(&self, items: Vec<ActivityItem>) {
-        self.render_conversations();
-        self.populate_unreads_content(items);
-    }
-
-    fn populate_unreads_content(&self, items: Vec<ActivityItem>) {
-        self.imp().message_title.set_title(&gettext("Unreads"));
-        self.load_secondary_html(&generate_html("unreads", || {
-            message_html::unreads_document(&items)
-        }));
     }
 
     fn populate_threads(&self) {
@@ -12444,30 +12065,6 @@ impl ConduitWindow {
         }
     }
 
-    fn unread_items(&self) -> Vec<ActivityItem> {
-        let imp = self.imp();
-        let conversations = imp.workspace.conversations.borrow();
-        let view = imp.workspace.view.borrow();
-        let user_names = imp.user_names.borrow();
-        let current_user_id = imp.current_user_id.borrow();
-        let visible_message_ts = conversations
-            .iter()
-            .flat_map(|conversation| {
-                view.channel_messages(&conversation.id)
-                    .iter()
-                    .map(|message| (conversation.id.clone(), message.ts.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<HashSet<_>>();
-        activity::build_unread_activity_items(
-            conversations.iter(),
-            &user_names,
-            current_user_id.as_deref(),
-            &imp.workspace.threads.borrow(),
-            &visible_message_ts,
-        )
-    }
-
     fn clear_list(&self, list: &gtk::ListBox) {
         while let Some(child) = list.first_child() {
             list.remove(&child);
@@ -12807,7 +12404,6 @@ impl ConduitWindow {
                     self.populate_history(&channel_id, messages);
                 }
             }
-            MainMessageView::Unreads => self.populate_unreads_content(self.unread_items()),
             MainMessageView::Threads => self.populate_threads(),
             MainMessageView::Search => {
                 let results = self.imp().workspace.view.borrow().search_results().to_vec();
@@ -13009,8 +12605,6 @@ impl ConduitWindow {
                 .collect(),
             recent_reactions,
             custom_emojis: imp.custom_emojis.borrow().clone(),
-            read_marker_url: None,
-            first_unread_ts: None,
             message_control_handles: HashMap::new(),
             message_control_action_handles: HashMap::new(),
         }
@@ -13382,16 +12976,16 @@ mod tests {
     #[test]
     fn navigation_history_keeps_distinct_bounded_visits() {
         let mut history = Vec::new();
-        let unreads = MainNavigationTarget::Unreads;
+        let threads = MainNavigationTarget::Threads;
         remember_navigation(
             &mut history,
             MainNavigationTarget::Conversation("C1".into()),
-            &unreads,
+            &threads,
         );
         remember_navigation(
             &mut history,
             MainNavigationTarget::Conversation("C1".into()),
-            &unreads,
+            &threads,
         );
         assert_eq!(
             history,
@@ -13402,7 +12996,7 @@ mod tests {
             remember_navigation(
                 &mut history,
                 MainNavigationTarget::Conversation(format!("C{index}")),
-                &unreads,
+                &threads,
             );
         }
         assert_eq!(history.len(), MAX_NAVIGATION_HISTORY);
@@ -13950,10 +13544,6 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             kind: ConversationKind::DirectMessage,
-            unread: false,
-            unread_count: 0,
-            has_mention: false,
-            mention_count: 0,
             selected: false,
             starred: false,
             private: true,
@@ -13971,9 +13561,6 @@ mod tests {
         let mut direct = sidebar_row("D1", "Ada");
         assert!(!sidebar_row_has_stable_incremental_membership(&direct));
 
-        direct.unread = true;
-        assert!(sidebar_row_has_stable_incremental_membership(&direct));
-        direct.unread = false;
         direct.selected = true;
         assert!(sidebar_row_has_stable_incremental_membership(&direct));
         direct.selected = false;
@@ -15622,7 +15209,6 @@ mod tests {
         );
         for view in [
             MainMessageView::Placeholder,
-            MainMessageView::Unreads,
             MainMessageView::Threads,
             MainMessageView::Search,
             MainMessageView::Files,
@@ -15740,10 +15326,6 @@ mod tests {
             Some(WorkspaceNavigationSelection::Messages)
         );
         assert_eq!(
-            workspace_navigation_selection(MainMessageView::Unreads),
-            Some(WorkspaceNavigationSelection::Unreads)
-        );
-        assert_eq!(
             workspace_navigation_selection(MainMessageView::Threads),
             Some(WorkspaceNavigationSelection::Threads)
         );
@@ -15770,7 +15352,6 @@ mod tests {
         assert!(workspace_composer_visible(MainMessageView::Conversation));
         for view in [
             MainMessageView::Placeholder,
-            MainMessageView::Unreads,
             MainMessageView::Threads,
             MainMessageView::Search,
             MainMessageView::Files,
@@ -16099,86 +15680,6 @@ mod tests {
             Some(THREAD_PANE_MAX_FRACTION)
         );
         assert_eq!(resized_end_sidebar_fraction(400.0, 0.0, 0.0), None);
-    }
-
-    #[test]
-    fn unread_focus_starts_after_last_read_or_uses_unread_count() {
-        let messages = [
-            SlackMessage {
-                ts: "3".to_string(),
-                ..Default::default()
-            },
-            SlackMessage {
-                ts: "1".to_string(),
-                ..Default::default()
-            },
-            SlackMessage {
-                ts: "2".to_string(),
-                ..Default::default()
-            },
-        ];
-
-        assert_eq!(
-            first_unread_message_ts(&messages, Some("1"), 0).as_deref(),
-            Some("2")
-        );
-        assert_eq!(
-            first_unread_message_ts(&messages, None, 2).as_deref(),
-            Some("2")
-        );
-        assert_eq!(first_unread_message_ts(&messages, None, 0), None);
-    }
-
-    #[test]
-    fn exact_hidden_attention_does_not_substitute_a_visible_root() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            ..Default::default()
-        };
-        conversation.observe_attention_message_at("2", true, false);
-        let messages = [SlackMessage {
-            ts: "3".to_string(),
-            ..Default::default()
-        }];
-
-        assert_eq!(
-            exact_first_visible_unread_message_ts(&conversation, &messages),
-            Some(None)
-        );
-    }
-
-    #[test]
-    fn exact_mixed_attention_focuses_the_visible_identity() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            ..Default::default()
-        };
-        conversation.observe_attention_message_at("2", true, false);
-        conversation.observe_attention_message_at("3", true, false);
-        let messages = [SlackMessage {
-            ts: "3".to_string(),
-            ..Default::default()
-        }];
-
-        assert_eq!(
-            exact_first_visible_unread_message_ts(&conversation, &messages),
-            Some(Some("3".to_string()))
-        );
-    }
-
-    #[test]
-    fn incomplete_attention_ledger_keeps_aggregate_fallback() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            ..Default::default()
-        };
-        conversation.observe_attention_message_at("2", true, false);
-        conversation.observe_attention_message(true, false);
-
-        assert_eq!(
-            exact_first_visible_unread_message_ts(&conversation, &[]),
-            None
-        );
     }
 
     #[test]

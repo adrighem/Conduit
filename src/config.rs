@@ -11,7 +11,6 @@ pub const NOTIFICATIONS_NAMES_AND_ALIASES_V1_KEY: &str = "notifications-names-an
 pub const NOTIFICATIONS_THREAD_REPLIES_V1_KEY: &str = "notifications-thread-replies-v1";
 pub const RECENT_REACTIONS_KEY: &str = "recent-reactions";
 pub const RECENT_REACTION_HISTORY_LIMIT: usize = 20;
-pub const SIDEBAR_SHOW_UNREADS_SECTION_KEY: &str = "sidebar-show-unreads-section";
 pub const WINDOW_HEIGHT_KEY: &str = "window-height";
 pub const WINDOW_MAXIMIZED_KEY: &str = "window-maximized";
 pub const WINDOW_WIDTH_KEY: &str = "window-width";

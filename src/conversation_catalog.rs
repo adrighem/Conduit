@@ -1,15 +1,11 @@
-#[cfg(test)]
-use crate::models::SlackUnreadState;
-use crate::models::{
-    conversation_metadata_key_is_unread_owned, SlackConversation, SlackConversationUnreadSnapshot,
-};
+use crate::models::SlackConversation;
 use std::collections::HashMap;
 
 /// The canonical, revision-aware set of conversations for a workspace.
 ///
 /// Membership snapshots are accumulated separately and committed atomically. Updates that
-/// happen after a snapshot starts (for example, opening a DM or receiving a realtime unread
-/// event) are protected from that older snapshot when it eventually commits.
+/// happen after a snapshot starts (for example, opening a DM) are protected from that older
+/// snapshot when it eventually commits.
 #[derive(Debug, Default)]
 pub(crate) struct ConversationCatalog {
     entries: HashMap<String, CatalogEntry>,
@@ -22,7 +18,6 @@ struct CatalogEntry {
     conversation: SlackConversation,
     membership_revision: u64,
     metadata_revision: u64,
-    unread_revision: u64,
 }
 
 #[derive(Debug)]
@@ -74,7 +69,6 @@ impl ConversationCatalog {
                 conversation,
                 membership_revision: revision,
                 metadata_revision: revision,
-                unread_revision: revision,
             },
         );
     }
@@ -110,9 +104,6 @@ impl ConversationCatalog {
                         merge_metadata(&mut entry.conversation, &incoming);
                         entry.metadata_revision = snapshot_revision;
                     }
-                    // Membership payloads are limited snapshots and can race newer
-                    // realtime/local read state. Existing unread overlays are updated
-                    // only through explicit unread patches.
                     entry.membership_revision = entry.membership_revision.max(snapshot_revision);
                 }
                 None => {
@@ -122,7 +113,6 @@ impl ConversationCatalog {
                             conversation: incoming,
                             membership_revision: snapshot_revision,
                             metadata_revision: snapshot_revision,
-                            unread_revision: snapshot_revision,
                         },
                     );
                 }
@@ -142,10 +132,6 @@ impl ConversationCatalog {
         match self.entries.get_mut(&id) {
             Some(entry) => {
                 merge_metadata(&mut entry.conversation, &conversation);
-                if conversation.unread_state().known {
-                    replace_unread_fields(&mut entry.conversation, &conversation);
-                    entry.unread_revision = revision;
-                }
                 entry.membership_revision = revision;
                 entry.metadata_revision = revision;
             }
@@ -156,16 +142,14 @@ impl ConversationCatalog {
                         conversation,
                         membership_revision: revision,
                         metadata_revision: revision,
-                        unread_revision: revision,
                     },
                 );
             }
         }
     }
 
-    /// Merges identity and presentation fields without allowing a delayed
-    /// details response to replace newer local/realtime unread state.
-    pub(crate) fn upsert_metadata(&mut self, mut conversation: SlackConversation) {
+    /// Merges identity and presentation fields from a details response.
+    pub(crate) fn upsert_metadata(&mut self, conversation: SlackConversation) {
         let revision = self.next_revision();
         let id = conversation.id.clone();
         match self.entries.get_mut(&id) {
@@ -175,122 +159,15 @@ impl ConversationCatalog {
                 entry.metadata_revision = revision;
             }
             None => {
-                strip_unread_fields(&mut conversation);
                 self.entries.insert(
                     id,
                     CatalogEntry {
                         conversation,
                         membership_revision: revision,
                         metadata_revision: revision,
-                        unread_revision: revision,
                     },
                 );
             }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn apply_realtime_unread(&mut self, id: &str, state: SlackUnreadState) {
-        self.apply_unread(id, state);
-    }
-
-    /// Applies Conduit's message-level attention classification without
-    /// overwriting the raw unread counters received from Slack.
-    ///
-    /// Returns whether the conversation metadata was already present.
-    #[cfg(test)]
-    pub(crate) fn observe_attention_message(
-        &mut self,
-        id: &str,
-        message_ts: &str,
-        record_unread: bool,
-        record_mention: bool,
-    ) -> bool {
-        self.apply_attention_observation(id, message_ts, record_unread, record_mention)
-            .0
-    }
-
-    /// Applies one semantic attention observation without replacing any
-    /// conversation fields. Returns `(conversation_existed, changed)`.
-    pub(crate) fn apply_attention_observation(
-        &mut self,
-        id: &str,
-        message_ts: &str,
-        record_unread: bool,
-        record_mention: bool,
-    ) -> (bool, bool) {
-        if id.trim().is_empty() || message_ts.trim().is_empty() {
-            return (false, false);
-        }
-        let existed = self.entries.contains_key(id);
-        if self.entries.get(id).is_some_and(|entry| {
-            entry
-                .conversation
-                .has_observed_attention_message(message_ts)
-        }) {
-            return (existed, false);
-        }
-        let revision = self.next_revision();
-        let entry = self
-            .entries
-            .entry(id.to_string())
-            .or_insert_with(|| CatalogEntry {
-                conversation: SlackConversation {
-                    id: id.to_string(),
-                    ..SlackConversation::default()
-                },
-                membership_revision: revision,
-                metadata_revision: revision,
-                unread_revision: revision,
-            });
-        let changed = entry.conversation.observe_attention_message_at(
-            message_ts,
-            record_unread,
-            record_mention,
-        );
-        if changed {
-            entry.unread_revision = revision;
-            entry.membership_revision = entry.membership_revision.max(revision);
-        }
-        (existed, changed)
-    }
-
-    pub(crate) fn apply_unread_snapshot(
-        &mut self,
-        snapshot: &SlackConversationUnreadSnapshot,
-    ) -> bool {
-        if !snapshot.unread_state.known || snapshot.channel_id.trim().is_empty() {
-            return false;
-        }
-
-        let before = self.get(&snapshot.channel_id).cloned();
-        let revision = self.next_revision();
-        let entry = self
-            .entries
-            .entry(snapshot.channel_id.clone())
-            .or_insert_with(|| CatalogEntry {
-                conversation: SlackConversation {
-                    id: snapshot.channel_id.clone(),
-                    ..SlackConversation::default()
-                },
-                membership_revision: revision,
-                metadata_revision: revision,
-                unread_revision: revision,
-            });
-        entry.conversation.apply_unread_snapshot(snapshot);
-        entry.unread_revision = revision;
-        entry.membership_revision = entry.membership_revision.max(revision);
-        before.as_ref() != Some(&entry.conversation)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn advance_read_cursor(&mut self, id: &str, ts: &str, remaining_unread: u64) {
-        self.apply_unread(
-            id,
-            SlackUnreadState::from_parts(true, remaining_unread > 0, remaining_unread),
-        );
-        if let Some(entry) = self.entries.get_mut(id) {
-            entry.conversation.advance_read_cursor(ts, remaining_unread);
         }
     }
 
@@ -299,9 +176,6 @@ impl ConversationCatalog {
         match self.entries.get_mut(&id) {
             Some(entry) => {
                 merge_metadata(&mut entry.conversation, &conversation);
-                if conversation.unread_state().known {
-                    replace_unread_fields(&mut entry.conversation, &conversation);
-                }
             }
             None => {
                 self.entries.insert(
@@ -310,35 +184,10 @@ impl ConversationCatalog {
                         conversation,
                         membership_revision: 0,
                         metadata_revision: 0,
-                        unread_revision: 0,
                     },
                 );
             }
         }
-    }
-
-    #[cfg(test)]
-    fn apply_unread(&mut self, id: &str, state: SlackUnreadState) {
-        if !state.known {
-            return;
-        }
-
-        let revision = self.next_revision();
-        let entry = self
-            .entries
-            .entry(id.to_string())
-            .or_insert_with(|| CatalogEntry {
-                conversation: SlackConversation {
-                    id: id.to_string(),
-                    ..SlackConversation::default()
-                },
-                membership_revision: revision,
-                metadata_revision: revision,
-                unread_revision: revision,
-            });
-        entry.conversation.apply_unread_state(state);
-        entry.unread_revision = revision;
-        entry.membership_revision = entry.membership_revision.max(revision);
     }
 
     fn next_revision(&mut self) -> u64 {
@@ -354,9 +203,6 @@ impl MembershipSnapshot {
         match self.conversations.get_mut(&id) {
             Some(existing) => {
                 merge_metadata(existing, &conversation);
-                if conversation.unread_state().known {
-                    replace_unread_fields(existing, &conversation);
-                }
             }
             None => {
                 self.conversations.insert(id, conversation);
@@ -377,37 +223,14 @@ fn merge_metadata(current: &mut SlackConversation, incoming: &SlackConversation)
     merge_option(&mut current.is_starred, &incoming.is_starred);
 
     for (key, value) in &incoming.extra {
-        if !is_unread_key(key) {
-            current.extra.insert(key.clone(), value.clone());
-        }
+        current.extra.insert(key.clone(), value.clone());
     }
-}
-
-fn replace_unread_fields(current: &mut SlackConversation, incoming: &SlackConversation) {
-    current.unread_count = incoming.unread_count;
-    current.extra.retain(|key, _| !is_unread_key(key));
-    current.extra.extend(
-        incoming
-            .extra
-            .iter()
-            .filter(|(key, _)| is_unread_key(key))
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
-}
-
-fn strip_unread_fields(conversation: &mut SlackConversation) {
-    conversation.unread_count = None;
-    conversation.extra.retain(|key, _| !is_unread_key(key));
 }
 
 fn merge_option<T: Clone>(current: &mut Option<T>, incoming: &Option<T>) {
     if let Some(value) = incoming {
         *current = Some(value.clone());
     }
-}
-
-fn is_unread_key(key: &str) -> bool {
-    conversation_metadata_key_is_unread_owned(key)
 }
 
 #[cfg(test)]
@@ -427,13 +250,9 @@ mod tests {
         let mut cached = conversation("C1");
         cached.name = Some("old-name".to_string());
         cached.is_private = Some(true);
-        cached.unread_count = Some(4);
         cached
             .extra
             .insert("topic".to_string(), json!("Cached topic"));
-        cached
-            .extra
-            .insert("unread_count_display".to_string(), json!(4));
 
         let mut catalog = ConversationCatalog::from_cached([cached]);
         let mut snapshot = catalog.begin_membership_snapshot();
@@ -450,7 +269,6 @@ mod tests {
         assert_eq!(merged.name.as_deref(), Some("fresh-name"));
         assert_eq!(merged.is_private, Some(true));
         assert_eq!(merged.is_channel, Some(true));
-        assert_eq!(merged.unread_state().display_count, 4);
         assert_eq!(merged.extra["topic"], json!("Cached topic"));
         assert_eq!(merged.extra["purpose"], json!("Fresh purpose"));
     }
@@ -528,122 +346,27 @@ mod tests {
     }
 
     #[test]
-    fn realtime_unread_beats_an_older_snapshot() {
-        let mut cached = conversation("C1");
-        cached.unread_count = Some(0);
-        let mut catalog = ConversationCatalog::from_cached([cached]);
-        let mut snapshot = catalog.begin_membership_snapshot();
-        let mut stale = conversation("C1");
-        stale.unread_count = Some(1);
-        snapshot.upsert(stale);
-
-        catalog.apply_realtime_unread("C1", SlackUnreadState::from_parts(true, true, 7));
-        assert!(catalog.commit_membership_snapshot(snapshot));
-
-        assert_eq!(catalog.get("C1").unwrap().unread_state().display_count, 7);
-    }
-
-    #[test]
-    fn attention_projection_filters_noise_and_read_marker_clears_local_unread() {
-        let mut cached = conversation("C1");
-        cached.unread_count = Some(0);
-        let mut catalog = ConversationCatalog::from_cached([cached]);
-
-        assert!(catalog.observe_attention_message("C1", "1.0", false, false));
-        catalog.apply_realtime_unread("C1", SlackUnreadState::from_parts(true, true, 1));
-        let filtered = catalog.get("C1").unwrap();
-        assert_eq!(filtered.raw_unread_activity_count(), 1);
-        assert!(!filtered.has_unread_activity());
-
-        assert!(catalog.observe_attention_message("C1", "2.0", true, false));
-        assert_eq!(catalog.get("C1").unwrap().unread_activity_count(), 1);
-        catalog.advance_read_cursor("C1", "20.0", 0);
-        assert!(!catalog.get("C1").unwrap().has_unread_activity());
-    }
-
-    #[test]
-    fn unread_snapshot_updates_sidebar_state_and_activity_metadata_together() {
-        let mut direct_message = conversation("D1");
-        direct_message.is_im = Some(true);
-        let mut catalog = ConversationCatalog::from_cached([direct_message]);
-
-        catalog.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
-            channel_id: "D1".to_string(),
-            unread_state: SlackUnreadState::from_parts(true, true, 0),
-            last_read: Some("10.0".to_string()),
-            latest: Some("11.0".to_string()),
-            mention_count: Some(2),
-            is_open: Some(true),
-        });
-
-        let current = catalog.get("D1").unwrap();
-        assert!(current.has_unread_activity());
-        assert_eq!(current.unread_activity_count(), 0);
-        assert_eq!(current.last_read_ts(), Some("10.0"));
-        assert_eq!(current.latest_message_ts(), Some("11.0"));
-        assert!(current.has_active_direct_message_hint());
-    }
-
-    #[test]
-    fn metadata_merge_never_overwrites_unread_state() {
+    fn metadata_merge_applies_newer_details_over_cached_fields() {
         let mut cached = conversation("C1");
         cached.name = Some("old".into());
-        cached.unread_count = Some(0);
-        cached.extra.extend(HashMap::from([
-            ("has_unreads".to_string(), json!(false)),
-            ("last_read".to_string(), json!("20.0")),
-            ("latest".to_string(), json!("21.0")),
-            ("mention_count".to_string(), json!(2)),
-            ("is_open".to_string(), json!(true)),
-            (crate::models::LOCAL_READ_TS_KEY.to_string(), json!("20.0")),
-        ]));
+        cached
+            .extra
+            .insert("topic".to_string(), json!("Cached topic"));
         let mut catalog = ConversationCatalog::from_cached([cached]);
 
-        let mut stale_details = conversation("C1");
-        stale_details.name = Some("renamed".into());
-        stale_details.unread_count = Some(9);
-        stale_details.extra.extend(HashMap::from([
-            ("has_unreads".to_string(), json!(true)),
-            ("last_read".to_string(), json!("10.0")),
-            ("latest".to_string(), json!("11.0")),
-            ("mention_count".to_string(), json!(9)),
-            ("is_open".to_string(), json!(false)),
-            (crate::models::LOCAL_READ_TS_KEY.to_string(), json!("10.0")),
-        ]));
-        catalog.upsert_metadata(stale_details);
+        let mut details = conversation("C1");
+        details.name = Some("renamed".into());
+        details.extra.insert("purpose".to_string(), json!("Fresh"));
+        catalog.upsert_metadata(details);
 
         let merged = catalog.get("C1").unwrap();
         assert_eq!(merged.name.as_deref(), Some("renamed"));
-        assert_eq!(merged.unread_activity_count(), 0);
-        assert_eq!(merged.last_read_ts(), Some("20.0"));
-        assert_eq!(merged.latest_message_ts(), Some("21.0"));
-        assert_eq!(merged.extra["mention_count"], json!(2));
-        assert_eq!(merged.extra["is_open"], json!(true));
-        assert_eq!(merged.local_read_ts(), Some("20.0"));
+        assert_eq!(merged.extra["topic"], json!("Cached topic"));
+        assert_eq!(merged.extra["purpose"], json!("Fresh"));
 
-        let mut new_details = conversation("D1");
-        new_details.unread_count = Some(4);
+        let new_details = conversation("D1");
         catalog.upsert_metadata(new_details);
-        assert!(!catalog.get("D1").unwrap().unread_state().known);
-    }
-
-    #[test]
-    fn local_mark_read_beats_an_older_unread_snapshot() {
-        let mut cached = conversation("C1");
-        cached.unread_count = Some(5);
-        let mut catalog = ConversationCatalog::from_cached([cached]);
-        let mut snapshot = catalog.begin_membership_snapshot();
-        let mut stale = conversation("C1");
-        stale.unread_count = Some(5);
-        snapshot.upsert(stale);
-
-        catalog.advance_read_cursor("C1", "20.0", 0);
-        assert!(catalog.commit_membership_snapshot(snapshot));
-
-        let unread = catalog.get("C1").unwrap().unread_state();
-        assert!(unread.known);
-        assert!(!unread.has_unread);
-        assert_eq!(unread.display_count, 0);
+        assert!(catalog.get("D1").is_some());
     }
 
     #[test]

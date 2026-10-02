@@ -18,7 +18,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-mod activity;
 mod application;
 mod asset_server;
 mod attention;

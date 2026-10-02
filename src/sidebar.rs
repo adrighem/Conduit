@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use crate::models::{SlackConversation, SlackUser, SlackUserStatus};
@@ -11,8 +10,8 @@ use serde_json::Value;
 pub type UserSearchAliases = HashMap<String, Vec<String>>;
 pub type UserStatuses = HashMap<String, SlackUserStatus>;
 
-// `last_read` can remain on hundreds of old DMs, so keep only a small history
-// projection while selected, unread, and explicitly active DMs remain uncapped.
+// Activity timestamps can remain on hundreds of old DMs, so keep only a small
+// history projection while selected and explicitly active DMs stay uncapped.
 const RECENT_HISTORY_DIRECT_MESSAGE_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +48,6 @@ impl ConversationKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidebarSectionKind {
     Priority,
-    Unreads,
     Channels,
     DirectMessages,
     Other,
@@ -59,7 +57,6 @@ impl SidebarSectionKind {
     pub fn title(self) -> &'static str {
         match self {
             Self::Priority => "Priority",
-            Self::Unreads => "Unreads",
             Self::Channels => "Channels",
             Self::DirectMessages => "Direct messages",
             Self::Other => "Other",
@@ -72,13 +69,6 @@ pub struct SidebarRowModel {
     pub id: String,
     pub title: String,
     pub kind: ConversationKind,
-    pub unread: bool,
-    pub unread_count: u64,
-    /// Priority-tier unread: direct message, direct/broadcast mention,
-    /// configured name/keyword, or a followed thread reply. Unlike `unread`/
-    /// `unread_count`, this stays true even while `muted` is set.
-    pub has_mention: bool,
-    pub mention_count: u64,
     pub selected: bool,
     pub starred: bool,
     pub private: bool,
@@ -112,38 +102,8 @@ pub struct ConversationPickerSections {
 }
 
 impl SidebarRowModel {
-    pub fn unread_badge_label(&self) -> Option<String> {
-        match self.unread_count {
-            0 => None,
-            1..=99 => Some(self.unread_count.to_string()),
-            _ => Some("99+".to_string()),
-        }
-    }
-
-    pub fn mention_badge_label(&self) -> Option<String> {
-        match self.mention_count {
-            0 => None,
-            1..=99 => Some(self.mention_count.to_string()),
-            _ => Some("99+".to_string()),
-        }
-    }
-
     pub fn accessible_label(&self) -> String {
         let mut label = format!("{}: {}", self.kind.accessible_name(), self.title);
-        if self.mention_count == 1 {
-            label.push_str(", 1 mention");
-        } else if self.mention_count > 1 {
-            label.push_str(&format!(", {} mentions", self.mention_count));
-        } else if self.has_mention {
-            label.push_str(", mentioned");
-        }
-        if self.unread_count == 1 {
-            label.push_str(", 1 unread");
-        } else if self.unread_count > 1 {
-            label.push_str(&format!(", {} unread", self.unread_count));
-        } else if self.unread {
-            label.push_str(", unread");
-        }
         if self.selected {
             label.push_str(", selected");
         }
@@ -175,10 +135,7 @@ pub struct SidebarSectionModel {
 
 impl SidebarSectionModel {
     pub fn display_title(&self) -> String {
-        match self.kind {
-            SidebarSectionKind::Unreads => format!("{} ({})", self.title, self.rows.len()),
-            _ => self.title.to_string(),
-        }
+        self.title.to_string()
     }
 }
 
@@ -210,11 +167,10 @@ pub enum SidebarListModel {
 
 /// Stable identity for an item rendered in the conversation sidebar.
 ///
-/// A conversation can occur both in the unread section and in its regular
-/// section, so the section is part of its identity. Search results have no
-/// section. Keeping this identity separate from the row contents lets the UI
-/// update an existing widget when only unread, selection, or status data
-/// changes.
+/// A conversation can occur in more than one section, so the section is part
+/// of its identity. Search results have no section. Keeping this identity
+/// separate from the row contents lets the UI update an existing widget when
+/// only selection or status data changes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SidebarItemKey {
     Placeholder(SidebarPlaceholder),
@@ -322,13 +278,13 @@ impl SidebarProjection {
             let positions = self.conversation_positions.get(next.id.as_str())?;
             for &position in positions {
                 let item = self.items.get(position)?;
-                let SidebarItemKey::Conversation { section, id } = &item.key else {
+                let SidebarItemKey::Conversation { id, .. } = &item.key else {
                     return None;
                 };
                 let SidebarItemModel::Conversation(previous) = &item.model else {
                     return None;
                 };
-                if id != &next.id || !sidebar_row_can_update_in_place(previous, next, *section) {
+                if id != &next.id || !sidebar_row_can_update_in_place(previous, next) {
                     return None;
                 }
                 if previous != next {
@@ -358,21 +314,14 @@ impl SidebarProjection {
     }
 }
 
-fn sidebar_row_can_update_in_place(
-    previous: &SidebarRowModel,
-    next: &SidebarRowModel,
-    section: Option<SidebarSectionKind>,
-) -> bool {
+fn sidebar_row_can_update_in_place(previous: &SidebarRowModel, next: &SidebarRowModel) -> bool {
     previous.id == next.id
         && previous.title == next.title
         && previous.kind == next.kind
-        && previous.unread == next.unread
         && previous.selected == next.selected
         && previous.starred == next.starred
         && previous.user_deleted == next.user_deleted
         && previous.search_aliases == next.search_aliases
-        && (section != Some(SidebarSectionKind::Unreads)
-            || previous.unread_count == next.unread_count)
 }
 
 fn keyed_sidebar_items_are_unique(items: &[KeyedSidebarItem]) -> bool {
@@ -489,8 +438,6 @@ pub struct SidebarBuildOptions<'a> {
     pub active_huddle_channel_id: Option<&'a str>,
     pub current_user_id: Option<&'a str>,
     pub query: &'a str,
-    pub unread_only: bool,
-    pub show_unreads_section: bool,
     pub show_all: bool,
     pub loading: bool,
     pub has_error: bool,
@@ -542,15 +489,6 @@ impl SidebarRowModel {
             .cloned()
             .collect();
         let muted = conversation.is_muted_conversation();
-        // Muting suppresses the ambient "something's new" signal, matching
-        // Slack, but never the priority/mention signal below — a muted
-        // channel still surfaces a direct mention.
-        let unread = conversation.has_unread_activity() && !muted;
-        let unread_count = if muted {
-            0
-        } else {
-            conversation.unread_activity_count()
-        };
         Self {
             id: conversation.id.clone(),
             title: conversation.navigation_name_with_users(
@@ -559,10 +497,6 @@ impl SidebarRowModel {
                 options.current_user_id,
             ),
             kind,
-            unread,
-            unread_count,
-            has_mention: conversation.has_mention_activity(),
-            mention_count: conversation.mention_activity_count(),
             selected: options.selected_channel == Some(conversation.id.as_str()),
             starred: conversation.is_starred(),
             private: conversation.is_private.unwrap_or(false)
@@ -699,10 +633,7 @@ where
                 )
         })
         .map(|conversation| sidebar_row_for_conversation(conversation, user_names, options))
-        .filter(|row| {
-            row.match_score(&query).is_some()
-                && (!options.unread_only || row.unread || row.selected)
-        })
+        .filter(|row| row.match_score(&query).is_some())
         .collect::<Vec<_>>();
 
     if rows.is_empty() {
@@ -721,12 +652,7 @@ where
         return SidebarListModel::Rows(rows);
     }
 
-    let mut sections = build_sidebar_sections_from_rows(rows, None);
-    if options.unread_only || !options.show_unreads_section {
-        sections.retain(|section| section.kind != SidebarSectionKind::Unreads);
-    }
-
-    SidebarListModel::Sections(sections)
+    SidebarListModel::Sections(build_sidebar_sections_from_rows(rows, None))
 }
 
 #[cfg(test)]
@@ -858,7 +784,6 @@ pub(crate) fn filter_conversation_switcher_rows(
             right_score
                 .band()
                 .cmp(&left_score.band())
-                .then_with(|| compare_unread_category(left, right))
                 .then_with(|| {
                     compare_participant_coverage(left, right, Some(&participant_coverage))
                 })
@@ -1033,10 +958,6 @@ pub fn conversation_picker_sections_with_statuses(
                 id: id.to_string(),
                 title,
                 kind: ConversationKind::DirectMessage,
-                unread: false,
-                unread_count: 0,
-                has_mention: false,
-                mention_count: 0,
                 selected: false,
                 starred: false,
                 private: true,
@@ -1091,7 +1012,6 @@ fn sort_picker_items(
 ) {
     items.sort_by(|left, right| {
         compare_relevance(&left.row, &right.row, query)
-            .then_with(|| compare_unread_category(&left.row, &right.row))
             .then_with(|| compare_participant_coverage(&left.row, &right.row, participant_coverage))
             .then_with(|| compare_user_deleted(&left.row, &right.row))
             .then_with(|| {
@@ -1108,7 +1028,6 @@ fn build_sidebar_sections_from_rows(
 ) -> Vec<SidebarSectionModel> {
     let mut priority_direct_messages = Vec::new();
     let mut priority_channels = Vec::new();
-    let mut unreads = Vec::new();
     let mut channels = Vec::new();
     let mut direct_messages = Vec::new();
     let mut other = Vec::new();
@@ -1126,10 +1045,6 @@ fn build_sidebar_sections_from_rows(
             }
         }
 
-        if row.unread || row.selected {
-            unreads.push(row.clone());
-        }
-
         match row.kind {
             ConversationKind::PublicChannel | ConversationKind::PrivateChannel => {
                 channels.push(row)
@@ -1143,7 +1058,6 @@ fn build_sidebar_sections_from_rows(
 
     sort_rows_by_title(&mut priority_direct_messages, query);
     sort_rows_by_title(&mut priority_channels, query);
-    sort_unread_rows(&mut unreads, query);
     sort_rows_by_title(&mut channels, query);
     sort_rows_by_title(&mut direct_messages, query);
     sort_rows_by_title(&mut other, query);
@@ -1155,7 +1069,6 @@ fn build_sidebar_sections_from_rows(
 
     [
         section(SidebarSectionKind::Priority, priority),
-        section(SidebarSectionKind::Unreads, unreads),
         section(SidebarSectionKind::Channels, channels),
         section(SidebarSectionKind::DirectMessages, direct_messages),
         section(SidebarSectionKind::Other, other),
@@ -1189,10 +1102,6 @@ pub fn conversation_visible_in_default_sidebar(
     }
 
     if selected_channel == Some(conversation.id.as_str()) {
-        return true;
-    }
-
-    if conversation.has_unread_activity() {
         return true;
     }
 
@@ -1241,7 +1150,6 @@ fn recent_history_direct_message_ids<'a>(
             )
         })
         .filter(|conversation| selected_channel != Some(conversation.id.as_str()))
-        .filter(|conversation| !conversation.has_unread_activity())
         .filter(|conversation| !conversation.is_starred())
         .filter(|conversation| !conversation.has_active_direct_message_hint())
         .filter(|conversation| !conversation.is_user_deleted() && !conversation.is_dormant())
@@ -1270,7 +1178,7 @@ fn recent_history_direct_message_ids<'a>(
 }
 
 fn conversation_activity_score(conversation: &SlackConversation) -> f64 {
-    ["latest", "latest_ts", "last_read"]
+    ["latest", "latest_ts"]
         .into_iter()
         .filter_map(|key| conversation_extra_value(conversation, key))
         .filter_map(conversation_activity_value)
@@ -1389,7 +1297,6 @@ fn sort_search_rows(
 ) {
     rows.sort_by(|left, right| {
         compare_relevance(left, right, Some(query))
-            .then_with(|| compare_unread_category(left, right))
             .then_with(|| compare_participant_coverage(left, right, Some(participant_coverage)))
             .then_with(|| compare_user_deleted(left, right))
             .then_with(|| {
@@ -1425,38 +1332,8 @@ fn compare_participant_coverage(
     (right.matched * left.total).cmp(&(left.matched * right.total))
 }
 
-fn compare_unread_category(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
-    unread_category(left).cmp(&unread_category(right))
-}
-
-fn unread_category(row: &SidebarRowModel) -> u8 {
-    match (row.unread, row.kind) {
-        (true, ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage) => 0,
-        (true, ConversationKind::PublicChannel | ConversationKind::PrivateChannel) => 1,
-        (true, ConversationKind::Unknown) => 2,
-        (false, _) => 3,
-    }
-}
-
 fn compare_user_deleted(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
     left.user_deleted.cmp(&right.user_deleted)
-}
-
-fn sort_unread_rows(rows: &mut [SidebarRowModel], query: Option<&SearchQuery>) {
-    rows.sort_by(|left, right| {
-        compare_relevance(left, right, query).then_with(|| {
-            (
-                Reverse(left.unread_count),
-                title_sort_key(&left.title),
-                &left.id,
-            )
-                .cmp(&(
-                    Reverse(right.unread_count),
-                    title_sort_key(&right.title),
-                    &right.id,
-                ))
-        })
-    });
 }
 
 fn compare_relevance(
@@ -1508,6 +1385,14 @@ mod tests {
         }
     }
 
+    fn active_dm(id: &str, user: &str) -> SlackConversation {
+        let mut conversation = dm(id, user);
+        conversation
+            .extra
+            .insert("is_open".to_string(), serde_json::json!(true));
+        conversation
+    }
+
     fn mpim(id: &str, name: &str) -> SlackConversation {
         SlackConversation {
             id: id.to_string(),
@@ -1556,15 +1441,11 @@ mod tests {
         }
     }
 
-    fn row(title: &str, unread_count: u64, selected: bool) -> SidebarRowModel {
+    fn row(title: &str, selected: bool) -> SidebarRowModel {
         SidebarRowModel {
             id: title.to_string(),
             title: title.to_string(),
             kind: ConversationKind::PublicChannel,
-            unread: unread_count > 0,
-            unread_count,
-            has_mention: false,
-            mention_count: 0,
             selected,
             starred: false,
             private: false,
@@ -1777,81 +1658,6 @@ mod tests {
     }
 
     #[test]
-    fn unread_section_duplicates_unread_conversations_and_sorts_by_count() {
-        let mut alpha = channel("C1", "alpha");
-        alpha.unread_count = Some(2);
-        let mut beta = dm("D1", "U1");
-        beta.unread_count = Some(7);
-        let mut gamma = channel("C2", "gamma");
-        gamma.unread_count = Some(7);
-
-        let mut user_names = HashMap::new();
-        user_names.insert("U1".to_string(), "Beta".to_string());
-
-        let sections = build_sidebar_sections(&[alpha, beta, gamma], &user_names, None);
-
-        assert_eq!(
-            titles(section(&sections, SidebarSectionKind::Unreads)),
-            vec!["Beta", "#gamma", "#alpha"]
-        );
-        assert_eq!(
-            titles(section(&sections, SidebarSectionKind::Channels)),
-            vec!["#alpha", "#gamma"]
-        );
-        assert_eq!(
-            titles(section(&sections, SidebarSectionKind::DirectMessages)),
-            vec!["Beta"]
-        );
-    }
-
-    #[test]
-    fn unread_section_uses_extra_unread_properties() {
-        let mut alpha = channel("C1", "alpha");
-        alpha
-            .extra
-            .insert("unread_count_display".to_string(), serde_json::json!(5));
-
-        let sections = build_sidebar_sections(&[alpha], &HashMap::new(), None);
-        let unread_row = &section(&sections, SidebarSectionKind::Unreads).rows[0];
-
-        assert_eq!(unread_row.title, "#alpha");
-        assert_eq!(unread_row.unread_count, 5);
-        assert!(unread_row.unread);
-    }
-
-    #[test]
-    fn unread_section_keeps_badgeless_unread_conversations() {
-        let mut alpha = channel("C1", "alpha");
-        alpha
-            .extra
-            .insert("has_unreads".to_string(), serde_json::json!(true));
-
-        let sections = build_sidebar_sections(&[alpha], &HashMap::new(), None);
-        let unread_row = &section(&sections, SidebarSectionKind::Unreads).rows[0];
-
-        assert_eq!(unread_row.title, "#alpha");
-        assert_eq!(unread_row.unread_count, 0);
-        assert!(unread_row.unread);
-        assert_eq!(unread_row.unread_badge_label(), None);
-    }
-
-    #[test]
-    fn unread_section_keeps_selected_read_conversation() {
-        let sections = build_sidebar_sections(
-            &[channel("C1", "alpha"), channel("C2", "beta")],
-            &HashMap::new(),
-            Some("C1"),
-        );
-        let unread_rows = &section(&sections, SidebarSectionKind::Unreads).rows;
-
-        assert_eq!(unread_rows.len(), 1);
-        assert_eq!(unread_rows[0].id, "C1");
-        assert!(unread_rows[0].selected);
-        assert!(!unread_rows[0].unread);
-        assert_eq!(unread_rows[0].unread_badge_label(), None);
-    }
-
-    #[test]
     fn default_sidebar_visibility_keeps_recent_dms_and_hides_inactive_dms() {
         let active_channel = channel("C1", "general");
         let mut open_dm = dm("D_OPEN", "U_OPEN");
@@ -1862,20 +1668,19 @@ mod tests {
         priority_dm
             .extra
             .insert("priority".to_string(), serde_json::json!(0.42));
-        let mut read_group_dm = mpim("M_READ", "read");
-        read_group_dm.extra.insert(
-            "last_read".to_string(),
-            serde_json::json!("1710000000.000001"),
-        );
+        let mut recent_group_dm = mpim("M_RECENT", "recent");
+        recent_group_dm
+            .extra
+            .insert("latest".to_string(), serde_json::json!("1710000000.000001"));
         let inactive_dm = dm("D_INACTIVE", "U_INACTIVE");
         let mut unopened_group_dm = mpim("M_UNOPENED", "unopened");
         unopened_group_dm
             .extra
-            .insert("last_read".to_string(), serde_json::json!("0.000000"));
+            .insert("latest".to_string(), serde_json::json!("0.000000"));
         let conversations = vec![
             open_dm.clone(),
             priority_dm.clone(),
-            read_group_dm.clone(),
+            recent_group_dm.clone(),
             inactive_dm.clone(),
             unopened_group_dm.clone(),
         ];
@@ -1898,9 +1703,9 @@ mod tests {
             recent_history_direct_messages.contains(&priority_dm.id),
         ));
         assert!(conversation_visible_in_default_sidebar(
-            &read_group_dm,
+            &recent_group_dm,
             None,
-            recent_history_direct_messages.contains(&read_group_dm.id),
+            recent_history_direct_messages.contains(&recent_group_dm.id),
         ));
         assert!(!conversation_visible_in_default_sidebar(
             &inactive_dm,
@@ -1920,10 +1725,9 @@ mod tests {
     }
 
     #[test]
-    fn default_sidebar_visibility_keeps_unread_dms_but_hides_read_deleted_dms() {
-        let mut unread_dormant = dm("D1", "U1");
-        unread_dormant.unread_count = Some(2);
-        unread_dormant.extra.insert(
+    fn default_sidebar_visibility_hides_dormant_deleted_and_archived_dms() {
+        let mut dormant = dm("D1", "U1");
+        dormant.extra.insert(
             "properties".to_string(),
             serde_json::json!({ "is_dormant": true }),
         );
@@ -1945,14 +1749,11 @@ mod tests {
             }
         }))
         .expect("failed to parse dormant DM");
-        let mut archived_unread = dm("D4", "U4");
-        archived_unread.is_archived = Some(true);
-        archived_unread.unread_count = Some(1);
+        let mut archived = dm("D4", "U4");
+        archived.is_archived = Some(true);
 
-        assert!(conversation_visible_in_default_sidebar(
-            &unread_dormant,
-            None,
-            false,
+        assert!(!conversation_visible_in_default_sidebar(
+            &dormant, None, false,
         ));
         assert!(conversation_visible_in_default_sidebar(
             &selected_deleted,
@@ -1970,7 +1771,7 @@ mod tests {
             true,
         ));
         assert!(!conversation_visible_in_default_sidebar(
-            &archived_unread,
+            &archived,
             Some("D4"),
             true,
         ));
@@ -1996,31 +1797,6 @@ mod tests {
     }
 
     #[test]
-    fn muting_suppresses_ambient_unread_but_not_a_pending_mention() {
-        let mut muted_with_mention = channel("C1", "alpha");
-        muted_with_mention
-            .extra
-            .insert("is_muted".to_string(), serde_json::json!(true));
-        // An ordinary unread message (ambient only) plus a mention.
-        muted_with_mention.observe_attention_message_at("1.0", true, false);
-        muted_with_mention.observe_attention_message_at("2.0", true, true);
-
-        let row =
-            SidebarRowModel::from_conversation(&muted_with_mention, &HashMap::new(), None, None);
-
-        assert!(row.muted);
-        assert!(
-            !row.unread,
-            "muting must suppress the ambient bold/unread signal"
-        );
-        assert_eq!(row.unread_count, 0);
-        assert_eq!(row.unread_badge_label(), None);
-        assert!(row.has_mention, "muting must not suppress a direct mention");
-        assert_eq!(row.mention_count, 1);
-        assert_eq!(row.mention_badge_label(), Some("1".to_string()));
-    }
-
-    #[test]
     fn starred_dormant_dm_remains_visible_in_the_default_sidebar() {
         let mut conversation = dm("D1", "U1");
         conversation.set_starred(true);
@@ -2037,15 +1813,10 @@ mod tests {
 
     #[test]
     fn selected_channel_is_marked_in_all_matching_rows() {
-        let mut general = channel("C1", "general");
-        general.unread_count = Some(1);
+        let general = channel("C1", "general");
 
         let sections = build_sidebar_sections(&[general], &HashMap::new(), Some("C1"));
 
-        assert!(
-            section(&sections, SidebarSectionKind::Unreads).rows[0].selected,
-            "unread duplicate should be selected"
-        );
         assert!(
             section(&sections, SidebarSectionKind::Channels).rows[0].selected,
             "regular row should be selected"
@@ -2053,48 +1824,27 @@ mod tests {
     }
 
     #[test]
-    fn unread_badge_is_capped_for_large_counts() {
-        assert_eq!(row("#general", 0, false).unread_badge_label(), None);
-        assert_eq!(
-            row("#general", 12, false).unread_badge_label().as_deref(),
-            Some("12")
-        );
-        assert_eq!(
-            row("#general", 120, false).unread_badge_label().as_deref(),
-            Some("99+")
-        );
-    }
-
-    #[test]
-    fn accessible_label_includes_type_unreads_and_selected_state() {
-        let mut unread_row = row("#general", 3, true);
-        unread_row.muted = true;
-        unread_row.external = true;
+    fn accessible_label_includes_type_and_selected_state() {
+        let mut selected_row = row("#general", true);
+        selected_row.muted = true;
+        selected_row.external = true;
 
         assert_eq!(
-            unread_row.accessible_label(),
-            "Public channel: #general, 3 unread, selected, muted, external"
-        );
-
-        let mut badgeless = row("#general", 0, false);
-        badgeless.unread = true;
-        assert_eq!(
-            badgeless.accessible_label(),
-            "Public channel: #general, unread"
+            selected_row.accessible_label(),
+            "Public channel: #general, selected, muted, external"
         );
     }
 
     #[test]
     fn direct_dm_rows_include_status_without_changing_title_or_group_dms() {
-        let mut direct = dm("D1", "U1");
-        direct.unread_count = Some(1);
-        let mut group: SlackConversation = serde_json::from_value(serde_json::json!({
+        let direct = active_dm("D1", "U1");
+        let group: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G1",
             "is_mpim": true,
+            "is_open": true,
             "members": ["U1", "U2"]
         }))
         .expect("failed to parse group DM");
-        group.unread_count = Some(1);
         let names = HashMap::from([
             ("U1".to_string(), "Ada".to_string()),
             ("U2".to_string(), "Grace".to_string()),
@@ -2124,17 +1874,6 @@ mod tests {
         assert_eq!(direct.status.as_ref().unwrap().text, "Heads down");
         assert!(direct.accessible_label().contains("status: Heads down"));
         assert!(group.status.is_none());
-    }
-
-    #[test]
-    fn unread_section_display_title_includes_row_count() {
-        let section = SidebarSectionModel {
-            kind: SidebarSectionKind::Unreads,
-            title: "Unreads",
-            rows: vec![row("#general", 1, false), row("#random", 1, false)],
-        };
-
-        assert_eq!(section.display_title(), "Unreads (2)");
     }
 
     #[test]
@@ -2183,37 +1922,35 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_list_applies_query_unread_and_default_visibility_filters() {
-        let unread = SlackConversation {
+    fn sidebar_list_applies_query_and_default_visibility_filters() {
+        let general = SlackConversation {
             id: "C123".to_string(),
             name: Some("general".to_string()),
             is_channel: Some(true),
-            unread_count: Some(2),
             ..Default::default()
         };
-        let read = SlackConversation {
+        let random = SlackConversation {
             id: "C456".to_string(),
             name: Some("random".to_string()),
             is_channel: Some(true),
             ..Default::default()
         };
-        let mut badgeless_unread_dm = SlackConversation {
+        let mut open_dm = SlackConversation {
             id: "D123".to_string(),
             user: Some("U123".to_string()),
             is_im: Some(true),
             ..Default::default()
         };
-        badgeless_unread_dm
+        open_dm
             .extra
-            .insert("has_unreads".to_string(), serde_json::json!(true));
+            .insert("is_open".to_string(), serde_json::json!(true));
         let user_names = HashMap::from([("U123".to_string(), "Ada".to_string())]);
 
         let rows = list_rows(build_sidebar_list(
-            &[unread.clone(), read.clone(), badgeless_unread_dm.clone()],
+            &[general.clone(), random.clone(), open_dm.clone()],
             &user_names,
             SidebarBuildOptions {
                 query: "ada",
-                unread_only: true,
                 ..Default::default()
             },
         ));
@@ -2222,11 +1959,10 @@ mod tests {
         assert_eq!(rows[0].title, "Ada");
         assert_eq!(
             list_placeholder(build_sidebar_list(
-                &[unread, read, badgeless_unread_dm],
+                &[general, random, open_dm],
                 &user_names,
                 SidebarBuildOptions {
-                    query: "random",
-                    unread_only: true,
+                    query: "nothing-matches-this",
                     ..Default::default()
                 },
             )),
@@ -2235,38 +1971,10 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_unread_only_filter_keeps_selected_read_conversation() {
-        let mut unread = channel("C1", "alerts");
-        unread.unread_count = Some(2);
-        let selected_read = channel("C2", "general");
-        let read = channel("C3", "random");
-
-        let sections = list_sections(build_sidebar_list(
-            &[unread, selected_read, read],
-            &HashMap::new(),
-            SidebarBuildOptions {
-                selected_channel: Some("C2"),
-                unread_only: true,
-                ..Default::default()
-            },
-        ));
-        let rows = &section(&sections, SidebarSectionKind::Channels).rows;
-
-        assert_eq!(
-            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            vec!["C1", "C2"]
-        );
-        assert!(rows[1].selected);
-        assert!(!rows[1].unread);
-    }
-
-    #[test]
-    fn sidebar_list_default_keeps_unread_or_selected_inactive_dms() {
-        let read_dm = dm("D_READ", "U_READ");
+    fn sidebar_list_default_keeps_selected_inactive_dms() {
+        let inactive_dm = dm("D_INACTIVE", "U_INACTIVE");
         let selected_group_dm = mpim("M_SELECTED", "selected");
-        let mut unread_group_dm = mpim("M_UNREAD", "unread");
-        unread_group_dm.unread_count = Some(1);
-        let conversations = [read_dm, selected_group_dm, unread_group_dm];
+        let conversations = [inactive_dm, selected_group_dm];
 
         let sections = list_sections(build_sidebar_list(
             &conversations,
@@ -2280,12 +1988,12 @@ mod tests {
 
         assert_eq!(
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            vec!["M_SELECTED", "M_UNREAD"]
+            vec!["M_SELECTED"]
         );
     }
 
     #[test]
-    fn sidebar_list_caps_recent_history_without_spending_slots_on_unread_or_selected_dms() {
+    fn sidebar_list_caps_recent_history_without_spending_slots_on_selected_dms() {
         let mut conversations = (0..RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 3)
             .map(|index| {
                 let mut conversation = dm(
@@ -2293,23 +2001,18 @@ mod tests {
                     &format!("U_RECENT_{index:02}"),
                 );
                 conversation.extra.insert(
-                    "last_read".to_string(),
+                    "latest".to_string(),
                     serde_json::json!(format!("{}.000001", index + 1)),
                 );
                 conversation
             })
             .collect::<Vec<_>>();
-        let mut unread_deleted = dm("D_UNREAD", "U_UNREAD");
-        unread_deleted.unread_count = Some(1);
-        unread_deleted
-            .extra
-            .insert("is_user_deleted".to_string(), serde_json::json!(true));
         let mut selected_dormant = dm("D_SELECTED", "U_SELECTED");
         selected_dormant.extra.insert(
             "properties".to_string(),
             serde_json::json!({ "is_dormant": true }),
         );
-        conversations.extend([unread_deleted, selected_dormant]);
+        conversations.push(selected_dormant);
 
         let sections = list_sections(build_sidebar_list(
             &conversations,
@@ -2325,8 +2028,7 @@ mod tests {
             .map(|row| row.id.as_str())
             .collect::<HashSet<_>>();
 
-        assert_eq!(rows.len(), RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 2);
-        assert!(ids.contains("D_UNREAD"));
+        assert_eq!(rows.len(), RECENT_HISTORY_DIRECT_MESSAGE_LIMIT + 1);
         assert!(ids.contains("D_SELECTED"));
         assert!(ids.contains("D_RECENT_22"));
         assert!(!ids.contains("D_RECENT_00"));
@@ -2376,7 +2078,7 @@ mod tests {
                 );
                 conversation.is_starred = Some(true);
                 conversation.extra.insert(
-                    "last_read".to_string(),
+                    "latest".to_string(),
                     serde_json::json!(format!("{}.000001", index + 100)),
                 );
                 conversation
@@ -2388,7 +2090,7 @@ mod tests {
                 &format!("U_RECENT_{index:02}"),
             );
             conversation.extra.insert(
-                "last_read".to_string(),
+                "latest".to_string(),
                 serde_json::json!(format!("{}.000001", index + 1)),
             );
             conversation
@@ -2450,21 +2152,20 @@ mod tests {
     }
 
     #[test]
-    fn show_all_still_respects_query_and_unread_only_filters() {
+    fn show_all_still_respects_the_query_filter() {
         let mut dormant_dm = dm("D_DORMANT", "U_DORMANT");
         dormant_dm.extra.insert(
             "properties".to_string(),
             serde_json::json!({ "is_dormant": true }),
         );
-        let unread_channel = SlackConversation {
-            id: "C_UNREAD".to_string(),
+        let alerts_channel = SlackConversation {
+            id: "C_ALERTS".to_string(),
             name: Some("alerts".to_string()),
             is_channel: Some(true),
-            unread_count: Some(1),
             ..Default::default()
         };
         let user_names = HashMap::from([("U_DORMANT".to_string(), "Ada".to_string())]);
-        let conversations = [dormant_dm, unread_channel];
+        let conversations = [dormant_dm, alerts_channel];
 
         assert_eq!(
             list_placeholder(build_sidebar_list(
@@ -2488,78 +2189,21 @@ mod tests {
         ));
         assert_eq!(queried[0].id, "D_DORMANT");
 
-        let unread_only = list_sections(build_sidebar_list(
+        let shown = list_sections(build_sidebar_list(
             &conversations,
             &user_names,
             SidebarBuildOptions {
-                unread_only: true,
                 show_all: true,
                 ..Default::default()
             },
         ));
-        let ids = unread_only
+        let ids = shown
             .iter()
             .flat_map(|section| section.rows.iter())
             .map(|row| row.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["C_UNREAD"]);
-    }
-
-    #[test]
-    fn sidebar_list_can_hide_unreads_section() {
-        let unread = SlackConversation {
-            id: "C123".to_string(),
-            name: Some("general".to_string()),
-            is_channel: Some(true),
-            unread_count: Some(2),
-            ..Default::default()
-        };
-
-        let sections = list_sections(build_sidebar_list(
-            &[unread],
-            &HashMap::new(),
-            SidebarBuildOptions {
-                show_unreads_section: false,
-                ..Default::default()
-            },
-        ));
-
-        assert!(sections
-            .iter()
-            .all(|section| section.kind != SidebarSectionKind::Unreads));
-        assert_eq!(
-            section(&sections, SidebarSectionKind::Channels).rows.len(),
-            1
-        );
-    }
-
-    #[test]
-    fn sidebar_list_can_show_unreads_section() {
-        let unread = SlackConversation {
-            id: "C123".to_string(),
-            name: Some("general".to_string()),
-            is_channel: Some(true),
-            unread_count: Some(2),
-            ..Default::default()
-        };
-
-        let sections = list_sections(build_sidebar_list(
-            &[unread],
-            &HashMap::new(),
-            SidebarBuildOptions {
-                show_unreads_section: true,
-                ..Default::default()
-            },
-        ));
-
-        assert_eq!(
-            section(&sections, SidebarSectionKind::Unreads).rows.len(),
-            1
-        );
-        assert_eq!(
-            section(&sections, SidebarSectionKind::Channels).rows.len(),
-            1
-        );
+            .collect::<HashSet<_>>();
+        assert!(ids.contains("C_ALERTS"));
+        assert!(ids.contains("D_DORMANT"));
     }
 
     #[test]
@@ -2718,33 +2362,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_switcher_ranks_unread_dms_then_unread_channels_then_read() {
-        let mut direct = dm("D1", "U1");
-        direct.unread_count = Some(1);
-        let mut group = mpim("M1", "triage");
-        group.unread_count = Some(1);
-        let mut unread_channel = channel("C1", "alpha-channel");
-        unread_channel.unread_count = Some(1);
-        let read_channel = channel("A1", "aardvark-channel");
-        let user_names = HashMap::from([("U1".to_string(), "Zoe".to_string())]);
-
-        let items = conversation_switcher_items(
-            &[read_channel, unread_channel, direct, group],
-            &user_names,
-            None,
-            "",
-        );
-
-        assert_eq!(
-            items
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["M1", "D1", "C1", "A1"]
-        );
-    }
-
-    #[test]
     fn deactivated_csaba_dm_is_final_priority_before_alphabetic_ordering() {
         let active = dm("CONV_ZOE", "U_ZOE");
         let mut csaba = dm("CONV_CSABA", "U_CSABA");
@@ -2784,18 +2401,15 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_relevance_band_precedes_existing_unread_count_sort() {
-        let mut alphabetical = channel("C1", "alpha-support");
-        alphabetical.unread_count = Some(10);
-        let mut relevant = channel("C2", "zebra-supp");
-        relevant.unread_count = Some(1);
+    fn sidebar_relevance_band_precedes_alphabetic_sort() {
+        let alphabetical = channel("C1", "alpha-support");
+        let relevant = channel("C2", "zebra-supp");
 
         let rows = list_rows(build_sidebar_list(
             &[alphabetical, relevant],
             &HashMap::new(),
             SidebarBuildOptions {
                 query: "supp",
-                show_unreads_section: true,
                 ..Default::default()
             },
         ));
@@ -2809,38 +2423,12 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_search_places_unread_categories_after_relevance() {
-        let exact_read = channel("X9", "1");
-        let mut unread_direct = dm("D1", "U9");
-        unread_direct.unread_count = Some(1);
-        let mut unread_channel = channel("C1", "alpha");
-        unread_channel.unread_count = Some(1);
-        let read_fallback = channel("A1", "aardvark");
-        let user_names = HashMap::from([("U9".to_string(), "Zoe".to_string())]);
-
-        let rows = list_rows(build_sidebar_list(
-            &[exact_read, unread_direct, unread_channel, read_fallback],
-            &user_names,
-            SidebarBuildOptions {
-                query: "1",
-                show_all: true,
-                ..Default::default()
-            },
-        ));
-
-        assert_eq!(
-            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            vec!["X9", "D1", "C1", "A1"]
-        );
-    }
-
-    #[test]
     fn sidebar_search_flattens_sections_and_ranks_group_dms_globally() {
         let group_dm: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G1",
             "is_mpim": true,
-            "members": ["U1", "U2"],
-            "unread_count": 2
+            "is_open": true,
+            "members": ["U1", "U2"]
         }))
         .expect("failed to parse group direct message");
         let channel = channel("C1", "fatness-robust");
@@ -2854,7 +2442,6 @@ mod tests {
             &user_names,
             SidebarBuildOptions {
                 query: "fat rob",
-                show_unreads_section: true,
                 ..Default::default()
             },
         ));
@@ -2867,15 +2454,14 @@ mod tests {
 
     #[test]
     fn sidebar_search_ranks_matching_direct_dm_above_matching_group_dm() {
-        let mut direct = dm("D_RICHARD", "U_RICHARD");
-        direct.unread_count = Some(1);
-        let mut group: SlackConversation = serde_json::from_value(serde_json::json!({
+        let direct = active_dm("D_RICHARD", "U_RICHARD");
+        let group: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G_RICHARD",
             "is_mpim": true,
+            "is_open": true,
             "members": ["U_SELF", "U_RICHARD", "U_OTHER"]
         }))
         .expect("failed to parse group DM");
-        group.unread_count = Some(1);
         let user_names = HashMap::from([
             ("U_SELF".to_string(), "Vincent".to_string()),
             ("U_RICHARD".to_string(), "Richard".to_string()),
@@ -2982,20 +2568,20 @@ mod tests {
 
     #[test]
     fn group_dm_search_ranks_by_matching_participant_coverage_and_excludes_self() {
-        let mut full_match: SlackConversation = serde_json::from_value(serde_json::json!({
+        let full_match: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G_FULL",
             "is_mpim": true,
+            "is_open": true,
             "members": ["U_SELF", "U_FAT", "U_ROB"]
         }))
         .expect("failed to parse full-match group DM");
-        full_match.unread_count = Some(1);
-        let mut partial_match: SlackConversation = serde_json::from_value(serde_json::json!({
+        let partial_match: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G_PARTIAL",
             "is_mpim": true,
+            "is_open": true,
             "members": ["U_SELF", "U_AARON", "U_BOTH"]
         }))
         .expect("failed to parse partial-match group DM");
-        partial_match.unread_count = Some(1);
         let user_names = HashMap::from([
             ("U_SELF".to_string(), "Vincent".to_string()),
             ("U_FAT".to_string(), "Fatima".to_string()),
@@ -3077,8 +2663,7 @@ mod tests {
 
     #[test]
     fn sidebar_filter_finds_existing_dm_by_user_alias() {
-        let mut conversation = dm("D_ZILVINAS", "U_ZILVINAS");
-        conversation.unread_count = Some(1);
+        let conversation = active_dm("D_ZILVINAS", "U_ZILVINAS");
         let user_names = HashMap::from([("U_ZILVINAS".to_string(), "Žilvinas".to_string())]);
         let aliases = HashMap::from([(
             "U_ZILVINAS".to_string(),
@@ -3371,38 +2956,6 @@ mod tests {
     }
 
     #[test]
-    fn conversation_picker_ranks_unread_categories_before_discovery_ties() {
-        let mut unread_direct = dm("D1", "U9");
-        unread_direct.unread_count = Some(1);
-        let mut unread_channel = channel("C1", "alpha");
-        unread_channel.unread_count = Some(1);
-        let user_names = HashMap::from([("U9".to_string(), "Zoe".to_string())]);
-
-        let sections = conversation_picker_sections(
-            &[unread_channel, unread_direct],
-            &[channel("A1", "aardvark")],
-            &[SlackUser {
-                id: Some("U1".to_string()),
-                real_name: Some("Beta".to_string()),
-                ..Default::default()
-            }],
-            &user_names,
-            None,
-            "1",
-        );
-
-        assert_eq!(
-            sections
-                .search_results
-                .expect("expected flat search results")
-                .iter()
-                .map(|item| item.row.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["D1", "C1", "U1", "A1"]
-        );
-    }
-
-    #[test]
     fn conversation_picker_ignores_channel_hash_during_alphabetic_fallback() {
         let sections = conversation_picker_sections(
             &[],
@@ -3430,7 +2983,7 @@ mod tests {
 
     #[test]
     fn keyed_sidebar_items_distinguish_duplicate_conversation_placements() {
-        let conversation = row("C1", 2, false);
+        let conversation = row("C1", false);
         let model = SidebarListModel::Sections(vec![
             SidebarSectionModel {
                 kind: SidebarSectionKind::Priority,
@@ -3438,8 +2991,8 @@ mod tests {
                 rows: vec![conversation.clone()],
             },
             SidebarSectionModel {
-                kind: SidebarSectionKind::Unreads,
-                title: SidebarSectionKind::Unreads.title(),
+                kind: SidebarSectionKind::DirectMessages,
+                title: SidebarSectionKind::DirectMessages.title(),
                 rows: vec![conversation.clone()],
             },
             SidebarSectionModel {
@@ -3461,7 +3014,7 @@ mod tests {
         assert_eq!(
             items[3].key,
             SidebarItemKey::Conversation {
-                section: Some(SidebarSectionKind::Unreads),
+                section: Some(SidebarSectionKind::DirectMessages),
                 id: "C1".to_string(),
             }
         );
@@ -3476,7 +3029,7 @@ mod tests {
 
     #[test]
     fn collapsing_priority_keeps_the_regular_conversation_row() {
-        let conversation = row("C1", 0, false);
+        let conversation = row("C1", false);
         let model = SidebarListModel::Sections(vec![
             SidebarSectionModel {
                 kind: SidebarSectionKind::Priority,
@@ -3509,12 +3062,12 @@ mod tests {
             SidebarSectionModel {
                 kind: SidebarSectionKind::Channels,
                 title: SidebarSectionKind::Channels.title(),
-                rows: vec![row("C1", 0, false), row("C2", 0, false)],
+                rows: vec![row("C1", false), row("C2", false)],
             },
             SidebarSectionModel {
                 kind: SidebarSectionKind::DirectMessages,
                 title: SidebarSectionKind::DirectMessages.title(),
-                rows: vec![row("D1", 0, false)],
+                rows: vec![row("D1", false)],
             },
         ]);
 
@@ -3550,7 +3103,7 @@ mod tests {
     #[test]
     fn collapsed_sections_do_not_change_flat_rows_or_placeholders() {
         let collapsed = HashSet::from([SidebarSectionKind::Channels]);
-        let rows = SidebarListModel::Rows(vec![row("C1", 0, false)]);
+        let rows = SidebarListModel::Rows(vec![row("C1", false)]);
         let placeholder = SidebarListModel::Placeholder(SidebarPlaceholder::NoMatches);
 
         assert_eq!(
@@ -3565,7 +3118,7 @@ mod tests {
 
     #[test]
     fn sidebar_projection_resets_once_then_ignores_identical_models() {
-        let items = SidebarListModel::Rows(vec![row("C1", 0, false)]).keyed_items();
+        let items = SidebarListModel::Rows(vec![row("C1", false)]).keyed_items();
         let mut projection = SidebarProjection::default();
 
         assert_eq!(
@@ -3579,7 +3132,7 @@ mod tests {
     #[test]
     fn sidebar_projection_updates_one_row_in_a_large_workspace() {
         let rows = (0..1_430)
-            .map(|index| row(&format!("C{index}"), 0, false))
+            .map(|index| row(&format!("C{index}"), false))
             .collect::<Vec<_>>();
         let mut next = SidebarListModel::Rows(rows).keyed_items();
         let mut projection = SidebarProjection::default();
@@ -3591,8 +3144,7 @@ mod tests {
         let SidebarItemModel::Conversation(changed) = &mut next[713].model else {
             panic!("expected conversation row");
         };
-        changed.unread_count = 4;
-        changed.unread = true;
+        changed.muted = true;
 
         assert_eq!(
             projection.reconcile(&next),
@@ -3602,17 +3154,14 @@ mod tests {
 
     #[test]
     fn sidebar_projection_updates_one_row_without_rebuilding_a_large_model() {
-        let mut rows = (0..1_430)
-            .map(|index| row(&format!("C{index}"), 1, false))
+        let rows = (0..1_430)
+            .map(|index| row(&format!("C{index}"), false))
             .collect::<Vec<_>>();
-        for row in &mut rows {
-            row.unread = true;
-        }
         let initial = SidebarListModel::Rows(rows).keyed_items();
         let mut projection = SidebarProjection::default();
         projection.reconcile(&initial);
-        let mut changed = row("C713", 4, false);
-        changed.unread = true;
+        let mut changed = row("C713", false);
+        changed.muted = true;
 
         assert_eq!(
             projection.update_conversation_rows(&[changed]),
@@ -3622,8 +3171,7 @@ mod tests {
 
     #[test]
     fn sidebar_projection_updates_every_duplicate_conversation_placement() {
-        let mut duplicated = row("C1", 2, false);
-        duplicated.unread = true;
+        let mut duplicated = row("C1", false);
         duplicated.starred = true;
         let items = SidebarListModel::Sections(vec![
             SidebarSectionModel {
@@ -3652,24 +3200,23 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_projection_rebuilds_when_unread_membership_or_order_can_change() {
-        let mut unread = row("C1", 2, false);
-        unread.unread = true;
+    fn sidebar_projection_rebuilds_when_section_membership_or_order_can_change() {
+        let starred = row("C1", false);
         let items = SidebarListModel::Sections(vec![SidebarSectionModel {
-            kind: SidebarSectionKind::Unreads,
-            title: SidebarSectionKind::Unreads.title(),
-            rows: vec![unread.clone()],
+            kind: SidebarSectionKind::Channels,
+            title: SidebarSectionKind::Channels.title(),
+            rows: vec![starred.clone()],
         }])
         .keyed_items();
         let mut projection = SidebarProjection::default();
         projection.reconcile(&items);
 
-        let mut reordered = unread.clone();
-        reordered.unread_count = 3;
+        let mut reordered = starred.clone();
+        reordered.title = "#renamed".to_string();
         assert_eq!(projection.update_conversation_rows(&[reordered]), None);
 
-        let mut membership_changed = unread;
-        membership_changed.unread = false;
+        let mut membership_changed = starred;
+        membership_changed.starred = true;
         assert_eq!(
             projection.update_conversation_rows(&[membership_changed]),
             None
@@ -3678,16 +3225,14 @@ mod tests {
 
     #[test]
     fn sidebar_projection_targeted_updates_are_atomic_and_require_existing_rows() {
-        let mut first = row("C1", 1, false);
-        first.unread = true;
-        let mut second = row("C2", 1, false);
-        second.unread = true;
+        let mut first = row("C1", false);
+        let mut second = row("C2", false);
         let items = SidebarListModel::Rows(vec![first.clone(), second.clone()]).keyed_items();
         let mut projection = SidebarProjection::default();
         projection.reconcile(&items);
 
         first.muted = true;
-        second.unread = false;
+        second.starred = true;
         assert_eq!(
             projection.update_conversation_rows(&[first.clone(), second]),
             None
@@ -3695,36 +3240,36 @@ mod tests {
         assert_eq!(projection.items(), items);
 
         assert_eq!(
-            projection.update_conversation_rows(&[row("missing", 0, false)]),
+            projection.update_conversation_rows(&[row("missing", false)]),
             None
         );
         assert_eq!(projection.items(), items);
     }
 
     #[test]
-    fn collapsed_unreads_allow_regular_row_count_updates() {
-        let mut unread = row("C1", 2, false);
-        unread.unread = true;
+    fn collapsed_sections_allow_regular_row_updates() {
+        let mut starred = row("C1", false);
+        starred.starred = true;
         let model = SidebarListModel::Sections(vec![
             SidebarSectionModel {
-                kind: SidebarSectionKind::Unreads,
-                title: SidebarSectionKind::Unreads.title(),
-                rows: vec![unread.clone()],
+                kind: SidebarSectionKind::Priority,
+                title: SidebarSectionKind::Priority.title(),
+                rows: vec![starred.clone()],
             },
             SidebarSectionModel {
                 kind: SidebarSectionKind::Channels,
                 title: SidebarSectionKind::Channels.title(),
-                rows: vec![unread.clone()],
+                rows: vec![starred.clone()],
             },
         ]);
         let items = model
-            .keyed_items_with_collapsed_sections(&HashSet::from([SidebarSectionKind::Unreads]));
+            .keyed_items_with_collapsed_sections(&HashSet::from([SidebarSectionKind::Priority]));
         let mut projection = SidebarProjection::default();
         projection.reconcile(&items);
-        unread.unread_count = 3;
+        starred.muted = true;
 
         assert_eq!(
-            projection.update_conversation_rows(&[unread]),
+            projection.update_conversation_rows(&[starred]),
             Some(vec![SidebarProjectionOperation::Update { position: 2 }])
         );
     }
@@ -3732,13 +3277,13 @@ mod tests {
     #[test]
     fn targeted_update_uses_positions_rebuilt_after_structural_reconciliation() {
         let initial =
-            SidebarListModel::Rows(vec![row("C1", 0, false), row("C2", 0, false)]).keyed_items();
+            SidebarListModel::Rows(vec![row("C1", false), row("C2", false)]).keyed_items();
         let reordered =
-            SidebarListModel::Rows(vec![row("C2", 0, false), row("C1", 0, false)]).keyed_items();
+            SidebarListModel::Rows(vec![row("C2", false), row("C1", false)]).keyed_items();
         let mut projection = SidebarProjection::default();
         projection.reconcile(&initial);
         projection.reconcile(&reordered);
-        let mut changed = row("C1", 0, false);
+        let mut changed = row("C1", false);
         changed.muted = true;
 
         assert_eq!(
@@ -3750,11 +3295,11 @@ mod tests {
     #[test]
     fn sidebar_projection_splices_only_a_local_structural_change() {
         let rows = (0..1_430)
-            .map(|index| row(&format!("C{index}"), 0, false))
+            .map(|index| row(&format!("C{index}"), false))
             .collect::<Vec<_>>();
         let initial = SidebarListModel::Rows(rows).keyed_items();
         let mut next = initial.clone();
-        let inserted = SidebarListModel::Rows(vec![row("C-new", 0, false)])
+        let inserted = SidebarListModel::Rows(vec![row("C-new", false)])
             .keyed_items()
             .pop()
             .unwrap();

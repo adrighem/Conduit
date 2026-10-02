@@ -32,15 +32,13 @@ use crate::message_handoff::{
     ResolvedMessageHandoff,
 };
 use crate::models::{
-    slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
-    SlackConversation, SlackConversationUnreadSnapshot, SlackFile, SlackMessage, SlackUnreadState,
-    SlackUser, SlackUserStatus, StoredToken,
+    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
+    SlackMessage, SlackUser, SlackUserStatus, StoredToken,
 };
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::ConversationHistoryService;
 use crate::slack::{
     DownloadedPreviewAsset, PreviewAssetMime, SlackApi, SlackError, SlackErrorCategory,
-    SlackUnreadSnapshot, SlackUnreadSnapshotRecord,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
@@ -53,18 +51,14 @@ use crate::sync_scheduler::{
     SyncPriority, SyncScheduler, SyncTargetKey, SyncTargetKind,
 };
 use crate::workspace_pipeline::{
-    ConversationMembershipSnapshot, ConversationRefresh, MessageAttentionEffect,
-    MessageMutationKind, MutationOrigin, SnapshotEnvelope, StoreBatch, StoreChange,
-    WorkspaceAttentionContext, WorkspaceBootstrapData, WorkspaceCoordinator, WorkspaceEffect,
-    WorkspaceMutation, WorkspacePatch, WorkspaceReduction, WorkspaceRevision,
+    ConversationMembershipSnapshot, MessageAttentionEffect, MessageMutationKind, MutationOrigin,
+    SnapshotEnvelope, StoreBatch, StoreChange, WorkspaceAttentionContext, WorkspaceBootstrapData,
+    WorkspaceCoordinator, WorkspaceEffect, WorkspaceMutation, WorkspacePatch, WorkspaceReduction,
+    WorkspaceRevision,
 };
 use crate::workspace_state::WorkspaceLifecycleEvent;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
-const CONVERSATION_ENRICHMENT_LIMIT: usize = 30;
-const MAX_UNREAD_REFRESH_PASSES: usize = 3;
-const UNREAD_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(1);
-const CONVERSATION_PATCH_BATCH_SIZE: usize = 20;
 const NAVIGATION_TASK_CONCURRENCY: usize = 2;
 const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
 const BACKGROUND_TASK_CONCURRENCY: usize = 3;
@@ -475,25 +469,6 @@ impl RuntimeCommand {
                 ),
                 RuntimeTaskLane::Interactive,
                 RuntimeAdmissionPolicy::durable_action(),
-            ),
-            Self::MarkConversationRead { channel_id, .. } => RuntimeCommandDescriptor::request(
-                channel(RuntimeOperation::ReadMarker, channel_id),
-                RuntimeTaskLane::Interactive,
-                RuntimeAdmissionPolicy::read_marker(),
-            ),
-            Self::MarkConversationReadAll { channel_id, .. } => RuntimeCommandDescriptor::mutation(
-                channel(RuntimeOperation::ReadMarker, channel_id),
-                RuntimeTaskLane::Interactive,
-                RuntimeAdmissionPolicy::read_marker(),
-            ),
-            Self::MarkThreadRead {
-                channel_id,
-                thread_ts,
-                ..
-            } => RuntimeCommandDescriptor::mutation(
-                thread(RuntimeOperation::ReadMarker, channel_id, thread_ts),
-                RuntimeTaskLane::Interactive,
-                RuntimeAdmissionPolicy::read_marker(),
             ),
             Self::PostMessage {
                 channel_id,
@@ -1077,7 +1052,7 @@ impl RuntimeRequest {
                     .replacement_key
                     .expect("coalescible command requires a replacement key"),
             }),
-            RuntimeAdmissionKind::DurableAction | RuntimeAdmissionKind::ReadMarker => {
+            RuntimeAdmissionKind::DurableAction => {
                 let context = if matches!(&command, RuntimeCommand::Huddle(_)) {
                     OperationContext::new(
                         RuntimeOperation::Huddle,
@@ -1348,7 +1323,7 @@ impl RuntimeCommandAdmissionState {
             request.identity.session < session
                 && matches!(
                     request.descriptor.admission.kind,
-                    RuntimeAdmissionKind::DurableAction | RuntimeAdmissionKind::ReadMarker
+                    RuntimeAdmissionKind::DurableAction
                 )
         }) || self.in_flight.iter().any(|key| {
             matches!(
@@ -1488,9 +1463,7 @@ impl RuntimeCommandAdmission {
                             state.counters.superseded = state.counters.superseded.saturating_add(1);
                             RuntimeCommandAdmissionOutcome::Superseded
                         }
-                        RuntimeAdmissionKind::Control
-                        | RuntimeAdmissionKind::DurableAction
-                        | RuntimeAdmissionKind::ReadMarker => {
+                        RuntimeAdmissionKind::Control | RuntimeAdmissionKind::DurableAction => {
                             unreachable!("only replaceable commands have replacement keys")
                         }
                     });
@@ -1853,7 +1826,6 @@ struct RuntimeConnection {
     workspace: WorkspaceReducerAdapter,
     current_user_id: Option<String>,
     user_cache: Arc<Mutex<HashMap<String, String>>>,
-    read_marks: Arc<Mutex<HashMap<String, String>>>,
     message_handoffs: Arc<Mutex<MessageHandoffResolver>>,
     conversation_star_sync: ConversationStarSyncGate,
     user_status_sync: UserStatusSync,
@@ -2083,7 +2055,7 @@ impl WorkspaceReducerAdapter {
 
     /// Flushes and drains all admitted reductions in revision order. Socket
     /// messages use this before durable attention classification so an older
-    /// read or unread mutation cannot make the classification stale.
+    /// pending mutation cannot make the classification stale.
     async fn recover_persisted_admitted(
         &self,
         store: Option<&WorkspaceStore>,
@@ -4572,7 +4544,6 @@ fn spawn_authentication_task<F>(
                             workspace,
                             current_user_id: auth.user_id.clone(),
                             user_cache: Arc::new(Mutex::new(HashMap::new())),
-                            read_marks: Arc::new(Mutex::new(HashMap::new())),
                             message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(
                                 256,
                             ))),
@@ -5008,7 +4979,6 @@ async fn run_job_payload(
             load_conversations_best_effort_with_api(
                 events,
                 &connection.slack,
-                connection.workspace_url.as_deref(),
                 WorkspacePipelineContext {
                     store: &connection.workspace_store,
                     reducer: &connection.workspace,
@@ -5268,11 +5238,6 @@ async fn handle_connected_command(
         .lock()
         .expect("runtime user cache lock poisoned")
         .clone();
-    let mut read_marks = connection
-        .read_marks
-        .lock()
-        .expect("runtime read marks lock poisoned")
-        .clone();
     let mut context = RuntimeContext {
         events,
         image_cache,
@@ -5282,7 +5247,6 @@ async fn handle_connected_command(
         workspace: &connection.workspace,
         current_user_id: connection.current_user_id.as_deref(),
         user_cache: &mut user_cache,
-        read_marks: &mut read_marks,
         message_handoffs: &connection.message_handoffs,
         conversation_star_sync: &connection.conversation_star_sync,
         user_status_sync: &connection.user_status_sync,
@@ -5297,16 +5261,6 @@ async fn handle_connected_command(
         .lock()
         .expect("runtime user cache lock poisoned")
         .extend(user_cache);
-    let mut shared_read_marks = connection
-        .read_marks
-        .lock()
-        .expect("runtime read marks lock poisoned");
-    for (channel_id, timestamp) in read_marks {
-        let marked_timestamp = shared_read_marks.entry(channel_id).or_default();
-        if timestamp > *marked_timestamp {
-            *marked_timestamp = timestamp;
-        }
-    }
     result
 }
 
@@ -5319,7 +5273,6 @@ struct RuntimeContext<'a> {
     workspace: &'a WorkspaceReducerAdapter,
     current_user_id: Option<&'a str>,
     user_cache: &'a mut HashMap<String, String>,
-    read_marks: &'a mut HashMap<String, String>,
     message_handoffs: &'a Arc<Mutex<MessageHandoffResolver>>,
     conversation_star_sync: &'a ConversationStarSyncGate,
     user_status_sync: &'a UserStatusSync,
@@ -5353,38 +5306,9 @@ fn cached_conversation_user_ids(
 struct ChannelHistoryPrefetchCandidate {
     id: String,
     huddle_metadata: bool,
-    unread: bool,
-    direct_message: bool,
-    unread_count: u64,
+    active_direct_message: bool,
     activity_score: f64,
     title: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ConversationUnreadRefreshTier {
-    UnknownActiveDirectMessage,
-    UnknownDirectMessage,
-    UnreadDirectMessage,
-    ActiveDirectMessage,
-    AttentionOrUnknown,
-    Background,
-}
-
-#[derive(Debug, Clone)]
-struct ConversationUnreadRefreshCandidate {
-    id: String,
-    tier: ConversationUnreadRefreshTier,
-    unread_count: u64,
-    priority: f64,
-    activity_score: f64,
-    title: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConversationUnreadRefreshPlan {
-    batch: Vec<String>,
-    queue: Vec<String>,
-    next_queue: Vec<String>,
 }
 
 #[cfg(test)]
@@ -5410,8 +5334,7 @@ fn channel_history_prefetch_candidates_with_huddles(
         right
             .huddle_metadata
             .cmp(&left.huddle_metadata)
-            .then_with(|| right.unread.cmp(&left.unread))
-            .then_with(|| right.unread_count.cmp(&left.unread_count))
+            .then_with(|| right.active_direct_message.cmp(&left.active_direct_message))
             .then_with(|| right.activity_score.total_cmp(&left.activity_score))
             .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.id.cmp(&right.id))
@@ -5421,7 +5344,7 @@ fn channel_history_prefetch_candidates_with_huddles(
         .partition(|candidate| candidate.huddle_metadata);
     let (urgent_direct_messages, mut remaining): (Vec<_>, Vec<_>) = remaining
         .into_iter()
-        .partition(|candidate| candidate.unread && candidate.direct_message);
+        .partition(|candidate| candidate.active_direct_message);
     huddle_candidates.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
     remaining.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT.saturating_sub(huddle_candidates.len()));
     huddle_candidates
@@ -5430,104 +5353,6 @@ fn channel_history_prefetch_candidates_with_huddles(
         .chain(remaining)
         .map(|candidate| candidate.id)
         .collect()
-}
-
-fn conversation_unread_refresh_candidates(conversations: &[SlackConversation]) -> Vec<String> {
-    let mut candidates = conversations
-        .iter()
-        .filter(|conversation| !conversation.is_archived.unwrap_or(false))
-        .filter(|conversation| !conversation.id.trim().is_empty())
-        .map(conversation_unread_refresh_candidate)
-        .collect::<Vec<_>>();
-
-    candidates.sort_by(|left, right| {
-        left.tier
-            .cmp(&right.tier)
-            .then_with(|| right.unread_count.cmp(&left.unread_count))
-            .then_with(|| right.priority.total_cmp(&left.priority))
-            .then_with(|| right.activity_score.total_cmp(&left.activity_score))
-            .then_with(|| left.title.cmp(&right.title))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    let mut seen = HashSet::new();
-    candidates
-        .into_iter()
-        .filter(|candidate| seen.insert(candidate.id.clone()))
-        .map(|candidate| candidate.id)
-        .collect()
-}
-
-fn conversation_unread_refresh_candidate(
-    conversation: &SlackConversation,
-) -> ConversationUnreadRefreshCandidate {
-    let unread = conversation.raw_unread_state();
-    let direct_message = conversation.is_direct_message();
-    let priority = conversation.priority_hint();
-    let active_direct_message = conversation.has_active_direct_message_hint();
-    let tier = if direct_message && !unread.known && active_direct_message {
-        ConversationUnreadRefreshTier::UnknownActiveDirectMessage
-    } else if direct_message && !unread.known {
-        ConversationUnreadRefreshTier::UnknownDirectMessage
-    } else if direct_message && unread.has_unread {
-        ConversationUnreadRefreshTier::UnreadDirectMessage
-    } else if active_direct_message {
-        ConversationUnreadRefreshTier::ActiveDirectMessage
-    } else if unread.has_unread || !unread.known {
-        ConversationUnreadRefreshTier::AttentionOrUnknown
-    } else {
-        ConversationUnreadRefreshTier::Background
-    };
-
-    ConversationUnreadRefreshCandidate {
-        id: conversation.id.clone(),
-        tier,
-        unread_count: conversation.raw_unread_activity_count(),
-        priority,
-        activity_score: conversation_activity_score(conversation),
-        title: conversation.display_name().to_lowercase(),
-    }
-}
-
-fn conversation_unread_refresh_plan(
-    cached_pending: Vec<String>,
-    ranked_candidates: Vec<String>,
-    limit: usize,
-) -> ConversationUnreadRefreshPlan {
-    let mut candidate_ids = HashSet::new();
-    let ranked_candidates = ranked_candidates
-        .into_iter()
-        .filter(|channel_id| !channel_id.trim().is_empty())
-        .filter(|channel_id| candidate_ids.insert(channel_id.clone()))
-        .collect::<Vec<_>>();
-    let mut cached_ids = HashSet::new();
-    let cached_pending = cached_pending
-        .into_iter()
-        .filter(|channel_id| candidate_ids.contains(channel_id))
-        .filter(|channel_id| cached_ids.insert(channel_id.clone()))
-        .collect::<Vec<_>>();
-    // Preserve the circular order for already-queued IDs. Newly unread or active
-    // conversations are surfaced by their state/realtime updates, while moving
-    // existing IDs back to the front here could indefinitely starve the tail.
-    let mut seen = HashSet::new();
-    let queue = ranked_candidates
-        .into_iter()
-        .filter(|channel_id| !cached_ids.contains(channel_id))
-        .chain(cached_pending)
-        .filter(|channel_id| seen.insert(channel_id.clone()))
-        .collect::<Vec<_>>();
-    let split = limit.min(queue.len());
-    let batch = queue[..split].to_vec();
-    let next_queue = queue[split..]
-        .iter()
-        .chain(&queue[..split])
-        .cloned()
-        .collect();
-
-    ConversationUnreadRefreshPlan {
-        batch,
-        queue,
-        next_queue,
-    }
 }
 
 fn channel_history_prefetch_candidate(
@@ -5544,9 +5369,10 @@ fn channel_history_prefetch_candidate(
         || conversation.is_im.unwrap_or(false)
         || conversation.is_mpim.unwrap_or(false);
     let huddle_metadata = current_huddle || conversation.has_huddle_metadata();
+    let active_direct_message = conversation.has_active_direct_message_hint();
     if !is_channel
         || ((conversation.is_im.unwrap_or(false) || conversation.is_mpim.unwrap_or(false))
-            && !conversation.raw_has_unread_activity()
+            && !active_direct_message
             && !huddle_metadata)
     {
         return None;
@@ -5555,27 +5381,17 @@ fn channel_history_prefetch_candidate(
     Some(ChannelHistoryPrefetchCandidate {
         id: conversation.id.clone(),
         huddle_metadata,
-        unread: conversation.raw_has_unread_activity(),
-        direct_message: conversation.is_im.unwrap_or(false)
-            || conversation.is_mpim.unwrap_or(false),
-        unread_count: conversation.raw_unread_activity_count(),
+        active_direct_message,
         activity_score: conversation_activity_score(conversation),
         title: conversation.display_name().to_lowercase(),
     })
 }
 
 fn conversation_activity_score(conversation: &SlackConversation) -> f64 {
-    [
-        "last_read",
-        "updated",
-        "updated_at",
-        "created",
-        "latest",
-        "latest_ts",
-    ]
-    .into_iter()
-    .filter_map(|key| conversation.extra.get(key).and_then(slack_numeric_value))
-    .fold(0.0, f64::max)
+    ["updated", "updated_at", "created", "latest", "latest_ts"]
+        .into_iter()
+        .filter_map(|key| conversation.extra.get(key).and_then(slack_numeric_value))
+        .fold(0.0, f64::max)
 }
 
 fn slack_numeric_value(value: &serde_json::Value) -> Option<f64> {
@@ -5612,7 +5428,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             load_conversations_best_effort_with_api(
                 context.events,
                 &api,
-                context.workspace_url,
                 WorkspacePipelineContext {
                     store: &workspace_store,
                     reducer: context.workspace,
@@ -6322,57 +6137,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 }
             }
         }
-        RuntimeCommand::MarkConversationRead { channel_id, ts } => {
-            let api = require_slack(context.slack)?;
-            mark_conversation_read_best_effort(
-                api,
-                context.events,
-                context.read_marks,
-                context.workspace_store,
-                context.workspace,
-                ConversationReadRequest {
-                    channel_id: &channel_id,
-                    latest_ts: &ts,
-                    mode: ConversationReadMode::ThroughVisible,
-                },
-            )
-            .await;
-        }
-        RuntimeCommand::MarkConversationReadAll { channel_id, ts } => {
-            let api = require_slack(context.slack)?;
-            mark_conversation_read_best_effort(
-                api,
-                context.events,
-                context.read_marks,
-                context.workspace_store,
-                context.workspace,
-                ConversationReadRequest {
-                    channel_id: &channel_id,
-                    latest_ts: &ts,
-                    mode: ConversationReadMode::All,
-                },
-            )
-            .await;
-        }
-        RuntimeCommand::MarkThreadRead {
-            channel_id,
-            thread_ts,
-            ts,
-        } => {
-            context
-                .workspace
-                .apply_persisted_and_publish(
-                    context.workspace_store.as_ref(),
-                    context.events,
-                    MutationOrigin::Local,
-                    WorkspaceMutation::ThreadRead {
-                        channel_id,
-                        thread_ts,
-                        last_read: ts,
-                    },
-                )
-                .await?;
-        }
         RuntimeCommand::PostMessage {
             channel_id,
             text,
@@ -6424,19 +6188,16 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         } => {
             let api = require_slack(context.slack)?;
             let response = api
-                .execute_slash_command(
-                    &channel_id,
-                    &command,
-                    &text,
-                    thread_ts.as_deref(),
-                )
+                .execute_slash_command(&channel_id, &command, &text, thread_ts.as_deref())
                 .await?;
-            context.events.send_event(RuntimeEventKind::SlashCommandExecuted {
-                channel_id,
-                command,
-                thread_ts,
-                response: Box::new(response),
-            });
+            context
+                .events
+                .send_event(RuntimeEventKind::SlashCommandExecuted {
+                    channel_id,
+                    command,
+                    thread_ts,
+                    response: Box::new(response),
+                });
         }
         RuntimeCommand::UpdateMessage {
             channel_id,
@@ -7560,7 +7321,6 @@ enum AttentionPersistenceStatus {
     NotApplicable,
     Accepted,
     AlreadyObserved,
-    AtOrBeforeReadCursor,
     Failed,
 }
 
@@ -7570,7 +7330,6 @@ impl AttentionPersistenceStatus {
             Self::NotApplicable => AttentionPersistenceOutcome::NotApplicable,
             Self::Accepted => AttentionPersistenceOutcome::Accepted,
             Self::AlreadyObserved => AttentionPersistenceOutcome::AlreadyObserved,
-            Self::AtOrBeforeReadCursor => AttentionPersistenceOutcome::AtOrBeforeReadCursor,
             Self::Failed => AttentionPersistenceOutcome::Failed,
         }
     }
@@ -7683,7 +7442,7 @@ async fn persist_realtime_events(
 /// Serializes socket message authority with interactive history snapshots.
 ///
 /// Older recovered patches publish first. The current typed patch then carries
-/// the complete timeline and first-unread projection to the window.
+/// the complete timeline projection to the window.
 async fn persist_socket_message(
     store: &WorkspaceStore,
     current_user_id: Option<&str>,
@@ -7737,10 +7496,10 @@ async fn persist_socket_message(
         attention_persistence.notification_claimed,
     );
     let delivery = match attention_persistence.attention_status {
-        AttentionPersistenceStatus::Accepted | AttentionPersistenceStatus::NotApplicable => None,
         AttentionPersistenceStatus::AlreadyObserved => Some(DeliveryState::Duplicate),
-        AttentionPersistenceStatus::AtOrBeforeReadCursor => Some(DeliveryState::Stale),
-        AttentionPersistenceStatus::Failed => None,
+        AttentionPersistenceStatus::Accepted
+        | AttentionPersistenceStatus::NotApplicable
+        | AttentionPersistenceStatus::Failed => None,
     };
     let current = workspace.apply_and_enqueue(
         Some(store),
@@ -7813,19 +7572,8 @@ async fn persist_socket_attention(
     };
     let channel_id = &message_event.channel_id;
     let message = &message_event.message;
-    // Ambient unread is scoped to messages that belong in the channel's own
-    // timeline, matching the same gate applied in workspace_pipeline.rs, so
-    // this early-claim path and the later reduction agree on what counts.
-    let general_unread = decision.record_unread && message.belongs_in_channel_timeline();
     match store
-        .accept_attention_delivery_for_message(
-            channel_id,
-            &message.ts,
-            message.thread_root_ts(),
-            general_unread,
-            decision.record_mention,
-            decision.send_notification,
-        )
+        .accept_attention_delivery_for_message(channel_id, &message.ts, decision.send_notification)
         .await
     {
         Ok(outcome) => match outcome.observation {
@@ -7840,16 +7588,6 @@ async fn persist_socket_attention(
                 );
                 RealtimeAttentionPersistence {
                     attention_status: AttentionPersistenceStatus::AlreadyObserved,
-                    notification_claimed: false,
-                }
-            }
-            AttentionObservationStatus::AtOrBeforeReadCursor => {
-                crate::debug::log(
-                    "attention",
-                    "AttentionRealtimeSuppressed reason=at_or_before_read_cursor",
-                );
-                RealtimeAttentionPersistence {
-                    attention_status: AttentionPersistenceStatus::AtOrBeforeReadCursor,
                     notification_claimed: false,
                 }
             }
@@ -8020,7 +7758,6 @@ async fn apply_conversation_membership_snapshot(
 async fn load_conversations_best_effort_with_api(
     events: &RuntimeEventSender,
     api: &SlackApi,
-    workspace_url: Option<&str>,
     workspace: WorkspacePipelineContext<'_>,
     cached_user_names: HashMap<String, String>,
     team_id: Option<&str>,
@@ -8036,15 +7773,6 @@ async fn load_conversations_best_effort_with_api(
     .await
     {
         Ok(conversations) => {
-            let browser_covered = apply_browser_unread_snapshot_best_effort(
-                events,
-                api,
-                workspace_url,
-                workspace.store,
-                workspace.reducer,
-                &conversations,
-            )
-            .await;
             events.send_event(RuntimeEventKind::WorkspaceLifecycle(
                 WorkspaceLifecycleEvent::SyncCompleted,
             ));
@@ -8053,22 +7781,11 @@ async fn load_conversations_best_effort_with_api(
                 .filter(|conversation| conversation.has_huddle_metadata())
                 .map(|conversation| conversation.id.clone())
                 .collect::<HashSet<_>>();
-            let unread_refresh_candidates =
-                uncovered_conversation_unread_refresh_candidates(&conversations, &browser_covered);
-            refresh_conversation_unread_states_best_effort(
-                events,
-                api,
-                workspace.store,
-                workspace.reducer,
-                unread_refresh_candidates,
-            )
-            .await;
-            let refreshed_conversations = workspace.reducer.conversations();
             prefetch_channel_histories_best_effort(
                 events,
                 api,
                 workspace,
-                &refreshed_conversations,
+                &conversations,
                 &current_huddle_channels,
                 team_id,
                 huddles,
@@ -8079,7 +7796,7 @@ async fn load_conversations_best_effort_with_api(
                 api,
                 workspace.store,
                 workspace.reducer,
-                &refreshed_conversations,
+                &conversations,
                 &cached_user_names,
             )
             .await;
@@ -8087,311 +7804,6 @@ async fn load_conversations_best_effort_with_api(
         Err(error) => handle_conversations_load_error(events, error),
     }
     Ok(())
-}
-
-fn uncovered_conversation_unread_refresh_candidates(
-    conversations: &[SlackConversation],
-    covered: &HashSet<String>,
-) -> Vec<String> {
-    conversation_unread_refresh_candidates(conversations)
-        .into_iter()
-        .filter(|channel_id| !covered.contains(channel_id))
-        .collect()
-}
-
-fn browser_unread_snapshots_for_catalog(
-    snapshot: SlackUnreadSnapshot,
-    conversations: &[SlackConversation],
-) -> (Vec<SlackConversationUnreadSnapshot>, HashSet<String>) {
-    let known_ids = conversations
-        .iter()
-        .map(|conversation| conversation.id.as_str())
-        .collect::<HashSet<_>>();
-    let mut covered = HashSet::new();
-    let snapshots = snapshot
-        .channels
-        .into_iter()
-        .map(|record| (record, None))
-        .chain(snapshot.ims.into_iter().map(|record| {
-            let is_open = record.is_open;
-            (record, Some(is_open))
-        }))
-        .chain(snapshot.mpims.into_iter().map(|record| (record, None)))
-        .filter(|(record, _)| known_ids.contains(record.conversation_id.as_str()))
-        .filter_map(|(record, is_open)| {
-            if !covered.insert(record.conversation_id.clone()) {
-                return None;
-            }
-            Some(browser_unread_record_snapshot(record, is_open))
-        })
-        .collect();
-    (snapshots, covered)
-}
-
-fn browser_unread_record_snapshot(
-    record: SlackUnreadSnapshotRecord,
-    is_open: Option<bool>,
-) -> SlackConversationUnreadSnapshot {
-    SlackConversationUnreadSnapshot {
-        channel_id: record.conversation_id,
-        unread_state: SlackUnreadState::from_parts(true, record.has_unreads, 0),
-        last_read: record.last_read,
-        latest: record.latest,
-        mention_count: Some(record.mention_count),
-        is_open,
-    }
-}
-
-#[derive(Default)]
-struct PendingConversationRefreshBatch {
-    refreshes: Vec<SnapshotEnvelope<ConversationRefresh>>,
-    potential_changes: usize,
-}
-
-impl PendingConversationRefreshBatch {
-    fn push(
-        &mut self,
-        refresh: SnapshotEnvelope<ConversationRefresh>,
-    ) -> Option<Vec<SnapshotEnvelope<ConversationRefresh>>> {
-        let potential_changes = refresh.data().potential_change_count();
-        if potential_changes == 0 {
-            return None;
-        }
-        let ready = (!self.refreshes.is_empty()
-            && self.potential_changes + potential_changes > CONVERSATION_PATCH_BATCH_SIZE)
-            .then(|| self.take());
-        self.potential_changes += potential_changes;
-        self.refreshes.push(refresh);
-        ready
-    }
-
-    fn take(&mut self) -> Vec<SnapshotEnvelope<ConversationRefresh>> {
-        self.potential_changes = 0;
-        std::mem::take(&mut self.refreshes)
-    }
-}
-
-async fn publish_conversation_refresh_batch(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-    workspace: &WorkspaceReducerAdapter,
-    refreshes: Vec<SnapshotEnvelope<ConversationRefresh>>,
-) {
-    if refreshes.is_empty() {
-        return;
-    }
-    if let Err(error) = workspace
-        .apply_persisted_and_publish(
-            workspace_store.as_ref(),
-            events,
-            MutationOrigin::WebApi,
-            WorkspaceMutation::ConversationRefreshBatch(refreshes),
-        )
-        .await
-    {
-        crate::debug::log(
-            "store",
-            &format!("ConversationRefreshStoreFailed error={error:#}"),
-        );
-    }
-}
-
-async fn apply_browser_unread_snapshot_best_effort(
-    events: &RuntimeEventSender,
-    api: &SlackApi,
-    workspace_url: Option<&str>,
-    workspace_store: &Option<WorkspaceStore>,
-    workspace: &WorkspaceReducerAdapter,
-    conversations: &[SlackConversation],
-) -> HashSet<String> {
-    if api.browser_cookie_d().is_none() {
-        return HashSet::new();
-    }
-    let base_revision = workspace.revision();
-    let Some(workspace_url) = workspace_url else {
-        crate::debug::log(
-            "runtime",
-            "BrowserUnreadSnapshotUnavailable category=Validation",
-        );
-        return HashSet::new();
-    };
-    let snapshot = match api.browser_unread_snapshot(workspace_url).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            crate::debug::log(
-                "runtime",
-                &format!(
-                    "BrowserUnreadSnapshotUnavailable category={:?}",
-                    error.category()
-                ),
-            );
-            return HashSet::new();
-        }
-    };
-    let (snapshots, covered) = browser_unread_snapshots_for_catalog(snapshot, conversations);
-    let submitted = snapshots.len();
-    let mut pending = PendingConversationRefreshBatch::default();
-    for snapshot in snapshots {
-        let refresh = SnapshotEnvelope::new(
-            base_revision,
-            ConversationRefresh {
-                metadata: None,
-                unread: Some(snapshot),
-            },
-        );
-        if let Some(ready) = pending.push(refresh) {
-            publish_conversation_refresh_batch(events, workspace_store, workspace, ready).await;
-        }
-    }
-    publish_conversation_refresh_batch(events, workspace_store, workspace, pending.take()).await;
-    crate::debug::log(
-        "runtime",
-        &format!(
-            "BrowserUnreadSnapshotApplied covered={} submitted={}",
-            covered.len(),
-            submitted
-        ),
-    );
-    covered
-}
-
-async fn refresh_conversation_unread_states_best_effort(
-    events: &RuntimeEventSender,
-    api: &SlackApi,
-    workspace_store: &Option<WorkspaceStore>,
-    workspace: &WorkspaceReducerAdapter,
-    ranked_channel_ids: Vec<String>,
-) {
-    let cached_pending = if let Some(store) = workspace_store.as_ref() {
-        match store.load_pending_unread_refresh().await {
-            Ok(cached_pending) => cached_pending,
-            Err(error) => {
-                crate::debug::log(
-                    "store",
-                    &format!("PendingUnreadRefreshLoadFailed error={error:#}"),
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    let ConversationUnreadRefreshPlan {
-        batch: mut pending,
-        queue,
-        next_queue,
-    } = conversation_unread_refresh_plan(
-        cached_pending,
-        ranked_channel_ids,
-        CONVERSATION_ENRICHMENT_LIMIT,
-    );
-    if let Some(store) = workspace_store.as_ref() {
-        if let Err(error) = store.store_pending_unread_refresh(&queue).await {
-            crate::debug::log(
-                "store",
-                &format!("PendingUnreadRefreshStoreFailed error={error:#}"),
-            );
-        }
-    }
-    let mut refresh_batch = PendingConversationRefreshBatch::default();
-    for pass in 0..MAX_UNREAD_REFRESH_PASSES {
-        let mut failed = Vec::new();
-        for channel_id in std::mem::take(&mut pending) {
-            let base_revision = workspace.revision();
-            match api.conversation_with_unread_state(&channel_id).await {
-                Ok((mut details, unread_state)) => {
-                    let unread_snapshot = SlackConversationUnreadSnapshot {
-                        channel_id: channel_id.clone(),
-                        unread_state,
-                        last_read: details
-                            .as_ref()
-                            .and_then(|details| details.last_read_ts().map(str::to_string)),
-                        latest: details
-                            .as_ref()
-                            .and_then(|details| details.latest_message_ts().map(str::to_string)),
-                        mention_count: details
-                            .as_ref()
-                            .and_then(|details| details.extra.get("mention_count")?.as_u64()),
-                        is_open: details
-                            .as_ref()
-                            .and_then(|details| details.extra.get("is_open")?.as_bool()),
-                    };
-                    if let Some(details) = details.as_mut() {
-                        // Cursor metadata is committed atomically with unread state below.
-                        details.extra.remove("last_read");
-                        details.extra.remove("latest");
-                        // The serialized conversation refresh and local toggle path
-                        // exclusively own user-relative star state.
-                        details.is_starred = None;
-                        if details.is_mpim.unwrap_or(false) {
-                            match api.conversation_members(&channel_id).await {
-                                Ok(members) => {
-                                    details.extra.insert(
-                                        "members".to_string(),
-                                        serde_json::json!(members),
-                                    );
-                                }
-                                Err(error) => crate::debug::log(
-                                    "runtime",
-                                    &format!("ConversationMembersRefreshFailed channel_id={channel_id} error={error:#}"),
-                                ),
-                            }
-                        }
-                    }
-                    crate::debug::log(
-                        "runtime",
-                        &format!(
-                            "ConversationUnreadRefreshed channel_id={channel_id} known={} unread={} display_count={}",
-                            unread_state.known, unread_state.has_unread, unread_state.display_count
-                        ),
-                    );
-                    if !unread_state.known {
-                        failed.push(channel_id.clone());
-                    }
-                    let refresh = SnapshotEnvelope::new(
-                        base_revision,
-                        ConversationRefresh {
-                            metadata: details,
-                            unread: unread_state.known.then_some(unread_snapshot),
-                        },
-                    );
-                    if let Some(ready) = refresh_batch.push(refresh) {
-                        publish_conversation_refresh_batch(
-                            events,
-                            workspace_store,
-                            workspace,
-                            ready,
-                        )
-                        .await;
-                    }
-                }
-                Err(error) => {
-                    crate::debug::log(
-                        "runtime",
-                        &format!("ConversationUnreadRefreshFailed channel_id={channel_id} pass={} error={error:#}", pass + 1),
-                    );
-                    failed.push(channel_id);
-                }
-            }
-        }
-        pending = failed;
-        if pending.is_empty() {
-            break;
-        }
-        if pass + 1 < MAX_UNREAD_REFRESH_PASSES {
-            tokio::time::sleep(UNREAD_REFRESH_RETRY_DELAY).await;
-        }
-    }
-    if let Some(store) = workspace_store.as_ref() {
-        if let Err(error) = store.store_pending_unread_refresh(&next_queue).await {
-            crate::debug::log(
-                "store",
-                &format!("PendingUnreadRefreshStoreFailed error={error:#}"),
-            );
-        }
-    }
-    publish_conversation_refresh_batch(events, workspace_store, workspace, refresh_batch.take())
-        .await;
 }
 
 async fn prefetch_channel_histories_best_effort(
@@ -8465,26 +7877,6 @@ async fn prefetch_channel_histories_best_effort(
                         "huddle",
                         &format!("HuddlePrefetchObservationFailed error={error}"),
                     );
-                }
-                let unread_snapshot = SlackConversationUnreadSnapshot {
-                    channel_id: channel_id.clone(),
-                    unread_state: page.unread_state,
-                    ..Default::default()
-                };
-                if page.unread_state.known {
-                    publish_conversation_refresh_batch(
-                        events,
-                        workspace.store,
-                        workspace.reducer,
-                        vec![SnapshotEnvelope::new(
-                            base_revision,
-                            ConversationRefresh {
-                                metadata: None,
-                                unread: Some(unread_snapshot),
-                            },
-                        )],
-                    )
-                    .await;
                 }
                 crate::debug::log(
                     "runtime",
@@ -8658,119 +8050,6 @@ async fn publish_history_snapshot_with_completion(
         cached,
     });
     Ok(reductions)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConversationReadMode {
-    ThroughVisible,
-    All,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ConversationReadRequest<'a> {
-    channel_id: &'a str,
-    latest_ts: &'a str,
-    mode: ConversationReadMode,
-}
-
-async fn mark_conversation_read_best_effort(
-    api: &SlackApi,
-    events: &RuntimeEventSender,
-    read_marks: &mut HashMap<String, String>,
-    workspace_store: &Option<WorkspaceStore>,
-    workspace: &WorkspaceReducerAdapter,
-    request: ConversationReadRequest<'_>,
-) {
-    let ConversationReadRequest {
-        channel_id,
-        latest_ts,
-        mode,
-    } = request;
-    if channel_id.trim().is_empty() || latest_ts.trim().is_empty() {
-        return;
-    }
-
-    if read_marks.get(channel_id).is_some_and(|marked_ts| {
-        marked_ts == latest_ts || slack_timestamp_is_after(marked_ts, latest_ts)
-    }) {
-        publish_local_read_marker(
-            events,
-            workspace_store,
-            workspace,
-            channel_id,
-            latest_ts,
-            mode,
-        )
-        .await;
-        return;
-    }
-
-    if !api.can_mark_read() {
-        crate::debug::log(
-            "runtime",
-            &format!("MarkReadSkipped channel_id={channel_id} reason=missing_token_scope"),
-        );
-    } else {
-        match api.mark_read(channel_id, latest_ts).await {
-            Ok(()) => crate::debug::log(
-                "runtime",
-                &format!("MarkRead channel_id={channel_id} ts={latest_ts}"),
-            ),
-            Err(error) => crate::debug::log(
-                "runtime",
-                &format!("MarkReadFailed channel_id={channel_id} ts={latest_ts} error={error:#}"),
-            ),
-        }
-    }
-
-    read_marks.insert(channel_id.to_string(), latest_ts.to_string());
-    publish_local_read_marker(
-        events,
-        workspace_store,
-        workspace,
-        channel_id,
-        latest_ts,
-        mode,
-    )
-    .await;
-}
-
-async fn publish_local_read_marker(
-    events: &RuntimeEventSender,
-    workspace_store: &Option<WorkspaceStore>,
-    workspace: &WorkspaceReducerAdapter,
-    channel_id: &str,
-    latest_ts: &str,
-    mode: ConversationReadMode,
-) {
-    let mutation = match mode {
-        ConversationReadMode::ThroughVisible => WorkspaceMutation::ReadAdvanced {
-            channel_id: channel_id.to_string(),
-            ts: latest_ts.to_string(),
-            remaining_unread: 0,
-        },
-        ConversationReadMode::All => WorkspaceMutation::ConversationReadAll {
-            channel_id: channel_id.to_string(),
-            ts: latest_ts.to_string(),
-        },
-    };
-    if let Err(error) = workspace
-        .apply_persisted_and_publish(
-            workspace_store.as_ref(),
-            events,
-            MutationOrigin::Local,
-            mutation,
-        )
-        .await
-    {
-        crate::debug::log(
-            "store",
-            &format!(
-                "ConversationReadStoreDeferred channel_id={channel_id} category={:?}",
-                error.category()
-            ),
-        );
-    }
 }
 
 fn workspace_store_id(auth: &AuthInfo) -> String {
@@ -9020,7 +8299,9 @@ mod tests {
 
     use super::*;
     use crate::slack::SlackMessageActionRequest;
-    use crate::workspace_pipeline::{MessageChange, StoreChange, WorkspaceChange};
+    use crate::workspace_pipeline::{
+        ConversationRefresh, MessageChange, StoreChange, WorkspaceChange,
+    };
 
     fn admission_request(session: u64, request: u64, command: RuntimeCommand) -> RuntimeRequest {
         RuntimeRequest::new(
@@ -9624,38 +8905,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_command_admission_never_coalesces_read_markers() {
-        let (sender, receiver) =
-            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::uniform(2, 2));
-        for request in 1..=2 {
-            assert_eq!(
-                sender.send(admission_request(
-                    1,
-                    request,
-                    RuntimeCommand::MarkConversationRead {
-                        channel_id: "C1".into(),
-                        ts: format!("{request}.0"),
-                    },
-                )),
-                RuntimeCommandAdmissionOutcome::Enqueued
-            );
-        }
-
-        let runtime = admission_test_runtime();
-        for request in 1..=2 {
-            let queued = runtime
-                .block_on(receiver.recv_lane(RuntimeTaskLane::Interactive))
-                .expect("read marker should remain queued");
-            assert_eq!(queued.request.identity.request, RequestId::new(request));
-        }
-        let snapshot = sender.snapshot();
-        assert_eq!(snapshot.admitted, 2);
-        assert_eq!(snapshot.dequeued, 2);
-        assert_eq!(snapshot.coalesced, 0);
-        assert_eq!(snapshot.superseded, 0);
-    }
-
-    #[test]
     fn runtime_command_admission_serializes_ordered_actions_per_target() {
         let runtime = admission_test_runtime();
         runtime.block_on(async {
@@ -10050,9 +9299,9 @@ mod tests {
             .try_send(admission_request(
                 1,
                 2,
-                RuntimeCommand::MarkConversationRead {
+                RuntimeCommand::SetConversationStarred {
                     channel_id: "C1".into(),
-                    ts: "2.0".into(),
+                    starred: true,
                 },
             ))
             .expect_err("older-session work must not enter after a newer session");
@@ -10062,7 +9311,7 @@ mod tests {
         );
         assert!(matches!(
             rejected.request.command,
-            RuntimeCommand::MarkConversationRead { .. }
+            RuntimeCommand::SetConversationStarred { .. }
         ));
     }
 
@@ -10729,7 +9978,6 @@ mod tests {
                 workspace: workspace.clone(),
                 current_user_id: None,
                 user_cache: Arc::new(Mutex::new(HashMap::new())),
-                read_marks: Arc::new(Mutex::new(HashMap::new())),
                 message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
                 conversation_star_sync: ConversationStarSyncGate::default(),
                 user_status_sync: UserStatusSync::default(),
@@ -10866,7 +10114,6 @@ mod tests {
                     workspace: workspace.clone(),
                     current_user_id: None,
                     user_cache: Arc::new(Mutex::new(HashMap::new())),
-                    read_marks: Arc::new(Mutex::new(HashMap::new())),
                     message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
                     conversation_star_sync: ConversationStarSyncGate::default(),
                     user_status_sync: UserStatusSync::default(),
@@ -11143,11 +10390,6 @@ mod tests {
                                 name: Some("one refreshed".into()),
                                 ..Default::default()
                             }),
-                            unread: Some(SlackConversationUnreadSnapshot {
-                                channel_id: "C1".into(),
-                                unread_state: SlackUnreadState::from_parts(true, true, 1),
-                                ..Default::default()
-                            }),
                         },
                     ),]),
                 )
@@ -11174,11 +10416,6 @@ mod tests {
                             metadata: Some(SlackConversation {
                                 id: "C2".into(),
                                 name: Some("two refreshed".into()),
-                                ..Default::default()
-                            }),
-                            unread: Some(SlackConversationUnreadSnapshot {
-                                channel_id: "C2".into(),
-                                unread_state: SlackUnreadState::from_parts(true, true, 2),
                                 ..Default::default()
                             }),
                         },
@@ -11211,7 +10448,8 @@ mod tests {
                     .iter()
                     .map(|patch| patch.changes().len())
                     .collect::<Vec<_>>(),
-                vec![2, 2]
+                vec![1, 1],
+                "a metadata-only refresh carries exactly one change per patch"
             );
             assert!(receiver.try_recv().is_err());
 
@@ -11221,225 +10459,11 @@ mod tests {
                 .find(|conversation| conversation.id == "C1")
                 .unwrap();
             assert_eq!(one.name.as_deref(), Some("one refreshed"));
-            assert_eq!(one.unread_activity_count(), 1);
             let two = stored
                 .iter()
                 .find(|conversation| conversation.id == "C2")
                 .unwrap();
             assert_eq!(two.name.as_deref(), Some("two refreshed"));
-            assert_eq!(two.unread_activity_count(), 2);
-        });
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn recovered_refresh_metadata_cannot_roll_back_a_canonical_local_read() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "conduit-conversation-refresh-local-read-recovery-{}-{nonce}",
-            std::process::id()
-        ));
-        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
-        let workspace = WorkspaceReducerAdapter::default();
-        let view = crate::workspace_state::WorkspaceSessionState::default();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let (sender, mut receiver) = runtime_event_channel();
-            let events = RuntimeEventSender::new(
-                sender,
-                RuntimeIdentity {
-                    session: SessionId::default().next(),
-                    request: RequestId::new(1),
-                },
-                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
-            );
-            let first = SlackConversation {
-                id: "C1".into(),
-                name: Some("one".into()),
-                is_channel: Some(true),
-                unread_count: Some(4),
-                extra: HashMap::from([
-                    ("has_unreads".into(), serde_json::json!(true)),
-                    ("last_read".into(), serde_json::json!("10.0")),
-                    ("latest".into(), serde_json::json!("15.0")),
-                ]),
-                ..Default::default()
-            };
-            let second = SlackConversation {
-                id: "C2".into(),
-                name: Some("two".into()),
-                is_channel: Some(true),
-                ..Default::default()
-            };
-            workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
-                        conversations: vec![first, second],
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
-            let bootstrap = receiver.recv().await.unwrap();
-            let RuntimeEventKind::WorkspacePatch(bootstrap) = bootstrap.kind else {
-                panic!("expected a typed bootstrap patch");
-            };
-            view.apply_workspace_patch(&bootstrap).unwrap();
-
-            let refresh_base = workspace.revision();
-            store
-                .install_conversation_batch_failure_trigger_for("C1")
-                .await
-                .unwrap();
-            assert!(workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::ConversationRefreshBatch(vec![SnapshotEnvelope::new(
-                        refresh_base,
-                        ConversationRefresh {
-                            metadata: Some(SlackConversation {
-                                id: "C1".into(),
-                                name: Some("one refreshed".into()),
-                                unread_count: Some(99),
-                                extra: HashMap::from([
-                                    ("last_read".into(), serde_json::json!("5.0")),
-                                    ("latest".into(), serde_json::json!("99.0")),
-                                    ("mention_count".into(), serde_json::json!(99)),
-                                    ("is_open".into(), serde_json::json!(false)),
-                                    (
-                                        crate::models::LOCAL_READ_TS_KEY.into(),
-                                        serde_json::json!("5.0"),
-                                    ),
-                                ]),
-                                ..Default::default()
-                            }),
-                            unread: Some(SlackConversationUnreadSnapshot {
-                                channel_id: "C1".into(),
-                                unread_state: SlackUnreadState::from_parts(true, true, 9),
-                                last_read: Some("11.0".into()),
-                                latest: Some("19.0".into()),
-                                mention_count: Some(3),
-                                is_open: Some(false),
-                            }),
-                        },
-                    )]),
-                )
-                .await
-                .is_err());
-            assert!(receiver.try_recv().is_err());
-
-            store
-                .clear_conversation_batch_failure_trigger()
-                .await
-                .unwrap();
-            let workspace_store = Some(store.clone());
-            publish_local_read_marker(
-                &events,
-                &workspace_store,
-                &workspace,
-                "C1",
-                "20.0",
-                ConversationReadMode::All,
-            )
-            .await;
-            view.conversations
-                .borrow_mut()
-                .advance_read_cursor("C1", "20.0", 0);
-            let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
-            let before_recovery = store.load_conversations().await.unwrap().unwrap();
-            let before_recovery = before_recovery
-                .iter()
-                .find(|conversation| conversation.id == "C1")
-                .unwrap();
-            assert_eq!(before_recovery.unread_activity_count(), 0);
-            assert_eq!(before_recovery.last_read_ts(), Some("20.0"));
-            assert_eq!(before_recovery.local_read_ts(), Some("20.0"));
-
-            workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::Local,
-                    WorkspaceMutation::ConversationStarChanged {
-                        channel_id: "C2".into(),
-                        starred: true,
-                    },
-                )
-                .await
-                .unwrap();
-
-            let recovered = receiver.recv().await.unwrap();
-            let read = receiver.recv().await.unwrap();
-            let following = receiver.recv().await.unwrap();
-            let patches = [recovered, read, following]
-                .into_iter()
-                .map(|event| match event.kind {
-                    RuntimeEventKind::WorkspacePatch(patch) => patch,
-                    other => panic!("expected a typed workspace patch, got {other:?}"),
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(patches[0].changes().len(), 2);
-            assert!(matches!(
-                patches[0].changes(),
-                [
-                    WorkspaceChange::ConversationMetadataUpsert(metadata),
-                    WorkspaceChange::UnreadChanged { snapshot },
-                ] if metadata.name.as_deref() == Some("one refreshed")
-                    && snapshot.channel_id == "C1"
-            ));
-            let recovered_application = view
-                .apply_workspace_patch_with_local_reads(&patches[0], &local_reads)
-                .unwrap();
-            assert!(
-                recovered_application.conversation_changed(),
-                "ordinary refreshed metadata should still render"
-            );
-            for patch in &patches[1..] {
-                view.apply_workspace_patch_with_local_reads(patch, &local_reads)
-                    .unwrap();
-            }
-            assert!(receiver.try_recv().is_err());
-
-            {
-                let conversations = view.conversations.borrow();
-                let current = conversations.get("C1").unwrap();
-                assert_eq!(current.name.as_deref(), Some("one refreshed"));
-                assert_eq!(current.unread_activity_count(), 0);
-                assert_eq!(current.last_read_ts(), Some("20.0"));
-                assert_eq!(current.latest_message_ts(), Some("19.0"));
-            }
-            let stored = store.load_conversations().await.unwrap().unwrap();
-            let stored = stored
-                .iter()
-                .find(|conversation| conversation.id == "C1")
-                .unwrap();
-            assert_eq!(stored.name.as_deref(), Some("one refreshed"));
-            assert_eq!(stored.unread_activity_count(), 0);
-            assert_eq!(stored.last_read_ts(), Some("20.0"));
-            assert_eq!(stored.local_read_ts(), Some("20.0"));
-            let coordinated = workspace
-                .coordinator
-                .lock()
-                .unwrap()
-                .conversation("C1")
-                .cloned()
-                .unwrap();
-            assert_eq!(coordinated.name.as_deref(), Some("one refreshed"));
-            assert_eq!(coordinated.unread_activity_count(), 0);
-            assert_eq!(coordinated.last_read_ts(), Some("20.0"));
-            assert_eq!(coordinated.local_read_ts(), Some("20.0"));
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -11505,8 +10529,6 @@ mod tests {
                             id: "C1".into(),
                             name: Some("general".into()),
                             is_channel: Some(true),
-                            unread_count: Some(0),
-                            extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
                             ..Default::default()
                         }],
                         histories: HashMap::from([(
@@ -11595,18 +10617,11 @@ mod tests {
             };
             assert!(matches!(
                 patch.changes(),
-                [
-                    WorkspaceChange::TimelineChanged { changes, .. },
-                    WorkspaceChange::ConversationAttentionObserved {
-                        channel_id,
-                        observations,
-                    },
-                ] if matches!(
+                [WorkspaceChange::TimelineChanged { changes, .. }] if matches!(
                     changes.as_slice(),
                     [crate::workspace_pipeline::MessageChange::Upsert(message)]
                         if message.ts == new_message.ts
-                ) && channel_id == "C1"
-                    && observations.iter().any(|item| item.message_ts == new_message.ts)
+                )
             ));
             assert!(
                 receiver.try_recv().is_err(),
@@ -11635,7 +10650,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_history_failure_withholds_completion_and_fresh_history_recovers_fifo() {
+    fn cached_history_is_durable_already_and_fresh_history_publishes_fifo() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -11676,7 +10691,6 @@ mod tests {
                         conversations: vec![SlackConversation {
                             id: "C1".into(),
                             is_channel: Some(true),
-                            extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -11699,12 +10713,7 @@ mod tests {
                 .store_history("C1", std::slice::from_ref(&cached))
                 .await
                 .unwrap();
-            store
-                .install_conversation_batch_failure_trigger_for("C1")
-                .await
-                .unwrap();
-
-            assert!(publish_history_snapshot_with_completion(
+            let cached_reductions = publish_history_snapshot_with_completion(
                 &events,
                 &Some(store.clone()),
                 &workspace,
@@ -11719,16 +10728,21 @@ mod tests {
                 true,
             )
             .await
-            .is_err());
+            .unwrap();
             assert!(
-                receiver.try_recv().is_err(),
-                "failed cache attention durability must withhold patch and completion"
+                cached_reductions
+                    .iter()
+                    .all(|reduction| reduction.store_batch().is_none()),
+                "a cached page is already durable and must not write back to the store"
             );
-
-            store
-                .clear_conversation_batch_failure_trigger()
-                .await
-                .unwrap();
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::WorkspacePatch(_)
+            ));
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::HistoryLoadCompleted { cached: true, .. }
+            ));
             let fresh_base = workspace.revision();
             let fresh = SlackMessage {
                 ts: "2.0".into(),
@@ -11753,25 +10767,13 @@ mod tests {
             .await
             .unwrap();
 
-            assert_eq!(reductions.len(), 2);
+            assert_eq!(reductions.len(), 1);
             assert!(matches!(
                 reductions[0].store_batch().unwrap().changes(),
-                [StoreChange::ConversationAttentionObserved { .. }]
+                [StoreChange::HistoryDelta { .. }]
             ));
-            assert!(matches!(
-                reductions[1].store_batch().unwrap().changes(),
-                [
-                    StoreChange::HistoryDelta { .. },
-                    StoreChange::ConversationAttentionObserved { .. },
-                ]
-            ));
-            let recovered_patch = receiver.recv().await.unwrap();
             let fresh_patch = receiver.recv().await.unwrap();
             let completion = receiver.recv().await.unwrap();
-            assert!(matches!(
-                recovered_patch.kind,
-                RuntimeEventKind::WorkspacePatch(_)
-            ));
             assert!(matches!(
                 fresh_patch.kind,
                 RuntimeEventKind::WorkspacePatch(_)
@@ -11784,7 +10786,7 @@ mod tests {
                 cached: completion_cached,
             } = completion.kind
             else {
-                panic!("fresh completion must follow both FIFO patches");
+                panic!("fresh completion must follow its patch");
             };
             assert_eq!(channel_id, "C1");
             assert!(has_more);
@@ -11856,7 +10858,6 @@ mod tests {
                         conversations: vec![SlackConversation {
                             id: "C1".into(),
                             is_channel: Some(true),
-                            extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
                             ..Default::default()
                         }],
                         histories: HashMap::from([("C1".into(), vec![initial])]),
@@ -11892,7 +10893,7 @@ mod tests {
             let page = vec![newer.clone(), normal_reply, older.clone()];
             let base_revision = workspace.revision();
             store
-                .install_conversation_batch_failure_trigger_for("C1")
+                .install_history_batch_failure_trigger_for("C1")
                 .await
                 .unwrap();
             assert!(publish_history_snapshot_with_completion(
@@ -11925,7 +10926,7 @@ mod tests {
                     .map(|message| message.ts.as_str())
                     .collect::<Vec<_>>(),
                 vec!["3.0"],
-                "history and attention must roll back in the same transaction"
+                "a failed history write must roll back inside its transaction"
             );
             let stored_conversation = store
                 .load_conversations()
@@ -11935,12 +10936,8 @@ mod tests {
                 .into_iter()
                 .find(|conversation| conversation.id == "C1")
                 .unwrap();
-            assert!(!stored_conversation.has_observed_attention_message("2.0"));
-            assert!(!stored_conversation.has_observed_attention_message("1.0"));
-            store
-                .clear_conversation_batch_failure_trigger()
-                .await
-                .unwrap();
+            assert_eq!(stored_conversation.id, "C1");
+            store.clear_history_batch_failure_trigger().await.unwrap();
 
             let reductions = publish_history_snapshot_with_completion(
                 &events,
@@ -11962,10 +10959,7 @@ mod tests {
             assert_eq!(reductions.len(), 1);
             assert!(matches!(
                 reductions[0].store_batch().unwrap().changes(),
-                [
-                    StoreChange::HistoryDelta { .. },
-                    StoreChange::ConversationAttentionObserved { .. },
-                ]
+                [StoreChange::HistoryDelta { .. }]
             ));
             assert!(matches!(
                 receiver.recv().await.unwrap().kind,
@@ -12050,7 +11044,6 @@ mod tests {
                         conversations: vec![SlackConversation {
                             id: "C1".into(),
                             is_channel: Some(true),
-                            extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -12148,8 +11141,7 @@ mod tests {
                 .into_iter()
                 .find(|conversation| conversation.id == "C1")
                 .unwrap();
-            assert!(stored_conversation.has_observed_attention_message("1.0"));
-            assert_eq!(stored_conversation.unread_activity_count(), 1);
+            assert_eq!(stored_conversation.id, "C1");
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -12376,416 +11368,6 @@ mod tests {
                     ("1.0", "authoritative edit".into()),
                 ]
             );
-        });
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn recovered_history_and_message_attention_remain_read_and_publish_in_revision_order() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "conduit-history-attention-recovery-{}-{nonce}",
-            std::process::id()
-        ));
-        let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-        let workspace = WorkspaceReducerAdapter::default();
-        workspace.update_attention_context(WorkspaceAttentionContext {
-            current_user_id: Some("U_SELF".into()),
-        });
-        let view = crate::workspace_state::WorkspaceSessionState::default();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let (sender, mut receiver) = runtime_event_channel();
-            let events = RuntimeEventSender::new(
-                sender,
-                RuntimeIdentity {
-                    session: SessionId::default().next(),
-                    request: RequestId::new(1),
-                },
-                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
-            );
-            let initial_message = SlackMessage {
-                ts: "10.0".into(),
-                user: Some("U_OTHER".into()),
-                text: Some("initial".into()),
-                ..Default::default()
-            };
-            workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
-                        conversations: vec![SlackConversation {
-                            id: "C1".into(),
-                            name: Some("general".into()),
-                            is_channel: Some(true),
-                            is_starred: Some(true),
-                            unread_count: Some(2),
-                            extra: HashMap::from([
-                                ("has_unreads".into(), serde_json::json!(true)),
-                                ("last_read".into(), serde_json::json!("10.0")),
-                                ("latest".into(), serde_json::json!("15.0")),
-                                ("topic".into(), serde_json::json!("Keep me")),
-                            ]),
-                            ..Default::default()
-                        }],
-                        histories: HashMap::from([("C1".into(), vec![initial_message.clone()])]),
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
-            let bootstrap = receiver.recv().await.unwrap();
-            let RuntimeEventKind::WorkspacePatch(bootstrap) = bootstrap.kind else {
-                panic!("expected a typed bootstrap patch");
-            };
-            view.apply_workspace_patch(&bootstrap).unwrap();
-
-            store
-                .install_conversation_batch_failure_trigger_for("C1")
-                .await
-                .unwrap();
-            let history_base = workspace.revision();
-            let history_message = SlackMessage {
-                ts: "11.0".into(),
-                user: Some("U_OTHER".into()),
-                text: Some("history attention".into()),
-                ..Default::default()
-            };
-            assert!(publish_prefetched_history_snapshot(
-                &events,
-                &Some(store.clone()),
-                &workspace,
-                "C1",
-                history_base,
-                vec![initial_message, history_message],
-            )
-            .await
-            .is_err());
-            assert!(receiver.try_recv().is_err());
-            assert_eq!(
-                store
-                    .load_history("C1")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .iter()
-                    .map(|message| message.ts.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["10.0"],
-                "the failed history and attention batch must roll back together"
-            );
-
-            let posted_message = SlackMessage {
-                ts: "12.0".into(),
-                user: Some("U_OTHER".into()),
-                text: Some("posted attention".into()),
-                ..Default::default()
-            };
-            assert!(workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::Realtime,
-                    WorkspaceMutation::MessageChanged {
-                        channel_id: "C1".into(),
-                        message: posted_message,
-                        kind: MessageMutationKind::Posted,
-                        origin: MutationOrigin::Realtime,
-                    },
-                )
-                .await
-                .is_err());
-            assert!(receiver.try_recv().is_err());
-
-            let after_cursor_message = SlackMessage {
-                ts: "21.0".into(),
-                user: Some("U_OTHER".into()),
-                text: Some("must remain unread after recovery".into()),
-                ..Default::default()
-            };
-            assert!(workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::Realtime,
-                    WorkspaceMutation::MessageChanged {
-                        channel_id: "C1".into(),
-                        message: after_cursor_message,
-                        kind: MessageMutationKind::Posted,
-                        origin: MutationOrigin::Realtime,
-                    },
-                )
-                .await
-                .is_err());
-            assert!(receiver.try_recv().is_err());
-
-            store
-                .clear_conversation_batch_failure_trigger()
-                .await
-                .unwrap();
-            let recovered = workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::Local,
-                    WorkspaceMutation::ReadAdvanced {
-                        channel_id: "C1".into(),
-                        ts: "20.0".into(),
-                        remaining_unread: 0,
-                    },
-                )
-                .await
-                .unwrap();
-            view.conversations
-                .borrow_mut()
-                .advance_read_cursor("C1", "20.0", 0);
-            let local_reads = HashMap::from([("C1".to_string(), "20.0".to_string())]);
-            assert_eq!(
-                recovered
-                    .iter()
-                    .map(|reduction| reduction.patch().revision().value())
-                    .collect::<Vec<_>>(),
-                vec![
-                    history_base.successor().value(),
-                    history_base.successor().successor().value(),
-                    history_base.successor().successor().successor().value(),
-                    history_base
-                        .successor()
-                        .successor()
-                        .successor()
-                        .successor()
-                        .value(),
-                ]
-            );
-            assert_eq!(
-                recovered
-                    .iter()
-                    .map(|reduction| reduction.effects().len())
-                    .collect::<Vec<_>>(),
-                vec![1, 1, 1, 0],
-                "effects from every recovered reduction must remain ordered"
-            );
-
-            let delivered = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
-            assert_eq!(delivered.len(), 4);
-            let patches = delivered
-                .into_iter()
-                .map(|event| match event.kind {
-                    RuntimeEventKind::WorkspacePatch(patch) => patch,
-                    other => panic!("expected only typed workspace patches, got {other:?}"),
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                patches
-                    .iter()
-                    .map(|patch| patch.revision().value())
-                    .collect::<Vec<_>>(),
-                recovered
-                    .iter()
-                    .map(|reduction| reduction.patch().revision().value())
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                patches
-                    .iter()
-                    .filter_map(|patch| {
-                        patch.changes().iter().find_map(|change| match change {
-                            WorkspaceChange::ConversationAttentionObserved {
-                                observations, ..
-                            } => observations
-                                .first()
-                                .map(|observation| observation.message_ts.as_str()),
-                            _ => None,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                vec!["11.0", "12.0", "21.0"]
-            );
-            for patch in &patches {
-                view.apply_workspace_patch_with_local_reads(patch, &local_reads)
-                    .unwrap();
-            }
-
-            let view_current = view.conversations.borrow().get("C1").cloned().unwrap();
-            let stored_current = store
-                .load_conversations()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_iter()
-                .find(|conversation| conversation.id == "C1")
-                .unwrap();
-            let coordinator_current = workspace
-                .coordinator
-                .lock()
-                .unwrap()
-                .conversation("C1")
-                .cloned()
-                .unwrap();
-            for current in [view_current, stored_current, coordinator_current] {
-                assert_eq!(current.name.as_deref(), Some("general"));
-                assert!(current.is_starred());
-                assert_eq!(current.raw_unread_activity_count(), 0);
-                assert_eq!(current.unread_activity_count(), 1);
-                assert!(current.has_unread_activity());
-                assert_eq!(current.last_read_ts(), Some("20.0"));
-                assert_eq!(
-                    current.extra.get("topic"),
-                    Some(&serde_json::json!("Keep me"))
-                );
-            }
-            assert_eq!(
-                store
-                    .load_conversations()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .into_iter()
-                    .find(|conversation| conversation.id == "C1")
-                    .unwrap()
-                    .local_read_ts(),
-                Some("20.0")
-            );
-        });
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn local_read_marker_admission_precedes_cursorless_refresh() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "conduit-local-read-refresh-admission-{}-{nonce}",
-            std::process::id()
-        ));
-        let store = WorkspaceStore::new(directory.clone(), "T1:U1");
-        let workspace = WorkspaceReducerAdapter::default();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let initial = SlackConversation {
-                id: "C1".into(),
-                unread_count: Some(4),
-                extra: HashMap::from([
-                    ("has_unreads".into(), serde_json::json!(true)),
-                    ("latest".into(), serde_json::json!("20.0")),
-                ]),
-                ..Default::default()
-            };
-            store
-                .store_conversations(std::slice::from_ref(&initial))
-                .await
-                .unwrap();
-            workspace
-                .apply(
-                    MutationOrigin::Cache,
-                    WorkspaceMutation::Hydrate(WorkspaceBootstrapData {
-                        conversations: vec![initial],
-                        ..Default::default()
-                    }),
-                )
-                .unwrap();
-
-            let (sender, mut receiver) = runtime_event_channel();
-            let events = RuntimeEventSender::new(
-                sender,
-                RuntimeIdentity {
-                    session: SessionId::default().next(),
-                    request: RequestId::new(1),
-                },
-                OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
-            );
-
-            let admission = workspace.store_batch_admission.lock().await;
-            let workspace_store = Some(store.clone());
-            let local_read = publish_local_read_marker(
-                &events,
-                &workspace_store,
-                &workspace,
-                "C1",
-                "20.0",
-                ConversationReadMode::All,
-            );
-            tokio::pin!(local_read);
-            assert!(matches!(
-                futures_util::poll!(&mut local_read),
-                std::task::Poll::Pending
-            ));
-            assert_eq!(
-                workspace
-                    .coordinator
-                    .lock()
-                    .unwrap()
-                    .conversation("C1")
-                    .unwrap()
-                    .local_read_ts(),
-                None
-            );
-            let before_release = store.load_conversations().await.unwrap().unwrap();
-            assert_eq!(before_release[0].local_read_ts(), None);
-            assert_eq!(before_release[0].unread_activity_count(), 4);
-
-            drop(admission);
-            local_read.await;
-            assert!(matches!(
-                receiver.recv().await.unwrap().kind,
-                RuntimeEventKind::WorkspacePatch(_)
-            ));
-            assert_eq!(
-                workspace
-                    .coordinator
-                    .lock()
-                    .unwrap()
-                    .conversation("C1")
-                    .unwrap()
-                    .local_read_ts(),
-                Some("20.0")
-            );
-            let persisted = store.load_conversations().await.unwrap().unwrap();
-            assert_eq!(persisted[0].local_read_ts(), Some("20.0"));
-            assert_eq!(persisted[0].unread_activity_count(), 0);
-
-            let base_revision = workspace.revision();
-            let reductions = workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &events,
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::ConversationRefreshBatch(vec![SnapshotEnvelope::new(
-                        base_revision,
-                        ConversationRefresh {
-                            metadata: None,
-                            unread: Some(SlackConversationUnreadSnapshot {
-                                channel_id: "C1".into(),
-                                unread_state: SlackUnreadState::from_parts(true, true, 7),
-                                latest: Some("30.0".into()),
-                                ..Default::default()
-                            }),
-                        },
-                    )]),
-                )
-                .await
-                .unwrap();
-            assert!(reductions.is_empty());
-            assert_eq!(workspace.revision(), base_revision);
-            assert!(receiver.try_recv().is_err());
-            let persisted = store.load_conversations().await.unwrap().unwrap();
-            assert_eq!(persisted[0].local_read_ts(), Some("20.0"));
-            assert_eq!(persisted[0].unread_activity_count(), 0);
         });
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -13577,7 +12159,6 @@ mod tests {
             .is_some());
         let metrics = workspace.attention_metrics_snapshot();
         assert_eq!(metrics.committed_decisions, 1);
-        assert_eq!(metrics.unread_decisions, 1);
         assert_eq!(metrics.notification_candidates, 1);
         assert_eq!(metrics.reason_count(AttentionReason::DirectMessage), 1);
         assert_eq!(metrics.origin_count(MutationOrigin::Realtime), 1);
@@ -13638,7 +12219,10 @@ mod tests {
             })
             .next();
 
-        assert!(live_attention.is_some_and(|effect| effect.decision.record_unread));
+        assert!(
+            live_attention.is_some_and(|effect| !effect.decision.send_notification),
+            "the live decision must honour the preference change, not the stale preview"
+        );
         assert!(claimed_notification_candidate(true, live_attention).is_none());
     }
 
@@ -13924,7 +12508,10 @@ mod tests {
         let slash_fields = RuntimeTraceFields::for_command(identity, &slash);
         assert_eq!(slash_fields.session, identity.session);
         assert_eq!(slash_fields.request, identity.request);
-        assert_eq!(slash_fields.operation, RuntimeOperation::ExecuteSlashCommand);
+        assert_eq!(
+            slash_fields.operation,
+            RuntimeOperation::ExecuteSlashCommand
+        );
         assert_eq!(slash_fields.target, "message:C123:123.456");
         assert!(!format!("{slash_fields:?}").contains("do not trace slash argument"));
     }
@@ -15278,163 +13865,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_attention_flushes_pending_read_before_notification_acceptance() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build test runtime");
-
-        runtime.block_on(async {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let directory = std::env::temp_dir().join(format!(
-                "conduit-realtime-attention-authority-{}-{nonce}",
-                std::process::id()
-            ));
-            let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let conversation = SlackConversation {
-                id: "D1".into(),
-                is_im: Some(true),
-                extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
-                ..Default::default()
-            };
-            store
-                .store_conversations(std::slice::from_ref(&conversation))
-                .await
-                .unwrap();
-            let workspace = WorkspaceReducerAdapter::default();
-            workspace.update_attention_context(WorkspaceAttentionContext {
-                current_user_id: Some("U_SELF".into()),
-            });
-            workspace.apply(
-                MutationOrigin::Cache,
-                WorkspaceMutation::ConversationUpsert(conversation),
-            );
-
-            let (runtime_events, mut runtime_receiver) = runtime_event_channel();
-            let event_sender = RuntimeEventSender::new(
-                runtime_events,
-                RuntimeIdentity {
-                    session: SessionId::default().next(),
-                    request: RequestId::new(1),
-                },
-                OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
-            );
-            store
-                .install_conversation_batch_failure_trigger_for("D1")
-                .await
-                .unwrap();
-            assert!(workspace
-                .apply_persisted_and_publish(
-                    Some(&store),
-                    &event_sender,
-                    MutationOrigin::Local,
-                    WorkspaceMutation::ReadAdvanced {
-                        channel_id: "D1".into(),
-                        ts: "20.0".into(),
-                        remaining_unread: 0,
-                    },
-                )
-                .await
-                .is_err());
-            assert!(runtime_receiver.try_recv().is_err());
-            store
-                .clear_conversation_batch_failure_trigger()
-                .await
-                .unwrap();
-
-            let (sender, receiver) =
-                realtime_persistence_channel(workspace.attention_metrics_handle());
-            let worker = tokio::spawn(persist_realtime_events(
-                receiver,
-                store.clone(),
-                Some("U_SELF".into()),
-                event_sender,
-                workspace.clone(),
-                UserStatusSync::default(),
-            ));
-            sender
-                .send(RealtimePersistenceEvent::Message {
-                    event: Box::new(crate::socket_mode::SocketModeMessageEvent {
-                        channel_id: "D1".into(),
-                        message: SlackMessage {
-                            ts: "10.0".into(),
-                            user: Some("U_OTHER".into()),
-                            text: Some("already read".into()),
-                            ..Default::default()
-                        },
-                        kind: SocketModeMessageKind::Posted,
-                    }),
-                })
-                .await
-                .unwrap();
-            drop(sender);
-            worker.await.unwrap();
-
-            let delivered = std::iter::from_fn(|| runtime_receiver.try_recv().ok())
-                .map(|event| event.kind)
-                .collect::<Vec<_>>();
-            assert!(
-                matches!(
-                    delivered.first(),
-                    Some(RuntimeEventKind::WorkspacePatch(patch))
-                        if matches!(
-                            patch.changes(),
-                            [WorkspaceChange::ConversationUpsert(conversation)]
-                                if conversation.last_read_ts() == Some("20.0")
-                                    && conversation.local_read_ts() == Some("20.0")
-                        )
-                ),
-                "the pending read patch must publish before the current message patch"
-            );
-            assert!(delivered.iter().any(|event| matches!(
-                event,
-                RuntimeEventKind::WorkspacePatch(patch)
-                    if timeline_patch_summary(patch.changes())
-                        == [("10.0".into(), Some("already read".into()))]
-            )));
-            assert!(!delivered.iter().any(|event| matches!(
-                event,
-                RuntimeEventKind::AttentionNotificationCandidate { .. }
-            )));
-            let metrics = workspace.attention_metrics_snapshot();
-            assert_eq!(
-                metrics.persistence_count(AttentionPersistenceOutcome::AtOrBeforeReadCursor),
-                1
-            );
-            assert_eq!(
-                metrics.persistence_count(AttentionPersistenceOutcome::Accepted),
-                0
-            );
-            assert_eq!(
-                store
-                    .load_history("D1")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .iter()
-                    .map(|message| message.ts.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["10.0"]
-            );
-            let persisted_conversation = store
-                .load_conversations()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_iter()
-                .find(|conversation| conversation.id == "D1")
-                .unwrap();
-            assert_eq!(persisted_conversation.local_read_ts(), Some("20.0"));
-            assert_eq!(persisted_conversation.unread_activity_count(), 0);
-            let _ = std::fs::remove_dir_all(directory);
-        });
-    }
-
-    #[test]
-    fn socket_recovery_failure_skips_claim_and_queues_delta_behind_pending_read() {
+    fn socket_recovery_failure_skips_claim_and_queues_delta_behind_pending_write() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -15453,7 +13884,6 @@ mod tests {
             let conversation = SlackConversation {
                 id: "D1".into(),
                 is_im: Some(true),
-                extra: HashMap::from([("last_read".into(), serde_json::json!("0.0"))]),
                 ..Default::default()
             };
             store
@@ -15487,10 +13917,9 @@ mod tests {
                     Some(&store),
                     &events,
                     MutationOrigin::Local,
-                    WorkspaceMutation::ReadAdvanced {
+                    WorkspaceMutation::ConversationStarChanged {
                         channel_id: "D1".into(),
-                        ts: "20.0".into(),
-                        remaining_unread: 0,
+                        starred: true,
                     },
                 )
                 .await
@@ -15613,32 +14042,24 @@ mod tests {
             drop(sender);
             worker.await.unwrap();
 
-            let recovered_read = runtime_receiver.recv().await.unwrap();
+            let recovered_star = runtime_receiver.recv().await.unwrap();
             let recovered_stale_message = runtime_receiver.recv().await.unwrap();
             let recovered_new_message = runtime_receiver.recv().await.unwrap();
             let current_patch = runtime_receiver.recv().await.unwrap();
             let (
-                RuntimeEventKind::WorkspacePatch(read_patch),
+                RuntimeEventKind::WorkspacePatch(star_patch),
                 RuntimeEventKind::WorkspacePatch(stale_message_patch),
                 RuntimeEventKind::WorkspacePatch(new_message_patch),
             ) = (
-                recovered_read.kind,
+                recovered_star.kind,
                 recovered_stale_message.kind,
                 recovered_new_message.kind,
             )
             else {
-                panic!("older read and both message patches must recover first");
+                panic!("the older star change and both message patches must recover first");
             };
-            assert!(read_patch.revision() < stale_message_patch.revision());
+            assert!(star_patch.revision() < stale_message_patch.revision());
             assert!(stale_message_patch.revision() < new_message_patch.revision());
-            assert!(new_message_patch.changes().iter().any(|change| matches!(
-                change,
-                WorkspaceChange::ConversationAttentionObserved {
-                    channel_id,
-                    observations,
-                } if channel_id == "D1"
-                    && observations.iter().any(|observation| observation.message_ts == "30.0")
-            )));
             assert!(
                 matches!(current_patch.kind, RuntimeEventKind::WorkspacePatch(patch)
                 if timeline_patch_summary(patch.changes())
@@ -15654,10 +14075,7 @@ mod tests {
                 .into_iter()
                 .find(|conversation| conversation.id == "D1")
                 .unwrap();
-            assert_eq!(persisted_conversation.local_read_ts(), Some("20.0"));
-            assert!(!persisted_conversation.has_observed_attention_message("10.0"));
-            assert!(persisted_conversation.has_observed_attention_message("30.0"));
-            assert_eq!(persisted_conversation.unread_activity_count(), 1);
+            assert_eq!(persisted_conversation.is_starred, Some(true));
             assert_eq!(
                 store
                     .load_history("D1")
@@ -15972,10 +14390,6 @@ mod tests {
                         .any(|(message_ts, body)| {
                             message_ts == "2.0" && body.as_deref() == Some("reply")
                         })
-                    && patch.changes().iter().any(|change| matches!(
-                        change,
-                        WorkspaceChange::ConversationAttentionObserved { .. }
-                    ))
             ));
             let _ = std::fs::remove_dir_all(directory);
         });
@@ -16102,9 +14516,8 @@ mod tests {
                     .lock()
                     .expect("workspace coordinator lock poisoned")
                     .conversation("D1")
-                    .unwrap()
-                    .unread_activity_count(),
-                1
+                    .map(|conversation| conversation.id.clone()),
+                Some("D1".to_string())
             );
             let delivered = std::iter::from_fn(|| runtime_receiver.try_recv().ok())
                 .map(|event| event.kind)
@@ -16114,11 +14527,6 @@ mod tests {
                 RuntimeEventKind::WorkspacePatch(patch)
                     if timeline_patch_summary(patch.changes())
                         == [("3.0".into(), Some("queue fallback".into()))]
-                        && patch.changes().iter().any(|change| matches!(
-                            change,
-                            WorkspaceChange::ConversationAttentionObserved { observations, .. }
-                                if observations.iter().any(|observation| observation.record_unread)
-                        ))
             )));
             assert!(delivered.iter().any(|event| matches!(
                 event,
@@ -16462,10 +14870,7 @@ mod tests {
             assert_eq!(thread.len(), 1);
             assert_eq!(thread[0].ts, "3.0");
             let conversation = store.load_conversations().await.unwrap().unwrap().remove(0);
-            // The thread reply ("3.0") doesn't belong in the channel's own
-            // timeline, so it contributes to the thread's unread state
-            // (checked above) but not the channel-level ambient count.
-            assert_eq!(conversation.unread_activity_count(), 2);
+            assert_eq!(conversation.id, "C1");
             let _ = std::fs::remove_dir_all(directory);
         });
     }
@@ -16687,7 +15092,7 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-            assert_eq!(conversation.unread_activity_count(), 1);
+            assert_eq!(conversation.id, "D1");
             let _ = std::fs::remove_dir_all(directory);
         });
     }
@@ -16777,9 +15182,8 @@ mod tests {
                     .lock()
                     .expect("workspace coordinator lock poisoned")
                     .conversation("D1")
-                    .unwrap()
-                    .unread_activity_count(),
-                1
+                    .map(|conversation| conversation.id.clone()),
+                Some("D1".to_string())
             );
             {
                 let pending = workspace
@@ -16795,16 +15199,6 @@ mod tests {
                         message,
                         kind: MessageMutationKind::Posted,
                     } if channel_id == "D1" && message.ts == "1.0"
-                )));
-                assert!(changes.iter().any(|change| matches!(
-                    change,
-                    StoreChange::ConversationAttentionObserved {
-                        channel_id,
-                        observations,
-                    } if channel_id == "D1"
-                        && observations.iter().any(|observation| {
-                            observation.message_ts == "1.0" && observation.record_unread
-                        })
                 )));
             }
             let event = receiver.recv().await.unwrap();
@@ -17008,7 +15402,6 @@ mod tests {
                 .attention_metrics_snapshot()
                 .delta_since(&baseline);
             assert_eq!(metrics.committed_decisions, 1_000);
-            assert_eq!(metrics.unread_decisions, 900);
             assert_eq!(metrics.notification_candidates, 500);
             assert_eq!(
                 metrics.reason_count(AttentionReason::MembershipLifecycle),
@@ -17023,10 +15416,6 @@ mod tests {
             assert_eq!(
                 metrics.persistence_count(AttentionPersistenceOutcome::AlreadyObserved),
                 200
-            );
-            assert_eq!(
-                metrics.persistence_count(AttentionPersistenceOutcome::AtOrBeforeReadCursor),
-                0
             );
             assert_eq!(metrics.notification_claims, 500);
             assert_eq!(metrics.queue_enqueued, 1_200);
@@ -17046,216 +15435,11 @@ mod tests {
             assert!(event_metrics.peak_depth <= RUNTIME_EVENT_QUEUE_CAPACITY);
             assert_eq!(event_metrics.dropped_progress, 0);
 
-            let before_reconciliation = workspace
-                .coordinator
-                .lock()
-                .expect("workspace coordinator lock poisoned")
-                .conversation("C1")
-                .unwrap()
-                .unread_activity_count();
-            assert_eq!(before_reconciliation, 700);
-            assert!(workspace
-                .apply(
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::HistorySnapshot {
-                        channel_id: "C1".into(),
-                        snapshot: SnapshotEnvelope::new(
-                            workspace.revision(),
-                            crate::workspace_pipeline::MessagePage {
-                                messages: channel_messages,
-                                complete: false,
-                                ..Default::default()
-                            },
-                        ),
-                    },
-                )
-                .is_none());
-            assert!(workspace
-                .apply(
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::HistorySnapshot {
-                        channel_id: "D1".into(),
-                        snapshot: SnapshotEnvelope::new(
-                            workspace.revision(),
-                            crate::workspace_pipeline::MessagePage {
-                                messages: direct_messages,
-                                complete: false,
-                                ..Default::default()
-                            },
-                        ),
-                    },
-                )
-                .is_none());
-            assert!(workspace
-                .apply(
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::ThreadSnapshot {
-                        channel_id: "C1".into(),
-                        thread_ts: "0.000001".into(),
-                        snapshot: SnapshotEnvelope::new(
-                            workspace.revision(),
-                            crate::workspace_pipeline::MessagePage {
-                                messages: thread_messages,
-                                complete: false,
-                                ..Default::default()
-                            },
-                        ),
-                    },
-                )
-                .is_none());
-            let raw_snapshot_base = workspace.revision();
-            workspace.apply(
-                MutationOrigin::WebApi,
-                WorkspaceMutation::UnreadChanged {
-                    snapshot: SlackConversationUnreadSnapshot {
-                        channel_id: "C1".into(),
-                        unread_state: SlackUnreadState::from_parts(true, true, 9_999),
-                        ..Default::default()
-                    },
-                    base_revision: raw_snapshot_base,
-                },
-            );
-            {
-                let coordinator = workspace
-                    .coordinator
-                    .lock()
-                    .expect("workspace coordinator lock poisoned");
-                let channel = coordinator.conversation("C1").unwrap();
-                assert_eq!(channel.raw_unread_activity_count(), 9_999);
-                assert_eq!(channel.unread_activity_count(), 700);
-                assert_eq!(
-                    coordinator
-                        .conversation("D1")
-                        .unwrap()
-                        .unread_activity_count(),
-                    200
-                );
-            }
-
-            let reopened_store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            let persisted = reopened_store.load_conversations().await.unwrap().unwrap();
-            assert_eq!(
-                persisted
-                    .iter()
-                    .find(|conversation| conversation.id == "C1")
-                    .unwrap()
-                    .unread_activity_count(),
-                700
-            );
-            assert_eq!(
-                persisted
-                    .iter()
-                    .find(|conversation| conversation.id == "D1")
-                    .unwrap()
-                    .unread_activity_count(),
-                200
-            );
-
             eprintln!(
                 "attention_realtime_burst ingress=1200 unique=1000 drain_ms={drain_milliseconds} \
-                 queue_peak={queue_peak} persistence_accepted=1000 already_observed=200 unread=900 \
+                 queue_peak={queue_peak} persistence_accepted=1000 already_observed=200 \
                  notification_claims=500"
             );
-            let _ = std::fs::remove_dir_all(directory);
-        });
-    }
-
-    #[test]
-    fn durable_read_rejection_keeps_timeline_without_restoring_attention() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build test runtime");
-
-        runtime.block_on(async {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let directory = std::env::temp_dir().join(format!(
-                "conduit-realtime-read-race-{}-{nonce}",
-                std::process::id()
-            ));
-            let store = WorkspaceStore::new(directory.clone(), "T1:U_SELF");
-            store
-                .store_conversations(&[SlackConversation {
-                    id: "C1".into(),
-                    ..Default::default()
-                }])
-                .await
-                .unwrap();
-            assert!(store
-                .clear_conversation_unread_state("C1", "20.0")
-                .await
-                .unwrap());
-
-            let workspace = WorkspaceReducerAdapter::default();
-            workspace.update_attention_context(WorkspaceAttentionContext {
-                current_user_id: Some("U_SELF".into()),
-            });
-            workspace.apply(
-                MutationOrigin::Cache,
-                WorkspaceMutation::ConversationUpsert(SlackConversation {
-                    id: "C1".into(),
-                    ..Default::default()
-                }),
-            );
-            let (runtime_events, mut receiver) = runtime_event_channel();
-            let event_sender = RuntimeEventSender::new(
-                runtime_events,
-                RuntimeIdentity {
-                    session: SessionId::default().next(),
-                    request: RequestId::new(1),
-                },
-                OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace),
-            );
-            let (sender, persistence_receiver) =
-                realtime_persistence_channel(workspace.attention_metrics_handle());
-            let worker = tokio::spawn(persist_realtime_events(
-                persistence_receiver,
-                store,
-                Some("U_SELF".into()),
-                event_sender,
-                workspace.clone(),
-                UserStatusSync::default(),
-            ));
-            sender
-                .send(RealtimePersistenceEvent::Message {
-                    event: Box::new(crate::socket_mode::SocketModeMessageEvent {
-                        channel_id: "C1".into(),
-                        message: SlackMessage {
-                            ts: "10.0".into(),
-                            user: Some("U_OTHER".into()),
-                            text: Some("already read".into()),
-                            ..Default::default()
-                        },
-                        kind: SocketModeMessageKind::Posted,
-                    }),
-                })
-                .await
-                .unwrap();
-            drop(sender);
-            worker.await.unwrap();
-
-            let metrics = workspace.attention_metrics_snapshot();
-            assert_eq!(
-                metrics.persistence_count(AttentionPersistenceOutcome::AtOrBeforeReadCursor),
-                1
-            );
-            assert_eq!(metrics.delivery_count(DeliveryState::Stale), 1);
-            assert_eq!(metrics.reason_count(AttentionReason::StaleDelivery), 1);
-            let event = receiver.recv().await.unwrap();
-            assert!(matches!(event.kind, RuntimeEventKind::WorkspacePatch(patch)
-                if timeline_patch_summary(patch.changes())
-                    == [("10.0".into(), Some("already read".into()))]));
-            let coordinator = workspace
-                .coordinator
-                .lock()
-                .expect("workspace coordinator lock poisoned");
-            let conversation = coordinator.conversation("C1").unwrap();
-            assert_eq!(conversation.unread_activity_count(), 0);
-            assert!(conversation.has_observed_attention_message("10.0"));
-            assert_eq!(coordinator.history("C1").len(), 1);
             let _ = std::fs::remove_dir_all(directory);
         });
     }
@@ -17540,7 +15724,6 @@ mod tests {
             workspace: workspace.clone(),
             current_user_id: Some("U_SELF".into()),
             user_cache: Arc::new(Mutex::new(HashMap::new())),
-            read_marks: Arc::new(Mutex::new(HashMap::new())),
             message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(256))),
             conversation_star_sync: ConversationStarSyncGate::default(),
             user_status_sync: UserStatusSync::default(),
@@ -17574,7 +15757,6 @@ mod tests {
                 MutationOrigin::Realtime,
             )
             .expect("direct message should still be classified");
-        assert!(effect.decision.record_unread);
         assert!(!effect.decision.send_notification);
     }
 
@@ -17924,9 +16106,6 @@ mod tests {
                     OpaqueAdmissionTarget::digest(&[channel_id, ts]),
                 ))
             }
-            RuntimeCommand::MarkConversationRead { .. }
-            | RuntimeCommand::MarkConversationReadAll { .. }
-            | RuntimeCommand::MarkThreadRead { .. } => RuntimeAdmissionPolicy::read_marker(),
             RuntimeCommand::UpdateAttentionPreferences(_)
             | RuntimeCommand::JoinConversation { .. }
             | RuntimeCommand::LeaveConversation { .. }
@@ -17981,8 +16160,7 @@ mod tests {
             | RuntimeCommand::StartBrowserSession { .. }
             | RuntimeCommand::JoinConversation { .. }
             | RuntimeCommand::OpenDirectMessage { .. }
-            | RuntimeCommand::ResolveMessagePermalink { .. }
-            | RuntimeCommand::MarkConversationRead { .. } => {
+            | RuntimeCommand::ResolveMessagePermalink { .. } => {
                 (true, None, RuntimeTaskLane::Interactive)
             }
             RuntimeCommand::RefreshConversations
@@ -18002,8 +16180,6 @@ mod tests {
             | RuntimeCommand::CreateChannel { .. }
             | RuntimeCommand::InviteToChannel { .. }
             | RuntimeCommand::ExecuteMessageAction { .. }
-            | RuntimeCommand::MarkConversationReadAll { .. }
-            | RuntimeCommand::MarkThreadRead { .. }
             | RuntimeCommand::PostMessage { .. }
             | RuntimeCommand::ExecuteSlashCommand { .. }
             | RuntimeCommand::UpdateMessage { .. }
@@ -18117,19 +16293,6 @@ mod tests {
                 },
                 control_handle: MessageControlHandle::synthetic(),
             },
-            RuntimeCommand::MarkConversationRead {
-                channel_id: "C1".to_string(),
-                ts: "1.0".to_string(),
-            },
-            RuntimeCommand::MarkConversationReadAll {
-                channel_id: "C1".to_string(),
-                ts: "1.0".to_string(),
-            },
-            RuntimeCommand::MarkThreadRead {
-                channel_id: "C1".to_string(),
-                thread_ts: "1.0".to_string(),
-                ts: "2.0".to_string(),
-            },
             RuntimeCommand::PostMessage {
                 channel_id: "C1".to_string(),
                 text: "message-text-canary".to_string(),
@@ -18188,7 +16351,7 @@ mod tests {
     #[test]
     fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
         let commands = runtime_command_fixtures();
-        assert_eq!(commands.len(), 43);
+        assert_eq!(commands.len(), 40);
 
         for command in commands {
             let descriptor = command.descriptor();
@@ -18361,14 +16524,6 @@ mod tests {
             RuntimeAdmissionKind::DurableAction
         );
         assert_eq!(
-            policy(RuntimeCommand::MarkConversationRead {
-                channel_id: "C1".to_string(),
-                ts: "1.0".to_string(),
-            })
-            .kind,
-            RuntimeAdmissionKind::ReadMarker
-        );
-        assert_eq!(
             policy(RuntimeCommand::RefreshConversations).kind,
             RuntimeAdmissionKind::Coalescible
         );
@@ -18455,21 +16610,20 @@ mod tests {
         assert_eq!(upload.lane, RuntimeTaskLane::Upload);
         assert!(!upload.supersedes_previous);
 
-        let interactive = RuntimeCommand::MarkConversationRead {
-            channel_id: "C123".to_string(),
-            ts: "1710000000.000100".to_string(),
+        let interactive = RuntimeCommand::OpenDirectMessage {
+            user_id: "U123".to_string(),
         }
         .descriptor();
         assert_eq!(interactive.lane, RuntimeTaskLane::Interactive);
         assert!(interactive.supersedes_previous);
 
-        let explicit_mark_all = RuntimeCommand::MarkConversationReadAll {
+        let durable_mutation = RuntimeCommand::SetConversationStarred {
             channel_id: "C123".to_string(),
-            ts: "1710000000.000100".to_string(),
+            starred: true,
         }
         .descriptor();
-        assert_eq!(explicit_mark_all.lane, RuntimeTaskLane::Interactive);
-        assert!(!explicit_mark_all.supersedes_previous);
+        assert_eq!(durable_mutation.lane, RuntimeTaskLane::Interactive);
+        assert!(!durable_mutation.supersedes_previous);
 
         let permalink = RuntimeCommand::ResolveMessagePermalink {
             channel_id: "C123".to_string(),
@@ -18778,7 +16932,6 @@ mod tests {
             workspace,
             current_user_id,
             user_cache: Arc::new(Mutex::new(HashMap::new())),
-            read_marks: Arc::new(Mutex::new(HashMap::new())),
             message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(8))),
             conversation_star_sync: ConversationStarSyncGate::default(),
             user_status_sync: UserStatusSync::default(),
@@ -20034,7 +18187,7 @@ mod tests {
         );
     }
 
-    fn channel(id: &str, unread_count: u64, last_read: Option<&str>) -> SlackConversation {
+    fn channel(id: &str, latest: Option<&str>) -> SlackConversation {
         let mut conversation = SlackConversation {
             id: id.to_string(),
             name: Some(
@@ -20043,76 +18196,76 @@ mod tests {
                     .to_string(),
             ),
             is_channel: Some(true),
-            unread_count: Some(unread_count),
             ..Default::default()
         };
-        if let Some(last_read) = last_read {
+        if let Some(latest) = latest {
             conversation
                 .extra
-                .insert("last_read".to_string(), serde_json::json!(last_read));
+                .insert("latest".to_string(), serde_json::json!(latest));
         }
         conversation
     }
 
-    fn private_channel(id: &str, unread_count: u64, last_read: Option<&str>) -> SlackConversation {
+    fn private_channel(id: &str, latest: Option<&str>) -> SlackConversation {
         SlackConversation {
             is_channel: Some(false),
             is_group: Some(true),
             is_private: Some(true),
-            ..channel(id, unread_count, last_read)
+            ..channel(id, latest)
         }
     }
 
-    fn archived_channel(id: &str, unread_count: u64) -> SlackConversation {
+    fn archived_channel(id: &str) -> SlackConversation {
         SlackConversation {
             is_archived: Some(true),
-            ..channel(id, unread_count, None)
+            ..channel(id, None)
         }
     }
 
-    fn dm(id: &str, unread_count: u64) -> SlackConversation {
-        SlackConversation {
+    fn dm(id: &str, active: bool) -> SlackConversation {
+        let mut conversation = SlackConversation {
             id: id.to_string(),
             user: Some("U123".to_string()),
             is_im: Some(true),
-            unread_count: Some(unread_count),
             ..Default::default()
+        };
+        if active {
+            conversation
+                .extra
+                .insert("is_open".to_string(), serde_json::json!(true));
         }
+        conversation
     }
 
     #[test]
-    fn channel_history_prefetch_candidates_prioritize_unread_and_recent_channels() {
-        let mut badgeless_unread = channel("C-badgeless", 0, Some("1710000100.000000"));
-        badgeless_unread
-            .extra
-            .insert("has_unreads".to_string(), serde_json::json!(true));
+    fn channel_history_prefetch_candidates_prioritize_active_dms_and_recent_channels() {
         let conversations = vec![
-            channel("C-old", 0, None),
-            dm("D-unread", 99),
-            archived_channel("C-archived", 99),
-            channel("C-recent", 0, Some("1710000300.000000")),
-            channel("C-unread", 4, Some("1710000000.000000")),
-            badgeless_unread,
-            private_channel("G-private", 0, Some("1710000200.000000")),
+            channel("C-old", None),
+            dm("D-active", true),
+            dm("D-idle", false),
+            archived_channel("C-archived"),
+            channel("C-recent", Some("1710000300.000000")),
+            channel("C-stale", Some("1710000000.000000")),
+            private_channel("G-private", Some("1710000200.000000")),
         ];
 
+        // Active DMs lead, then channels by most recent activity. Idle DMs and
+        // archived conversations are not prefetched at all.
         assert_eq!(
             channel_history_prefetch_candidates(&conversations),
-            vec![
-                "D-unread",
-                "C-unread",
-                "C-badgeless",
-                "C-recent",
-                "G-private",
-                "C-old"
-            ]
+            vec!["D-active", "C-recent", "G-private", "C-stale", "C-old"]
         );
     }
 
     #[test]
     fn channel_history_prefetch_candidates_are_bounded() {
         let conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
-            .map(|index| channel(&format!("C{index}"), index as u64, None))
+            .map(|index| {
+                channel(
+                    &format!("C{index}"),
+                    Some(&format!("17100000{index:02}.000000")),
+                )
+            })
             .collect::<Vec<_>>();
 
         let candidates = channel_history_prefetch_candidates(&conversations);
@@ -20123,11 +18276,16 @@ mod tests {
     }
 
     #[test]
-    fn channel_history_prefetch_always_includes_unread_direct_messages() {
+    fn channel_history_prefetch_always_includes_active_direct_messages() {
         let mut conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
-            .map(|index| channel(&format!("C{index}"), (index + 10) as u64, None))
+            .map(|index| {
+                channel(
+                    &format!("C{index}"),
+                    Some(&format!("17100000{index:02}.000000")),
+                )
+            })
             .collect::<Vec<_>>();
-        conversations.push(dm("D-urgent", 1));
+        conversations.push(dm("D-urgent", true));
 
         let candidates = channel_history_prefetch_candidates(&conversations);
 
@@ -20136,28 +18294,16 @@ mod tests {
     }
 
     #[test]
-    fn raw_unread_direct_message_is_prefetched_after_local_overlay_was_read() {
-        let mut offline_unread = dm("D-offline", 2);
-        offline_unread.observe_attention_message(false, false);
-        assert!(!offline_unread.has_unread_activity());
-        assert!(offline_unread.raw_has_unread_activity());
-
-        assert_eq!(
-            channel_history_prefetch_candidates(&[offline_unread.clone()]),
-            ["D-offline"]
-        );
-        assert_eq!(
-            conversation_unread_refresh_candidates(&[offline_unread]),
-            ["D-offline"]
-        );
-    }
-
-    #[test]
     fn channel_history_prefetch_always_includes_huddle_metadata() {
         let mut conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
-            .map(|index| channel(&format!("C{index}"), (index + 10) as u64, None))
+            .map(|index| {
+                channel(
+                    &format!("C{index}"),
+                    Some(&format!("17100000{index:02}.000000")),
+                )
+            })
             .collect::<Vec<_>>();
-        let mut huddle = channel("C-huddle", 0, None);
+        let mut huddle = channel("C-huddle", None);
         huddle.extra.insert(
             "properties".to_string(),
             serde_json::json!({"huddles": [{"id": "R123"}]}),
@@ -20173,8 +18319,13 @@ mod tests {
     #[test]
     fn channel_history_prefetch_keeps_current_huddles_after_cache_redaction() {
         let conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
-            .map(|index| channel(&format!("C{index}"), (index + 10) as u64, None))
-            .chain([channel("C-huddle", 0, None)])
+            .map(|index| {
+                channel(
+                    &format!("C{index}"),
+                    Some(&format!("17100000{index:02}.000000")),
+                )
+            })
+            .chain([channel("C-huddle", None)])
             .collect::<Vec<_>>();
         let current_huddle_channels = HashSet::from(["C-huddle".to_string()]);
 
@@ -20187,313 +18338,15 @@ mod tests {
     }
 
     #[test]
-    fn browser_unread_snapshot_covers_only_known_records_and_keeps_badges_boolean() {
-        let conversations = vec![channel("C1", 0, None), dm("D1", 0), dm("D2", 0)];
-        let raw = SlackUnreadSnapshot {
-            channels: vec![SlackUnreadSnapshotRecord {
-                conversation_id: "C1".to_string(),
-                last_read: Some("10.0".to_string()),
-                latest: Some("10.0".to_string()),
-                has_unreads: false,
-                mention_count: 0,
-                is_open: false,
-            }],
-            ims: vec![
-                SlackUnreadSnapshotRecord {
-                    conversation_id: "D1".to_string(),
-                    last_read: Some("10.0".to_string()),
-                    latest: Some("11.0".to_string()),
-                    has_unreads: true,
-                    mention_count: 5,
-                    is_open: true,
-                },
-                SlackUnreadSnapshotRecord {
-                    conversation_id: "D-unknown".to_string(),
-                    last_read: Some("10.0".to_string()),
-                    latest: Some("11.0".to_string()),
-                    has_unreads: true,
-                    mention_count: 1,
-                    is_open: true,
-                },
-            ],
-            mpims: Vec::new(),
-        };
-
-        let (snapshots, covered) = browser_unread_snapshots_for_catalog(raw, &conversations);
-
-        assert_eq!(covered, HashSet::from(["C1".to_string(), "D1".to_string()]));
-        assert_eq!(snapshots.len(), 2);
-        let direct_message = snapshots
-            .iter()
-            .find(|snapshot| snapshot.channel_id == "D1")
-            .unwrap();
-        assert!(direct_message.unread_state.has_unread);
-        assert_eq!(direct_message.unread_state.display_count, 0);
-        assert_eq!(direct_message.mention_count, Some(5));
-        assert_eq!(direct_message.is_open, Some(true));
-        assert_eq!(
-            uncovered_conversation_unread_refresh_candidates(&conversations, &covered),
-            vec!["D2"]
-        );
-    }
-
-    #[test]
-    fn conversation_refresh_batches_bound_their_potential_patch_count() {
-        let mut pending = PendingConversationRefreshBatch::default();
-        let mut ready = Vec::new();
-        for index in 0..11 {
-            let channel_id = format!("C{index}");
-            if let Some(batch) = pending.push(SnapshotEnvelope::new(
-                WorkspaceRevision::INITIAL,
-                ConversationRefresh {
-                    metadata: Some(SlackConversation {
-                        id: channel_id.clone(),
-                        ..Default::default()
-                    }),
-                    unread: Some(SlackConversationUnreadSnapshot {
-                        channel_id,
-                        unread_state: SlackUnreadState::from_parts(true, true, 1),
-                        ..Default::default()
-                    }),
-                },
-            )) {
-                ready.push(batch);
-            }
-        }
-
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].len(), 10);
-        assert_eq!(
-            ready[0]
-                .iter()
-                .map(|refresh| refresh.data().potential_change_count())
-                .sum::<usize>(),
-            CONVERSATION_PATCH_BATCH_SIZE
-        );
-        assert_eq!(pending.refreshes.len(), 1);
-        assert_eq!(pending.potential_changes, 2);
-    }
-
-    #[test]
-    fn conversation_unread_refresh_candidates_prioritize_dm_state_before_known_unread_channels() {
-        let conversations = vec![
-            channel("C-zebra", 0, None),
-            archived_channel("C-archived", 10),
-            dm("D-ada", 4),
-            channel("C-aggregator", 0, None),
-            channel("C-127", 0, None),
-        ];
-
-        assert_eq!(
-            conversation_unread_refresh_candidates(&conversations),
-            vec!["D-ada", "C-127", "C-aggregator", "C-zebra"]
-        );
-
-        let mut many = (0..CONVERSATION_ENRICHMENT_LIMIT + 5)
-            .map(|index| channel(&format!("C{index}"), 10, None))
-            .collect::<Vec<_>>();
-        let unknown_dm = SlackConversation {
-            id: "D-unknown".to_string(),
-            user: Some("U-unknown".to_string()),
-            is_im: Some(true),
-            ..Default::default()
-        };
-        let mut active_unknown_dm = SlackConversation {
-            id: "D-active".to_string(),
-            user: Some("U-active".to_string()),
-            is_im: Some(true),
-            ..Default::default()
-        };
-        active_unknown_dm
-            .extra
-            .insert("priority".to_string(), serde_json::json!(0.75));
-        let known_unread_dm = dm("D-unread", 1);
-        let mut active_known_read_count = dm("D-active-read-count", 0);
-        active_known_read_count
-            .extra
-            .insert("is_open".to_string(), serde_json::json!(true));
-        let mut active_known_read_flag = SlackConversation {
-            id: "D-active-read-flag".to_string(),
-            user: Some("U-read-flag".to_string()),
-            is_im: Some(true),
-            ..Default::default()
-        };
-        active_known_read_flag
-            .extra
-            .insert("has_unreads".to_string(), serde_json::json!(false));
-        active_known_read_flag
-            .extra
-            .insert("priority".to_string(), serde_json::json!(0.5));
-        assert!(!unknown_dm.unread_state().known);
-        assert!(active_known_read_count.unread_state().known);
-        assert!(active_known_read_flag.unread_state().known);
-        assert!(!active_known_read_flag.unread_state().has_unread);
-        many.extend([
-            unknown_dm,
-            active_unknown_dm,
-            known_unread_dm,
-            active_known_read_count,
-            active_known_read_flag,
-        ]);
-
-        let candidates = conversation_unread_refresh_candidates(&many);
-        assert_eq!(candidates.first().map(String::as_str), Some("D-active"));
-        assert_eq!(candidates.get(1).map(String::as_str), Some("D-unknown"));
-        assert_eq!(candidates.get(2).map(String::as_str), Some("D-unread"));
-        let unread_dm_index = candidates
-            .iter()
-            .position(|channel_id| channel_id == "D-unread")
-            .unwrap();
-        for active_read_id in ["D-active-read-count", "D-active-read-flag"] {
-            assert!(
-                unread_dm_index
-                    < candidates
-                        .iter()
-                        .position(|channel_id| channel_id == active_read_id)
-                        .unwrap()
-            );
-        }
-        let plan = conversation_unread_refresh_plan(
-            Vec::new(),
-            candidates.clone(),
-            CONVERSATION_ENRICHMENT_LIMIT,
-        );
-        assert_eq!(plan.batch.len(), CONVERSATION_ENRICHMENT_LIMIT);
-        assert!(plan.batch.contains(&"D-active".to_string()));
-        assert!(plan.batch.contains(&"D-unknown".to_string()));
-        assert_eq!(plan.queue.len(), candidates.len());
-        assert_eq!(plan.next_queue.len(), candidates.len());
-    }
-
-    #[test]
     fn conversation_priority_ignores_non_finite_values() {
         for priority in ["NaN", "inf", "-inf"] {
-            let mut conversation = dm("D1", 0);
+            let mut conversation = dm("D1", false);
             conversation
                 .extra
                 .insert("priority".to_string(), serde_json::json!(priority));
 
             assert_eq!(conversation.priority_hint(), 0.0);
         }
-    }
-
-    #[test]
-    fn conversation_unread_refresh_plan_rotates_every_candidate_without_starvation() {
-        let candidates = (0..CONVERSATION_ENRICHMENT_LIMIT * 2 + 5)
-            .map(|index| format!("C{index:02}"))
-            .collect::<Vec<_>>();
-        let first = conversation_unread_refresh_plan(
-            Vec::new(),
-            candidates.clone(),
-            CONVERSATION_ENRICHMENT_LIMIT,
-        );
-        assert_eq!(first.batch, candidates[..CONVERSATION_ENRICHMENT_LIMIT]);
-
-        let second = conversation_unread_refresh_plan(
-            first.next_queue.clone(),
-            candidates.clone(),
-            CONVERSATION_ENRICHMENT_LIMIT,
-        );
-
-        assert_eq!(
-            second.batch,
-            candidates[CONVERSATION_ENRICHMENT_LIMIT..CONVERSATION_ENRICHMENT_LIMIT * 2]
-        );
-        assert!(!second.batch.contains(&candidates[0]));
-        assert!(second.batch.len() <= CONVERSATION_ENRICHMENT_LIMIT);
-
-        let third = conversation_unread_refresh_plan(
-            second.next_queue.clone(),
-            candidates.clone(),
-            CONVERSATION_ENRICHMENT_LIMIT,
-        );
-        assert_eq!(
-            third.batch,
-            candidates[CONVERSATION_ENRICHMENT_LIMIT * 2..]
-                .iter()
-                .chain(&candidates[..CONVERSATION_ENRICHMENT_LIMIT - 5])
-                .cloned()
-                .collect::<Vec<_>>()
-        );
-        let visited = first
-            .batch
-            .iter()
-            .chain(&second.batch)
-            .chain(&third.batch)
-            .collect::<HashSet<_>>();
-        assert_eq!(visited.len(), candidates.len());
-        assert!(candidates
-            .iter()
-            .all(|channel_id| visited.contains(channel_id)));
-
-        let mut with_new_candidate = vec!["D-new-active".to_string()];
-        with_new_candidate.extend(candidates.clone());
-        let with_new = conversation_unread_refresh_plan(
-            first.next_queue.clone(),
-            with_new_candidate,
-            CONVERSATION_ENRICHMENT_LIMIT,
-        );
-        assert_eq!(
-            with_new.batch.first().map(String::as_str),
-            Some("D-new-active")
-        );
-
-        let mut reranked = candidates.clone();
-        reranked.rotate_right(1);
-        let reranked_existing = conversation_unread_refresh_plan(
-            first.next_queue,
-            reranked,
-            CONVERSATION_ENRICHMENT_LIMIT,
-        );
-        assert_eq!(
-            reranked_existing.batch.first().map(String::as_str),
-            Some("C30")
-        );
-    }
-
-    #[test]
-    fn conversation_unread_refresh_plan_prunes_and_deduplicates_pending_work() {
-        let plan = conversation_unread_refresh_plan(
-            vec![
-                "C2".to_string(),
-                "C-stale".to_string(),
-                "C2".to_string(),
-                String::new(),
-                "C1".to_string(),
-            ],
-            vec![
-                "C1".to_string(),
-                String::new(),
-                "C2".to_string(),
-                "C1".to_string(),
-                "C3".to_string(),
-            ],
-            2,
-        );
-
-        assert_eq!(plan.queue, vec!["C3", "C2", "C1"]);
-        assert_eq!(plan.batch, vec!["C3", "C2"]);
-        assert_eq!(plan.next_queue, vec!["C1", "C3", "C2"]);
-        assert_eq!(
-            plan.queue.iter().collect::<HashSet<_>>().len(),
-            plan.queue.len()
-        );
-
-        let no_network = conversation_unread_refresh_plan(
-            Vec::new(),
-            vec!["C1".to_string(), "C2".to_string()],
-            0,
-        );
-        assert!(no_network.batch.is_empty());
-        assert_eq!(no_network.next_queue, no_network.queue);
-
-        let under_limit = conversation_unread_refresh_plan(
-            Vec::new(),
-            vec!["C1".to_string(), "C2".to_string()],
-            CONVERSATION_ENRICHMENT_LIMIT,
-        );
-        assert_eq!(under_limit.batch, under_limit.queue);
-        assert_eq!(under_limit.next_queue, under_limit.queue);
     }
 
     #[test]
@@ -20514,15 +18367,12 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let mut cached = channel("C1", 5, Some("10.0"));
+            let mut cached = channel("C1", Some("10.0"));
             cached.name = Some("cached".to_string());
             cached.is_starred = Some(false);
             cached
                 .extra
                 .insert("topic".to_string(), serde_json::json!("Cached topic"));
-            cached
-                .extra
-                .insert("unread_count_display".to_string(), serde_json::json!(3));
             let removed = SlackConversation {
                 id: "C_OLD".to_string(),
                 name: Some("removed".to_string()),
@@ -20626,8 +18476,6 @@ mod tests {
                 .unwrap();
             assert_eq!(current.name.as_deref(), Some("renamed"));
             assert!(current.is_starred());
-            assert_eq!(current.unread_activity_count(), 5);
-            assert_eq!(current.unread_state().display_count, 3);
             assert_eq!(current.extra["topic"], serde_json::json!("Cached topic"));
             assert!(conversations
                 .iter()
@@ -20671,7 +18519,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let workspace = WorkspaceReducerAdapter::default();
-            let retained = channel("C1", 0, None);
+            let retained = channel("C1", None);
             workspace
                 .apply(
                     MutationOrigin::Cache,

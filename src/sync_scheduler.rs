@@ -67,12 +67,11 @@ pub(crate) enum SyncPriority {
 pub(crate) enum SyncDurability {
     Ephemeral,
     DurableAction,
-    ReadMarker,
 }
 
 impl SyncDurability {
     fn is_durable(self) -> bool {
-        matches!(self, Self::DurableAction | Self::ReadMarker)
+        matches!(self, Self::DurableAction)
     }
 }
 
@@ -1183,38 +1182,37 @@ mod tests {
     }
 
     #[test]
-    fn durable_actions_and_read_markers_cannot_be_replaceable_or_skippable() {
-        for durability in [SyncDurability::DurableAction, SyncDurability::ReadMarker] {
-            let replaceable = SyncJob::new(
-                SyncJobId::new(1),
-                CancellationId::new(2),
-                conversation_target(3),
-                SyncPriority::Interactive,
-                durability,
-                FreshnessPolicy::Always,
-                ReplacementClass::Refresh(RefreshClass::ConversationHistory),
-                RetryPolicy::Never,
-            );
-            assert_eq!(
-                replaceable.unwrap_err(),
-                JobContractError::DurableWorkCannotBeReplaceable
-            );
+    fn durable_actions_cannot_be_replaceable_or_skippable() {
+        let durability = SyncDurability::DurableAction;
+        let replaceable = SyncJob::new(
+            SyncJobId::new(1),
+            CancellationId::new(2),
+            conversation_target(3),
+            SyncPriority::Interactive,
+            durability,
+            FreshnessPolicy::Always,
+            ReplacementClass::Refresh(RefreshClass::ConversationHistory),
+            RetryPolicy::Never,
+        );
+        assert_eq!(
+            replaceable.unwrap_err(),
+            JobContractError::DurableWorkCannotBeReplaceable
+        );
 
-            let skippable = SyncJob::new(
-                SyncJobId::new(4),
-                CancellationId::new(5),
-                conversation_target(6),
-                SyncPriority::Interactive,
-                durability,
-                FreshnessPolicy::IfOlderThan { max_age_ms: 500 },
-                ReplacementClass::Never,
-                RetryPolicy::Never,
-            );
-            assert_eq!(
-                skippable.unwrap_err(),
-                JobContractError::DurableWorkMustAlwaysRun
-            );
-        }
+        let skippable = SyncJob::new(
+            SyncJobId::new(4),
+            CancellationId::new(5),
+            conversation_target(6),
+            SyncPriority::Interactive,
+            durability,
+            FreshnessPolicy::IfOlderThan { max_age_ms: 500 },
+            ReplacementClass::Never,
+            RetryPolicy::Never,
+        );
+        assert_eq!(
+            skippable.unwrap_err(),
+            JobContractError::DurableWorkMustAlwaysRun
+        );
     }
 
     #[test]
@@ -1782,7 +1780,7 @@ mod tests {
     fn queued_cancellation_releases_capacity_but_durable_work_is_protected() {
         let mut scheduler = scheduler(2, 1, 3);
         let ephemeral = ephemeral_job(1);
-        let durable = durable_job(2, SyncDurability::ReadMarker, RetryPolicy::Never);
+        let durable = durable_job(2, SyncDurability::DurableAction, RetryPolicy::Never);
         admit(&mut scheduler, ephemeral.clone());
         admit(&mut scheduler, durable.clone());
 
@@ -2012,32 +2010,31 @@ mod tests {
 
     #[test]
     fn durable_running_work_rejects_cancellation_without_releasing_capacity() {
-        for durability in [SyncDurability::DurableAction, SyncDurability::ReadMarker] {
-            let mut scheduler = scheduler(1, 1, 3);
-            let job = durable_job(1, durability, RetryPolicy::Never);
-            admit(&mut scheduler, job.clone());
-            let running = scheduler.dispatch_next(10_000).unwrap();
+        let durability = SyncDurability::DurableAction;
+        let mut scheduler = scheduler(1, 1, 3);
+        let job = durable_job(1, durability, RetryPolicy::Never);
+        admit(&mut scheduler, job.clone());
+        let running = scheduler.dispatch_next(10_000).unwrap();
 
-            assert_eq!(
-                scheduler.cancel(job.cancellation_id(), 10_000),
-                CancellationOutcome::Protected { job_id: job.id() }
-            );
-            assert_eq!(
-                scheduler.complete(running.run(), JobOutcome::Cancelled, 10_000),
-                Err(CompletionError::DurableCancellationForbidden)
-            );
-            assert_eq!(
-                scheduler
-                    .admit(ephemeral_job(2), 10_000, None)
-                    .unwrap_err()
-                    .reason(),
-                AdmissionRejectionReason::AtCapacity
-            );
-            assert_eq!(
-                scheduler.complete(running.run(), JobOutcome::Succeeded, 10_000),
-                Ok(CompletionOutcome::Completed)
-            );
-        }
+        assert_eq!(
+            scheduler.cancel(job.cancellation_id(), 10_000),
+            CancellationOutcome::Protected { job_id: job.id() }
+        );
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Cancelled, 10_000),
+            Err(CompletionError::DurableCancellationForbidden)
+        );
+        assert_eq!(
+            scheduler
+                .admit(ephemeral_job(2), 10_000, None)
+                .unwrap_err()
+                .reason(),
+            AdmissionRejectionReason::AtCapacity
+        );
+        assert_eq!(
+            scheduler.complete(running.run(), JobOutcome::Succeeded, 10_000),
+            Ok(CompletionOutcome::Completed)
+        );
     }
 
     #[test]
@@ -2316,12 +2313,12 @@ mod tests {
         let running_ephemeral = with_priority(ephemeral_job(1), SyncPriority::Interactive);
         let queued_ephemeral = ephemeral_job(2);
         let durable_action = durable_job(3, SyncDurability::DurableAction, RetryPolicy::Never);
-        let read_marker = durable_job(4, SyncDurability::ReadMarker, RetryPolicy::Never);
+        let durable_write = durable_job(4, SyncDurability::DurableAction, RetryPolicy::Never);
         admit(&mut scheduler, running_ephemeral.clone());
         let running = scheduler.dispatch_next(10_000).unwrap();
         admit(&mut scheduler, queued_ephemeral.clone());
         admit(&mut scheduler, durable_action.clone());
-        admit(&mut scheduler, read_marker.clone());
+        admit(&mut scheduler, durable_write.clone());
 
         let report = scheduler.begin_shutdown(10_000);
         assert_eq!(report.phase(), ShutdownPhase::Draining);
@@ -2359,7 +2356,7 @@ mod tests {
         assert_eq!(scheduler.shutdown_phase(), ShutdownPhase::Draining);
         assert_eq!(
             dispatch_and_complete(&mut scheduler, 10_000),
-            read_marker.id()
+            durable_write.id()
         );
         assert_eq!(scheduler.shutdown_phase(), ShutdownPhase::Drained);
         assert!(scheduler.is_drained());
@@ -2444,7 +2441,7 @@ mod tests {
     #[test]
     fn durable_terminal_failure_is_handed_back_before_shutdown_drains() {
         let mut scheduler = scheduler(1, 1, 3);
-        let job = durable_job(1, SyncDurability::ReadMarker, RetryPolicy::Never);
+        let job = durable_job(1, SyncDurability::DurableAction, RetryPolicy::Never);
         scheduler.admit(job.clone(), 1_000, None).unwrap();
         let running = scheduler.dispatch_next(1_000).unwrap();
         assert_eq!(
@@ -2600,7 +2597,7 @@ mod tests {
             SyncDurability::DurableAction,
             RetryPolicy::fixed(2, 250).unwrap(),
         );
-        let durable_failure = durable_job(4, SyncDurability::ReadMarker, RetryPolicy::Never);
+        let durable_failure = durable_job(4, SyncDurability::DurableAction, RetryPolicy::Never);
         let shutdown_cancel = ephemeral_job(5);
         for job in [
             old_refresh.clone(),
@@ -2777,13 +2774,12 @@ mod tests {
         const RUNNING_CAPACITY: usize = 4;
         let mut scheduler = scheduler(ADMISSION_CAPACITY, RUNNING_CAPACITY, 3);
         for id in 1..=ADMISSION_CAPACITY as u64 {
-            let durability = if id % 2 == 0 {
-                SyncDurability::DurableAction
-            } else {
-                SyncDurability::ReadMarker
-            };
             scheduler
-                .admit(durable_job(id, durability, RetryPolicy::Never), 1_000, None)
+                .admit(
+                    durable_job(id, SyncDurability::DurableAction, RetryPolicy::Never),
+                    1_000,
+                    None,
+                )
                 .unwrap();
         }
 
@@ -2896,7 +2892,7 @@ mod tests {
         assert_admission_counters_reconcile(counters);
 
         let mut durable_scheduler = SyncScheduler::new(SchedulerConfig::new(1, 1, 3).unwrap());
-        let durable = durable_job(2, SyncDurability::ReadMarker, RetryPolicy::Never);
+        let durable = durable_job(2, SyncDurability::DurableAction, RetryPolicy::Never);
         durable_scheduler
             .admit(durable.clone(), 1_000, None)
             .unwrap();

@@ -35,20 +35,14 @@
         </child>
         <child>
           <object class="GtkShortcutsShortcut">
-            <property name="title" translatable="yes" context="shortcut window">Unreads</property>
+            <property name="title" translatable="yes" context="shortcut window">Files</property>
             <property name="accelerator">&lt;Control&gt;2</property>
           </object>
         </child>
         <child>
           <object class="GtkShortcutsShortcut">
-            <property name="title" translatable="yes" context="shortcut window">Files</property>
-            <property name="accelerator">&lt;Control&gt;3</property>
-          </object>
-        </child>
-        <child>
-          <object class="GtkShortcutsShortcut">
             <property name="title" translatable="yes" context="shortcut window">Later</property>
-            <property name="accelerator">&lt;Control&gt;4</property>
+            <property name="accelerator">&lt;Control&gt;3</property>
           </object>
         </child>
       </object>

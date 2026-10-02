@@ -80,18 +80,10 @@ pub fn sidebar_row_widget(
     icon.set_tooltip_text(Some(model.kind.accessible_name()));
     content.append(&icon);
 
-    // A pending mention can exist without the ambient unread flag (e.g. a
-    // mention in a thread reply that doesn't belong to the channel's own
-    // timeline), so the row still needs to stand out in that case.
-    let emphasized = model.unread || model.has_mention;
     let title = gtk::Label::new(Some(&model.title));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.set_attributes(Some(&sidebar_title_attributes(emphasized)));
-    if emphasized {
-        title.add_css_class("heading");
-    }
     content.append(&title);
 
     if let Some(status) = model.status.as_ref() {
@@ -107,11 +99,7 @@ pub fn sidebar_row_widget(
                 indicator.append(&label);
             }
             Some(EmojiValue::CustomImage(url)) => {
-                let picture = sidebar_status_emoji_picture(
-                    &url,
-                    &text,
-                    emoji_size,
-                );
+                let picture = sidebar_status_emoji_picture(&url, &text, emoji_size);
                 picture.add_css_class("status-emoji");
                 indicator.append(&picture);
             }
@@ -132,22 +120,6 @@ pub fn sidebar_row_widget(
         starred.set_tooltip_text(Some("Starred"));
         starred.update_property(&[gtk::accessible::Property::Label("Starred")]);
         content.append(&starred);
-    }
-
-    if let Some(unread_label) = model.unread_badge_label() {
-        let unread = gtk::Label::new(Some(&unread_label));
-        unread.add_css_class("caption");
-        unread.add_css_class("heading");
-        content.append(&unread);
-    }
-
-    if let Some(mention_label) = model.mention_badge_label() {
-        let mention = gtk::Label::new(Some(&mention_label));
-        mention.add_css_class("caption");
-        mention.add_css_class("heading");
-        mention.add_css_class("accent");
-        mention.set_tooltip_text(Some("Mentioned"));
-        content.append(&mention);
     }
 
     if model.muted {
@@ -171,14 +143,6 @@ pub fn sidebar_row_widget(
 
     row.set_child(Some(&content));
     row
-}
-
-fn sidebar_title_attributes(unread: bool) -> gtk::pango::AttrList {
-    let attributes = gtk::pango::AttrList::new();
-    attributes.insert(gtk::pango::AttrInt::new_weight(sidebar_title_weight(
-        unread,
-    )));
-    attributes
 }
 
 fn sidebar_target_emoji_size(widget: &impl gtk::prelude::WidgetExt) -> i32 {
@@ -216,9 +180,12 @@ fn sidebar_status_emoji_picture(url: &str, label: &str, size: i32) -> gtk::Pictu
                 &stream,
                 gtk::gio::Cancellable::NONE,
                 move |animation| {
-                    let Some(picture) = weak_picture.upgrade() else { return };
+                    let Some(picture) = weak_picture.upgrade() else {
+                        return;
+                    };
                     let Ok(animation) = animation else { return };
-                    let frame = std::rc::Rc::new(animation.iter(Some(std::time::SystemTime::now())));
+                    let frame =
+                        std::rc::Rc::new(animation.iter(Some(std::time::SystemTime::now())));
                     let pixbuf = frame.pixbuf();
                     let w = pixbuf.width();
                     let h = pixbuf.height();
@@ -236,23 +203,4 @@ fn sidebar_status_emoji_picture(url: &str, label: &str, size: i32) -> gtk::Pictu
         },
     );
     picture
-}
-
-fn sidebar_title_weight(unread: bool) -> gtk::pango::Weight {
-    if unread {
-        gtk::pango::Weight::Bold
-    } else {
-        gtk::pango::Weight::Normal
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn title_weight_uses_bold_only_for_unread_rows() {
-        assert_eq!(sidebar_title_weight(false), gtk::pango::Weight::Normal);
-        assert_eq!(sidebar_title_weight(true), gtk::pango::Weight::Bold);
-    }
 }

@@ -70,7 +70,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::models::{SlackMessage, SlackUnreadState};
+    use crate::models::SlackMessage;
     use crate::slack::{SlackError, SlackMessagePage, CHANNEL_HISTORY_PAGE_LIMIT};
     use crate::store::StoreError;
 
@@ -89,7 +89,6 @@ mod tests {
                 messages: vec![message("3", "fresh")],
                 has_more: true,
                 next_cursor: Some("next".into()),
-                unread_state: SlackUnreadState::default(),
             })
         }
     }

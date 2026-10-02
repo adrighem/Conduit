@@ -116,19 +116,6 @@ pub enum RuntimeCommand {
         request: SlackMessageActionRequest,
         control_handle: MessageControlHandle,
     },
-    MarkConversationRead {
-        channel_id: String,
-        ts: String,
-    },
-    MarkConversationReadAll {
-        channel_id: String,
-        ts: String,
-    },
-    MarkThreadRead {
-        channel_id: String,
-        thread_ts: String,
-        ts: String,
-    },
     PostMessage {
         channel_id: String,
         text: String,
@@ -220,7 +207,6 @@ pub enum RuntimeOperation {
     SavedItems,
     User,
     Emoji,
-    ReadMarker,
     ImageAsset,
     Media,
     AttachmentDownload,
@@ -276,7 +262,6 @@ pub struct OperationContext {
 pub enum RuntimeAdmissionKind {
     Control,
     DurableAction,
-    ReadMarker,
     Coalescible,
     Supersedable,
 }
@@ -346,13 +331,6 @@ impl RuntimeAdmissionPolicy {
     pub fn durable_action() -> Self {
         Self {
             kind: RuntimeAdmissionKind::DurableAction,
-            replacement_key: None,
-        }
-    }
-
-    pub fn read_marker() -> Self {
-        Self {
-            kind: RuntimeAdmissionKind::ReadMarker,
             replacement_key: None,
         }
     }

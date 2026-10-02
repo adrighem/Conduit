@@ -1,26 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::huddles::model::{SlackHuddleRoom, SlackHuddleState};
 use crate::rich_message::{MessageAuthor, MessageDocument, MessageNode, MESSAGE_CONTENT_VERSION};
 
 const CONVERSATION_MEMBER_KEYS: [&str; 2] = ["members", "users"];
-const SEEN_ATTENTION_MESSAGE_TS_KEY: &str = "conduit_seen_realtime_message_ts";
-const MAX_SEEN_ATTENTION_MESSAGES: usize = 512;
-pub(crate) const LOCAL_READ_TS_KEY: &str = "conduit_local_read_ts";
-
-pub(crate) fn conversation_metadata_key_is_unread_owned(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key.contains("unread")
-        || matches!(
-            key.as_str(),
-            "last_read" | "latest" | "mention_count" | "is_open"
-        )
-        || key == LOCAL_READ_TS_KEY
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredToken {
@@ -79,40 +66,8 @@ pub struct SlackConversation {
     pub is_private: Option<bool>,
     pub is_archived: Option<bool>,
     pub is_starred: Option<bool>,
-    pub unread_count: Option<u64>,
-    #[serde(
-        default,
-        rename = "__conduit_attention",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub attention: Option<ConversationAttentionState>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
-}
-
-/// Conduit's message-level unread projection. Slack's aggregate unread fields
-/// remain untouched so reconciliation can compare both views.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConversationAttentionState {
-    pub unread_count: u64,
-    pub has_unread: bool,
-    #[serde(default)]
-    raw_unread_count: u64,
-    #[serde(default)]
-    raw_has_unread: bool,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    unread_message_ts: BTreeSet<String>,
-    /// Priority-tier subset of `unread_message_ts`: direct messages, direct
-    /// mentions, broadcast mentions, configured names/keywords, or replies to
-    /// a thread the user started, participated in, or subscribed to. Tracked
-    /// independently so muting can suppress the ambient signal above while
-    /// still surfacing this one.
-    #[serde(default)]
-    pub mention_count: u64,
-    #[serde(default)]
-    pub has_mention: bool,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    mention_message_ts: BTreeSet<String>,
 }
 
 impl SlackConversation {
@@ -158,81 +113,12 @@ impl SlackConversation {
         self.is_direct_message() && (self.extra_bool("is_open") || self.priority_hint() > 0.0)
     }
 
-    pub fn last_read_ts(&self) -> Option<&str> {
-        self.extra.get("last_read").and_then(Value::as_str)
-    }
-
-    pub(crate) fn local_read_ts(&self) -> Option<&str> {
-        self.extra.get(LOCAL_READ_TS_KEY).and_then(Value::as_str)
-    }
-
-    pub(crate) fn set_local_read_ts(&mut self, ts: &str) {
-        if !ts.trim().is_empty()
-            && self
-                .local_read_ts()
-                .is_none_or(|current| slack_timestamp_is_after(ts, current))
-        {
-            self.extra
-                .insert(LOCAL_READ_TS_KEY.to_string(), Value::String(ts.to_string()));
-        }
-    }
-
-    pub(crate) fn clear_local_read_ts(&mut self) {
-        self.extra.remove(LOCAL_READ_TS_KEY);
-    }
-
-    pub(crate) fn unread_snapshot_rewinds_read(
-        &self,
-        snapshot: &SlackConversationUnreadSnapshot,
-    ) -> bool {
-        let newer_local_read = self.local_read_ts().is_some_and(|local| {
-            snapshot
-                .last_read
-                .as_deref()
-                .is_none_or(|server| slack_timestamp_is_after(local, server))
-        });
-        let newer_cached_read = self.last_read_ts().is_some_and(|current| {
-            snapshot
-                .last_read
-                .as_deref()
-                .is_some_and(|server| slack_timestamp_is_after(current, server))
-        });
-        newer_local_read || newer_cached_read
-    }
-
     pub fn latest_message_ts(&self) -> Option<&str> {
         self.extra.get("latest").and_then(|latest| {
             latest
                 .as_str()
                 .or_else(|| latest.get("ts").and_then(Value::as_str))
         })
-    }
-
-    pub fn advance_read_cursor(&mut self, ts: &str, remaining_unread: u64) {
-        self.advance_raw_read_cursor(ts, remaining_unread);
-        self.acknowledge_attention_through(ts);
-        if remaining_unread == 0 && self.attention.is_none() {
-            self.clear_attention_activity();
-        }
-    }
-
-    pub(crate) fn advance_raw_read_cursor(&mut self, ts: &str, remaining_unread: u64) {
-        self.advance_read_cursor_position(ts);
-        self.apply_unread_state_preserving_attention(SlackUnreadState::from_parts(
-            true,
-            remaining_unread > 0,
-            remaining_unread,
-        ));
-    }
-
-    pub(crate) fn advance_read_cursor_position(&mut self, ts: &str) {
-        if self
-            .last_read_ts()
-            .is_none_or(|current| slack_timestamp_is_after(ts, current))
-        {
-            self.extra
-                .insert("last_read".to_string(), Value::String(ts.to_string()));
-        }
     }
 
     pub fn display_name(&self) -> String {
@@ -258,344 +144,6 @@ impl SlackConversation {
         user_ids.sort();
         user_ids.dedup();
         user_ids
-    }
-
-    pub fn raw_unread_activity_count(&self) -> u64 {
-        let extra_unread_count = self
-            .extra
-            .iter()
-            .filter(|(key, _)| is_unread_key(key))
-            .filter_map(|(_, value)| unread_count_value(value))
-            .max()
-            .unwrap_or_default();
-
-        self.unread_count
-            .unwrap_or_default()
-            .max(extra_unread_count)
-    }
-
-    pub fn raw_has_unread_activity(&self) -> bool {
-        self.raw_unread_activity_count() > 0
-            || self
-                .extra
-                .iter()
-                .filter(|(key, _)| is_unread_key(key))
-                .any(|(_, value)| unread_flag_value(value))
-    }
-
-    pub fn raw_unread_state(&self) -> SlackUnreadState {
-        let known = self.unread_count.is_some() || self.extra.keys().any(|key| is_unread_key(key));
-        let display_count = self
-            .extra
-            .get("unread_count_display")
-            .and_then(unread_count_value)
-            .or_else(|| {
-                self.extra
-                    .get("unread_count_string")
-                    .and_then(unread_count_value)
-            })
-            .unwrap_or_else(|| self.unread_count.unwrap_or_default());
-
-        SlackUnreadState::from_parts(known, self.raw_has_unread_activity(), display_count)
-    }
-
-    pub fn unread_activity_count(&self) -> u64 {
-        self.attention.as_ref().map_or_else(
-            || self.raw_unread_activity_count(),
-            |state| state.unread_count,
-        )
-    }
-
-    pub fn has_unread_activity(&self) -> bool {
-        self.attention.as_ref().map_or_else(
-            || self.raw_has_unread_activity(),
-            |state| state.has_unread || state.unread_count > 0,
-        )
-    }
-
-    /// Priority-tier unread: direct messages, direct/broadcast mentions,
-    /// configured names/keywords, or thread replies the user is following.
-    /// Independent of mute, unlike the ambient signal above.
-    pub fn has_mention_activity(&self) -> bool {
-        self.attention
-            .as_ref()
-            .is_some_and(|state| state.has_mention || state.mention_count > 0)
-    }
-
-    pub fn mention_activity_count(&self) -> u64 {
-        self.attention
-            .as_ref()
-            .map_or(0, |state| state.mention_count)
-    }
-
-    pub fn unread_state(&self) -> SlackUnreadState {
-        self.attention.as_ref().map_or_else(
-            || self.raw_unread_state(),
-            |state| SlackUnreadState::from_parts(true, state.has_unread, state.unread_count),
-        )
-    }
-
-    pub fn observe_attention_message(&mut self, record_unread: bool, record_mention: bool) {
-        let raw = self.raw_unread_state();
-        let state = self.attention.get_or_insert(ConversationAttentionState {
-            unread_count: 0,
-            has_unread: false,
-            raw_unread_count: raw.display_count,
-            raw_has_unread: raw.has_unread,
-            unread_message_ts: BTreeSet::new(),
-            mention_count: 0,
-            has_mention: false,
-            mention_message_ts: BTreeSet::new(),
-        });
-        if record_unread {
-            state.unread_count = state.unread_count.saturating_add(1);
-            state.has_unread = true;
-        }
-        if record_mention {
-            state.mention_count = state.mention_count.saturating_add(1);
-            state.has_mention = true;
-        }
-    }
-
-    pub(crate) fn has_observed_attention_message(&self, message_ts: &str) -> bool {
-        self.extra
-            .get(SEEN_ATTENTION_MESSAGE_TS_KEY)
-            .and_then(Value::as_array)
-            .is_some_and(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .any(|known| known == message_ts)
-            })
-    }
-
-    pub(crate) fn tracked_unread_message_timestamps(&self) -> Option<Vec<&str>> {
-        self.attention.as_ref().and_then(|state| {
-            if state.unread_count > 0 && state.unread_message_ts.is_empty() {
-                None
-            } else {
-                Some(state.unread_message_ts.iter().map(String::as_str).collect())
-            }
-        })
-    }
-
-    pub(crate) fn observe_attention_message_at(
-        &mut self,
-        message_ts: &str,
-        record_unread: bool,
-        record_mention: bool,
-    ) -> bool {
-        if message_ts.trim().is_empty() || self.has_observed_attention_message(message_ts) {
-            return false;
-        }
-        self.observe_attention_message(record_unread, record_mention);
-        if record_unread || record_mention {
-            let state = self
-                .attention
-                .as_mut()
-                .expect("attention state was initialized above");
-            if record_unread {
-                state.unread_message_ts.insert(message_ts.to_string());
-            }
-            if record_mention {
-                state.mention_message_ts.insert(message_ts.to_string());
-            }
-        }
-        let mut seen = self
-            .extra
-            .get(SEEN_ATTENTION_MESSAGE_TS_KEY)
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        seen.push(message_ts.to_string());
-        if seen.len() > MAX_SEEN_ATTENTION_MESSAGES {
-            seen.drain(..seen.len() - MAX_SEEN_ATTENTION_MESSAGES);
-        }
-        self.extra.insert(
-            SEEN_ATTENTION_MESSAGE_TS_KEY.to_string(),
-            Value::Array(seen.into_iter().map(Value::String).collect()),
-        );
-        true
-    }
-
-    pub fn clear_attention_activity(&mut self) {
-        self.attention = Some(ConversationAttentionState::default());
-    }
-
-    /// Clears classified unread observations at or before a read cursor while
-    /// retaining newer observations and the bounded delivery ledger.
-    pub(crate) fn acknowledge_attention_through(&mut self, read_ts: &str) {
-        let Some(attention) = self.attention.as_mut() else {
-            return;
-        };
-        attention
-            .unread_message_ts
-            .retain(|message_ts| slack_timestamp_is_after(message_ts, read_ts));
-        let tracked_after = u64::try_from(attention.unread_message_ts.len()).unwrap_or(u64::MAX);
-        // Legacy untracked counts cannot be proven newer than the cursor.
-        attention.unread_count = tracked_after;
-        attention.has_unread = attention.unread_count > 0;
-        attention
-            .mention_message_ts
-            .retain(|message_ts| slack_timestamp_is_after(message_ts, read_ts));
-        attention.mention_count =
-            u64::try_from(attention.mention_message_ts.len()).unwrap_or(u64::MAX);
-        attention.has_mention = attention.mention_count > 0;
-    }
-
-    pub(crate) fn clear_raw_unread_activity(&mut self) {
-        self.unread_count = Some(0);
-
-        for (key, value) in &mut self.extra {
-            if is_unread_key(key) {
-                *value = cleared_unread_value(value);
-            }
-        }
-        self.reconcile_attention_with_raw(self.raw_unread_state());
-    }
-
-    pub fn acknowledge_attention_messages(&mut self, message_ts: &[String]) -> u64 {
-        let Some(attention) = self.attention.as_mut() else {
-            return 0;
-        };
-        let mut acknowledged = 0;
-        for message_ts in message_ts {
-            if acknowledged >= attention.unread_count {
-                break;
-            }
-            if attention.unread_message_ts.remove(message_ts) {
-                acknowledged += 1;
-            }
-        }
-        attention.unread_count -= acknowledged;
-        attention.has_unread = attention.unread_count > 0;
-        for message_ts in message_ts {
-            if attention.mention_message_ts.remove(message_ts) {
-                attention.mention_count = attention.mention_count.saturating_sub(1);
-            }
-        }
-        attention.has_mention = attention.mention_count > 0;
-        acknowledged
-    }
-
-    pub fn clear_unread_activity(&mut self) {
-        self.clear_raw_unread_activity();
-        self.clear_attention_activity();
-    }
-
-    pub fn apply_unread_state(&mut self, state: SlackUnreadState) {
-        self.apply_unread_state_preserving_attention(state);
-        if !state.known {
-            return;
-        }
-        self.reconcile_attention_with_raw(state);
-    }
-
-    fn apply_unread_state_preserving_attention(&mut self, state: SlackUnreadState) {
-        if !state.known {
-            return;
-        }
-
-        self.unread_count = Some(state.display_count);
-        self.extra.insert(
-            "unread_count_display".to_string(),
-            serde_json::json!(state.display_count),
-        );
-        self.extra.insert(
-            "has_unreads".to_string(),
-            serde_json::json!(state.has_unread),
-        );
-        if let Some(attention) = self.attention.as_mut() {
-            attention.raw_unread_count = state.display_count;
-            attention.raw_has_unread = state.has_unread;
-        }
-    }
-
-    fn reconcile_attention_with_raw(&mut self, raw: SlackUnreadState) {
-        let Some(attention) = self.attention.as_mut() else {
-            return;
-        };
-        if !raw.has_unread {
-            attention.unread_count = 0;
-            attention.has_unread = false;
-            attention.unread_message_ts.clear();
-        }
-        attention.raw_unread_count = raw.display_count;
-        attention.raw_has_unread = raw.has_unread;
-    }
-
-    pub fn apply_unread_snapshot(&mut self, snapshot: &SlackConversationUnreadSnapshot) {
-        if self.id != snapshot.channel_id || !snapshot.unread_state.known {
-            return;
-        }
-
-        self.apply_unread_state(snapshot.unread_state);
-        if let Some(last_read) = snapshot.last_read.as_deref() {
-            let should_advance = self
-                .last_read_ts()
-                .is_none_or(|current| slack_timestamp_is_after(last_read, current));
-            if should_advance {
-                self.extra.insert(
-                    "last_read".to_string(),
-                    Value::String(last_read.to_string()),
-                );
-            }
-        }
-        if let Some(latest) = snapshot.latest.as_deref() {
-            let should_advance = self
-                .latest_message_ts()
-                .is_none_or(|current| slack_timestamp_is_after(latest, current));
-            if should_advance {
-                self.extra
-                    .insert("latest".to_string(), Value::String(latest.to_string()));
-            }
-        }
-        if let Some(mention_count) = snapshot.mention_count {
-            self.extra.insert(
-                "mention_count".to_string(),
-                serde_json::json!(mention_count),
-            );
-        }
-        if let Some(is_open) = snapshot.is_open {
-            self.extra
-                .insert("is_open".to_string(), serde_json::json!(is_open));
-        }
-    }
-
-    pub(crate) fn apply_unread_snapshot_preserving_attention_messages(
-        &mut self,
-        snapshot: &SlackConversationUnreadSnapshot,
-        preserved_message_ts: &[String],
-    ) {
-        let preserved = self
-            .attention
-            .as_ref()
-            .map(|attention| {
-                attention
-                    .unread_message_ts
-                    .iter()
-                    .filter(|message_ts| preserved_message_ts.contains(message_ts))
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        self.apply_unread_snapshot(snapshot);
-        if snapshot.unread_state.has_unread || preserved.is_empty() {
-            return;
-        }
-        let Some(attention) = self.attention.as_mut() else {
-            return;
-        };
-        attention.unread_message_ts = preserved;
-        attention.unread_count =
-            u64::try_from(attention.unread_message_ts.len()).unwrap_or(u64::MAX);
-        attention.has_unread = attention.unread_count > 0;
     }
 
     pub fn is_muted_conversation(&self) -> bool {
@@ -778,33 +326,6 @@ fn non_empty_string(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SlackUnreadState {
-    pub known: bool,
-    pub has_unread: bool,
-    pub display_count: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SlackConversationUnreadSnapshot {
-    pub channel_id: String,
-    pub unread_state: SlackUnreadState,
-    pub last_read: Option<String>,
-    pub latest: Option<String>,
-    pub mention_count: Option<u64>,
-    pub is_open: Option<bool>,
-}
-
-impl SlackUnreadState {
-    pub fn from_parts(known: bool, has_unread: bool, display_count: u64) -> Self {
-        Self {
-            known,
-            has_unread: known && (has_unread || display_count > 0),
-            display_count,
-        }
-    }
-}
-
 pub(crate) fn slack_timestamp_is_after(candidate: &str, current: &str) -> bool {
     compare_slack_timestamps(candidate, current)
         .unwrap_or_else(|| candidate.cmp(current))
@@ -845,41 +366,6 @@ fn slack_timestamp_parts(value: &str) -> Option<(u64, &str)> {
         return None;
     }
     Some((seconds.parse().ok()?, fraction))
-}
-
-fn is_unread_key(key: &str) -> bool {
-    key.to_lowercase().contains("unread")
-}
-
-fn unread_count_value(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => number.as_u64().or_else(|| {
-            number
-                .as_i64()
-                .filter(|value| *value > 0)
-                .map(|value| value as u64)
-        }),
-        Value::String(value) => value.parse::<u64>().ok(),
-        _ => None,
-    }
-}
-
-fn unread_flag_value(value: &Value) -> bool {
-    match value {
-        Value::Bool(value) => *value,
-        Value::Number(number) => number.as_u64().is_some_and(|value| value > 0),
-        Value::String(value) => value.parse::<u64>().is_ok_and(|value| value > 0),
-        _ => false,
-    }
-}
-
-fn cleared_unread_value(value: &Value) -> Value {
-    match value {
-        Value::Bool(_) => Value::Bool(false),
-        Value::Number(_) => serde_json::json!(0),
-        Value::String(_) => Value::String("0".to_string()),
-        _ => value.clone(),
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1322,10 +808,6 @@ pub struct SlackMessage {
     pub latest_reply: Option<String>,
     #[serde(default)]
     pub subscribed: Option<bool>,
-    #[serde(default)]
-    pub last_read: Option<String>,
-    #[serde(default)]
-    pub unread_count: Option<u64>,
     pub is_starred: Option<bool>,
     pub edited: Option<SlackMessageEdit>,
     pub reactions: Option<Vec<SlackReaction>>,
@@ -2537,347 +2019,25 @@ mod tests {
             "id": "C123",
             "name": "general",
             "is_channel": true,
-            "unread_count": 3,
-            "unread_count_display": 2,
             "is_ext_shared": true,
-            "last_read": "1700000000.000000"
+            "purpose": {"value": "team chat"}
         }))
         .expect("failed to parse conversation");
 
-        assert_eq!(conversation.unread_count, Some(3));
         assert_eq!(
-            conversation.extra.get("unread_count_display"),
-            Some(&serde_json::json!(2))
+            conversation.extra.get("is_ext_shared"),
+            Some(&serde_json::json!(true))
         );
         assert_eq!(
-            conversation.extra.get("last_read"),
-            Some(&serde_json::json!("1700000000.000000"))
+            conversation.extra.get("purpose"),
+            Some(&serde_json::json!({"value": "team chat"}))
         );
 
         let serialized = serde_json::to_value(&conversation).expect("failed to serialize");
-        assert_eq!(serialized["unread_count_display"], serde_json::json!(2));
+        assert_eq!(serialized["is_ext_shared"], serde_json::json!(true));
         assert_eq!(
-            serialized["last_read"],
-            serde_json::json!("1700000000.000000")
-        );
-    }
-
-    #[test]
-    fn conversation_unread_activity_uses_known_and_extra_unread_counts() {
-        let unread_count: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "C1",
-            "unread_count": 3,
-            "unread_count_display": 0
-        }))
-        .expect("failed to parse conversation");
-        let unread_display: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "C2",
-            "unread_count": 0,
-            "unread_count_display": 4
-        }))
-        .expect("failed to parse conversation");
-        let unread_flag: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "C3",
-            "has_unreads": true
-        }))
-        .expect("failed to parse conversation");
-
-        assert_eq!(unread_count.unread_activity_count(), 3);
-        assert_eq!(unread_display.unread_activity_count(), 4);
-        assert_eq!(unread_flag.unread_activity_count(), 0);
-        assert!(unread_flag.has_unread_activity());
-        assert!(unread_display.has_unread_activity());
-    }
-
-    #[test]
-    fn conversation_applies_badgeless_unread_state() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            unread_count: Some(7),
-            ..Default::default()
-        };
-
-        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 0));
-
-        assert_eq!(conversation.unread_activity_count(), 0);
-        assert!(conversation.has_unread_activity());
-        assert_eq!(
-            conversation.extra.get("unread_count_display"),
-            Some(&serde_json::json!(0))
-        );
-        assert_eq!(
-            conversation.extra.get("has_unreads"),
-            Some(&serde_json::json!(true))
-        );
-    }
-
-    #[test]
-    fn conversation_unread_snapshot_updates_cursors_monotonically() {
-        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "D1",
-            "is_im": true,
-            "latest": "10.000002"
-        }))
-        .unwrap();
-        conversation.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
-            channel_id: "D1".to_string(),
-            unread_state: SlackUnreadState::from_parts(true, true, 0),
-            last_read: Some("9.999999".to_string()),
-            latest: Some("10.000001".to_string()),
-            mention_count: Some(3),
-            is_open: Some(true),
-        });
-
-        assert_eq!(conversation.last_read_ts(), Some("9.999999"));
-        assert_eq!(conversation.latest_message_ts(), Some("10.000002"));
-        assert!(conversation.has_unread_activity());
-        assert_eq!(conversation.unread_activity_count(), 0);
-        assert_eq!(
-            conversation.extra.get("mention_count"),
-            Some(&serde_json::json!(3))
-        );
-        assert!(conversation.has_active_direct_message_hint());
-        assert!(slack_timestamp_is_after("10.0", "9.999999"));
-        assert!(!slack_timestamp_is_after("10.000001", "10.000002"));
-    }
-
-    #[test]
-    fn conversation_unread_state_prefers_display_count() {
-        let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "C1",
-            "unread_count": 5,
-            "unread_count_display": 0
-        }))
-        .expect("failed to parse conversation");
-
-        let state = conversation.unread_state();
-
-        assert!(state.known);
-        assert!(state.has_unread);
-        assert_eq!(state.display_count, 0);
-    }
-
-    #[test]
-    fn attention_unread_overlay_keeps_raw_slack_state_distinct() {
-        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "C1",
-            "unread_count": 2,
-            "unread_count_display": 2,
-            "has_unreads": true
-        }))
-        .unwrap();
-
-        conversation.observe_attention_message(false, false);
-        conversation.apply_unread_snapshot(&SlackConversationUnreadSnapshot {
-            channel_id: "C1".to_string(),
-            unread_state: SlackUnreadState::from_parts(true, true, 3),
-            ..Default::default()
-        });
-
-        assert_eq!(conversation.raw_unread_state().display_count, 3);
-        assert_eq!(conversation.unread_activity_count(), 0);
-        assert!(!conversation.has_unread_activity());
-    }
-
-    #[test]
-    fn raw_increases_never_create_local_attention_unread() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            unread_count: Some(1),
-            ..Default::default()
-        };
-
-        conversation.observe_attention_message(true, false);
-        assert_eq!(conversation.unread_activity_count(), 1);
-        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 2));
-        assert_eq!(conversation.raw_unread_activity_count(), 2);
-        assert_eq!(conversation.unread_activity_count(), 1);
-
-        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 4));
-        assert_eq!(conversation.unread_activity_count(), 1);
-        conversation.apply_unread_state(SlackUnreadState::from_parts(true, false, 0));
-        assert_eq!(conversation.unread_activity_count(), 0);
-    }
-
-    #[test]
-    fn raw_zero_preserves_exact_tracked_attention_identities() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            unread_count: Some(2),
-            ..Default::default()
-        };
-        conversation.observe_attention_message_at("1.0", true, false);
-        conversation.observe_attention_message_at("2.0", true, false);
-
-        conversation.advance_raw_read_cursor("3.0", 0);
-
-        assert_eq!(conversation.raw_unread_activity_count(), 0);
-        assert_eq!(conversation.unread_activity_count(), 2);
-        assert_eq!(
-            conversation.tracked_unread_message_timestamps(),
-            Some(vec!["1.0", "2.0"])
-        );
-    }
-
-    #[test]
-    fn acknowledging_attention_messages_preserves_other_unreads_and_raw_state() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            unread_count: Some(9),
-            ..Default::default()
-        };
-        conversation.observe_attention_message_at("1.0", true, false);
-        conversation.observe_attention_message_at("2.0", true, false);
-        conversation.observe_attention_message_at("3.0", true, false);
-
-        assert_eq!(
-            conversation.acknowledge_attention_messages(&["1.0".to_string(), "2.0".to_string()]),
-            2
-        );
-        assert_eq!(conversation.unread_activity_count(), 1);
-        assert!(conversation.has_unread_activity());
-        assert_eq!(conversation.raw_unread_activity_count(), 9);
-    }
-
-    #[test]
-    fn legacy_attention_state_does_not_acknowledge_untracked_message_timestamps() {
-        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "C1",
-            "__conduit_attention": {
-                "unread_count": 2,
-                "has_unread": true
-            }
-        }))
-        .unwrap();
-
-        assert_eq!(
-            conversation.acknowledge_attention_messages(&["2.0".to_string()]),
-            0
-        );
-        assert_eq!(conversation.unread_activity_count(), 2);
-        assert!(conversation.has_unread_activity());
-        assert_eq!(conversation.tracked_unread_message_timestamps(), None);
-    }
-
-    #[test]
-    fn badgeless_raw_snapshot_does_not_clear_classified_attention() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            unread_count: Some(3),
-            ..Default::default()
-        };
-        conversation.observe_attention_message(true, false);
-
-        conversation.apply_unread_state(SlackUnreadState::from_parts(true, true, 0));
-
-        assert!(conversation.raw_has_unread_activity());
-        assert_eq!(conversation.raw_unread_state().display_count, 0);
-        assert!(conversation.has_unread_activity());
-        assert_eq!(conversation.unread_activity_count(), 1);
-    }
-
-    #[test]
-    fn attention_overlay_round_trips_and_local_read_clears_it() {
-        let mut conversation = SlackConversation {
-            id: "D1".to_string(),
-            ..Default::default()
-        };
-        conversation.observe_attention_message(true, false);
-        let serialized = serde_json::to_string(&conversation).unwrap();
-        let mut restored: SlackConversation = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(restored.raw_unread_activity_count(), 0);
-        assert_eq!(restored.unread_activity_count(), 1);
-        restored.advance_read_cursor("20.0", 0);
-        assert_eq!(restored.unread_activity_count(), 0);
-        assert!(!restored.has_unread_activity());
-    }
-
-    #[test]
-    fn read_cursor_preserves_newer_semantic_attention_and_seen_identity() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            unread_count: Some(2),
-            ..Default::default()
-        };
-        conversation.observe_attention_message_at("19.0", true, false);
-        conversation.observe_attention_message_at("21.0", true, false);
-
-        conversation.advance_read_cursor("20.0", 0);
-
-        assert_eq!(conversation.raw_unread_activity_count(), 0);
-        assert_eq!(conversation.unread_activity_count(), 1);
-        assert!(conversation.has_unread_activity());
-        assert!(conversation.has_observed_attention_message("19.0"));
-        assert!(conversation.has_observed_attention_message("21.0"));
-        assert!(!conversation.observe_attention_message_at("21.0", true, false));
-        assert_eq!(conversation.unread_activity_count(), 1);
-    }
-
-    #[test]
-    fn mention_ledger_tracks_independently_of_ambient_unread() {
-        let mut conversation = SlackConversation {
-            id: "C1".to_string(),
-            ..Default::default()
-        };
-        // An ordinary message: counts as ambient unread only.
-        conversation.observe_attention_message_at("1.0", true, false);
-        // A mention: counts toward both ledgers.
-        conversation.observe_attention_message_at("2.0", true, true);
-        // A mention buried in a thread reply that doesn't belong to the
-        // channel's own timeline: mention-only, no ambient bump.
-        conversation.observe_attention_message_at("3.0", false, true);
-
-        assert_eq!(conversation.unread_activity_count(), 2);
-        assert!(conversation.has_unread_activity());
-        assert_eq!(conversation.mention_activity_count(), 2);
-        assert!(conversation.has_mention_activity());
-
-        // Reading through "2.0" clears both the ordinary and mention entries
-        // at or before the cursor, but the later mention-only entry survives.
-        conversation.advance_read_cursor("2.0", 0);
-        assert_eq!(conversation.unread_activity_count(), 0);
-        assert!(!conversation.has_unread_activity());
-        assert_eq!(conversation.mention_activity_count(), 1);
-        assert!(conversation.has_mention_activity());
-
-        let acknowledged = conversation.acknowledge_attention_messages(&["3.0".to_string()]);
-        assert_eq!(acknowledged, 0, "already below the ambient cursor");
-        assert_eq!(conversation.mention_activity_count(), 0);
-        assert!(!conversation.has_mention_activity());
-    }
-
-    #[test]
-    fn conversation_clear_unread_activity_resets_known_and_extra_fields() {
-        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
-            "id": "C1",
-            "unread_count": 4,
-            "unread_count_display": 2,
-            "has_unreads": true,
-            "unread_count_string": "5",
-            "last_read": "1710000000.000000"
-        }))
-        .expect("failed to parse conversation");
-
-        conversation.clear_unread_activity();
-
-        assert_eq!(conversation.unread_activity_count(), 0);
-        assert_eq!(conversation.unread_count, Some(0));
-        assert_eq!(
-            conversation.extra.get("unread_count_display"),
-            Some(&serde_json::json!(0))
-        );
-        assert_eq!(
-            conversation.extra.get("has_unreads"),
-            Some(&serde_json::json!(false))
-        );
-        assert_eq!(
-            conversation.extra.get("unread_count_string"),
-            Some(&serde_json::json!("0"))
-        );
-        assert_eq!(
-            conversation.extra.get("last_read"),
-            Some(&serde_json::json!("1710000000.000000"))
+            serialized["purpose"],
+            serde_json::json!({"value": "team chat"})
         );
     }
 
@@ -3123,21 +2283,6 @@ mod tests {
         assert!(reply.belongs_to_thread("1"));
         assert!(broadcast.belongs_in_channel_timeline());
         assert!(legacy_broadcast.belongs_in_channel_timeline());
-    }
-
-    #[test]
-    fn advancing_read_cursor_preserves_messages_after_the_cursor() {
-        let mut conversation = SlackConversation {
-            id: "C123".into(),
-            unread_count: Some(3),
-            ..Default::default()
-        };
-
-        conversation.advance_read_cursor("2.0", 1);
-
-        assert_eq!(conversation.last_read_ts(), Some("2.0"));
-        assert!(conversation.has_unread_activity());
-        assert_eq!(conversation.unread_activity_count(), 1);
     }
 
     #[test]

@@ -34,6 +34,10 @@ impl ThreadRelationship {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeliveryState {
     Fresh,
+    /// Retained alongside `Stale` as part of the delivery taxonomy: both lost
+    /// their producers when read-cursor tracking was removed, and the pending
+    /// read/unread redesign is expected to restore them.
+    #[cfg_attr(not(test), allow(dead_code))]
     Reconciled,
     Historical,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -183,13 +187,6 @@ impl AttentionReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionDecision {
-    pub(crate) record_unread: bool,
-    /// Whether this message is priority-tier (direct message, direct mention,
-    /// broadcast mention, configured name/keyword, or a reply to a thread the
-    /// user started, participated in, or subscribed to). Content-based only —
-    /// independent of notification preferences and of mute, so it can drive a
-    /// persisted "you were addressed" signal that survives both.
-    pub(crate) record_mention: bool,
     pub(crate) send_notification: bool,
     pub(crate) reasons: Vec<AttentionReason>,
 }
@@ -240,40 +237,30 @@ impl AttentionPolicy {
     pub(crate) fn decide(&self, candidate: AttentionCandidate<'_>) -> AttentionDecision {
         if is_membership_lifecycle_subtype(candidate.subtype) {
             return AttentionDecision {
-                record_unread: false,
-                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::MembershipLifecycle],
             };
         }
         if candidate.no_notifications || is_non_message_noise_subtype(candidate.subtype) {
             return AttentionDecision {
-                record_unread: false,
-                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::NonMessageNoise],
             };
         }
         if !candidate.has_content {
             return AttentionDecision {
-                record_unread: false,
-                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::EmptyMessage],
             };
         }
         if candidate.mutation != MessageMutation::Posted {
             return AttentionDecision {
-                record_unread: false,
-                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::NonPostedMutation],
             };
         }
         if candidate.author_is_self {
             return AttentionDecision {
-                record_unread: false,
-                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::SelfAuthored],
             };
@@ -317,22 +304,6 @@ impl AttentionPolicy {
                 }
             });
         }
-        // Priority tier: content-based only, independent of notification
-        // preferences and mute, matching Slack's "muted channels still show a
-        // mention badge" behavior.
-        let is_priority = reasons.iter().copied().any(|reason| {
-            matches!(
-                reason,
-                AttentionReason::DirectMessage
-                    | AttentionReason::DirectMention
-                    | AttentionReason::BroadcastMention
-                    | AttentionReason::NameOrAlias
-                    | AttentionReason::KeywordOrPhrase
-                    | AttentionReason::StartedThreadReply
-                    | AttentionReason::ParticipatedThreadReply
-                    | AttentionReason::SubscribedThreadReply
-            )
-        });
         let notification_relevant = reasons
             .iter()
             .copied()
@@ -350,10 +321,6 @@ impl AttentionPolicy {
         if candidate.actively_reading {
             reasons.push(AttentionReason::ActiveTarget);
         }
-        let records_unread = matches!(
-            candidate.delivery,
-            DeliveryState::Fresh | DeliveryState::Reconciled
-        );
         match candidate.delivery {
             DeliveryState::Fresh => {}
             DeliveryState::Reconciled | DeliveryState::Historical => {
@@ -363,16 +330,12 @@ impl AttentionPolicy {
             DeliveryState::Duplicate => reasons.push(AttentionReason::DuplicateDelivery),
         }
 
-        let record_unread = records_unread;
-        let record_mention = records_unread && is_priority;
         let send_notification = candidate.delivery == DeliveryState::Fresh
             && notification_relevant
             && self.preferences.desktop_notifications
             && !candidate.muted
             && !candidate.actively_reading;
         AttentionDecision {
-            record_unread,
-            record_mention,
             send_notification,
             reasons,
         }
@@ -589,11 +552,10 @@ mod tests {
     }
 
     #[test]
-    fn decision_matrix_separates_unread_from_notification_relevance() {
+    fn decision_matrix_maps_each_trigger_to_its_notification_relevance() {
         struct Case {
             name: &'static str,
             candidate: AttentionCandidate<'static>,
-            unread: bool,
             notify: bool,
             reason: AttentionReason,
         }
@@ -619,56 +581,48 @@ mod tests {
             Case {
                 name: "direct message",
                 candidate: direct_message,
-                unread: true,
                 notify: true,
                 reason: AttentionReason::DirectMessage,
             },
             Case {
                 name: "group direct message",
                 candidate: group_direct_message,
-                unread: true,
                 notify: true,
                 reason: AttentionReason::DirectMessage,
             },
             Case {
                 name: "direct mention",
                 candidate: mention,
-                unread: true,
                 notify: true,
                 reason: AttentionReason::DirectMention,
             },
             Case {
                 name: "ordinary channel message",
                 candidate: ordinary,
-                unread: true,
                 notify: false,
                 reason: AttentionReason::OrdinaryMessage,
             },
             Case {
                 name: "reply to a thread the user started",
                 candidate: thread_started,
-                unread: true,
                 notify: true,
                 reason: AttentionReason::StartedThreadReply,
             },
             Case {
                 name: "reply to a thread the user participated in",
                 candidate: thread_participated,
-                unread: true,
                 notify: true,
                 reason: AttentionReason::ParticipatedThreadReply,
             },
             Case {
                 name: "reply to a subscribed thread",
                 candidate: thread_subscribed,
-                unread: true,
                 notify: true,
                 reason: AttentionReason::SubscribedThreadReply,
             },
             Case {
                 name: "reply to an unrelated thread",
                 candidate: thread_unrelated,
-                unread: true,
                 notify: false,
                 reason: AttentionReason::OrdinaryMessage,
             },
@@ -676,7 +630,6 @@ mod tests {
 
         for case in cases {
             let actual = decision(case.candidate);
-            assert_eq!(actual.record_unread, case.unread, "{} unread", case.name);
             assert_eq!(
                 actual.send_notification, case.notify,
                 "{} notification",
@@ -704,7 +657,6 @@ mod tests {
             let mut message = candidate();
             message.subtype = Some(subtype);
             let actual = decision(message);
-            assert!(!actual.record_unread, "{subtype} unread");
             assert!(!actual.send_notification, "{subtype} notification");
             assert_eq!(
                 actual.reasons,
@@ -752,11 +704,10 @@ mod tests {
     }
 
     #[test]
-    fn suppression_matrix_preserves_unread_where_appropriate() {
+    fn suppression_matrix_blocks_notifications_for_every_suppressed_case() {
         struct Case {
             name: &'static str,
             mutate: fn(&mut AttentionCandidate<'static>),
-            unread: bool,
             reason: AttentionReason,
         }
 
@@ -764,43 +715,36 @@ mod tests {
             Case {
                 name: "self authored",
                 mutate: |message| message.author_is_self = true,
-                unread: false,
                 reason: AttentionReason::SelfAuthored,
             },
             Case {
                 name: "muted",
                 mutate: |message| message.muted = true,
-                unread: true,
                 reason: AttentionReason::MutedConversation,
             },
             Case {
                 name: "active target",
                 mutate: |message| message.actively_reading = true,
-                unread: true,
                 reason: AttentionReason::ActiveTarget,
             },
             Case {
-                name: "reconciled unread",
+                name: "reconciled",
                 mutate: |message| message.delivery = DeliveryState::Reconciled,
-                unread: true,
                 reason: AttentionReason::HistoricalDelivery,
             },
             Case {
-                name: "historical read",
+                name: "historical",
                 mutate: |message| message.delivery = DeliveryState::Historical,
-                unread: false,
                 reason: AttentionReason::HistoricalDelivery,
             },
             Case {
                 name: "stale",
                 mutate: |message| message.delivery = DeliveryState::Stale,
-                unread: false,
                 reason: AttentionReason::StaleDelivery,
             },
             Case {
                 name: "duplicate",
                 mutate: |message| message.delivery = DeliveryState::Duplicate,
-                unread: false,
                 reason: AttentionReason::DuplicateDelivery,
             },
         ];
@@ -810,7 +754,6 @@ mod tests {
             message.conversation = ConversationKind::DirectMessage;
             (case.mutate)(&mut message);
             let actual = decision(message);
-            assert_eq!(actual.record_unread, case.unread, "{} unread", case.name);
             assert!(!actual.send_notification, "{} notification", case.name);
             assert!(
                 actual.reasons.contains(&case.reason),
@@ -854,7 +797,6 @@ mod tests {
             ),
         ] {
             let actual = AttentionPolicy::new(preferences).decide(message);
-            assert!(actual.record_unread);
             assert!(!actual.send_notification);
         }
     }
@@ -906,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn master_notification_setting_does_not_disable_unread() {
+    fn master_notification_setting_suppresses_every_notification() {
         let mut message = candidate();
         message.conversation = ConversationKind::DirectMessage;
         let actual = AttentionPolicy::new(AttentionPreferences {
@@ -915,7 +857,6 @@ mod tests {
         })
         .decide(message);
 
-        assert!(actual.record_unread);
         assert!(!actual.send_notification);
         assert!(actual
             .reasons
@@ -946,17 +887,20 @@ mod tests {
             message.text = text;
             let actual = decision(message);
             assert!(actual.send_notification, "{text}");
-            assert!(actual.record_mention, "{text}");
             assert!(actual.reasons.contains(&AttentionReason::BroadcastMention));
         }
 
         let mut malformed = candidate();
         malformed.text = "<!channel";
-        assert!(!decision(malformed).record_mention);
+        assert!(!decision(malformed)
+            .reasons
+            .contains(&AttentionReason::BroadcastMention));
 
         let mut unrelated = candidate();
         unrelated.text = "<!date^1234567890^{date_short}|fallback>";
-        assert!(!decision(unrelated).record_mention);
+        assert!(!decision(unrelated)
+            .reasons
+            .contains(&AttentionReason::BroadcastMention));
     }
 
     #[test]
@@ -965,7 +909,6 @@ mod tests {
             let mut message = candidate();
             message.mutation = mutation;
             let actual = decision(message);
-            assert!(!actual.record_unread);
             assert!(!actual.send_notification);
             assert_eq!(actual.reasons, vec![AttentionReason::NonPostedMutation]);
         }
@@ -998,15 +941,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_non_message_noise_are_not_unread() {
+    fn empty_and_non_message_noise_produce_no_notification() {
         let mut empty = candidate();
         empty.text = " ";
         empty.has_content = false;
         assert_eq!(
             decision(empty),
             AttentionDecision {
-                record_unread: false,
-                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::EmptyMessage],
             }
@@ -1017,8 +958,6 @@ mod tests {
         assert_eq!(
             decision(noise),
             AttentionDecision {
-                record_unread: false,
-                record_mention: false,
                 send_notification: false,
                 reasons: vec![AttentionReason::NonMessageNoise],
             }
@@ -1048,20 +987,14 @@ mod tests {
         message
     }
 
-    fn measure_classifier_burst(policy: &AttentionPolicy) -> (u128, u64, u64) {
+    fn measure_classifier_burst(policy: &AttentionPolicy) -> (u128, u64) {
         let started = Instant::now();
-        let mut unread = 0_u64;
         let mut notification_candidates = 0_u64;
         for index in 0..10_000 {
             let decision = black_box(policy.decide(black_box(classifier_burst_candidate(index))));
-            unread += u64::from(decision.record_unread);
             notification_candidates += u64::from(decision.send_notification);
         }
-        (
-            started.elapsed().as_nanos(),
-            unread,
-            notification_candidates,
-        )
+        (started.elapsed().as_nanos(), notification_candidates)
     }
 
     #[test]
@@ -1071,14 +1004,12 @@ mod tests {
             keywords: vec!["priority phrase".into()],
             ..AttentionPreferences::default()
         });
-        let (_, warmup_unread, warmup_notifications) = measure_classifier_burst(&policy);
-        assert_eq!(warmup_unread, 9_000);
+        let (_, warmup_notifications) = measure_classifier_burst(&policy);
         assert_eq!(warmup_notifications, 5_000);
 
         let mut elapsed = Vec::with_capacity(5);
         for _ in 0..5 {
-            let (nanoseconds, unread, notification_candidates) = measure_classifier_burst(&policy);
-            assert_eq!(unread, 9_000);
+            let (nanoseconds, notification_candidates) = measure_classifier_burst(&policy);
             assert_eq!(notification_candidates, 5_000);
             elapsed.push(nanoseconds);
         }
@@ -1087,7 +1018,7 @@ mod tests {
         eprintln!(
             "attention_classifier_burst decisions=10000 iterations=5 \
              median_batch_ns={median_batch_nanoseconds} median_ns_per_decision={} \
-             unread=9000 notification_candidates=5000",
+             notification_candidates=5000",
             median_batch_nanoseconds / 10_000
         );
     }

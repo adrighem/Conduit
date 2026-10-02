@@ -1016,21 +1016,6 @@ impl ConduitApplication {
         };
 
         let settings = gio::Settings::new(config::APPLICATION_ID);
-        let unreads_row = adw::SwitchRow::builder()
-            .title("Show Unreads section")
-            .subtitle("Duplicate unread conversations into a separate sidebar section.")
-            .active(settings.boolean(config::SIDEBAR_SHOW_UNREADS_SECTION_KEY))
-            .build();
-        settings
-            .bind(
-                config::SIDEBAR_SHOW_UNREADS_SECTION_KEY,
-                &unreads_row,
-                "active",
-            )
-            .build();
-
-        let sidebar_group = adw::PreferencesGroup::builder().title("Sidebar").build();
-        sidebar_group.add(&unreads_row);
         let notifications_group = notification_preferences_group(&settings, &window);
 
         let realtime_row = adw::PasswordEntryRow::builder()
@@ -1087,7 +1072,6 @@ impl ConduitApplication {
             .title("Preferences")
             .icon_name("view-list-symbolic")
             .build();
-        page.add(&sidebar_group);
         page.add(&notifications_group);
         page.add(&realtime_group);
         page.add(&account_group);

@@ -7,14 +7,13 @@ use crate::workspace_pipeline::MutationOrigin;
 
 const ORIGIN_COUNT: usize = 4;
 const DELIVERY_COUNT: usize = 5;
-const PERSISTENCE_OUTCOME_COUNT: usize = 5;
+const PERSISTENCE_OUTCOME_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttentionPersistenceOutcome {
     NotApplicable,
     Accepted,
     AlreadyObserved,
-    AtOrBeforeReadCursor,
     Failed,
 }
 
@@ -24,7 +23,6 @@ impl AttentionPersistenceOutcome {
             Self::NotApplicable => "not_applicable",
             Self::Accepted => "accepted",
             Self::AlreadyObserved => "already_observed",
-            Self::AtOrBeforeReadCursor => "at_or_before_read_cursor",
             Self::Failed => "failed",
         }
     }
@@ -34,8 +32,7 @@ impl AttentionPersistenceOutcome {
             Self::NotApplicable => 0,
             Self::Accepted => 1,
             Self::AlreadyObserved => 2,
-            Self::AtOrBeforeReadCursor => 3,
-            Self::Failed => 4,
+            Self::Failed => 3,
         }
     }
 }
@@ -43,7 +40,6 @@ impl AttentionPersistenceOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttentionMetricsSnapshot {
     pub(crate) committed_decisions: u64,
-    pub(crate) unread_decisions: u64,
     pub(crate) notification_candidates: u64,
     reason_counts: [u64; AttentionReason::COUNT],
     origin_counts: [u64; ORIGIN_COUNT],
@@ -80,9 +76,6 @@ impl AttentionMetricsSnapshot {
             committed_decisions: self
                 .committed_decisions
                 .saturating_sub(baseline.committed_decisions),
-            unread_decisions: self
-                .unread_decisions
-                .saturating_sub(baseline.unread_decisions),
             notification_candidates: self
                 .notification_candidates
                 .saturating_sub(baseline.notification_candidates),
@@ -113,7 +106,6 @@ impl AttentionMetricsSnapshot {
 #[derive(Debug)]
 pub(crate) struct AttentionMetrics {
     committed_decisions: AtomicU64,
-    unread_decisions: AtomicU64,
     notification_candidates: AtomicU64,
     reason_counts: [AtomicU64; AttentionReason::COUNT],
     origin_counts: [AtomicU64; ORIGIN_COUNT],
@@ -136,7 +128,6 @@ impl Default for AttentionMetrics {
     fn default() -> Self {
         Self {
             committed_decisions: AtomicU64::new(0),
-            unread_decisions: AtomicU64::new(0),
             notification_candidates: AtomicU64::new(0),
             reason_counts: std::array::from_fn(|_| AtomicU64::new(0)),
             origin_counts: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -157,8 +148,6 @@ impl AttentionMetrics {
         decision: &AttentionDecision,
     ) {
         self.committed_decisions.fetch_add(1, Ordering::Relaxed);
-        self.unread_decisions
-            .fetch_add(u64::from(decision.record_unread), Ordering::Relaxed);
         self.notification_candidates
             .fetch_add(u64::from(decision.send_notification), Ordering::Relaxed);
         self.origin_counts[origin_index(origin)].fetch_add(1, Ordering::Relaxed);
@@ -174,7 +163,6 @@ impl AttentionMetrics {
             revision,
             origin = origin_code(origin),
             delivery = delivery_code(delivery),
-            record_unread = decision.record_unread,
             notification_candidate = decision.send_notification,
             reasons = ?AttentionReasonCodes(&decision.reasons),
         );
@@ -251,7 +239,6 @@ impl AttentionMetrics {
             .expect("attention queue metrics lock poisoned");
         AttentionMetricsSnapshot {
             committed_decisions: self.committed_decisions.load(Ordering::Relaxed),
-            unread_decisions: self.unread_decisions.load(Ordering::Relaxed),
             notification_candidates: self.notification_candidates.load(Ordering::Relaxed),
             reason_counts: std::array::from_fn(|index| {
                 self.reason_counts[index].load(Ordering::Relaxed)
@@ -281,7 +268,6 @@ impl AttentionMetrics {
             parent: None,
             event = "attention_metrics_snapshot",
             committed_decisions = snapshot.committed_decisions,
-            unread_decisions = snapshot.unread_decisions,
             notification_candidates = snapshot.notification_candidates,
             notification_claims = snapshot.notification_claims,
             reasons = ?AttentionReasonCounts(&snapshot.reason_counts),
@@ -291,8 +277,6 @@ impl AttentionMetrics {
                 [AttentionPersistenceOutcome::Accepted.index()],
             ledger_already_observed = snapshot.persistence_counts
                 [AttentionPersistenceOutcome::AlreadyObserved.index()],
-            ledger_at_or_before_read_cursor = snapshot.persistence_counts
-                [AttentionPersistenceOutcome::AtOrBeforeReadCursor.index()],
             ledger_failed = snapshot.persistence_counts
                 [AttentionPersistenceOutcome::Failed.index()],
             queue_enqueued = snapshot.queue_enqueued,
@@ -374,8 +358,6 @@ mod tests {
     fn metrics_count_each_committed_decision_and_multi_trigger_reason_once() {
         let metrics = AttentionMetrics::default();
         let decision = AttentionDecision {
-            record_unread: true,
-            record_mention: true,
             send_notification: true,
             reasons: vec![
                 AttentionReason::DirectMessage,
@@ -388,7 +370,6 @@ mod tests {
         let snapshot = metrics.snapshot();
 
         assert_eq!(snapshot.committed_decisions, 1);
-        assert_eq!(snapshot.unread_decisions, 1);
         assert_eq!(snapshot.notification_candidates, 1);
         assert_eq!(snapshot.reason_count(AttentionReason::DirectMessage), 1);
         assert_eq!(snapshot.reason_count(AttentionReason::KeywordOrPhrase), 1);
@@ -513,7 +494,6 @@ mod tests {
             AttentionPersistenceOutcome::NotApplicable,
             AttentionPersistenceOutcome::Accepted,
             AttentionPersistenceOutcome::AlreadyObserved,
-            AttentionPersistenceOutcome::AtOrBeforeReadCursor,
             AttentionPersistenceOutcome::Failed,
         ];
         for outcome in ALL_OUTCOMES {
@@ -521,7 +501,6 @@ mod tests {
                 AttentionPersistenceOutcome::NotApplicable
                 | AttentionPersistenceOutcome::Accepted
                 | AttentionPersistenceOutcome::AlreadyObserved
-                | AttentionPersistenceOutcome::AtOrBeforeReadCursor
                 | AttentionPersistenceOutcome::Failed => {}
             }
         }

@@ -53,16 +53,12 @@ pub const WINDOW_SHORTCUTS: &[ActionShortcut] = &[
         accelerators: &["<control>1"],
     },
     ActionShortcut {
-        action: "win.show-unreads",
+        action: "win.show-files",
         accelerators: &["<control>2"],
     },
     ActionShortcut {
-        action: "win.show-files",
-        accelerators: &["<control>3"],
-    },
-    ActionShortcut {
         action: "win.show-later",
-        accelerators: &["<control>4"],
+        accelerators: &["<control>3"],
     },
     ActionShortcut {
         action: "win.refresh-conversations",
@@ -115,8 +111,12 @@ mod tests {
             ["<control>1"]
         );
         assert_eq!(
-            accelerators_for_action("win.show-unreads").unwrap(),
+            accelerators_for_action("win.show-files").unwrap(),
             ["<control>2"]
+        );
+        assert_eq!(
+            accelerators_for_action("win.show-later").unwrap(),
+            ["<control>3"]
         );
     }
 

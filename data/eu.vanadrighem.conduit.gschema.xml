@@ -6,11 +6,6 @@
 			<summary>Saved message drafts</summary>
 			<description>Message drafts stored by workspace, conversation, and optional thread.</description>
 		</key>
-		<key name="sidebar-show-unreads-section" type="b">
-			<default>false</default>
-			<summary>Show the Unreads sidebar section</summary>
-			<description>Whether unread conversations are duplicated into a separate Unreads section at the top of the conversation sidebar.</description>
-		</key>
 		<key name="notifications-enabled-v1" type="b">
 			<default>true</default>
 			<summary>Enable desktop message notifications</summary>
