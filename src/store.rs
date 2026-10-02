@@ -1023,7 +1023,6 @@ impl WorkspaceStore {
         .await
     }
 
-    #[cfg(test)]
     pub async fn load_conversations(&self) -> Result<Option<Vec<SlackConversation>>> {
         let workspace_key = self.workspace_key.clone();
         let conversations = self
@@ -7418,6 +7417,67 @@ mod tests {
             let thread = store.load_thread("C123", "1.0").await.unwrap().unwrap();
             assert_eq!(thread.len(), 1);
             assert_eq!(thread[0].ts, "1.1");
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn workspace_store_round_trips_read_state_watermarks() {
+        use crate::thread_catalog::ThreadCatalog;
+
+        let directory = temp_cache_dir("workspace-store-read-watermarks");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let runtime = runtime();
+
+        runtime.block_on(async {
+            let conversation = SlackConversation {
+                id: "C123".into(),
+                name: Some("general".into()),
+                last_read: Some("1710000200.000100".into()),
+                unread_count: Some(4),
+                unread_count_display: Some(1),
+                ..Default::default()
+            };
+            store
+                .store_conversations(&[conversation.clone()])
+                .await
+                .expect("store conversations failed");
+
+            let loaded_convs = store
+                .load_conversations()
+                .await
+                .expect("load conversations failed")
+                .expect("conversations found");
+            assert_eq!(loaded_convs.len(), 1);
+            assert_eq!(loaded_convs[0].last_read.as_deref(), Some("1710000200.000100"));
+            assert_eq!(loaded_convs[0].unread_count, Some(4));
+            assert_eq!(loaded_convs[0].unread_count_display, Some(1));
+
+            let mut catalog = ThreadCatalog::default();
+            let root = SlackMessage {
+                ts: "1710000000.000100".into(),
+                reply_count: Some(2),
+                subscribed: Some(true),
+                latest_reply: Some("1710000300.000100".into()),
+                ..Default::default()
+            };
+            catalog.observe_thread("C123", &root.ts.clone(), &[root], false);
+            let mut records = catalog.into_records();
+            records[0].last_read = Some("1710000250.000100".into());
+
+            store
+                .store_thread_catalog(&records)
+                .await
+                .expect("store thread catalog failed");
+
+            let loaded_records = store
+                .load_thread_catalog()
+                .await
+                .expect("load thread catalog failed");
+            assert_eq!(loaded_records.len(), 1);
+            assert_eq!(loaded_records[0].last_read.as_deref(), Some("1710000250.000100"));
+            assert!(loaded_records[0].has_unread_replies());
         });
 
         let _ = std::fs::remove_dir_all(directory);

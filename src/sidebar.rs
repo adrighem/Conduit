@@ -69,6 +69,10 @@ pub struct SidebarRowModel {
     pub id: String,
     pub title: String,
     pub kind: ConversationKind,
+    pub unread: bool,
+    pub unread_count: u64,
+    pub has_mention: bool,
+    pub mention_count: u64,
     pub selected: bool,
     pub starred: bool,
     pub private: bool,
@@ -102,8 +106,47 @@ pub struct ConversationPickerSections {
 }
 
 impl SidebarRowModel {
+    pub fn unread_badge_label(&self) -> Option<String> {
+        if matches!(
+            self.kind,
+            ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+        ) {
+            return None;
+        }
+        match self.unread_count {
+            0 => None,
+            1..=99 => Some(self.unread_count.to_string()),
+            _ => Some("99+".to_string()),
+        }
+    }
+
+    pub fn mention_badge_label(&self) -> Option<String> {
+        if !self.has_mention && self.mention_count == 0 {
+            return None;
+        }
+        match self.mention_count {
+            0 => Some("@".to_string()),
+            1..=99 => Some(self.mention_count.to_string()),
+            _ => Some("99+".to_string()),
+        }
+    }
+
     pub fn accessible_label(&self) -> String {
         let mut label = format!("{}: {}", self.kind.accessible_name(), self.title);
+        if self.mention_count == 1 {
+            label.push_str(", 1 mention");
+        } else if self.mention_count > 1 {
+            label.push_str(&format!(", {} mentions", self.mention_count));
+        } else if self.has_mention {
+            label.push_str(", mentioned");
+        }
+        if self.unread_count == 1 {
+            label.push_str(", 1 unread");
+        } else if self.unread_count > 1 {
+            label.push_str(&format!(", {} unread", self.unread_count));
+        } else if self.unread {
+            label.push_str(", unread");
+        }
         if self.selected {
             label.push_str(", selected");
         }
@@ -489,6 +532,12 @@ impl SidebarRowModel {
             .cloned()
             .collect();
         let muted = conversation.is_muted_conversation();
+        let unread = conversation.has_unread_activity() && !muted;
+        let unread_count = if muted {
+            0
+        } else {
+            conversation.unread_activity_count()
+        };
         Self {
             id: conversation.id.clone(),
             title: conversation.navigation_name_with_users(
@@ -497,6 +546,10 @@ impl SidebarRowModel {
                 options.current_user_id,
             ),
             kind,
+            unread,
+            unread_count,
+            has_mention: conversation.has_mention_activity(),
+            mention_count: conversation.mention_activity_count(),
             selected: options.selected_channel == Some(conversation.id.as_str()),
             starred: conversation.is_starred(),
             private: conversation.is_private.unwrap_or(false)
@@ -958,6 +1011,10 @@ pub fn conversation_picker_sections_with_statuses(
                 id: id.to_string(),
                 title,
                 kind: ConversationKind::DirectMessage,
+                unread: false,
+                unread_count: 0,
+                has_mention: false,
+                mention_count: 0,
                 selected: false,
                 starred: false,
                 private: true,
@@ -1119,6 +1176,9 @@ pub fn conversation_visible_in_default_sidebar(
 
     match conversation_kind(conversation) {
         ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
+            if conversation.has_unread_activity() || conversation.has_mention_activity() {
+                return !conversation.is_user_deleted();
+            }
             !conversation.is_user_deleted()
                 && !conversation.is_dormant()
                 && (conversation.has_active_direct_message_hint() || recent_history_direct_message)
@@ -1446,6 +1506,10 @@ mod tests {
             id: title.to_string(),
             title: title.to_string(),
             kind: ConversationKind::PublicChannel,
+            unread: false,
+            unread_count: 0,
+            has_mention: false,
+            mention_count: 0,
             selected,
             starred: false,
             private: false,
@@ -1797,18 +1861,47 @@ mod tests {
     }
 
     #[test]
-    fn starred_dormant_dm_remains_visible_in_the_default_sidebar() {
-        let mut conversation = dm("D1", "U1");
-        conversation.set_starred(true);
-        conversation
-            .extra
-            .insert("is_dormant".to_string(), serde_json::json!(true));
+    fn category_1_channels_bold_when_unread_no_numeric_badge_muted_suppresses() {
+        let mut alpha = channel("C1", "alpha");
+        alpha.unread_count = Some(3);
+        let row = SidebarRowModel::from_conversation(&alpha, &HashMap::new(), None, None);
+        assert!(row.unread);
+        assert_eq!(row.unread_badge_label(), None);
 
-        assert!(conversation_visible_in_default_sidebar(
-            &conversation,
-            None,
-            false,
-        ));
+        let mut muted_alpha = channel("C2", "alpha-muted");
+        muted_alpha.unread_count = Some(3);
+        muted_alpha.extra.insert("is_muted".to_string(), serde_json::json!(true));
+        let muted_row = SidebarRowModel::from_conversation(&muted_alpha, &HashMap::new(), None, None);
+        assert!(!muted_row.unread);
+        assert_eq!(muted_row.unread_badge_label(), None);
+    }
+
+    #[test]
+    fn category_4_dms_bold_title_and_numeric_badge_and_unhide_dormant() {
+        let mut unread_dm = dm("D1", "U1");
+        unread_dm.unread_count = Some(5);
+        unread_dm.extra.insert("is_dormant".to_string(), serde_json::json!(true));
+
+        let row = SidebarRowModel::from_conversation(&unread_dm, &HashMap::new(), None, None);
+        assert!(row.unread);
+        assert_eq!(row.unread_count, 5);
+        assert_eq!(row.unread_badge_label().as_deref(), Some("5"));
+        assert!(conversation_visible_in_default_sidebar(&unread_dm, None, false));
+    }
+
+    #[test]
+    fn category_5_mentions_override_mute_status() {
+        let mut muted_channel = channel("C1", "general");
+        muted_channel.extra.insert("is_muted".to_string(), serde_json::json!(true));
+        muted_channel.extra.insert("has_mention".to_string(), serde_json::json!(true));
+        muted_channel.extra.insert("mention_count".to_string(), serde_json::json!(2));
+
+        let row = SidebarRowModel::from_conversation(&muted_channel, &HashMap::new(), None, None);
+        assert!(row.muted);
+        assert!(!row.unread);
+        assert!(row.has_mention);
+        assert_eq!(row.mention_count, 2);
+        assert_eq!(row.mention_badge_label().as_deref(), Some("2"));
     }
 
     #[test]

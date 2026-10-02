@@ -88,6 +88,17 @@ impl<'a> EmojiCatalog<'a> {
                     .copied()
                     .flatten()
             })
+            .or_else(|| {
+                let fallback = match name {
+                    "robot_face" => Some("robot"),
+                    "slight_smile" => Some("slightly_smiling_face"),
+                    other => other.strip_suffix("_face"),
+                }?;
+                let EmojiValue::Unicode(ch) = self.resolve_with_seen(fallback, seen)? else {
+                    return None;
+                };
+                emojis::get(ch)
+            })
             .map(|emoji| EmojiValue::Unicode(emoji.as_str()))
     }
 

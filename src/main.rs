@@ -58,6 +58,7 @@ mod sync_scheduler;
 mod thread_catalog;
 mod thread_pane;
 mod timeline_presenter;
+pub mod timeline_message_widget;
 mod window;
 mod workspace_pipeline;
 mod workspace_state;

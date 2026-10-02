@@ -50,6 +50,7 @@ pub struct MessageHtmlContext {
     pub recent_reactions: Vec<String>,
     pub custom_emojis: Arc<HashMap<String, String>>,
     pub timeline_generation: Option<u64>,
+    pub last_read: Option<String>,
     pub(crate) message_control_handles: HashMap<MessageRef, MessageControlHandle>,
     pub(crate) message_control_action_handles:
         HashMap<(MessageRef, MessageControlKey), MessageControlHandle>,
@@ -886,7 +887,20 @@ fn conversation_list_items_html(
     context: &MessageHtmlContext,
 ) -> String {
     let mut html = String::with_capacity(messages.len() * 1024);
+    let mut unread_divider_rendered = false;
     for group in message_groups(messages) {
+        if !unread_divider_rendered && context.thread_ts.is_none() {
+            if let Some(last_read) = context.last_read.as_deref() {
+                if let Some(first_msg) = group.first() {
+                    if crate::models::slack_timestamp_is_after(&first_msg.ts, last_read) {
+                        html.push_str("<li class=\"new-messages-divider\" role=\"separator\"><span class=\"new-messages-label\">");
+                        html.push_str(&gettext("New Messages"));
+                        html.push_str("</span></li>");
+                        unread_divider_rendered = true;
+                    }
+                }
+            }
+        }
         html.push_str("<li class=\"message-list-item\">");
         html.push_str(&message_group_article(Some(channel_id), &group, context));
         html.push_str("</li>");
@@ -2384,7 +2398,7 @@ fn timestamp_html(ts: &str) -> String {
     )
 }
 
-fn localized_timestamp_parts(ts: &str) -> Option<(String, String, String)> {
+pub(crate) fn localized_timestamp_parts(ts: &str) -> Option<(String, String, String)> {
     let datetime = slack_ts_datetime(ts)?;
     let now = gtk::glib::DateTime::now_local().ok()?;
     localized_timestamp_parts_at(&datetime, &now)
@@ -2421,37 +2435,53 @@ fn full_timestamp_with_timezone(localized: &str, timezone: &str) -> String {
     }
 }
 
+fn capitalize_first_letter(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
 fn compact_timestamp_text(
     datetime: &gtk::glib::DateTime,
     now: &gtk::glib::DateTime,
 ) -> Option<String> {
     let time = datetime.format(&gettext("%H:%M")).ok()?.to_string();
-    let days_old = local_calendar_day(datetime) - local_calendar_day(now);
-    let days_old = -days_old;
+    let days_old = local_calendar_day(now) - local_calendar_day(datetime);
 
-    let day = match days_old {
-        0 => return Some(time),
-        1 => gettext("Yesterday"),
-        2..=5 => datetime.format("%A").ok()?.to_string(),
-        _ => {
-            let include_year = days_old >= 183 && datetime.year() != now.year();
-            let format = if include_year {
-                gettext("%b %e, %Y")
-            } else {
-                gettext("%b %e")
-            };
-            datetime
-                .format(&format)
-                .ok()?
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
+    if days_old == 0 {
+        return Some(time);
+    }
+
+    if (1..=6).contains(&days_old) {
+        let weekday_raw = datetime.format("%A").ok()?.to_string();
+        let weekday = capitalize_first_letter(&weekday_raw);
+        return Some(
+            gettext("{day}, {time}")
+                .replace("{day}", &weekday)
+                .replace("{time}", &time),
+        );
+    }
+
+    let include_year = days_old >= 183 || datetime.year() != now.year();
+    let format_str = if include_year {
+        gettext("%e %b %Y")
+    } else {
+        gettext("%e %b")
     };
+    let date_raw = datetime
+        .format(&format_str)
+        .ok()?
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let date_str = capitalize_first_letter(&date_raw);
 
     Some(
         gettext("{day}, {time}")
-            .replace("{day}", &day)
+            .replace("{day}", &date_str)
             .replace("{time}", &time),
     )
 }
@@ -3627,7 +3657,7 @@ fn message_actions_html(
         gettext("Save for later")
     };
     actions.push_str(&format!(
-        "<details class=\"more-actions\"><summary class=\"action-button\" title=\"{}\" aria-label=\"{}\">⋯</summary><div class=\"more-actions-menu\" role=\"menu\"><a class=\"more-action{}\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a></div></details>",
+        "<details class=\"more-actions\"><summary class=\"action-button\" title=\"{}\" aria-label=\"{}\">⋯</summary><div class=\"more-actions-menu\" role=\"menu\"><a class=\"more-action{}\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a></div></details>",
         escape_html(&gettext("More actions")),
         escape_html(&gettext("More actions")),
         if starred { " is-active" } else { "" },
@@ -3637,11 +3667,21 @@ fn message_actions_html(
         escape_html(&gettext("Copy link")),
         escape_html(&copy_message_action_url(channel_id, message)),
         escape_html(&gettext("Copy message")),
+        escape_html(&mark_unread_action_url(channel_id, message)),
+        escape_html(&gettext("Mark Unread")),
     ));
 
     format!(
         "<nav class=\"quick-actions\" aria-label=\"{}\">{actions}</nav>",
         escape_html(&gettext("Message actions"))
+    )
+}
+
+pub fn mark_unread_action_url(channel_id: &str, message: &SlackMessage) -> String {
+    format!(
+        "conduit://mark-unread?channel={}&ts={}",
+        encode_query(channel_id),
+        encode_query(&message.ts)
     )
 }
 
@@ -3857,6 +3897,305 @@ fn reaction_tooltip_text(name: &str, context: &MessageHtmlContext) -> String {
     match EmojiCatalog::new(&context.custom_emojis).resolve(name) {
         Some(EmojiValue::Unicode(value)) => value.to_string(),
         Some(EmojiValue::CustomImage(_)) | None => format!(":{name}:"),
+    }
+}
+
+pub fn mrkdwn_to_pango(text: &str, context: &MessageHtmlContext) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("```") {
+        output.push_str(&mrkdwn_to_pango_inline(&rest[..start], context));
+        rest = &rest[start + 3..];
+        if let Some(end) = rest.find("```") {
+            output.push_str("<tt>");
+            output.push_str(&escape_pango(&rest[..end]));
+            output.push_str("</tt>");
+            rest = &rest[end + 3..];
+        } else {
+            output.push_str(&escape_pango("```"));
+            output.push_str(&mrkdwn_to_pango_inline(rest, context));
+            rest = "";
+        }
+    }
+
+    output.push_str(&mrkdwn_to_pango_inline(rest, context));
+    output
+}
+
+fn mrkdwn_to_pango_inline(text: &str, context: &MessageHtmlContext) -> String {
+    let mut output = String::new();
+    let mut rest = text;
+
+    while !rest.is_empty() {
+        if let Some((character, consumed)) = decode_html_entity_prefix(rest) {
+            push_escaped_pango_character(&mut output, character);
+            rest = &rest[consumed..];
+            continue;
+        }
+        if rest.starts_with('`') {
+            if let Some(end) = rest[1..].find('`') {
+                output.push_str("<tt>");
+                output.push_str(&escape_pango(&rest[1..1 + end]));
+                output.push_str("</tt>");
+                rest = &rest[end + 2..];
+                continue;
+            }
+        }
+
+        if let Some((pango, consumed)) = render_slack_entity_pango(rest, context) {
+            output.push_str(&pango);
+            rest = &rest[consumed..];
+            continue;
+        }
+
+        if let Some((pango, consumed)) = render_bare_channel_reference_pango(rest, context) {
+            output.push_str(&pango);
+            rest = &rest[consumed..];
+            continue;
+        }
+
+        if let Some((pango, consumed)) = render_emoji_shortcode_pango(rest, context) {
+            output.push_str(&pango);
+            rest = &rest[consumed..];
+            continue;
+        }
+
+        if let Some((pango, consumed)) = render_wrapped_pango(rest, '*', "b", context) {
+            output.push_str(&pango);
+            rest = &rest[consumed..];
+            continue;
+        }
+
+        if let Some((pango, consumed)) = render_wrapped_pango(rest, '_', "i", context) {
+            output.push_str(&pango);
+            rest = &rest[consumed..];
+            continue;
+        }
+
+        if let Some((pango, consumed)) = render_wrapped_pango(rest, '~', "s", context) {
+            output.push_str(&pango);
+            rest = &rest[consumed..];
+            continue;
+        }
+
+        let next = rest.chars().next().expect("non-empty string has a char");
+        if next == '\n' {
+            output.push('\n');
+        } else {
+            push_escaped_pango_character(&mut output, next);
+        }
+        rest = &rest[next.len_utf8()..];
+    }
+
+    output
+}
+
+fn render_slack_entity_pango(text: &str, context: &MessageHtmlContext) -> Option<(String, usize)> {
+    if !text.starts_with('<') {
+        return None;
+    }
+
+    let end = text.find('>')?;
+    let raw = &text[1..end];
+    let rendered = if let Some(user_id) = raw.strip_prefix('@') {
+        let name = context
+            .user_names
+            .get(user_id)
+            .cloned()
+            .unwrap_or_else(|| user_id.to_string());
+        format!(
+            "<span weight=\"bold\" foreground=\"#1d9bd1\">@{}</span>",
+            escape_pango(&name)
+        )
+    } else if raw.starts_with("!subteam^") {
+        user_group_mention_pango(raw, context)
+    } else if let Some(channel) = raw.strip_prefix('#') {
+        let (channel_id, fallback) = channel
+            .split_once('|')
+            .map_or((channel, None), |(channel_id, label)| {
+                (channel_id, Some(label))
+            });
+        let raw_display = context
+            .conversation_titles
+            .get(channel_id)
+            .map(|s| s.strip_prefix('#').unwrap_or(s).to_string())
+            .unwrap_or_else(|| {
+                fallback
+                    .filter(|f| !f.trim().is_empty())
+                    .unwrap_or(channel_id)
+                    .to_string()
+            });
+        let clean_display = raw_display.strip_prefix('#').unwrap_or(&raw_display);
+        let display = if clean_display.trim().is_empty() {
+            channel_id.strip_prefix('#').unwrap_or(channel_id)
+        } else {
+            clean_display
+        };
+        format!("<span weight=\"bold\">#{}</span>", escape_pango(display))
+    } else if let Some((url, label)) = raw.split_once('|') {
+        if is_http_url(url) {
+            external_link_pango(url, label)
+        } else {
+            escape_pango(label)
+        }
+    } else if raw.starts_with('!') {
+        slack_special_entity_pango(raw)
+    } else if is_http_url(raw) {
+        external_link_pango(raw, raw)
+    } else {
+        return None;
+    };
+
+    Some((rendered, end + 1))
+}
+
+fn render_bare_channel_reference_pango(
+    text: &str,
+    context: &MessageHtmlContext,
+) -> Option<(String, usize)> {
+    let candidate = text.strip_prefix('#')?;
+    let id_length = candidate
+        .bytes()
+        .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        .count();
+    if id_length == 0 {
+        return None;
+    }
+    let channel_id = &candidate[..id_length];
+    let title = context.conversation_titles.get(channel_id)?;
+    let display = title.strip_prefix('#').unwrap_or(title);
+    Some((
+        format!("<span weight=\"bold\">#{}</span>", escape_pango(display)),
+        id_length + 1,
+    ))
+}
+
+fn user_group_mention_pango(raw: &str, context: &MessageHtmlContext) -> String {
+    let Some(group) = raw.strip_prefix("!subteam^") else {
+        return escape_pango(raw);
+    };
+    let (group_id, fallback_label) = group
+        .split_once('|')
+        .map(|(group_id, label)| (group_id, Some(normalized_user_group_label(label))))
+        .unwrap_or((group, None));
+
+    let label = context
+        .user_group_names
+        .get(group_id)
+        .cloned()
+        .or(fallback_label)
+        .unwrap_or_else(|| group_id.to_string());
+    let label = normalized_user_group_label(&label);
+    format!("<span weight=\"bold\">@{}</span>", escape_pango(&label))
+}
+
+fn slack_special_entity_pango(raw: &str) -> String {
+    if let Some((_, label)) = raw.rsplit_once('|') {
+        return escape_pango(label);
+    }
+
+    match raw {
+        "!channel" => "<span weight=\"bold\">@channel</span>".to_string(),
+        "!here" => "<span weight=\"bold\">@here</span>".to_string(),
+        "!everyone" => "<span weight=\"bold\">@everyone</span>".to_string(),
+        _ => escape_pango(raw),
+    }
+}
+
+fn external_link_pango(url: &str, label: &str) -> String {
+    format!(
+        "<a href=\"{}\">{}</a>",
+        escape_pango(url),
+        escape_pango(label)
+    )
+}
+
+fn render_emoji_shortcode_pango(
+    text: &str,
+    context: &MessageHtmlContext,
+) -> Option<(String, usize)> {
+    if !text.starts_with(':') {
+        return None;
+    }
+
+    let end = text[1..].find(':')? + 1;
+    let code = &text[1..end];
+    if code.is_empty()
+        || code.len() > 64
+        || !code.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+')
+        })
+    {
+        return None;
+    }
+
+    let mut consumed = end + 1;
+    let mut resolved_code = code.to_string();
+    if let Some((modifier, modifier_len)) = adjacent_skin_tone_shortcode(&text[consumed..]) {
+        resolved_code.push_str("::");
+        resolved_code.push_str(modifier);
+        consumed += modifier_len;
+    }
+    let shortcode = &text[..consumed];
+    let emoji = EmojiCatalog::new(&context.custom_emojis).resolve(&resolved_code);
+
+    let rendered = match emoji {
+        Some(EmojiValue::Unicode(val)) => escape_pango(val),
+        _ => escape_pango(shortcode),
+    };
+
+    Some((rendered, consumed))
+}
+
+fn render_wrapped_pango(
+    text: &str,
+    marker: char,
+    tag: &str,
+    context: &MessageHtmlContext,
+) -> Option<(String, usize)> {
+    if !text.starts_with(marker) {
+        return None;
+    }
+
+    let marker_len = marker.len_utf8();
+    let end = text[marker_len..].find(marker)?;
+    let inner = &text[marker_len..marker_len + end];
+    if inner.trim().is_empty() {
+        return None;
+    }
+
+    Some((
+        format!("<{tag}>{}</{tag}>", mrkdwn_to_pango_inline(inner, context)),
+        marker_len + end + marker_len,
+    ))
+}
+
+fn escape_pango(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some((character, consumed)) = decode_html_entity_prefix(rest) {
+            push_escaped_pango_character(&mut escaped, character);
+            rest = &rest[consumed..];
+            continue;
+        }
+
+        let character = rest.chars().next().expect("non-empty text has a character");
+        push_escaped_pango_character(&mut escaped, character);
+        rest = &rest[character.len_utf8()..];
+    }
+    escaped
+}
+
+fn push_escaped_pango_character(output: &mut String, character: char) {
+    match character {
+        '&' => output.push_str("&amp;"),
+        '<' => output.push_str("&lt;"),
+        '>' => output.push_str("&gt;"),
+        '\'' => output.push_str("&apos;"),
+        '"' => output.push_str("&quot;"),
+        c => output.push(c),
     }
 }
 
@@ -4994,32 +5333,35 @@ mod tests {
             today.format(&gettext("%H:%M")).ok().as_deref()
         );
 
-        let yesterday = compact_timestamp_text(&at(2026, 7, 14), &now).unwrap();
-        assert!(yesterday.contains(&gettext("Yesterday")));
+        let yesterday = at(2026, 7, 14);
+        let weekday_yesterday = capitalize_first_letter(&yesterday.format("%A").unwrap());
+        assert!(compact_timestamp_text(&yesterday, &now)
+            .unwrap()
+            .contains(&weekday_yesterday));
 
         let five_days_ago = at(2026, 7, 10);
-        let weekday = five_days_ago.format("%A").unwrap().to_string();
+        let weekday = capitalize_first_letter(&five_days_ago.format("%A").unwrap());
         assert!(compact_timestamp_text(&five_days_ago, &now)
             .unwrap()
             .contains(&weekday));
 
         let six_days_ago = at(2026, 7, 9);
-        let date_without_year = six_days_ago
-            .format(&gettext("%b %e"))
+        let weekday_six = capitalize_first_letter(&six_days_ago.format("%A").unwrap());
+        assert!(compact_timestamp_text(&six_days_ago, &now)
             .unwrap()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let six_days_label = compact_timestamp_text(&six_days_ago, &now).unwrap();
-        assert!(six_days_label.contains(&date_without_year));
-        assert!(!six_days_label.contains("2026"));
+            .contains(&weekday_six));
+
+        let seven_days_ago = at(2026, 7, 8);
+        let seven_days_label = compact_timestamp_text(&seven_days_ago, &now).unwrap();
+        assert!(seven_days_label.contains("8 Jul"));
+        assert!(!seven_days_label.contains("2026"));
 
         let recent_previous_year_now = at(2026, 1, 10);
         let recent_previous_year = at(2025, 12, 31);
         assert!(
-            !compact_timestamp_text(&recent_previous_year, &recent_previous_year_now)
+            compact_timestamp_text(&recent_previous_year, &recent_previous_year_now)
                 .unwrap()
-                .contains("2025")
+                .contains("31 Dec 2025")
         );
 
         let old_previous_year = at(2025, 12, 31);
@@ -7003,5 +7345,73 @@ mod tests {
             "unexpected msteams link in action button: {html}"
         );
         assert!(html.contains("is-unavailable"));
+    }
+
+    #[test]
+    fn test_mrkdwn_to_pango_plain_text_escaping() {
+        let context = MessageHtmlContext::default();
+        let input = "Cats & Dogs <Birds> \"Fish\" 'Frogs'";
+        let output = mrkdwn_to_pango(input, &context);
+        assert_eq!(
+            output,
+            "Cats &amp; Dogs &lt;Birds&gt; &quot;Fish&quot; &apos;Frogs&apos;"
+        );
+    }
+
+    #[test]
+    fn test_mrkdwn_to_pango_basic_formatting() {
+        let context = MessageHtmlContext::default();
+        let input = "*bold* _italic_ ~strike~ `inline code`";
+        let output = mrkdwn_to_pango(input, &context);
+        assert_eq!(
+            output,
+            "<b>bold</b> <i>italic</i> <s>strike</s> <tt>inline code</tt>"
+        );
+    }
+
+    #[test]
+    fn test_mrkdwn_to_pango_links() {
+        let context = MessageHtmlContext::default();
+        let input = "<https://example.com|Example> and <https://conduit.app>";
+        let output = mrkdwn_to_pango(input, &context);
+        assert_eq!(
+            output,
+            "<a href=\"https://example.com\">Example</a> and <a href=\"https://conduit.app\">https://conduit.app</a>"
+        );
+    }
+
+    #[test]
+    fn test_mrkdwn_to_pango_mentions() {
+        let mut context = MessageHtmlContext::default();
+        let mut user_names = HashMap::new();
+        user_names.insert("U123".to_string(), "Alice".to_string());
+        context.user_names = Arc::new(user_names);
+
+        context
+            .conversation_titles
+            .insert("C123".to_string(), "general".to_string());
+
+        let input = "<@U123> in <#C123|general> and <#C999>";
+        let output = mrkdwn_to_pango(input, &context);
+        assert_eq!(
+            output,
+            "<span weight=\"bold\" foreground=\"#1d9bd1\">@Alice</span> in <span weight=\"bold\">#general</span> and <span weight=\"bold\">#C999</span>"
+        );
+    }
+
+    #[test]
+    fn test_mrkdwn_to_pango_emoji() {
+        let context = MessageHtmlContext::default();
+        let input = ":smile: and :unknown_emoji:";
+        let output = mrkdwn_to_pango(input, &context);
+        assert_eq!(output, "😄 and :unknown_emoji:");
+    }
+
+    #[test]
+    fn test_mrkdwn_to_pango_nested_formatting() {
+        let context = MessageHtmlContext::default();
+        let input = "*bold with `code` and _italic_*";
+        let output = mrkdwn_to_pango(input, &context);
+        assert_eq!(output, "<b>bold with <tt>code</tt> and <i>italic</i></b>");
     }
 }

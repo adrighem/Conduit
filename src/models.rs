@@ -66,6 +66,12 @@ pub struct SlackConversation {
     pub is_private: Option<bool>,
     pub is_archived: Option<bool>,
     pub is_starred: Option<bool>,
+    #[serde(default)]
+    pub last_read: Option<String>,
+    #[serde(default)]
+    pub unread_count: Option<u64>,
+    #[serde(default)]
+    pub unread_count_display: Option<u64>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -94,8 +100,89 @@ impl SlackConversation {
         self.is_starred = Some(starred);
     }
 
+    pub fn is_ts_unread(&self, ts: &str) -> bool {
+        let ts = ts.trim();
+        if ts.is_empty() || ts == "0" || ts == "0.000000" {
+            return false;
+        }
+        match self.last_read.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(last_read) => slack_timestamp_is_after(ts, last_read),
+            None => false,
+        }
+    }
+
+    pub fn is_ts_read(&self, ts: &str) -> bool {
+        let ts = ts.trim();
+        if ts.is_empty() {
+            return false;
+        }
+        !self.is_ts_unread(ts)
+    }
+
+    pub fn advance_last_read(&mut self, new_ts: &str) -> bool {
+        let new_ts = new_ts.trim();
+        if new_ts.is_empty() {
+            return false;
+        }
+        let should_update = match self.last_read.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(current) => slack_timestamp_is_after(new_ts, current),
+            None => true,
+        };
+        if should_update {
+            self.last_read = Some(new_ts.to_string());
+        }
+        should_update
+    }
+
     pub fn is_dormant(&self) -> bool {
         self.extra_bool("is_dormant")
+    }
+
+    pub fn unread_activity_count(&self) -> u64 {
+        let extra_count = self
+            .extra
+            .get("unread_count_display")
+            .and_then(unread_count_value)
+            .or_else(|| {
+                self.extra
+                    .get("unread_count_string")
+                    .and_then(unread_count_value)
+            })
+            .unwrap_or_default();
+
+        self.unread_count_display
+            .or(self.unread_count)
+            .unwrap_or_default()
+            .max(extra_count)
+    }
+
+    pub fn has_unread_activity(&self) -> bool {
+        if self.unread_activity_count() > 0 {
+            return true;
+        }
+        if self.extra_bool("has_unreads") || self.extra_bool("has_unread") {
+            return true;
+        }
+        if let Some(latest) = self.latest_message_ts() {
+            if self.is_ts_unread(latest) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn mention_activity_count(&self) -> u64 {
+        self.extra
+            .get("mention_count")
+            .and_then(unread_count_value)
+            .or_else(|| self.extra.get("mention_count_display").and_then(unread_count_value))
+            .unwrap_or_default()
+    }
+
+    pub fn has_mention_activity(&self) -> bool {
+        self.mention_activity_count() > 0
+            || self.extra_bool("has_mention")
+            || self.extra_bool("has_mentions")
     }
 
     pub fn priority_hint(&self) -> f64 {
@@ -324,6 +411,19 @@ fn user_id_from_value(value: &Value) -> Option<String> {
 fn non_empty_string(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn unread_count_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64().or_else(|| {
+            number
+                .as_i64()
+                .filter(|value| *value > 0)
+                .map(|value| value as u64)
+        }),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 pub(crate) fn slack_timestamp_is_after(candidate: &str, current: &str) -> bool {
@@ -809,6 +909,8 @@ pub struct SlackMessage {
     #[serde(default)]
     pub subscribed: Option<bool>,
     pub is_starred: Option<bool>,
+    #[serde(default)]
+    pub is_thread_broadcast: Option<bool>,
     pub edited: Option<SlackMessageEdit>,
     pub reactions: Option<Vec<SlackReaction>>,
     pub files: Option<Vec<SlackFile>>,
@@ -2310,5 +2412,31 @@ mod tests {
         }))
         .expect("attachment with empty ts deserializes");
         assert_eq!(empty_ts.ts, None);
+    }
+
+    #[test]
+    fn conversation_read_state_tracking_and_watermark_advancement() {
+        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+            "id": "C123",
+            "last_read": "1710000000.000100",
+            "unread_count": 5,
+            "unread_count_display": 2
+        }))
+        .expect("conversation with read fields deserializes");
+
+        assert_eq!(conversation.last_read.as_deref(), Some("1710000000.000100"));
+        assert_eq!(conversation.unread_count, Some(5));
+        assert_eq!(conversation.unread_count_display, Some(2));
+
+        assert!(conversation.is_ts_unread("1710000000.000200"));
+        assert!(conversation.is_ts_read("1710000000.000100"));
+        assert!(conversation.is_ts_read("1710000000.000050"));
+
+        assert!(!conversation.advance_last_read("1710000000.000050"));
+        assert_eq!(conversation.last_read.as_deref(), Some("1710000000.000100"));
+
+        assert!(conversation.advance_last_read("1710000000.000300"));
+        assert_eq!(conversation.last_read.as_deref(), Some("1710000000.000300"));
+        assert!(conversation.is_ts_read("1710000000.000200"));
     }
 }

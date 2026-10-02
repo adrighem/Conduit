@@ -373,6 +373,7 @@ mod imp {
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
         pub(super) main_timeline_presenter: RefCell<TimelinePresenter>,
         pub(super) thread_timeline_presenter: RefCell<TimelinePresenter>,
+        pub(super) native_timeline_view: RefCell<Option<crate::timeline_message_widget::NativeTimelineView>>,
         pub(super) sidebar_projection: RefCell<SidebarProjection>,
         pub(super) sidebar_filter_generation: Cell<u64>,
         pub(super) picker_filter_generation: Cell<u64>,
@@ -1101,16 +1102,16 @@ glib::wrapper! {
 use crate::picker_views::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MediaKind {
+pub(crate) enum MediaKind {
     Image,
     Video,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MediaGalleryItem {
-    url: String,
-    name: String,
-    kind: MediaKind,
+pub(crate) struct MediaGalleryItem {
+    pub(crate) url: String,
+    pub(crate) name: String,
+    pub(crate) kind: MediaKind,
 }
 
 #[derive(Debug)]
@@ -2311,8 +2312,17 @@ fn promoted_recent_reactions<'a>(
 }
 
 fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
-    let url = if file.supported_media_kind() == Some("video") {
-        file.video_preview_url()?
+    let is_video = file.supported_media_kind() == Some("video")
+        || file.mimetype.as_deref().is_some_and(|m| m.starts_with("video/"))
+        || file.thumb_video.is_some();
+    let url = if is_video {
+        file.thumb_video
+            .as_deref()
+            .or(file.thumb_720.as_deref())
+            .or(file.thumb_480.as_deref())
+            .or(file.thumb_360.as_deref())
+            .or(file.url_static_preview.as_deref())
+            .or_else(|| file.preview_url())?
     } else {
         file.preview_url()?
     };
@@ -2359,8 +2369,10 @@ fn retain_image_asset_request(
 fn message_image_asset_requests<'a>(
     messages: impl IntoIterator<Item = &'a SlackMessage>,
     avatar_urls: &HashMap<String, String>,
+    custom_emojis: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
     let mut requests = HashMap::new();
+    let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     for message in messages {
         for request in message
             .files
@@ -2387,6 +2399,34 @@ fn message_image_asset_requests<'a>(
         {
             retain_image_asset_request(&mut requests, Some(request));
         }
+        for reaction in message.reactions.as_ref().into_iter().flatten() {
+            if let Some(name) = reaction.name.as_deref() {
+                let clean_name = name.trim_matches(':');
+                if let Some(crate::emoji::EmojiValue::CustomImage(url)) = catalog.resolve(clean_name) {
+                    retain_image_asset_request(&mut requests, bounded_image_asset_request(&url));
+                }
+            }
+        }
+        if let Some(text) = message.text.as_deref() {
+            let mut rest = text;
+            while let Some(start) = rest.find(':') {
+                rest = &rest[start + 1..];
+                if let Some(end) = rest.find(':') {
+                    let code = &rest[..end];
+                    if !code.is_empty()
+                        && code.len() <= 64
+                        && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+                    {
+                        if let Some(crate::emoji::EmojiValue::CustomImage(url)) = catalog.resolve(code) {
+                            retain_image_asset_request(&mut requests, bounded_image_asset_request(&url));
+                        }
+                    }
+                    rest = &rest[end + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
         if let Some(url) = message
             .user
             .as_ref()
@@ -2402,7 +2442,12 @@ fn message_image_asset_requests<'a>(
     requests
 }
 
-fn messages_use_image_asset(messages: &[SlackMessage], key: &str) -> bool {
+fn messages_use_image_asset(
+    messages: &[SlackMessage],
+    custom_emojis: &HashMap<String, String>,
+    key: &str,
+) -> bool {
+    let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     messages.iter().any(|message| {
         message.avatar_url() == Some(key)
             || message
@@ -2423,6 +2468,38 @@ fn messages_use_image_asset(messages: &[SlackMessage], key: &str) -> bool {
                 .document
                 .image_urls()
                 .any(|candidate| candidate == key)
+            || message
+                .reactions
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .any(|r| {
+                    r.name.as_deref().is_some_and(|name| {
+                        let clean_name = name.trim_matches(':');
+                        matches!(catalog.resolve(clean_name), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key)
+                    })
+                })
+            || message.text.as_deref().is_some_and(|text| {
+                let mut rest = text;
+                while let Some(start) = rest.find(':') {
+                    rest = &rest[start + 1..];
+                    if let Some(end) = rest.find(':') {
+                        let code = &rest[..end];
+                        if !code.is_empty()
+                            && code.len() <= 64
+                            && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+                        {
+                            if matches!(catalog.resolve(code), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key) {
+                                return true;
+                            }
+                        }
+                        rest = &rest[end + 1..];
+                    } else {
+                        break;
+                    }
+                }
+                false
+            })
     })
 }
 
@@ -2957,11 +3034,31 @@ impl ConduitWindow {
         let message_view = self.create_message_web_view(&web_context, &network_session, text_zoom);
         let secondary_message_view =
             self.create_message_web_view(&web_context, &network_session, text_zoom);
+        let native_timeline = crate::timeline_message_widget::NativeTimelineView::new();
+        let window_weak = self.downgrade();
+        native_timeline.set_on_open_media(move |item| {
+            if let Some(window) = window_weak.upgrade() {
+                window.open_media_viewer(item);
+            }
+        });
+        let window_weak_thread = self.downgrade();
+        native_timeline.set_on_open_thread(move |ts| {
+            if let Some(window) = window_weak_thread.upgrade() {
+                if let Some(channel_id) = window.visible_channel_id() {
+                    window.open_thread(&channel_id, &ts);
+                }
+            }
+        });
         self.connect_timeline_load(&message_view, TimelineSurface::Main);
-        let viewer = self.create_media_viewer(&message_view, &secondary_message_view);
+        let viewer = self.create_media_viewer(
+            &message_view,
+            &secondary_message_view,
+            &native_timeline,
+        );
         self.imp().message_view_box.append(&viewer.surface_stack);
         *self.imp().message_view.borrow_mut() = Some(message_view.clone());
         *self.imp().secondary_message_view.borrow_mut() = Some(secondary_message_view.clone());
+        *self.imp().native_timeline_view.borrow_mut() = Some(native_timeline);
         *self.imp().media_viewer.borrow_mut() = Some(viewer);
         self.setup_media_viewer_callbacks();
 
@@ -3014,6 +3111,7 @@ impl ConduitWindow {
         &self,
         message_view: &webkit6::WebView,
         secondary_message_view: &webkit6::WebView,
+        native_timeline: &crate::timeline_message_widget::NativeTimelineView,
     ) -> MediaViewer {
         let surface_stack = gtk::Stack::new();
         surface_stack.set_hexpand(true);
@@ -3021,6 +3119,7 @@ impl ConduitWindow {
         surface_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
         surface_stack.add_named(message_view, Some("timeline"));
         surface_stack.add_named(secondary_message_view, Some("secondary"));
+        surface_stack.add_named(native_timeline.widget(), Some("native_timeline"));
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         root.add_css_class("view");
@@ -3233,7 +3332,7 @@ impl ConduitWindow {
         viewer.surface_stack.add_controller(keys);
     }
 
-    fn open_media_viewer(&self, item: MediaGalleryItem) {
+    pub(crate) fn open_media_viewer(&self, item: MediaGalleryItem) {
         let messages = {
             let view = self.imp().workspace.view.borrow();
             view.last_channel_id()
@@ -3351,6 +3450,15 @@ impl ConduitWindow {
 
     fn close_media_viewer(&self) {
         if let Some(viewer) = self.imp().media_viewer.borrow().as_ref() {
+            if let Some(child) = viewer.content_stack.child_by_name("video") {
+                if let Ok(video) = child.downcast::<gtk::Video>() {
+                    if let Some(stream) = video.media_stream() {
+                        stream.pause();
+                    }
+                    video.set_media_stream(None::<&gtk::MediaStream>);
+                    viewer.content_stack.remove(&video);
+                }
+            }
             viewer
                 .surface_stack
                 .set_visible_child_name(self.active_surface_name());
@@ -3565,6 +3673,9 @@ impl ConduitWindow {
         let picker_handler_registered = user_content_manager
             .register_script_message_handler(EMOJI_PICKER_MESSAGE_HANDLER, None);
 
+        let conduit_handler_registered = user_content_manager
+            .register_script_message_handler("conduit", None);
+
         let web_view = webkit6::WebView::builder()
             .web_context(web_context)
             .network_session(network_session)
@@ -3590,6 +3701,19 @@ impl ConduitWindow {
                     };
                     let mut generation_gate = generation_gate.borrow_mut();
                     window.handle_emoji_picker_query(&web_view, &mut generation_gate, value);
+                },
+            );
+        }
+
+        if conduit_handler_registered {
+            let weak_window = self.downgrade();
+            user_content_manager.connect_script_message_received(
+                Some("conduit"),
+                move |_, value| {
+                    let Some(window) = weak_window.upgrade() else {
+                        return;
+                    };
+                    window.handle_conduit_script_message(value);
                 },
             );
         }
@@ -3684,6 +3808,68 @@ impl ConduitWindow {
             None::<&gio::Cancellable>,
             |_| {},
         );
+    }
+
+    fn handle_conduit_script_message(&self, value: &webkit6::javascriptcore::Value) {
+        if !gtk::prelude::GtkWindowExt::is_active(self) {
+            return;
+        }
+        let Some(json_str) = value.to_json(0) else {
+            return;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+            return;
+        };
+        let msg_type = parsed.get("type").and_then(serde_json::Value::as_str);
+        if msg_type == Some("messages_read") {
+            let Some(channel_id) = self.visible_channel_id() else {
+                return;
+            };
+            if let Some(timestamps) = parsed.get("timestamps").and_then(serde_json::Value::as_array) {
+                let max_ts = timestamps
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .fold(None, |acc: Option<&str>, ts| match acc {
+                        None => Some(ts),
+                        Some(curr) => {
+                            if crate::models::slack_timestamp_is_after(ts, curr) {
+                                Some(ts)
+                            } else {
+                                Some(curr)
+                            }
+                        }
+                    });
+                if let Some(ts) = max_ts {
+                    self.mark_conversation_read(&channel_id, ts);
+                }
+            }
+        }
+    }
+
+    fn mark_conversation_read(&self, channel_id: &str, ts: &str) {
+        let mut convs = self.imp().workspace.conversations.borrow_mut();
+        if !convs.advance_last_read(channel_id, ts) {
+            return;
+        }
+        drop(convs);
+        self.send_command(RuntimeCommand::MarkConversationRead {
+            channel_id: channel_id.to_string(),
+            ts: ts.to_string(),
+        });
+        self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+    }
+
+    fn mark_conversation_unread(&self, channel_id: &str, ts: &str) {
+        let mut convs = self.imp().workspace.conversations.borrow_mut();
+        if !convs.set_last_read(channel_id, ts.to_string()) {
+            return;
+        }
+        drop(convs);
+        self.send_command(RuntimeCommand::MarkConversationUnread {
+            channel_id: channel_id.to_string(),
+            ts: ts.to_string(),
+        });
+        self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::MAIN);
     }
 
     fn setup_reaction_picker_escape_fallback(&self) {
@@ -7737,6 +7923,16 @@ impl ConduitWindow {
                 self.open_thread(&channel_id, &ts);
                 true
             }
+            Some("mark-unread") => {
+                let Some(channel_id) = query_param(url, "channel") else {
+                    return true;
+                };
+                let Some(ts) = query_param(url, "ts") else {
+                    return true;
+                };
+                self.mark_conversation_unread(&channel_id, &ts);
+                true
+            }
             Some("message-control") => {
                 let query = url.query_pairs().collect::<Vec<_>>();
                 let Some(handle) =
@@ -8767,11 +8963,12 @@ impl ConduitWindow {
         if thread_uses_avatar {
             self.queue_ui_invalidations(UiInvalidations::THREAD);
         }
-        let main_uses_asset = self.main_view_uses_image_asset(key);
+        let custom_emojis = self.imp().custom_emojis.borrow();
+        let main_uses_asset = self.main_view_uses_image_asset(&custom_emojis, key);
         let (main_view, thread_uses_asset) = {
             let state = self.imp().workspace.view.borrow();
             let thread = state.selected_thread_ts().is_some()
-                && messages_use_image_asset(state.current_thread_messages(), key);
+                && messages_use_image_asset(state.current_thread_messages(), &custom_emojis, key);
             (state.main_view(), thread)
         };
 
@@ -8790,6 +8987,14 @@ impl ConduitWindow {
                 message_html::update_image_patch(key, source),
                 UiInvalidations::THREAD,
             );
+        }
+        if let Some(native_timeline) = self.imp().native_timeline_view.borrow().as_ref() {
+            let context = self.message_html_context(None);
+            native_timeline.update_image_asset(&context);
+        }
+        if let Some(native_timeline) = self.thread_pane().native_timeline_view.borrow().as_ref() {
+            let context = self.message_html_context(None);
+            native_timeline.update_image_asset(&context);
         }
     }
 
@@ -9397,19 +9602,19 @@ impl ConduitWindow {
         }
     }
 
-    fn main_view_uses_image_asset(&self, key: &str) -> bool {
+    fn main_view_uses_image_asset(&self, custom_emojis: &HashMap<String, String>, key: &str) -> bool {
         let state = self.imp().workspace.view.borrow();
         match state.main_view() {
             MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
-                messages_use_image_asset(state.channel_messages(channel_id), key)
+                messages_use_image_asset(state.channel_messages(channel_id), custom_emojis, key)
             }),
             MainMessageView::Threads => state
                 .observed_threads()
                 .iter()
-                .any(|(_, message)| messages_use_image_asset(std::slice::from_ref(message), key)),
+                .any(|(_, message)| messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)),
             MainMessageView::Saved => state.saved_items().iter().any(|item| {
                 item.message.as_ref().is_some_and(|message| {
-                    messages_use_image_asset(std::slice::from_ref(message), key)
+                    messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
                 })
             }),
             MainMessageView::Search | MainMessageView::Files | MainMessageView::Placeholder => {
@@ -9646,6 +9851,34 @@ impl ConduitWindow {
             .borrow()
             .get(channel_id)
             .cloned();
+
+        if let Some(conv) = conversation.as_ref() {
+            let mark_read_button = gtk::Button::with_label(&gettext("Mark as read"));
+            mark_read_button.add_css_class("flat");
+            let channel_id_clone = channel_id.to_string();
+            let weak_window = self.downgrade();
+            let popover_for_read = popover.clone();
+            let target_ts = conv
+                .latest_message_ts()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}.000000",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    )
+                });
+            mark_read_button.connect_clicked(move |_| {
+                popover_for_read.popdown();
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                window.mark_conversation_read(&channel_id_clone, &target_ts);
+            });
+            menu.append(&mark_read_button);
+        }
 
         if let Some(action) = conversation
             .as_ref()
@@ -11040,6 +11273,11 @@ impl ConduitWindow {
                 .borrow_mut()
                 .note_render_requested(generation)
         });
+        if std::env::var("CONDUIT_NATIVE_TIMELINE").as_deref() == Ok("1") {
+            if let Some(native_timeline) = imp.native_timeline_view.borrow().as_ref() {
+                native_timeline.set_messages(&messages, &context);
+            }
+        }
         self.show_timeline_surface();
         if render_action != Some(ConversationOpenRenderAction::HoldReconciliation) {
             let revision = imp.workspace.workspace_patch_revision();
@@ -11140,6 +11378,27 @@ impl ConduitWindow {
             context.load_more_url = self.thread_load_more_url(channel_id, ts);
         }
         context.timeline_scroll = scroll_behavior;
+
+        if std::env::var("CONDUIT_NATIVE_TIMELINE").as_deref() == Ok("1") {
+            let thread_native_timeline = self.thread_pane().ensure_native_timeline();
+            let window_weak = self.downgrade();
+            thread_native_timeline.set_on_open_media(move |item| {
+                if let Some(window) = window_weak.upgrade() {
+                    window.open_media_viewer(item);
+                }
+            });
+            let window_weak_thread = self.downgrade();
+            thread_native_timeline.set_on_open_thread(move |ts| {
+                if let Some(window) = window_weak_thread.upgrade() {
+                    if let Some(channel_id) = window.visible_channel_id() {
+                        window.open_thread(&channel_id, &ts);
+                    }
+                }
+            });
+            thread_native_timeline.set_messages(&messages, &context);
+            self.thread_pane().ensure_open();
+            return;
+        }
         let focus_message_ts = imp
             .workspace
             .view
@@ -12102,7 +12361,11 @@ impl ConduitWindow {
             if viewer.surface_stack.visible_child_name().as_deref() == Some("media") {
                 self.close_media_viewer();
             }
-            viewer.surface_stack.set_visible_child_name("timeline");
+            if std::env::var("CONDUIT_NATIVE_TIMELINE").as_deref() == Ok("1") {
+                viewer.surface_stack.set_visible_child_name("native_timeline");
+            } else {
+                viewer.surface_stack.set_visible_child_name("timeline");
+            }
         }
     }
 
@@ -12346,7 +12609,9 @@ impl ConduitWindow {
 
     fn request_image_assets<'a>(&self, messages: impl IntoIterator<Item = &'a SlackMessage>) {
         let avatar_urls = self.imp().user_avatar_urls.borrow();
-        let requests = message_image_asset_requests(messages, &avatar_urls);
+        let custom_emojis = self.imp().custom_emojis.borrow();
+        let requests = message_image_asset_requests(messages, &avatar_urls, &custom_emojis);
+        drop(custom_emojis);
         drop(avatar_urls);
         if requests.is_empty() {
             return;
@@ -12455,10 +12720,12 @@ impl ConduitWindow {
         message: &SlackMessage,
     ) -> MessageHtmlContext {
         let avatar_urls = self.imp().user_avatar_urls.borrow();
-        let image_keys = message_image_asset_requests([message], &avatar_urls)
+        let custom_emojis = self.imp().custom_emojis.borrow();
+        let image_keys = message_image_asset_requests([message], &avatar_urls, &custom_emojis)
             .into_iter()
             .map(|(key, _)| key)
             .collect::<HashSet<_>>();
+        drop(custom_emojis);
         drop(avatar_urls);
         let mut context = self.message_html_context_with_image_keys(thread_ts, Some(&image_keys));
         if let Some(channel_id) = self.visible_channel_id() {
@@ -12582,6 +12849,13 @@ impl ConduitWindow {
             })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
+        let last_read = self.visible_channel_id().and_then(|channel_id| {
+            imp.workspace
+                .conversations
+                .borrow()
+                .get(&channel_id)
+                .and_then(|c| c.last_read.clone())
+        });
         MessageHtmlContext {
             user_names,
             user_full_names: imp.user_full_names.borrow().clone(),
@@ -12595,6 +12869,7 @@ impl ConduitWindow {
             load_more_url: None,
             timeline_scroll: TimelineScrollBehavior::Preserve,
             timeline_generation: None,
+            last_read,
             image_assets,
             failed_image_urls: imp
                 .failed_image_assets
@@ -13544,6 +13819,10 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             kind: ConversationKind::DirectMessage,
+            unread: false,
+            unread_count: 0,
+            has_mention: false,
+            mention_count: 0,
             selected: false,
             starred: false,
             private: true,
@@ -15712,6 +15991,7 @@ mod tests {
         let requests = message_image_asset_requests(
             &messages,
             &HashMap::from([("U123".to_string(), avatar_url.clone())]),
+            &HashMap::new(),
         );
 
         assert_eq!(requests, vec![(avatar_url.clone(), avatar_url)]);
@@ -15731,6 +16011,7 @@ mod tests {
         assert!(message_image_asset_requests(
             &messages,
             &HashMap::from([("U123".to_string(), oversized_url)]),
+            &HashMap::new(),
         )
         .is_empty());
     }
@@ -15767,7 +16048,7 @@ mod tests {
         }];
 
         assert_eq!(
-            message_image_asset_requests(&messages, &HashMap::new()),
+            message_image_asset_requests(&messages, &HashMap::new(), &HashMap::new()),
             vec![
                 (bot_avatar.clone(), bot_avatar),
                 (attachment_image.clone(), attachment_image),
@@ -15786,7 +16067,7 @@ mod tests {
             ..Default::default()
         }];
 
-        assert!(message_image_asset_requests(&messages, &HashMap::new()).is_empty());
+        assert!(message_image_asset_requests(&messages, &HashMap::new(), &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -15805,7 +16086,7 @@ mod tests {
 
         assert!(message.attachments.is_none());
         assert_eq!(
-            message_image_asset_requests(&[message], &HashMap::new()),
+            message_image_asset_requests(&[message], &HashMap::new(), &HashMap::new()),
             vec![(image_url.clone(), image_url)]
         );
     }
@@ -15828,8 +16109,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            message_image_asset_requests(&[message], &HashMap::new()),
+            message_image_asset_requests(&[message], &HashMap::new(), &HashMap::new()),
             vec![(animated_url.to_string(), animated_url.to_string())]
+        );
+    }
+
+    #[test]
+    fn custom_emoji_reactions_are_requested() {
+        let emoji_url = "https://emoji.example.com/pepe-robot.png".to_string();
+        let custom_emojis = HashMap::from([("pepe-robot".to_string(), emoji_url.clone())]);
+        let message = SlackMessage {
+            ts: "1710000002.000100".to_string(),
+            reactions: Some(vec![crate::models::SlackReaction {
+                name: Some(":pepe-robot:".to_string()),
+                count: Some(1),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            message_image_asset_requests(&[message], &HashMap::new(), &custom_emojis),
+            vec![(emoji_url.clone(), emoji_url)]
         );
     }
 
@@ -15849,7 +16150,7 @@ mod tests {
             .expect("GIF block should normalize"),
         );
 
-        assert!(messages_use_image_asset(&[message], image_url));
+        assert!(messages_use_image_asset(&[message], &HashMap::new(), image_url));
     }
 
     #[test]

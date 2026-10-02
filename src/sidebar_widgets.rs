@@ -80,10 +80,15 @@ pub fn sidebar_row_widget(
     icon.set_tooltip_text(Some(model.kind.accessible_name()));
     content.append(&icon);
 
+    let emphasized = model.unread || model.has_mention;
     let title = gtk::Label::new(Some(&model.title));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.set_attributes(Some(&sidebar_title_attributes(emphasized)));
+    if emphasized {
+        title.add_css_class("heading");
+    }
     content.append(&title);
 
     if let Some(status) = model.status.as_ref() {
@@ -120,6 +125,22 @@ pub fn sidebar_row_widget(
         starred.set_tooltip_text(Some("Starred"));
         starred.update_property(&[gtk::accessible::Property::Label("Starred")]);
         content.append(&starred);
+    }
+
+    if let Some(unread_label) = model.unread_badge_label() {
+        let unread = gtk::Label::new(Some(&unread_label));
+        unread.add_css_class("caption");
+        unread.add_css_class("heading");
+        content.append(&unread);
+    }
+
+    if let Some(mention_label) = model.mention_badge_label() {
+        let mention = gtk::Label::new(Some(&mention_label));
+        mention.add_css_class("caption");
+        mention.add_css_class("heading");
+        mention.add_css_class("accent");
+        mention.set_tooltip_text(Some("Mentioned"));
+        content.append(&mention);
     }
 
     if model.muted {
@@ -203,4 +224,31 @@ fn sidebar_status_emoji_picture(url: &str, label: &str, size: i32) -> gtk::Pictu
         },
     );
     picture
+}
+
+fn sidebar_title_attributes(unread: bool) -> gtk::pango::AttrList {
+    let attributes = gtk::pango::AttrList::new();
+    attributes.insert(gtk::pango::AttrInt::new_weight(sidebar_title_weight(
+        unread,
+    )));
+    attributes
+}
+
+fn sidebar_title_weight(unread: bool) -> gtk::pango::Weight {
+    if unread {
+        gtk::pango::Weight::Bold
+    } else {
+        gtk::pango::Weight::Normal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_weight_uses_bold_only_for_unread_rows() {
+        assert_eq!(sidebar_title_weight(false), gtk::pango::Weight::Normal);
+        assert_eq!(sidebar_title_weight(true), gtk::pango::Weight::Bold);
+    }
 }

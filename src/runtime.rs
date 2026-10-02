@@ -32,8 +32,8 @@ use crate::message_handoff::{
     ResolvedMessageHandoff,
 };
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUser, SlackUserStatus, StoredToken,
+    slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
+    SlackConversation, SlackFile, SlackMessage, SlackUser, SlackUserStatus, StoredToken,
 };
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::ConversationHistoryService;
@@ -568,6 +568,16 @@ impl RuntimeCommand {
                     },
                 ),
                 RuntimeTaskLane::Upload,
+                RuntimeAdmissionPolicy::durable_action(),
+            ),
+            Self::MarkConversationRead { channel_id, .. } => RuntimeCommandDescriptor::mutation(
+                channel(RuntimeOperation::MarkRead, channel_id),
+                RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
+            ),
+            Self::MarkConversationUnread { channel_id, .. } => RuntimeCommandDescriptor::mutation(
+                channel(RuntimeOperation::MarkUnread, channel_id),
+                RuntimeTaskLane::Interactive,
                 RuntimeAdmissionPolicy::durable_action(),
             ),
             Self::Huddle(command) => RuntimeCommandDescriptor::mutation(
@@ -1831,6 +1841,7 @@ struct RuntimeConnection {
     user_status_sync: UserStatusSync,
     team_id: Option<String>,
     huddles: HuddleActorHandle,
+    read_flusher: ReadFlusherHandle,
     scheduler: Arc<Mutex<SyncScheduler>>,
     pending_jobs: Arc<Mutex<HashMap<SyncJobId, SyncJobPayload>>>,
     next_job_id: Arc<std::sync::atomic::AtomicU64>,
@@ -4551,6 +4562,10 @@ fn spawn_authentication_task<F>(
                             user_status_sync: UserStatusSync::default(),
                             team_id: auth.team_id.clone(),
                             huddles,
+                            read_flusher: ReadFlusherHandle::new(
+                                Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                                Arc::new(Notify::new()),
+                            ),
                             scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                                 SchedulerConfig::new(256, 8, 5).unwrap(),
                             ))),
@@ -5253,6 +5268,7 @@ async fn handle_connected_command(
         team_id: connection.team_id.as_deref(),
         workspace_url: connection.workspace_url.as_deref(),
         huddles: &connection.huddles,
+        read_flusher: &connection.read_flusher,
     };
 
     let result = handle_command(command, &mut context).await;
@@ -5279,6 +5295,7 @@ struct RuntimeContext<'a> {
     team_id: Option<&'a str>,
     workspace_url: Option<&'a str>,
     huddles: &'a HuddleActorHandle,
+    read_flusher: &'a ReadFlusherHandle,
 }
 
 #[derive(Clone, Copy)]
@@ -6461,6 +6478,20 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context
                 .events
                 .send_event(RuntimeEventKind::FileUploaded(label));
+        }
+        RuntimeCommand::MarkConversationRead { channel_id, ts } => {
+            context.read_flusher.enqueue(&channel_id, &ts);
+        }
+        RuntimeCommand::MarkConversationUnread { channel_id, ts } => {
+            context.read_flusher.enqueue_force(&channel_id, &ts);
+            if let Some(store) = context.workspace_store.as_mut() {
+                if let Ok(Some(mut convs)) = store.load_conversations().await {
+                    if let Some(conv) = convs.iter_mut().find(|c| c.id == channel_id) {
+                        conv.last_read = Some(ts.clone());
+                        let _ = store.store_conversations(&convs).await;
+                    }
+                }
+            }
         }
     }
 
@@ -8289,6 +8320,190 @@ impl EventSenderExt for RuntimeEventSender {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct PendingReadMark {
+    pub channel_id: String,
+    pub target_ts: String,
+}
+
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
+pub struct ReadFlusherQueue {
+    last_marked: HashMap<String, String>,
+    pending: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+impl ReadFlusherQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_last_marked(&mut self, channel_id: impl Into<String>, ts: impl Into<String>) {
+        let channel_id = channel_id.into();
+        let ts = ts.into();
+        if let Some(current) = self.last_marked.get(&channel_id) {
+            if slack_timestamp_is_after(&ts, current) {
+                self.last_marked.insert(channel_id, ts);
+            }
+        } else {
+            self.last_marked.insert(channel_id, ts);
+        }
+    }
+
+    pub fn last_marked(&self, channel_id: &str) -> Option<&str> {
+        self.last_marked.get(channel_id).map(String::as_str)
+    }
+
+    pub fn pending_mark(&self, channel_id: &str) -> Option<&str> {
+        self.pending.get(channel_id).map(String::as_str)
+    }
+
+    pub fn enqueue(&mut self, channel_id: &str, target_ts: &str) -> bool {
+        if let Some(marked_ts) = self.last_marked.get(channel_id) {
+            if !slack_timestamp_is_after(target_ts, marked_ts) {
+                return false;
+            }
+        }
+        if let Some(p_ts) = self.pending.get(channel_id) {
+            if !slack_timestamp_is_after(target_ts, p_ts) {
+                return false;
+            }
+        }
+        self.pending.insert(channel_id.to_string(), target_ts.to_string());
+        true
+    }
+
+    pub fn enqueue_force(&mut self, channel_id: &str, target_ts: &str) {
+        self.pending.insert(channel_id.to_string(), target_ts.to_string());
+    }
+
+    pub fn flush(&mut self) -> Vec<PendingReadMark> {
+        let mut flushed = Vec::with_capacity(self.pending.len());
+        for (channel_id, target_ts) in self.pending.drain() {
+            self.last_marked.insert(channel_id.clone(), target_ts.clone());
+            flushed.push(PendingReadMark {
+                channel_id,
+                target_ts,
+            });
+        }
+        flushed
+    }
+
+    pub fn flush_channel(&mut self, channel_id: &str) -> Option<PendingReadMark> {
+        if let Some(target_ts) = self.pending.remove(channel_id) {
+            self.last_marked.insert(channel_id.to_string(), target_ts.clone());
+            Some(PendingReadMark {
+                channel_id: channel_id.to_string(),
+                target_ts,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct ReadFlusherHandle {
+    queue: Arc<Mutex<ReadFlusherQueue>>,
+    notify: Arc<Notify>,
+}
+
+#[allow(dead_code)]
+impl ReadFlusherHandle {
+    pub fn new(queue: Arc<Mutex<ReadFlusherQueue>>, notify: Arc<Notify>) -> Self {
+        Self { queue, notify }
+    }
+
+    pub fn set_last_marked(&self, channel_id: &str, ts: &str) {
+        let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+        q.set_last_marked(channel_id, ts);
+    }
+
+    pub fn enqueue(&self, channel_id: &str, target_ts: &str) -> bool {
+        let updated = {
+            let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+            q.enqueue(channel_id, target_ts)
+        };
+        if updated {
+            self.notify.notify_one();
+        }
+        updated
+    }
+
+    pub fn enqueue_force(&self, channel_id: &str, target_ts: &str) {
+        {
+            let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+            q.enqueue_force(channel_id, target_ts);
+        }
+        self.notify.notify_one();
+    }
+
+    pub fn flush_channel(&self, channel_id: &str) -> Option<PendingReadMark> {
+        let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+        q.flush_channel(channel_id)
+    }
+
+    pub fn flush(&self) -> Vec<PendingReadMark> {
+        let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+        q.flush()
+    }
+}
+
+#[allow(dead_code)]
+pub async fn execute_read_flusher_mark(api: &SlackApi, mark: &PendingReadMark) -> Result<()> {
+    let mut retries = 0usize;
+    loop {
+        match api.conversations_mark(&mark.channel_id, &mark.target_ts).await {
+            Ok(()) => return Ok(()),
+            Err(slack_err) => {
+                if slack_err.category() == SlackErrorCategory::RateLimited && retries < 3 {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << retries))).await;
+                    continue;
+                }
+                return Err(anyhow::Error::from(slack_err));
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn run_read_flusher_loop(
+    handle: ReadFlusherHandle,
+    api: SlackApi,
+    debounce_delay: Duration,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    loop {
+        if shutdown.try_recv().is_ok() {
+            let marks = handle.flush();
+            for mark in marks {
+                let _ = execute_read_flusher_mark(&api, &mark).await;
+            }
+            break;
+        }
+
+        handle.notify.notified().await;
+        tokio::time::sleep(debounce_delay).await;
+
+        let marks = handle.flush();
+        for mark in marks {
+            if let Err(error) = execute_read_flusher_mark(&api, &mark).await {
+                crate::debug::log(
+                    "read_flusher",
+                    &format!(
+                        "conversations_mark failed channel={} error={error}",
+                        mark.channel_id
+                    ),
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -9983,6 +10198,10 @@ mod tests {
                 user_status_sync: UserStatusSync::default(),
                 team_id: None,
                 huddles,
+                read_flusher: ReadFlusherHandle::new(
+                    Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                    Arc::new(Notify::new()),
+                ),
                 scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                     SchedulerConfig::new(256, 8, 5).unwrap(),
                 ))),
@@ -10119,6 +10338,10 @@ mod tests {
                     user_status_sync: UserStatusSync::default(),
                     team_id: None,
                     huddles,
+                    read_flusher: ReadFlusherHandle::new(
+                        Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                        Arc::new(Notify::new()),
+                    ),
                     scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                         SchedulerConfig::new(256, 8, 5).unwrap(),
                     ))),
@@ -15729,6 +15952,10 @@ mod tests {
             user_status_sync: UserStatusSync::default(),
             team_id: None,
             huddles,
+            read_flusher: ReadFlusherHandle::new(
+                Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                Arc::new(Notify::new()),
+            ),
             scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                 SchedulerConfig::new(256, 8, 5).unwrap(),
             ))),
@@ -16122,6 +16349,8 @@ mod tests {
             | RuntimeCommand::SetSaved { .. }
             | RuntimeCommand::SetConversationStarred { .. }
             | RuntimeCommand::SetCurrentUserStatus { .. }
+            | RuntimeCommand::MarkConversationRead { .. }
+            | RuntimeCommand::MarkConversationUnread { .. }
             | RuntimeCommand::UploadFiles { .. }
             | RuntimeCommand::Huddle(_) => RuntimeAdmissionPolicy::durable_action(),
         }
@@ -16187,6 +16416,8 @@ mod tests {
             | RuntimeCommand::SetSaved { .. }
             | RuntimeCommand::SetConversationStarred { .. }
             | RuntimeCommand::SetCurrentUserStatus { .. }
+            | RuntimeCommand::MarkConversationRead { .. }
+            | RuntimeCommand::MarkConversationUnread { .. }
             | RuntimeCommand::Huddle(_) => (false, None, RuntimeTaskLane::Interactive),
         }
     }
@@ -16335,6 +16566,14 @@ mod tests {
             RuntimeCommand::SetCurrentUserStatus {
                 status: SlackUserStatus::default(),
             },
+            RuntimeCommand::MarkConversationRead {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+            },
+            RuntimeCommand::MarkConversationUnread {
+                channel_id: "C1".to_string(),
+                ts: "1.0".to_string(),
+            },
             RuntimeCommand::UploadFiles {
                 channel_id: "C1".to_string(),
                 thread_ts: None,
@@ -16351,7 +16590,7 @@ mod tests {
     #[test]
     fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
         let commands = runtime_command_fixtures();
-        assert_eq!(commands.len(), 40);
+        assert_eq!(commands.len(), 42);
 
         for command in commands {
             let descriptor = command.descriptor();
@@ -16937,6 +17176,10 @@ mod tests {
             user_status_sync: UserStatusSync::default(),
             team_id: None,
             huddles,
+            read_flusher: ReadFlusherHandle::new(
+                Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                Arc::new(Notify::new()),
+            ),
             scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                 SchedulerConfig::new(256, 8, 5).unwrap(),
             ))),
@@ -19037,5 +19280,91 @@ mod tests {
             assert!(!paths[1].exists());
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn read_flusher_queue_monotonic_protection() {
+        let mut queue = ReadFlusherQueue::new();
+        queue.set_last_marked("C1", "100.000000");
+
+        // Forward read target accepted
+        assert!(queue.enqueue("C1", "150.000000"));
+        assert_eq!(queue.pending_mark("C1"), Some("150.000000"));
+
+        // Backward or equal candidate rejected
+        assert!(!queue.enqueue("C1", "120.000000"));
+        assert!(!queue.enqueue("C1", "100.000000"));
+        assert_eq!(queue.pending_mark("C1"), Some("150.000000"));
+    }
+
+    #[test]
+    fn read_flusher_queue_deduplication() {
+        let mut queue = ReadFlusherQueue::new();
+        queue.set_last_marked("C1", "100.000000");
+
+        // First forward enqueue accepted
+        assert!(queue.enqueue("C1", "150.000000"));
+
+        // Equal or older pending enqueue skipped
+        assert!(!queue.enqueue("C1", "150.000000"));
+        assert!(!queue.enqueue("C1", "140.000000"));
+
+        // Newer pending enqueue accepted and collapses prior update
+        assert!(queue.enqueue("C1", "200.000000"));
+        assert_eq!(queue.pending_mark("C1"), Some("200.000000"));
+    }
+
+    #[test]
+    fn read_flusher_queue_debounced_batching() {
+        let mut queue = ReadFlusherQueue::new();
+        queue.enqueue("C1", "100.000000");
+        queue.enqueue("C2", "200.000000");
+        queue.enqueue("C1", "150.000000");
+
+        let flushed = queue.flush();
+        assert_eq!(flushed.len(), 2);
+        assert!(flushed.contains(&PendingReadMark {
+            channel_id: "C1".to_string(),
+            target_ts: "150.000000".to_string(),
+        }));
+        assert!(flushed.contains(&PendingReadMark {
+            channel_id: "C2".to_string(),
+            target_ts: "200.000000".to_string(),
+        }));
+
+        // After flush, last_marked updated and pending emptied
+        assert_eq!(queue.last_marked("C1"), Some("150.000000"));
+        assert_eq!(queue.last_marked("C2"), Some("200.000000"));
+        assert!(queue.flush().is_empty());
+    }
+
+    #[test]
+    fn read_flusher_queue_immediate_channel_flush() {
+        let mut queue = ReadFlusherQueue::new();
+        queue.enqueue("C1", "100.000000");
+        queue.enqueue("C2", "200.000000");
+
+        let c1_mark = queue.flush_channel("C1");
+        assert_eq!(
+            c1_mark,
+            Some(PendingReadMark {
+                channel_id: "C1".to_string(),
+                target_ts: "100.000000".to_string(),
+            })
+        );
+        assert_eq!(queue.last_marked("C1"), Some("100.000000"));
+
+        // C2 remains pending
+        assert_eq!(queue.pending_mark("C2"), Some("200.000000"));
+    }
+
+    #[test]
+    fn read_flusher_queue_forced_enqueue() {
+        let mut queue = ReadFlusherQueue::new();
+        queue.set_last_marked("C1", "200.000000");
+
+        // Force enqueue allows backward mark for manual overrides
+        queue.enqueue_force("C1", "100.000000");
+        assert_eq!(queue.pending_mark("C1"), Some("100.000000"));
     }
 }

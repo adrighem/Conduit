@@ -153,6 +153,8 @@ pub enum SlackError {
     RateLimited { method: String },
     #[error("{message}")]
     Validation { message: String },
+    #[error("Invalid parameters")]
+    InvalidParameters,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -181,7 +183,7 @@ impl SlackError {
             }
             Self::Api { .. } => SlackErrorCategory::Unexpected,
             Self::RateLimited { .. } => SlackErrorCategory::RateLimited,
-            Self::Validation { .. } => SlackErrorCategory::Validation,
+            Self::Validation { .. } | Self::InvalidParameters => SlackErrorCategory::Validation,
             Self::Other(error) => classify_wrapped_slack_error(error),
         }
     }
@@ -619,6 +621,21 @@ impl SlackApi {
             .post_form(
                 "conversations.leave",
                 &[("channel", channel_id.to_string())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn conversations_mark(&self, channel_id: &str, ts: &str) -> Result<()> {
+        let channel_id = channel_id.trim_matches(|c: char| c.is_ascii_whitespace());
+        let ts = ts.trim_matches(|c: char| c.is_ascii_whitespace());
+        if channel_id.is_empty() || ts.is_empty() {
+            return Err(SlackError::InvalidParameters);
+        }
+        let _: BasicResponse = self
+            .post_form(
+                "conversations.mark",
+                &[("channel", channel_id.to_string()), ("ts", ts.to_string())],
             )
             .await?;
         Ok(())
@@ -2009,10 +2026,10 @@ fn is_trusted_avatar_url(url: &str) -> bool {
         return false;
     }
     url.host_str().is_some_and(|host| {
-        matches!(
-            host.trim_end_matches('.').to_ascii_lowercase().as_str(),
-            "a.slack-edge.com" | "avatars.slack-edge.com" | "secure.gravatar.com"
-        )
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        host == "slack-edge.com"
+            || host.ends_with(".slack-edge.com")
+            || host == "secure.gravatar.com"
     })
 }
 
@@ -3344,6 +3361,12 @@ mod tests {
         assert!(is_trusted_avatar_url(
             "https://a.slack-edge.com/80588/img/slackbot_72.png"
         ));
+        assert!(is_trusted_avatar_url(
+            "https://emoji.slack-edge.com/T1/custom/hash.png"
+        ));
+        assert!(is_trusted_avatar_url(
+            "https://emoji.slack-edge.com/T1/custom/hash.gif"
+        ));
         assert!(!is_trusted_avatar_url(
             "http://avatars.slack-edge.com/avatar.png"
         ));
@@ -4207,5 +4230,67 @@ mod tests {
         assert_eq!(form.get("file").map(String::as_str), Some("F123"));
         assert_eq!(file.id.as_deref(), Some("F123"));
         assert_eq!(file.display_title(), "Design");
+    }
+
+    #[test]
+    fn test_conversations_mark_parameter_validation() {
+        let token = user_test_token();
+        let api = SlackApi::new(token);
+        let rt = tokio::runtime::Runtime::new().expect("test runtime should start");
+
+        let res = rt.block_on(api.conversations_mark("", "1234.5678"));
+        assert!(matches!(res, Err(SlackError::InvalidParameters)));
+
+        let res = rt.block_on(api.conversations_mark("   \t\n", "1234.5678"));
+        assert!(matches!(res, Err(SlackError::InvalidParameters)));
+
+        let res = rt.block_on(api.conversations_mark("C12345", ""));
+        assert!(matches!(res, Err(SlackError::InvalidParameters)));
+
+        let res = rt.block_on(api.conversations_mark("C12345", "  \r\n"));
+        assert!(matches!(res, Err(SlackError::InvalidParameters)));
+    }
+
+    #[test]
+    fn test_conversations_mark_request_formatting() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(r#"{"ok":true}"#)
+                        .with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("content type header should be valid"),
+                        ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, body)
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let result = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.conversations_mark("  C12345  ", "\t1234.5678\n"));
+        assert!(result.is_ok());
+
+        let (path, body) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/conversations.mark");
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(form.get("channel").map(String::as_str), Some("C12345"));
+        assert_eq!(form.get("ts").map(String::as_str), Some("1234.5678"));
     }
 }

@@ -96,6 +96,133 @@
     return root.scrollHeight - root.scrollTop - root.clientHeight <= bottomThreshold;
   }
 
+  let dwellTimer = null;
+  let scrollSettleTimer = null;
+  let reportedReadTimestamps = new Set();
+  let observer = null;
+
+  function isMessageQualifiedVisible(element) {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+    if (viewportHeight <= 0 || rect.height <= 0) return false;
+
+    const visibleTop = Math.max(0, rect.top);
+    const visibleBottom = Math.min(viewportHeight, rect.bottom);
+    const intersectionHeight = Math.max(0, visibleBottom - visibleTop);
+    const intersectionRatio = intersectionHeight / rect.height;
+
+    const criterionA = intersectionRatio >= 0.8;
+    const criterionB =
+      rect.height >= 0.5 * viewportHeight &&
+      intersectionHeight >= 0.5 * viewportHeight;
+
+    return criterionA || criterionB;
+  }
+
+  function dispatchMessagesRead(timestamps) {
+    if (!timestamps || timestamps.length === 0) return;
+    if (
+      window.webkit &&
+      window.webkit.messageHandlers &&
+      window.webkit.messageHandlers.conduit
+    ) {
+      window.webkit.messageHandlers.conduit.postMessage({
+        type: "messages_read",
+        timestamps: timestamps
+      });
+    }
+  }
+
+  function checkAndDispatchReadMessages() {
+    const messages = document.querySelectorAll("[data-message-ts]");
+    const unreadQualified = [];
+    messages.forEach(function (el) {
+      const ts = el.dataset.messageTs;
+      if (ts && !reportedReadTimestamps.has(ts)) {
+        if (isMessageQualifiedVisible(el)) {
+          unreadQualified.push(ts);
+        }
+      }
+    });
+    if (unreadQualified.length > 0) {
+      unreadQualified.forEach(function (ts) {
+        reportedReadTimestamps.add(ts);
+      });
+      dispatchMessagesRead(unreadQualified);
+    }
+  }
+
+  function scheduleDwellTimer() {
+    if (dwellTimer || scrollSettleTimer) return;
+    dwellTimer = window.setTimeout(function () {
+      dwellTimer = null;
+      checkAndDispatchReadMessages();
+    }, 2000);
+  }
+
+  function onScrollReadState() {
+    if (dwellTimer) {
+      window.clearTimeout(dwellTimer);
+      dwellTimer = null;
+    }
+    if (scrollSettleTimer) {
+      window.clearTimeout(scrollSettleTimer);
+    }
+    scrollSettleTimer = window.setTimeout(function () {
+      scrollSettleTimer = null;
+      scheduleDwellTimer();
+    }, 150);
+  }
+
+  function observeNewMessages(container) {
+    if (!observer || !container) return;
+    const elements = container.querySelectorAll
+      ? Array.from(container.querySelectorAll("[data-message-ts]"))
+      : [];
+    if (container.matches && container.matches("[data-message-ts]")) {
+      elements.push(container);
+    }
+    elements.forEach(function (el) {
+      observer.observe(el);
+    });
+  }
+
+  function initReadDetection() {
+    cleanupReadDetection();
+    if (typeof IntersectionObserver !== "undefined") {
+      observer = new IntersectionObserver(
+        function () {
+          if (!scrollSettleTimer) {
+            scheduleDwellTimer();
+          }
+        },
+        {
+          threshold: [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        }
+      );
+      document.querySelectorAll("[data-message-ts]").forEach(function (el) {
+        observer.observe(el);
+      });
+    }
+    scheduleDwellTimer();
+  }
+
+  function cleanupReadDetection() {
+    if (dwellTimer) {
+      window.clearTimeout(dwellTimer);
+      dwellTimer = null;
+    }
+    if (scrollSettleTimer) {
+      window.clearTimeout(scrollSettleTimer);
+      scrollSettleTimer = null;
+    }
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+  }
+
   let viewportAnchor = null;
   let viewportAnchorTop = 0;
   let restoringViewportAnchor = false;
@@ -213,6 +340,7 @@
     revealTimeline();
     rememberStoredViewport();
     rememberViewportAnchor();
+    initReadDetection();
     notifyHost("positioned");
   }
 
@@ -310,6 +438,7 @@
       noteUserInteraction();
       return;
     }
+    onScrollReadState();
     scheduleRememberViewportAnchor();
     if (!initialPositionPending) rememberStoredViewport();
   }, { passive: true });
@@ -385,6 +514,8 @@
       ) return false;
 
       snapshotReplaced = true;
+      cleanupReadDetection();
+      reportedReadTimestamps.clear();
 
       if (rememberViewportAnchorFrame) {
         window.cancelAnimationFrame(rememberViewportAnchorFrame);
@@ -466,6 +597,8 @@
         }
         if (patch.position === "prepend") list.prepend(content);
         else list.append(content);
+        observeNewMessages(list);
+        if (!scrollSettleTimer) scheduleDwellTimer();
         return true;
       }
 
@@ -478,7 +611,10 @@
         if (patch.arrival === "sent") {
           animateSentMessage(content, patch.message_ts, arrivalVisible);
         }
+        const parent = target.parentElement;
         target.replaceWith(content);
+        observeNewMessages(parent || document);
+        if (!scrollSettleTimer) scheduleDwellTimer();
         return true;
       }
 

@@ -28,6 +28,7 @@ pub(crate) struct ThreadPane {
     view_box: gtk::Box,
     web_view: Rc<RefCell<Option<webkit6::WebView>>>,
     web_view_creations: Rc<Cell<usize>>,
+    pub(crate) native_timeline_view: Rc<RefCell<Option<crate::timeline_message_widget::NativeTimelineView>>>,
 }
 
 impl ThreadPane {
@@ -42,7 +43,31 @@ impl ThreadPane {
             view_box: view_box.clone(),
             web_view: Rc::new(RefCell::new(None)),
             web_view_creations: Rc::new(Cell::new(0)),
+            native_timeline_view: Rc::new(RefCell::new(None)),
         }
+    }
+
+    pub(crate) fn sync_visibility(&self) {
+        let native_active = std::env::var("CONDUIT_NATIVE_TIMELINE").as_deref() == Ok("1");
+        if let Some(native_view) = self.native_timeline_view.borrow().as_ref() {
+            native_view.widget().set_visible(native_active);
+        }
+        if let Some(web_view) = self.web_view.borrow().as_ref() {
+            web_view.set_visible(!native_active);
+        }
+    }
+
+    pub(crate) fn ensure_native_timeline(&self) -> crate::timeline_message_widget::NativeTimelineView {
+        let view = if let Some(view) = self.native_timeline_view.borrow().clone() {
+            view
+        } else {
+            let view = crate::timeline_message_widget::NativeTimelineView::new();
+            self.view_box.append(view.widget());
+            *self.native_timeline_view.borrow_mut() = Some(view.clone());
+            view
+        };
+        self.sync_visibility();
+        view
     }
 
     pub(crate) fn has_web_view(&self) -> bool {
@@ -58,14 +83,17 @@ impl ThreadPane {
     }
 
     pub(crate) fn attach_web_view(&self, web_view: webkit6::WebView) -> webkit6::WebView {
-        if let Some(existing) = self.web_view() {
-            return existing;
-        }
-        self.view_box.append(&web_view);
-        self.web_view.replace(Some(web_view.clone()));
-        self.web_view_creations
-            .set(self.web_view_creations.get() + 1);
-        web_view
+        let wv = if let Some(existing) = self.web_view() {
+            existing
+        } else {
+            self.view_box.append(&web_view);
+            self.web_view.replace(Some(web_view.clone()));
+            self.web_view_creations
+                .set(self.web_view_creations.get() + 1);
+            web_view
+        };
+        self.sync_visibility();
+        wv
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -98,6 +126,7 @@ impl ThreadPane {
     }
 
     pub(crate) fn load_html(&self, html: &str) {
+        self.sync_visibility();
         let Some(web_view) = self.web_view() else {
             return;
         };

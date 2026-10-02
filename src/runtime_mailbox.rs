@@ -155,6 +155,14 @@ pub enum RuntimeCommand {
     SetCurrentUserStatus {
         status: SlackUserStatus,
     },
+    MarkConversationRead {
+        channel_id: String,
+        ts: String,
+    },
+    MarkConversationUnread {
+        channel_id: String,
+        ts: String,
+    },
     UploadFiles {
         channel_id: String,
         thread_ts: Option<String>,
@@ -221,6 +229,8 @@ pub enum RuntimeOperation {
     UserStatus,
     FileUpload,
     SocketMode,
+    MarkRead,
+    MarkUnread,
     Huddle,
 }
 

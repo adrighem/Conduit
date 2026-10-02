@@ -27,6 +27,8 @@ pub struct ThreadRecord {
     pub(crate) root: Option<SlackMessage>,
     pub(crate) reply_count: u64,
     pub(crate) latest_reply: Option<String>,
+    #[serde(default)]
+    pub(crate) last_read: Option<String>,
     /// `None` means Slack has not supplied subscription metadata yet.
     pub(crate) subscribed: Option<bool>,
     /// Reply authors are append-only: deleting a reply does not erase the
@@ -44,9 +46,31 @@ impl ThreadRecord {
             root: None,
             reply_count: 0,
             latest_reply: None,
+            last_read: None,
             subscribed: None,
             participant_user_ids: HashSet::new(),
             seen_reply_ts: HashSet::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn has_unread_replies(&self) -> bool {
+        let Some(latest_reply) = self
+            .latest_reply
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return false;
+        };
+        match self
+            .last_read
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(last_read) => slack_timestamp_is_after(latest_reply, last_read),
+            None => true,
         }
     }
 
@@ -504,5 +528,23 @@ mod tests {
             catalog.get("C1", "1.0").unwrap().latest_reply.as_deref(),
             Some("10.000000")
         );
+    }
+
+    #[test]
+    fn thread_record_unread_replies_check() {
+        let mut record = ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+        assert!(!record.has_unread_replies());
+
+        record.latest_reply = Some("10.000000".to_string());
+        assert!(record.has_unread_replies());
+
+        record.last_read = Some("9.000000".to_string());
+        assert!(record.has_unread_replies());
+
+        record.last_read = Some("10.000000".to_string());
+        assert!(!record.has_unread_replies());
+
+        record.last_read = Some("11.000000".to_string());
+        assert!(!record.has_unread_replies());
     }
 }
