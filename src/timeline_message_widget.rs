@@ -57,7 +57,6 @@ mod wrap_box_imp {
             while let Some(child) = self.children.borrow_mut().pop() {
                 child.unparent();
             }
-            self.parent_dispose();
         }
     }
 

@@ -7461,9 +7461,6 @@ mod tests {
         let output = mrkdwn_to_pango(input, &context);
         assert_eq!(output, "<b>bold with <tt>code</tt> and <i>italic</i></b>");
     }
-||||||| 18cc5db
-=======
-
     #[test]
     fn test_renders_bare_urls_and_mailto_links() {
         let message = SlackMessage {
@@ -7480,5 +7477,4 @@ mod tests {
         ));
         assert!(html.contains("<a href=\"mailto:support@conduit.app\" rel=\"noreferrer noopener\">mailto:support@conduit.app</a>"));
     }
->>>>>>> origin/main
 }
