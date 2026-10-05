@@ -11,7 +11,7 @@ Conduit should not mirror an entire workspace archive in the background, but a f
 This slice implements the smallest useful native version:
 
 - Slack history calls return page metadata with `has_more` and `response_metadata.next_cursor`.
-- Channel history fetches use a larger bounded page size and expose a **Load older messages** action at the top of the WebKit message timeline.
+- Channel history fetches use a larger bounded page size and expose a **Load older messages** action at the top of the message timeline.
 - Thread replies use the same cursor model and expose **Load more replies** at the bottom of the thread timeline.
 - The thread pane defaults to two-thirds of the conversation area, leaving one-third for the main channel pane. It can be resized down to one-fifth but not beyond the two-thirds maximum. Narrow windows retain the adaptive overlay presentation.
 - The GTK window keeps cursors in memory and merges loaded pages by Slack timestamp, newest first, before rendering chronologically.

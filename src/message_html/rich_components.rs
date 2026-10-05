@@ -213,12 +213,7 @@ fn render_inline(inline: &RichInline, context: &MessageHtmlContext) -> String {
                 .get(user_id)
                 .map(String::as_str)
                 .unwrap_or(user_id);
-            let tooltip = context
-                .user_full_names
-                .get(user_id)
-                .map(String::as_str)
-                .unwrap_or(name);
-            return super::mention_actions_html(user_id, name, tooltip);
+            return format!("@{}", super::escape_html(name));
         }
         RichInline::Channel(channel_id) => {
             let name = context

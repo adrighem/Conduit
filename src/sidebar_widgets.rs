@@ -29,6 +29,7 @@ pub struct SidebarRowLayout {
     margin_bottom: i32,
     margin_start: i32,
     margin_end: i32,
+    show_avatars: bool,
 }
 
 impl SidebarRowLayout {
@@ -38,6 +39,7 @@ impl SidebarRowLayout {
             margin_bottom: 1,
             margin_start: 6,
             margin_end: 6,
+            show_avatars: false,
         }
     }
 
@@ -47,6 +49,7 @@ impl SidebarRowLayout {
             margin_bottom: 6,
             margin_start: 8,
             margin_end: 8,
+            show_avatars: true,
         }
     }
 }
@@ -76,9 +79,21 @@ pub fn sidebar_row_widget(
     content.set_margin_start(layout.margin_start);
     content.set_margin_end(layout.margin_end);
 
-    let icon = gtk::Image::from_icon_name(model.kind.icon_name());
-    icon.set_tooltip_text(Some(model.kind.accessible_name()));
-    content.append(&icon);
+    if layout.show_avatars {
+        if let Some(avatar_url) = model.avatar_url.as_deref() {
+            register_switcher_avatar_css();
+            let avatar = switcher_avatar_picture(avatar_url, model.kind.accessible_name(), 20);
+            content.append(&avatar);
+        } else {
+            let icon = gtk::Image::from_icon_name(model.kind.icon_name());
+            icon.set_tooltip_text(Some(model.kind.accessible_name()));
+            content.append(&icon);
+        }
+    } else {
+        let icon = gtk::Image::from_icon_name(model.kind.icon_name());
+        icon.set_tooltip_text(Some(model.kind.accessible_name()));
+        content.append(&icon);
+    }
 
     let emphasized = model.unread || model.has_mention;
     let title = gtk::Label::new(Some(&model.title));
@@ -175,6 +190,75 @@ fn sidebar_target_emoji_size(widget: &impl gtk::prelude::WidgetExt) -> i32 {
     } else {
         16
     }
+}
+
+fn register_switcher_avatar_css() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if !gtk::is_initialized() {
+            return;
+        }
+        let Some(display) = gtk::gdk::Display::default() else {
+            return;
+        };
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(".switcher-avatar { border-radius: 9999px; }");
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+}
+
+fn switcher_avatar_picture(url: &str, label: &str, size: i32) -> gtk::Picture {
+    let picture = gtk::Picture::new();
+    picture.set_alternative_text(Some(label));
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Cover);
+    picture.set_size_request(size, size);
+    picture.set_halign(gtk::Align::Center);
+    picture.set_valign(gtk::Align::Center);
+    picture.set_overflow(gtk::Overflow::Hidden);
+    picture.add_css_class("switcher-avatar");
+
+    let weak_picture = picture.downgrade();
+    let file = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE")
+        .map(gtk::gio::File::for_path)
+        .unwrap_or_else(|| gtk::gio::File::for_uri(url));
+
+    file.read_async(
+        gtk::glib::Priority::DEFAULT,
+        gtk::gio::Cancellable::NONE,
+        move |stream| {
+            let Ok(stream) = stream else { return };
+            let weak_picture = weak_picture.clone();
+            gdk_pixbuf::PixbufAnimation::from_stream_async(
+                &stream,
+                gtk::gio::Cancellable::NONE,
+                move |animation| {
+                    let Some(picture) = weak_picture.upgrade() else {
+                        return;
+                    };
+                    let Ok(animation) = animation else { return };
+                    let frame = animation.iter(Some(std::time::SystemTime::now()));
+                    let pixbuf = frame.pixbuf();
+                    let w = pixbuf.width();
+                    let h = pixbuf.height();
+                    let (target_w, target_h) = if w > h {
+                        (size, (size * h / w).max(1))
+                    } else {
+                        ((size * w / h).max(1), size)
+                    };
+                    let scaled = pixbuf
+                        .scale_simple(target_w, target_h, gdk_pixbuf::InterpType::Bilinear)
+                        .unwrap_or(pixbuf);
+                    picture.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&scaled)));
+                },
+            );
+        },
+    );
+    picture
 }
 
 fn sidebar_status_emoji_picture(url: &str, label: &str, size: i32) -> gtk::Picture {

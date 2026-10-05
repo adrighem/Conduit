@@ -7,7 +7,7 @@
 
 //! Pure workspace navigation and message state.
 //!
-//! This module deliberately has no dependency on GTK, WebKit, or the runtime. Callers apply
+//! This module deliberately has no dependency on GTK or the runtime. Callers apply
 //! the returned outcomes to their views and translate request decisions into runtime commands.
 
 use std::cell::{Cell, RefCell};

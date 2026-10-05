@@ -19,7 +19,6 @@ BuildRequires:  pkgconfig(dbus-1)
 BuildRequires:  pkgconfig(gdk-pixbuf-2.0)
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
-BuildRequires:  pkgconfig(webkitgtk-6.0)
 BuildRequires:  python3-gobject
 BuildRequires:  rust >= 1.88
 

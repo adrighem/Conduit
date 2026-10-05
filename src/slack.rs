@@ -388,6 +388,48 @@ impl std::fmt::Debug for SlackMessageActionRequest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SidebarTheme {
+    pub column_bg: String,
+    pub menu_bg_hover: String,
+    pub active_item: String,
+    pub active_item_text: String,
+    pub hover_item: String,
+    pub text_color: String,
+    pub active_presence: String,
+    pub mention_badge: Option<String>,
+    pub top_nav_bg: Option<String>,
+    pub top_nav_text: Option<String>,
+}
+
+fn is_valid_sidebar_theme_hex(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn parse_sidebar_theme_csv(raw: &str) -> Option<SidebarTheme> {
+    let tokens: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| is_valid_sidebar_theme_hex(token))
+        .collect();
+    if tokens.len() < 7 {
+        return None;
+    }
+    Some(SidebarTheme {
+        column_bg: tokens[0].to_string(),
+        menu_bg_hover: tokens[1].to_string(),
+        active_item: tokens[2].to_string(),
+        active_item_text: tokens[3].to_string(),
+        hover_item: tokens[4].to_string(),
+        text_color: tokens[5].to_string(),
+        active_presence: tokens[6].to_string(),
+        mention_badge: tokens.get(7).map(|token| token.to_string()),
+        top_nav_bg: tokens.get(8).map(|token| token.to_string()),
+        top_nav_text: tokens.get(9).map(|token| token.to_string()),
+    })
+}
+
 impl SlackApi {
     pub fn access_token(&self) -> &str {
         &self.access_token
@@ -424,6 +466,31 @@ impl SlackApi {
             user_id: response.user_id,
             url: response.url,
         })
+    }
+
+    pub(crate) async fn fetch_sidebar_theme(&self) -> Result<Option<SidebarTheme>> {
+        if self.browser_cookie_d.is_none() {
+            return Ok(None);
+        }
+        let response: ClientUserBootResponse = match self.post_form("client.userBoot", &[]).await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                crate::debug::log(
+                    "slack",
+                    &format!("SidebarThemeFetchFailed error={error:#}"),
+                );
+                return Ok(None);
+            }
+        };
+        let Some(raw_theme) = response
+            .self_data
+            .and_then(|self_data| self_data.prefs)
+            .and_then(|prefs| prefs.sidebar_theme)
+        else {
+            return Ok(None);
+        };
+        Ok(parse_sidebar_theme_csv(&raw_theme))
     }
 
     pub(crate) async fn execute_message_action(
@@ -603,7 +670,6 @@ impl SlackApi {
     /// Lists workspace-defined emoji. Slack represents aliases as
     /// `alias:target`, which is intentionally preserved for catalog-level
     /// resolution.
-    #[allow(dead_code)]
     pub async fn custom_emojis(&self) -> Result<HashMap<String, String>> {
         let response: EmojiListResponse = self.post_form("emoji.list", &[]).await?;
         Ok(response.emoji)
@@ -2037,6 +2103,27 @@ pub(crate) fn supports_native_preview_asset_url(url: &str) -> bool {
     is_trusted_slack_download_url(url) || is_trusted_avatar_url(url)
 }
 
+/// Trusted sources for `SlackAttachment` unfurl preview images specifically
+/// (e.g. a `/giphy` share), in addition to Slack's own CDN. These are
+/// Slack-recognized unfurl integrations, not arbitrary user-pasted URLs, so
+/// this is a narrower, separate allowlist from [`supports_native_preview_asset_url`]
+/// rather than a general loosening of what gets auto-fetched.
+pub(crate) fn supports_unfurl_attachment_preview_url(url: &str) -> bool {
+    if supports_native_preview_asset_url(url) {
+        return true;
+    }
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    parsed.host_str().is_some_and(|host| {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        host == "giphy.com" || host.ends_with(".giphy.com")
+    })
+}
+
 fn ensure_trusted_slack_download_url(url: &str) -> Result<()> {
     if !is_trusted_slack_download_url(url) {
         return Err(SlackError::validation(
@@ -2208,6 +2295,25 @@ struct AuthTestResponse {
     user_id: Option<String>,
 }
 impl_slack_response!(AuthTestResponse);
+
+#[derive(Debug, Deserialize)]
+struct ClientUserBootResponse {
+    ok: bool,
+    error: Option<String>,
+    #[serde(rename = "self")]
+    self_data: Option<ClientUserBootSelf>,
+}
+impl_slack_response!(ClientUserBootResponse);
+
+#[derive(Debug, Deserialize)]
+struct ClientUserBootSelf {
+    prefs: Option<ClientUserBootPrefs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientUserBootPrefs {
+    sidebar_theme: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct MessageActionResponse {
@@ -2507,6 +2613,33 @@ mod tests {
             bytes.extend_from_slice(*brand);
         }
         bytes
+    }
+
+    #[test]
+    fn parse_sidebar_theme_csv_accepts_eight_value_theme() {
+        let csv = "#350d36,#350d36,#1264a3,#ffffff,#350d36,#ffffff,#2bac76,#e8912d";
+        let theme = parse_sidebar_theme_csv(csv).expect("theme should parse");
+        assert_eq!(theme.column_bg, "#350d36");
+        assert_eq!(theme.menu_bg_hover, "#350d36");
+        assert_eq!(theme.active_item, "#1264a3");
+        assert_eq!(theme.active_item_text, "#ffffff");
+        assert_eq!(theme.hover_item, "#350d36");
+        assert_eq!(theme.text_color, "#ffffff");
+        assert_eq!(theme.active_presence, "#2bac76");
+        assert_eq!(theme.mention_badge, Some("#e8912d".to_string()));
+        assert_eq!(theme.top_nav_bg, None);
+        assert_eq!(theme.top_nav_text, None);
+    }
+
+    #[test]
+    fn parse_sidebar_theme_csv_rejects_non_custom_preset_value() {
+        assert_eq!(parse_sidebar_theme_csv("default"), None);
+    }
+
+    #[test]
+    fn parse_sidebar_theme_csv_rejects_too_short_theme() {
+        let csv = "#350d36,#350d36,#1264a3,#ffffff,#350d36,#ffffff";
+        assert_eq!(parse_sidebar_theme_csv(csv), None);
     }
 
     fn browser_test_token(browser_cookie_d: Option<&str>) -> StoredToken {

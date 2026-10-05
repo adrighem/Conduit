@@ -4292,32 +4292,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/webkit6/webkit6-0.4.0.crate",
-        "sha256": "8c359ef247305dcade3363c281c505b943e0e6162a42eac76ff76ed8e7cebfbd",
-        "dest": "cargo/vendor/webkit6-0.4.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"8c359ef247305dcade3363c281c505b943e0e6162a42eac76ff76ed8e7cebfbd\", \"files\": {}}",
-        "dest": "cargo/vendor/webkit6-0.4.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/webkit6-sys/webkit6-sys-0.4.0.crate",
-        "sha256": "96284c5280af5984dbdae8dae3cfeea11b44b214f9bd42b35c0ca75903bccce2",
-        "dest": "cargo/vendor/webkit6-sys-0.4.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"96284c5280af5984dbdae8dae3cfeea11b44b214f9bd42b35c0ca75903bccce2\", \"files\": {}}",
-        "dest": "cargo/vendor/webkit6-sys-0.4.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/webpki-root-certs/webpki-root-certs-1.0.7.crate",
         "sha256": "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c",
         "dest": "cargo/vendor/webpki-root-certs-1.0.7"

@@ -27,7 +27,7 @@ All cache files live below:
 ${XDG_CACHE_HOME:-~/.cache}/eu.vanadrighem.conduit/state
 ```
 
-This keeps actual caching in a subfolder below `~/.cache`, alongside the existing WebKit and image-asset caches.
+This keeps actual caching in a subfolder below `~/.cache`, alongside the existing image-asset caches.
 
 ## Stored Data
 

@@ -819,6 +819,7 @@ pub enum RuntimeEventKind {
         user_id: String,
     },
     EmojiCatalogLoaded(HashMap<String, String>),
+    WorkspaceThemeLoaded(crate::slack::SidebarTheme),
     ImageAssetLoaded {
         key: String,
         asset: CachedAssetDescriptor,
@@ -1021,7 +1022,8 @@ impl RuntimeEventKind {
             | Self::MessageActionFailed { .. }
             | Self::AttachmentDownloadProgress { .. }
             | Self::FileUploadProgress { .. }
-            | Self::FileUploaded(_) => fallback.clone(),
+            | Self::FileUploaded(_)
+            | Self::WorkspaceThemeLoaded(_) => fallback.clone(),
         }
     }
 }
@@ -4582,6 +4584,24 @@ fn spawn_authentication_task<F>(
                         WorkspaceLifecycleEvent::Authenticated,
                     ));
                     events.send_event(RuntimeEventKind::Authenticated(auth));
+                    let theme_api = connection.slack.clone();
+                    let theme_events = events.clone();
+                    tokio::spawn(async move {
+                        match theme_api.fetch_sidebar_theme().await {
+                            Ok(Some(theme)) => {
+                                theme_events.send_event(RuntimeEventKind::WorkspaceThemeLoaded(
+                                    theme,
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                crate::debug::log(
+                                    "runtime",
+                                    &format!("SidebarThemeLoadFailed error={error:#}"),
+                                );
+                            }
+                        }
+                    });
                     spawn_workspace_tasks(
                         &state_for_task,
                         identity,
@@ -5004,6 +5024,8 @@ async fn run_job_payload(
                 &connection.huddles,
             )
             .await?;
+
+            sync_custom_emojis_best_effort(events, connection).await;
         }
         SyncJobPayload::LoadHistory { channel_id } => {
             let api = &connection.slack;
@@ -5082,6 +5104,36 @@ async fn run_job_payload(
         }
     }
     Ok(())
+}
+
+/// Best-effort live refresh of the workspace's custom emoji catalog. Runs
+/// alongside the main workspace refresh job rather than as its own job,
+/// since the catalog changes rarely and doesn't warrant a separate schedule.
+/// Never fails the caller: `emoji.list` errors are logged and swallowed so a
+/// transient failure here can't take down the rest of workspace sync.
+async fn sync_custom_emojis_best_effort(events: &RuntimeEventSender, connection: &RuntimeConnection) {
+    let Some(store) = connection.workspace_store.as_ref() else {
+        return;
+    };
+    match connection.slack.custom_emojis().await {
+        Ok(emojis) => {
+            if let Err(error) = store.store_custom_emojis(&emojis).await {
+                crate::debug::log(
+                    "store",
+                    &format!("CustomEmojiStoreFailed error={error:#}"),
+                );
+            }
+            if !emojis.is_empty() {
+                events.send_event(RuntimeEventKind::EmojiCatalogLoaded(emojis));
+            }
+        }
+        Err(error) => {
+            crate::debug::log(
+                "runtime",
+                &format!("CustomEmojiFetchFailed error={error:#}"),
+            );
+        }
+    }
 }
 
 async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &RuntimeConnection) {
@@ -17187,6 +17239,162 @@ mod tests {
             next_job_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cached_bootstrap_load_gate: None,
         }
+    }
+
+    #[test]
+    fn custom_emoji_sync_persists_and_emits_on_success() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-custom-emoji-sync-success-test-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let workspace = WorkspaceReducerAdapter::default();
+
+            let (sender, mut receiver) = runtime_event_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let server_addr = server.server_addr();
+            let server_thread = std::thread::spawn(move || {
+                let request = server.recv().unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(
+                            r#"{"ok":true,"emoji":{"partyparrot":"https://example.com/parrot.gif"}}"#,
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            });
+
+            let mut slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            slack.api_base_url = format!("http://{server_addr}/api");
+
+            let connection = test_interactive_runtime_connection(
+                slack,
+                Some(store.clone()),
+                workspace,
+                Some("U123".to_string()),
+            );
+
+            sync_custom_emojis_best_effort(&events, &connection).await;
+            server_thread.join().unwrap();
+
+            assert!(matches!(
+                receiver.recv().await.unwrap().kind,
+                RuntimeEventKind::EmojiCatalogLoaded(emojis)
+                    if emojis.get("partyparrot").map(String::as_str)
+                        == Some("https://example.com/parrot.gif")
+            ));
+
+            let bootstrap = store
+                .load_bootstrap()
+                .await
+                .unwrap()
+                .expect("missing cached bootstrap");
+            assert_eq!(
+                bootstrap.custom_emojis.get("partyparrot").map(String::as_str),
+                Some("https://example.com/parrot.gif")
+            );
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn custom_emoji_sync_failure_is_swallowed_and_does_not_emit() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "conduit-custom-emoji-sync-failure-test-{}-{nonce}",
+                std::process::id()
+            ));
+            let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+            let workspace = WorkspaceReducerAdapter::default();
+
+            let (sender, mut receiver) = runtime_event_channel();
+            let events = RuntimeEventSender {
+                sender,
+                session: SessionId::default().next(),
+                request: None,
+                fallback: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+                workspace_patch_send_gate: None,
+            };
+
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let server_addr = server.server_addr();
+            let server_thread = std::thread::spawn(move || {
+                let request = server.recv().unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string(
+                            r#"{"ok":false,"error":"internal_error"}"#,
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            });
+
+            let mut slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            slack.api_base_url = format!("http://{server_addr}/api");
+
+            let connection = test_interactive_runtime_connection(
+                slack,
+                Some(store.clone()),
+                workspace,
+                Some("U123".to_string()),
+            );
+
+            // Must not panic and must not block on a failed fetch.
+            sync_custom_emojis_best_effort(&events, &connection).await;
+            server_thread.join().unwrap();
+
+            assert!(receiver.try_recv().is_err());
+
+            let _ = std::fs::remove_dir_all(directory);
+        });
     }
 
     #[test]

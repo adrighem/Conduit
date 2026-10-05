@@ -15,8 +15,7 @@ Conduit should instead be a reliable native GNOME client for daily messaging:
 - Fast access to workspaces, channels, DMs, threads, unread activity, saved items, search, and files.
 - Local state that makes the app useful during slow network periods without becoming a full offline Slack archive.
 - Clear boundaries where Slack-only surfaces open in Slack instead of being reimplemented poorly.
-- Native GTK/libadwaita UI for shell, navigation, controls, and preferences.
-- WebKit only where rich message rendering or Slack web handoff is the pragmatic choice.
+- Native GTK/libadwaita UI for shell, navigation, controls, and timeline.
 
 ## Build Order
 

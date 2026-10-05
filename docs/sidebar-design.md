@@ -274,7 +274,7 @@ Slack client, runtime, and store coverage verifies the guarded browser bootstrap
 
 ## Native UI Boundary
 
-The sidebar is fully GTK4/libadwaita-native. WebKit is still used for message and thread rendering elsewhere in the app, but not for sidebar navigation, filtering, section headers, row icons, unread badges, row activation, or selection state.
+The sidebar is fully GTK4/libadwaita-native. It handles sidebar navigation, filtering, section headers, row icons, unread badges, row activation, and selection state natively.
 
 ## Current Limits
 

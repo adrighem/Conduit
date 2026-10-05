@@ -13,17 +13,6 @@ import time
 
 MAIN_WINDOW_TITLE = "Conduit"
 SWITCHER_TITLE = "Switch conversation"
-WEBKIT_SETTINGS = {
-    "allow_file_access": False,
-    "allow_universal_access": False,
-    "html5_database": False,
-    "html5_local_storage": True,
-    "javascript": True,
-    "media": True,
-    "webaudio": False,
-    "webgl": False,
-    "zoom_text_only": True,
-}
 
 
 def wait_until(predicate, timeout: float = 40.0, interval: float = 0.1):
@@ -253,7 +242,7 @@ def verify_emoji_completion(window_id: str, target: str, state_path: Path) -> No
     wait_until(
         lambda: completion_state(
             state_path,
-            {"emoji": "+1", "target": target, "webkit": WEBKIT_SETTINGS},
+            {"emoji": "+1", "target": target},
         )
     )
     assert composer_text(window_id) == ":+1:"
@@ -264,7 +253,7 @@ def verify_emoji_completion(window_id: str, target: str, state_path: Path) -> No
     wait_until(
         lambda: completion_state(
             state_path,
-            {"emoji": "smiley", "target": target, "webkit": WEBKIT_SETTINGS},
+            {"emoji": "smiley", "target": target},
         )
     )
     assert composer_text(window_id) == ":smiley:"
@@ -277,7 +266,7 @@ def verify_emoji_completion(window_id: str, target: str, state_path: Path) -> No
     wait_until(
         lambda: completion_state(
             state_path,
-            {"emoji": "smile", "target": target, "webkit": WEBKIT_SETTINGS},
+            {"emoji": "smile", "target": target},
         )
     )
     assert composer_text(window_id) == ":smile:"
@@ -303,7 +292,6 @@ def verify_person_completion(window_id: str, target: str, state_path: Path) -> N
                 "mention": "UGRACE",
                 "serialized": "<@UGRACE> ",
                 "target": target,
-                "webkit": WEBKIT_SETTINGS,
             },
         ),
         timeout=5.0,
@@ -321,7 +309,6 @@ def verify_person_completion(window_id: str, target: str, state_path: Path) -> N
                 "mention": "UADA",
                 "serialized": "@race Hopper <@UADA> ",
                 "target": target,
-                "webkit": WEBKIT_SETTINGS,
             },
         ),
         timeout=5.0,
@@ -340,7 +327,6 @@ def verify_person_completion(window_id: str, target: str, state_path: Path) -> N
                 "mention": "UGRACE",
                 "serialized": "<@UGRACE> ",
                 "target": target,
-                "webkit": WEBKIT_SETTINGS,
             },
         ),
         timeout=5.0,

@@ -87,7 +87,7 @@ semantic HTML / opaque control handles
           +-> exact-message Slack handoff
 ```
 
-Parsing, domain state, presentation, and execution are separate layers. No renderer or WebKit
+Parsing, domain state, presentation, and execution are separate layers. No renderer
 callback talks to Slack directly.
 
 ## 1. Slack Wire Boundary
@@ -260,7 +260,7 @@ The resolver is a narrow port. The approved private interaction transport talks 
 never to a publishing app's Request URL. Merely having Socket Mode enabled is not sufficient:
 Conduit's connection belongs to Conduit's app, not Bob or Jira.
 
-## 4. Presentation and WebKit Boundary
+## 4. Presentation Boundary
 
 Build a pure `MessageRenderPlan` from the canonical document plus resolved capabilities. HTML
 generation consumes this plan and has no access to raw Slack JSON.
@@ -275,7 +275,7 @@ For each rendered control:
   locally usable options;
 - the message also exposes one clear “Open in Slack to interact” action.
 
-WebKit receives opaque, generation-scoped control handles such as
+Views receive opaque, generation-scoped control handles such as
 `conduit://message-control?id=<opaque>`. The handle registry lives beside the timeline presenter
 and maps the handle back to:
 
@@ -400,7 +400,7 @@ directly with credentials from generated HTML.
   URLs, cookies, authorization headers, or complete interaction objects.
 - Do not persist raw wire payloads.
 - Validate URL schemes before generating a render plan.
-- Resolve actions from current coordinator state rather than trusting WebKit input.
+- Resolve actions from current coordinator state rather than trusting view input.
 - Scope handles to one session, timeline generation, message revision, and workspace.
 - Bound control activation concurrency and suppress double activation while in flight.
 - Require explicit confirmation for destructive controls when Slack supplies confirmation metadata.

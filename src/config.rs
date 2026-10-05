@@ -25,14 +25,6 @@ pub const PKGDATADIR: &str = match option_env!("CONDUIT_PKGDATADIR") {
     None => "/usr/local/share/conduit",
 };
 
-pub fn webkit_data_dir() -> PathBuf {
-    app_cache_dir().join("webkit-data")
-}
-
-pub fn webkit_cache_dir() -> PathBuf {
-    app_cache_dir().join("webkit-cache")
-}
-
 pub fn image_asset_cache_dir() -> PathBuf {
     app_cache_dir().join("image-assets")
 }
@@ -112,8 +104,6 @@ mod tests {
     fn persistent_cache_paths_live_under_app_cache_dir() {
         let app_cache = app_cache_dir();
 
-        assert!(webkit_data_dir().starts_with(&app_cache));
-        assert!(webkit_cache_dir().starts_with(&app_cache));
         assert!(image_asset_cache_dir().starts_with(&app_cache));
         assert!(attachment_cache_dir().starts_with(&app_cache));
         assert!(upload_staging_dir().starts_with(&app_cache));

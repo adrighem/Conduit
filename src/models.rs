@@ -809,6 +809,8 @@ pub struct SlackAttachment {
     pub fields: Option<Vec<SlackAttachmentField>>,
     pub image_url: Option<String>,
     pub thumb_url: Option<String>,
+    #[serde(default)]
+    pub is_animated: Option<bool>,
     pub footer: Option<String>,
     pub footer_icon: Option<String>,
     #[serde(default, deserialize_with = "deserialize_flexible_slack_ts")]
@@ -1799,6 +1801,30 @@ mod tests {
                 .unwrap()[0]
                 .value,
             Some("people_ops".to_string())
+        );
+    }
+
+    #[test]
+    fn giphy_unfurl_attachment_preserves_is_animated() {
+        let message: SlackMessage = serde_json::from_value(serde_json::json!({
+            "ts": "1710000000.000400",
+            "attachments": [{
+                "fallback": "giphy.gif",
+                "image_url": "https://media.giphy.com/media/test123/giphy.gif",
+                "image_width": 480,
+                "image_height": 270,
+                "is_animated": true,
+                "from_url": "https://giphy.com/gifs/test123",
+                "service_name": "giphy"
+            }]
+        }))
+        .expect("giphy-shaped attachment should deserialize");
+
+        let attachment = &message.attachments.as_ref().unwrap()[0];
+        assert_eq!(attachment.is_animated, Some(true));
+        assert_eq!(
+            attachment.image_url.as_deref(),
+            Some("https://media.giphy.com/media/test123/giphy.gif")
         );
     }
 

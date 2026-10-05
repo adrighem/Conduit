@@ -101,7 +101,7 @@
         element.lang = resolvedLocale;
         element.dataset.conduitLocalized = "true";
       } catch (_) {
-        // Keep the server-rendered fallback if WebKit rejects a date.
+        // Keep the server-rendered fallback if formatting fails.
       }
     });
   }

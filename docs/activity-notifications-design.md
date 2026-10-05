@@ -33,7 +33,7 @@ The sidebar primary row is now:
 
 Activity uses `emblem-important-symbolic`, which is available in the Adwaita icon set used by this project.
 
-The main-pane Activity view is rendered in the existing message WebKit document renderer, matching Search and Later. That keeps the implementation small and consistent with the current shell. A later native GTK list can replace this if the view grows richer than a simple attention list.
+The main-pane Activity view is rendered matching Search and Later. That keeps the implementation small and consistent with the current shell. A later native GTK list can replace this if the view grows richer than a simple attention list.
 
 ## Notifications
 

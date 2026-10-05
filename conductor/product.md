@@ -1,6 +1,6 @@
 # Initial Concept
 
-Conduit is a lightweight GNOME desktop client for Slack written in Rust with GTK4, libadwaita, and WebKitGTK.
+Conduit is a lightweight GNOME desktop client for Slack written in Rust with GTK4 and libadwaita.
 
 # Product Overview
 

@@ -27,7 +27,7 @@ Make opening a conversation a generation-scoped transaction with one immutable s
 - An explicit target in an otherwise read conversation cannot compete with bottom positioning.
 - The generated timeline contains one initial viewport controller rather than independent scroll-restoration and focus scripts.
 - Read observers are not active until the controller commits the opening.
-- WebKit integration coverage delays content growth and snapshot reconciliation and proves the committed target remains stable.
+- native UI integration coverage delays content growth and snapshot reconciliation and proves the committed target remains stable.
 - Metadata and asset updates arriving during document loading are coalesced and cannot cause an older generation to replace the active conversation.
 - `cargo fmt --check`, strict Clippy, all Rust tests, `cargo check`, Meson compile, and Meson tests pass under a sanitized allowlisted environment.
 
@@ -35,7 +35,7 @@ Make opening a conversation a generation-scoped transaction with one immutable s
 
 - Reuse the existing request/session identity, `WorkspaceViewState`, typed DOM patch protocol, and anchor-preserving timeline runtime.
 - Keep semantic opening policy in headless Rust code; keep viewport measurements and scrolling in JavaScript.
-- Do not add a frontend framework or replace WebKitGTK.
+- Do not add a frontend framework or replace GTK4.
 - Do not log message bodies, credentials, browser-session data, or complete environments.
 - Prefer incremental compatibility adapters over a simultaneous rewrite of all timeline surfaces.
 

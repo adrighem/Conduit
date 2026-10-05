@@ -24,7 +24,7 @@ const OAUTH_CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OAUTH_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const OAUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const LEGACY_DEFAULT_BROWSER_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8934;
 pub const DEFAULT_USER_SCOPES: &[&str] = &[

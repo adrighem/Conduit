@@ -25,7 +25,7 @@ use gtk::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::models::{SlackMessage, SlackUser};
+use crate::models::{SlackConversation, SlackMessage, SlackUser};
 use crate::rich_message::{MessageNode, RichInline, RichInlineStyle, RichTextNode};
 use crate::search::{
     SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
@@ -58,6 +58,27 @@ pub struct MentionCandidate {
     pub full_name: Option<String>,
     pub username: Option<String>,
     pub search_aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelToken {
+    pub start: usize,
+    pub end: usize,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelCandidate {
+    pub channel_id: String,
+    pub title: String,
+    pub is_private: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelInsertion {
+    pub text: String,
+    pub caret: usize,
+    pub span: ComposerEntitySpan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1119,6 +1140,36 @@ pub fn mention_token_at_caret(text: &str, caret: usize) -> Option<MentionToken> 
     })
 }
 
+fn is_channel_query_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-')
+}
+
+pub fn channel_token_at_caret(text: &str, caret: usize) -> Option<ChannelToken> {
+    let characters = text.chars().collect::<Vec<_>>();
+    if caret > characters.len()
+        || characters
+            .get(caret)
+            .is_some_and(|character| is_channel_query_character(*character) || *character == '#')
+    {
+        return None;
+    }
+
+    let mut query_start = caret;
+    while query_start > 0 && is_channel_query_character(characters[query_start - 1]) {
+        query_start -= 1;
+    }
+    let hash = query_start.checked_sub(1)?;
+    if characters[hash] != '#' || (hash > 0 && !is_mention_boundary(characters[hash - 1])) {
+        return None;
+    }
+
+    Some(ChannelToken {
+        start: hash,
+        end: caret,
+        query: characters[query_start..caret].iter().collect(),
+    })
+}
+
 fn valid_user_id(user_id: &str) -> bool {
     !user_id.is_empty()
         && user_id
@@ -1262,6 +1313,109 @@ pub fn search_mention_candidates(
         })
         .take(limit)
         .collect()
+}
+
+pub fn channel_candidates<'a>(
+    conversations: impl IntoIterator<Item = &'a SlackConversation>,
+) -> Vec<ChannelCandidate> {
+    let mut candidates_by_id: HashMap<String, ChannelCandidate> = HashMap::new();
+
+    for conversation in conversations {
+        let Some(title) = trimmed_owned(conversation.name.clone()) else {
+            continue;
+        };
+        candidates_by_id
+            .entry(conversation.id.clone())
+            .or_insert_with(|| ChannelCandidate {
+                channel_id: conversation.id.clone(),
+                title,
+                is_private: conversation.is_private.unwrap_or(false),
+            });
+    }
+
+    let mut candidates = candidates_by_id.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.title
+            .to_lowercase()
+            .cmp(&right.title.to_lowercase())
+            .then_with(|| left.channel_id.cmp(&right.channel_id))
+    });
+    candidates
+}
+
+pub fn search_channel_candidates(
+    candidates: &[ChannelCandidate],
+    query: &str,
+    limit: usize,
+) -> Vec<ChannelCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let query = SearchQuery::parse(query);
+    let mut matches = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let score = query.score([
+                SearchField::new(&candidate.title, PRIMARY_FIELD_WEIGHT),
+                SearchField::new(&candidate.channel_id, ID_FIELD_WEIGHT),
+            ])?;
+            Some((candidate.clone(), score))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left, left_score), (right, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+            .then_with(|| left.channel_id.cmp(&right.channel_id))
+    });
+
+    let mut seen_channel_ids = HashSet::new();
+    matches
+        .into_iter()
+        .filter_map(|(candidate, _)| {
+            seen_channel_ids
+                .insert(candidate.channel_id.clone())
+                .then_some(candidate)
+        })
+        .take(limit)
+        .collect()
+}
+
+pub fn replace_channel_token(
+    text: &str,
+    token: &ChannelToken,
+    candidate: &ChannelCandidate,
+) -> ChannelInsertion {
+    let mut characters = text.chars().collect::<Vec<_>>();
+    let end = token.end.min(characters.len());
+    let start = token.start.min(end);
+    let title = match candidate.title.trim() {
+        "" => candidate.channel_id.as_str(),
+        title => title,
+    };
+    let label = format!("#{title}");
+    let label_characters = label.chars().collect::<Vec<_>>();
+    let append_space = end == characters.len();
+    let mut replacement = label_characters.clone();
+    if append_space {
+        replacement.push(' ');
+    }
+    characters.splice(start..end, replacement.iter().copied());
+
+    let span_end = start + label_characters.len();
+    ChannelInsertion {
+        text: characters.into_iter().collect(),
+        caret: span_end + usize::from(append_space),
+        span: ComposerEntitySpan {
+            start,
+            end: span_end,
+            label,
+            kind: ComposerEntityKind::Channel {
+                channel_id: candidate.channel_id.clone(),
+            },
+        },
+    }
 }
 
 pub fn replace_mention_token(
@@ -1763,6 +1917,15 @@ mod tests {
         }
     }
 
+    fn conversation(id: &str, name: Option<&str>, is_private: bool) -> SlackConversation {
+        SlackConversation {
+            id: id.to_string(),
+            name: name.map(ToString::to_string),
+            is_private: Some(is_private),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn enter_action_sends_on_plain_enter() {
         assert_eq!(
@@ -2206,6 +2369,127 @@ mod tests {
         assert_eq!(mention_token_at_caret("@ada/name", 9), None);
         assert_eq!(mention_token_at_caret("@ada", 2), None);
         assert_eq!(mention_token_at_caret("@ada", 99), None);
+    }
+
+    #[test]
+    fn detects_channel_mentions_at_boundaries_with_supported_query_characters() {
+        assert_eq!(
+            channel_token_at_caret("#", 1),
+            Some(ChannelToken {
+                start: 0,
+                end: 1,
+                query: String::new(),
+            })
+        );
+        assert_eq!(
+            channel_token_at_caret("hello #rotterdam-office_2", 25),
+            Some(ChannelToken {
+                start: 6,
+                end: 25,
+                query: "rotterdam-office_2".to_string(),
+            })
+        );
+        assert_eq!(
+            channel_token_at_caret("hello (#general", 15).unwrap().query,
+            "general"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_query_and_caret_middle_channel_mentions() {
+        assert_eq!(channel_token_at_caret("word#general", 12), None);
+        assert_eq!(channel_token_at_caret("<#C123", 6), None);
+        assert_eq!(channel_token_at_caret("https://#general", 16), None);
+        assert_eq!(channel_token_at_caret("\\#general", 9), None);
+        assert_eq!(channel_token_at_caret("#general", 2), None);
+        assert_eq!(channel_token_at_caret("#general", 99), None);
+    }
+
+    #[test]
+    fn channel_candidates_filter_unnamed_and_deduplicate_ids() {
+        let conversations = vec![
+            conversation("C1", Some("general"), false),
+            conversation("C1", Some("general-dup"), false),
+            conversation("C2", Some("rotterdam-office"), true),
+            conversation("C3", None, false),
+        ];
+
+        let candidates = channel_candidates(&conversations);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.channel_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C1", "C2"]
+        );
+        assert_eq!(candidates[0].title, "general");
+        assert!(!candidates[0].is_private);
+        assert_eq!(candidates[1].title, "rotterdam-office");
+        assert!(candidates[1].is_private);
+    }
+
+    #[test]
+    fn channel_search_ranks_and_limits_candidates() {
+        let candidates = channel_candidates(&[
+            conversation("C1", Some("general"), false),
+            conversation("C2", Some("rotterdam-office"), true),
+            conversation("C3", Some("amsterdam-office"), true),
+        ]);
+
+        assert_eq!(
+            search_channel_candidates(&candidates, "office", 10)
+                .iter()
+                .map(|candidate| candidate.channel_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C3", "C2"]
+        );
+        assert_eq!(
+            search_channel_candidates(&candidates, "rotterdam", 1).len(),
+            1
+        );
+        assert!(search_channel_candidates(&candidates, "office", 0).is_empty());
+    }
+
+    #[test]
+    fn channel_replacement_uses_character_offsets_and_only_appends_space_at_end() {
+        let candidate = ChannelCandidate {
+            channel_id: "C1".to_string(),
+            title: "rotterdam-office".to_string(),
+            is_private: false,
+        };
+        let text = "see #rot";
+        let insertion =
+            replace_channel_token(text, &channel_token_at_caret(text, 8).unwrap(), &candidate);
+
+        assert_eq!(insertion.text, "see #rotterdam-office ");
+        assert_eq!(insertion.caret, 22);
+        assert_eq!(insertion.span.start, 4);
+        assert_eq!(insertion.span.end, 21);
+        assert_eq!(insertion.span.label, "#rotterdam-office");
+        assert_eq!(
+            insertion.span.kind,
+            ComposerEntityKind::Channel {
+                channel_id: "C1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn serializes_channel_entity_span_as_slack_channel_link() {
+        let text = "see #rotterdam-office";
+        let spans = vec![ComposerEntitySpan {
+            start: 4,
+            end: 21,
+            label: "#rotterdam-office".to_string(),
+            kind: ComposerEntityKind::Channel {
+                channel_id: "C1".to_string(),
+            },
+        }];
+        assert_eq!(
+            serialize_composer_semantics(text, &[], &spans),
+            "see <#C1>"
+        );
     }
 
     #[test]

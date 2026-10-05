@@ -1,6 +1,6 @@
 # Contributing to Conduit
 
-Conduit is an early GNOME desktop client for Slack written in Rust with GTK4, libadwaita, and WebKitGTK. Contributions should keep the app stable, native-feeling, and easy to maintain.
+Conduit is an early GNOME desktop client for Slack written in Rust with GTK4 and libadwaita. Contributions should keep the app stable, native-feeling, and easy to maintain.
 
 ## Before You Start
 
@@ -11,7 +11,7 @@ Conduit is an early GNOME desktop client for Slack written in Rust with GTK4, li
 
 ## Development Setup
 
-Install the GNOME development stack, WebKitGTK 6.0, D-Bus development headers, Rust, Meson, and Ninja.
+Install the GNOME development stack, D-Bus development headers, Rust, Meson, and Ninja.
 
 Build and test with:
 
@@ -73,7 +73,6 @@ When changing Slack API behavior, document any new scopes, redirect behavior, to
 ## UI Guidelines
 
 - Keep navigation, sidebars, dialogs, setup screens, and controls native GTK4/libadwaita.
-- Use WebKit only for sanitized message rendering where the app already uses it.
 - Put grouping, sorting, parsing, and other behavioral logic in testable Rust modules when possible.
 - Match existing UI conventions before adding new patterns.
 

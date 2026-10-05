@@ -282,7 +282,7 @@ A sensible Debian 13 development bootstrap is:
 ```bash
 sudo apt install \
   build-essential cargo rustc pkg-config meson ninja-build \
-  libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libsecret-1-dev \
+  libgtk-4-dev libadwaita-1-dev libsecret-1-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-libav gstreamer1.0-pipewire \
@@ -292,7 +292,7 @@ sudo apt install \
   libwebrtc-audio-processing-dev
 ```
 
-Those package names align with Debian 13’s GTK4/WebKitGTK 6, PipeWire/portal, and RTC/media packaging. `libsecret-1-dev` is relevant for secure token storage; `gstreamer1.0-pipewire` bridges GStreamer to PipeWire; `libnice-dev`, `libsrtp2-dev`, `libopus-dev`, `libvpx-dev`, and `libopenh264-dev` cover the core RTC stack; and `libwebrtc-audio-processing-dev` gives you a packaged AEC/AGC option. citeturn42search0turn42search2turn42search3turn35view0turn33view1turn33view2turn33view0turn43view0turn43view3turn43view4turn43view1turn43view2turn33view5
+Those package names align with Debian 13’s GTK4, PipeWire/portal, and RTC/media packaging. `libsecret-1-dev` is relevant for secure token storage; `gstreamer1.0-pipewire` bridges GStreamer to PipeWire; `libnice-dev`, `libsrtp2-dev`, `libopus-dev`, `libvpx-dev`, and `libopenh264-dev` cover the core RTC stack; and `libwebrtc-audio-processing-dev` gives you a packaged AEC/AGC option. citeturn42search0turn42search2turn42search3turn35view0turn33view1turn33view2turn33view0turn43view0turn43view3turn43view4turn43view1turn43view2turn33view5
 
 Conduit’s Meson files show that the project shells out to Cargo and provides a `cargo test` Meson test target. A normal local build should therefore remain simple:
 

@@ -6,7 +6,7 @@
  */
 
 //! Revisioned contracts shared by workspace producers, the pure reducer, presentation, and
-//! persistence. This module intentionally has no dependency on GTK, WebKit, Slack clients, or
+//! persistence. This module intentionally has no dependency on GTK, Slack clients, or
 //! SQLite so every input can follow the same deterministic path.
 
 // These contracts are migrated surface-by-surface; the coordinator task wires their consumers.

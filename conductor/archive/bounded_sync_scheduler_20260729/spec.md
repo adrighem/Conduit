@@ -29,7 +29,7 @@ queue behavior before it is integrated with the authoritative workspace coordina
 - A burst cannot create more waiting tasks than the configured admitted capacity.
 - Replaceable work for one target cannot cancel work for another target.
 - Metrics reconcile to a zero queue depth after drain.
-- The module is independent of GTK and WebKitGTK.
+- The module is independent of GTK and GTK4.
 - Runtime integration remains blocked until the issue #11 conversation-authority slice is merged.
 
 ## Out of Scope

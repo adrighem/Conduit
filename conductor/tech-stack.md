@@ -2,7 +2,7 @@
 
 ## Application
 - Rust 2021.
-- GTK4, libadwaita, and WebKitGTK 6 for the desktop UI.
+- GTK4 and libadwaita for the desktop UI.
 - Tokio's multi-threaded runtime for concurrent background I/O, with asynchronous channels delivering events to GTK's main loop.
 - Request/session identities and operation targets prevent stale asynchronous work from changing the active workspace surface.
 - `WorkspaceViewState` owns navigation, loading, transient search context, and render-state transitions independently from GTK widgets.
@@ -38,7 +38,7 @@
 - GitHub Release bundles are the supported Flatpak distribution path. Flathub onboarding remains a separate human-owned process subject to Flathub policy and review.
 
 ## Local State
-- XDG cache paths under the application ID for WebKit data, image assets, and Slack state caches.
+- XDG cache paths under the application ID for image assets and Slack state caches.
 - A workspace-scoped `StoreHub` owns one persistent SQLite writer and two query-only readers behind bounded channels. Revisioned atomic `StoreBatch` writes, unchanged suppression, commit barriers, and clean shutdown replace routine per-operation write connections.
 - Schema-v2 freshness and retry metadata augment keyed derived-cache payloads. Cache migration/corruption recovery may recreate derived Slack data without touching keyring credentials or GSettings drafts.
 - GSettings stores workspace/user/conversation/thread-scoped composer drafts.
@@ -53,7 +53,7 @@
 
 ## Presentation
 - libadwaita split views and breakpoints adapt the workspace and thread shell to narrow windows.
-- Generated message documents use semantic HTML, logical responsive CSS, locale-aware timestamps, RTL direction, and keyboard-focusable message targets.
+- Native message widget views render conversation and thread timelines.
 - A tolerant Slack wire decoder normalizes Block Kit, legacy attachments, and bot/app identity into
   one versioned canonical message document. Rendering, accessibility, notifications, mentions, and
   cache projections share that document; raw callback values are neither rendered nor persisted.
@@ -61,11 +61,9 @@
   session/revision-scoped handles and a typed, validated exact-message external handoff with
   explicit authoritative or constructed-fallback provenance.
 - A keyed `SidebarProjection` applies splice, update, and reset operations to a `gio::ListStore` backing a virtualized `GtkListView`, preserving stable selection without whole-catalog rebuilds.
-- Conversation navigation creates a generation-scoped opening session with an immutable semantic target. One WebKit viewport controller owns initial geometry, reveals the timeline only after positioning, cancels on user interaction, and arms read observation after commit.
+- Conversation navigation creates a generation-scoped opening session with an immutable semantic target.
 - `WorkspaceViewState` consumes workspace patches to update cached projections and derives the narrow sidebar, title, picker, main-view, and thread presentation changes needed for each patch.
-- Each message WebView owns a revision-aware timeline presenter. Navigation loads a generated document, while cached-to-fresh snapshots, realtime messages, response regions, user details, and loaded media are coalesced into one anchor-preserving typed DOM delta per GTK frame; full reloads are reserved for initial navigation, revision mismatch, and unrecoverable presentation recovery.
-- Cached message media uses an exact raster/video MIME allowlist, content-signature validation, and 8/16 MiB per-file bounds. Raw payloads live under workspace-scoped SHA-256 keys in a deterministic 512 MiB/16,384-entry/30-day disk cache; failed enforcement rolls back the new file. The UI retains only descriptors for a 64 MiB/2,048-entry logical ready set, with bounded source and request state. A private `conduit-asset` WebKit scheme revalidates each file, serves only registered keys with bounded single-range video responses, and invalidates broken DOM sources before one recovery attempt.
-- The thread timeline WebView is created lazily on first thread open to minimize baseline process-tree footprint.
+- Cached message media uses an exact raster/video MIME allowlist, content-signature validation, and 8/16 MiB per-file bounds. Raw payloads live under workspace-scoped SHA-256 keys in a deterministic 512 MiB/16,384-entry/30-day disk cache; failed enforcement rolls back the new file. The UI retains only descriptors for a 64 MiB/2,048-entry logical ready set, with bounded source and request state.
 - The emoji reaction and status pickers use an on-demand, bounded native query model with usage-ranked quick reactions and full Slack skin-tone modifier sequence composition.
 - Desktop notifications use stable workspace/user/channel IDs and typed application actions so activation can survive a cold start.
 

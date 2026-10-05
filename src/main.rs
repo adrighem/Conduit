@@ -30,6 +30,7 @@ mod conversation_catalog;
 mod debug;
 mod drafts;
 mod emoji;
+mod emoji_picker_window;
 mod gnome_search_provider;
 mod http_client;
 mod huddles;

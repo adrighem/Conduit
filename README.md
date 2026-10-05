@@ -8,8 +8,8 @@
   A focused, native Slack client for the GNOME desktop.
 </p>
 
-Conduit is an independent Slack client built with Rust, GTK4, libadwaita, and
-WebKitGTK. It focuses on channels, direct messages, threads, search, files,
+Conduit is an independent Slack client built with Rust, GTK4, and
+libadwaita. It focuses on channels, direct messages, threads, search, files,
 notifications, and keyboard-driven navigation while storing workspace credentials
 in the system keyring.
 
@@ -270,8 +270,8 @@ for the full policy.
 - OAuth and imported browser-session credentials, plus Socket Mode tokens entered in
   Preferences, are stored through the system Secret Service/keyring.
 - Workspace metadata, names, statuses, emoji, and message and thread history are
-  stored in `state/state.sqlite3` below Conduit's XDG cache directory. WebKit,
-  downloaded image, media, and attachment data use sibling cache directories.
+  stored in `state/state.sqlite3` below Conduit's XDG cache directory.
+  Downloaded image, media, and attachment data use sibling cache directories.
 - Inline image and video previews are stored as MIME-checked raw files in
   workspace-scoped cache directories. Each preview is limited to 8 MiB for images
   or 16 MiB for videos; the preview cache is limited to 512 MiB and 16,384 files,
@@ -389,7 +389,7 @@ The default build requires:
 - Rust 1.88 or newer. The repository pins the reviewed Rust, rustfmt, and Clippy
   version in `rust-toolchain.toml`, currently 1.97.1.
 - Meson 1.0 or newer, Ninja, CMake, a C compiler, pkg-config, and gettext.
-- Development packages for GTK4, libadwaita, WebKitGTK 6.0, GdkPixbuf, GLib/GIO,
+- Development packages for GTK4, libadwaita, GdkPixbuf, GLib/GIO,
   and D-Bus.
 - Python 3 with PyGObject and GdkPixbuf introspection for the headless UI tests.
 - A running Secret Service-compatible keyring when connecting a workspace.

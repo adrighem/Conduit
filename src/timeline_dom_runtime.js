@@ -123,11 +123,11 @@
   function dispatchMessagesRead(timestamps) {
     if (!timestamps || timestamps.length === 0) return;
     if (
-      window.webkit &&
-      window.webkit.messageHandlers &&
-      window.webkit.messageHandlers.conduit
+      window.conduitBridge &&
+      window.conduitBridge.messageHandlers &&
+      window.conduitBridge.messageHandlers.conduit
     ) {
-      window.webkit.messageHandlers.conduit.postMessage({
+      window.conduitBridge.messageHandlers.conduit.postMessage({
         type: "messages_read",
         timestamps: timestamps
       });

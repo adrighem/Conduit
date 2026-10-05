@@ -40,9 +40,9 @@
 
   function nativeHandlerAvailable() {
     return Boolean(
-      window.webkit &&
-      window.webkit.messageHandlers &&
-      window.webkit.messageHandlers.conduitEmojiPicker
+      window.conduitBridge &&
+      window.conduitBridge.messageHandlers &&
+      window.conduitBridge.messageHandlers.conduitEmojiPicker
     );
   }
 
@@ -85,7 +85,7 @@
       empty.hidden = false;
       return;
     }
-    window.webkit.messageHandlers.conduitEmojiPicker.postMessage({
+    window.conduitBridge.messageHandlers.conduitEmojiPicker.postMessage({
       version: PROTOCOL_VERSION,
       generation: activeGeneration,
       query,

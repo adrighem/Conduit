@@ -1,14 +1,9 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::rc::Rc;
-
-use gtk::gio::{self, prelude::*};
-use gtk::glib;
 
 use crate::config;
 use crate::message_html::CachedAssetSource;
@@ -430,114 +425,4 @@ pub fn open_conduit_asset_at(
     }
     file.seek(SeekFrom::Start(0))?;
     Ok(file)
-}
-
-pub fn finish_conduit_asset_error(request: &webkit6::URISchemeRequest) {
-    let mut error = glib::Error::new(
-        gio::IOErrorEnum::NotFound,
-        "unknown or invalid Conduit asset",
-    );
-    request.finish_error(&mut error);
-}
-
-pub fn finish_conduit_asset_response(
-    request: &webkit6::URISchemeRequest,
-    descriptor: &CachedAssetDescriptor,
-    mut file: File,
-    method: &str,
-    plan: ConduitAssetResponsePlan,
-) -> io::Result<()> {
-    let total_length = descriptor.size();
-    let (status, reason, start, end, content_length) = match plan {
-        ConduitAssetResponsePlan::Full => {
-            (200, "OK", 0, total_length.saturating_sub(1), total_length)
-        }
-        ConduitAssetResponsePlan::Partial { start, end } => {
-            (206, "Partial Content", start, end, end - start + 1)
-        }
-        ConduitAssetResponsePlan::NotSatisfiable => {
-            let stream = gio::MemoryInputStream::new();
-            let response = webkit6::URISchemeResponse::new(&stream, 0);
-            response.set_status(416, Some("Range Not Satisfiable"));
-            response.set_content_type(descriptor.content_type());
-            let headers =
-                webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
-            headers.replace("Accept-Ranges", "bytes");
-            headers.replace("Cache-Control", "no-store");
-            headers.replace("Content-Length", "0");
-            headers.replace("Content-Range", &format!("bytes */{total_length}"));
-            headers.replace("X-Content-Type-Options", "nosniff");
-            response.set_http_headers(headers);
-            request.finish_with_response(&response);
-            return Ok(());
-        }
-    };
-
-    let stream: gio::InputStream = if method == "HEAD" {
-        gio::MemoryInputStream::new().upcast()
-    } else {
-        file.seek(SeekFrom::Start(start))?;
-        gio::ReadInputStream::new(file.take(content_length)).upcast()
-    };
-    let stream_length = if method == "HEAD" {
-        0
-    } else {
-        content_length as i64
-    };
-    let response = webkit6::URISchemeResponse::new(&stream, stream_length);
-    response.set_status(status, Some(reason));
-    response.set_content_type(descriptor.content_type());
-    let headers = webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
-    headers.replace("Accept-Ranges", "bytes");
-    headers.replace("Cache-Control", "no-store");
-    headers.replace("Content-Length", &content_length.to_string());
-    headers.replace("X-Content-Type-Options", "nosniff");
-    if status == 206 {
-        headers.replace(
-            "Content-Range",
-            &format!("bytes {start}-{end}/{total_length}"),
-        );
-    }
-    response.set_http_headers(headers);
-    request.finish_with_response(&response);
-    Ok(())
-}
-
-pub fn serve_conduit_asset_request(
-    request: &webkit6::URISchemeRequest,
-    assets: &Rc<RefCell<BoundedConduitAssets>>,
-) -> ConduitAssetServeOutcome {
-    let Some(uri) = request.uri() else {
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Rejected;
-    };
-    let Some(cache_key) = conduit_asset_request_key(uri.as_str()) else {
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Rejected;
-    };
-    let Some(descriptor) = conduit_asset_for_request(uri.as_str(), &mut assets.borrow_mut()) else {
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Rejected;
-    };
-    let method = request.http_method();
-    let Some(method) = conduit_asset_request_method(method.as_deref()) else {
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Rejected;
-    };
-    let range = request
-        .http_headers()
-        .and_then(|headers| headers.one("Range"))
-        .map(|range| range.to_string());
-    let plan = conduit_asset_response_plan(range.as_deref(), descriptor.size());
-    let Ok(file) = open_conduit_asset(&descriptor) else {
-        assets.borrow_mut().remove(&cache_key);
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Invalidated(cache_key);
-    };
-    if finish_conduit_asset_response(request, &descriptor, file, method, plan).is_err() {
-        assets.borrow_mut().remove(&cache_key);
-        finish_conduit_asset_error(request);
-        return ConduitAssetServeOutcome::Invalidated(cache_key);
-    }
-    ConduitAssetServeOutcome::Served(cache_key)
 }

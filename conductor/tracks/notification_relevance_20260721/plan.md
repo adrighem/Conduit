@@ -28,5 +28,5 @@
 - [x] Task: Add attention counters and structured reasons for decisions without logging message content or configured keywords 4d6ed69
 - [x] Task: Measure a realtime burst for classification cost, queue growth, duplicate delivery, and unread reconciliation behavior 4d6ed69
 - [x] Task: Update user and architecture documentation for relevant-only notifications and the raw-unread/attention distinction 4d6ed69
-- [x] Task: Run formatting, unit, integration, Meson, GSettings, GTK, and WebKit validation suites 4d6ed69
+- [x] Task: Run formatting, unit, integration, Meson, GSettings, GTK, and native UI validation suites 4d6ed69
 - [x] Task: Conductor - User Manual Verification 'Hardening, measurement, and documentation' (Protocol in workflow.md) bb88980

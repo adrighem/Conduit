@@ -22,6 +22,7 @@ pub const EMOJI_PICKER_PROTOCOL_VERSION: u8 = 1;
 pub const EMOJI_PICKER_RESULT_LIMIT: usize = 64;
 pub const EMOJI_PICKER_MAX_QUERY_CHARS: usize = 128;
 pub const EMOJI_PICKER_CATEGORIES: &[&str] = &[
+    "All",
     "Smileys",
     "People",
     "Nature",
@@ -311,7 +312,9 @@ impl EmojiPickerModel {
             self.ranked_entries(query)
         };
         if let Some(category) = request.category.as_deref() {
-            matches.retain(|entry| entry.category == category);
+            if category != "All" {
+                matches.retain(|entry| entry.category == category);
+            }
         }
 
         let total = matches.len();

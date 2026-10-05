@@ -1,14 +1,14 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use gdk_pixbuf::prelude::*;
+use adw::prelude::*;
 use gtk::glib::subclass::prelude::*;
 use gtk::{
-    gio, glib, pango, prelude::*, Box, Button, CssProvider, Grid, Image, Label,
+    gio, glib, pango, Box, Button, CssProvider, Grid, Image, Label,
     ListView, NoSelection, Orientation, Picture, ScrolledWindow, Separator,
-    SignalListItemFactory, Widget,
+    SignalListItemFactory, ToggleButton, Widget,
 };
 
 use crate::message_html::MessageHtmlContext;
@@ -240,6 +240,139 @@ impl BoundedTextureCache {
 
 thread_local! {
     static TEXTURE_CACHE: RefCell<BoundedTextureCache> = RefCell::new(BoundedTextureCache::new());
+    // Collapsed image/video attachments, in-memory only (reset on app restart).
+    // Message rows are fully rebuilt on every scroll-recycle (no connect_unbind),
+    // so this state cannot live on the transient widget - it must survive here,
+    // keyed by a stable ts+index pair.
+    static COLLAPSED_MEDIA: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+fn media_collapse_key(ts: &str, slot: &str) -> String {
+    format!("{ts}:{slot}")
+}
+
+fn is_media_collapsed(ts: &str, slot: &str) -> bool {
+    let key = media_collapse_key(ts, slot);
+    COLLAPSED_MEDIA.with(|set| set.borrow().contains(&key))
+}
+
+fn set_media_collapsed(ts: &str, slot: &str, collapsed: bool) {
+    let key = media_collapse_key(ts, slot);
+    COLLAPSED_MEDIA.with(|set| {
+        if collapsed {
+            set.borrow_mut().insert(key);
+        } else {
+            set.borrow_mut().remove(&key);
+        }
+    });
+}
+
+/// Wraps a media widget (image/video) with a small ▶/▼ toggle button that
+/// shows/hides it, mirroring Slack's own "collapse image previews" affordance.
+/// `slot` must be stable and unique per message (e.g. `"file:{index}"` vs
+/// `"attachment:{index}"`) so the collapsed state survives row rebuilds and
+/// files/attachments at the same index don't collide in the same key space.
+fn wrap_collapsible_media(media: Widget, ts: &str, slot: &str) -> Box {
+    let container = Box::new(Orientation::Vertical, 2);
+    container.set_halign(gtk::Align::Start);
+
+    let collapsed = is_media_collapsed(ts, slot);
+
+    let toggle = ToggleButton::new();
+    toggle.set_focus_on_click(false);
+    toggle.set_icon_name(if collapsed {
+        "pan-end-symbolic"
+    } else {
+        "pan-down-symbolic"
+    });
+    toggle.add_css_class("flat");
+    toggle.add_css_class("circular");
+    toggle.set_halign(gtk::Align::Start);
+    toggle.set_tooltip_text(Some("Show or hide image"));
+    toggle.set_active(!collapsed);
+
+    media.set_visible(!collapsed);
+
+    let ts_owned = ts.to_string();
+    let slot_owned = slot.to_string();
+    let media_weak = media.downgrade();
+    toggle.connect_toggled(move |btn| {
+        let expanded = btn.is_active();
+        btn.set_icon_name(if expanded {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        });
+        if let Some(media) = media_weak.upgrade() {
+            media.set_visible(expanded);
+        }
+        set_media_collapsed(&ts_owned, &slot_owned, !expanded);
+    });
+
+    container.append(&toggle);
+    container.append(&media);
+    container
+}
+
+/// Loads `path` as an animated `Picture` when it's a multi-frame image (GIF/
+/// animated WebP), falling back to the shared static-texture cache otherwise.
+/// Generalizes the animation driver already used for custom emoji reactions
+/// (see `load_custom_emoji_picture`) to arbitrary message/attachment images.
+fn load_animated_or_static_picture(
+    path: &Path,
+    width: i32,
+    height: i32,
+    content_fit: gtk::ContentFit,
+) -> Widget {
+    if let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) {
+        if !anim.is_static_image() {
+            let iter = anim.iter(None);
+            let first_pixbuf = iter.pixbuf();
+            let pic = Picture::for_paintable(&gtk::gdk::Texture::for_pixbuf(&first_pixbuf));
+            pic.set_size_request(width, height);
+            pic.set_content_fit(content_fit);
+
+            let start_animation = move |p: &Picture, anim_obj: &gdk_pixbuf::PixbufAnimation| {
+                let iter = anim_obj.iter(None);
+                let last_update = Rc::new(Cell::new(std::time::Instant::now()));
+                let delay_ms = iter
+                    .delay_time()
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(60)
+                    .max(60);
+                p.add_tick_callback(move |p, _frame_clock| {
+                    if !p.is_mapped() {
+                        return glib::ControlFlow::Break;
+                    }
+                    if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
+                        last_update.set(std::time::Instant::now());
+                        iter.advance(std::time::SystemTime::now());
+                        p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&iter.pixbuf())));
+                    }
+                    glib::ControlFlow::Continue
+                });
+            };
+
+            let anim_for_map = anim.clone();
+            pic.connect_map(move |p| {
+                start_animation(p, &anim_for_map);
+            });
+            if pic.is_mapped() {
+                start_animation(&pic, &anim);
+            }
+
+            return pic.upcast::<Widget>();
+        }
+    }
+
+    let pic = if let Some(tex) = get_or_load_texture(path) {
+        Picture::for_paintable(&tex)
+    } else {
+        Picture::for_filename(path)
+    };
+    pic.set_size_request(width, height);
+    pic.set_content_fit(content_fit);
+    pic.upcast::<Widget>()
 }
 
 pub(crate) fn register_timeline_css() {
@@ -257,7 +390,23 @@ pub(crate) fn register_timeline_css() {
             .blockquote { border-left: 3px solid #888888; padding-left: 8px; margin-left: 4px; }
             .reaction-pill { padding: 2px 6px; min-width: 0; min-height: 0; border-radius: 12px; }
             .reaction-pill label { min-width: 0; }
+            .reaction-emoji-unicode { font-size: 32px; line-height: 1; }
+            .reaction-emoji-image { margin-top: 3px; margin-bottom: 3px; }
             .timeline-attachment { border-left: 3px solid #e0e0e0; padding-left: 8px; margin-left: 4px; }
+            .timeline-video-play-icon {
+                background-color: rgba(0, 0, 0, 0.55);
+                border-radius: 9999px;
+                padding: 12px;
+                color: #ffffff;
+            }
+            .thread-reply-pill {
+                background-color: #D6ECFF;
+                color: #1264A3;
+                border-radius: 12px;
+                padding: 2px 10px;
+            }
+            .thread-reply-active { font-weight: bold; }
+            .reaction-pill-active { background-color: #D6ECFF; color: #1264A3; }
             "#,
         );
         gtk::style_context_add_provider_for_display(
@@ -282,13 +431,42 @@ fn get_or_load_texture(path: &Path) -> Option<gtk::gdk::Texture> {
     })
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum TimelineAction {
+    OpenMedia(crate::window::MediaGalleryItem),
+    OpenThread(String),
+    ToggleReaction { ts: String, name: String, add: bool },
+    ForwardMessage(String),
+    MarkUnread(String),
+    CopyMessageLink(String),
+    CopyMessageText(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HoverEvent {
+    Enter {
+        row: Widget,
+        ts: String,
+        reactions: Vec<crate::emoji::EmojiEntry>,
+    },
+    Leave,
+}
+
+#[derive(Clone)]
+struct HoveredMessage {
+    row: Widget,
+    ts: String,
+}
+
 #[derive(Clone)]
 pub struct NativeTimelineView {
+    container: Box,
     scrolled_window: ScrolledWindow,
+    list_view: ListView,
+    placeholder_label: Label,
     pub store: gio::ListStore,
     context: Rc<RefCell<Option<MessageHtmlContext>>>,
-    on_open_media: Rc<RefCell<Option<OpenMediaCallback>>>,
-    on_open_thread: Rc<RefCell<Option<Rc<dyn Fn(String)>>>>,
+    on_action: Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>>,
     asset_update_pending: Rc<Cell<bool>>,
 }
 
@@ -309,8 +487,76 @@ impl NativeTimelineView {
 
         let factory = SignalListItemFactory::new();
         let context: Rc<RefCell<Option<MessageHtmlContext>>> = Rc::new(RefCell::new(None));
-        let on_open_media: Rc<RefCell<Option<OpenMediaCallback>>> = Rc::new(RefCell::new(None));
-        let on_open_thread: Rc<RefCell<Option<Rc<dyn Fn(String)>>>> = Rc::new(RefCell::new(None));
+        let on_action: Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>> = Rc::new(RefCell::new(None));
+        let hovered: Rc<RefCell<Option<HoveredMessage>>> = Rc::new(RefCell::new(None));
+        let hover_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        // Holds the quick-bar's current overflow popover (rebuilt fresh on
+        // every hover). The hover-leave debounce below queries its live
+        // `is_visible()` directly instead of a manually-toggled flag, so it
+        // can never go stale relative to whatever GTK's show/closed signals
+        // actually do or when they fire.
+        let current_popover: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+
+        let quick_bar = Box::new(Orientation::Horizontal, 2);
+        quick_bar.add_css_class("card");
+        quick_bar.set_visible(false);
+        quick_bar.set_halign(gtk::Align::Start);
+        quick_bar.set_valign(gtk::Align::Start);
+
+        let bar_motion = gtk::EventControllerMotion::new();
+        {
+            let hover_generation = hover_generation.clone();
+            bar_motion.connect_enter(move |_, _, _| {
+                hover_generation.set(hover_generation.get().wrapping_add(1));
+                crate::debug::log(
+                    "quickbar",
+                    &format!("bar_motion enter generation={}", hover_generation.get()),
+                );
+            });
+        }
+        {
+            let hover_generation = hover_generation.clone();
+            let hovered = hovered.clone();
+            let quick_bar_weak = quick_bar.downgrade();
+            let current_popover = current_popover.clone();
+            bar_motion.connect_leave(move |_| {
+                hover_generation.set(hover_generation.get().wrapping_add(1));
+                let expected = hover_generation.get();
+                crate::debug::log(
+                    "quickbar",
+                    &format!("bar_motion leave generation={expected} scheduling hide check in 150ms"),
+                );
+                let hovered = hovered.clone();
+                let quick_bar_weak = quick_bar_weak.clone();
+                let hover_generation = hover_generation.clone();
+                let current_popover = current_popover.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                    let popover_open = current_popover
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|p| p.is_visible());
+                    let current_generation = hover_generation.get();
+                    let stale = current_generation != expected;
+                    crate::debug::log(
+                        "quickbar",
+                        &format!(
+                            "bar_motion leave timeout fired expected_gen={expected} current_gen={current_generation} stale={stale} popover_open={popover_open} will_hide={}",
+                            !stale && !popover_open
+                        ),
+                    );
+                    if current_generation == expected && !popover_open {
+                        *hovered.borrow_mut() = None;
+                        if let Some(bar) = quick_bar_weak.upgrade() {
+                            bar.set_visible(false);
+                        }
+                    }
+                });
+            });
+        }
+        quick_bar.add_controller(bar_motion.clone());
+
+        let overlay = gtk::Overlay::new();
+        overlay.add_overlay(&quick_bar);
 
         factory.connect_setup(|_factory, list_item| {
             let item = list_item
@@ -320,8 +566,13 @@ impl NativeTimelineView {
         });
 
         let context_clone = context.clone();
-        let on_open_media_clone = on_open_media.clone();
-        let on_open_thread_clone = on_open_thread.clone();
+        let on_action_clone = on_action.clone();
+        let hovered_for_bind = hovered.clone();
+        let hover_generation_for_bind = hover_generation.clone();
+        let current_popover_for_bind = current_popover.clone();
+        let bar_motion_for_bind = bar_motion.clone();
+        let quick_bar_for_bind = quick_bar.clone();
+        let overlay_for_bind = overlay.clone();
         factory.connect_bind(move |_factory, list_item| {
             let item = list_item
                 .downcast_ref::<gtk::ListItem>()
@@ -333,13 +584,137 @@ impl NativeTimelineView {
             let msg = msg_obj.message();
 
             if let Some(ctx) = context_clone.borrow().as_ref() {
-                let cb_media = on_open_media_clone.borrow().clone();
-                let cb_thread = on_open_thread_clone.borrow().clone();
+                let on_action = on_action_clone.clone();
+                let cb_media: OpenMediaCallback = {
+                    let on_action = on_action.clone();
+                    Rc::new(move |media_item| {
+                        let on_action = on_action.clone();
+                        glib::idle_add_local_once(move || {
+                            if let Some(h) = on_action.borrow().as_ref() {
+                                h(TimelineAction::OpenMedia(media_item));
+                            }
+                        });
+                    })
+                };
+                let cb_thread: Rc<dyn Fn(String)> = {
+                    let on_action = on_action.clone();
+                    Rc::new(move |thread_ts| {
+                        let on_action = on_action.clone();
+                        glib::idle_add_local_once(move || {
+                            if let Some(h) = on_action.borrow().as_ref() {
+                                h(TimelineAction::OpenThread(thread_ts));
+                            }
+                        });
+                    })
+                };
+                let cb_reaction: Rc<dyn Fn(String, String, bool)> = {
+                    let on_action = on_action.clone();
+                    Rc::new(move |ts, name, add| {
+                        let on_action = on_action.clone();
+                        glib::idle_add_local_once(move || {
+                            if let Some(h) = on_action.borrow().as_ref() {
+                                h(TimelineAction::ToggleReaction { ts, name, add });
+                            }
+                        });
+                    })
+                };
+                let cb_hover: Rc<dyn Fn(HoverEvent)> = {
+                    let hovered = hovered_for_bind.clone();
+                    let hover_generation = hover_generation_for_bind.clone();
+                    let current_popover = current_popover_for_bind.clone();
+                    let bar_motion = bar_motion_for_bind.clone();
+                    let quick_bar = quick_bar_for_bind.clone();
+                    let overlay = overlay_for_bind.clone();
+                    let context_for_hover = context_clone.clone();
+                    let on_action_for_hover = on_action_clone.clone();
+                    Rc::new(move |event| match event {
+                        HoverEvent::Enter { row, ts, reactions } => {
+                            hover_generation.set(hover_generation.get().wrapping_add(1));
+                            // Overlay/hit-test boundary jitter right at the bar's own
+                            // edge (e.g. over the overflow button) can fire a spurious
+                            // re-"enter" for the SAME row that's already showing the
+                            // bar. Rebuilding in that case would tear down (not
+                            // cleanly close) any popover the user currently has open.
+                            // Only rebuild when the hovered message actually changed.
+                            let already_showing_this_message = quick_bar.get_visible()
+                                && hovered
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|current| current.ts == ts);
+                            crate::debug::log(
+                                "quickbar",
+                                &format!(
+                                    "row HoverEnter ts={ts} generation={} already_showing={already_showing_this_message}",
+                                    hover_generation.get()
+                                ),
+                            );
+                            *hovered.borrow_mut() = Some(HoveredMessage { row, ts: ts.clone() });
+                            if already_showing_this_message {
+                                return;
+                            }
+                            if let Some(ctx) = context_for_hover.borrow().as_ref() {
+                                rebuild_quick_bar(
+                                    &quick_bar,
+                                    &ts,
+                                    &reactions,
+                                    ctx,
+                                    &on_action_for_hover,
+                                    &hover_generation,
+                                    &hovered,
+                                    &current_popover,
+                                    &bar_motion,
+                                );
+                            }
+                            quick_bar.set_visible(true);
+                            overlay.queue_allocate();
+                        }
+                        HoverEvent::Leave => {
+                            hover_generation.set(hover_generation.get().wrapping_add(1));
+                            let expected = hover_generation.get();
+                            crate::debug::log(
+                                "quickbar",
+                                &format!(
+                                    "row HoverLeave generation={expected} scheduling hide check in 150ms"
+                                ),
+                            );
+                            let hovered = hovered.clone();
+                            let quick_bar_weak = quick_bar.downgrade();
+                            let hover_generation = hover_generation.clone();
+                            let current_popover = current_popover.clone();
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(150),
+                                move || {
+                                    let popover_open = current_popover
+                                        .borrow()
+                                        .as_ref()
+                                        .is_some_and(|p| p.is_visible());
+                                    let current_generation = hover_generation.get();
+                                    let stale = current_generation != expected;
+                                    crate::debug::log(
+                                        "quickbar",
+                                        &format!(
+                                            "row HoverLeave timeout fired expected_gen={expected} current_gen={current_generation} stale={stale} popover_open={popover_open} will_hide={}",
+                                            !stale && !popover_open
+                                        ),
+                                    );
+                                    if current_generation == expected && !popover_open {
+                                        *hovered.borrow_mut() = None;
+                                        if let Some(bar) = quick_bar_weak.upgrade() {
+                                            bar.set_visible(false);
+                                        }
+                                    }
+                                },
+                            );
+                        }
+                    })
+                };
                 let msg_widget = build_timeline_message_widget(
                     &msg,
                     ctx,
-                    cb_media.as_ref(),
-                    cb_thread.as_ref(),
+                    Some(&cb_media),
+                    Some(&cb_thread),
+                    Some(&cb_reaction),
+                    Some(&cb_hover),
                 );
                 item.set_child(Some(&msg_widget));
             }
@@ -352,22 +727,78 @@ impl NativeTimelineView {
         scrolled_window.set_vexpand(true);
         scrolled_window.set_child(Some(&list_view));
 
+        {
+            let hovered = hovered.clone();
+            let hover_generation = hover_generation.clone();
+            let quick_bar_weak = quick_bar.downgrade();
+            scrolled_window.vadjustment().connect_value_changed(move |_| {
+                hover_generation.set(hover_generation.get().wrapping_add(1));
+                *hovered.borrow_mut() = None;
+                if let Some(bar) = quick_bar_weak.upgrade() {
+                    bar.set_visible(false);
+                }
+            });
+        }
+
+        overlay.set_child(Some(&scrolled_window));
+
+        {
+            let hovered = hovered.clone();
+            let quick_bar_for_position = quick_bar.clone().upcast::<Widget>();
+            overlay.connect_get_child_position(move |ov, widget| {
+                if *widget != quick_bar_for_position {
+                    return None;
+                }
+                let hovered_ref = hovered.borrow();
+                let hovered = hovered_ref.as_ref()?;
+                let bounds = hovered.row.compute_bounds(ov)?;
+                let (_, bar_w, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                let (_, bar_h, _, _) = widget.measure(gtk::Orientation::Vertical, -1);
+                let overlay_width = ov.width();
+                let max_x = (overlay_width - bar_w).max(0) as f32;
+                let x = (bounds.x() + bounds.width() - bar_w as f32 - 8.0)
+                    .max(4.0)
+                    .min(max_x.max(4.0));
+                let y = (bounds.y() + 4.0).max(0.0);
+                Some(gtk::gdk::Rectangle::new(
+                    x.round() as i32,
+                    y.round() as i32,
+                    bar_w,
+                    bar_h,
+                ))
+            });
+        }
+
+        let placeholder_label = Label::new(None);
+        placeholder_label.set_hexpand(true);
+        placeholder_label.set_vexpand(true);
+        placeholder_label.set_valign(gtk::Align::Center);
+        placeholder_label.set_halign(gtk::Align::Center);
+        placeholder_label.set_justify(gtk::Justification::Center);
+        placeholder_label.set_wrap(true);
+        placeholder_label.add_css_class("dim-label");
+        placeholder_label.set_visible(false);
+
+        let container = Box::new(Orientation::Vertical, 0);
+        container.set_hexpand(true);
+        container.set_vexpand(true);
+        container.append(&overlay);
+        container.append(&placeholder_label);
+
         Self {
+            container,
             scrolled_window,
+            list_view,
+            placeholder_label,
             store,
             context,
-            on_open_media,
-            on_open_thread,
+            on_action,
             asset_update_pending: Rc::new(Cell::new(false)),
         }
     }
 
-    pub(crate) fn set_on_open_media<F: Fn(crate::window::MediaGalleryItem) + 'static>(&self, f: F) {
-        *self.on_open_media.borrow_mut() = Some(Rc::new(f));
-    }
-
-    pub(crate) fn set_on_open_thread<F: Fn(String) + 'static>(&self, f: F) {
-        *self.on_open_thread.borrow_mut() = Some(Rc::new(f));
+    pub(crate) fn set_on_action<F: Fn(TimelineAction) + 'static>(&self, f: F) {
+        *self.on_action.borrow_mut() = Some(Rc::new(f));
     }
 
     pub fn update_image_asset(&self, context: &MessageHtmlContext) {
@@ -392,7 +823,14 @@ impl NativeTimelineView {
         });
     }
 
-    pub fn set_messages(&self, messages: &[SlackMessage], context: &MessageHtmlContext) {
+    pub fn set_messages(
+        &self,
+        messages: &[SlackMessage],
+        context: &MessageHtmlContext,
+        focus_ts: Option<&str>,
+    ) {
+        self.placeholder_label.set_visible(false);
+        self.scrolled_window.set_visible(true);
         *self.context.borrow_mut() = Some(context.clone());
         self.store.remove_all();
         for msg in messages.iter().rev() {
@@ -400,14 +838,36 @@ impl NativeTimelineView {
             self.store.append(&obj);
         }
 
+        let focus_index = focus_ts.and_then(|ts| {
+            messages
+                .iter()
+                .rev()
+                .position(|msg| msg.ts == ts)
+                .map(|pos| pos as u32)
+        });
+
+        let list_view = self.list_view.clone();
         let vadj = self.scrolled_window.vadjustment();
         glib::idle_add_local_once(move || {
-            vadj.set_value(vadj.upper() - vadj.page_size());
+            if let Some(index) = focus_index {
+                list_view.scroll_to(index, gtk::ListScrollFlags::empty(), None);
+            } else {
+                vadj.set_value(vadj.upper() - vadj.page_size());
+            }
         });
     }
 
+    /// Shows a plain-text placeholder (loading state, empty state, error message) in place of
+    /// the message list, for surfaces that have no structured content to render yet.
+    pub fn show_placeholder(&self, text: &str) {
+        self.store.remove_all();
+        self.placeholder_label.set_label(text);
+        self.placeholder_label.set_visible(true);
+        self.scrolled_window.set_visible(false);
+    }
+
     pub fn widget(&self) -> &Widget {
-        self.scrolled_window.upcast_ref()
+        self.container.upcast_ref()
     }
 }
 
@@ -617,6 +1077,7 @@ fn render_text_content(
                 label.set_wrap(true);
                 label.set_wrap_mode(pango::WrapMode::WordChar);
                 label.set_selectable(true);
+                label.set_focus_on_click(false);
                 label.set_xalign(0.0);
                 label.set_markup(&format!("<tt>{}</tt>", glib::markup_escape_text(&code)));
                 frame.append(&label);
@@ -631,6 +1092,7 @@ fn render_text_content(
                 label.set_wrap(true);
                 label.set_wrap_mode(pango::WrapMode::WordChar);
                 label.set_selectable(true);
+                label.set_focus_on_click(false);
                 label.set_xalign(0.0);
                 label.set_markup(&format!("<i>{}</i>", pango));
                 quote_box.append(&label);
@@ -643,6 +1105,7 @@ fn render_text_content(
                     label.set_wrap(true);
                     label.set_wrap_mode(pango::WrapMode::WordChar);
                     label.set_selectable(true);
+                    label.set_focus_on_click(false);
                     label.set_xalign(0.0);
                     label.set_markup(&pango);
                     target_box.append(&label);
@@ -728,6 +1191,11 @@ fn extract_rich_text_string(section_or_elem: &serde_json::Value) -> String {
                         out.push_str(&format!(":{name}:"));
                     }
                 }
+                "channel" => {
+                    if let Some(cid) = sub.get("channel_id").and_then(|v| v.as_str()) {
+                        out.push_str(&format!("<#{cid}>"));
+                    }
+                }
                 _ => {
                     if let Some(t) = sub.get("text").and_then(|v| v.as_str()) {
                         out.push_str(t);
@@ -759,6 +1227,7 @@ fn render_blocks(
                         label.set_wrap(true);
                         label.set_wrap_mode(pango::WrapMode::WordChar);
                         label.set_selectable(true);
+                        label.set_focus_on_click(false);
                         label.set_xalign(0.0);
                         label.set_markup(&format!(
                             "<span size=\"larger\" weight=\"bold\">{}</span>",
@@ -788,6 +1257,7 @@ fn render_blocks(
                                     field_label.set_wrap(true);
                                     field_label.set_wrap_mode(pango::WrapMode::WordChar);
                                     field_label.set_selectable(true);
+                                    field_label.set_focus_on_click(false);
                                     field_label.set_xalign(0.0);
                                     field_label.set_markup(&pango);
                                     let col = (idx % 2) as i32;
@@ -839,6 +1309,7 @@ fn render_blocks(
                                         label.set_wrap(true);
                                         label.set_wrap_mode(pango::WrapMode::WordChar);
                                         label.set_selectable(true);
+                                        label.set_focus_on_click(false);
                                         label.set_xalign(0.0);
                                         label.set_markup(&pango);
                                         list_box.append(&label);
@@ -854,6 +1325,7 @@ fn render_blocks(
                                 label.set_wrap(true);
                                 label.set_wrap_mode(pango::WrapMode::WordChar);
                                 label.set_selectable(true);
+                                label.set_focus_on_click(false);
                                 label.set_xalign(0.0);
                                 label.set_markup(&format!(
                                     "<tt>{}</tt>",
@@ -873,6 +1345,7 @@ fn render_blocks(
                                 label.set_wrap(true);
                                 label.set_wrap_mode(pango::WrapMode::WordChar);
                                 label.set_selectable(true);
+                                label.set_focus_on_click(false);
                                 label.set_xalign(0.0);
                                 label.set_markup(&format!("<i>{}</i>", pango));
                                 quote_box.append(&label);
@@ -894,6 +1367,7 @@ fn render_blocks(
                         let btn_text =
                             extract_block_text(elem).unwrap_or_else(|| "Button".to_string());
                         let btn = Button::with_label(&btn_text);
+                        btn.set_focus_on_click(false);
                         actions_box.append(&btn);
                     }
                 }
@@ -939,6 +1413,7 @@ fn render_blocks(
                                 label.set_wrap(true);
                                 label.set_wrap_mode(pango::WrapMode::WordChar);
                                 label.set_selectable(true);
+                                label.set_focus_on_click(false);
                                 label.set_xalign(0.0);
                                 label.add_css_class("dim-label");
                                 label.set_markup(&format!("<span size=\"small\">{}</span>", pango));
@@ -976,11 +1451,12 @@ fn render_files(
     root_box: &Box,
     context: &MessageHtmlContext,
     on_open_media: Option<&OpenMediaCallback>,
+    ts: &str,
 ) {
     let files_box = Box::new(Orientation::Vertical, 6);
     files_box.set_halign(gtk::Align::Start);
 
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
         let is_video = file
             .mimetype
             .as_deref()
@@ -1036,6 +1512,8 @@ fn render_files(
             container.add_css_class("timeline-video-container");
             container.set_halign(gtk::Align::Start);
 
+            let overlay = gtk::Overlay::new();
+
             if let Some(path) = local_thumb {
                 let pic = if let Some(tex) = get_or_load_texture(&path) {
                     Picture::for_paintable(&tex)
@@ -1045,35 +1523,25 @@ fn render_files(
                 pic.set_content_fit(gtk::ContentFit::ScaleDown);
                 pic.set_size_request(600, 340);
                 pic.set_tooltip_text(Some(&title));
-                container.append(&pic);
+                overlay.set_child(Some(&pic));
             } else {
                 let poster_box = Box::new(Orientation::Vertical, 0);
                 poster_box.set_size_request(360, 200);
                 poster_box.add_css_class("card");
                 poster_box.add_css_class("rounded");
-
-                let play_icon = Image::from_icon_name("media-playback-start-symbolic");
-                play_icon.set_pixel_size(48);
-                play_icon.set_vexpand(true);
-                play_icon.set_valign(gtk::Align::Center);
-                play_icon.set_halign(gtk::Align::Center);
-                poster_box.append(&play_icon);
-
-                container.append(&poster_box);
+                poster_box.set_tooltip_text(Some(&title));
+                overlay.set_child(Some(&poster_box));
             }
 
-            let play_box = Box::new(Orientation::Horizontal, 6);
             let play_icon = Image::from_icon_name("media-playback-start-symbolic");
-            play_icon.set_pixel_size(16);
-            play_box.append(&play_icon);
+            play_icon.set_pixel_size(24);
+            play_icon.add_css_class("timeline-video-play-icon");
+            play_icon.set_valign(gtk::Align::Center);
+            play_icon.set_halign(gtk::Align::Center);
+            play_icon.set_can_target(false);
+            overlay.add_overlay(&play_icon);
 
-            let title_label = Label::new(Some(&title));
-            title_label.add_css_class("dim-label");
-            title_label.set_xalign(0.0);
-            title_label.set_ellipsize(pango::EllipsizeMode::End);
-            play_box.append(&title_label);
-
-            container.append(&play_box);
+            container.append(&overlay);
 
             if !video_url.is_empty() {
                 let gesture = gtk::GestureClick::new();
@@ -1093,7 +1561,7 @@ fn render_files(
                 container.set_cursor_from_name(Some("pointer"));
             }
 
-            files_box.append(&container);
+            files_box.append(&wrap_collapsible_media(container.upcast::<Widget>(), ts, &format!("file:{index}")));
         } else if is_image {
             let container = Box::new(Orientation::Vertical, 2);
             container.add_css_class("timeline-image-container");
@@ -1124,15 +1592,9 @@ fn render_files(
             });
 
             let img_widget: Widget = if let Some(path) = local_path {
-                let pic = if let Some(tex) = get_or_load_texture(&path) {
-                    Picture::for_paintable(&tex)
-                } else {
-                    Picture::for_filename(&path)
-                };
-                pic.set_content_fit(gtk::ContentFit::ScaleDown);
-                pic.set_size_request(400, 300);
+                let pic = load_animated_or_static_picture(&path, 400, 300, gtk::ContentFit::ScaleDown);
                 pic.add_css_class("rounded");
-                pic.upcast::<Widget>()
+                pic
             } else {
                 let icon = Image::from_icon_name("image-x-generic-symbolic");
                 icon.set_pixel_size(48);
@@ -1160,12 +1622,7 @@ fn render_files(
                 container.set_cursor_from_name(Some("pointer"));
             }
 
-            let label = Label::new(Some(&title));
-            label.add_css_class("dim-label");
-            label.set_xalign(0.0);
-            container.append(&label);
-
-            files_box.append(&container);
+            files_box.append(&wrap_collapsible_media(container.upcast::<Widget>(), ts, &format!("file:{index}")));
         } else {
             let file_card = Box::new(Orientation::Horizontal, 8);
             file_card.add_css_class("file-card");
@@ -1206,6 +1663,7 @@ fn render_files(
             file_card.append(&info_box);
 
             let download_btn = Button::from_icon_name("document-save-symbolic");
+            download_btn.set_focus_on_click(false);
             download_btn.add_css_class("flat");
             download_btn.set_tooltip_text(Some("Download file"));
             file_card.append(&download_btn);
@@ -1221,28 +1679,31 @@ fn render_attachments(
     attachments: &[SlackAttachment],
     root_box: &Box,
     context: &MessageHtmlContext,
+    ts: &str,
 ) {
     register_timeline_css();
-    for attachment in attachments {
-        let attach_box = Box::new(Orientation::Vertical, 4);
-        attach_box.add_css_class("timeline-attachment");
-
+    for (index, attachment) in attachments.iter().enumerate() {
         if let Some(pretext) = attachment.pretext.as_deref().filter(|s| !s.trim().is_empty()) {
             let pango = crate::message_html::mrkdwn_to_pango(pretext, context);
             let label = Label::new(None);
             label.set_wrap(true);
             label.set_wrap_mode(pango::WrapMode::WordChar);
             label.set_selectable(true);
+            label.set_focus_on_click(false);
             label.set_xalign(0.0);
             label.set_markup(&pango);
-            attach_box.append(&label);
+            root_box.append(&label);
         }
+
+        let attach_box = Box::new(Orientation::Vertical, 4);
+        attach_box.add_css_class("timeline-attachment");
 
         if let Some(title) = attachment.title.as_deref().filter(|s| !s.trim().is_empty()) {
             let label = Label::new(None);
             label.set_wrap(true);
             label.set_wrap_mode(pango::WrapMode::WordChar);
             label.set_selectable(true);
+            label.set_focus_on_click(false);
             label.set_xalign(0.0);
             if let Some(title_link) = attachment
                 .title_link
@@ -1266,6 +1727,7 @@ fn render_attachments(
             label.set_wrap(true);
             label.set_wrap_mode(pango::WrapMode::WordChar);
             label.set_selectable(true);
+            label.set_focus_on_click(false);
             label.set_xalign(0.0);
             label.set_markup(&pango);
             attach_box.append(&label);
@@ -1293,6 +1755,7 @@ fn render_attachments(
                     field_label.set_wrap(true);
                     field_label.set_wrap_mode(pango::WrapMode::WordChar);
                     field_label.set_selectable(true);
+                    field_label.set_focus_on_click(false);
                     field_label.set_xalign(0.0);
                     field_label.set_markup(&markup);
                     let col = (idx % 2) as i32;
@@ -1301,6 +1764,37 @@ fn render_attachments(
                 }
             }
             attach_box.append(&grid);
+        }
+
+        if let Some(image_url) = attachment
+            .image_url
+            .as_deref()
+            .or(attachment.thumb_url.as_deref())
+            .filter(|s| !s.trim().is_empty())
+        {
+            let local_path = resolve_cached_asset_path(image_url, context).or_else(|| {
+                std::path::Path::new(image_url)
+                    .exists()
+                    .then(|| std::path::PathBuf::from(image_url))
+            });
+
+            if let Some(path) = local_path {
+                let pic = load_animated_or_static_picture(&path, 400, 300, gtk::ContentFit::ScaleDown);
+                pic.add_css_class("rounded");
+                let title = attachment
+                    .title
+                    .as_deref()
+                    .or(attachment.fallback.as_deref())
+                    .unwrap_or("");
+                if !title.is_empty() {
+                    pic.set_tooltip_text(Some(title));
+                }
+                attach_box.append(&wrap_collapsible_media(
+                    pic,
+                    ts,
+                    &format!("attachment:{index}"),
+                ));
+            }
         }
 
         if let Some(attach_blocks) = attachment
@@ -1353,7 +1847,10 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
         if let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) {
             if anim.is_static_image() {
                 if let Some(pixbuf) = anim.static_image() {
-                    let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+                    let scaled = pixbuf
+                        .scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
+                        .unwrap_or(pixbuf);
+                    let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
                     let entry = (None, texture);
                     map.insert(path.to_path_buf(), entry.clone());
                     return Some(entry);
@@ -1361,12 +1858,19 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
             } else {
                 let iter = anim.iter(None);
                 let initial_pixbuf = iter.pixbuf();
-                let texture = gtk::gdk::Texture::for_pixbuf(&initial_pixbuf);
+                let scaled = initial_pixbuf
+                    .scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
+                    .unwrap_or(initial_pixbuf);
+                let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
                 let entry = (Some(anim), texture);
                 map.insert(path.to_path_buf(), entry.clone());
                 return Some(entry);
             }
-        } else if let Ok(texture) = gtk::gdk::Texture::from_filename(path) {
+        } else if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file(path) {
+            let scaled = pixbuf
+                .scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
+                .unwrap_or(pixbuf);
+            let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
             let entry = (None, texture);
             map.insert(path.to_path_buf(), entry.clone());
             return Some(entry);
@@ -1376,35 +1880,344 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
 
     if let Some((opt_anim, texture)) = cached {
         let pic = Picture::for_paintable(&texture);
-        pic.set_size_request(16, 16);
+        pic.set_size_request(32, 32);
+        pic.set_can_shrink(true);
         pic.set_content_fit(gtk::ContentFit::Cover);
+        pic.add_css_class("reaction-emoji-image");
 
         if let Some(anim) = opt_anim {
-            let iter = anim.iter(None);
-            let delay_ms = iter.delay_time().map(|d| d.as_millis() as u64).unwrap_or(60).max(60);
-            let pic_clone = pic.clone();
+            let start_animation = |p: &Picture, anim_obj: &gdk_pixbuf::PixbufAnimation| {
+                let iter = anim_obj.iter(None);
+                let last_update = Rc::new(Cell::new(std::time::Instant::now()));
+                let delay_ms = iter.delay_time().map(|d| d.as_millis() as u64).unwrap_or(60).max(60);
 
-            glib::timeout_add_local(
-                std::time::Duration::from_millis(delay_ms),
-                move || {
-                    if pic_clone.root().is_none() || !pic_clone.is_mapped() {
+                p.add_tick_callback(move |p, _frame_clock| {
+                    if !p.is_mapped() {
                         return glib::ControlFlow::Break;
                     }
-                    iter.advance(std::time::SystemTime::now());
-                    let pixbuf = iter.pixbuf();
-                    pic_clone.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&pixbuf)));
+                    if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
+                        last_update.set(std::time::Instant::now());
+                        iter.advance(std::time::SystemTime::now());
+                        let pixbuf = iter.pixbuf();
+                        let scaled = pixbuf
+                            .scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
+                            .unwrap_or(pixbuf);
+                        p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&scaled)));
+                    }
                     glib::ControlFlow::Continue
-                },
-            );
+                });
+            };
+
+            let anim_for_map = anim.clone();
+            pic.connect_map(move |p| {
+                start_animation(p, &anim_for_map);
+            });
+
+            if pic.is_mapped() {
+                start_animation(&pic, &anim);
+            }
         }
 
         return pic.upcast::<Widget>();
     }
 
     let pic = Picture::for_filename(path);
-    pic.set_size_request(16, 16);
+    pic.set_size_request(32, 32);
+    pic.set_can_shrink(true);
     pic.set_content_fit(gtk::ContentFit::Cover);
+    pic.add_css_class("reaction-emoji-image");
     pic.upcast::<Widget>()
+}
+
+const ADD_REACTION_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" width="32" height="32" fill="currentColor"><path fill="currentColor" d="M10.28 4.117a7 7 0 1 0 5.604 5.604A2.5 2.5 0 0 1 13 7.25v-.251h-.251a2.5 2.5 0 0 1-2.47-2.883Z"/><path fill="currentColor" fill-rule="evenodd" d="M15.5 1a.75.75 0 0 1 .75.75v2h2a.75.75 0 0 1 0 1.5h-2v2a.75.75 0 0 1-1.5 0v-2h-2a.75.75 0 0 1 0-1.5h2v-2A.75.75 0 0 1 15.5 1Zm-13 10a6.5 6.5 0 0 1 7.166-6.466.75.75 0 0 0 .152-1.493 8 8 0 1 0 7.14 7.139.75.75 0 0 0-1.492.152A6.525 6.525 0 0 1 15.5 11a6.5 6.5 0 1 1-13 0Zm4.25-.5a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Zm4.5 0a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5ZM9 15c1.277 0 2.553-.724 3.06-2.173.148-.426-.209-.827-.66-.827H6.6c-.452 0-.808.4-.66.827C6.448 14.276 7.724 15 9 15Z" clip-rule="evenodd"/></svg>"#;
+
+fn load_add_reaction_widget() -> Widget {
+    let pic = Picture::new();
+    pic.set_size_request(32, 32);
+    pic.set_can_shrink(true);
+    pic.set_content_fit(gtk::ContentFit::Cover);
+    pic.add_css_class("reaction-emoji-image");
+
+    if let Ok(loader) = gdk_pixbuf::PixbufLoader::with_type("svg") {
+        if loader.write(ADD_REACTION_SVG.as_bytes()).is_ok() && loader.close().is_ok() {
+            if let Some(pixbuf) = loader.pixbuf() {
+                if let Some(scaled) = pixbuf.scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear) {
+                    let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
+                    pic.set_paintable(Some(&texture));
+                    return pic.upcast::<Widget>();
+                }
+            }
+        }
+    }
+    let icon = Image::from_icon_name("list-add-symbolic");
+    icon.set_pixel_size(32);
+    icon.add_css_class("reaction-emoji-image");
+    icon.upcast::<Widget>()
+}
+
+fn resolve_reaction_emoji_widget(
+    clean_name: &str,
+    raw_name: &str,
+    context: &MessageHtmlContext,
+    emoji_catalog: &crate::emoji::EmojiCatalog,
+) -> Widget {
+    match emoji_catalog.resolve(clean_name) {
+        Some(crate::emoji::EmojiValue::Unicode(ch)) => {
+            let lbl = Label::new(Some(ch));
+            lbl.add_css_class("reaction-emoji-unicode");
+            lbl.upcast()
+        }
+        Some(crate::emoji::EmojiValue::CustomImage(ref url)) => {
+            if let Some(path) = resolve_cached_asset_path(url, context) {
+                load_custom_emoji_picture(&path)
+            } else {
+                let icon = Image::from_icon_name("image-missing-symbolic");
+                icon.set_pixel_size(32);
+                icon.add_css_class("reaction-emoji-image");
+                icon.upcast()
+            }
+        }
+        None => {
+            if let Some(unicode) = emojis::get(clean_name).or_else(|| emojis::get(raw_name)) {
+                let lbl = Label::new(Some(unicode.as_str()));
+                lbl.add_css_class("reaction-emoji-unicode");
+                lbl.upcast()
+            } else if clean_name.chars().any(|c| !c.is_ascii()) {
+                let lbl = Label::new(Some(clean_name));
+                lbl.add_css_class("reaction-emoji-unicode");
+                lbl.upcast()
+            } else {
+                let icon = Image::from_icon_name("image-missing-symbolic");
+                icon.set_pixel_size(32);
+                icon.add_css_class("reaction-emoji-image");
+                icon.upcast()
+            }
+        }
+    }
+}
+
+fn rebuild_quick_bar(
+    quick_bar: &Box,
+    ts: &str,
+    reactions: &[crate::emoji::EmojiEntry],
+    context: &MessageHtmlContext,
+    on_action: &Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>>,
+    hover_generation: &Rc<Cell<u64>>,
+    hovered: &Rc<RefCell<Option<HoveredMessage>>>,
+    current_popover: &Rc<RefCell<Option<gtk::Popover>>>,
+    bar_motion: &gtk::EventControllerMotion,
+) {
+    while let Some(child) = quick_bar.first_child() {
+        quick_bar.remove(&child);
+    }
+
+    let emoji_catalog = crate::emoji::EmojiCatalog::new(&context.custom_emojis);
+
+    for entry in reactions {
+        let btn = Button::new();
+        btn.set_focus_on_click(false);
+        let widget = resolve_reaction_emoji_widget(&entry.name, &entry.name, context, &emoji_catalog);
+        btn.set_child(Some(&widget));
+        btn.add_css_class("flat");
+        btn.add_css_class("circular");
+        btn.set_tooltip_text(Some(&format!(":{}:", entry.name)));
+        let ts = ts.to_string();
+        let name = entry.name.clone();
+        let on_action = on_action.clone();
+        btn.connect_clicked(move |_| {
+            if let Some(h) = on_action.borrow().as_ref() {
+                h(TimelineAction::ToggleReaction {
+                    ts: ts.clone(),
+                    name: name.clone(),
+                    add: true,
+                });
+            }
+        });
+        quick_bar.append(&btn);
+    }
+
+    let add_pic = load_add_reaction_widget();
+    let add_btn = Button::new();
+    add_btn.set_focus_on_click(false);
+    add_btn.set_child(Some(&add_pic));
+    add_btn.add_css_class("flat");
+    add_btn.add_css_class("circular");
+    add_btn.set_tooltip_text(Some("Add reaction..."));
+    {
+        let custom_emojis = context.custom_emojis.clone();
+        let ts = ts.to_string();
+        let on_action = on_action.clone();
+        let weak_add_btn = add_btn.downgrade();
+        add_btn.connect_clicked(move |_| {
+            let Some(btn) = weak_add_btn.upgrade() else {
+                return;
+            };
+            let on_action = on_action.clone();
+            let ts = ts.clone();
+            let picker = crate::emoji_picker_window::EmojiPickerWindow::new(
+                &btn,
+                &custom_emojis,
+                move |selected_name| {
+                    let clean = selected_name.trim().trim_matches(':');
+                    if !clean.is_empty() {
+                        if let Some(h) = on_action.borrow().as_ref() {
+                            h(TimelineAction::ToggleReaction {
+                                ts: ts.clone(),
+                                name: clean.to_string(),
+                                add: true,
+                            });
+                        }
+                    }
+                },
+            );
+            picker.present();
+        });
+    }
+    quick_bar.append(&add_btn);
+
+    quick_bar.append(&gtk::Separator::new(Orientation::Vertical));
+
+    let reply_btn = Button::from_icon_name("mail-reply-sender-symbolic");
+    reply_btn.set_focus_on_click(false);
+    reply_btn.add_css_class("flat");
+    reply_btn.add_css_class("circular");
+    reply_btn.set_tooltip_text(Some("Reply in thread"));
+    {
+        let ts = ts.to_string();
+        let on_action = on_action.clone();
+        reply_btn.connect_clicked(move |_| {
+            if let Some(h) = on_action.borrow().as_ref() {
+                h(TimelineAction::OpenThread(ts.clone()));
+            }
+        });
+    }
+    quick_bar.append(&reply_btn);
+
+    let forward_btn = Button::from_icon_name("mail-forward-symbolic");
+    forward_btn.set_focus_on_click(false);
+    forward_btn.add_css_class("flat");
+    forward_btn.add_css_class("circular");
+    forward_btn.set_tooltip_text(Some("Forward message..."));
+    {
+        let ts = ts.to_string();
+        let on_action = on_action.clone();
+        forward_btn.connect_clicked(move |_| {
+            if let Some(h) = on_action.borrow().as_ref() {
+                h(TimelineAction::ForwardMessage(ts.clone()));
+            }
+        });
+    }
+    quick_bar.append(&forward_btn);
+
+    let unread_btn = Button::from_icon_name("mail-mark-unread-symbolic");
+    unread_btn.set_focus_on_click(false);
+    unread_btn.add_css_class("flat");
+    unread_btn.add_css_class("circular");
+    unread_btn.set_tooltip_text(Some("Mark unread"));
+    {
+        let ts = ts.to_string();
+        let on_action = on_action.clone();
+        unread_btn.connect_clicked(move |_| {
+            if let Some(h) = on_action.borrow().as_ref() {
+                h(TimelineAction::MarkUnread(ts.clone()));
+            }
+        });
+    }
+    quick_bar.append(&unread_btn);
+
+    let overflow_btn = gtk::MenuButton::new();
+    overflow_btn.set_focus_on_click(false);
+    overflow_btn.set_icon_name("view-more-symbolic");
+    overflow_btn.add_css_class("flat");
+    overflow_btn.add_css_class("circular");
+    overflow_btn.set_tooltip_text(Some("More actions"));
+
+    let popover = gtk::Popover::new();
+    let popover_box = Box::new(Orientation::Vertical, 0);
+
+    let copy_link_btn = Button::with_label("Copy link");
+    copy_link_btn.set_focus_on_click(false);
+    copy_link_btn.add_css_class("flat");
+    {
+        let ts = ts.to_string();
+        let on_action = on_action.clone();
+        let popover_weak = popover.downgrade();
+        copy_link_btn.connect_clicked(move |_| {
+            if let Some(h) = on_action.borrow().as_ref() {
+                h(TimelineAction::CopyMessageLink(ts.clone()));
+            }
+            if let Some(p) = popover_weak.upgrade() {
+                p.popdown();
+            }
+        });
+    }
+    popover_box.append(&copy_link_btn);
+
+    let copy_text_btn = Button::with_label("Copy message");
+    copy_text_btn.set_focus_on_click(false);
+    copy_text_btn.add_css_class("flat");
+    {
+        let ts = ts.to_string();
+        let on_action = on_action.clone();
+        let popover_weak = popover.downgrade();
+        copy_text_btn.connect_clicked(move |_| {
+            if let Some(h) = on_action.borrow().as_ref() {
+                h(TimelineAction::CopyMessageText(ts.clone()));
+            }
+            if let Some(p) = popover_weak.upgrade() {
+                p.popdown();
+            }
+        });
+    }
+    popover_box.append(&copy_text_btn);
+
+    popover.set_child(Some(&popover_box));
+    *current_popover.borrow_mut() = Some(popover.clone());
+
+    {
+        popover.connect_show(move |p| {
+            crate::debug::log(
+                "quickbar",
+                &format!("popover show is_visible={}", p.is_visible()),
+            );
+        });
+    }
+    {
+        let hover_generation = hover_generation.clone();
+        let hovered = hovered.clone();
+        let bar_motion = bar_motion.clone();
+        let quick_bar_weak = quick_bar.downgrade();
+        popover.connect_closed(move |p| {
+            let contains_pointer = bar_motion.contains_pointer();
+            crate::debug::log(
+                "quickbar",
+                &format!(
+                    "popover closed is_visible={} bar_contains_pointer={contains_pointer}",
+                    p.is_visible()
+                ),
+            );
+            // The pointer never crosses the bar's boundary while the popover
+            // has the grab, so no fresh `Enter` arrives here to tell us the
+            // user is still hovering - ask the bar's own motion controller
+            // directly instead of guessing from stale crossing events.
+            if !contains_pointer {
+                hover_generation.set(hover_generation.get().wrapping_add(1));
+                *hovered.borrow_mut() = None;
+                if let Some(bar) = quick_bar_weak.upgrade() {
+                    bar.set_visible(false);
+                    crate::debug::log("quickbar", "popover closed -> hiding quick bar");
+                }
+            } else {
+                crate::debug::log(
+                    "quickbar",
+                    "popover closed -> pointer still over bar, keeping it visible",
+                );
+            }
+        });
+    }
+
+    overflow_btn.set_popover(Some(&popover));
+    quick_bar.append(&overflow_btn);
 }
 
 pub(crate) fn build_timeline_message_widget(
@@ -1412,7 +2225,10 @@ pub(crate) fn build_timeline_message_widget(
     context: &MessageHtmlContext,
     on_open_media: Option<&OpenMediaCallback>,
     on_open_thread: Option<&Rc<dyn Fn(String)>>,
+    on_toggle_reaction: Option<&Rc<dyn Fn(String, String, bool)>>,
+    on_hover: Option<&Rc<dyn Fn(HoverEvent)>>,
 ) -> Box {
+    register_timeline_css();
     if let Some(subtype) = message.subtype.as_deref() {
         if matches!(
             subtype,
@@ -1442,6 +2258,7 @@ pub(crate) fn build_timeline_message_widget(
             label.set_wrap(true);
             label.set_wrap_mode(pango::WrapMode::WordChar);
             label.set_selectable(true);
+            label.set_focus_on_click(false);
             label.set_xalign(0.0);
             label.add_css_class("dim-label");
             label.set_markup(&format!("<i>{}</i>", pango));
@@ -1524,7 +2341,7 @@ pub(crate) fn build_timeline_message_widget(
 
     // Files
     if let Some(files) = message.files.as_deref().filter(|f| !f.is_empty()) {
-        render_files(files, &root_box, context, on_open_media);
+        render_files(files, &root_box, context, on_open_media, &message.ts);
     }
 
     // Attachments
@@ -1533,7 +2350,7 @@ pub(crate) fn build_timeline_message_widget(
         .as_deref()
         .filter(|a| !a.is_empty())
     {
-        render_attachments(attachments, &root_box, context);
+        render_attachments(attachments, &root_box, context, &message.ts);
     }
 
     // Reactions
@@ -1548,51 +2365,37 @@ pub(crate) fn build_timeline_message_widget(
             let count = r.count.unwrap_or(1);
             let clean_name = raw_name.trim_matches(':');
 
-            let pill_button = match emoji_catalog.resolve(clean_name) {
-                Some(crate::emoji::EmojiValue::Unicode(ch)) => {
-                    let btn = Button::with_label(&format!("{ch} {count}"));
-                    btn.add_css_class("reaction-pill");
-                    btn.add_css_class("flat");
-                    btn
-                }
-                Some(crate::emoji::EmojiValue::CustomImage(ref url)) => {
-                    if let Some(path) = resolve_cached_asset_path(url, context) {
-                        let box_widget = Box::new(Orientation::Horizontal, 3);
-                        let pic = load_custom_emoji_picture(&path);
-                        box_widget.append(&pic);
+            let emoji_widget = resolve_reaction_emoji_widget(clean_name, raw_name, context, &emoji_catalog);
 
-                        let label = Label::new(Some(&count.to_string()));
-                        box_widget.append(&label);
-
-                        let btn = Button::new();
-                        btn.set_child(Some(&box_widget));
-                        btn.add_css_class("reaction-pill");
-                        btn.add_css_class("flat");
-                        btn
-                    } else {
-                        let btn = Button::with_label(&format!(":{clean_name}: {count}"));
-                        btn.add_css_class("reaction-pill");
-                        btn.add_css_class("flat");
-                        btn
-                    }
-                }
-                None => {
-                    if emojis::get(clean_name).is_some()
-                        || emojis::get(raw_name).is_some()
-                        || clean_name.chars().any(|c| !c.is_ascii())
-                    {
-                        let btn = Button::with_label(&format!("{clean_name} {count}"));
-                        btn.add_css_class("reaction-pill");
-                        btn.add_css_class("flat");
-                        btn
-                    } else {
-                        let btn = Button::with_label(&format!(":{clean_name}: {count}"));
-                        btn.add_css_class("reaction-pill");
-                        btn.add_css_class("flat");
-                        btn
-                    }
-                }
+            let has_self = if let Some(ref my_id) = context.current_user_id {
+                r.users.as_ref().is_some_and(|users| users.contains(my_id))
+            } else {
+                false
             };
+
+            let box_widget = Box::new(Orientation::Horizontal, 3);
+            box_widget.append(&emoji_widget);
+
+            let label = Label::new(Some(&count.to_string()));
+            box_widget.append(&label);
+
+            let pill_button = Button::new();
+            pill_button.set_focus_on_click(false);
+            pill_button.set_child(Some(&box_widget));
+            pill_button.add_css_class("reaction-pill");
+            pill_button.add_css_class("flat");
+            if has_self {
+                pill_button.add_css_class("reaction-pill-active");
+            }
+
+            if let Some(cb) = on_toggle_reaction {
+                let cb = cb.clone();
+                let message_ts = message.ts.clone();
+                let clean_name_str = clean_name.to_string();
+                pill_button.connect_clicked(move |_| {
+                    cb(message_ts.clone(), clean_name_str.clone(), !has_self);
+                });
+            }
 
             let tooltip_text = if let Some(users) = &r.users {
                 let reactor_names: Vec<&str> = users
@@ -1618,6 +2421,43 @@ pub(crate) fn build_timeline_message_widget(
             pill_button.set_valign(gtk::Align::Center);
             wrap_box.append(&pill_button);
         }
+
+        let add_pic = load_add_reaction_widget();
+        let add_btn = Button::new();
+        add_btn.set_focus_on_click(false);
+        add_btn.set_child(Some(&add_pic));
+        add_btn.add_css_class("reaction-pill");
+        add_btn.add_css_class("flat");
+        add_btn.set_tooltip_text(Some("Add reaction..."));
+        add_btn.set_halign(gtk::Align::Start);
+        add_btn.set_valign(gtk::Align::Center);
+
+        if let Some(cb) = on_toggle_reaction {
+            let weak_add_btn = add_btn.downgrade();
+            let custom_emojis = context.custom_emojis.clone();
+            let message_ts = message.ts.clone();
+            let cb = cb.clone();
+
+            add_btn.connect_clicked(move |_| {
+                let Some(btn) = weak_add_btn.upgrade() else { return; };
+                let cb = cb.clone();
+                let message_ts = message_ts.clone();
+                let picker = crate::emoji_picker_window::EmojiPickerWindow::new(
+                    &btn,
+                    &custom_emojis,
+                    move |selected_name| {
+                        let clean = selected_name.trim().trim_matches(':');
+                        if !clean.is_empty() {
+                            cb(message_ts.clone(), clean.to_string(), true);
+                        }
+                    },
+                );
+                picker.present();
+            });
+        }
+
+        wrap_box.append(&add_btn);
+
         root_box.append(&wrap_box);
     }
 
@@ -1642,7 +2482,16 @@ pub(crate) fn build_timeline_message_widget(
             count_str
         };
         let reply_button = Button::with_label(&label_text);
+        reply_button.set_focus_on_click(false);
         reply_button.add_css_class("flat");
+        reply_button.add_css_class("thread-reply-pill");
+        let replied = message
+            .reply_users
+            .as_deref()
+            .is_some_and(|users| context.current_user_id.as_deref().is_some_and(|me| users.iter().any(|u| u == me)));
+        if replied {
+            reply_button.add_css_class("thread-reply-active");
+        }
         if let Some(cb) = on_open_thread {
             let cb = cb.clone();
             let ts = message.ts.clone();
@@ -1652,6 +2501,26 @@ pub(crate) fn build_timeline_message_widget(
         }
         thread_footer.append(&reply_button);
         root_box.append(&thread_footer);
+    }
+
+    if let Some(cb) = on_hover {
+        let motion = gtk::EventControllerMotion::new();
+        let cb_enter = cb.clone();
+        let ts = message.ts.clone();
+        let reactions = crate::message_html::recent_reactions(context);
+        let row_for_enter = root_box.clone().upcast::<Widget>();
+        motion.connect_enter(move |_, _, _| {
+            cb_enter(HoverEvent::Enter {
+                row: row_for_enter.clone(),
+                ts: ts.clone(),
+                reactions: reactions.clone(),
+            });
+        });
+        let cb_leave = cb.clone();
+        motion.connect_leave(move |_| {
+            cb_leave(HoverEvent::Leave);
+        });
+        root_box.add_controller(motion);
     }
 
     root_box
@@ -1672,6 +2541,7 @@ mod tests {
             user_full_names: Arc::default(),
             user_avatar_urls: Arc::default(),
             conversation_titles: HashMap::default(),
+            private_conversation_ids: std::collections::HashSet::default(),
             user_statuses: Arc::default(),
             user_group_names: Arc::default(),
             user_group_members: Arc::default(),
@@ -1702,6 +2572,91 @@ mod tests {
             return;
         }
         f();
+    }
+
+    #[test]
+    fn rich_text_channel_element_renders_as_pill_instead_of_vanishing() {
+        let elem = serde_json::json!({
+            "type": "rich_text_section",
+            "elements": [{"type": "channel", "channel_id": "C123"}]
+        });
+        let token = extract_rich_text_string(&elem);
+        assert_eq!(token, "<#C123>");
+
+        let mut context = test_context();
+        context
+            .conversation_titles
+            .insert("C123".to_string(), "#general".to_string());
+        let pango = crate::message_html::mrkdwn_to_pango(&token, &context);
+        assert!(pango.contains("background=\"#D6ECFF\""));
+        assert!(pango.contains("general"));
+    }
+
+    #[test]
+    fn media_collapse_key_is_stable_and_namespaced_per_slot() {
+        let a = media_collapse_key("1710000000.000100", "file:0");
+        let b = media_collapse_key("1710000000.000100", "file:0");
+        assert_eq!(a, b, "querying the same ts/slot twice must yield the same key");
+
+        let c = media_collapse_key("1710000000.000100", "attachment:0");
+        assert_ne!(
+            a, c,
+            "a file and an attachment at the same index must not collide"
+        );
+    }
+
+    #[test]
+    fn giphy_attachment_image_renders_instead_of_nothing() {
+        if !ensure_gtk() {
+            return;
+        }
+
+        let cache_dir = crate::config::image_asset_cache_dir();
+        let ws_dir = cache_dir.join("test_ws_giphy");
+        let _ = std::fs::create_dir_all(&ws_dir);
+
+        let test_url = "https://media.giphy.com/media/test123/giphy.gif";
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update("test_ws_giphy".as_bytes());
+            hasher.update([0]);
+            hasher.update(test_url.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        let dummy_file = ws_dir.join(format!("{hash}.png"));
+        // Not a real image - this only exercises the "fails to parse as an
+        // animation" fallback to a static texture/picture, which is enough to
+        // prove the attachment renders an image widget instead of nothing.
+        std::fs::write(&dummy_file, b"not a real image").unwrap();
+
+        let ctx = test_context();
+        let root_box = Box::new(Orientation::Vertical, 0);
+        let attachment = SlackAttachment {
+            image_url: Some(test_url.to_string()),
+            is_animated: Some(true),
+            ..Default::default()
+        };
+        render_attachments(&[attachment], &root_box, &ctx, "1710000000.000100");
+
+        let attach_box = root_box
+            .first_child()
+            .and_then(|w| w.downcast::<Box>().ok())
+            .expect("attach_box should be appended to root_box");
+        let media_wrapper = attach_box
+            .first_child()
+            .and_then(|w| w.downcast::<Box>().ok())
+            .expect("collapsible media wrapper should be the only attach_box child");
+        let toggle = media_wrapper
+            .first_child()
+            .and_then(|w| w.downcast::<ToggleButton>().ok());
+        assert!(
+            toggle.is_some(),
+            "expected a collapse/expand toggle button, i.e. an image widget was built"
+        );
+
+        let _ = std::fs::remove_file(dummy_file);
+        let _ = std::fs::remove_dir(ws_dir);
     }
 
     #[test]
@@ -1756,7 +2711,7 @@ mod tests {
         ]);
         msg1.reply_count = Some(5);
 
-        let widget1 = build_timeline_message_widget(&msg1, &ctx, None, None);
+        let widget1 = build_timeline_message_widget(&msg1, &ctx, None, None, None, None);
         assert_eq!(widget1.orientation(), Orientation::Vertical);
 
         // 2. Section blocks and fields
@@ -1778,7 +2733,7 @@ mod tests {
             }
         ]));
 
-        let widget2 = build_timeline_message_widget(&msg2, &ctx, None, None);
+        let widget2 = build_timeline_message_widget(&msg2, &ctx, None, None, None, None);
         assert_eq!(widget2.orientation(), Orientation::Vertical);
 
         // 3. Divider, actions and context
@@ -1802,7 +2757,7 @@ mod tests {
             }
         ]));
 
-        let widget3 = build_timeline_message_widget(&msg3, &ctx, None, None);
+        let widget3 = build_timeline_message_widget(&msg3, &ctx, None, None, None, None);
         assert_eq!(widget3.orientation(), Orientation::Vertical);
 
         // 4. Attachments with color border
@@ -1823,7 +2778,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let widget4 = build_timeline_message_widget(&msg4, &ctx, None, None);
+        let widget4 = build_timeline_message_widget(&msg4, &ctx, None, None, None, None);
         assert_eq!(widget4.orientation(), Orientation::Vertical);
 
         // 5. Image file
@@ -1839,7 +2794,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let widget_img = build_timeline_message_widget(&msg_img, &ctx, None, None);
+        let widget_img = build_timeline_message_widget(&msg_img, &ctx, None, None, None, None);
         assert_eq!(widget_img.orientation(), Orientation::Vertical);
 
         // 6. Video file
@@ -1855,7 +2810,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let widget_vid = build_timeline_message_widget(&msg_vid, &ctx, None, None);
+        let widget_vid = build_timeline_message_widget(&msg_vid, &ctx, None, None, None, None);
         assert_eq!(widget_vid.orientation(), Orientation::Vertical);
 
         // 7. Document file with size
@@ -1871,7 +2826,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let widget_doc = build_timeline_message_widget(&msg_doc, &ctx, None, None);
+        let widget_doc = build_timeline_message_widget(&msg_doc, &ctx, None, None, None, None);
         assert_eq!(widget_doc.orientation(), Orientation::Vertical);
 
         // 8. Rich text blocks
@@ -1920,7 +2875,7 @@ mod tests {
             }
         ]));
 
-        let widget_rich = build_timeline_message_widget(&msg_rich, &ctx, None, None);
+        let widget_rich = build_timeline_message_widget(&msg_rich, &ctx, None, None, None, None);
         assert_eq!(widget_rich.orientation(), Orientation::Vertical);
 
         // 9. Subtype system message
@@ -1930,22 +2885,22 @@ mod tests {
         msg_sys.subtype = Some("channel_join".to_string());
         msg_sys.text = Some("joined the channel".to_string());
 
-        let widget_sys = build_timeline_message_widget(&msg_sys, &ctx, None, None);
+        let widget_sys = build_timeline_message_widget(&msg_sys, &ctx, None, None, None, None);
         assert_eq!(widget_sys.orientation(), Orientation::Horizontal);
 
         // 10. Thread broadcast banner
         let mut msg_bc = SlackMessage::default();
-        msg_bc.ts = "1700000000.001000".to_string();
+        msg_bc.ts = "1700000000.0001000".to_string();
         msg_bc.user = Some("U123".to_string());
         msg_bc.text = Some("Broadcast reply".to_string());
         msg_bc.is_thread_broadcast = Some(true);
 
-        let widget_bc = build_timeline_message_widget(&msg_bc, &ctx, None, None);
+        let widget_bc = build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None);
         assert_eq!(widget_bc.orientation(), Orientation::Vertical);
 
         // 11. Native timeline view & update_image_asset
         let timeline_view = NativeTimelineView::new();
-        timeline_view.set_messages(&[msg1, msg2], &ctx);
+        timeline_view.set_messages(&[msg1, msg2], &ctx, None);
         assert_eq!(timeline_view.store.n_items(), 2);
         timeline_view.update_image_asset(&ctx);
         assert_eq!(timeline_view.store.n_items(), 2);
@@ -1970,7 +2925,7 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        let widget_rx = build_timeline_message_widget(&msg_reaction, &ctx_emoji, None, None);
+        let widget_rx = build_timeline_message_widget(&msg_reaction, &ctx_emoji, None, None, None, None);
         assert_eq!(widget_rx.orientation(), Orientation::Vertical);
 
         let path = resolve_cached_asset_path("nonexistent_key", &ctx_emoji);

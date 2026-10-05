@@ -1,0 +1,8 @@
+{
+  "track_id": "slash_commands_giphy_20260915",
+  "type": "feature",
+  "status": "in_progress",
+  "created_at": "2026-09-15T00:00:00Z",
+  "updated_at": "2026-09-15T00:00:00Z",
+  "description": "Detect generic slash commands in the composer, restrict execution to explicitly supported commands, and add end-to-end support for the /giphy slash command."
+}

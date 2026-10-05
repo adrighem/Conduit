@@ -47,7 +47,7 @@ picker shell backed by bounded native queries.
 
 ## Out of Scope
 
-- Replacing WebKitGTK or GTK.
+- Replacing GTK4 or GTK.
 - Changing composer `@` or `:` completion.
 - Implementing the cached-media URI scheme from issue #9.
 - Sharing render processes unless controlled measurements show a clear benefit.

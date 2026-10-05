@@ -38,6 +38,7 @@ pub struct MessageHtmlContext {
     pub user_full_names: Arc<HashMap<String, String>>,
     pub user_avatar_urls: Arc<HashMap<String, String>>,
     pub conversation_titles: HashMap<String, String>,
+    pub private_conversation_ids: HashSet<String>,
     pub user_statuses: Arc<HashMap<String, SlackUserStatus>>,
     pub user_group_names: Arc<HashMap<String, String>>,
     pub user_group_members: Arc<HashMap<String, Vec<String>>>,
@@ -362,7 +363,7 @@ pub fn timeline_dom_patch_call(patch: &TimelineDomPatch) -> String {
     script
 }
 
-/// JavaScript suitable for applying one frame's timeline patches in one WebKit call.
+/// JavaScript suitable for applying one frame's timeline patches.
 pub fn timeline_dom_delta_call(patches: &[TimelineDomPatch]) -> String {
     let payload = timeline_dom_payload(patches);
     let mut script = String::with_capacity(payload.len() + 75);
@@ -600,45 +601,19 @@ fn author_actions_script() -> &'static str {
     });
   }
 
-  function closeMentionMenus(except) {
-    document.querySelectorAll(".mention-actions > button[aria-expanded='true']").forEach(function (button) {
-      if (button === except) return;
-      button.setAttribute("aria-expanded", "false");
-      button.nextElementSibling.hidden = true;
-    });
-  }
-
   document.addEventListener("click", function (event) {
-    const mention = event.target.closest(".mention-actions > button");
-    if (mention) {
-      const opening = mention.getAttribute("aria-expanded") !== "true";
-      closeAuthorMenus(null);
-      closeMentionMenus(mention);
-      mention.setAttribute("aria-expanded", opening ? "true" : "false");
-      mention.nextElementSibling.hidden = !opening;
-      return;
-    }
     const author = event.target.closest("details.author-actions");
     if (!author) closeAuthorMenus(null);
-    if (!event.target.closest(".mention-actions")) closeMentionMenus(null);
   });
 
   document.addEventListener("keydown", function (event) {
     if (event.key !== "Escape" && event.key !== "Esc") return;
     const authorMenu = document.querySelector("details.author-actions[open]");
-    const mention = document.querySelector(".mention-actions > button[aria-expanded='true']");
-    if (!authorMenu && !mention) return;
+    if (!authorMenu) return;
     event.preventDefault();
-    if (authorMenu) {
-      authorMenu.open = false;
-      const author = authorMenu.querySelector("summary");
-      if (author) author.focus();
-    }
-    if (mention) {
-      mention.setAttribute("aria-expanded", "false");
-      mention.nextElementSibling.hidden = true;
-      mention.focus();
-    }
+    authorMenu.open = false;
+    const author = authorMenu.querySelector("summary");
+    if (author) author.focus();
   }, true);
 })();"#
 }
@@ -1067,8 +1042,7 @@ fn html_document_with_locales(
     time_locale: Option<&str>,
 ) -> String {
     let has_message_actions = body.contains("class=\"quick-actions\"");
-    let has_author_actions =
-        body.contains("class=\"author-actions\"") || body.contains("class=\"mention-actions\"");
+    let has_author_actions = body.contains("class=\"author-actions\"");
     let needs_timestamp_localizer = body.contains("<time") || script.is_some();
     let scripts = [
         needs_timestamp_localizer.then_some(TIMESTAMP_LOCALIZATION_SCRIPT),
@@ -1266,8 +1240,7 @@ a:hover {{
   gap: 8px;
 }}
 
-.author-actions,
-.mention-actions {{
+.author-actions {{
   position: relative;
   display: inline-block;
 }}
@@ -1279,8 +1252,6 @@ a:hover {{
   padding-inline: 4px;
   border-radius: 4px;
 }}
-
-.author-actions > summary::-webkit-details-marker {{ display: none; }}
 
 .author-actions > summary::after {{
   content: "▾";
@@ -1316,17 +1287,6 @@ a:hover {{
 .author-menu a:hover {{
   background: var(--soft);
   text-decoration: none;
-}}
-
-.mention-actions > button {{
-  border: 0;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-}}
-
-.mention-actions > .author-menu[hidden] {{
-  display: none;
 }}
 
 .message-part {{
@@ -1412,15 +1372,6 @@ pre code {{
   border-radius: 0;
   background: transparent;
   font-size: 13px;
-}}
-
-.mention {{
-  display: inline-block;
-  padding-block: 0;
-  padding-inline: 4px;
-  border-radius: 4px;
-  background: var(--accent-soft);
-  font-weight: 700;
 }}
 
 .channel-reference {{
@@ -1669,10 +1620,6 @@ pre code {{
 
 .more-actions > summary {{
   list-style: none;
-}}
-
-.more-actions > summary::-webkit-details-marker {{
-  display: none;
 }}
 
 .more-actions-menu {{
@@ -2029,7 +1976,6 @@ fn message_article(
     article.push_str("</div><div data-message-region=\"responses\">");
     article.push_str(&message_responses_html(channel_id, message, context));
     article.push_str("</div>");
-    article.push_str(&message_actions_html(channel_id, message, context));
     article.push_str("</article>");
     article
 }
@@ -2149,21 +2095,6 @@ fn author_identity_html(
     )
 }
 
-fn mention_actions_html(user_id: &str, name: &str, tooltip: &str) -> String {
-    let label = format!("@{name}");
-    format!(
-        "<span class=\"mention-actions\"><button type=\"button\" class=\"mention\" title=\"{}\" data-mention-user-id=\"{}\" aria-haspopup=\"menu\" aria-expanded=\"false\">{}</button><span class=\"author-menu\" role=\"menu\" aria-label=\"{}\" hidden><a href=\"{}\">{}</a><a href=\"{}\">{}</a></span></span>",
-        escape_html(tooltip),
-        escape_html(user_id),
-        escape_html(&label),
-        escape_html(&gettext("Person actions")),
-        escape_html(&user_message_action_url(user_id)),
-        escape_html(&gettext("Message")),
-        escape_html(&user_profile_action_url(user_id)),
-        escape_html(&gettext("Profile")),
-    )
-}
-
 fn message_part_html(
     channel_id: Option<&str>,
     message: &SlackMessage,
@@ -2181,7 +2112,6 @@ fn message_part_html(
     part.push_str("</div><div data-message-region=\"responses\">");
     part.push_str(&message_responses_html(channel_id, message, context));
     part.push_str("</div>");
-    part.push_str(&message_actions_html(channel_id, message, context));
     part.push_str("</div>");
     part
 }
@@ -2928,12 +2858,7 @@ fn rich_text_inline_html(
                 .get(user_id)
                 .map(String::as_str)
                 .unwrap_or(user_id);
-            let tooltip = context
-                .user_full_names
-                .get(user_id)
-                .map(String::as_str)
-                .unwrap_or(name);
-            mention_actions_html(user_id, name, tooltip)
+            format!("@{}", escape_html(name))
         }
         "channel" => {
             let channel_id = element.get("channel_id")?.as_str()?;
@@ -3439,7 +3364,7 @@ fn preview_image_html(
             debug::log(
                 "render",
                 &format!(
-                    "image state=direct-webkit key={}",
+                    "image state=direct-html key={}",
                     debug::url_for_log(asset_key)
                 ),
             );
@@ -3596,87 +3521,6 @@ fn thread_response_html(
     )
 }
 
-fn message_actions_html(
-    channel_id: Option<&str>,
-    message: &SlackMessage,
-    context: &MessageHtmlContext,
-) -> String {
-    let Some(channel_id) = channel_id else {
-        return String::new();
-    };
-    if message.ts.is_empty() {
-        return String::new();
-    }
-
-    let thread_ts = action_thread_ts(message, context);
-    let mut actions = String::new();
-    for emoji in recent_reactions(context) {
-        let reacted = message.user_reacted(&emoji.name, context.current_user_id.as_deref());
-        actions.push_str(&action_button_content_html(
-            &reaction_action_url(channel_id, message, &emoji.name, !reacted, thread_ts),
-            &emoji_value_html(&emoji.value, false),
-            &gettext("React with :{emoji}:").replace("{emoji}", &emoji.name),
-            reacted,
-        ));
-    }
-    let reaction_template =
-        reaction_action_url(channel_id, message, "__REACTION__", true, thread_ts);
-    actions.push_str(&format!(
-        "<button type=\"button\" class=\"action-button\" data-open-emoji-picker data-reaction-template=\"{}\" title=\"{}\" aria-label=\"{}\">☺<span aria-hidden=\"true\">+</span></button>",
-        escape_html(&reaction_template),
-        escape_html(&gettext("Add reaction")),
-        escape_html(&gettext("Add reaction")),
-    ));
-    actions.push_str("<span class=\"action-divider\" aria-hidden=\"true\"></span>");
-
-    if context.thread_ts.is_none() {
-        let title = message
-            .reply_count
-            .filter(|count| *count > 0)
-            .map(|count| gettext("View thread ({count})").replace("{count}", &count.to_string()))
-            .unwrap_or_else(|| gettext("Reply in thread"));
-        actions.push_str(&action_button_html(
-            &thread_action_url(channel_id, &message.ts),
-            "💬",
-            &title,
-            false,
-        ));
-    }
-
-    actions.push_str(&action_button_html(
-        &forward_action_url(channel_id, message),
-        "↗",
-        &gettext("Forward message"),
-        false,
-    ));
-
-    let starred = message.is_starred.unwrap_or(false);
-    let save_title = if starred {
-        gettext("Remove from saved items")
-    } else {
-        gettext("Save for later")
-    };
-    actions.push_str(&format!(
-        "<details class=\"more-actions\"><summary class=\"action-button\" title=\"{}\" aria-label=\"{}\">⋯</summary><div class=\"more-actions-menu\" role=\"menu\"><a class=\"more-action{}\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a><a class=\"more-action\" role=\"menuitem\" href=\"{}\">{}</a></div></details>",
-        escape_html(&gettext("More actions")),
-        escape_html(&gettext("More actions")),
-        if starred { " is-active" } else { "" },
-        escape_html(&save_action_url(channel_id, message, !starred, thread_ts)),
-        escape_html(&save_title),
-        escape_html(&copy_link_action_url(channel_id, message)),
-        escape_html(&gettext("Copy link")),
-        escape_html(&copy_message_action_url(channel_id, message)),
-        escape_html(&gettext("Copy message")),
-        escape_html(&mark_unread_action_url(channel_id, message)),
-        escape_html(&gettext("Mark Unread")),
-    ));
-
-    format!(
-        "<nav class=\"quick-actions\" aria-label=\"{}\">{actions}</nav>",
-        escape_html(&gettext("Message actions"))
-    )
-}
-
 pub fn mark_unread_action_url(channel_id: &str, message: &SlackMessage) -> String {
     format!(
         "conduit://mark-unread?channel={}&ts={}",
@@ -3814,7 +3658,7 @@ fn action_thread_ts<'a>(
     })
 }
 
-fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
+pub(crate) fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
     let catalog = EmojiCatalog::new(&context.custom_emojis);
     let mut usage = HashMap::new();
     for (index, name) in context
@@ -3865,22 +3709,6 @@ fn emoji_entry(name: &str, context: &MessageHtmlContext) -> Option<EmojiEntry> {
         category: "",
         value,
     })
-}
-
-fn action_button_html(href: &str, label: &str, title: &str, active: bool) -> String {
-    action_button_content_html(href, &escape_html(label), title, active)
-}
-
-fn action_button_content_html(href: &str, content: &str, title: &str, active: bool) -> String {
-    let active_class = if active { " is-active" } else { "" };
-    format!(
-        "<a class=\"action-button{}\" href=\"{}\" title=\"{}\" aria-label=\"{}\">{}</a>",
-        active_class,
-        escape_html(href),
-        escape_html(title),
-        escape_html(title),
-        content
-    )
 }
 
 fn encode_query(value: &str) -> String {
@@ -3989,6 +3817,14 @@ fn mrkdwn_to_pango_inline(text: &str, context: &MessageHtmlContext) -> String {
     output
 }
 
+fn mention_pill_pango(prefix: &str, label: &str) -> String {
+    format!(
+        "<span background=\"#D6ECFF\" foreground=\"#1264A3\"> {}{} </span>",
+        prefix,
+        escape_pango(label)
+    )
+}
+
 fn render_slack_entity_pango(text: &str, context: &MessageHtmlContext) -> Option<(String, usize)> {
     if !text.starts_with('<') {
         return None;
@@ -4002,10 +3838,7 @@ fn render_slack_entity_pango(text: &str, context: &MessageHtmlContext) -> Option
             .get(user_id)
             .cloned()
             .unwrap_or_else(|| user_id.to_string());
-        format!(
-            "<span weight=\"bold\" foreground=\"#1d9bd1\">@{}</span>",
-            escape_pango(&name)
-        )
+        mention_pill_pango("@", &name)
     } else if raw.starts_with("!subteam^") {
         user_group_mention_pango(raw, context)
     } else if let Some(channel) = raw.strip_prefix('#') {
@@ -4030,7 +3863,12 @@ fn render_slack_entity_pango(text: &str, context: &MessageHtmlContext) -> Option
         } else {
             clean_display
         };
-        format!("<span weight=\"bold\">#{}</span>", escape_pango(display))
+        let prefix = if context.private_conversation_ids.contains(channel_id) {
+            "🔒 "
+        } else {
+            "#"
+        };
+        mention_pill_pango(prefix, display)
     } else if let Some((url, label)) = raw.split_once('|') {
         if is_http_url(url) {
             external_link_pango(url, label)
@@ -4063,10 +3901,12 @@ fn render_bare_channel_reference_pango(
     let channel_id = &candidate[..id_length];
     let title = context.conversation_titles.get(channel_id)?;
     let display = title.strip_prefix('#').unwrap_or(title);
-    Some((
-        format!("<span weight=\"bold\">#{}</span>", escape_pango(display)),
-        id_length + 1,
-    ))
+    let prefix = if context.private_conversation_ids.contains(channel_id) {
+        "🔒 "
+    } else {
+        "#"
+    };
+    Some((mention_pill_pango(prefix, display), id_length + 1))
 }
 
 fn user_group_mention_pango(raw: &str, context: &MessageHtmlContext) -> String {
@@ -4085,7 +3925,7 @@ fn user_group_mention_pango(raw: &str, context: &MessageHtmlContext) -> String {
         .or(fallback_label)
         .unwrap_or_else(|| group_id.to_string());
     let label = normalized_user_group_label(&label);
-    format!("<span weight=\"bold\">@{}</span>", escape_pango(&label))
+    mention_pill_pango("@", &label)
 }
 
 fn slack_special_entity_pango(raw: &str) -> String {
@@ -4309,14 +4149,24 @@ fn render_slack_entity(text: &str, context: &MessageHtmlContext) -> Option<(Stri
             .get(user_id)
             .cloned()
             .unwrap_or_else(|| user_id.to_string());
-        let tooltip = context
-            .user_full_names
-            .get(user_id)
-            .map(String::as_str)
-            .unwrap_or(&name);
-        mention_actions_html(user_id, &name, tooltip)
+        format!("@{}", escape_html(&name))
     } else if raw.starts_with("!subteam^") {
-        user_group_mention_html(raw, context)
+        if let Some(group) = raw.strip_prefix("!subteam^") {
+            let (group_id, fallback_label) = group
+                .split_once('|')
+                .map(|(group_id, label)| (group_id, Some(normalized_user_group_label(label))))
+                .unwrap_or((group, None));
+            let label = context
+                .user_group_names
+                .get(group_id)
+                .cloned()
+                .or(fallback_label)
+                .unwrap_or_else(|| group_id.to_string());
+            let label = normalized_user_group_label(&label);
+            format!("@{}", escape_html(&label))
+        } else {
+            escape_html(raw)
+        }
     } else if let Some(channel) = raw.strip_prefix('#') {
         let (channel_id, fallback) = channel
             .split_once('|')
@@ -4379,44 +4229,8 @@ fn render_bare_url(text: &str) -> Option<(String, usize)> {
     Some((html, consumed_bytes))
 }
 
-fn user_group_mention_html(raw: &str, context: &MessageHtmlContext) -> String {
-    let Some(group) = raw.strip_prefix("!subteam^") else {
-        return escape_html(raw);
-    };
-    let (group_id, fallback_label) = group
-        .split_once('|')
-        .map(|(group_id, label)| (group_id, Some(normalized_user_group_label(label))))
-        .unwrap_or((group, None));
-
-    let label = context
-        .user_group_names
-        .get(group_id)
-        .cloned()
-        .or(fallback_label)
-        .unwrap_or_else(|| group_id.to_string());
-    let label = normalized_user_group_label(&label);
-
-    if let Some(members) = context
-        .user_group_members
-        .get(group_id)
-        .filter(|members| !members.is_empty())
-    {
-        format!(
-            "<span class=\"mention\" title=\"{}\">@{}</span>",
-            escape_html(&user_group_member_title(members)),
-            escape_html(&label)
-        )
-    } else {
-        format!("<span class=\"mention\">@{}</span>", escape_html(&label))
-    }
-}
-
 fn normalized_user_group_label(label: &str) -> String {
     label.trim().trim_start_matches('@').to_string()
-}
-
-fn user_group_member_title(members: &[String]) -> String {
-    gettext("Members: {members}").replace("{members}", &members.join(", "))
 }
 
 fn slack_special_entity_html(raw: &str) -> String {
@@ -4897,7 +4711,7 @@ mod tests {
     }
 
     #[test]
-    fn webkit_documents_decode_entities_once_before_safe_rendering() {
+    fn html_documents_decode_entities_once_before_safe_rendering() {
         assert_eq!(
             escape_html("&gt; &lt; &amp; &quot; &apos; &#62; &#x1F642;"),
             "&gt; &lt; &amp; &quot; &#39; &gt; 🙂"
@@ -5124,11 +4938,7 @@ mod tests {
             &context,
         );
 
-        assert!(html.contains(
-            "<button type=\"button\" class=\"mention\" title=\"Ada Lovelace\" data-mention-user-id=\"U123\" aria-haspopup=\"menu\" aria-expanded=\"false\">@Ada</button>"
-        ));
-        assert!(html.contains("conduit://user-message?user=U123"));
-        assert!(html.contains("conduit://user-profile?user=U123"));
+        assert!(html.contains("@Ada"));
         assert!(html.contains("href=\"conduit://channel?channel=C999\">#general-renamed</a>"));
         assert!(html.contains("href=\"https://example.com\""));
         assert!(html.contains(">docs</a>"));
@@ -5162,9 +4972,7 @@ mod tests {
             &context,
         );
 
-        assert!(html.contains(
-            "<span class=\"mention\" title=\"Members: Ada Lovelace, Grace Hopper\">@platform</span>"
-        ));
+        assert!(html.contains("@platform"));
         assert!(!html.contains("!subteam^S123"));
     }
 
@@ -5202,7 +5010,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_slack_skin_tones_across_text_rich_reactions_quick_actions_and_status() {
+    fn renders_slack_skin_tones_across_text_rich_reactions_and_status() {
         let mut plain = message("Approved :+1::skin-tone-3: :rocket::skin-tone-3:");
         plain.reactions = Some(vec![SlackReaction {
             name: Some("+1::skin-tone-4".to_string()),
@@ -5241,15 +5049,13 @@ mod tests {
         assert!(html.contains(":rocket::skin-tone-3:"));
         assert!(html.contains(">👍🏽 1</a>"));
         assert!(html.contains("name=%2B1%3A%3Askin-tone-4&amp;add=true"));
-        assert!(html.contains("name=%2B1%3A%3Askin-tone-5&amp;add=true"));
-        assert!(html.contains(">👍🏾</a>"));
         assert!(html.contains("class=\"user-status\""));
         assert!(html.contains(">👍🏿</span>"));
         assert!(html.contains(">👍🏻</span>"));
     }
 
     #[test]
-    fn workspace_emoji_render_in_messages_and_quick_actions_without_eager_picker_data() {
+    fn workspace_emoji_render_in_messages_without_eager_picker_data() {
         let context = MessageHtmlContext {
             custom_emojis: Arc::new(HashMap::from([
                 (
@@ -5266,7 +5072,6 @@ mod tests {
 
         assert!(html.contains("title=\":parrot_alias:\" role=\"img\""));
         assert!(html.contains("src=\"https://emoji.example/party-parrot.gif\""));
-        assert!(html.contains("name=party_parrot"));
         assert!(!html.contains("data-emoji-name=\"party_parrot\""));
         assert!(!html.contains("data-src=\"https://emoji.example/party-parrot.gif\""));
         assert!(html.contains("data-emoji-category=\"Workspace\""));
@@ -6000,106 +5805,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_message_quick_actions() {
-        let mut message = message("threaded");
-        message.reply_count = Some(3);
-        message.is_starred = Some(true);
-        message.reactions = Some(vec![
-            SlackReaction {
-                name: Some("thumbsup".to_string()),
-                count: Some(3),
-                users: Some(vec![
-                    "U999".to_string(),
-                    "U456".to_string(),
-                    "U123".to_string(),
-                ]),
-            },
-            SlackReaction {
-                name: Some("eyes".to_string()),
-                count: Some(1),
-                users: Some(vec!["U456".to_string()]),
-            },
-        ]);
-        let context = MessageHtmlContext {
-            current_user_id: Some("U999".to_string()),
-            user_names: Arc::new(HashMap::from([
-                ("U999".to_string(), "Ada Lovelace".to_string()),
-                ("U456".to_string(), "Grace Hopper".to_string()),
-                ("U123".to_string(), "Linus Torvalds".to_string()),
-            ])),
-            recent_reactions: vec![
-                "heart".to_string(),
-                "thumbsup".to_string(),
-                "eyes".to_string(),
-                "fire".to_string(),
-            ],
-            ..Default::default()
-        };
-
-        let html = conversation_document("C123", &[message], &context);
-
-        assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains(">💬</a>"));
-        assert!(html.contains(">thread (3)</a>"));
-        assert!(html.contains(
-            "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=heart&amp;add=true"
-        ));
-        assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
-        assert!(html.contains(
-            "href=\"conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true\" title=\"Grace Hopper: :eyes:\""
-        ));
-        assert!(html.contains(
-            "conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=eyes&amp;add=true"
-        ));
-        let reaction_chip = html.find("<a class=\"reaction is-active\"").unwrap();
-        assert!(html.contains("title=\"Ada Lovelace, Grace Hopper, Linus Torvalds: :thumbsup:\""));
-        assert!(
-            html.contains("aria-label=\"Ada Lovelace, Grace Hopper, Linus Torvalds: :thumbsup:\"")
-        );
-        assert!(html.contains("conduit://reaction?channel=C123&amp;ts=1710000000.000100&amp;name=thumbsup&amp;add=false"));
-        let thread_chip = html.find("<a class=\"reaction thread-reaction\"").unwrap();
-        assert!(reaction_chip < thread_chip);
-        assert!(html.contains("conduit://save?channel=C123&amp;ts=1710000000.000100&amp;add=false"));
-        assert!(html.contains("conduit://copy-link?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains("conduit://copy-message?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains("conduit://forward?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains("data-open-emoji-picker"));
-        assert_eq!(html.matches("id=\"emoji-picker\"").count(), 1);
-        assert!(html.contains("aria-labelledby=\"emoji-picker-title\""));
-        assert!(html.contains("id=\"emoji-search\""));
-        assert!(html.contains("conduitEmojiPicker.postMessage"));
-        assert!(html.contains("window.conduitReceiveEmojiPickerResult"));
-        assert!(html.contains("grid.replaceChildren(...choices)"));
-        assert!(html.contains("role=\"tablist\""));
-        assert!(html.contains("class=\"emoji-grid\""));
-        assert!(html.contains("role=\"menu\""));
-        assert!(html.contains("if (menu) menu.open = false"));
-        let quick_actions = &html[html.find("<nav class=\"quick-actions\"").unwrap()..];
-        let quick_actions = &quick_actions[..quick_actions.find("</nav>").unwrap()];
-        let recent = quick_actions.find("name=heart").unwrap();
-        let picker = quick_actions.find("data-open-emoji-picker").unwrap();
-        let reactions = &quick_actions[..picker];
-        let thread = quick_actions.find("conduit://thread?").unwrap();
-        let forward = quick_actions.find("conduit://forward?").unwrap();
-        let more = quick_actions.find("class=\"more-actions\"").unwrap();
-        assert_eq!(reactions.matches("conduit://reaction?").count(), 4);
-        assert!(reactions.contains("name=fire"));
-        assert!(recent < picker && picker < thread && thread < forward && forward < more);
-        for unavailable_action in [
-            "Edit message",
-            "Mark unread",
-            "Remind me",
-            "Turn off notifications",
-            "Organise",
-            "Connect to apps",
-            "Delete message",
-        ] {
-            assert!(!html.contains(unavailable_action), "{unavailable_action}");
-        }
-        assert!(!html.contains("Remove +1"));
-    }
-
-    #[test]
     fn quick_reactions_rank_frequency_within_latest_twenty_uses() {
         let mut history = [
             "heart", "eyes", "thumbsup", "fire", "heart", "eyes", "thumbsup", "fire", "heart",
@@ -6214,81 +5919,6 @@ mod tests {
     }
 
     #[test]
-    fn emoji_picker_cancellation_is_shared_and_restores_focus() {
-        let html = conversation_document(
-            "C123",
-            &[message("Pick a reaction")],
-            &MessageHtmlContext::default(),
-        );
-
-        assert!(html.contains("function cancelPicker(event)"));
-        assert!(html.contains("event.preventDefault();"));
-        assert!(html.contains("event.stopPropagation();"));
-        assert!(html.contains("picker.close(\"cancel\")"));
-        assert!(html.contains(
-            "picker.querySelector(\".picker-close\").addEventListener(\"click\", cancelPicker)"
-        ));
-        assert!(html.contains("picker.addEventListener(\"cancel\", cancelPicker)"));
-        assert!(html.contains(
-            "if (!picker.open || (event.key !== \"Escape\" && event.key !== \"Esc\")) return"
-        ));
-        assert!(html.contains("cancelPicker(event);"));
-        assert!(html.contains("if (event.target !== picker) return"));
-        assert!(html.contains("if (!inside) cancelPicker(event)"));
-        assert!(html.contains("if (opener) opener.focus()"));
-        assert!(html.contains("Close emoji picker"));
-        assert!(!html.contains("reaction-picker"));
-    }
-
-    #[test]
-    fn emoji_picker_exposes_shared_accessibility_and_keyboard_navigation() {
-        let html = conversation_document(
-            "C123",
-            &[message("Pick a reaction")],
-            &MessageHtmlContext::default(),
-        );
-
-        assert!(html.contains("role=\"combobox\""));
-        assert!(html.contains("aria-controls=\"emoji-grid\""));
-        assert!(html.contains("choice.setAttribute(\"role\", \"gridcell\")"));
-        assert!(html.contains("choice.setAttribute(\"aria-selected\", \"false\")"));
-        assert!(html.contains("function moveSelection(offset)"));
-        assert!(html.contains("event.key === \"ArrowUp\" || event.key === \"ArrowDown\""));
-        assert!(html.contains("moveSelection(event.key === \"ArrowUp\" ? -1 : 1)"));
-        assert!(html.contains("event.key === \"Enter\" && selectedChoice"));
-        assert!(html.contains("activateChoice(selectedChoice)"));
-        assert!(html.contains("search.setAttribute(\"aria-activedescendant\", selectedChoice.id)"));
-        assert!(html.contains(".emoji-choice[aria-selected=\"true\"]"));
-    }
-
-    #[test]
-    fn initial_emoji_picker_document_is_a_lightweight_native_query_shell() {
-        let custom_emojis = (0..256)
-            .map(|index| {
-                (
-                    format!("private_workspace_emoji_{index:03}"),
-                    format!("https://emoji.example/private-{index:03}.png"),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let context = MessageHtmlContext {
-            custom_emojis: Arc::new(custom_emojis),
-            ..Default::default()
-        };
-
-        let html = conversation_document("C123", &[message("Pick a reaction")], &context);
-
-        assert_eq!(html.matches("class=\"emoji-choice\"").count(), 0);
-        assert!(!html.contains("private_workspace_emoji_000"));
-        assert!(!html.contains("https://emoji.example/private-000.png"));
-        assert!(html.contains("id=\"emoji-grid\""));
-        assert!(html.contains("data-emoji-protocol-version=\"1\""));
-        assert!(html.contains("data-emoji-result-limit=\"64\""));
-        assert!(html.contains("data-emoji-max-query-chars=\"128\""));
-        assert!(html.contains("window.webkit.messageHandlers.conduitEmojiPicker.postMessage"));
-    }
-
-    #[test]
     fn picker_script_discards_stale_results_and_materializes_data_as_dom_nodes() {
         let script = emoji_picker_script();
 
@@ -6359,34 +5989,6 @@ mod tests {
 
         assert!(reply < load_more);
         assert!(html.contains("thread_ts=1710000000.000100"));
-    }
-
-    #[test]
-    fn thread_context_actions_reload_thread_without_thread_button() {
-        let image_url = "https://files.slack.com/files-pri/T123-F123/thread.png";
-        let mut message = message("reply");
-        message.text = Some("reply :stuck_out_tongue:".to_string());
-        message.files = Some(vec![SlackFile {
-            title: Some("Thread image".to_string()),
-            mimetype: Some("image/png".to_string()),
-            thumb_480: Some(image_url.to_string()),
-            ..Default::default()
-        }]);
-        message.thread_ts = Some("1710000000.000100".to_string());
-        message.ts = "1710000010.000200".to_string();
-        let context = MessageHtmlContext {
-            thread_ts: Some("1710000000.000100".to_string()),
-            image_assets: HashMap::from([(image_url.to_string(), cached_image_source('a'))]),
-            ..Default::default()
-        };
-
-        let html = conversation_document("C123", &[message], &context);
-
-        assert!(html.contains("thread_ts=1710000000.000100"));
-        assert!(!html.contains("conduit://thread?"));
-        assert!(html.contains("title=\":stuck_out_tongue:\" role=\"img\""));
-        assert!(html.contains(&format!("src=\"{}\"", cached_image_source('a').uri())));
-        assert!(html.contains("Thread image"));
     }
 
     #[test]
@@ -7442,7 +7044,22 @@ mod tests {
         let output = mrkdwn_to_pango(input, &context);
         assert_eq!(
             output,
-            "<span weight=\"bold\" foreground=\"#1d9bd1\">@Alice</span> in <span weight=\"bold\">#general</span> and <span weight=\"bold\">#C999</span>"
+            "<span background=\"#D6ECFF\" foreground=\"#1264A3\"> @Alice </span> in <span background=\"#D6ECFF\" foreground=\"#1264A3\"> #general </span> and <span background=\"#D6ECFF\" foreground=\"#1264A3\"> #C999 </span>"
+        );
+    }
+
+    #[test]
+    fn test_mrkdwn_to_pango_private_channel_mention() {
+        let mut context = MessageHtmlContext::default();
+        context
+            .conversation_titles
+            .insert("C123".to_string(), "#secret-room".to_string());
+        context.private_conversation_ids.insert("C123".to_string());
+
+        let output = mrkdwn_to_pango("<#C123|secret-room>", &context);
+        assert_eq!(
+            output,
+            "<span background=\"#D6ECFF\" foreground=\"#1264A3\"> 🔒 secret-room </span>"
         );
     }
 

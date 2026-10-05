@@ -4,14 +4,14 @@
 
 Incrementally replace Conduit's competing cache, runtime, and UI update paths with one revisioned workspace coordinator. GTK intents, Slack responses, and realtime events enter a bounded scheduler and coordinator; the coordinator emits revisioned `WorkspacePatch` values for presentation and ordered `StoreBatch` values for a persistent SQLite `StoreHub`.
 
-GTK and WebKitGTK remain the presentation stack. Credentials in Secret Service and drafts in GSettings must survive migration. The derived Slack cache may be recreated when migration or corruption recovery requires it.
+GTK and GTK4 remain the presentation stack. Credentials in Secret Service and drafts in GSettings must survive migration. The derived Slack cache may be recreated when migration or corruption recovery requires it.
 
 ## Baseline
 
 - `runtime.rs` currently combines supervision, network scheduling, cache orchestration, and workspace business rules.
 - `WorkspaceStore` serializes read-modify-write operations but opens SQLite connections per operation and retains whole-state compatibility APIs.
 - cached hydration, Web API responses, local actions, and realtime events can follow different mutation and UI-notification paths.
-- GTK maintains conversation/thread catalogs and broadly invalidates sidebar or WebKit presentation.
+- GTK maintains conversation/thread catalogs and broadly invalidates sidebar or native UI presentation.
 - the sidebar is a widget-heavy `GtkListBox`; message documents still have full-document reload paths and embedded data assets.
 
 ## Requirements
@@ -42,12 +42,12 @@ GTK and WebKitGTK remain the presentation stack. Credentials in Secret Service a
 - Store tests cover atomic rollback, unchanged suppression, reader visibility after barriers, shutdown flush, malformed rows, cache recovery, and concurrent search reads.
 - One unread update does not reset or rebuild a 1,430-row sidebar model.
 - Timeline tests cover revision mismatch, loading queues, batched insert/edit/delete/enrichment, pinned-bottom behavior, non-bottom anchoring, delayed media, and user-scroll cancellation.
-- At settled idle, the median of three 60-second samples is below 2% native CPU and below 2% WebKit CPU, with zero store commits, sidebar updates, or document reloads.
+- At settled idle, the median of three 60-second samples is below 2% native CPU and below 2% native UI CPU, with zero store commits, sidebar updates, or document reloads.
 - `cargo fmt --check`, strict Clippy, Rust tests, Meson compilation, and Meson tests pass at phase boundaries.
 
 ## Out of Scope
 
-- Replacing GTK, WebKitGTK, Tokio, rusqlite, auth/keyring, drafts/GSettings, attachment handling, or the huddle actor.
+- Replacing GTK, GTK4, Tokio, rusqlite, auth/keyring, drafts/GSettings, attachment handling, or the huddle actor.
 - Supporting multiple simultaneously active workspaces.
 - Changing Conduit's external/public API.
 - Introducing a generic dependency-injection framework.

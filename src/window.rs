@@ -29,27 +29,27 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gettextrs::gettext;
 use gtk::{gio, glib};
-use webkit6::prelude::*;
 
 use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
 use crate::composer::{
     completion_key_action, composer_draft_from_message, decode_rich_composer_draft,
-    emoji_token_at_caret, encode_rich_composer_draft, expand_composer_semantic_selection,
-    hydrate_composer_mentions, mention_candidates, mention_token_at_caret, message_edit_key_action,
-    replace_emoji_token, replace_mention_token, search_mention_candidates,
+    channel_candidates, channel_token_at_caret, emoji_token_at_caret, encode_rich_composer_draft,
+    expand_composer_semantic_selection, hydrate_composer_mentions, mention_candidates,
+    mention_token_at_caret, message_edit_key_action, replace_channel_token, replace_emoji_token,
+    replace_mention_token, search_channel_candidates, search_mention_candidates,
     serialize_composer_semantics, text_view_enter_action, text_view_text, validate_slash_command,
-    CompletionKeyAction, ComposerAttachmentDraft, ComposerBlockKind, ComposerBlockSpan,
-    ComposerEntityKind, ComposerEntitySpan, ComposerStyleSpan, ComposerTextStyle, EmojiToken,
-    MentionCandidate, MentionSpan, MentionToken, MessageEditKeyAction, RichComposerDraft,
-    SlashCommandValidation, TextViewEnterAction,
+    ChannelCandidate, ChannelToken, CompletionKeyAction, ComposerAttachmentDraft,
+    ComposerBlockKind, ComposerBlockSpan, ComposerEntityKind, ComposerEntitySpan,
+    ComposerStyleSpan, ComposerTextStyle, EmojiToken, MentionCandidate, MentionSpan, MentionToken,
+    MessageEditKeyAction, RichComposerDraft, SlashCommandValidation, TextViewEnterAction,
 };
 use crate::config;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::emoji::{
     emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
-    EmojiPickerGenerationGate, EmojiPickerModel, EmojiPickerMove, EmojiPickerQuery, EmojiValue,
+    EmojiPickerModel, EmojiPickerMove, EmojiPickerQuery, EmojiValue,
 };
 use crate::huddles::fallback::external_huddle_url;
 use crate::huddles::presentation::{present_huddle, HuddlePrimaryAction};
@@ -346,8 +346,6 @@ mod imp {
         pub pending_upload_drafts: RefCell<HashMap<DraftKey, Option<String>>>,
         pub sidebar_error: RefCell<Option<String>>,
         pub current_user_id: RefCell<Option<String>>,
-        pub message_view: RefCell<Option<webkit6::WebView>>,
-        pub secondary_message_view: RefCell<Option<webkit6::WebView>>,
         pub message_font_settings_handler: RefCell<Option<(gtk::Settings, glib::SignalHandlerId)>>,
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub(super) thread_pane_controller: RefCell<Option<ThreadPane>>,
@@ -357,13 +355,13 @@ mod imp {
         pub(super) failed_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) recovering_image_assets: RefCell<BoundedImageAssetKeys>,
         pub custom_emojis: RefCell<Arc<HashMap<String, String>>>,
-        pub reaction_emoji_picker_model: RefCell<Option<Arc<EmojiPickerModel>>>,
         pub realtime_status: Cell<RealtimeStatus>,
         pub(super) message_composer_completion: RefCell<Option<ComposerCompletion>>,
         pub(super) thread_composer_completion: RefCell<Option<ComposerCompletion>>,
         pub(super) message_composer_toolbar: RefCell<Option<ComposerToolbar>>,
         pub(super) thread_composer_toolbar: RefCell<Option<ComposerToolbar>>,
         pub(super) composer_format_css_provider: RefCell<Option<gtk::CssProvider>>,
+        pub(super) workspace_theme_css_provider: RefCell<Option<gtk::CssProvider>>,
         pub(super) message_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) thread_mentions: RefCell<Vec<ComposerMentionMark>>,
         pub(super) message_entities: RefCell<Vec<ComposerEntityMark>>,
@@ -413,7 +411,6 @@ mod imp {
             obj.setup_adaptive_layout();
             obj.setup_runtime();
             obj.setup_message_view();
-            obj.setup_reaction_picker_escape_fallback();
             obj.configure_accessibility();
             obj.configure_auth_ui();
             obj.setup_settings();
@@ -699,6 +696,9 @@ mod imp {
             if let Some(provider) = self.composer_format_css_provider.borrow_mut().take() {
                 gtk::style_context_remove_provider_for_display(&self.obj().display(), &provider);
             }
+            if let Some(provider) = self.workspace_theme_css_provider.borrow_mut().take() {
+                gtk::style_context_remove_provider_for_display(&self.obj().display(), &provider);
+            }
             if let Some((settings, handler)) =
                 self.message_font_settings_handler.borrow_mut().take()
             {
@@ -724,12 +724,7 @@ mod imp {
                 &self.message_composer_toolbar,
                 &self.thread_composer_toolbar,
             ] {
-                if let Some(toolbar) = toolbar.borrow_mut().take() {
-                    toolbar.emoji_picker.popover.popdown();
-                    if toolbar.emoji_picker.popover.parent().is_some() {
-                        toolbar.emoji_picker.popover.unparent();
-                    }
-                }
+                toolbar.borrow_mut().take();
             }
             let status_dialog = self.status_dialog.borrow_mut().take();
             if let Some(state) = status_dialog {
@@ -891,26 +886,19 @@ const COMPOSER_TARGETS: [ComposerTarget; 2] = [ComposerTarget::Message, Composer
 const UI_EVENT_BATCH_LIMIT: usize = 8;
 const MAX_PENDING_SLACK_URIS: usize = 16;
 const MAX_PENDING_MESSAGE_NOTIFICATIONS: usize = 128;
-const EMOJI_PICKER_MESSAGE_HANDLER: &str = "conduitEmojiPicker";
-const APPLY_EMOJI_PICKER_RESULT_SCRIPT: &str =
-    "window.conduitReceiveEmojiPickerResult(JSON.parse(payload));";
-const CANCEL_REACTION_PICKER_SCRIPT: &str = r#"(function () {
-  const picker = document.getElementById("emoji-picker");
-  if (!picker || !picker.open) return false;
-  picker.dispatchEvent(new Event("cancel", { cancelable: true }));
-  return true;
-})()"#;
 
 #[derive(Debug, Clone)]
 enum ComposerCompletionToken {
     Emoji(EmojiToken),
     Mention(MentionToken),
+    Channel(ChannelToken),
 }
 
 #[derive(Debug, Clone)]
 enum ComposerCompletionEntry {
     Emoji(EmojiEntry),
     Mention(MentionCandidate),
+    Channel(ChannelCandidate),
 }
 
 #[derive(Debug)]
@@ -1018,7 +1006,6 @@ fn configure_composer_format_menu_control(button: &gtk::MenuButton) {
 struct ComposerToolbar {
     buttons: HashMap<ComposerFormatAction, gtk::ToggleButton>,
     updating: Rc<Cell<bool>>,
-    emoji_picker: StatusEmojiPicker,
 }
 
 fn composer_emoji_preview(entry: &EmojiEntry) -> gtk::Widget {
@@ -1109,6 +1096,31 @@ fn composer_completion_row(entry: &ComposerCompletionEntry) -> gtk::ListBoxRow {
             );
             row.update_property(&[gtk::accessible::Property::Label(&accessible)]);
         }
+        ComposerCompletionEntry::Channel(candidate) => {
+            let icon_name = if candidate.is_private {
+                "channel-secure-symbolic"
+            } else {
+                "channel-public-symbolic"
+            };
+            let preview = gtk::Image::from_icon_name(icon_name);
+            preview.set_pixel_size(24);
+
+            let label = gtk::Label::new(Some(&format!("#{}", candidate.title)));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+
+            content.append(&preview);
+            content.append(&label);
+            let kind = if candidate.is_private {
+                "Private channel"
+            } else {
+                "Channel"
+            };
+            row.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{kind}: {}",
+                candidate.title
+            ))]);
+        }
     }
 
     row.set_child(Some(&content));
@@ -1136,6 +1148,14 @@ fn composer_completion_description(
                 "Person suggestion {position}: {}{detail}",
                 candidate.display_name
             )
+        }
+        ComposerCompletionEntry::Channel(candidate) => {
+            let kind = if candidate.is_private {
+                "Private channel"
+            } else {
+                "Channel"
+            };
+            format!("{kind} suggestion {position}: {}", candidate.title)
         }
     }
 }
@@ -2298,13 +2318,6 @@ where
     invalidations
 }
 
-fn message_navigation_uri(decision: &webkit6::PolicyDecision) -> Option<String> {
-    let navigation = decision.downcast_ref::<webkit6::NavigationPolicyDecision>()?;
-    let mut action = navigation.navigation_action()?;
-    let request = action.request()?;
-    request.uri().map(|uri| uri.to_string())
-}
-
 fn query_param(url: &url::Url, name: &str) -> Option<String> {
     url.query_pairs()
         .find(|(key, _)| key == name)
@@ -2313,13 +2326,6 @@ fn query_param(url: &url::Url, name: &str) -> Option<String> {
 
 fn emoji_picker_query_from_json(json: &str) -> Option<EmojiPickerQuery> {
     serde_json::from_str(json).ok()
-}
-
-fn emoji_picker_query_from_value(
-    value: &webkit6::javascriptcore::Value,
-) -> Option<EmojiPickerQuery> {
-    let json = value.to_json(0)?;
-    emoji_picker_query_from_json(json.as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2384,7 +2390,10 @@ fn attachment_image_asset_request(
         .image_url
         .as_deref()
         .or(attachment.thumb_url.as_deref())?;
-    native_preview_asset_request(url)
+    if !crate::slack::supports_unfurl_attachment_preview_url(url) {
+        return None;
+    }
+    bounded_image_asset_request(url)
 }
 
 fn native_preview_asset_request(url: &str) -> Option<(String, String)> {
@@ -2763,35 +2772,9 @@ fn timeline_scroll_behavior(behavior: WorkspaceScrollBehavior) -> TimelineScroll
     }
 }
 
-fn configure_message_web_view_settings(settings: &webkit6::Settings) {
-    settings.set_allow_file_access_from_file_urls(false);
-    settings.set_allow_universal_access_from_file_urls(false);
-    settings.set_enable_html5_database(false);
-    settings.set_enable_html5_local_storage(true);
-    settings.set_enable_javascript(true);
-    settings.set_enable_media(true);
-    settings.set_enable_webgl(false);
-    settings.set_enable_webaudio(false);
-    settings.set_zoom_text_only(true);
-}
 
-fn message_text_zoom(font_name: Option<&str>) -> f64 {
-    let Some(font_name) = font_name else {
-        return 1.0;
-    };
-    let description = gtk::pango::FontDescription::from_string(font_name);
-    let size = f64::from(description.size()) / f64::from(gtk::pango::SCALE);
-    if !size.is_finite() || size <= 0.0 {
-        return 1.0;
-    }
 
-    let css_pixels = if description.is_size_absolute() {
-        size
-    } else {
-        size * 96.0 / 72.0
-    };
-    css_pixels / message_html::MESSAGE_BASE_FONT_SIZE_CSS_PX
-}
+
 
 fn browser_session_input(
     xoxc_token: &str,
@@ -2885,9 +2868,11 @@ impl ConduitWindow {
         imp.thread_resize_handle
             .set_cursor_from_name(Some("col-resize"));
         let initial_width = Rc::new(Cell::new(0.0));
+        let initial_split_width = Rc::new(Cell::new(0.0));
         let drag = gtk::GestureDrag::new();
         let weak_window = self.downgrade();
         let drag_initial_width = initial_width.clone();
+        let drag_initial_split_width = initial_split_width.clone();
         drag.connect_drag_begin(move |_, _, _| {
             if let Some(window) = weak_window.upgrade() {
                 let imp = window.imp();
@@ -2901,6 +2886,7 @@ impl ConduitWindow {
                             as i32
                     });
                 drag_initial_width.set(f64::from(width));
+                drag_initial_split_width.set(f64::from(imp.thread_split.width()));
             }
         });
         let weak_window = self.downgrade();
@@ -2909,10 +2895,14 @@ impl ConduitWindow {
                 return;
             };
             let split = &window.imp().thread_split;
+            // Freeze split_width at drag start: re-reading split.width() live here
+            // would feed the relayout triggered by set_sidebar_width_fraction below
+            // straight back into this formula, causing the separator to jump/flicker
+            // on every pointer-motion tick instead of tracking the cursor smoothly.
             if let Some(fraction) = resized_end_sidebar_fraction(
                 initial_width.get(),
                 offset_x,
-                f64::from(split.width()),
+                initial_split_width.get(),
             ) {
                 split.set_sidebar_width_fraction(fraction);
             }
@@ -3068,50 +3058,69 @@ impl ConduitWindow {
         });
     }
 
-    fn setup_message_view(&self) {
-        let web_context = self.create_message_web_context();
-        let network_session = self.create_message_network_session();
-        let font_settings = gtk::Settings::default();
-        let text_zoom = message_text_zoom(
-            font_settings
-                .as_ref()
-                .and_then(gtk::Settings::gtk_font_name)
-                .as_deref(),
-        );
-
-        let message_view = self.create_message_web_view(&web_context, &network_session, text_zoom);
-        let secondary_message_view =
-            self.create_message_web_view(&web_context, &network_session, text_zoom);
-        let native_timeline = crate::timeline_message_widget::NativeTimelineView::new();
-        let window_weak = self.downgrade();
-        native_timeline.set_on_open_media(move |item| {
-            if let Some(window) = window_weak.upgrade() {
-                window.open_media_viewer(item);
-            }
-        });
-        let window_weak_thread = self.downgrade();
-        native_timeline.set_on_open_thread(move |ts| {
-            if let Some(window) = window_weak_thread.upgrade() {
-                if let Some(channel_id) = window.visible_channel_id() {
-                    window.open_thread(&channel_id, &ts);
+    fn handle_timeline_action(&self, action: crate::timeline_message_widget::TimelineAction) {
+        use crate::timeline_message_widget::TimelineAction;
+        match action {
+            TimelineAction::OpenMedia(item) => self.open_media_viewer(item),
+            TimelineAction::OpenThread(ts) => {
+                if let Some(channel_id) = self.visible_channel_id() {
+                    self.open_thread(&channel_id, &ts);
                 }
             }
+            TimelineAction::ToggleReaction { ts, name, add } => {
+                if let Some(channel_id) = self.visible_channel_id() {
+                    let canonical = {
+                        let custom = self.imp().custom_emojis.borrow();
+                        crate::emoji::EmojiCatalog::new(&custom).canonical_name(&name)
+                    };
+                    if self.send_command(RuntimeCommand::SetReaction {
+                        channel_id,
+                        ts,
+                        name: canonical.clone(),
+                        add,
+                        thread_ts: None,
+                    }) && add {
+                        self.remember_recent_reaction(&canonical);
+                    }
+                }
+            }
+            TimelineAction::ForwardMessage(ts) => {
+                if let Some(channel_id) = self.visible_channel_id() {
+                    self.forward_message(&channel_id, &ts);
+                }
+            }
+            TimelineAction::MarkUnread(ts) => {
+                if let Some(channel_id) = self.visible_channel_id() {
+                    self.mark_conversation_unread(&channel_id, &ts);
+                }
+            }
+            TimelineAction::CopyMessageLink(ts) => {
+                if let Some(channel_id) = self.visible_channel_id() {
+                    self.copy_message_link(&channel_id, &ts);
+                }
+            }
+            TimelineAction::CopyMessageText(ts) => {
+                if let Some(channel_id) = self.visible_channel_id() {
+                    self.copy_message_text(&channel_id, &ts);
+                }
+            }
+        }
+    }
+
+    fn setup_message_view(&self) {
+        let native_timeline = crate::timeline_message_widget::NativeTimelineView::new();
+        let window_weak = self.downgrade();
+        native_timeline.set_on_action(move |action| {
+            if let Some(window) = window_weak.upgrade() {
+                window.handle_timeline_action(action);
+            }
         });
-        self.connect_timeline_load(&message_view, TimelineSurface::Main);
-        let viewer = self.create_media_viewer(
-            &message_view,
-            &secondary_message_view,
-            &native_timeline,
-        );
+        let viewer = self.create_media_viewer(&native_timeline);
         self.imp().message_view_box.append(&viewer.surface_stack);
-        *self.imp().message_view.borrow_mut() = Some(message_view.clone());
-        *self.imp().secondary_message_view.borrow_mut() = Some(secondary_message_view.clone());
         *self.imp().native_timeline_view.borrow_mut() = Some(native_timeline);
         *self.imp().media_viewer.borrow_mut() = Some(viewer);
         self.setup_media_viewer_callbacks();
 
-        let weak_message_view = message_view.downgrade();
-        let weak_secondary_message_view = secondary_message_view.downgrade();
         let thread_pane = ThreadPane::new(
             &self.imp().thread_split.get(),
             &self.imp().thread_title.get(),
@@ -3119,54 +3128,18 @@ impl ConduitWindow {
         );
         *self.imp().thread_pane_controller.borrow_mut() = Some(thread_pane);
 
-        if let Some(font_settings) = font_settings {
-            let weak_window = self.downgrade();
-            let handler = font_settings.connect_gtk_font_name_notify(move |settings| {
-                let text_zoom = message_text_zoom(settings.gtk_font_name().as_deref());
-                if let Some(view) = weak_message_view.upgrade() {
-                    view.set_zoom_level(text_zoom);
-                }
-                if let Some(view) = weak_secondary_message_view.upgrade() {
-                    view.set_zoom_level(text_zoom);
-                }
-                if let Some(view) = weak_window
-                    .upgrade()
-                    .and_then(|window| window.thread_pane().web_view())
-                {
-                    view.set_zoom_level(text_zoom);
-                }
-            });
-            *self.imp().message_font_settings_handler.borrow_mut() = Some((font_settings, handler));
-        }
-
         self.show_message_placeholder(&gettext("Select a conversation"));
         self.close_thread_pane();
     }
 
-    fn connect_timeline_load(&self, web_view: &webkit6::WebView, surface: TimelineSurface) {
-        let weak_window = self.downgrade();
-        web_view.connect_load_changed(move |_, event| {
-            if event != webkit6::LoadEvent::Finished {
-                return;
-            }
-            if let Some(window) = weak_window.upgrade() {
-                window.finish_timeline_document_load(surface);
-            }
-        });
-    }
-
     fn create_media_viewer(
         &self,
-        message_view: &webkit6::WebView,
-        secondary_message_view: &webkit6::WebView,
         native_timeline: &crate::timeline_message_widget::NativeTimelineView,
     ) -> MediaViewer {
         let surface_stack = gtk::Stack::new();
         surface_stack.set_hexpand(true);
         surface_stack.set_vexpand(true);
         surface_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-        surface_stack.add_named(message_view, Some("timeline"));
-        surface_stack.add_named(secondary_message_view, Some("secondary"));
         surface_stack.add_named(native_timeline.widget(), Some("native_timeline"));
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -3258,7 +3231,7 @@ impl ConduitWindow {
         content_stack.add_named(&loading, Some("loading"));
         root.append(&content_stack);
         surface_stack.add_named(&root, Some("media"));
-        surface_stack.set_visible_child_name("timeline");
+        surface_stack.set_visible_child_name("native_timeline");
 
         self.connect_media_viewer_button(&close, |window| window.close_media_viewer());
         self.connect_media_viewer_button(&previous_button, |window| window.navigate_media(-1));
@@ -3483,17 +3456,7 @@ impl ConduitWindow {
     }
 
     fn active_surface_name(&self) -> &'static str {
-        let imp = self.imp();
-        if imp.profile_visible.get() {
-            return "secondary";
-        }
-        match imp.workspace.view.borrow().main_view() {
-            MainMessageView::Conversation | MainMessageView::Placeholder => "timeline",
-            MainMessageView::Threads
-            | MainMessageView::Search
-            | MainMessageView::Files
-            | MainMessageView::Saved => "secondary",
-        }
+        "native_timeline"
     }
 
     fn close_media_viewer(&self) {
@@ -3668,232 +3631,6 @@ impl ConduitWindow {
         self.set_status("Video loaded");
     }
 
-    fn create_message_network_session(&self) -> webkit6::NetworkSession {
-        let data_dir = config::webkit_data_dir();
-        let cache_dir = config::webkit_cache_dir();
-        create_cache_directory(&data_dir);
-        create_cache_directory(&cache_dir);
-
-        let data_dir = data_dir.to_string_lossy().into_owned();
-        let cache_dir = cache_dir.to_string_lossy().into_owned();
-        webkit6::NetworkSession::new(Some(&data_dir), Some(&cache_dir))
-    }
-
-    fn create_message_web_context(&self) -> webkit6::WebContext {
-        let context = webkit6::WebContext::new();
-        let assets = Rc::clone(&self.imp().conduit_assets);
-        let weak_window = self.downgrade();
-        context.register_uri_scheme("conduit-asset", move |request| {
-            let outcome = serve_conduit_asset_request(request, &assets);
-            let Some(window) = weak_window.upgrade() else {
-                return;
-            };
-            match outcome {
-                ConduitAssetServeOutcome::Rejected => {}
-                ConduitAssetServeOutcome::Served(cache_key) => {
-                    window.mark_conduit_asset_served(&cache_key);
-                }
-                ConduitAssetServeOutcome::Invalidated(cache_key) => {
-                    let weak_window = window.downgrade();
-                    glib::idle_add_local_once(move || {
-                        if let Some(window) = weak_window.upgrade() {
-                            window.recover_invalid_conduit_asset(&cache_key);
-                        }
-                    });
-                }
-            }
-        });
-        if let Some(security_manager) = context.security_manager() {
-            security_manager.register_uri_scheme_as_secure("conduit-asset");
-        }
-        context
-    }
-
-    fn create_message_web_view(
-        &self,
-        web_context: &webkit6::WebContext,
-        network_session: &webkit6::NetworkSession,
-        text_zoom: f64,
-    ) -> webkit6::WebView {
-        let settings = webkit6::Settings::new();
-        configure_message_web_view_settings(&settings);
-        let user_content_manager = webkit6::UserContentManager::new();
-        let picker_handler_registered = user_content_manager
-            .register_script_message_handler(EMOJI_PICKER_MESSAGE_HANDLER, None);
-
-        let conduit_handler_registered = user_content_manager
-            .register_script_message_handler("conduit", None);
-
-        let web_view = webkit6::WebView::builder()
-            .web_context(web_context)
-            .network_session(network_session)
-            .settings(&settings)
-            .user_content_manager(&user_content_manager)
-            .build();
-        web_view.set_hexpand(true);
-        web_view.set_vexpand(true);
-        web_view.set_zoom_level(text_zoom);
-
-        if picker_handler_registered {
-            let weak_window = self.downgrade();
-            let weak_web_view = web_view.downgrade();
-            let generation_gate = Rc::new(RefCell::new(EmojiPickerGenerationGate::default()));
-            user_content_manager.connect_script_message_received(
-                Some(EMOJI_PICKER_MESSAGE_HANDLER),
-                move |_, value| {
-                    let Some(window) = weak_window.upgrade() else {
-                        return;
-                    };
-                    let Some(web_view) = weak_web_view.upgrade() else {
-                        return;
-                    };
-                    let mut generation_gate = generation_gate.borrow_mut();
-                    window.handle_emoji_picker_query(&web_view, &mut generation_gate, value);
-                },
-            );
-        }
-
-        if conduit_handler_registered {
-            let weak_window = self.downgrade();
-            user_content_manager.connect_script_message_received(
-                Some("conduit"),
-                move |_, value| {
-                    let Some(window) = weak_window.upgrade() else {
-                        return;
-                    };
-                    window.handle_conduit_script_message(value);
-                },
-            );
-        }
-
-        let weak_window = self.downgrade();
-        web_view.connect_decide_policy(move |_, decision, decision_type| {
-            if !matches!(
-                decision_type,
-                webkit6::PolicyDecisionType::NavigationAction
-                    | webkit6::PolicyDecisionType::NewWindowAction
-            ) {
-                return false;
-            }
-
-            let Some(uri) = message_navigation_uri(decision) else {
-                return false;
-            };
-
-            let handled = weak_window
-                .upgrade()
-                .is_some_and(|window| window.handle_message_view_uri(&uri));
-            if handled {
-                decision.ignore();
-            }
-            handled
-        });
-
-        web_view
-    }
-
-    fn ensure_thread_web_view(&self) -> webkit6::WebView {
-        let thread_pane = self.thread_pane();
-        if let Some(web_view) = thread_pane.web_view() {
-            return web_view;
-        }
-
-        let message_view = self
-            .imp()
-            .message_view
-            .borrow()
-            .clone()
-            .expect("main message WebView should be initialized");
-        let web_context = message_view
-            .web_context()
-            .expect("main message WebView should have a WebContext");
-        let network_session = message_view
-            .network_session()
-            .expect("main message WebView should have a NetworkSession");
-        let thread_view =
-            self.create_message_web_view(&web_context, &network_session, message_view.zoom_level());
-        self.connect_timeline_load(&thread_view, TimelineSurface::Thread);
-        thread_pane.attach_web_view(thread_view)
-    }
-
-    fn reaction_emoji_picker_model(&self) -> Arc<EmojiPickerModel> {
-        if let Some(model) = self.imp().reaction_emoji_picker_model.borrow().as_ref() {
-            return model.clone();
-        }
-        let model = Arc::new(EmojiPickerModel::new(
-            EmojiCatalog::new(&self.imp().custom_emojis.borrow()).entries(),
-        ));
-        *self.imp().reaction_emoji_picker_model.borrow_mut() = Some(model.clone());
-        model
-    }
-
-    fn handle_emoji_picker_query(
-        &self,
-        web_view: &webkit6::WebView,
-        generation_gate: &mut EmojiPickerGenerationGate,
-        value: &webkit6::javascriptcore::Value,
-    ) {
-        let Some(query) = emoji_picker_query_from_value(value) else {
-            return;
-        };
-        let Some(result) = self.reaction_emoji_picker_model().query(&query) else {
-            return;
-        };
-        if !generation_gate.accept(query.generation) {
-            return;
-        }
-        let Ok(payload) = serde_json::to_string(&result) else {
-            return;
-        };
-        let arguments = glib::VariantDict::new(None);
-        arguments.insert("payload", payload.as_str());
-        let arguments = arguments.end();
-        web_view.call_async_javascript_function(
-            APPLY_EMOJI_PICKER_RESULT_SCRIPT,
-            Some(&arguments),
-            None,
-            None,
-            None::<&gio::Cancellable>,
-            |_| {},
-        );
-    }
-
-    fn handle_conduit_script_message(&self, value: &webkit6::javascriptcore::Value) {
-        if !gtk::prelude::GtkWindowExt::is_active(self) {
-            return;
-        }
-        let Some(json_str) = value.to_json(0) else {
-            return;
-        };
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) else {
-            return;
-        };
-        let msg_type = parsed.get("type").and_then(serde_json::Value::as_str);
-        if msg_type == Some("messages_read") {
-            let Some(channel_id) = self.visible_channel_id() else {
-                return;
-            };
-            if let Some(timestamps) = parsed.get("timestamps").and_then(serde_json::Value::as_array) {
-                let max_ts = timestamps
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .fold(None, |acc: Option<&str>, ts| match acc {
-                        None => Some(ts),
-                        Some(curr) => {
-                            if crate::models::slack_timestamp_is_after(ts, curr) {
-                                Some(ts)
-                            } else {
-                                Some(curr)
-                            }
-                        }
-                    });
-                if let Some(ts) = max_ts {
-                    self.mark_conversation_read(&channel_id, ts);
-                }
-            }
-        }
-    }
-
     fn mark_conversation_read(&self, channel_id: &str, ts: &str) {
         let mut convs = self.imp().workspace.conversations.borrow_mut();
         if !convs.advance_last_read(channel_id, ts) {
@@ -3920,44 +3657,9 @@ impl ConduitWindow {
         self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::MAIN);
     }
 
-    fn setup_reaction_picker_escape_fallback(&self) {
-        // WebKitGTK does not consistently forward Escape to an open HTML
-        // dialog. Capture it at the application window and dispatch the
-        // dialog's existing cancellation path into both timeline WebViews.
-        let controller = gtk::EventControllerKey::new();
-        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let weak_window = self.downgrade();
-        controller.connect_key_pressed(move |_, key, _, _| {
-            if key != gtk::gdk::Key::Escape {
-                return glib::Propagation::Proceed;
-            }
-            let Some(window) = weak_window.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-
-            let main_view = window.imp().message_view.borrow().clone();
-            let secondary_view = window.imp().secondary_message_view.borrow().clone();
-            let thread_view = window.thread_pane().web_view();
-            for web_view in main_view
-                .into_iter()
-                .chain(secondary_view)
-                .chain(thread_view)
-            {
-                web_view.evaluate_javascript(
-                    CANCEL_REACTION_PICKER_SCRIPT,
-                    None,
-                    None,
-                    None::<&gio::Cancellable>,
-                    |_| {},
-                );
-            }
-            glib::Propagation::Proceed
-        });
-        self.add_controller(controller);
-    }
-
     fn setup_sidebar_list(&self) {
         self.ensure_composer_format_control_css();
+        self.imp().conversation_list.add_css_class("conduit-themed-sidebar");
         let factory = gtk::SignalListItemFactory::new();
         let weak_window = self.downgrade();
         factory.connect_bind(move |_, object| {
@@ -5250,6 +4952,69 @@ impl ConduitWindow {
         )
     }
 
+    fn apply_workspace_theme(&self, theme: &crate::slack::SidebarTheme) {
+        fn is_valid_hex_color(value: &str) -> bool {
+            let bytes = value.as_bytes();
+            bytes.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(u8::is_ascii_hexdigit)
+        }
+
+        let required = [
+            &theme.column_bg,
+            &theme.menu_bg_hover,
+            &theme.active_item,
+            &theme.active_item_text,
+            &theme.hover_item,
+            &theme.text_color,
+            &theme.active_presence,
+        ];
+        let optional = [
+            theme.mention_badge.as_ref(),
+            theme.top_nav_bg.as_ref(),
+            theme.top_nav_text.as_ref(),
+        ];
+        if !required.iter().all(|value| is_valid_hex_color(value))
+            || !optional
+                .iter()
+                .flatten()
+                .all(|value| is_valid_hex_color(value))
+        {
+            crate::debug::log(
+                "window",
+                "WorkspaceThemeRejected reason=invalid_color_value",
+            );
+            return;
+        }
+
+        let mut css = format!(
+            ".conduit-themed-sidebar {{ background-color: {}; color: {}; }}\n\
+             .conduit-themed-sidebar row:hover {{ background-color: {}; }}\n\
+             .conduit-themed-sidebar row.active-conversation,\n\
+             .conduit-themed-sidebar row:selected {{ background-color: {}; color: {}; }}\n",
+            theme.column_bg,
+            theme.text_color,
+            theme.menu_bg_hover,
+            theme.active_item,
+            theme.active_item_text,
+        );
+        if let Some(mention_badge) = &theme.mention_badge {
+            css.push_str(&format!(
+                ".conduit-themed-sidebar .mention {{ background-color: {mention_badge}; }}\n"
+            ));
+        }
+
+        if let Some(provider) = self.imp().workspace_theme_css_provider.borrow_mut().take() {
+            gtk::style_context_remove_provider_for_display(&self.display(), &provider);
+        }
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(&css);
+        gtk::style_context_add_provider_for_display(
+            &self.display(),
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        *self.imp().workspace_theme_css_provider.borrow_mut() = Some(provider);
+    }
+
     fn ensure_composer_format_control_css(&self) {
         if self.imp().composer_format_css_provider.borrow().is_some() {
             return;
@@ -5278,23 +5043,6 @@ impl ConduitWindow {
         let overflow = self.composer_format_overflow(target);
         configure_composer_format_menu_control(&overflow);
         host.remove(&overflow);
-        let weak_window = self.downgrade();
-        let emoji_picker =
-            StatusEmojiPicker::new_for_composer(&self.imp().custom_emojis.borrow(), move |name| {
-                if let Some(window) = weak_window.upgrade() {
-                    window.insert_composer_emoji(target, name);
-                    if let Some(popover) = window.composer_format_overflow(target).popover() {
-                        popover.popdown();
-                    }
-                }
-            });
-        if let Some(menu_button) = emoji_picker
-            .row
-            .activatable_widget()
-            .and_downcast::<gtk::MenuButton>()
-        {
-            menu_button.set_popover(None::<&gtk::Popover>);
-        }
 
         for control in composer_format_controls() {
             if control.action == ComposerFormatAction::Emoji {
@@ -5410,7 +5158,6 @@ impl ConduitWindow {
         *self.composer_toolbar(target).borrow_mut() = Some(ComposerToolbar {
             buttons,
             updating,
-            emoji_picker,
         });
 
         let buffer = self.composer_text_view(target).buffer();
@@ -5480,20 +5227,18 @@ impl ConduitWindow {
     }
 
     fn popup_composer_emoji(&self, target: ComposerTarget, anchor: &impl IsA<gtk::Widget>) {
-        let popover = self
-            .composer_toolbar(target)
-            .borrow()
-            .as_ref()
-            .map(|toolbar| toolbar.emoji_picker.popover.clone());
-        let Some(popover) = popover else {
-            return;
-        };
-        popover.popdown();
-        if popover.parent().is_some() {
-            popover.unparent();
-        }
-        popover.set_parent(anchor);
-        popover.popup();
+        let weak_window = self.downgrade();
+        let custom_emojis = self.imp().custom_emojis.borrow().clone();
+        let picker = crate::emoji_picker_window::EmojiPickerWindow::new(
+            anchor,
+            &custom_emojis,
+            move |name| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.insert_composer_emoji(target, name);
+                }
+            },
+        );
+        picker.present();
     }
 
     fn insert_composer_emoji(&self, target: ComposerTarget, name: &str) {
@@ -6233,6 +5978,9 @@ impl ConduitWindow {
         let mention_token = mention_token_at_caret(&text, caret).filter(|token| {
             !self.composer_range_intersects_semantic(target, token.start, token.end)
         });
+        let channel_token = channel_token_at_caret(&text, caret).filter(|token| {
+            !self.composer_range_intersects_semantic(target, token.start, token.end)
+        });
         let (token, entries) = if let Some(token) = mention_token {
             let candidates = mention_candidates(&self.imp().discovered_users.borrow());
             let entries = search_mention_candidates(&candidates, &token.query, 10)
@@ -6240,6 +5988,19 @@ impl ConduitWindow {
                 .map(ComposerCompletionEntry::Mention)
                 .collect();
             (Some(ComposerCompletionToken::Mention(token)), entries)
+        } else if let Some(token) = channel_token {
+            let imp = self.imp();
+            let candidates = channel_candidates(
+                imp.discovered_channels
+                    .borrow()
+                    .iter()
+                    .chain(imp.workspace.conversations.borrow().iter()),
+            );
+            let entries = search_channel_candidates(&candidates, &token.query, 10)
+                .into_iter()
+                .map(ComposerCompletionEntry::Channel)
+                .collect();
+            (Some(ComposerCompletionToken::Channel(token)), entries)
         } else {
             let token = emoji_token_at_caret(&text, caret);
             let entries = token.as_ref().map_or_else(Vec::new, |token| {
@@ -6254,7 +6015,11 @@ impl ConduitWindow {
             });
             (token.map(ComposerCompletionToken::Emoji), entries)
         };
-        let is_person_completion = matches!(token, Some(ComposerCompletionToken::Mention(_)));
+        let completion_list_label = match token {
+            Some(ComposerCompletionToken::Mention(_)) => "Person suggestions",
+            Some(ComposerCompletionToken::Channel(_)) => "Channel suggestions",
+            _ => "Emoji suggestions",
+        };
 
         let mut completion_ref = self.composer_completion(target).borrow_mut();
         let Some(completion) = completion_ref.as_mut() else {
@@ -6274,11 +6039,7 @@ impl ConduitWindow {
 
         completion
             .list
-            .update_property(&[gtk::accessible::Property::Label(if is_person_completion {
-                "Person suggestions"
-            } else {
-                "Emoji suggestions"
-            })]);
+            .update_property(&[gtk::accessible::Property::Label(completion_list_label)]);
         for entry in &completion.entries {
             completion.list.append(&composer_completion_row(entry));
         }
@@ -6410,6 +6171,39 @@ impl ConduitWindow {
                     target,
                     TestComposerCompletion::Mention {
                         user_id: &candidate.user_id,
+                        serialized: &serialized,
+                    },
+                );
+            }
+            (
+                ComposerCompletionToken::Channel(token),
+                ComposerCompletionEntry::Channel(candidate),
+            ) => {
+                let insertion = replace_channel_token(&text, &token, &candidate);
+                let old_length = text.chars().count();
+                let new_length = insertion.text.chars().count();
+                let replacement_length =
+                    new_length.saturating_sub(old_length.saturating_sub(token.end - token.start));
+                let replacement = insertion
+                    .text
+                    .chars()
+                    .skip(token.start)
+                    .take(replacement_length)
+                    .collect::<String>();
+                let mut start = buffer.iter_at_offset(token.start as i32);
+                let mut end = buffer.iter_at_offset(token.end as i32);
+                buffer.begin_user_action();
+                buffer.delete(&mut start, &mut end);
+                buffer.insert(&mut start, &replacement);
+                buffer.place_cursor(&buffer.iter_at_offset(insertion.caret as i32));
+                buffer.end_user_action();
+                self.add_composer_entity(target, insertion.span);
+                let serialized = self.composer_canonical_text(target);
+                record_test_composer_completion(
+                    self.imp(),
+                    target,
+                    TestComposerCompletion::Channel {
+                        channel_id: &candidate.channel_id,
                         serialized: &serialized,
                     },
                 );
@@ -6778,6 +6572,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::EmojiCatalogLoaded(emojis) => self.replace_custom_emojis(emojis),
+            RuntimeEventKind::WorkspaceThemeLoaded(theme) => self.apply_workspace_theme(&theme),
             RuntimeEventKind::ImageAssetLoaded { key, asset } => {
                 crate::debug::log(
                     "ui",
@@ -7164,60 +6959,20 @@ impl ConduitWindow {
     }
 
     fn flush_timeline_frame(&self, surface: TimelineSurface) {
-        let Some(delta) = self.timeline_presenter(surface).borrow_mut().take_frame() else {
+        let Some(_delta) = self.timeline_presenter(surface).borrow_mut().take_frame() else {
             return;
         };
         let fallback = timeline_surface_invalidation(surface);
-        let web_view = match surface {
-            TimelineSurface::Main => self.imp().message_view.borrow().clone(),
-            TimelineSurface::Thread => self.thread_pane().web_view(),
-        };
-        let Some(web_view) = web_view else {
-            self.timeline_presenter(surface).borrow_mut().patch_failed();
-            self.queue_ui_invalidations(fallback);
-            return;
-        };
-        let script = message_html::timeline_dom_delta_call(delta.patches());
-        crate::debug::pipeline_counters().record_timeline_delta();
-        let weak_window = self.downgrade();
-        web_view.evaluate_javascript(
-            &script,
-            None,
-            None,
-            None::<&gio::Cancellable>,
-            move |result| {
-                if result.is_ok_and(|value| value.to_boolean()) {
-                    return;
-                }
-                if let Some(window) = weak_window.upgrade() {
-                    window
-                        .timeline_presenter(surface)
-                        .borrow_mut()
-                        .patch_failed();
-                    window.queue_ui_invalidations(fallback);
-                }
-            },
-        );
+        self.queue_ui_invalidations(fallback);
     }
 
     fn finish_timeline_document_load(&self, surface: TimelineSurface) {
-        let action = {
-            let mut presenter = self.timeline_presenter(surface).borrow_mut();
-            let Some(document) = presenter.document().cloned() else {
-                return;
-            };
-            let revision = presenter.presented_revision();
-            presenter.document_loaded(&document, revision)
+        let mut presenter = self.timeline_presenter(surface).borrow_mut();
+        let Some(document) = presenter.document().cloned() else {
+            return;
         };
-        match action {
-            TimelinePresenterAction::ScheduleFrame => self.schedule_timeline_frame(surface),
-            TimelinePresenterAction::ReloadDocument => {
-                self.queue_ui_invalidations(timeline_surface_invalidation(surface));
-            }
-            TimelinePresenterAction::Ready
-            | TimelinePresenterAction::Queued
-            | TimelinePresenterAction::LoadDocument => {}
-        }
+        let revision = presenter.presented_revision();
+        let _ = presenter.document_loaded(&document, revision);
     }
 
     fn timeline_presenter(&self, surface: TimelineSurface) -> &RefCell<TimelinePresenter> {
@@ -7459,7 +7214,7 @@ impl ConduitWindow {
         self.render_closed_thread();
         self.imp().message_title.set_title(&title);
         self.render_conversations();
-        self.load_secondary_html(&message_html::placeholder_document(&title, loading_message));
+        self.show_secondary_text_placeholder(&title, loading_message);
         self.imp().workspace_split.set_show_content(true);
         true
     }
@@ -7474,10 +7229,7 @@ impl ConduitWindow {
         self.imp().message_title.set_title(&title);
         self.render_closed_thread();
         self.render_conversations();
-        self.load_secondary_html(&message_html::placeholder_document(
-            &title,
-            &gettext("Loading saved items"),
-        ));
+        self.show_secondary_text_placeholder(&title, &gettext("Loading saved items"));
         self.send_command(RuntimeCommand::LoadSavedItems);
         self.imp().workspace_split.set_show_content(true);
     }
@@ -7497,10 +7249,7 @@ impl ConduitWindow {
         self.render_closed_thread();
         self.render_conversations();
         self.imp().message_title.set_title(&title);
-        self.load_secondary_html(&message_html::placeholder_document(
-            &title,
-            &gettext("Searching"),
-        ));
+        self.show_secondary_text_placeholder(&title, &gettext("Searching"));
         self.send_command(RuntimeCommand::SearchMessages { query });
         self.imp().workspace_split.set_show_content(true);
     }
@@ -8007,30 +7756,6 @@ impl ConduitWindow {
         self.close_thread_pane();
     }
 
-    fn handle_message_view_uri(&self, uri: &str) -> bool {
-        let Ok(url) = url::Url::parse(uri) else {
-            return false;
-        };
-
-        match url.scheme() {
-            "conduit" => self.handle_message_action_url(&url),
-            "http" | "https" | "msteams" | "zoommtg" | "mailto" => {
-                let workspace_url = self.imp().workspace_url.borrow().clone();
-                if let Some(location) = slack_message_location(uri, workspace_url.as_deref()) {
-                    self.open_message_context(location);
-                } else {
-                    self.open_external_link(uri);
-                }
-                true
-            }
-            "about" | "app" => false,
-            _ => {
-                self.set_status("Unsupported message link");
-                true
-            }
-        }
-    }
-
     fn show_user_profile(&self, user_id: &str) {
         let user_id = user_id.trim();
         if user_id.is_empty() {
@@ -8045,404 +7770,10 @@ impl ConduitWindow {
         *self.imp().pending_profile_user_id.borrow_mut() = Some(user_id.to_string());
         self.imp().message_title.set_title(&gettext("Profile"));
         self.sync_message_title_profile_action();
-        self.load_secondary_html(&message_html::placeholder_document(
-            &gettext("Profile"),
-            &gettext("Loading profile"),
-        ));
+        self.show_secondary_text_placeholder(&gettext("Profile"), &gettext("Loading profile"));
         self.imp().workspace_split.set_show_content(true);
         self.send_command(RuntimeCommand::LoadUserProfile {
             user_id: user_id.to_string(),
-        });
-    }
-
-    fn handle_message_action_url(&self, url: &url::Url) -> bool {
-        match url.host_str() {
-            Some("timeline-positioned" | "timeline-interacted") => {
-                match timeline_lifecycle_action(url) {
-                    Some(TimelineLifecycleAction::Positioned(generation)) => {
-                        let reconcile = {
-                            let mut opening = self.imp().conversation_opening.borrow_mut();
-                            opening.commit_position(generation)
-                                && opening.take_pending_reconciliation(generation)
-                        };
-                        if reconcile {
-                            self.reconcile_current_conversation_snapshot();
-                        }
-                    }
-                    Some(TimelineLifecycleAction::Interacted(generation)) => {
-                        let reconcile = {
-                            let mut opening = self.imp().conversation_opening.borrow_mut();
-                            opening.note_user_interaction(generation)
-                                && opening.take_pending_reconciliation(generation)
-                        };
-                        if reconcile {
-                            self.reconcile_current_conversation_snapshot();
-                        }
-                    }
-                    None => {}
-                }
-                true
-            }
-            Some("thread") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                self.open_thread(&channel_id, &ts);
-                true
-            }
-            Some("mark-unread") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                self.mark_conversation_unread(&channel_id, &ts);
-                true
-            }
-            Some("message-control") => {
-                let query = url.query_pairs().collect::<Vec<_>>();
-                let Some(handle) =
-                    (query.len() == 1 && query[0].0 == "id").then(|| query[0].1.to_string())
-                else {
-                    self.set_status("Message action is no longer available");
-                    return true;
-                };
-                let claimed = self
-                    .imp()
-                    .message_control_registry
-                    .borrow_mut()
-                    .claim_token(&handle);
-                let Ok((control_handle, target)) = claimed else {
-                    self.set_status("Message action is no longer available");
-                    return true;
-                };
-                self.activate_message_control(control_handle, target);
-                true
-            }
-            Some("channel") => {
-                if let Some(channel_id) = query_param(url, "channel") {
-                    self.open_channel_reference(&channel_id);
-                }
-                true
-            }
-            Some("user-message") => {
-                if let Some(user_id) = query_param(url, "user") {
-                    self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
-                }
-                true
-            }
-            Some("user-profile") => {
-                if let Some(user_id) = query_param(url, "user") {
-                    self.show_user_profile(&user_id);
-                }
-                true
-            }
-            Some("profile-close") => {
-                self.imp().profile_visible.set(false);
-                self.imp().pending_profile_user_id.borrow_mut().take();
-                self.refresh_current_conversation_title();
-                self.queue_ui_invalidations(UiInvalidations::MAIN);
-                self.sync_back_button();
-                true
-            }
-            Some("message") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(message_ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                let Some(location) = SearchMessageLocation::new(
-                    &channel_id,
-                    &message_ts,
-                    query_param(url, "thread_ts").as_deref(),
-                ) else {
-                    return true;
-                };
-                self.open_message_context(location);
-                true
-            }
-            Some("load-older") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(cursor) = query_param(url, "cursor") else {
-                    return true;
-                };
-                if let Some(ts) = query_param(url, "thread_ts") {
-                    let should_load = {
-                        let mut state = self.imp().workspace.view.borrow_mut();
-                        state.visible_channel_id() == Some(channel_id.as_str())
-                            && state.selected_thread_ts() == Some(ts.as_str())
-                            && state.thread_cursor() == Some(cursor.as_str())
-                            && state.begin_thread_history_request()
-                    };
-                    if should_load {
-                        self.set_status("Loading more replies");
-                        self.send_command(RuntimeCommand::LoadOlderThread {
-                            channel_id,
-                            ts,
-                            cursor,
-                        });
-                    }
-                } else {
-                    self.set_status("Loading older messages");
-                    self.send_command(RuntimeCommand::LoadOlderHistory { channel_id, cursor });
-                }
-                true
-            }
-            Some("reaction") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                let name = query_param(url, "name").unwrap_or_else(|| "+1".to_string());
-                let name = {
-                    let custom = self.imp().custom_emojis.borrow();
-                    crate::emoji::EmojiCatalog::new(&custom).canonical_name(&name)
-                };
-                let add = query_param(url, "add").is_none_or(|value| value == "true");
-                let thread_ts = query_param(url, "thread_ts");
-                if self.send_command(RuntimeCommand::SetReaction {
-                    channel_id,
-                    ts,
-                    name: name.clone(),
-                    add,
-                    thread_ts,
-                }) {
-                    if add {
-                        self.remember_recent_reaction(&name);
-                    }
-                    self.set_status(if add {
-                        "Adding reaction"
-                    } else {
-                        "Removing reaction"
-                    });
-                }
-                true
-            }
-            Some("save") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                let add = query_param(url, "add").is_none_or(|value| value == "true");
-                let thread_ts = query_param(url, "thread_ts");
-                if self.send_command(RuntimeCommand::SetSaved {
-                    channel_id,
-                    ts,
-                    add,
-                    thread_ts,
-                }) {
-                    self.set_status(if add {
-                        "Saving message"
-                    } else {
-                        "Removing saved message"
-                    });
-                }
-                true
-            }
-            Some("copy-message") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                self.copy_message_text(&channel_id, &ts);
-                true
-            }
-            Some("copy-link") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                self.copy_message_link(&channel_id, &ts);
-                true
-            }
-            Some("forward") => {
-                let Some(channel_id) = query_param(url, "channel") else {
-                    return true;
-                };
-                let Some(ts) = query_param(url, "ts") else {
-                    return true;
-                };
-                self.forward_message(&channel_id, &ts);
-                true
-            }
-            Some("media") => {
-                let Some(media_url) = query_param(url, "url").filter(|url| {
-                    url::Url::parse(url)
-                        .ok()
-                        .is_some_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
-                }) else {
-                    return true;
-                };
-                let name = query_param(url, "name").unwrap_or_else(|| "Media".to_string());
-                let kind = match query_param(url, "kind").as_deref() {
-                    Some("image") => MediaKind::Image,
-                    Some("video") => MediaKind::Video,
-                    _ => return true,
-                };
-                self.open_media_viewer(MediaGalleryItem {
-                    url: media_url,
-                    name,
-                    kind,
-                });
-                true
-            }
-            Some("attachment") => {
-                let Some(attachment_url) = query_param(url, "url").filter(|url| {
-                    url::Url::parse(url)
-                        .ok()
-                        .is_some_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
-                }) else {
-                    self.set_status("Invalid attachment link");
-                    return true;
-                };
-                let name = query_param(url, "name")
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| "Attachment".to_string());
-                self.set_status(&format!("Downloading {name}"));
-                self.send_command(RuntimeCommand::DownloadAttachment {
-                    url: attachment_url,
-                    name,
-                });
-                true
-            }
-            _ => true,
-        }
-    }
-
-    fn activate_message_control(
-        &self,
-        control_handle: MessageControlHandle,
-        target: MessageControlTarget,
-    ) {
-        let message_ref = target.message();
-        let Some(message) = self.find_message(message_ref.channel_id(), message_ref.timestamp())
-        else {
-            self.imp()
-                .message_control_registry
-                .borrow_mut()
-                .release(&control_handle);
-            self.set_status("This message changed; try again");
-            return;
-        };
-
-        let MessageControlSelection::Control(key) = target.selection() else {
-            self.set_status("Opening message in Slack");
-            let admitted = self.send_command(RuntimeCommand::ResolveMessagePermalink {
-                channel_id: message_ref.channel_id().to_string(),
-                ts: message_ref.timestamp().to_string(),
-            });
-            let mut registry = self.imp().message_control_registry.borrow_mut();
-            if admitted {
-                registry.complete(&control_handle);
-            } else {
-                registry.release(&control_handle);
-            }
-            return;
-        };
-        let Some(control) = message.document.control(key).cloned() else {
-            self.imp()
-                .message_control_registry
-                .borrow_mut()
-                .release(&control_handle);
-            self.set_status("This message changed; try again");
-            return;
-        };
-        let Some(action) = control.action().cloned() else {
-            self.imp()
-                .message_control_registry
-                .borrow_mut()
-                .release(&control_handle);
-            self.set_status("This action is not available yet");
-            return;
-        };
-        let Some(service_id) = message.author.bot_id().map(ToString::to_string) else {
-            self.imp()
-                .message_control_registry
-                .borrow_mut()
-                .release(&control_handle);
-            self.set_status("This action is not available yet");
-            return;
-        };
-        let request = SlackMessageActionRequest {
-            channel_id: message_ref.channel_id().to_string(),
-            message_ts: message.ts.clone(),
-            thread_ts: message.thread_ts.clone(),
-            service_id,
-            app_id: message.author.app_id().map(ToString::to_string),
-            bot_user_id: message.user.clone(),
-            action,
-        };
-
-        if let Some(confirmation) = control.confirmation.clone() {
-            let heading = confirmation
-                .title
-                .unwrap_or_else(|| gettext("Confirm action"));
-            let body = confirmation.text.unwrap_or_else(|| control.label.clone());
-            let confirm_label = confirmation
-                .confirm_label
-                .unwrap_or_else(|| gettext("Confirm"));
-            let deny_label = confirmation.deny_label.unwrap_or_else(|| gettext("Cancel"));
-            let dialog = adw::AlertDialog::builder()
-                .heading(heading)
-                .body(body)
-                .default_response("cancel")
-                .close_response("cancel")
-                .build();
-            dialog.add_response("cancel", &deny_label);
-            dialog.add_response("confirm", &confirm_label);
-            dialog.set_response_appearance(
-                "confirm",
-                if confirmation.destructive {
-                    adw::ResponseAppearance::Destructive
-                } else {
-                    adw::ResponseAppearance::Suggested
-                },
-            );
-            let weak_window = self.downgrade();
-            dialog.connect_response(None, move |_, response| {
-                let Some(window) = weak_window.upgrade() else {
-                    return;
-                };
-                if response == "confirm" {
-                    window.dispatch_message_action(request.clone(), control_handle.clone());
-                } else {
-                    window
-                        .imp()
-                        .message_control_registry
-                        .borrow_mut()
-                        .release(&control_handle);
-                }
-            });
-            dialog.present(Some(self));
-        } else {
-            self.dispatch_message_action(request, control_handle);
-        }
-    }
-
-    fn dispatch_message_action(
-        &self,
-        request: SlackMessageActionRequest,
-        control_handle: MessageControlHandle,
-    ) {
-        self.set_status("Sending action");
-        self.send_command(RuntimeCommand::ExecuteMessageAction {
-            request,
-            control_handle,
         });
     }
 
@@ -8826,22 +8157,8 @@ impl ConduitWindow {
 
     fn replace_custom_emojis(&self, emojis: HashMap<String, String>) {
         *self.imp().custom_emojis.borrow_mut() = Arc::new(emojis);
-        self.imp().reaction_emoji_picker_model.borrow_mut().take();
         if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
-            state
-                .emoji_picker
-                .refresh_catalog(&self.imp().custom_emojis.borrow());
             write_status_dialog_test_state(self, state);
-        }
-        for toolbar in [
-            &self.imp().message_composer_toolbar,
-            &self.imp().thread_composer_toolbar,
-        ] {
-            if let Some(toolbar) = toolbar.borrow().as_ref() {
-                toolbar
-                    .emoji_picker
-                    .refresh_catalog(&self.imp().custom_emojis.borrow());
-            }
         }
         for target in COMPOSER_TARGETS {
             self.refresh_composer_completion(target);
@@ -9039,12 +8356,12 @@ impl ConduitWindow {
         let message = surface.error_message(error);
         match surface {
             PlaceholderSurface::Messages => {
-                self.load_message_html(&message_html::placeholder_document(&title, &message));
+                self.show_message_text_placeholder(&title, &message);
             }
             PlaceholderSurface::SearchResults
             | PlaceholderSurface::Files
             | PlaceholderSurface::SavedItems => {
-                self.load_secondary_html(&message_html::placeholder_document(&title, &message));
+                self.show_secondary_text_placeholder(&title, &message);
             }
         }
     }
@@ -9052,53 +8369,6 @@ impl ConduitWindow {
     fn show_thread_error(&self, error: &str) {
         let message = localized_replies_error(error);
         self.show_thread_placeholder(&message);
-    }
-
-    fn image_asset_keys_for_cache_key(&self, cache_key: &str) -> Vec<String> {
-        self.imp()
-            .image_assets
-            .borrow()
-            .iter()
-            .filter(|(_, source)| {
-                conduit_asset_request_key(source.uri()).as_deref() == Some(cache_key)
-            })
-            .map(|(key, _)| key.clone())
-            .collect()
-    }
-
-    fn mark_conduit_asset_served(&self, cache_key: &str) {
-        if self.imp().recovering_image_assets.borrow().is_empty() {
-            return;
-        }
-        let keys = self.image_asset_keys_for_cache_key(cache_key);
-        let mut recovering = self.imp().recovering_image_assets.borrow_mut();
-        for key in keys {
-            recovering.remove(&key);
-        }
-    }
-
-    fn recover_invalid_conduit_asset(&self, cache_key: &str) {
-        let keys = self.image_asset_keys_for_cache_key(cache_key);
-        for key in keys {
-            self.imp().image_assets.borrow_mut().remove(&key);
-            self.patch_image_asset(&key, None);
-
-            let action = {
-                let mut recovering = self.imp().recovering_image_assets.borrow_mut();
-                let mut pending = self.imp().pending_image_assets.borrow_mut();
-                image_asset_recovery_action(&mut recovering, &mut pending, &key)
-            };
-            match action {
-                ImageAssetRecoveryAction::Retry => {
-                    self.send_command(RuntimeCommand::LoadImageAsset {
-                        key: key.clone(),
-                        url: key,
-                    });
-                }
-                ImageAssetRecoveryAction::AlreadyPending => {}
-                ImageAssetRecoveryAction::Fail => self.mark_image_asset_failed(&key),
-            }
-        }
     }
 
     fn mark_image_asset_failed(&self, key: &str) {
@@ -9603,6 +8873,7 @@ impl ConduitWindow {
             let user_search_aliases = imp.user_search_aliases.borrow();
             let user_full_names = imp.user_full_names.borrow();
             let user_statuses = imp.user_statuses.borrow();
+            let user_avatar_urls = imp.user_avatar_urls.borrow();
             let current_user_id = imp.current_user_id.borrow();
             let query = imp.sidebar_filter_entry.text();
             let selected_channel = self.visible_channel_id();
@@ -9623,6 +8894,7 @@ impl ConduitWindow {
                 user_search_aliases: Some(&user_search_aliases),
                 user_full_names: Some(&user_full_names),
                 user_statuses: Some(&user_statuses),
+                user_avatar_urls: Some(&user_avatar_urls),
             };
             let mut rows = Vec::with_capacity(changed_channel_ids.len());
             for channel_id in changed_channel_ids {
@@ -9906,6 +9178,7 @@ impl ConduitWindow {
                     user_search_aliases: Some(&user_search_aliases),
                     user_full_names: Some(&imp.user_full_names.borrow()),
                     user_statuses: Some(&imp.user_statuses.borrow()),
+                    user_avatar_urls: Some(&imp.user_avatar_urls.borrow()),
                 },
             );
             (model, conversations.len())
@@ -10366,21 +9639,63 @@ impl ConduitWindow {
             .close_response("cancel")
             .build();
 
+        let selected_emoji = Rc::new(RefCell::new(status.emoji_name().to_string()));
+        let emoji_row = adw::ActionRow::builder()
+            .title(gettext("Status emoji"))
+            .activatable(true)
+            .build();
+        let emoji_btn_label = if status.emoji_name().is_empty() {
+            "💬".to_string()
+        } else {
+            format!(":{}:", status.emoji_name())
+        };
+        let emoji_button = gtk::Button::with_label(&emoji_btn_label);
+        emoji_button.add_css_class("flat");
+
         let weak_dialog = dialog.downgrade();
         let weak_status_entry = status_entry.downgrade();
-        let emoji_picker = StatusEmojiPicker::new(
-            &self.imp().custom_emojis.borrow(),
-            status.emoji_name(),
-            move |selected_emoji| {
-                let (Some(dialog), Some(status_entry)) =
-                    (weak_dialog.upgrade(), weak_status_entry.upgrade())
-                else {
-                    return;
-                };
-                update_status_dialog_save_response(&dialog, &status_entry, selected_emoji);
-            },
-        );
-        group.add(&emoji_picker.row);
+        let selected_emoji_clone = selected_emoji.clone();
+        let weak_button = emoji_button.downgrade();
+        let weak_window = self.downgrade();
+
+        let open_picker = move |btn: &gtk::Button| {
+            let weak_dialog = weak_dialog.clone();
+            let weak_status_entry = weak_status_entry.clone();
+            let selected_emoji_clone = selected_emoji_clone.clone();
+            let weak_button = weak_button.clone();
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let custom_emojis = window.imp().custom_emojis.borrow().clone();
+            let picker = crate::emoji_picker_window::EmojiPickerWindow::new(
+                btn,
+                &custom_emojis,
+                move |chosen| {
+                    selected_emoji_clone.replace(chosen.to_string());
+                    if let Some(button) = weak_button.upgrade() {
+                        button.set_label(&format!(":{chosen}:"));
+                    }
+                    if let (Some(dialog), Some(status_entry)) =
+                        (weak_dialog.upgrade(), weak_status_entry.upgrade())
+                    {
+                        update_status_dialog_save_response(&dialog, &status_entry, chosen);
+                    }
+                },
+            );
+            picker.present();
+        };
+
+        let open_picker_clone = open_picker.clone();
+        emoji_button.connect_clicked(open_picker_clone);
+        let open_picker_row = open_picker;
+        let weak_emoji_btn = emoji_button.downgrade();
+        emoji_row.connect_activated(move |_| {
+            if let Some(btn) = weak_emoji_btn.upgrade() {
+                open_picker_row(&btn);
+            }
+        });
+        emoji_row.add_suffix(&emoji_button);
+        group.add(&emoji_row);
 
         let now = current_unix_seconds();
         let (expiration_labels, expiration_choices, expiration_selected) =
@@ -10403,11 +9718,11 @@ impl ConduitWindow {
         }
         dialog.add_response("save", &gettext("Save"));
         dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-        update_status_dialog_save_response(&dialog, &status_entry, &emoji_picker.selected_name());
+        update_status_dialog_save_response(&dialog, &status_entry, &selected_emoji.borrow());
 
         {
             let weak_dialog = dialog.downgrade();
-            let selected_name = emoji_picker.selected_name_state();
+            let selected_name = selected_emoji.clone();
             status_entry.connect_changed(move |entry| {
                 enforce_status_text_limit(entry);
                 let Some(dialog) = weak_dialog.upgrade() else {
@@ -10417,13 +9732,13 @@ impl ConduitWindow {
             });
         }
 
-        let selected_emoji = emoji_picker.selected_name_state();
         let expiration_choice_count = expiration_choices.len();
         let expiration_choices = Rc::new(expiration_choices);
         let weak_status_entry = status_entry.downgrade();
         let weak_expiration_row = expiration_row.downgrade();
         let weak_window = self.downgrade();
         let dialog_draft = status.clone();
+        let selected_emoji_for_response = selected_emoji.clone();
         dialog.connect_response(None, move |_, response| {
             let Some(window) = weak_window.upgrade() else {
                 return;
@@ -10441,7 +9756,7 @@ impl ConduitWindow {
                     else {
                         return;
                     };
-                    let emoji = selected_emoji.borrow().clone();
+                    let emoji = selected_emoji_for_response.borrow().clone();
                     let choice = expiration_choices
                         .get(expiration_row.selected() as usize)
                         .copied()
@@ -10475,57 +9790,13 @@ impl ConduitWindow {
             .replace(StatusDialogState {
                 dialog: dialog.clone(),
                 status_entry: status_entry.clone(),
-                emoji_picker,
+                selected_emoji,
                 expiration_choice_count,
             });
         dialog.present(Some(self));
         status_entry.grab_focus();
         if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
             write_status_dialog_test_state(self, state);
-        }
-        if std::env::var_os("CONDUIT_TEST_STATUS_OPEN_EMOJI").is_some() {
-            let weak_window = self.downgrade();
-            glib::idle_add_local_once(move || {
-                let Some(window) = weak_window.upgrade() else {
-                    return;
-                };
-                if let Some(state) = window.imp().status_dialog.borrow().as_ref() {
-                    state.emoji_picker.popover.popup();
-                    state.emoji_picker.search.grab_focus();
-                    write_status_dialog_test_state(&window, state);
-                };
-            });
-        }
-        if std::env::var_os("CONDUIT_TEST_STATUS_REOPEN_EMOJI").is_some() {
-            let reopened = Rc::new(Cell::new(false));
-            if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
-                let weak_window = self.downgrade();
-                let reopened = reopened.clone();
-                state.emoji_picker.popover.connect_closed(move |_| {
-                    if reopened.replace(true) {
-                        return;
-                    }
-                    let weak_window = weak_window.clone();
-                    glib::idle_add_local_once(move || {
-                        let Some(window) = weak_window.upgrade() else {
-                            return;
-                        };
-                        if let Some(state) = window.imp().status_dialog.borrow().as_ref() {
-                            state.emoji_picker.popover.popup();
-                            state.emoji_picker.search.grab_focus();
-                            write_status_dialog_test_state(&window, state);
-                        };
-                    });
-                });
-            }
-            let weak_window = self.downgrade();
-            glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                if let Some(window) = weak_window.upgrade() {
-                    if let Some(state) = window.imp().status_dialog.borrow().as_ref() {
-                        state.emoji_picker.popover.popdown();
-                    };
-                }
-            });
         }
     }
 
@@ -10950,6 +10221,7 @@ impl ConduitWindow {
                     known_user_search_aliases: &imp.user_search_aliases.borrow(),
                     user_full_names: &imp.user_full_names.borrow(),
                     user_statuses: &imp.user_statuses.borrow(),
+                    user_avatar_urls: &imp.user_avatar_urls.borrow(),
                 },
                 query.as_str(),
             )
@@ -11341,19 +10613,13 @@ impl ConduitWindow {
                 }
             }
             ConversationSelectionDecision::RequestFresh => {
-                self.load_message_html(&message_html::placeholder_document(
-                    &gettext("Messages"),
-                    &gettext("Loading messages"),
-                ));
+                self.show_message_text_placeholder(&gettext("Messages"), &gettext("Loading messages"));
                 self.send_command(RuntimeCommand::LoadHistory {
                     channel_id: channel_id.to_string(),
                 });
             }
             ConversationSelectionDecision::AwaitFresh => {
-                self.load_message_html(&message_html::placeholder_document(
-                    &gettext("Messages"),
-                    &gettext("Loading messages"),
-                ));
+                self.show_message_text_placeholder(&gettext("Messages"), &gettext("Loading messages"));
             }
         }
         self.imp().pending_last_conversation.borrow_mut().take();
@@ -11411,10 +10677,7 @@ impl ConduitWindow {
                 .borrow()
                 .active_waits_for_explicit_target(channel_id)
         {
-            self.load_message_html(&message_html::placeholder_document(
-                &gettext("Messages"),
-                &gettext("Loading message context"),
-            ));
+            self.show_message_text_placeholder(&gettext("Messages"), &gettext("Loading message context"));
             return;
         }
         let explicit_focus_ts = imp
@@ -11449,46 +10712,31 @@ impl ConduitWindow {
                 .borrow_mut()
                 .note_render_requested(generation)
         });
-        if std::env::var("CONDUIT_NATIVE_TIMELINE").as_deref() == Ok("1") {
+        if render_action != Some(ConversationOpenRenderAction::HoldReconciliation) {
             if let Some(native_timeline) = imp.native_timeline_view.borrow().as_ref() {
-                native_timeline.set_messages(&messages, &context);
+                native_timeline.set_messages(&messages, &context, focus_message_ts.as_deref());
+            }
+            // The native timeline renders synchronously, so once this snapshot has been
+            // applied the position is already settled: commit it so any snapshot held back
+            // by a concurrent HoldReconciliation gets reconciled against current state.
+            if let Some(generation) = active_open_generation {
+                let weak_window = self.downgrade();
+                glib::idle_add_local_once(move || {
+                    let Some(window) = weak_window.upgrade() else {
+                        return;
+                    };
+                    let reconcile = {
+                        let mut opening = window.imp().conversation_opening.borrow_mut();
+                        opening.commit_position(generation)
+                            && opening.take_pending_reconciliation(generation)
+                    };
+                    if reconcile {
+                        window.reconcile_current_conversation_snapshot();
+                    }
+                });
             }
         }
         self.show_timeline_surface();
-        if render_action != Some(ConversationOpenRenderAction::HoldReconciliation) {
-            let revision = imp.workspace.workspace_patch_revision();
-            let document = TimelineDocument::Conversation(channel_id.to_string());
-            let loaded = self.ensure_timeline_document(
-                TimelineSurface::Main,
-                document,
-                revision,
-                context.timeline_scroll,
-                || {
-                    generate_html("conversation", || {
-                        message_html::conversation_document_with_focus(
-                            channel_id,
-                            &messages,
-                            &context,
-                            focus_message_ts.as_deref(),
-                        )
-                    })
-                },
-            );
-            if !loaded {
-                self.apply_timeline_patches_at_revision(
-                    TimelineSurface::Main,
-                    revision,
-                    vec![message_html::conversation_snapshot_patch_with_focus(
-                        channel_id,
-                        &messages,
-                        &context,
-                        focus_message_ts.as_deref(),
-                    )],
-                    context.timeline_scroll,
-                    UiInvalidations::MAIN,
-                );
-            }
-        }
         self.queue_history_asset_followups(channel_id, messages);
     }
 
@@ -11554,68 +10802,22 @@ impl ConduitWindow {
             context.load_more_url = self.thread_load_more_url(channel_id, ts);
         }
         context.timeline_scroll = scroll_behavior;
-
-        if std::env::var("CONDUIT_NATIVE_TIMELINE").as_deref() == Ok("1") {
-            let thread_native_timeline = self.thread_pane().ensure_native_timeline();
-            let window_weak = self.downgrade();
-            thread_native_timeline.set_on_open_media(move |item| {
-                if let Some(window) = window_weak.upgrade() {
-                    window.open_media_viewer(item);
-                }
-            });
-            let window_weak_thread = self.downgrade();
-            thread_native_timeline.set_on_open_thread(move |ts| {
-                if let Some(window) = window_weak_thread.upgrade() {
-                    if let Some(channel_id) = window.visible_channel_id() {
-                        window.open_thread(&channel_id, &ts);
-                    }
-                }
-            });
-            thread_native_timeline.set_messages(&messages, &context);
-            self.thread_pane().ensure_open();
-            return;
-        }
         let focus_message_ts = imp
             .workspace
             .view
             .borrow_mut()
             .take_thread_focus_for_render(channel_id, ts, &messages);
-        let revision = imp.workspace.workspace_patch_revision();
-        let document = TimelineDocument::Thread {
-            channel_id: channel_id.to_string(),
-            ts: ts.to_string(),
-        };
-        let loaded = self.ensure_timeline_document(
-            TimelineSurface::Thread,
-            document,
-            revision,
-            context.timeline_scroll,
-            || {
-                generate_html("thread", || {
-                    message_html::conversation_document_with_focus(
-                        channel_id,
-                        &messages,
-                        &context,
-                        focus_message_ts.as_deref(),
-                    )
-                })
-            },
-        );
-        if !loaded {
-            self.ensure_thread_web_view();
+
+        {
+            let thread_native_timeline = self.thread_pane().ensure_native_timeline();
+            let window_weak = self.downgrade();
+            thread_native_timeline.set_on_action(move |action| {
+                if let Some(window) = window_weak.upgrade() {
+                    window.handle_timeline_action(action);
+                }
+            });
+            thread_native_timeline.set_messages(&messages, &context, focus_message_ts.as_deref());
             self.thread_pane().ensure_open();
-            self.apply_timeline_patches_at_revision(
-                TimelineSurface::Thread,
-                revision,
-                vec![message_html::conversation_snapshot_patch_with_focus(
-                    channel_id,
-                    &messages,
-                    &context,
-                    focus_message_ts.as_deref(),
-                )],
-                context.timeline_scroll,
-                UiInvalidations::THREAD,
-            );
         }
     }
 
@@ -12526,10 +11728,25 @@ impl ConduitWindow {
     }
 
     fn show_message_placeholder(&self, text: &str) {
-        self.load_message_html(&message_html::placeholder_document(
-            &gettext("Messages"),
-            text,
-        ));
+        if let Some(native_timeline) = self.imp().native_timeline_view.borrow().as_ref() {
+            native_timeline.show_placeholder(text);
+        }
+        self.show_timeline_surface();
+    }
+
+    /// Shows a titled text placeholder (loading state, empty state, error) in the main
+    /// timeline surface, for flows that previously rendered `placeholder_document` HTML.
+    fn show_message_text_placeholder(&self, title: &str, message: &str) {
+        self.show_message_placeholder(&format!("{title}\n\n{message}"));
+    }
+
+    /// Shows a titled text placeholder in the secondary surface. See
+    /// `show_message_text_placeholder` for the main-surface equivalent.
+    fn show_secondary_text_placeholder(&self, title: &str, message: &str) {
+        if let Some(native_timeline) = self.imp().native_timeline_view.borrow().as_ref() {
+            native_timeline.show_placeholder(&format!("{title}\n\n{message}"));
+        }
+        self.show_secondary_surface();
     }
 
     fn show_timeline_surface(&self) {
@@ -12537,101 +11754,20 @@ impl ConduitWindow {
             if viewer.surface_stack.visible_child_name().as_deref() == Some("media") {
                 self.close_media_viewer();
             }
-            if std::env::var("CONDUIT_NATIVE_TIMELINE").as_deref() == Ok("1") {
-                viewer.surface_stack.set_visible_child_name("native_timeline");
-            } else {
-                viewer.surface_stack.set_visible_child_name("timeline");
-            }
+            viewer.surface_stack.set_visible_child_name("native_timeline");
         }
     }
 
     fn show_secondary_surface(&self) {
-        if let Some(viewer) = self.imp().media_viewer.borrow().as_ref() {
-            if viewer.surface_stack.visible_child_name().as_deref() == Some("media") {
-                self.close_media_viewer();
-            }
-            viewer.surface_stack.set_visible_child_name("secondary");
-        }
-    }
-
-    fn load_message_html(&self, html: &str) {
-        self.timeline_presenter(TimelineSurface::Main)
-            .borrow_mut()
-            .reset();
         self.show_timeline_surface();
-        if let Some(web_view) = self.imp().message_view.borrow().as_ref() {
-            let started = Instant::now();
-            crate::debug::log("ui", &format!("load_message_html bytes={}", html.len()));
-            crate::debug::pipeline_counters().record_document_load();
-            web_view.load_html(html, Some(message_html::base_uri()));
-            log_performance(started, |elapsed_ms| {
-                format!(
-                    "html_load_submit surface=main bytes={} elapsed_ms={:.2}",
-                    html.len(),
-                    elapsed_ms
-                )
-            });
-        }
     }
 
-    fn load_secondary_html(&self, html: &str) {
+    fn load_message_html(&self, _html: &str) {
+        self.show_timeline_surface();
+    }
+
+    fn load_secondary_html(&self, _html: &str) {
         self.show_secondary_surface();
-        if let Some(web_view) = self.imp().secondary_message_view.borrow().as_ref() {
-            let started = Instant::now();
-            crate::debug::log("ui", &format!("load_secondary_html bytes={}", html.len()));
-            crate::debug::pipeline_counters().record_document_load();
-            web_view.load_html(html, Some(message_html::base_uri()));
-            log_performance(started, |elapsed_ms| {
-                format!(
-                    "html_load_submit surface=secondary bytes={} elapsed_ms={:.2}",
-                    html.len(),
-                    elapsed_ms
-                )
-            });
-        }
-    }
-
-    fn ensure_timeline_document(
-        &self,
-        surface: TimelineSurface,
-        document: TimelineDocument,
-        revision: WorkspaceRevision,
-        scroll: TimelineScrollBehavior,
-        render: impl FnOnce() -> String,
-    ) -> bool {
-        let action = self
-            .timeline_presenter(surface)
-            .borrow_mut()
-            .prepare_document(document, revision, scroll);
-        if action != TimelinePresenterAction::LoadDocument {
-            return false;
-        }
-
-        let html = render();
-        let started = Instant::now();
-        match surface {
-            TimelineSurface::Main => {
-                self.show_timeline_surface();
-                if let Some(web_view) = self.imp().message_view.borrow().as_ref() {
-                    crate::debug::pipeline_counters().record_document_load();
-                    web_view.load_html(&html, Some(message_html::base_uri()));
-                }
-            }
-            TimelineSurface::Thread => {
-                self.ensure_thread_web_view();
-                self.thread_pane().load_document(&html);
-                record_test_web_view_lifecycle(self);
-            }
-        }
-        log_performance(started, |elapsed_ms| {
-            format!(
-                "timeline_document_load surface={surface:?} bytes={} revision={} elapsed_ms={:.2}",
-                html.len(),
-                revision.value(),
-                elapsed_ms
-            )
-        });
-        true
     }
 
     fn close_thread_pane(&self) {
@@ -12646,7 +11782,6 @@ impl ConduitWindow {
         self.timeline_presenter(TimelineSurface::Thread)
             .borrow_mut()
             .reset();
-        self.ensure_thread_web_view();
         self.thread_pane().show_placeholder(message);
         record_test_web_view_lifecycle(self);
     }
@@ -13007,6 +12142,14 @@ impl ConduitWindow {
                 (conversation.id.clone(), title)
             },
         ));
+        let private_conversation_ids = imp
+            .discovered_channels
+            .borrow()
+            .iter()
+            .chain(imp.workspace.conversations.borrow().iter())
+            .filter(|conversation| conversation.is_private.unwrap_or(false))
+            .map(|conversation| conversation.id.clone())
+            .collect::<HashSet<_>>();
         let recent_reactions = imp
             .settings
             .borrow()
@@ -13037,6 +12180,7 @@ impl ConduitWindow {
             user_full_names: imp.user_full_names.borrow().clone(),
             user_avatar_urls: imp.user_avatar_urls.borrow().clone(),
             conversation_titles,
+            private_conversation_ids,
             user_statuses: imp.user_statuses.borrow().clone(),
             user_group_names: imp.user_group_names.borrow().clone(),
             user_group_members: imp.user_group_members.borrow().clone(),
@@ -13124,9 +12268,9 @@ fn record_test_web_view_lifecycle(window: &ConduitWindow) {
     let _ = std::fs::write(
         path,
         serde_json::json!({
-            "main_web_view": imp.message_view.borrow().is_some(),
-            "thread_web_view": window.thread_pane().has_web_view(),
-            "thread_web_view_creations": window.thread_pane().web_view_creation_count(),
+            "main_web_view": false,
+            "thread_web_view": false,
+            "thread_web_view_creations": 0,
             "thread_open": window.thread_pane().is_open(),
             "thread_widget_children": thread_widget_children,
             "selected_channel": window.selected_channel_id(),
@@ -13223,26 +12367,12 @@ fn write_status_dialog_test_state(window: &ConduitWindow, state: &StatusDialogSt
         path,
         serde_json::json!({
             "dialog_heading": state.dialog.heading().map(|heading| heading.to_string()),
-            "emoji_search": true,
-            "emoji_filter_ready": state.emoji_picker.popover.child().is_some(),
-            "emoji_layout": "reaction-grid",
-            "emoji_category_count": state.emoji_picker.category_count(),
-            "emoji_active_category": state.emoji_picker.active_category(),
-            "emoji_page_total": state.emoji_picker.page_total(),
-            "emoji_popup_visible": state.emoji_picker.popover.is_visible(),
-            "emoji_query": state.emoji_picker.search.text().to_string(),
-            "emoji_choice_count": state.emoji_picker.source_choice_count(),
-            "emoji_visible_choice_count": state.emoji_picker.visible_choice_count(),
-            "emoji_first_visible_name": state.emoji_picker.first_visible_name(),
-            "emoji_contains_late_custom": state.emoji_picker.contains("late_status_parrot"),
-            "emoji_selected_name": state.emoji_picker.selected_name(),
-            "emoji_selected_visible_name": state.emoji_picker.selected_visible_name(),
-            "emoji_selected_summary_kind": state.emoji_picker.selected_summary_kind(),
+            "emoji_selected_name": state.selected_emoji.borrow().clone(),
             "expiration_choice_count": state.expiration_choice_count,
             "save_enabled": state.dialog.is_response_enabled("save"),
             "clear_available": state.dialog.has_response("clear"),
             "status_has_value": !state.status_entry.text().trim().is_empty()
-                || !state.emoji_picker.selected_name().is_empty(),
+                || !state.selected_emoji.borrow().is_empty(),
             "header_title": imp.workspace_title_label.title().to_string(),
             "header_subtitle": imp.workspace_title_label.subtitle().to_string(),
             "window_width": window.width(),
@@ -13255,6 +12385,10 @@ enum TestComposerCompletion<'a> {
     Emoji(&'a str),
     Mention {
         user_id: &'a str,
+        serialized: &'a str,
+    },
+    Channel {
+        channel_id: &'a str,
         serialized: &'a str,
     },
 }
@@ -13302,19 +12436,11 @@ fn record_test_composer_completion_ready(target: ComposerTarget, completion: &Co
 }
 
 fn record_test_composer_completion(
-    window: &imp::ConduitWindow,
+    _window: &imp::ConduitWindow,
     target: ComposerTarget,
     completion: TestComposerCompletion<'_>,
 ) {
     let Some(path) = std::env::var_os("CONDUIT_TEST_COMPOSER_COMPLETION_FILE") else {
-        return;
-    };
-    let settings = window
-        .message_view
-        .borrow()
-        .as_ref()
-        .and_then(webkit6::prelude::WebViewExt::settings);
-    let Some(settings) = settings else {
         return;
     };
     let target = match target {
@@ -13323,17 +12449,6 @@ fn record_test_composer_completion(
     };
     let mut state = serde_json::json!({
         "target": target,
-        "webkit": {
-            "allow_file_access": settings.allows_file_access_from_file_urls(),
-            "allow_universal_access": settings.allows_universal_access_from_file_urls(),
-            "html5_database": settings.enables_html5_database(),
-            "html5_local_storage": settings.enables_html5_local_storage(),
-            "javascript": settings.enables_javascript(),
-            "media": settings.enables_media(),
-            "webaudio": settings.enables_webaudio(),
-            "webgl": settings.enables_webgl(),
-            "zoom_text_only": settings.is_zoom_text_only(),
-        },
     });
     match completion {
         TestComposerCompletion::Emoji(name) => state["emoji"] = name.into(),
@@ -13342,6 +12457,13 @@ fn record_test_composer_completion(
             serialized,
         } => {
             state["mention"] = user_id.into();
+            state["serialized"] = serialized.into();
+        }
+        TestComposerCompletion::Channel {
+            channel_id,
+            serialized,
+        } => {
+            state["channel"] = channel_id.into();
             state["serialized"] = serialized.into();
         }
     }
@@ -13494,41 +12616,7 @@ mod tests {
         assert!(!valid_channel_name(&"a".repeat(81)));
     }
 
-    #[test]
-    fn reaction_picker_escape_fallback_uses_the_shared_cancel_event() {
-        assert!(CANCEL_REACTION_PICKER_SCRIPT.contains("picker.open"));
-        assert!(CANCEL_REACTION_PICKER_SCRIPT
-            .contains("picker.dispatchEvent(new Event(\"cancel\", { cancelable: true }))"));
-    }
 
-    #[test]
-    fn emoji_picker_bridge_accepts_only_the_typed_query_shape() {
-        let query = emoji_picker_query_from_json(
-            r#"{"version":1,"generation":42,"query":"party parr","category":null,"offset":64}"#,
-        )
-        .unwrap();
-
-        assert_eq!(query.version, 1);
-        assert_eq!(query.generation, 42);
-        assert_eq!(query.query, "party parr");
-        assert_eq!(query.category, None);
-        assert_eq!(query.offset, 64);
-        assert!(emoji_picker_query_from_json(
-            r#"{"version":1,"generation":42,"query":"","category":null,"offset":0,"extra":true}"#
-        )
-        .is_none());
-        assert!(emoji_picker_query_from_json("not-json").is_none());
-    }
-
-    #[test]
-    fn emoji_picker_bridge_passes_serialized_data_as_a_function_argument() {
-        assert_eq!(
-            APPLY_EMOJI_PICKER_RESULT_SCRIPT,
-            "window.conduitReceiveEmojiPickerResult(JSON.parse(payload));"
-        );
-        assert!(!APPLY_EMOJI_PICKER_RESULT_SCRIPT.contains("${"));
-        assert!(!APPLY_EMOJI_PICKER_RESULT_SCRIPT.contains("entries"));
-    }
 
     #[test]
     fn lifecycle_presentation_owns_connection_surface_and_status() {
@@ -14035,6 +13123,7 @@ mod tests {
             user_deleted: false,
             search_aliases: Vec::new(),
             status: None,
+            avatar_url: None,
         }
     }
 
@@ -14997,19 +14086,7 @@ mod tests {
         assert_eq!(picker_flags, UiInvalidations::PICKER);
     }
 
-    #[test]
-    fn message_text_zoom_matches_the_gtk_theme_font_size() {
-        let expected = 11.0 * 96.0 / 72.0 / 14.0;
-        assert!((message_text_zoom(Some("Cantarell 11")) - expected).abs() < 1e-12);
-        assert!((message_text_zoom(Some("Sans 10.5")) - 1.0).abs() < 1e-12);
-        assert!((message_text_zoom(Some("Sans 14px")) - 1.0).abs() < 1e-12);
-        assert_eq!(
-            message_text_zoom(Some("Cantarell 11")),
-            message_text_zoom(Some("Serif 11"))
-        );
-        assert_eq!(message_text_zoom(Some("Cantarell")), 1.0);
-        assert_eq!(message_text_zoom(None), 1.0);
-    }
+
 
     #[test]
     fn browser_session_input_requires_both_tokens() {

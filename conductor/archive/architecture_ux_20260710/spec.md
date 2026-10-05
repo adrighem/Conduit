@@ -2,7 +2,7 @@
 
 ## Summary
 
-Evolve Conduit from a feature-rich prototype into a durable desktop architecture without discarding its tested GTK/WebKit approach. Correctness and state ownership come first, followed by responsiveness, clearer module boundaries, adaptive accessibility, and coherent product semantics.
+Evolve Conduit from a feature-rich prototype into a durable desktop architecture without discarding its tested GTK/native UI approach. Correctness and state ownership come first, followed by responsiveness, clearer module boundaries, adaptive accessibility, and coherent product semantics.
 
 ## Requirements
 
@@ -34,5 +34,5 @@ Evolve Conduit from a feature-rich prototype into a durable desktop architecture
 - Multi-workspace switching.
 - Presence and avatar synchronization.
 - A full Slack-wide mentions/replies/reactions Activity API that Slack does not currently expose through Conduit's configured endpoints. The current surface may be renamed to accurately describe unread conversations.
-- Replacing WebKitGTK with a native message widget tree.
+- Replacing GTK4 with a native message widget tree.
 - CSS features with less than 80% browser support.

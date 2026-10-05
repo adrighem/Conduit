@@ -52,11 +52,6 @@ def wait_for_window_manager(environment: dict[str, str], process: subprocess.Pop
 def run_test() -> int:
     with tempfile.TemporaryDirectory(prefix="conduit-dbus-") as temporary:
         environment = os.environ.copy()
-        # Headless/containerized test environments commonly disallow the user
-        # namespaces required by WebKit's Bubblewrap sandbox. The activated
-        # service inherits the D-Bus daemon's environment, so this must be set
-        # before that daemon starts.
-        environment["WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS"] = "1"
         config = Path(temporary) / "bus.conf"
         service_dir = os.environ.get("CONDUIT_TEST_DBUS_SERVICE_DIR")
         service_config = (

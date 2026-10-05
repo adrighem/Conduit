@@ -12,7 +12,7 @@ Incrementally harden Conduit's runtime architecture around typed failures, struc
 4. Workspace connection lifecycle must be represented by a small explicit state model covering disconnected, connecting, syncing, ready, degraded, authentication-required, and terminal startup failure behavior.
 5. Lifecycle transitions must be pure and unit tested; GTK widgets must render the authoritative lifecycle rather than independently infer it from status strings.
 6. Application use cases must be extracted incrementally from `runtime.rs` and `window.rs` behind narrow services. Network and persistence traits should be introduced only where a concrete test seam or alternate implementation needs them.
-7. Domain and application modules must remain usable in headless unit tests and must not depend on GTK or WebKit.
+7. Domain and application modules must remain usable in headless unit tests and must not depend on GTK or native UI.
 8. Existing user-visible behavior, request supersession, stale-event protection, and operation-local recovery must remain intact.
 
 ## Acceptance Criteria
@@ -35,7 +35,7 @@ Incrementally harden Conduit's runtime architecture around typed failures, struc
 
 ## Out of Scope
 
-- Replacing Tokio, GTK, WebKitGTK, reqwest, or rusqlite.
+- Replacing Tokio, GTK, GTK4, reqwest, or rusqlite.
 - Multi-workspace switching.
 - A complete rewrite of `runtime.rs` or `window.rs` in one phase.
 - A generic dependency-injection framework or event-sourcing architecture.

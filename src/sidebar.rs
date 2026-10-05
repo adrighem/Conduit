@@ -82,6 +82,7 @@ pub struct SidebarRowModel {
     pub user_deleted: bool,
     pub search_aliases: Vec<String>,
     pub status: Option<SlackUserStatus>,
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +488,7 @@ pub struct SidebarBuildOptions<'a> {
     pub user_search_aliases: Option<&'a UserSearchAliases>,
     pub user_full_names: Option<&'a HashMap<String, String>>,
     pub user_statuses: Option<&'a UserStatuses>,
+    pub user_avatar_urls: Option<&'a HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -497,6 +499,7 @@ struct SidebarRowOptions<'a> {
     user_search_aliases: Option<&'a UserSearchAliases>,
     user_full_names: Option<&'a HashMap<String, String>>,
     user_statuses: Option<&'a UserStatuses>,
+    user_avatar_urls: Option<&'a HashMap<String, String>>,
 }
 
 impl SidebarRowModel {
@@ -564,6 +567,10 @@ impl SidebarRowModel {
                 .then_some(conversation.user.as_deref())
                 .flatten()
                 .and_then(|user_id| active_user_status(options.user_statuses, user_id)),
+            avatar_url: (kind == ConversationKind::DirectMessage)
+                .then_some(conversation.user.as_deref())
+                .flatten()
+                .and_then(|user_id| options.user_avatar_urls?.get(user_id).cloned()),
         }
     }
 
@@ -598,6 +605,7 @@ pub(crate) fn sidebar_row_for_conversation(
             user_search_aliases: options.user_search_aliases,
             user_full_names: options.user_full_names,
             user_statuses: options.user_statuses,
+            user_avatar_urls: options.user_avatar_urls,
         },
     )
 }
@@ -740,9 +748,11 @@ pub fn conversation_switcher_items(
         None,
         None,
         None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn conversation_switcher_items_with_aliases(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
@@ -751,6 +761,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
     user_search_aliases: Option<&UserSearchAliases>,
     user_full_names: Option<&HashMap<String, String>>,
     user_statuses: Option<&UserStatuses>,
+    user_avatar_urls: Option<&HashMap<String, String>>,
 ) -> Vec<SidebarRowModel> {
     let rows = conversation_switcher_rows_with_aliases(
         conversations,
@@ -759,6 +770,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
         user_search_aliases,
         user_full_names,
         user_statuses,
+        user_avatar_urls,
     );
     filter_conversation_switcher_rows(
         &rows,
@@ -770,6 +782,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn conversation_switcher_rows_with_aliases(
     conversations: &[SlackConversation],
     user_names: &HashMap<String, String>,
@@ -777,6 +790,7 @@ pub(crate) fn conversation_switcher_rows_with_aliases(
     user_search_aliases: Option<&UserSearchAliases>,
     user_full_names: Option<&HashMap<String, String>>,
     user_statuses: Option<&UserStatuses>,
+    user_avatar_urls: Option<&HashMap<String, String>>,
 ) -> Vec<SidebarRowModel> {
     conversations
         .iter()
@@ -790,6 +804,7 @@ pub(crate) fn conversation_switcher_rows_with_aliases(
                     user_search_aliases,
                     user_full_names,
                     user_statuses,
+                    user_avatar_urls,
                     ..Default::default()
                 },
             )
@@ -887,6 +902,7 @@ pub fn conversation_picker_sections_with_aliases(
             known_user_search_aliases,
             user_full_names: &HashMap::new(),
             user_statuses: &HashMap::new(),
+            user_avatar_urls: &HashMap::new(),
         },
         query,
     )
@@ -901,6 +917,7 @@ pub struct ConversationPickerSource<'a> {
     pub known_user_search_aliases: &'a UserSearchAliases,
     pub user_full_names: &'a HashMap<String, String>,
     pub user_statuses: &'a UserStatuses,
+    pub user_avatar_urls: &'a HashMap<String, String>,
 }
 
 pub fn conversation_picker_sections_with_statuses(
@@ -916,6 +933,7 @@ pub fn conversation_picker_sections_with_statuses(
         known_user_search_aliases,
         user_full_names,
         user_statuses,
+        user_avatar_urls,
     } = source;
     let search_query = SearchQuery::parse(query);
     let mut all_user_search_aliases = known_user_search_aliases.clone();
@@ -972,6 +990,7 @@ pub fn conversation_picker_sections_with_statuses(
         Some(&all_user_search_aliases),
         Some(user_full_names),
         Some(user_statuses),
+        Some(user_avatar_urls),
     )
     .into_iter()
     .map(|row| ConversationPickerItem {
@@ -1026,6 +1045,7 @@ pub fn conversation_picker_sections_with_statuses(
                 status: user
                     .status()
                     .filter(|status| status.active_at(current_unix_seconds())),
+                avatar_url: user_avatar_urls.get(id).cloned(),
             };
             row.match_score(&search_query)
                 .is_some()
@@ -1519,7 +1539,42 @@ mod tests {
             user_deleted: false,
             search_aliases: Vec::new(),
             status: None,
+            avatar_url: None,
         }
+    }
+
+    #[test]
+    fn dm_row_gets_avatar_url_from_options_but_channel_does_not() {
+        let dm_conversation = dm("D1", "U1");
+        let channel_conversation = channel("C1", "general");
+        let avatar_urls = HashMap::from([("U1".to_string(), "https://example.com/u1.png".to_string())]);
+        let options = SidebarBuildOptions {
+            user_avatar_urls: Some(&avatar_urls),
+            ..Default::default()
+        };
+
+        let dm_row = sidebar_row_for_conversation(&dm_conversation, &HashMap::new(), options);
+        let channel_row = sidebar_row_for_conversation(&channel_conversation, &HashMap::new(), options);
+
+        assert_eq!(
+            dm_row.avatar_url.as_deref(),
+            Some("https://example.com/u1.png")
+        );
+        assert_eq!(channel_row.avatar_url, None);
+    }
+
+    #[test]
+    fn dm_row_has_no_avatar_when_user_missing_from_map() {
+        let dm_conversation = dm("D1", "U_UNKNOWN");
+        let avatar_urls = HashMap::from([("U1".to_string(), "https://example.com/u1.png".to_string())]);
+        let options = SidebarBuildOptions {
+            user_avatar_urls: Some(&avatar_urls),
+            ..Default::default()
+        };
+
+        let dm_row = sidebar_row_for_conversation(&dm_conversation, &HashMap::new(), options);
+
+        assert_eq!(dm_row.avatar_url, None);
     }
 
     #[test]
@@ -2349,11 +2404,13 @@ mod tests {
             None,
             Some(&full_names),
             None,
+            None,
         );
         let empty_conversations = Vec::new();
         let empty_users = Vec::new();
         let empty_aliases = HashMap::new();
         let empty_statuses = HashMap::new();
+        let empty_avatar_urls = HashMap::new();
         let forward_picker = conversation_picker_sections_with_statuses(
             ConversationPickerSource {
                 conversations: &[dm],
@@ -2364,6 +2421,7 @@ mod tests {
                 known_user_search_aliases: &empty_aliases,
                 user_full_names: &full_names,
                 user_statuses: &empty_statuses,
+                user_avatar_urls: &empty_avatar_urls,
             },
             "",
         );

@@ -219,6 +219,7 @@ fn prepare_states(states: Vec<CachedSearchState>) -> Vec<PreparedSearchState> {
                 Some(&state.user_search_aliases),
                 Some(&state.user_full_names),
                 None,
+                None,
             );
             PreparedSearchState {
                 workspace_id: state.workspace_id,

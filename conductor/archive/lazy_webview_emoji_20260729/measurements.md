@@ -6,7 +6,7 @@
 - OS: Debian GNU/Linux 13 (trixie), Linux 7.1.4-native-xanmod1 x86_64
 - CPU: 13th Gen Intel(R) Core(TM) i7-1355U, 12 logical CPUs
 - Rust: 1.95.0
-- WebKitGTK: 2.52.3
+- GTK4: 2.52.3
 - GTK: 4.22.4
 - libadwaita: 1.9.2
 
@@ -114,7 +114,7 @@ cost after every close.
 
 ## Picker-open latency and scroll stability
 
-The production picker JavaScript was exercised in WebKitGTK three times with the credential-free,
+The production picker JavaScript was exercised in GTK4 three times with the credential-free,
 bounded picker fixture. The fixture deliberately waits 30 ms before returning the current native
 query result, so the measurement covers dispatch, that fixed delay, result validation, and
 materialization of the first 64 choices.

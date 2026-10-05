@@ -13,7 +13,6 @@ Build-Depends:
  libdbus-1-dev,
  libgdk-pixbuf-2.0-dev,
  libgtk-4-dev,
- libwebkitgtk-6.0-dev,
  meson,
  ninja-build,
  pkgconf,
@@ -33,5 +32,5 @@ Depends:
  xdg-desktop-portal,
  xdg-utils
 Description: focused native Slack client for GNOME
- Conduit is a Rust, GTK4, libadwaita, and WebKitGTK desktop client for
+ Conduit is a Rust, GTK4, and libadwaita desktop client for
  everyday Slack conversations, threads, search, files, and huddles.
