@@ -26,6 +26,13 @@ pub struct UploadAttachment {
     pub remove_after_upload: bool,
 }
 
+/// Editable free-text conversation metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationTextField {
+    Topic,
+    Purpose,
+}
+
 #[derive(Debug)]
 pub enum RuntimeCommand {
     LoadStoredToken,
@@ -49,6 +56,14 @@ pub enum RuntimeCommand {
     },
     LeaveConversation {
         channel_id: String,
+    },
+    LoadConversationDetails {
+        channel_id: String,
+    },
+    SetConversationText {
+        channel_id: String,
+        field: ConversationTextField,
+        text: String,
     },
     OpenDirectMessage {
         user_id: String,
@@ -219,6 +234,8 @@ pub enum RuntimeOperation {
     ConversationDiscovery,
     OpenConversation,
     LeaveConversation,
+    ConversationDetails,
+    ConversationEdit,
     History,
     OlderHistory,
     Thread,

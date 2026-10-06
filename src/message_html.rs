@@ -5,6 +5,7 @@ use gettextrs::gettext;
 use serde::Serialize;
 
 use crate::config;
+use crate::day_label::{capitalize_first_letter, date_text};
 use crate::debug;
 use crate::emoji::{
     EmojiCatalog, EmojiEntry, EmojiValue, EMOJI_PICKER_CATEGORIES, EMOJI_PICKER_MAX_QUERY_CHARS,
@@ -2387,72 +2388,32 @@ fn full_timestamp_with_timezone(localized: &str, timezone: &str) -> String {
     }
 }
 
-fn capitalize_first_letter(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-    }
-}
-
 fn compact_timestamp_text(
     datetime: &gtk::glib::DateTime,
     now: &gtk::glib::DateTime,
 ) -> Option<String> {
     let time = datetime.format(&gettext("%H:%M")).ok()?.to_string();
-    let days_old = local_calendar_day(now) - local_calendar_day(datetime);
+    let days_old = crate::day_label::days_old(datetime, now);
 
     if days_old == 0 {
         return Some(time);
     }
 
-    if (1..=6).contains(&days_old) {
-        let weekday_raw = datetime.format("%A").ok()?.to_string();
-        let weekday = capitalize_first_letter(&weekday_raw);
-        return Some(
-            gettext("{day}, {time}")
-                .replace("{day}", &weekday)
-                .replace("{time}", &time),
-        );
-    }
-
-    let include_year = days_old >= 183 || datetime.year() != now.year();
-    let format_str = if include_year {
-        gettext("%e %b %Y")
+    let day = if days_old == 1 {
+        gettext("Yesterday")
+    } else if (2..=6).contains(&days_old) {
+        capitalize_first_letter(&datetime.format("%A").ok()?.to_string())
     } else {
-        gettext("%e %b")
+        date_text(datetime, now)?
     };
-    let date_raw = datetime
-        .format(&format_str)
-        .ok()?
-        .trim()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let date_str = capitalize_first_letter(&date_raw);
-
     Some(
         gettext("{day}, {time}")
-            .replace("{day}", &date_str)
+            .replace("{day}", &day)
             .replace("{time}", &time),
     )
 }
 
-fn local_calendar_day(datetime: &gtk::glib::DateTime) -> i64 {
-    // Convert a civil date to a monotonic day number. Time and UTC offset are
-    // intentionally ignored: relative labels follow the user's local dates.
-    let mut year = i64::from(datetime.year());
-    let month = i64::from(datetime.month());
-    let day = i64::from(datetime.day_of_month());
-    year -= i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let shifted_month = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
-    era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
-}
-
-fn slack_ts_datetime(ts: &str) -> Option<gtk::glib::DateTime> {
+pub(crate) fn slack_ts_datetime(ts: &str) -> Option<gtk::glib::DateTime> {
     let (seconds, _) = parse_slack_ts(ts)?;
     gtk::glib::DateTime::from_unix_local(seconds).ok()
 }
@@ -5124,10 +5085,9 @@ mod tests {
         );
 
         let yesterday = at(2026, 7, 14);
-        let weekday_yesterday = capitalize_first_letter(&yesterday.format("%A").unwrap());
         assert!(compact_timestamp_text(&yesterday, &now)
             .unwrap()
-            .contains(&weekday_yesterday));
+            .starts_with("Yesterday, "));
 
         let five_days_ago = at(2026, 7, 10);
         let weekday = capitalize_first_letter(&five_days_ago.format("%A").unwrap());
@@ -7031,7 +6991,7 @@ mod tests {
 
     #[test]
     fn test_mrkdwn_to_pango_emoji() {
-        let mut context = MessageHtmlContext::default();
+        let context = MessageHtmlContext::default();
         let input = ":smile: and :unknown_emoji:";
         let output = mrkdwn_to_pango(input, &context);
         assert_eq!(output, "😄 and :unknown_emoji:");

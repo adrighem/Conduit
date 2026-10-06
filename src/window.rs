@@ -1513,6 +1513,22 @@ fn message_title_profile_action(
     conversation.and_then(conversation_profile_action)
 }
 
+/// Channels and group DMs make the title a button for the details dialog.
+fn message_title_opens_details(
+    main_view: MainMessageView,
+    editing_message: bool,
+    conversation: Option<&SlackConversation>,
+) -> bool {
+    main_view == MainMessageView::Conversation
+        && !editing_message
+        && conversation.is_some_and(|conversation| {
+            matches!(
+                crate::channel_details::title_behavior(sidebar::conversation_kind(conversation)),
+                Some(crate::channel_details::TitleBehavior::OpenDetails(_))
+            )
+        })
+}
+
 fn message_title_profile_label(title: &str) -> String {
     gettext("Open profile for {name}").replace("{name}", title)
 }
@@ -1983,6 +1999,7 @@ enum RuntimeFailureRecovery {
     Files,
     SavedItems,
     User(String),
+    ConversationDetails(String),
     Image(String),
     Media,
     Attachment,
@@ -2047,6 +2064,10 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
         (RuntimeOperation::User, RuntimeTarget::User(user_id)) => {
             RuntimeFailureRecovery::User(user_id.clone())
         }
+        (
+            RuntimeOperation::ConversationDetails | RuntimeOperation::ConversationEdit,
+            RuntimeTarget::Channel(channel_id),
+        ) => RuntimeFailureRecovery::ConversationDetails(channel_id.clone()),
         (RuntimeOperation::ImageAsset, RuntimeTarget::Image(key)) => {
             RuntimeFailureRecovery::Image(key.clone())
         }
@@ -2413,14 +2434,16 @@ fn attachment_image_asset_request(
         .image_url
         .as_deref()
         .or(attachment.thumb_url.as_deref())?;
-    native_preview_asset_request(url)
+    document_image_asset_request(url)
 }
 
-fn native_preview_asset_request(url: &str) -> Option<(String, String)> {
-    if !crate::slack::supports_native_preview_asset_url(url) {
-        return None;
-    }
-    bounded_image_asset_request(url)
+/// Document images (blocks, unfurls) keep the original URL as cache key but
+/// fetch via `preview_fetch_url`: direct for allowlisted hosts, otherwise
+/// through Slack's image proxy. Must agree with `timeline_media::fetchable_url`.
+fn document_image_asset_request(url: &str) -> Option<(String, String)> {
+    let (key, _) = bounded_image_asset_request(url)?;
+    let fetch_url = crate::image_proxy::preview_fetch_url(url)?;
+    Some((key, fetch_url))
 }
 
 fn bounded_image_asset_request(url: &str) -> Option<(String, String)> {
@@ -2472,7 +2495,7 @@ fn message_image_asset_requests<'a>(
         for request in message
             .document
             .image_urls()
-            .filter_map(native_preview_asset_request)
+            .filter_map(document_image_asset_request)
         {
             retain_image_asset_request(&mut requests, Some(request));
         }
@@ -3084,6 +3107,10 @@ impl ConduitWindow {
                     self.copy_message_text(&channel_id, &ts);
                 }
             }
+            TimelineAction::MessageUser(user_id) => {
+                self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
+            }
+            TimelineAction::ShowProfile(user_id) => self.show_profile_dialog(&user_id),
             TimelineAction::AutoMarkRead {
                 channel_id,
                 thread_ts,
@@ -6428,10 +6455,27 @@ impl ConduitWindow {
                 }
                 self.set_status(&gettext("People added"));
             }
+            RuntimeEventKind::ConversationDetailsLoaded {
+                channel_id,
+                conversation,
+            } => self.apply_channel_details(&channel_id, &conversation),
+            RuntimeEventKind::ConversationDetailsUpdated {
+                channel_id,
+                conversation,
+            } => {
+                self.apply_channel_details(&channel_id, &conversation);
+                self.set_status(&gettext("Conversation updated"));
+            }
+            RuntimeEventKind::ConversationMembersLoaded {
+                channel_id,
+                user_ids,
+                complete,
+            } => crate::channel_details_dialog::append_members(&channel_id, &user_ids, complete),
             RuntimeEventKind::ConversationStarUpdateCompleted {
-                channel_id: _,
+                channel_id,
                 starred,
             } => {
+                self.refresh_channel_details(&channel_id, true);
                 self.set_status(&gettext(if starred {
                     "Conversation starred"
                 } else {
@@ -6449,7 +6493,8 @@ impl ConduitWindow {
                     "Status updated"
                 }));
             }
-            RuntimeEventKind::ConversationLeft { channel_id: _ } => {
+            RuntimeEventKind::ConversationLeft { channel_id } => {
+                crate::channel_details_dialog::close(&channel_id);
                 self.set_status(&gettext("Left channel"));
             }
             RuntimeEventKind::AttentionNotificationCandidate {
@@ -6638,6 +6683,7 @@ impl ConduitWindow {
             RuntimeEventKind::WorkspaceRefreshRequested => self.refresh_conversations(),
             RuntimeEventKind::Huddle(event) => self.handle_huddle_event(event),
             RuntimeEventKind::UserProfileLoadCompleted { user_id } => {
+                self.refresh_profile_dialog(&user_id);
                 let imp = self.imp();
                 let expected = imp.pending_profile_user_id.borrow().clone();
                 if accepts_user_profile_completion(
@@ -7813,22 +7859,257 @@ impl ConduitWindow {
         self.close_thread_pane();
     }
 
-    fn show_user_profile(&self, user_id: &str) {
+    /// Builds the profile dialog input from the workspace directory, if the
+    /// user is known.
+    fn profile_dialog_input(&self, user_id: &str) -> Option<crate::profile_dialog::ProfileInput> {
+        let imp = self.imp();
+        let user = imp.workspace.users.borrow().get(user_id).cloned()?;
+        let avatar_url = imp
+            .user_avatar_urls
+            .borrow()
+            .get(user_id)
+            .cloned()
+            .or_else(|| user.avatar_url());
+        let context = self.message_html_context(None);
+        let avatar_path = avatar_url.and_then(|url| {
+            crate::timeline_message_widget::resolve_cached_asset_path(&url, &context)
+        });
+        let can_message = !user.is_bot.unwrap_or(false)
+            && imp.current_user_id.borrow().as_deref() != Some(user_id);
+        Some(crate::profile_dialog::ProfileInput {
+            user,
+            avatar_path,
+            custom_emojis: imp.custom_emojis.borrow().as_ref().clone(),
+            can_message,
+        })
+    }
+
+    /// Conversation kind of the open conversation, if known.
+    fn visible_conversation(&self) -> Option<SlackConversation> {
+        let channel_id = self.visible_channel_id()?;
+        self.imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(&channel_id)
+            .cloned()
+    }
+
+    fn channel_details_input(
+        &self,
+        conversation: &SlackConversation,
+        loaded: bool,
+    ) -> Option<crate::channel_details_dialog::DetailsInput> {
+        let crate::channel_details::TitleBehavior::OpenDetails(layout) =
+            crate::channel_details::title_behavior(sidebar::conversation_kind(conversation))?
+        else {
+            return None;
+        };
+        let now = glib::DateTime::now_local().ok();
+        Some(crate::channel_details_dialog::DetailsInput {
+            channel_id: conversation.id.clone(),
+            title: self.conversation_title(&conversation.id),
+            layout,
+            is_private: sidebar::conversation_kind(conversation) == ConversationKind::PrivateChannel,
+            muted: conversation.is_muted_conversation(),
+            starred: conversation.is_starred(),
+            about: crate::channel_details::about_model(conversation),
+            loaded,
+            utc_offset_secs: now.map_or(0, |now| now.utc_offset().as_seconds()),
+        })
+    }
+
+    fn channel_member_row(&self, user_id: &str) -> crate::channel_details::MemberRow {
+        let imp = self.imp();
+        let user = imp.workspace.users.borrow().get(user_id).cloned();
+        let name = imp
+            .user_names
+            .borrow()
+            .get(user_id)
+            .cloned()
+            .or_else(|| user.as_ref().and_then(SlackUser::display_name))
+            .unwrap_or_else(|| user_id.to_string());
+        let now = current_unix_seconds();
+        let emojis = imp.custom_emojis.borrow();
+        let status = user
+            .as_ref()
+            .and_then(SlackUser::status)
+            .filter(|status| status.active_at(now))
+            .map(|status| {
+                let glyph = match crate::emoji::EmojiCatalog::new(&emojis).resolve(status.emoji_name())
+                {
+                    Some(crate::emoji::EmojiValue::Unicode(glyph)) => glyph,
+                    _ => "",
+                };
+                [glyph, status.text.trim()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let avatar_url = imp
+            .user_avatar_urls
+            .borrow()
+            .get(user_id)
+            .cloned()
+            .or_else(|| user.as_ref().and_then(SlackUser::avatar_url));
+        let context = self.message_html_context(None);
+        let avatar_path = avatar_url.and_then(|url| {
+            crate::timeline_message_widget::resolve_cached_asset_path(&url, &context)
+        });
+        crate::channel_details::MemberRow {
+            user_id: user_id.to_string(),
+            name,
+            status,
+            avatar_path,
+        }
+    }
+
+    fn channel_details_callbacks(&self) -> crate::channel_details_dialog::Callbacks {
+        let weak = self.downgrade();
+        let with_window = |weak: &glib::WeakRef<Self>| weak.clone();
+        let star_weak = with_window(&weak);
+        let edit_weak = with_window(&weak);
+        let leave_weak = with_window(&weak);
+        let profile_weak = with_window(&weak);
+        let member_weak = with_window(&weak);
+        let name_weak = with_window(&weak);
+        let plain_weak = with_window(&weak);
+        crate::channel_details_dialog::Callbacks {
+            on_star: Rc::new(move |channel_id, starred| {
+                if let Some(window) = star_weak.upgrade() {
+                    window.send_command(RuntimeCommand::SetConversationStarred {
+                        channel_id,
+                        starred,
+                    });
+                }
+            }),
+            on_edit: Rc::new(move |channel_id, field, text| {
+                if let Some(window) = edit_weak.upgrade() {
+                    window.send_command(RuntimeCommand::SetConversationText {
+                        channel_id,
+                        field,
+                        text,
+                    });
+                }
+            }),
+            on_leave: Rc::new(move |channel_id| {
+                if let Some(window) = leave_weak.upgrade() {
+                    window.leave_channel(&channel_id);
+                }
+            }),
+            on_profile: Rc::new(move |user_id| {
+                if let Some(window) = profile_weak.upgrade() {
+                    window.show_profile_dialog(&user_id);
+                }
+            }),
+            resolve_member: Rc::new(move |user_id| match member_weak.upgrade() {
+                Some(window) => window.channel_member_row(user_id),
+                None => crate::channel_details::MemberRow {
+                    user_id: user_id.to_string(),
+                    name: user_id.to_string(),
+                    status: String::new(),
+                    avatar_path: None,
+                },
+            }),
+            user_name: Rc::new(move |user_id| {
+                name_weak
+                    .upgrade()
+                    .and_then(|window| window.imp().user_names.borrow().get(user_id).cloned())
+            }),
+            plain_text: Rc::new(move |text| match plain_weak.upgrade() {
+                Some(window) => {
+                    let names = window.imp().user_names.borrow().clone();
+                    crate::channel_details::slack_text_to_plain(
+                        text,
+                        &window.imp().custom_emojis.borrow(),
+                        &|id| names.get(id).cloned(),
+                    )
+                }
+                None => text.to_string(),
+            }),
+        }
+    }
+
+    /// Opens the channel details dialog for the visible conversation and
+    /// loads fresh info and members; the dialog updates in place.
+    fn show_channel_details(&self) {
+        let Some(conversation) = self.visible_conversation() else {
+            return;
+        };
+        let Some(input) = self.channel_details_input(&conversation, false) else {
+            return;
+        };
+        crate::channel_details_dialog::present(self, &input, self.channel_details_callbacks());
+        self.send_command(RuntimeCommand::LoadConversationDetails {
+            channel_id: conversation.id,
+        });
+    }
+
+    /// Pushes the latest cached conversation state (star, mute, topic) into
+    /// the open details dialog, if it is for `channel_id`.
+    fn refresh_channel_details(&self, channel_id: &str, loaded: bool) {
+        let conversation = self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .cloned();
+        if let Some(input) =
+            conversation.and_then(|conversation| self.channel_details_input(&conversation, loaded))
+        {
+            crate::channel_details_dialog::update(&input);
+        }
+    }
+
+    /// Applies a `conversations.info` record to the dialog. The record is
+    /// shown directly (not merged into the sidebar state) so read state and
+    /// other locally tracked fields are never overwritten.
+    fn apply_channel_details(&self, channel_id: &str, fresh: &SlackConversation) {
+        let mut merged = self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .cloned()
+            .unwrap_or_else(|| fresh.clone());
+        for key in ["topic", "purpose", "creator", "created", "num_members"] {
+            if let Some(value) = fresh.extra.get(key) {
+                merged.extra.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(input) = self.channel_details_input(&merged, true) {
+            crate::channel_details_dialog::update(&input);
+        }
+    }
+
+    fn refresh_profile_dialog(&self, user_id: &str) {
+        if let Some(input) = self.profile_dialog_input(user_id) {
+            crate::profile_dialog::update(user_id, &input);
+        }
+    }
+
+    /// Opens the native profile dialog for `user_id` and loads the full
+    /// profile; the dialog updates in place when it arrives.
+    fn show_profile_dialog(&self, user_id: &str) {
         let user_id = user_id.trim();
         if user_id.is_empty() {
             return;
         }
-        if !self.flush_current_drafts() {
-            return;
-        }
-        self.close_media_viewer();
-        self.imp().profile_visible.set(true);
-        self.sync_back_button();
-        *self.imp().pending_profile_user_id.borrow_mut() = Some(user_id.to_string());
-        self.imp().message_title.set_title(&gettext("Profile"));
-        self.sync_message_title_profile_action();
-        self.show_secondary_text_placeholder(&gettext("Profile"), &gettext("Loading profile"));
-        self.imp().workspace_split.set_show_content(true);
+        let weak_window = self.downgrade();
+        crate::profile_dialog::present(
+            self,
+            user_id,
+            self.profile_dialog_input(user_id),
+            Rc::new(move |user_id| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.send_command(RuntimeCommand::OpenDirectMessage { user_id });
+                }
+            }),
+        );
         self.send_command(RuntimeCommand::LoadUserProfile {
             user_id: user_id.to_string(),
         });
@@ -8287,11 +8568,15 @@ impl ConduitWindow {
                 }
             }
             RuntimeFailureRecovery::User(user_id) => {
+                crate::profile_dialog::show_error(&user_id, error);
                 self.imp().pending_user_ids.borrow_mut().remove(&user_id);
                 crate::debug::log(
                     "ui",
                     &format!("UserLoadFailed user_id={user_id} error={error}"),
                 );
+            }
+            RuntimeFailureRecovery::ConversationDetails(channel_id) => {
+                crate::channel_details_dialog::show_error(&channel_id, error);
             }
             RuntimeFailureRecovery::Image(key) => self.mark_image_asset_failed(&key),
             RuntimeFailureRecovery::Media => {
@@ -8352,7 +8637,12 @@ impl ConduitWindow {
                     self.set_status(error);
                 }
             }
-            RuntimeFailureRecovery::ConversationStar => self.set_status(error),
+            RuntimeFailureRecovery::ConversationStar => {
+                self.set_status(error);
+                if let Some(channel_id) = self.visible_channel_id() {
+                    self.refresh_channel_details(&channel_id, true);
+                }
+            }
             RuntimeFailureRecovery::UserStatus => {
                 let draft = self.imp().pending_status_update.borrow_mut().take();
                 let error = current_user_status_error_message(failure);
@@ -9503,7 +9793,7 @@ impl ConduitWindow {
             profile_button.connect_clicked(move |_| {
                 popover_for_profile.popdown();
                 if let Some(window) = weak_window.upgrade() {
-                    window.show_user_profile(&action.user_id);
+                    window.show_profile_dialog(&action.user_id);
                 }
             });
             menu.append(&profile_button);
@@ -10531,7 +10821,8 @@ impl ConduitWindow {
     fn sync_message_title_profile_action(&self) {
         let imp = self.imp();
         let action = self.current_message_title_profile_action();
-        let interactive = action.is_some();
+        let details = action.is_none() && self.message_title_opens_details();
+        let interactive = action.is_some() || details;
         imp.message_title_action
             .set_title(imp.message_title.title().as_str());
         imp.message_title_action
@@ -10549,7 +10840,9 @@ impl ConduitWindow {
                 })
                 .map(|status| message_title_profile_status_description(&status.accessible_text))
         });
-        let label = action.map(|_| message_title_profile_label(imp.message_title.title().as_str()));
+        let label = action
+            .map(|_| message_title_profile_label(imp.message_title.title().as_str()))
+            .or_else(|| details.then(|| gettext("Conversation details")));
         let tooltip = label
             .as_deref()
             .map(|label| message_title_profile_tooltip(label, status_description.as_deref()));
@@ -10567,9 +10860,19 @@ impl ConduitWindow {
             .set_visible_child_name(if interactive { "profile" } else { "passive" });
     }
 
+    fn message_title_opens_details(&self) -> bool {
+        message_title_opens_details(
+            self.current_main_view(),
+            self.message_edit_is_active(),
+            self.visible_conversation().as_ref(),
+        )
+    }
+
     fn open_message_title_profile(&self) {
         if let Some(action) = self.current_message_title_profile_action() {
-            self.show_user_profile(&action.user_id);
+            self.show_profile_dialog(&action.user_id);
+        } else if self.message_title_opens_details() {
+            self.show_channel_details();
         }
     }
 
@@ -13674,6 +13977,16 @@ mod tests {
                 RuntimeFailureRecovery::User("U123".to_string()),
             ),
             (
+                RuntimeOperation::ConversationDetails,
+                RuntimeTarget::Channel("C123".to_string()),
+                RuntimeFailureRecovery::ConversationDetails("C123".to_string()),
+            ),
+            (
+                RuntimeOperation::ConversationEdit,
+                RuntimeTarget::Channel("C123".to_string()),
+                RuntimeFailureRecovery::ConversationDetails("C123".to_string()),
+            ),
+            (
                 RuntimeOperation::ImageAsset,
                 RuntimeTarget::Image("asset".to_string()),
                 RuntimeFailureRecovery::Image("asset".to_string()),
@@ -13763,6 +14076,22 @@ mod tests {
             )),
             RuntimeFailureRecovery::NonDisruptive
         );
+    }
+
+    #[test]
+    fn message_title_opens_details_only_for_channels_and_group_dms() {
+        let conversation = |json: serde_json::Value| -> SlackConversation {
+            serde_json::from_value(json).expect("conversation fixture")
+        };
+        let channel = conversation(serde_json::json!({"id": "C1", "is_channel": true}));
+        let group = conversation(serde_json::json!({"id": "G1", "is_mpim": true}));
+        let direct = conversation(serde_json::json!({"id": "D1", "is_im": true, "user": "U1"}));
+        let view = MainMessageView::Conversation;
+        assert!(message_title_opens_details(view, false, Some(&channel)));
+        assert!(message_title_opens_details(view, false, Some(&group)));
+        assert!(!message_title_opens_details(view, false, Some(&direct)));
+        assert!(!message_title_opens_details(view, true, Some(&channel)));
+        assert!(!message_title_opens_details(view, false, None));
     }
 
     #[test]
@@ -15372,19 +15701,34 @@ mod tests {
     }
 
     #[test]
-    fn public_link_unfurl_images_are_left_to_the_web_view() {
-        let image_url = "https://images.example.test/card.png".to_string();
-        let messages = [SlackMessage {
+    fn external_attachment_images_are_requested_through_the_image_proxy() {
+        let attachment = |url: &str| SlackMessage {
             attachments: Some(vec![crate::models::SlackAttachment {
-                image_url: Some(image_url),
+                image_url: Some(url.to_string()),
                 ..Default::default()
             }]),
             ..Default::default()
-        }];
-
-        assert!(
-            message_image_asset_requests(&messages, &HashMap::new(), &HashMap::new()).is_empty()
+        };
+        let external = "https://images.example.test/card.png";
+        let requests = message_image_asset_requests(
+            &[attachment(external)],
+            &HashMap::new(),
+            &HashMap::new(),
         );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, external);
+        assert!(
+            requests[0].1.starts_with("https://slack-imgs.com/?c=1&o1=ro&url="),
+            "{}",
+            requests[0].1
+        );
+        for private in ["http://localhost/a.png", "https://10.0.0.1/a.png", "http://192.168.1.2/a.png"] {
+            assert!(
+                message_image_asset_requests(&[attachment(private)], &HashMap::new(), &HashMap::new())
+                    .is_empty(),
+                "{private}"
+            );
+        }
     }
 
     #[test]
@@ -15406,6 +15750,68 @@ mod tests {
             message_image_asset_requests(&[message], &HashMap::new(), &HashMap::new()),
             vec![(image_url.clone(), image_url)]
         );
+    }
+
+    /// The native renderer shows a download placeholder only for URLs it
+    /// expects to land; every such URL must actually be requested here.
+    #[test]
+    fn document_images_are_requested_exactly_when_the_renderer_waits_for_them() {
+        let message = crate::slack_message_wire::normalize_cached_message(
+            crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                "ts": "1710000003.000100",
+                "text": "mixed media",
+                "blocks": [
+                    {"type": "image", "alt_text": "chart",
+                     "image_url": "https://cdn.example.test/chart.png"},
+                    {"type": "image", "alt_text": "shot",
+                     "image_url": "https://files.slack.com/files-pri/T1-F1/shot.png"},
+                    {"type": "context", "elements": [
+                        {"type": "image", "alt_text": "icon",
+                         "image_url": "https://a.slack-edge.com/icon.png"},
+                        {"type": "image", "alt_text": "ext icon",
+                         "image_url": "https://example.test/icon.png"},
+                        {"type": "image", "alt_text": "local",
+                         "image_url": "http://localhost/icon.png"}
+                    ]}
+                ],
+                "attachments": [
+                    {"title": "Site", "image_url": "https://example.test/og.png",
+                     "footer_icon": "https://example.test/favicon.ico"},
+                    {"title": "GIF", "image_url": "https://media1.giphy.com/media/a/giphy.gif"}
+                ]
+            }))
+            .into_message()
+            .expect("message should normalize"),
+        );
+        let requests = message_image_asset_requests([&message], &HashMap::new(), &HashMap::new());
+        let requested: HashSet<String> = requests.iter().map(|(key, _)| key.clone()).collect();
+        let urls: Vec<&str> = message.document.image_urls().collect();
+        assert_eq!(urls.len(), 8);
+
+        // External images keep their original URL as cache key but are
+        // fetched through the proxy; allowlisted ones are fetched directly.
+        let fetch_for = |key: &str| {
+            requests
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, fetch)| fetch.as_str())
+        };
+        assert_eq!(
+            fetch_for("https://files.slack.com/files-pri/T1-F1/shot.png"),
+            Some("https://files.slack.com/files-pri/T1-F1/shot.png")
+        );
+        let proxied = fetch_for("https://example.test/og.png").expect("og image requested");
+        assert!(proxied.starts_with("https://slack-imgs.com/?c=1&o1=ro&url="), "{proxied}");
+        assert_eq!(fetch_for("http://localhost/icon.png"), None);
+
+        for url in urls {
+            let image = crate::rich_message::MessageImage::new(Some(url.to_string()), "", None);
+            assert_eq!(
+                crate::timeline_media::fetchable_url(&image).is_some(),
+                requested.contains(url),
+                "{url}"
+            );
+        }
     }
 
     #[test]

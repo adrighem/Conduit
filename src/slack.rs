@@ -864,6 +864,39 @@ impl SlackApi {
         Ok(())
     }
 
+    /// Fetches the full `conversations.info` record (topic, purpose, creator).
+    pub async fn conversation_info(&self, channel_id: &str) -> Result<SlackConversation> {
+        let channel_id = required_conversation_id(channel_id)?;
+        let response: ConversationJoinResponse = self
+            .post_form("conversations.info", &[("channel", channel_id)])
+            .await?;
+        Ok(response.channel)
+    }
+
+    /// Fetches one page of member IDs plus the cursor for the next page.
+    pub async fn conversation_members_page(
+        &self,
+        channel_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        let params = conversation_members_params(channel_id, cursor)?;
+        let response: ConversationMembersResponse =
+            self.post_form("conversations.members", &params).await?;
+        Ok((response.members, next_cursor(response.response_metadata)))
+    }
+
+    pub async fn set_conversation_topic(&self, channel_id: &str, topic: &str) -> Result<()> {
+        let params = conversation_text_params(channel_id, "topic", topic)?;
+        let _: BasicResponse = self.post_form("conversations.setTopic", &params).await?;
+        Ok(())
+    }
+
+    pub async fn set_conversation_purpose(&self, channel_id: &str, purpose: &str) -> Result<()> {
+        let params = conversation_text_params(channel_id, "purpose", purpose)?;
+        let _: BasicResponse = self.post_form("conversations.setPurpose", &params).await?;
+        Ok(())
+    }
+
     pub async fn conversations_mark(&self, channel_id: &str, ts: &str) -> Result<()> {
         let channel_id = channel_id.trim_matches(|c: char| c.is_ascii_whitespace());
         let ts = ts.trim_matches(|c: char| c.is_ascii_whitespace());
@@ -1139,7 +1172,7 @@ impl SlackApi {
                 "preview URL is not a trusted Slack asset URL",
             ));
         }
-        let request = if is_trusted_slack_download_url(url) {
+        let request = if preview_download_needs_auth(url) {
             self.authenticated_request(Method::GET, url)
         } else {
             self.http.get(url)
@@ -1997,6 +2030,39 @@ fn paginated_list_params(
     params
 }
 
+fn required_conversation_id(channel_id: &str) -> Result<String> {
+    let channel_id = channel_id.trim();
+    if channel_id.is_empty() {
+        return Err(SlackError::validation("conversation ID is required"));
+    }
+    Ok(channel_id.to_string())
+}
+
+fn conversation_members_params(
+    channel_id: &str,
+    cursor: Option<&str>,
+) -> Result<Vec<(&'static str, String)>> {
+    let mut params = vec![
+        ("channel", required_conversation_id(channel_id)?),
+        ("limit", "200".to_string()),
+    ];
+    if let Some(cursor) = cursor.map(str::trim).filter(|cursor| !cursor.is_empty()) {
+        params.push(("cursor", cursor.to_string()));
+    }
+    Ok(params)
+}
+
+fn conversation_text_params(
+    channel_id: &str,
+    field: &'static str,
+    text: &str,
+) -> Result<Vec<(&'static str, String)>> {
+    Ok(vec![
+        ("channel", required_conversation_id(channel_id)?),
+        (field, text.trim().to_string()),
+    ])
+}
+
 fn next_cursor(metadata: Option<ResponseMetadata>) -> Option<String> {
     metadata
         .and_then(|metadata| metadata.next_cursor)
@@ -2294,6 +2360,28 @@ pub(crate) fn supports_native_preview_asset_url(url: &str) -> bool {
     is_trusted_slack_download_url(url)
         || is_trusted_avatar_url(url)
         || is_trusted_gif_service_url(url)
+        || is_slack_image_proxy_url(url)
+}
+
+/// Slack's public image proxy (exact host, https only). It serves any image
+/// anonymously, so requests to it never carry Slack credentials.
+fn is_slack_image_proxy_url(url: &str) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| host.trim_end_matches('.').eq_ignore_ascii_case("slack-imgs.com"))
+}
+
+/// Only Slack-owned hosts get the workspace credentials; everything else
+/// the preview downloader reaches (avatars, GIF services, the image proxy)
+/// is fetched anonymously.
+fn preview_download_needs_auth(url: &str) -> bool {
+    is_trusted_slack_download_url(url)
 }
 
 fn is_trusted_gif_service_url(url: &str) -> bool {
@@ -2620,6 +2708,16 @@ struct ConversationJoinResponse {
     channel: SlackConversation,
 }
 impl_slack_response!(ConversationJoinResponse);
+
+#[derive(Debug, Deserialize)]
+struct ConversationMembersResponse {
+    ok: bool,
+    error: Option<String>,
+    #[serde(default)]
+    members: Vec<String>,
+    response_metadata: Option<ResponseMetadata>,
+}
+impl_slack_response!(ConversationMembersResponse);
 
 #[derive(Debug, Deserialize)]
 struct ConversationOpenResponse {
@@ -3795,6 +3893,24 @@ mod tests {
     }
 
     #[test]
+    fn image_proxy_is_allowlisted_exactly_and_never_authenticated() {
+        let proxy = "https://slack-imgs.com/?c=1&o1=ro&url=https%3A%2F%2Fexample.com%2Fa.png";
+        assert!(supports_native_preview_asset_url(proxy));
+        assert!(!preview_download_needs_auth(proxy));
+        assert!(preview_download_needs_auth(
+            "https://files.slack.com/files-pri/T1-F1/a.png"
+        ));
+        for bad in [
+            "http://slack-imgs.com/?url=x",
+            "https://slack-imgs.com.evil.example/?url=x",
+            "https://evil-slack-imgs.com/?url=x",
+            "https://token@slack-imgs.com/?url=x",
+        ] {
+            assert!(!supports_native_preview_asset_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn attachment_download_size_is_bounded() {
         assert!(ensure_attachment_size(None).is_ok());
         assert!(ensure_attachment_size(Some(MAX_MEDIA_DOWNLOAD_BYTES)).is_ok());
@@ -4704,5 +4820,35 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(form.get("channel").map(String::as_str), Some("C12345"));
         assert_eq!(form.get("ts").map(String::as_str), Some("1234.5678"));
+    }
+
+    #[test]
+    fn conversation_members_params_trim_and_paginate() {
+        assert_eq!(
+            conversation_members_params(" C1 ", Some(" next ")).unwrap(),
+            vec![
+                ("channel", "C1".to_string()),
+                ("limit", "200".to_string()),
+                ("cursor", "next".to_string()),
+            ]
+        );
+        assert_eq!(
+            conversation_members_params("C1", Some("  ")).unwrap().len(),
+            2
+        );
+        assert!(conversation_members_params("  ", None).is_err());
+    }
+
+    #[test]
+    fn conversation_text_params_use_field_name() {
+        assert_eq!(
+            conversation_text_params("C1", "topic", "  hello  ").unwrap(),
+            vec![("channel", "C1".to_string()), ("topic", "hello".to_string())]
+        );
+        assert_eq!(
+            conversation_text_params("C1", "purpose", "").unwrap()[1],
+            ("purpose", String::new())
+        );
+        assert!(conversation_text_params("", "topic", "x").is_err());
     }
 }

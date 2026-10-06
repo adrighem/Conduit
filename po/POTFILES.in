@@ -6,6 +6,9 @@ data/eu.vanadrighem.conduit.metainfo.xml.in
 src/activity.rs
 src/application.rs
 src/message_html.rs
+src/profile_dialog.rs
+src/channel_details_dialog.rs
+src/channel_details.rs
 src/shortcuts-dialog.ui
 src/window.rs
 src/window.ui

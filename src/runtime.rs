@@ -59,6 +59,7 @@ use crate::workspace_pipeline::{
 use crate::workspace_state::WorkspaceLifecycleEvent;
 
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
+const CONVERSATION_MEMBER_PAGE_LIMIT: usize = 25;
 const NAVIGATION_TASK_CONCURRENCY: usize = 2;
 const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
 const BACKGROUND_TASK_CONCURRENCY: usize = 3;
@@ -339,6 +340,16 @@ impl RuntimeCommand {
             ),
             Self::LeaveConversation { channel_id } => RuntimeCommandDescriptor::mutation(
                 channel(RuntimeOperation::LeaveConversation, channel_id),
+                RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
+            ),
+            Self::LoadConversationDetails { channel_id } => RuntimeCommandDescriptor::request(
+                channel(RuntimeOperation::ConversationDetails, channel_id),
+                RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
+            ),
+            Self::SetConversationText { channel_id, .. } => RuntimeCommandDescriptor::mutation(
+                channel(RuntimeOperation::ConversationEdit, channel_id),
                 RuntimeTaskLane::Interactive,
                 RuntimeAdmissionPolicy::durable_action(),
             ),
@@ -799,6 +810,22 @@ pub enum RuntimeEventKind {
     ConversationLeft {
         channel_id: String,
     },
+    /// Fresh `conversations.info` record for the details dialog.
+    ConversationDetailsLoaded {
+        channel_id: String,
+        conversation: Box<SlackConversation>,
+    },
+    /// One page of member IDs for the details dialog.
+    ConversationMembersLoaded {
+        channel_id: String,
+        user_ids: Vec<String>,
+        complete: bool,
+    },
+    /// Conversation record re-read after a topic or purpose edit.
+    ConversationDetailsUpdated {
+        channel_id: String,
+        conversation: Box<SlackConversation>,
+    },
     AttentionNotificationCandidate {
         channel_id: String,
         message: Box<SlackMessage>,
@@ -940,6 +967,15 @@ impl RuntimeEventKind {
             }
             Self::ConversationLeft { channel_id } => OperationContext::new(
                 RuntimeOperation::LeaveConversation,
+                RuntimeTarget::Channel(channel_id.clone()),
+            ),
+            Self::ConversationDetailsLoaded { channel_id, .. }
+            | Self::ConversationMembersLoaded { channel_id, .. } => OperationContext::new(
+                RuntimeOperation::ConversationDetails,
+                RuntimeTarget::Channel(channel_id.clone()),
+            ),
+            Self::ConversationDetailsUpdated { channel_id, .. } => OperationContext::new(
+                RuntimeOperation::ConversationEdit,
                 RuntimeTarget::Channel(channel_id.clone()),
             ),
             Self::HistoryLoadCompleted {
@@ -5597,6 +5633,67 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     RuntimeEventKind::ConversationLeft { channel_id },
                 )
                 .await?;
+        }
+        RuntimeCommand::LoadConversationDetails { channel_id } => {
+            let api = require_slack(context.slack)?;
+            let conversation = api.conversation_info(&channel_id).await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationDetailsLoaded {
+                    channel_id: channel_id.clone(),
+                    conversation: Box::new(conversation),
+                });
+            let mut cursor: Option<String> = None;
+            let mut finished = false;
+            for _ in 0..CONVERSATION_MEMBER_PAGE_LIMIT {
+                let (user_ids, next) = api
+                    .conversation_members_page(&channel_id, cursor.as_deref())
+                    .await?;
+                finished = next.is_none();
+                context
+                    .events
+                    .send_event(RuntimeEventKind::ConversationMembersLoaded {
+                        channel_id: channel_id.clone(),
+                        user_ids,
+                        complete: finished,
+                    });
+                if finished {
+                    break;
+                }
+                cursor = next;
+            }
+            if !finished {
+                // Very large conversation: treat the fetched pages as the list.
+                context
+                    .events
+                    .send_event(RuntimeEventKind::ConversationMembersLoaded {
+                        channel_id,
+                        user_ids: Vec::new(),
+                        complete: true,
+                    });
+            }
+        }
+        RuntimeCommand::SetConversationText {
+            channel_id,
+            field,
+            text,
+        } => {
+            let api = require_slack(context.slack)?;
+            match field {
+                ConversationTextField::Topic => {
+                    api.set_conversation_topic(&channel_id, &text).await?
+                }
+                ConversationTextField::Purpose => {
+                    api.set_conversation_purpose(&channel_id, &text).await?
+                }
+            }
+            let conversation = api.conversation_info(&channel_id).await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::ConversationDetailsUpdated {
+                    channel_id,
+                    conversation: Box::new(conversation),
+                });
         }
         RuntimeCommand::OpenDirectMessage { user_id } => {
             let api = require_slack(context.slack)?;
@@ -16511,6 +16608,10 @@ mod tests {
                     NavigationSlot::Main
                 }),
             ),
+            RuntimeCommand::LoadConversationDetails { .. }
+            | RuntimeCommand::SetConversationText { .. } => {
+                RuntimeAdmissionPolicy::durable_action()
+            }
             RuntimeCommand::LoadUser { user_id } => {
                 RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::User {
                     scope: UserLoadScope::Basic,
@@ -16590,6 +16691,7 @@ mod tests {
             | RuntimeCommand::StartOAuth { .. }
             | RuntimeCommand::StartBrowserSession { .. }
             | RuntimeCommand::JoinConversation { .. }
+            | RuntimeCommand::LoadConversationDetails { .. }
             | RuntimeCommand::OpenDirectMessage { .. }
             | RuntimeCommand::ResolveMessagePermalink { .. } => {
                 (true, None, RuntimeTaskLane::Interactive)
@@ -16607,6 +16709,7 @@ mod tests {
             | RuntimeCommand::Disconnect
             | RuntimeCommand::UpdateAttentionPreferences(_)
             | RuntimeCommand::LeaveConversation { .. }
+            | RuntimeCommand::SetConversationText { .. }
             | RuntimeCommand::OpenGroupDirectMessage { .. }
             | RuntimeCommand::CreateChannel { .. }
             | RuntimeCommand::InviteToChannel { .. }
@@ -16648,6 +16751,14 @@ mod tests {
             },
             RuntimeCommand::LeaveConversation {
                 channel_id: "C1".to_string(),
+            },
+            RuntimeCommand::LoadConversationDetails {
+                channel_id: "C1".to_string(),
+            },
+            RuntimeCommand::SetConversationText {
+                channel_id: "C1".to_string(),
+                field: ConversationTextField::Topic,
+                text: "topic".to_string(),
             },
             RuntimeCommand::OpenDirectMessage {
                 user_id: "U1".to_string(),
@@ -16797,7 +16908,7 @@ mod tests {
     #[test]
     fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
         let commands = runtime_command_fixtures();
-        assert_eq!(commands.len(), 43);
+        assert_eq!(commands.len(), 45);
 
         for command in commands {
             let descriptor = command.descriptor();

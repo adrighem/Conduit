@@ -20,6 +20,9 @@ mod imp {
     #[derive(Default)]
     pub struct TimelineMessageObject {
         pub message: RefCell<SlackMessage>,
+        /// True for a day-separator row; `message` is then the first message
+        /// of the day it introduces (only its `ts` is used).
+        pub day_separator: std::cell::Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -179,6 +182,26 @@ impl TimelineMessageObject {
         let obj: Self = glib::Object::builder().build();
         *obj.imp().message.borrow_mut() = message;
         obj
+    }
+
+    /// Separator row introducing the day of `first_message_of_day`.
+    pub fn day_separator(first_message_of_day: SlackMessage) -> Self {
+        let obj = Self::new(first_message_of_day);
+        obj.imp().day_separator.set(true);
+        obj
+    }
+
+    pub fn is_day_separator(&self) -> bool {
+        self.imp().day_separator.get()
+    }
+
+    /// Fresh object with the same content and kind, to force a re-bind.
+    pub fn duplicate(&self) -> Self {
+        if self.is_day_separator() {
+            Self::day_separator(self.message())
+        } else {
+            Self::new(self.message())
+        }
     }
 
     pub fn message(&self) -> SlackMessage {
@@ -419,6 +442,7 @@ pub(crate) fn register_timeline_css() {
         provider.load_from_string(
             r#"
             .blockquote { border-left: 3px solid #888888; padding-left: 8px; margin-left: 4px; }
+            .author-menu-button { padding: 2px; margin: -2px; min-width: 0; min-height: 0; }
             .reaction-pill { padding: 2px 6px; min-width: 0; min-height: 0; border-radius: 12px; }
             .reaction-pill label { min-width: 0; }
             .reaction-emoji-unicode { font-size: 32px; line-height: 1; }
@@ -444,6 +468,10 @@ pub(crate) fn register_timeline_css() {
             }
             .thread-reply-active { font-weight: bold; }
             .reaction-pill-active { background-color: #D6ECFF; color: #1264A3; }
+            .day-separator-line {
+                background-color: color-mix(in srgb, currentColor 15%, transparent);
+                min-height: 1px;
+            }
             .unread-separator-line { background-color: #1264A3; min-height: 2px; }
             .unread-separator-label { color: #1264A3; font-weight: bold; }
             .timeline-text-view,
@@ -465,7 +493,7 @@ pub(crate) fn register_timeline_css() {
     });
 }
 
-fn get_or_load_texture(path: &Path) -> Option<gtk::gdk::Texture> {
+pub(crate) fn get_or_load_texture(path: &Path) -> Option<gtk::gdk::Texture> {
     TEXTURE_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         if let Some((_, tex)) = map.get(path) {
@@ -488,6 +516,10 @@ pub(crate) enum TimelineAction {
     MarkUnread(String),
     CopyMessageLink(String),
     CopyMessageText(String),
+    /// Open (or create) the direct message with this user.
+    MessageUser(String),
+    /// Show the native profile dialog for this user.
+    ShowProfile(String),
     /// Fired by the visibility-based auto-read-marking mechanism once a
     /// message has dwelled sufficiently on screen. Carries its own
     /// channel_id/thread_ts explicitly rather than relying on the handler
@@ -646,6 +678,14 @@ impl NativeTimelineView {
                 .expect("TimelineMessageObject expected");
             let msg = msg_obj.message();
 
+            let is_separator = msg_obj.is_day_separator();
+            item.set_selectable(!is_separator);
+            item.set_activatable(!is_separator);
+            if is_separator {
+                item.set_child(Some(&day_separator_widget(&msg.ts)));
+                return;
+            }
+
             if let Some(ctx) = context_clone.borrow().as_ref() {
                 let on_action = on_action_clone.clone();
                 let cb_media: OpenMediaCallback = {
@@ -681,6 +721,15 @@ impl NativeTimelineView {
                                 &on_action,
                                 TimelineAction::ToggleReaction { ts, name, add },
                             );
+                        });
+                    })
+                };
+                let cb_author: Rc<dyn Fn(TimelineAction)> = {
+                    let on_action = on_action.clone();
+                    Rc::new(move |action| {
+                        let on_action = on_action.clone();
+                        glib::idle_add_local_once(move || {
+                            dispatch_timeline_action(&on_action, action);
                         });
                     })
                 };
@@ -781,6 +830,7 @@ impl NativeTimelineView {
                     Some(&cb_thread),
                     Some(&cb_reaction),
                     Some(&cb_hover),
+                    Some(&cb_author),
                 );
                 item.set_child(Some(&msg_widget));
             }
@@ -1035,7 +1085,7 @@ impl NativeTimelineView {
             let mut new_items = Vec::with_capacity(n_items as usize);
             for i in 0..n_items {
                 if let Some(obj) = this.store.item(i).and_then(|o| o.downcast::<TimelineMessageObject>().ok()) {
-                    new_items.push(TimelineMessageObject::new(obj.message()));
+                    new_items.push(obj.duplicate());
                 }
             }
             if !new_items.is_empty() {
@@ -1057,18 +1107,8 @@ impl NativeTimelineView {
         *self.read_candidate.borrow_mut() = None;
         self.read_generation.set(self.read_generation.get().wrapping_add(1));
         self.store.remove_all();
-        for msg in messages.iter().rev() {
-            let obj = TimelineMessageObject::new(msg.clone());
-            self.store.append(&obj);
-        }
-
-        let focus_index = focus_ts.and_then(|ts| {
-            messages
-                .iter()
-                .rev()
-                .position(|msg| msg.ts == ts)
-                .map(|pos| pos as u32)
-        });
+        let (items, focus_index) = build_store_items(messages, focus_ts);
+        self.store.splice(0, 0, &items);
 
         let list_view = self.list_view.clone();
         let vadj = self.scrolled_window.vadjustment();
@@ -2237,6 +2277,71 @@ fn row_message_ts(widget: &Widget) -> Option<String> {
     None
 }
 
+/// Chronological store items for `messages` (newest first on input): a day
+/// separator is inserted wherever the local calendar day changes. The store
+/// is only ever rebuilt wholesale from the message list (`set_messages`) or
+/// re-spliced item-for-item (`update_image_asset`), so separators are derived
+/// here once and can never drift out of sync with inserts or prepends.
+/// Also returns the index of `focus_ts` within the resulting items.
+fn build_store_items(
+    messages: &[SlackMessage],
+    focus_ts: Option<&str>,
+) -> (Vec<TimelineMessageObject>, Option<u32>) {
+    let days: Vec<Option<i64>> = messages
+        .iter()
+        .rev()
+        .map(|msg| {
+            crate::message_html::slack_ts_datetime(&msg.ts)
+                .map(|dt| crate::day_label::local_calendar_day(&dt))
+        })
+        .collect();
+    let mut items = Vec::with_capacity(messages.len() + 4);
+    let mut focus_index = None;
+    for (i, msg) in messages.iter().rev().enumerate() {
+        if crate::day_label::separator_before(&days, i) {
+            items.push(TimelineMessageObject::day_separator(msg.clone()));
+        }
+        if focus_ts == Some(msg.ts.as_str()) && focus_index.is_none() {
+            focus_index = Some(items.len() as u32);
+        }
+        items.push(TimelineMessageObject::new(msg.clone()));
+    }
+    (items, focus_index)
+}
+
+/// Full-width rule with the day label ("Today", "15 Sep", ...) centered on
+/// it. Deliberately distinct from the red/accent unread separator.
+fn day_separator_widget(ts: &str) -> Box {
+    let label_text = crate::message_html::slack_ts_datetime(ts)
+        .zip(gtk::glib::DateTime::now_local().ok())
+        .and_then(|(dt, now)| crate::day_label::day_label(&dt, &now))
+        .unwrap_or_default();
+
+    let row = Box::new(Orientation::Horizontal, 12);
+    row.set_margin_top(8);
+    row.set_margin_bottom(8);
+    row.set_margin_start(12);
+    row.set_margin_end(12);
+    row.update_property(&[gtk::accessible::Property::Label(&label_text)]);
+
+    let append_line = || {
+        let line = Separator::new(Orientation::Horizontal);
+        line.add_css_class("day-separator-line");
+        line.set_valign(gtk::Align::Center);
+        line.set_hexpand(true);
+        row.append(&line);
+    };
+    append_line();
+    let label = Label::new(Some(&label_text));
+    label.add_css_class("dim-label");
+    label.add_css_class("caption");
+    label.add_css_class("heading");
+    row.append(&label);
+    append_line();
+    register_timeline_css();
+    row
+}
+
 fn unread_separator_widget() -> Box {
     let separator_row = Box::new(Orientation::Horizontal, 6);
     separator_row.set_margin_top(4);
@@ -2327,6 +2432,7 @@ pub(crate) fn build_timeline_message_widget(
     on_open_thread: Option<&Rc<dyn Fn(String)>>,
     on_toggle_reaction: Option<&Rc<dyn Fn(String, String, bool)>>,
     on_hover: Option<&Rc<dyn Fn(HoverEvent)>>,
+    on_author_action: Option<&Rc<dyn Fn(TimelineAction)>>,
 ) -> Box {
     register_timeline_css();
     if let Some(subtype) = message.subtype.as_deref() {
@@ -2380,7 +2486,6 @@ pub(crate) fn build_timeline_message_widget(
     let header_box = Box::new(Orientation::Horizontal, 8);
 
     let avatar_widget = build_avatar_widget(message, context);
-    header_box.append(&avatar_widget);
 
     let author_name = context
         .display_user_id(message)
@@ -2396,7 +2501,29 @@ pub(crate) fn build_timeline_message_widget(
     let author_label = Label::new(None);
     author_label.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(&author_name)));
     author_label.set_xalign(0.0);
-    header_box.append(&author_label);
+
+    let author_user_id = context.display_user_id(message);
+    let menu_access = crate::author_menu::author_menu_access(
+        author_user_id,
+        context.current_user_id.as_deref(),
+        &context.bot_user_ids,
+    );
+    match (on_author_action, author_user_id) {
+        (Some(on_action), Some(user_id)) if menu_access.any() => {
+            header_box.append(&crate::author_menu::author_menu_button(
+                &avatar_widget,
+                &author_label,
+                user_id,
+                &author_name,
+                menu_access,
+                on_action.clone(),
+            ));
+        }
+        _ => {
+            header_box.append(&avatar_widget);
+            header_box.append(&author_label);
+        }
+    }
 
     let timestamp_label = Label::new(None);
     if let Some((_machine, full, short)) =
@@ -2855,7 +2982,7 @@ mod tests {
             Arc::make_mut(&mut ctx.user_full_names)
                 .insert("U04R5M67EBV".to_string(), "Robey Groeneweg".to_string());
 
-            let widget = build_timeline_message_widget(&message, &ctx, None, None, None, None)
+            let widget = build_timeline_message_widget(&message, &ctx, None, None, None, None, None)
                 .upcast::<Widget>();
             let texts = label_texts(&widget);
 
@@ -2900,7 +3027,7 @@ mod tests {
             .expect("cached GIF picker message deserializes");
             let message = crate::slack_message_wire::normalize_cached_message(cached);
 
-            let widget = build_timeline_message_widget(&message, &test_context(), None, None, None, None)
+            let widget = build_timeline_message_widget(&message, &test_context(), None, None, None, None, None)
                 .upcast::<Widget>();
 
             assert!(label_texts(&widget).iter().any(|text| text == "GIF"));
@@ -2976,7 +3103,7 @@ mod tests {
             };
             message.refresh_canonical_content();
 
-            let widget = build_timeline_message_widget(&message, &test_context(), None, None, None, None)
+            let widget = build_timeline_message_widget(&message, &test_context(), None, None, None, None, None)
                 .upcast::<Widget>();
             let all = descendants(&widget);
 
@@ -3015,6 +3142,69 @@ mod tests {
         assert_eq!(format_file_size(10737418240), "10.0 GB");
     }
 
+    fn find_menu_button(widget: &Widget) -> Option<gtk::MenuButton> {
+        if let Some(button) = widget.downcast_ref::<gtk::MenuButton>() {
+            return Some(button.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_menu_button(&current) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    fn author_header_is_a_menu_target_for_people_only() {
+        run_gtk_test(|| {
+            let mut message = SlackMessage::default();
+            message.ts = "1700000000.000100".to_string();
+            message.user = Some("U123".to_string());
+            message.text = Some("hi".to_string());
+
+            let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+            let recorder = seen.clone();
+            let on_action: Rc<dyn Fn(TimelineAction)> = Rc::new(move |action| {
+                recorder.borrow_mut().push(format!("{action:?}"));
+            });
+
+            let widget = build_timeline_message_widget(
+                &message, &test_context(), None, None, None, None, Some(&on_action),
+            );
+            let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
+            assert!(button.menu_model().is_some());
+            button.activate_action("author.profile", None).unwrap();
+            button.activate_action("author.message", None).unwrap();
+            assert_eq!(
+                *seen.borrow(),
+                ["ShowProfile(\"U123\")", "MessageUser(\"U123\")"]
+            );
+
+            // Yourself: Message is disabled, Profile stays available.
+            let mut own = test_context();
+            own.current_user_id = Some("U123".to_string());
+            let widget = build_timeline_message_widget(
+                &message, &own, None, None, None, None, Some(&on_action),
+            );
+            let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
+            seen.borrow_mut().clear();
+            button.activate_action("author.message", None).unwrap();
+            assert!(seen.borrow().is_empty());
+            button.activate_action("author.profile", None).unwrap();
+            assert_eq!(seen.borrow().len(), 1);
+
+            // Bots get a plain header.
+            let mut bot = test_context();
+            bot.bot_user_ids = Arc::new(HashSet::from(["U123".to_string()]));
+            let widget = build_timeline_message_widget(
+                &message, &bot, None, None, None, None, Some(&on_action),
+            );
+            assert!(find_menu_button(widget.upcast_ref()).is_none());
+        });
+    }
+
     #[test]
     fn test_timeline_message_widget_all_gtk() {
         run_gtk_test(|| {
@@ -3039,7 +3229,7 @@ mod tests {
         ]);
         msg1.reply_count = Some(5);
 
-        let widget1 = build_timeline_message_widget(&msg1, &ctx, None, None, None, None);
+        let widget1 = build_timeline_message_widget(&msg1, &ctx, None, None, None, None, None);
         assert_eq!(widget1.orientation(), Orientation::Vertical);
 
         // 2. Section blocks and fields
@@ -3061,7 +3251,7 @@ mod tests {
             }
         ]));
 
-        let widget2 = build_timeline_message_widget(&msg2, &ctx, None, None, None, None);
+        let widget2 = build_timeline_message_widget(&msg2, &ctx, None, None, None, None, None);
         assert_eq!(widget2.orientation(), Orientation::Vertical);
 
         // 3. Divider, actions and context
@@ -3085,7 +3275,7 @@ mod tests {
             }
         ]));
 
-        let widget3 = build_timeline_message_widget(&msg3, &ctx, None, None, None, None);
+        let widget3 = build_timeline_message_widget(&msg3, &ctx, None, None, None, None, None);
         assert_eq!(widget3.orientation(), Orientation::Vertical);
 
         // 4. Attachments with color border
@@ -3106,7 +3296,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let widget4 = build_timeline_message_widget(&msg4, &ctx, None, None, None, None);
+        let widget4 = build_timeline_message_widget(&msg4, &ctx, None, None, None, None, None);
         assert_eq!(widget4.orientation(), Orientation::Vertical);
 
         // 5. Image file
@@ -3122,7 +3312,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let widget_img = build_timeline_message_widget(&msg_img, &ctx, None, None, None, None);
+        let widget_img = build_timeline_message_widget(&msg_img, &ctx, None, None, None, None, None);
         assert_eq!(widget_img.orientation(), Orientation::Vertical);
 
         // 6. Video file
@@ -3138,7 +3328,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let widget_vid = build_timeline_message_widget(&msg_vid, &ctx, None, None, None, None);
+        let widget_vid = build_timeline_message_widget(&msg_vid, &ctx, None, None, None, None, None);
         assert_eq!(widget_vid.orientation(), Orientation::Vertical);
 
         // 7. Document file with size
@@ -3154,7 +3344,7 @@ mod tests {
             ..Default::default()
         }]);
 
-        let widget_doc = build_timeline_message_widget(&msg_doc, &ctx, None, None, None, None);
+        let widget_doc = build_timeline_message_widget(&msg_doc, &ctx, None, None, None, None, None);
         assert_eq!(widget_doc.orientation(), Orientation::Vertical);
 
         // 8. Rich text blocks
@@ -3203,7 +3393,7 @@ mod tests {
             }
         ]));
 
-        let widget_rich = build_timeline_message_widget(&msg_rich, &ctx, None, None, None, None);
+        let widget_rich = build_timeline_message_widget(&msg_rich, &ctx, None, None, None, None, None);
         assert_eq!(widget_rich.orientation(), Orientation::Vertical);
 
         // 9. Subtype system message
@@ -3213,7 +3403,7 @@ mod tests {
         msg_sys.subtype = Some("channel_join".to_string());
         msg_sys.text = Some("joined the channel".to_string());
 
-        let widget_sys = build_timeline_message_widget(&msg_sys, &ctx, None, None, None, None);
+        let widget_sys = build_timeline_message_widget(&msg_sys, &ctx, None, None, None, None, None);
         assert_eq!(widget_sys.orientation(), Orientation::Horizontal);
 
         // 10. Thread broadcast banner
@@ -3223,15 +3413,16 @@ mod tests {
         msg_bc.text = Some("Broadcast reply".to_string());
         msg_bc.is_thread_broadcast = Some(true);
 
-        let widget_bc = build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None);
+        let widget_bc = build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None, None);
         assert_eq!(widget_bc.orientation(), Orientation::Vertical);
 
         // 11. Native timeline view & update_image_asset
         let timeline_view = NativeTimelineView::new();
         timeline_view.set_messages(&[msg1, msg2], &ctx, None);
-        assert_eq!(timeline_view.store.n_items(), 2);
+        // Two same-day messages: one leading day separator plus both rows.
+        assert_eq!(timeline_view.store.n_items(), 3);
         timeline_view.update_image_asset(&ctx);
-        assert_eq!(timeline_view.store.n_items(), 2);
+        assert_eq!(timeline_view.store.n_items(), 3);
 
         // 12. Custom emoji reactions & resolve_cached_asset_path
         let mut ctx_emoji = ctx.clone();
@@ -3253,7 +3444,7 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        let widget_rx = build_timeline_message_widget(&msg_reaction, &ctx_emoji, None, None, None, None);
+        let widget_rx = build_timeline_message_widget(&msg_reaction, &ctx_emoji, None, None, None, None, None);
         assert_eq!(widget_rx.orientation(), Orientation::Vertical);
 
         let path = resolve_cached_asset_path("nonexistent_key", &ctx_emoji);

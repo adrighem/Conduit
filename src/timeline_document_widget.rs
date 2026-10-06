@@ -17,7 +17,7 @@ use crate::rich_message::{
     MessageField, MessageImage, MessageLinkedText, MessageNode, MessageQuote, RichInline,
     RichInlineStyle, RichTextNode,
 };
-use crate::timeline_media::{context_icon, image_block, MediaSources};
+use crate::timeline_media::{context_icon, fetchable_url, image_block, MediaSources};
 use crate::timeline_message_widget::{
     create_message_text_widget, register_timeline_css, render_text_content,
 };
@@ -252,7 +252,14 @@ impl<'a> DocumentRenderer<'a> {
                 render_text_content(fallback, &card, self.context);
             }
         }
-        if let Some(image) = attachment.image.as_ref() {
+        // Unfurl previews on the linked site's own host are never fetched
+        // (privacy allowlist); the card's title and text already describe
+        // the link, so omit the image instead of an "Image: ..." line.
+        if let Some(image) = attachment
+            .image
+            .as_ref()
+            .filter(|image| fetchable_url(image).is_some())
+        {
             card.append(&self.image(image));
         }
         if !attachment.actions.is_empty() {
