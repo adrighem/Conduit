@@ -1264,6 +1264,8 @@ pub(crate) fn create_message_text_widget(
         label.set_selectable(true);
         label.set_focus_on_click(false);
         label.set_xalign(0.0);
+        // libadwaita's document font (family, size, line height) for reading content.
+        label.add_css_class("document");
         label.set_markup(pango);
         return label.upcast::<Widget>();
     }
@@ -1275,6 +1277,7 @@ pub(crate) fn create_message_text_widget(
     view.set_cursor_visible(false);
     view.set_wrap_mode(gtk::WrapMode::WordChar);
     view.add_css_class("timeline-text-view");
+    view.add_css_class("document");
     register_timeline_css();
 
     let buffer = view.buffer();
