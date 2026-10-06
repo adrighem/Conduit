@@ -26,8 +26,18 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Ubuntu 26.04 ships libadwaita 1.7 or newer, which the build requires.
+    container: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
 
     steps:
+      - name: Install base tooling
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git golang-go
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.commit_sha || github.sha }}
@@ -41,8 +51,8 @@ jobs:
 
       - name: Install GNOME dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt-get update
+          apt-get install -y \
             appstream \
             desktop-file-utils \
             gettext \
@@ -52,14 +62,12 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libgstreamer1.0-dev \
             libgtk-4-dev \
-            libwebkitgtk-6.0-dev \
             meson \
             ninja-build \
             pkg-config \
             python3-gi \
             gir1.2-gdkpixbuf-2.0 \
             gir1.2-gtk-4.0 \
-            gir1.2-webkit-6.0 \
             gstreamer1.0-libav \
             gstreamer1.0-nice \
             gstreamer1.0-pipewire \

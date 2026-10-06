@@ -18,15 +18,16 @@ The workflow uses the repository `GITHUB_TOKEN` by default. Repository Actions s
 The first packaging tier is x86_64 only:
 
 - `conduit_<version>-1_amd64.deb`, built and installed on Debian 13 (Trixie).
+- `conduit_<version>-1_ubuntu26.04_amd64.deb`, built and installed on Ubuntu 26.04.
 - `conduit-<version>-1.fc44.x86_64.rpm`, built and installed on Fedora 44.
 - `conduit-<version>-x86_64.flatpak`, built offline against the GNOME 50 runtime.
-- `SHA256SUMS`, covering all three packages.
+- `SHA256SUMS`, covering all packages.
 
 General release packages intentionally disable the optional `native-media` and `screen-share` features while production Slack huddle joining is unavailable. Huddle discovery, preflight, and the exact **Open in Slack** fallback remain available. CI continues to compile and test the optional media stack and synthetic harness, but those experiments do not add media dependencies or capture permissions to release packages.
 
 Clean validation containers install each native package, check dynamic libraries and RPATH, and validate desktop, AppStream, and GSettings metadata. A separate privileged Flatpak validation job installs the generated bundle, verifies its ref, runtime, commit, installed files, release metadata, and permissions, and executes a command inside the sandbox. Asset publication depends on all three validation jobs.
 
-Update the pinned Debian/Fedora targets when either distribution leaves support. Update `RUST_VERSION` when the minimum Rust version in `Cargo.toml` or locked dependencies requires it.
+Update the pinned Debian/Ubuntu/Fedora targets when a distribution leaves support. Update `RUST_VERSION` when the minimum Rust version in `Cargo.toml` or locked dependencies requires it.
 
 ## Updating Flatpak dependencies
 

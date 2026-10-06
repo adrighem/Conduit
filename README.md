@@ -20,7 +20,7 @@ with or endorsed by Slack Technologies, LLC.
 ## Before you start
 
 - Conduit is intentionally designed for one connected Slack workspace.
-- Current release packages target x86_64 Debian 13, Fedora 44, and Flatpak. Other
+- Current release packages target x86_64 Debian 13, Ubuntu 26.04, Fedora 44, and Flatpak. Other
   systems and architectures require a source build.
 - Current GitHub packages do not embed a shared Slack client ID. To use the
   recommended OAuth flow, you need permission to create and install a Slack app in
@@ -43,6 +43,9 @@ Install it with the matching system tool:
 ```sh
 # Debian 13 (Trixie)
 sudo apt install ./conduit_VERSION-1_amd64.deb
+
+# Ubuntu 26.04
+sudo apt install ./conduit_VERSION-1_ubuntu26.04_amd64.deb
 
 # Fedora 44
 sudo dnf install ./conduit-VERSION-1.fc44.x86_64.rpm
@@ -389,7 +392,7 @@ The default build requires:
 - Rust 1.88 or newer. The repository pins the reviewed Rust, rustfmt, and Clippy
   version in `rust-toolchain.toml`, currently 1.97.1.
 - Meson 1.0 or newer, Ninja, CMake, a C compiler, pkg-config, and gettext.
-- Development packages for GTK4, libadwaita, GdkPixbuf, GLib/GIO,
+- Development packages for GTK4, libadwaita 1.7 or newer, GdkPixbuf, GLib/GIO,
   and D-Bus.
 - Python 3 with PyGObject and GdkPixbuf introspection for the headless UI tests.
 - A running Secret Service-compatible keyring when connecting a workspace.

@@ -127,7 +127,17 @@ jobs:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
-    container: debian:trixie
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: debian-trixie
+            image: debian:trixie
+            deb_suffix: ""
+          - target: ubuntu-26.04
+            image: ubuntu:26.04
+            deb_suffix: _ubuntu26.04
     env:
       RUSTUP_HOME: /opt/rustup
     steps:
@@ -143,13 +153,14 @@ jobs:
             appstream build-essential ca-certificates cmake debhelper \
             desktop-file-utils gettext libadwaita-1-dev libdbus-1-dev \
             gir1.2-gdkpixbuf-2.0 libgdk-pixbuf-2.0-dev libgtk-4-dev \
-            libwebkitgtk-6.0-dev lintian meson ninja-build pkgconf \
+            lintian meson ninja-build pkgconf \
             python3 python3-gi rustup
           rustup toolchain install "$RUST_VERSION" --profile minimal
       - name: Build Debian package
         env:
           RUSTUP_TOOLCHAIN: ${{ env.RUST_VERSION }}
           VERSION: ${{ needs.release-please.outputs.version }}
+          DEB_SUFFIX: ${{ matrix.deb_suffix }}
         run: |
           cp -a packaging/debian debian
           mv debian/changelog.in debian/changelog
@@ -159,9 +170,13 @@ jobs:
           mkdir -p dist
           mv "../conduit_${VERSION}-1_amd64.deb" dist/
           lintian --fail-on error "dist/conduit_${VERSION}-1_amd64.deb"
+          if [ -n "$DEB_SUFFIX" ]; then
+            mv "dist/conduit_${VERSION}-1_amd64.deb" \
+              "dist/conduit_${VERSION}-1${DEB_SUFFIX}_amd64.deb"
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: conduit-${{ needs.release-please.outputs.version }}-deb
+          name: conduit-${{ needs.release-please.outputs.version }}-deb-${{ matrix.target }}
           path: dist/*.deb
           if-no-files-found: error
 
@@ -169,11 +184,19 @@ jobs:
     needs: [release-please, build-deb]
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
-    container: debian:trixie
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: debian-trixie
+            image: debian:trixie
+          - target: ubuntu-26.04
+            image: ubuntu:26.04
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: conduit-${{ needs.release-please.outputs.version }}-deb
+          name: conduit-${{ needs.release-please.outputs.version }}-deb-${{ matrix.target }}
           path: dist
       - name: Install and validate Debian package
         env:
@@ -218,8 +241,7 @@ jobs:
             --disablerepo=fedora-cisco-openh264 \
             appstream cargo cmake dbus-devel desktop-file-utils gcc gettext git \
             gdk-pixbuf2-devel gtk4-devel libadwaita-devel meson ninja-build \
-            pkgconf-pkg-config python3-gobject rpm-build rpmlint rust \
-            webkitgtk6.0-devel
+            pkgconf-pkg-config python3-gobject rpm-build rpmlint rust
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.release-please.outputs.sha }}

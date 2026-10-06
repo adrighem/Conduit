@@ -107,7 +107,7 @@ The default build includes discovery, huddle UI state, and the external fallback
 - `native_media` builds the GStreamer `webrtcbin` engine, device discovery, media controls, and statistics.
 - `screen_share` adds the XDG ScreenCast portal and PipeWire sharing path and requires `native_media`.
 
-On Debian 13, install the native media development and runtime packages:
+On Debian 13 or Ubuntu 26.04, install the native media development and runtime packages:
 
 ```sh
 sudo apt install \
